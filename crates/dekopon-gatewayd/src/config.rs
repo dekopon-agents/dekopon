@@ -2,6 +2,7 @@
 //! models and credential env vars, so a writable or symlinked copy could redirect the daemon.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     env, io,
     net::SocketAddr,
@@ -411,6 +412,11 @@ pub enum TransportConfig {
         #[serde(default)]
         graph_endpoint: Option<String>,
     },
+    GithubWebhook {
+        name: String,
+        bind: SocketAddr,
+        secret_env: String,
+    },
     TelegramLongPoll {
         name: String,
         bot_token_env: String,
@@ -457,6 +463,7 @@ impl TransportConfig {
             Self::SlackSocketMode { name, .. }
             | Self::DiscordGateway { name, .. }
             | Self::WhatsappCloudApi { name, .. }
+            | Self::GithubWebhook { name, .. }
             | Self::TelegramLongPoll { name, .. }
             | Self::Local { name, .. } => name,
         }
@@ -468,6 +475,7 @@ impl TransportConfig {
             Self::SlackSocketMode { .. } => ChatTransportKind::Slack,
             Self::DiscordGateway { .. } => ChatTransportKind::Discord,
             Self::WhatsappCloudApi { .. } => ChatTransportKind::Whatsapp,
+            Self::GithubWebhook { .. } => ChatTransportKind::Github,
             Self::TelegramLongPoll { .. } => ChatTransportKind::Telegram,
             Self::Local { .. } => ChatTransportKind::Local,
         }
@@ -479,6 +487,7 @@ impl TransportConfig {
             Self::SlackSocketMode { .. } => "slackSocketMode",
             Self::DiscordGateway { .. } => "discordGateway",
             Self::WhatsappCloudApi { .. } => "whatsappCloudApi",
+            Self::GithubWebhook { .. } => "githubWebhook",
             Self::TelegramLongPoll { .. } => "telegramLongPoll",
             Self::Local { .. } => "local",
         }
@@ -747,6 +756,8 @@ pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 pub struct RouteConfig {
     pub transport: String,
     pub conversation: ConversationMatchConfig,
+    #[serde(default, deserialize_with = "github_events_present")]
+    pub github_events: Option<Vec<GithubEvent>>,
     /// Subjects only routes which agent hears a message; authority stays with Cedar and the
     /// broker's subject mapping, and it is restricted to direct-message routes since a channel
     /// version would read as an access list.
@@ -790,6 +801,19 @@ pub struct RouteConfig {
     pub follow: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubEvent {
+    PullRequest,
+    WorkflowRun,
+}
+
+fn github_events_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<GithubEvent>>, D::Error> {
+    Vec::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryWindow {
     pub scope: MemoryScope,
@@ -822,6 +846,7 @@ impl MemoryPolicy {
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
     pub transport: String,
+    pub github_events: Option<Vec<GithubEvent>>,
     pub conversation: ConversationMatch,
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
@@ -1021,18 +1046,54 @@ pub async fn load_in(
     expected_uid: u32,
     mode: LoadMode,
 ) -> Result<(ResolvedConfig, Vec<ConfigError>), ConfigError> {
-    let path = absolute(path.as_ref())?;
+    let (resolved, mut refusals) = load_reporting(path.as_ref(), expected_uid, mode).await;
+    match (resolved, mode, refusals.is_empty()) {
+        (Some(resolved), LoadMode::Check, _) | (Some(resolved), LoadMode::Boot, true) => {
+            Ok((resolved, refusals))
+        }
+        _ => Err(refusals.remove(0)),
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "decode constructs only Decode; other ConfigError variants cannot arise here"
+)]
+pub(crate) async fn load_reporting(
+    path: &Path,
+    expected_uid: u32,
+    mode: LoadMode,
+) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
+    let path = match absolute(path) {
+        Ok(path) => path,
+        Err(error) => return (None, vec![error]),
+    };
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
         return load_directory(path, expected_uid, mode).await;
     }
-    let config = decode(&read_config_file(path.clone(), expected_uid).await?)?;
-    let resolved = resolve(
-        config,
-        path,
-        &BrokerSocketDiscovery::from_process(None),
-        expected_uid,
-    )?;
-    Ok((resolved, Vec::new()))
+    let resolved = async {
+        let config =
+            decode(&read_config_file(path.clone(), expected_uid).await?).map_err(|error| {
+                match error {
+                    ConfigError::Decode { source, .. } => ConfigError::Decode {
+                        path: Some(path.clone()),
+                        source,
+                    },
+                    other => other,
+                }
+            })?;
+        resolve(
+            config,
+            path,
+            &BrokerSocketDiscovery::from_process(None),
+            expected_uid,
+        )
+    }
+    .await;
+    match resolved {
+        Ok(resolved) => (Some(resolved), Vec::new()),
+        Err(error) => (None, vec![error]),
+    }
 }
 
 const MERGE_RULES: MergeRules = MergeRules {
@@ -1045,27 +1106,31 @@ const MERGE_RULES: MergeRules = MergeRules {
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
-    mode: LoadMode,
-) -> Result<(ResolvedConfig, Vec<ConfigError>), ConfigError> {
-    let paths = fragments::scan_directory(&directory, expected_uid, "yaml")?;
-    let first = paths
-        .first()
-        .cloned()
-        .ok_or_else(|| ConfigError::EmptyConfigDirectory {
-            path: directory.clone(),
-        })?;
+    _mode: LoadMode,
+) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
+    let paths = match scan_gateway_directory(&directory, expected_uid) {
+        Ok(paths) => paths,
+        Err(error) => return (None, vec![error.into()]),
+    };
+    let Some(first) = paths.first().cloned() else {
+        return (
+            None,
+            vec![ConfigError::EmptyConfigDirectory { path: directory }],
+        );
+    };
     let mut parsed = Vec::with_capacity(paths.len());
     let mut defined = BTreeMap::<String, PathBuf>::new();
     let mut referenced = Vec::<(PathBuf, String)>::new();
     let mut model_files = BTreeMap::<String, PathBuf>::new();
     for path in paths {
-        let bytes = read_config_file(path.clone(), expected_uid).await?;
-        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).map_err(|source| {
-            ConfigError::DecodeFragment {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let bytes = match read_config_file(path.clone(), expected_uid).await {
+            Ok(bytes) => bytes,
+            Err(error) => return (None, vec![error]),
+        };
+        let mapping = match serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes) {
+            Ok(mapping) => mapping,
+            Err(source) => return (None, vec![ConfigError::DecodeFragment { path, source }]),
+        };
         for transport in names_under(&mapping, "transports", "name") {
             defined.insert(transport, path.clone());
         }
@@ -1085,25 +1150,22 @@ async fn load_directory(
     let mut refusals = Vec::new();
     if !stray.is_empty() {
         let refusal = ConfigError::RouteOutsideTransportFragment { routes: stray };
-        if mode == LoadMode::Boot {
-            return Err(refusal);
-        }
         refusals.push(refusal);
     }
     let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
     if let Some(refusal) = refusal {
-        if mode == LoadMode::Boot {
-            return Err(refusal.into());
-        }
         refusals.push(refusal.into());
     }
-    // A later refusal is reported as the fragment refusal it may well be caused by.
-    let later =
-        |error: ConfigError, mut refusals: Vec<ConfigError>| refusals.pop().unwrap_or(error);
     let config = match serde_yaml::from_value::<GatewaydConfig>(serde_yaml::Value::Mapping(merged))
     {
         Ok(config) => config,
-        Err(source) => return Err(later(ConfigError::Decode { source }, refusals)),
+        Err(source) => {
+            refusals.push(ConfigError::Decode {
+                path: Some(directory),
+                source,
+            });
+            return (None, refusals);
+        }
     };
     match resolve(
         config,
@@ -1113,15 +1175,18 @@ async fn load_directory(
     ) {
         Ok(mut resolved) => {
             resolved.model_files.extend(model_files);
-            Ok((resolved, refusals))
+            (Some(resolved), refusals)
         }
-        Err(error) => Err(later(error, refusals)),
+        Err(error) => {
+            refusals.push(error);
+            (None, refusals)
+        }
     }
 }
 
 fn decode(document: &[u8]) -> Result<GatewaydConfig, ConfigError> {
     serde_yaml::from_slice::<GatewaydConfig>(document)
-        .map_err(|source| ConfigError::Decode { source })
+        .map_err(|source| ConfigError::Decode { path: None, source })
 }
 
 fn names_under(mapping: &serde_yaml::Mapping, list: &str, field: &str) -> Vec<String> {
@@ -1134,21 +1199,615 @@ fn names_under(mapping: &serde_yaml::Mapping, list: &str, field: &str) -> Vec<St
         .collect()
 }
 
+fn scan_gateway_directory(
+    directory: &Path,
+    expected_uid: u32,
+) -> Result<Vec<PathBuf>, FragmentError> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|source| FragmentError::Read {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    use std::os::unix::fs::MetadataExt as _;
+    let projected = std::fs::symlink_metadata(directory.join("..data"))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if projected {
+        let read_only = rustix::fs::statvfs(directory)
+            .is_ok_and(|stat| stat.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY));
+        if !metadata.is_dir() || !read_only || metadata.uid() != 0 && metadata.uid() != expected_uid
+        {
+            return Err(FragmentError::InsecureDirectory {
+                path: directory.to_path_buf(),
+            });
+        }
+        let mut paths = std::fs::read_dir(directory)
+            .map_err(|source| FragmentError::Read {
+                path: directory.to_path_buf(),
+                source,
+            })?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|source| FragmentError::Read {
+                        path: directory.to_path_buf(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.retain(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "yaml")
+        });
+        paths.sort();
+        Ok(paths)
+    } else {
+        fragments::scan_directory(directory, expected_uid, "yaml")
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SourceSnapshot(pub(crate) BTreeMap<PathBuf, Vec<u8>>);
+
+/// In memory only, never logged or published: it covers source bytes and exists to tell one raw
+/// candidate from another.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct RawCandidate([u8; 32]);
+
+impl std::fmt::Debug for RawCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RawCandidate")
+    }
+}
+
+impl RawCandidate {
+    pub(crate) fn of(
+        config: Result<&SourceSnapshot, &ConfigError>,
+        catalog: Option<Result<&SourceSnapshot, &ConfigError>>,
+    ) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        for source in [Some(config), catalog] {
+            let parts = match source {
+                Some(Ok(snapshot)) => snapshot
+                    .0
+                    .iter()
+                    .flat_map(|(path, bytes)| [path.as_os_str().as_encoded_bytes(), bytes])
+                    .map(Cow::Borrowed)
+                    .collect(),
+                Some(Err(error)) => vec![Cow::Owned(dekopon_core::error_chain(error).into_bytes())],
+                None => Vec::new(),
+            };
+            hasher.update(parts.len().to_le_bytes());
+            for part in parts {
+                hasher.update(part.len().to_le_bytes());
+                hasher.update(part);
+            }
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub(crate) fn refusing(self, refusal: &str) -> Self {
+        use sha2::{Digest as _, Sha256};
+        Self(
+            Sha256::new()
+                .chain_update(self.0)
+                .chain_update(refusal)
+                .finalize()
+                .into(),
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct GatewaySources {
+    pub(crate) config: SourceSnapshot,
+    pub(crate) catalog: SourceSnapshot,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct GatewayChanges {
+    pub(crate) swap: Vec<&'static str>,
+    pub(crate) restart_required: Vec<&'static str>,
+}
+
+impl GatewaySources {
+    pub(crate) async fn still_current(
+        &self,
+        config_path: &Path,
+        catalog_path: &Path,
+        uid: u32,
+    ) -> Result<bool, ConfigError> {
+        if self.config != source_snapshot(config_path, None, uid).await? {
+            return Ok(false);
+        }
+        let catalog = source_snapshot(catalog_path, None, uid).await?;
+        if !catalog
+            .0
+            .iter()
+            .all(|(path, bytes)| self.catalog.0.get(path) == Some(bytes))
+        {
+            return Ok(false);
+        }
+        for (path, bytes) in &self.catalog.0 {
+            if read_source_entry(path.clone(), uid).await? != *bytes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn changes(&self, next: &Self) -> Result<GatewayChanges, ConfigError> {
+        let old = merged_mapping(&self.config)?;
+        let new = merged_mapping(&next.config)?;
+        let classified = [
+            ("models", "models"),
+            ("routes", "routes"),
+            ("stopWords", "stopWords"),
+            ("catalogPath", "catalog"),
+            ("broker", "broker"),
+            ("transports", "transports"),
+            ("sessions", "sessions"),
+            ("shutdownGraceMs", "shutdownGraceMs"),
+            ("telemetry", "telemetry"),
+            ("metering", "metering"),
+            ("proxy", "proxy"),
+            ("apiVersion", "apiVersion"),
+        ];
+        if old.keys().chain(new.keys()).any(|key| {
+            !key.as_str()
+                .is_some_and(|key| classified.iter().any(|(known, _)| known == &key))
+        }) {
+            return Err(ConfigError::UnclassifiedSource);
+        }
+        let mut changes = GatewayChanges::default();
+        for (key, category) in classified {
+            let before = effective_value(&old, key);
+            let after = effective_value(&new, key);
+            if before == after
+                || ["broker", "sessions", "metering"].contains(&key)
+                    && before.is_none_or(|value| {
+                        value
+                            .as_mapping()
+                            .is_some_and(serde_yaml::Mapping::is_empty)
+                    })
+                    && after.is_none_or(|value| {
+                        value
+                            .as_mapping()
+                            .is_some_and(serde_yaml::Mapping::is_empty)
+                    })
+            {
+                continue;
+            }
+            match category {
+                "models" | "routes" | "stopWords" | "catalog" => changes.swap.push(category),
+                "transports" | "sessions" => {
+                    let (resident_before, indicators_before) = split_indicators(before, category);
+                    let (resident_after, indicators_after) = split_indicators(after, category);
+                    if resident_before != resident_after {
+                        changes.restart_required.push(category);
+                    }
+                    if indicators_before != indicators_after {
+                        changes.swap.push("indicators");
+                    }
+                }
+                "broker" | "shutdownGraceMs" | "telemetry" | "metering" | "proxy" => {
+                    changes.restart_required.push(category);
+                }
+                "apiVersion" => return Err(ConfigError::UnclassifiedSource),
+                _ => return Err(ConfigError::UnclassifiedSource),
+            }
+        }
+        if self.catalog != next.catalog && !changes.swap.contains(&"catalog") {
+            changes.swap.push("catalog");
+        }
+        Ok(changes)
+    }
+}
+
+fn effective_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(key).filter(|value| !value.is_null())
+}
+
+fn split_indicators(
+    value: Option<&serde_yaml::Value>,
+    category: &str,
+) -> (Option<serde_yaml::Value>, Option<serde_yaml::Value>) {
+    let Some(value) = value else {
+        return if category == "sessions" {
+            (
+                Some(serde_yaml::Value::Mapping(serde_yaml::Mapping::new())),
+                None,
+            )
+        } else {
+            (None, None)
+        };
+    };
+    if category == "sessions" {
+        let Some(mapping) = value.as_mapping() else {
+            return (Some(value.clone()), None);
+        };
+        let mut resident = mapping.clone();
+        let indicators = resident
+            .remove("indicators")
+            .filter(|value| !value.is_null());
+        if resident
+            .get("maxConcurrent")
+            .and_then(serde_yaml::Value::as_u64)
+            == u64::try_from(SessionsConfig::default().max_concurrent).ok()
+        {
+            resident.remove("maxConcurrent");
+        }
+        return (Some(serde_yaml::Value::Mapping(resident)), indicators);
+    }
+    let Some(items) = value.as_sequence() else {
+        return (Some(value.clone()), None);
+    };
+    let mut resident = items.clone();
+    let mut indicators = Vec::new();
+    for item in &mut resident {
+        if let Some(mapping) = item.as_mapping_mut() {
+            indicators.push(
+                mapping
+                    .remove("indicators")
+                    .unwrap_or(serde_yaml::Value::Null),
+            );
+        }
+    }
+    (
+        Some(serde_yaml::Value::Sequence(resident)),
+        Some(serde_yaml::Value::Sequence(indicators)),
+    )
+}
+
+pub(crate) fn merged_mapping(
+    snapshot: &SourceSnapshot,
+) -> Result<serde_yaml::Mapping, ConfigError> {
+    let parsed = snapshot
+        .0
+        .iter()
+        .map(|(path, bytes)| {
+            serde_yaml::from_slice::<serde_yaml::Mapping>(bytes)
+                .map(|mapping| (path.clone(), mapping))
+                .map_err(|source| ConfigError::DecodeFragment {
+                    path: path.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
+    match refusal {
+        Some(refusal) => Err(refusal.into()),
+        None => Ok(merged),
+    }
+}
+
+pub(crate) async fn source_snapshot(
+    source: &Path,
+    catalog: Option<&dekopon_config::LocalCatalog>,
+    expected_uid: u32,
+) -> Result<SourceSnapshot, ConfigError> {
+    let mut paths = if source.is_dir() {
+        scan_gateway_directory(source, expected_uid)?
+    } else {
+        vec![source.to_path_buf()]
+    };
+    let loaded = catalog.map(loaded_catalog_bytes).transpose()?;
+    if let Some(loaded) = &loaded {
+        paths.extend(loaded.keys().cloned());
+    }
+    paths.sort();
+    paths.dedup();
+    let mut entries = BTreeMap::new();
+    for path in paths {
+        entries.insert(path.clone(), read_source_entry(path, expected_uid).await?);
+    }
+    // A catalog serves what it loaded, so its snapshot must be those bytes, not a later read.
+    if let Some(loaded) = loaded
+        && !entries
+            .iter()
+            .map(|(path, bytes)| (path, bytes.as_slice()))
+            .eq(loaded.iter().map(|(path, bytes)| (path, bytes.as_ref())))
+    {
+        return Err(ConfigError::ChangedDuringLoad);
+    }
+    Ok(SourceSnapshot(entries))
+}
+
+fn loaded_catalog_bytes(
+    catalog: &dekopon_config::LocalCatalog,
+) -> Result<BTreeMap<PathBuf, Cow<'_, [u8]>>, ConfigError> {
+    let mut loaded = BTreeMap::new();
+    for (path, text) in catalog.files() {
+        record_loaded(&mut loaded, path.clone(), Cow::Borrowed(text.as_bytes()))?;
+    }
+    let root = catalog.source();
+    let base = if root.is_dir() {
+        root
+    } else {
+        root.parent().ok_or(ConfigError::MissingParent)?
+    };
+    for agent in catalog.agents() {
+        if let Some(file) = &agent.spec.instructions_file {
+            let text = agent
+                .spec
+                .instructions
+                .as_deref()
+                .ok_or(ConfigError::ChangedDuringLoad)?;
+            record_loaded(&mut loaded, base.join(file), Cow::Borrowed(text.as_bytes()))?;
+        }
+        let id = agent
+            .metadata
+            .name
+            .parse()
+            .map_err(|_invalid| ConfigError::InvalidCatalogAgent)?;
+        for skill in catalog.agent_skills(&id) {
+            let root = skill.source();
+            record_loaded(
+                &mut loaded,
+                root.join(dekopon_config::skill::SKILL_FILE_NAME),
+                Cow::Borrowed(skill.file().as_bytes()),
+            )?;
+            for resource in skill.resources() {
+                record_loaded(
+                    &mut loaded,
+                    root.join(&resource.path),
+                    Cow::Borrowed(resource.text.as_bytes()),
+                )?;
+            }
+            for (directory, names) in skill.directories() {
+                record_loaded(
+                    &mut loaded,
+                    directory.clone(),
+                    Cow::Owned(listing_bytes(directory, names)?),
+                )?;
+            }
+        }
+    }
+    Ok(loaded)
+}
+
+fn record_loaded<'a>(
+    loaded: &mut BTreeMap<PathBuf, Cow<'a, [u8]>>,
+    path: PathBuf,
+    bytes: Cow<'a, [u8]>,
+) -> Result<(), ConfigError> {
+    match loaded.entry(path) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(bytes);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == bytes => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => Err(ConfigError::ChangedDuringLoad),
+    }
+}
+
+async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = std::fs::symlink_metadata(&path).map_err(|source| ConfigError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return read_config_file(path, expected_uid).await;
+    }
+    let read_only = rustix::fs::statvfs(&path)
+        .map_err(|source| ConfigError::Read {
+            path: path.clone(),
+            source: source.into(),
+        })?
+        .f_flag
+        .contains(rustix::fs::StatVfsMountFlags::RDONLY);
+    if metadata.uid() != expected_uid && (metadata.uid() != 0 || !read_only)
+        || metadata.permissions().mode() & 0o022 != 0 && !read_only
+    {
+        return Err(ConfigError::InsecureProjection { path });
+    }
+    let mut names = std::fs::read_dir(&path)
+        .map_err(|source| ConfigError::Read {
+            path: path.clone(),
+            source,
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|source| ConfigError::Read {
+                    path: path.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    listing_bytes(&path, &names)
+}
+
+fn listing_bytes(path: &Path, sorted: &[std::ffi::OsString]) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    if sorted.len() > 1024 {
+        return Err(ConfigError::InsecureProjection {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut bytes = Vec::new();
+    for name in sorted {
+        let name = name.as_bytes();
+        if bytes.len().saturating_add(name.len()).saturating_add(4) > HARD_MAX_CONFIG_BYTES {
+            return Err(ConfigError::InsecureProjection {
+                path: path.to_path_buf(),
+            });
+        }
+        bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(name);
+    }
+    Ok(bytes)
+}
+
+fn read_gateway_projection(path: &Path, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+    let root = path.parent().ok_or(ConfigError::MissingParent)?;
+    let read_only = rustix::fs::statvfs(root)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: source.into(),
+        })?
+        .f_flag
+        .contains(rustix::fs::StatVfsMountFlags::RDONLY);
+    read_gateway_projection_at(path, expected_uid, read_only)
+}
+
+pub(crate) fn read_gateway_projection_at(
+    path: &Path,
+    expected_uid: u32,
+    read_only: bool,
+) -> Result<Vec<u8>, ConfigError> {
+    read_gateway_projection_with(path, expected_uid, read_only, || {})
+}
+
+pub(crate) fn read_gateway_projection_with(
+    path: &Path,
+    expected_uid: u32,
+    read_only: bool,
+    after_read: impl FnOnce(),
+) -> Result<Vec<u8>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let insecure = || ConfigError::InsecureProjection {
+        path: path.to_path_buf(),
+    };
+    let read_error = |source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let root = path.parent().ok_or_else(insecure)?;
+    let root_metadata = std::fs::symlink_metadata(root).map_err(read_error)?;
+    if !read_only
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != 0 && root_metadata.uid() != expected_uid
+    {
+        return Err(insecure());
+    }
+    let link = std::fs::symlink_metadata(path).map_err(read_error)?;
+    let data_link = std::fs::symlink_metadata(root.join("..data")).map_err(read_error)?;
+    if !link.file_type().is_symlink()
+        || !data_link.file_type().is_symlink()
+        || link.uid() != 0 && link.uid() != expected_uid
+        || data_link.uid() != 0 && data_link.uid() != expected_uid
+        || std::fs::read_link(path).map_err(read_error)?
+            != Path::new("..data").join(path.file_name().ok_or_else(insecure)?)
+    {
+        return Err(insecure());
+    }
+    let generation = std::fs::read_link(root.join("..data")).map_err(read_error)?;
+    if !matches!(
+        generation.components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    ) {
+        return Err(insecure());
+    }
+    let directory = root.join(&generation);
+    let metadata = std::fs::symlink_metadata(&directory).map_err(read_error)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0 && metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(insecure());
+    }
+    let target = directory.join(path.file_name().ok_or_else(insecure)?);
+    let owner = std::fs::symlink_metadata(&target)
+        .map_err(read_error)?
+        .uid();
+    if owner != 0 && owner != expected_uid {
+        return Err(insecure());
+    }
+    let bytes = read_trusted_file(
+        &target,
+        owner,
+        FileTier::NotWorldWritable,
+        HARD_MAX_CONFIG_BYTES,
+    )
+    .map_err(|source| ConfigError::InsecureFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    after_read();
+    if std::fs::read_link(root.join("..data")).map_err(read_error)? != generation {
+        return Err(ConfigError::ChangedDuringLoad);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_gateway_regular_file_at(
+    path: &Path,
+    expected_uid: u32,
+    observed: u32,
+    read_only: bool,
+    read: impl FnOnce(&Path, u32, FileTier, usize) -> Result<Vec<u8>, FileHygieneError>,
+) -> Result<Vec<u8>, FileHygieneError> {
+    let owner = if observed == 0 && read_only {
+        0
+    } else {
+        expected_uid
+    };
+    if owner != observed {
+        return Err(FileHygieneError::WrongOwner {
+            path: path.to_path_buf(),
+            owner: observed,
+            expected: expected_uid,
+        });
+    }
+    read(
+        path,
+        owner,
+        FileTier::NotWorldWritable,
+        HARD_MAX_CONFIG_BYTES,
+    )
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-async fn read_config_file(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
+pub(crate) async fn read_config_file(
+    path: PathBuf,
+    expected_uid: u32,
+) -> Result<Vec<u8>, ConfigError> {
     // This file isn't a secret, since credentials live in the environment and transport credential
     // files, so the bar here is only that nobody else can rewrite it.
     let owned = path.clone();
+    let projection =
+        std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if projection {
+        return tokio::task::spawn_blocking(move || read_gateway_projection(&owned, expected_uid))
+            .await
+            .map_err(|join| ConfigError::Read {
+                path,
+                source: io::Error::other(join),
+            })?;
+    }
     tokio::task::spawn_blocking(move || {
-        read_trusted_file(
-            &owned,
-            expected_uid,
-            FileTier::NotWorldWritable,
-            HARD_MAX_CONFIG_BYTES,
-        )
+        use std::os::unix::fs::MetadataExt as _;
+        let observed = std::fs::symlink_metadata(&owned)
+            .map_err(|source| FileHygieneError::Io {
+                path: owned.clone(),
+                source,
+            })?
+            .uid();
+        let read_only = if observed == 0 && expected_uid != 0 {
+            let parent = owned.parent().ok_or_else(|| FileHygieneError::Io {
+                path: owned.clone(),
+                source: io::Error::new(io::ErrorKind::InvalidInput, "source has no parent"),
+            })?;
+            rustix::fs::statvfs(parent)
+                .map_err(|source| FileHygieneError::Io {
+                    path: owned.clone(),
+                    source: source.into(),
+                })?
+                .f_flag
+                .contains(rustix::fs::StatVfsMountFlags::RDONLY)
+        } else {
+            false
+        };
+        read_gateway_regular_file_at(&owned, expected_uid, observed, read_only, read_trusted_file)
     })
     .await
     .map_err(|join| ConfigError::Read {
@@ -1216,6 +1875,9 @@ pub(crate) fn resolve(
     let mut transport_names = BTreeSet::new();
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     let mut transports = Vec::with_capacity(config.transports.len());
+    let mut webhook_mounts = BTreeSet::new();
+    let mut whatsapp_binds: BTreeMap<SocketAddr, Vec<String>> = BTreeMap::new();
+    let mut github_binds = Vec::new();
     for transport in config.transports {
         let name = transport.name().to_owned();
         if name.trim().is_empty() {
@@ -1228,16 +1890,40 @@ pub(crate) fn resolve(
             continue;
         }
         transport_kinds.insert(name.clone(), transport.chat_kind());
+        let mount = match &transport {
+            TransportConfig::WhatsappCloudApi {
+                bind,
+                callback_path,
+                ..
+            } => {
+                whatsapp_binds.entry(*bind).or_default().push(name.clone());
+                Some((*bind, callback_path.as_str()))
+            }
+            TransportConfig::GithubWebhook { bind, .. } => {
+                github_binds.push((name.clone(), *bind));
+                Some((*bind, "/webhooks/github"))
+            }
+            TransportConfig::SlackSocketMode { .. }
+            | TransportConfig::DiscordGateway { .. }
+            | TransportConfig::TelegramLongPoll { .. }
+            | TransportConfig::Local { .. } => None,
+        };
+        if let Some((bind, path)) = mount
+            && !webhook_mounts.insert((bind, path.to_owned()))
+        {
+            problems.push(ConfigProblem::ConflictingWebhookMount { name: name.clone() });
+        }
         let indicators = match &transport {
             TransportConfig::SlackSocketMode { liveness, .. }
             | TransportConfig::DiscordGateway { liveness, .. }
             | TransportConfig::TelegramLongPoll { liveness, .. }
             | TransportConfig::WhatsappCloudApi { liveness, .. }
-            | TransportConfig::Local { liveness, .. } => liveness,
+            | TransportConfig::Local { liveness, .. } => Some(liveness),
+            TransportConfig::GithubWebhook { .. } => None,
         };
         for kind in indicators
-            .conversations
-            .keys()
+            .into_iter()
+            .flat_map(|liveness| liveness.conversations.keys())
             .filter(|kind| !transport.chat_kind().produces(**kind))
         {
             problems.push(ConfigProblem::ImpossibleLivenessConversation {
@@ -1246,6 +1932,21 @@ pub(crate) fn resolve(
             });
         }
         transports.push(match transport {
+            TransportConfig::GithubWebhook {
+                name,
+                bind,
+                secret_env,
+            } => {
+                check_env_name(&secret_env, &mut problems);
+                if bind.port() == 0 {
+                    problems.push(ConfigProblem::InvalidGithubBind { name: name.clone() });
+                }
+                TransportConfig::GithubWebhook {
+                    name,
+                    bind,
+                    secret_env,
+                }
+            }
             TransportConfig::SlackSocketMode {
                 name,
                 app_token_env,
@@ -1363,6 +2064,22 @@ pub(crate) fn resolve(
             },
         });
     }
+    for (bind, transports) in &whatsapp_binds {
+        if transports.len() > 1 {
+            problems.push(ConfigProblem::SharedWhatsappBind {
+                bind: *bind,
+                transports: transports.clone(),
+            });
+        }
+    }
+    if !whatsapp_binds.is_empty() {
+        for (name, _) in github_binds
+            .into_iter()
+            .filter(|(_, bind)| !whatsapp_binds.contains_key(bind))
+        {
+            problems.push(ConfigProblem::GithubBindNotShared { name });
+        }
+    }
 
     let mut models_incomplete = config.models.is_empty();
     let mut model_names = BTreeSet::new();
@@ -1473,9 +2190,7 @@ pub(crate) fn resolve(
     let mut routes = Vec::with_capacity(config.routes.len());
     for (index, route) in config.routes.into_iter().enumerate() {
         if !transports_incomplete && !transport_names.contains(&route.transport) {
-            problems.push(ConfigProblem::UnknownRouteTransport {
-                transport: route.transport.clone(),
-            });
+            problems.push(ConfigProblem::UnknownRouteTransport { route: index });
         }
         let conversation = route.conversation.selector();
         if let Some(chat_kind) = transport_kinds.get(&route.transport) {
@@ -1485,6 +2200,22 @@ pub(crate) fn resolve(
                     problem,
                 });
             }
+        }
+        let github_route =
+            transport_kinds.get(&route.transport) == Some(&ChatTransportKind::Github);
+        match (&route.github_events, github_route) {
+            (Some(events), true)
+                if !events.is_empty()
+                    && events.len() <= 2
+                    && events
+                        .iter()
+                        .enumerate()
+                        .all(|(index, event)| !events[..index].contains(event)) => {}
+            (None, false) => {}
+            _ => problems.push(ConfigProblem::InvalidGithubEvents { route: index }),
+        }
+        if github_route && !matches!(route.memory, MemoryConfig::OneShot { .. }) {
+            problems.push(ConfigProblem::GithubRequiresOneShot { route: index });
         }
         if route.progress_notes && route.progress_detail == ProgressDetail::Off {
             problems.push(ConfigProblem::ProgressNotesWithoutDetail { route: index });
@@ -1568,9 +2299,7 @@ pub(crate) fn resolve(
             && !models_incomplete
             && !model_names.contains(model)
         {
-            problems.push(ConfigProblem::UnknownRouteModel {
-                model: model.clone(),
-            });
+            problems.push(ConfigProblem::UnknownRouteModel { route: index });
         }
         if let Some(model) = &route.model
             && proxy_only.contains(model)
@@ -1740,6 +2469,7 @@ pub(crate) fn resolve(
         }
         routes.push(ResolvedRoute {
             transport: route.transport,
+            github_events: route.github_events,
             conversation,
             subjects: route.subjects,
             agent: route.agent,
@@ -1930,6 +2660,7 @@ fn resolve_liveness(
         | TransportConfig::TelegramLongPoll { liveness, .. }
         | TransportConfig::WhatsappCloudApi { liveness, .. }
         | TransportConfig::Local { liveness, .. } => liveness,
+        TransportConfig::GithubWebhook { .. } => return ResolvedLiveness::default(),
     };
     let mut settings = LivenessSettings::default();
     let mut keep_alive = KeepAliveConfig::default();
@@ -2056,7 +2787,7 @@ fn checked_endpoint(
     }
 }
 
-/// Validates a variable name only, never a secret, so it is safe to echo in error messages; the
+/// A rejected name may be a pasted secret, so the refusal never echoes it; the
 /// grammar is narrower than the OS's, rejecting a stray space that would otherwise fail cryptically
 /// at connect time.
 fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
@@ -2070,9 +2801,7 @@ fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     if valid {
         Ok(())
     } else {
-        Err(ConfigProblem::InvalidEnvironmentName {
-            name: name.to_owned(),
-        })
+        Err(ConfigProblem::InvalidEnvironmentName)
     }
 }
 
@@ -2093,7 +2822,6 @@ fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<Strin
         return Ok(trimmed.to_owned());
     }
     Err(ConfigProblem::UnsupportedEndpoint {
-        endpoint,
         production: production.to_owned(),
     })
 }
@@ -2166,6 +2894,8 @@ pub enum ConfigError {
     },
     #[error("gateway configuration path is not a regular non-symlink file: {path}")]
     NotRegular { path: PathBuf },
+    #[error("gateway projection is not a trusted read-only source: {path}")]
+    InsecureProjection { path: PathBuf },
     #[error(
         "gateway configuration must be single-link, owned by the daemon UID, and not group/world writable: {path}"
     )]
@@ -2176,8 +2906,9 @@ pub enum ConfigError {
     },
     #[error("gateway configuration is {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
-    #[error("gateway configuration is not strict valid YAML/JSON")]
+    #[error("gateway configuration {} is not strict valid YAML/JSON", path.as_ref().map_or_else(|| "document".to_owned(), |path| path.display().to_string()))]
     Decode {
+        path: Option<PathBuf>,
         #[source]
         source: serde_yaml::Error,
     },
@@ -2198,6 +2929,14 @@ pub enum ConfigError {
     RouteOutsideTransportFragment { routes: Vec<String> },
     #[error("configured path has no parent")]
     MissingParent,
+    #[error("loaded catalog has an invalid agent identity")]
+    InvalidCatalogAgent,
+    #[error("gateway source changed during candidate validation")]
+    ChangedDuringLoad,
+    #[error("gateway source change has no classified live disposition")]
+    UnclassifiedSource,
+    #[error("gateway changes require restart: {}", categories.join(", "))]
+    RestartRequired { categories: Vec<&'static str> },
     #[error("{path}: {}", render_problems(.problems))]
     Invalid {
         path: PathBuf,
@@ -2288,6 +3027,23 @@ pub enum ConfigProblem {
         script_timeout_ms: u64,
         max_duration_ms: u64,
     },
+    #[error("GitHub transport {name:?} must bind an explicit nonzero port")]
+    InvalidGithubBind { name: String },
+    #[error("GitHub transport {name:?} must bind the same address as a WhatsApp transport")]
+    GithubBindNotShared { name: String },
+    #[error("webhook transport {name:?} conflicts with another listener bind or callback path")]
+    ConflictingWebhookMount { name: String },
+    #[error(
+        "WhatsApp transports {transports:?} each own a listener on {bind}; give each WhatsApp transport its own bind"
+    )]
+    SharedWhatsappBind {
+        bind: SocketAddr,
+        transports: Vec<String>,
+    },
+    #[error("routes[{route}]: githubEvents must be nonempty, unique and GitHub-only")]
+    InvalidGithubEvents { route: usize },
+    #[error("routes[{route}]: GitHub requires memory.mode: oneShot")]
+    GithubRequiresOneShot { route: usize },
     #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
     InvalidWhatsappBind { name: String },
     #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
@@ -2300,10 +3056,10 @@ pub enum ConfigProblem {
         "WhatsApp transport {name} requires debounceMaxWaitMs >= debounceMs when collection is enabled"
     )]
     InvalidWhatsappDebounce { name: String },
-    #[error("route names unknown transport {transport:?}")]
-    UnknownRouteTransport { transport: String },
-    #[error("route names unknown model {model:?}")]
-    UnknownRouteModel { model: String },
+    #[error("routes[{route}] names an unknown transport")]
+    UnknownRouteTransport { route: usize },
+    #[error("routes[{route}] names an unknown model")]
+    UnknownRouteModel { route: usize },
     #[error(
         "route names model {model:?}, whose kind anthropic is served only through the guest model proxy"
     )]
@@ -2384,14 +3140,11 @@ pub enum ConfigProblem {
     )]
     ForgetAfterWithoutRecall { route: usize },
     #[error(
-        "{name:?} is not a valid environment variable name; transports and models name variables, never secrets"
+        "an environment variable name is not valid; transports and models name variables, never secrets"
     )]
-    InvalidEnvironmentName { name: String },
-    #[error("endpoint {endpoint:?} must be {production} or a literal loopback http:// URL")]
-    UnsupportedEndpoint {
-        endpoint: String,
-        production: String,
-    },
+    InvalidEnvironmentName,
+    #[error("an endpoint must be {production} or a literal loopback http:// URL")]
+    UnsupportedEndpoint { production: String },
     #[error("broker frame bounds are invalid")]
     BrokerLimits {
         #[source]

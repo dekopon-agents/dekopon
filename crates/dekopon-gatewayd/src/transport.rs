@@ -25,11 +25,13 @@ use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 pub(crate) mod discord;
+pub(crate) mod github;
 mod hydration;
 pub(crate) mod local;
 pub(crate) mod recovery;
 pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod webhook;
 pub(crate) mod whatsapp;
 
 pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;
@@ -273,6 +275,7 @@ pub(crate) enum ReplyTarget {
     WhatsApp {
         recipient: String,
     },
+    GithubTrace,
     Local {
         connection: u64,
     },
@@ -349,6 +352,14 @@ fn remove_ascii_insensitive(text: &str, needle: &str) -> String {
 
 pub(crate) trait ChatTransport: Send {
     fn name(&self) -> &str;
+
+    fn sibling_driver(&self) -> Option<(String, Arc<dyn ChatDriver>)> {
+        None
+    }
+
+    fn sibling_fetcher(&self) -> Option<(String, Arc<dyn AssetFetcher>)> {
+        None
+    }
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>>;
 
@@ -847,6 +858,22 @@ impl SeenIds {
         }
     }
 
+    pub(crate) fn insert_if_absent(
+        &mut self,
+        key: &str,
+        accept: impl FnOnce() -> bool,
+    ) -> Result<bool, ()> {
+        if self.seen.contains(key) {
+            return Ok(false);
+        }
+        if !accept() {
+            return Err(());
+        }
+        let inserted = self.insert(key.to_owned());
+        debug_assert!(inserted);
+        Ok(true)
+    }
+
     pub(crate) fn insert(&mut self, key: String) -> bool {
         if !self.seen.insert(key.clone()) {
             return false;
@@ -988,6 +1015,17 @@ mod tests {
         }
         let drawn: HashSet<u64> = (0..64).map(|_| jitter_below(u64::MAX)).collect();
         assert!(drawn.len() > 1, "the jitter is the same value every time");
+    }
+
+    #[test]
+    fn failed_acceptance_never_consumes_a_recent_delivery_id() {
+        let mut seen = SeenIds::new(1024);
+        assert!(matches!(seen.insert_if_absent("guid", || false), Err(())));
+        assert!(matches!(seen.insert_if_absent("guid", || true), Ok(true)));
+        assert!(matches!(
+            seen.insert_if_absent("guid", || panic!("duplicate must not enqueue")),
+            Ok(false)
+        ));
     }
 
     #[test]

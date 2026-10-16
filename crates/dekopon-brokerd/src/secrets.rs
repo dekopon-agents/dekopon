@@ -15,7 +15,7 @@ use dekopon_broker::{
     BrokerBuildError, MAX_SECRET_BINDINGS, SecretCatalog, SecretMaterial, SecretResolutionError,
     SecretResolver, SecretUseBinding,
 };
-use dekopon_capability::HttpPathRule;
+use dekopon_capability::{HttpPathRule, SecretUseGrantError};
 use dekopon_core::{
     CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind,
     read_trusted_file,
@@ -42,7 +42,7 @@ use tokio::{
 };
 use tracing::Instrument as _;
 
-mod oauth2;
+pub(crate) mod oauth2;
 
 pub const SECRET_MAP_API_VERSION: &str = "dekopon.dev/secret-map/v1alpha1";
 pub const HARD_MAX_SECRET_MAP_BYTES: usize = 1024 * 1024;
@@ -299,6 +299,133 @@ struct ResolvedEntry {
 struct MapResolver {
     entries: BTreeMap<SecretDrn, ResolvedEntry>,
     expected_uid: u32,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ScheduledCatalog {
+    resolver: Option<Arc<MapResolver>>,
+}
+
+impl ScheduledCatalog {
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        match (&self.resolver, &other.resolver) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) async fn inspect_records(&self) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        for (drn, entry) in &resolver.entries {
+            if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                let path = record_path.clone();
+                let drn = drn.clone();
+                let uid = resolver.expected_uid;
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                if tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        oauth2::inspect_boot(&path, uid, &drn)
+                    })
+                })
+                .await
+                .is_err()
+                {
+                    tracing::error!(event = "broker_credential_record_inspection_failed");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn entries(&self) -> Vec<(SecretDrn, PathBuf, bool)> {
+        let mut records = BTreeMap::new();
+        for (drn, path, has_seed) in self
+            .resolver
+            .iter()
+            .flat_map(|resolver| &resolver.entries)
+            .filter_map(|(drn, entry)| match &entry.source {
+                SecretSource::OAuth2Refresh {
+                    record_path,
+                    seed_path,
+                    refresh: OAuth2RefreshMode::Scheduled,
+                    ..
+                } => Some((drn.clone(), record_path.clone(), seed_path.is_some())),
+                SecretSource::OAuth2Refresh {
+                    refresh: OAuth2RefreshMode::Lazy,
+                    ..
+                }
+                | SecretSource::SecureFile { .. }
+                | SecretSource::KubernetesProjection { .. }
+                | SecretSource::OnePasswordConnect { .. }
+                | SecretSource::VaultKv1 { .. }
+                | SecretSource::VaultKv2 { .. }
+                | SecretSource::AwsSecretsManager { .. }
+                | SecretSource::AwsSsmParameter { .. }
+                | SecretSource::GcpSecretManager { .. }
+                | SecretSource::AzureKeyVault { .. }
+                | SecretSource::KubernetesTokenRequest { .. }
+                | SecretSource::KubernetesApi { .. } => None,
+            })
+        {
+            records.entry(path).or_insert((drn, has_seed));
+        }
+        records
+            .into_iter()
+            .map(|(path, (drn, has_seed))| (drn, path, has_seed))
+            .collect()
+    }
+
+    pub(crate) fn refresh(
+        &self,
+        drn: &SecretDrn,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> impl Future<Output = Result<(), SourceError>> + Send + 'static {
+        let catalog = self.clone();
+        let drn = drn.clone();
+        async move { catalog.refresh_task(&drn, clock)?.await.map(drop) }
+    }
+
+    fn refresh_task(
+        &self,
+        drn: &SecretDrn,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<impl Future<Output = Result<Vec<u8>, SourceError>> + Send + 'static, SourceError>
+    {
+        let resolver = self.resolver.as_ref().ok_or(SourceError::Missing)?;
+        let entry = resolver.entries.get(drn).ok_or(SourceError::Missing)?;
+        let SecretSource::OAuth2Refresh {
+            record_path,
+            seed_path,
+            token_endpoint,
+            client_id,
+            timeout_ms,
+            refresh: OAuth2RefreshMode::Scheduled,
+        } = &entry.source
+        else {
+            return Err(SourceError::Config);
+        };
+        let span = tracing::info_span!(target: "credential", "broker.credential.refresh",
+            credential = %drn, trigger = "scheduled", outcome = tracing::field::Empty,
+            secret.source.kind = "oauth2-refresh", duration_ms = tracing::field::Empty,
+            credential.expires_at_unix_ms = tracing::field::Empty);
+        Ok(oauth2::refresh_task(
+            oauth2::RefreshInputs {
+                credential: Some(drn.clone()),
+                path: record_path.clone(),
+                seed_path: seed_path.clone(),
+                endpoint: token_endpoint.clone(),
+                client_id: client_id.clone(),
+                timeout: Duration::from_millis(*timeout_ms),
+                uid: resolver.expected_uid,
+                client: entry.client.clone(),
+                clock,
+                scheduled: true,
+            },
+            span,
+        ))
+    }
 }
 
 impl fmt::Debug for MapResolver {
@@ -1338,7 +1465,17 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
     }
 }
 
-pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
+#[cfg(test)]
+async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
+    load_with_bytes(path, expected_uid)
+        .await
+        .map(|(catalog, _, _)| catalog)
+}
+
+pub(crate) async fn load_with_bytes(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(SecretCatalog, Vec<u8>, ScheduledCatalog), SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
         .map_err(|source| SecretMapError::Read {
@@ -1350,7 +1487,8 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
             diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
         }
     })?;
-    validate_map(file, path, expected_uid).await
+    let (catalog, scheduled) = validate_map(file, path, expected_uid).await?;
+    Ok((catalog, bytes, scheduled))
 }
 
 #[expect(
@@ -1362,7 +1500,7 @@ async fn validate_map(
     file: SecretMapFile,
     map_path: &Path,
     expected_uid: u32,
-) -> Result<SecretCatalog, SecretMapError> {
+) -> Result<(SecretCatalog, ScheduledCatalog), SecretMapError> {
     let mut problems = Vec::new();
     if file.map_revision.is_empty()
         || file.map_revision.len() > 128
@@ -1449,7 +1587,7 @@ async fn validate_map(
         {
             problems.push(format!("{} uses an invalid RFC 6901 pointer", entry.drn));
         }
-        for binding in entry.bindings {
+        for (position, binding) in entry.bindings.into_iter().enumerate() {
             let resolved = SecretUseBinding {
                 binding_id: binding.id,
                 secret: entry.drn.clone(),
@@ -1464,8 +1602,9 @@ async fn validate_map(
             };
             if !binding_ids.insert(resolved.binding_id.clone()) {
                 problems.push(format!(
-                    "duplicate secret binding identifier {:?}",
-                    resolved.binding_id
+                    "{} binding #{} repeats an earlier binding identifier",
+                    resolved.secret,
+                    position + 1
                 ));
             }
             if !binding_keys.insert((
@@ -1480,9 +1619,16 @@ async fn validate_map(
                 ));
             }
             if let Err(error) = resolved.validate() {
+                let reason = match error {
+                    SecretUseGrantError::InvalidPath { .. } => {
+                        "secret path is not canonical".to_owned()
+                    }
+                    other => other.to_string(),
+                };
                 problems.push(format!(
-                    "secret binding {:?} is invalid: {error}",
-                    resolved.binding_id
+                    "{} binding #{} is invalid: {reason}",
+                    resolved.secret,
+                    position + 1
                 ));
             }
             bindings.push(resolved);
@@ -1560,9 +1706,16 @@ async fn validate_map(
         entries: resolved_entries,
         expected_uid,
     });
-    SecretCatalog::new(bindings, resolver)
+    let dyn_resolver: Arc<dyn SecretResolver> = Arc::<MapResolver>::clone(&resolver);
+    let catalog = SecretCatalog::new(bindings, dyn_resolver)
         .and_then(|catalog| catalog.with_authority_revision(file.map_revision))
-        .map_err(|source| SecretMapError::Catalog { source })
+        .map_err(|source| SecretMapError::Catalog { source })?;
+    Ok((
+        catalog,
+        ScheduledCatalog {
+            resolver: Some(resolver),
+        },
+    ))
 }
 
 async fn kubernetes_client(root: &Path, ca_key: &str) -> Result<reqwest::Client, SourceError> {
@@ -1711,17 +1864,22 @@ fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
 )]
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || read_trusted_file(&owned, uid, FileTier::Private, maximum))
-        .await
-        .map_err(|join| classified(SourceError::Internal, &join))?
-        .map_err(|error| {
-            let mapped = match error {
-                FileHygieneError::Io { .. } => SourceError::Io,
-                FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
-                _ => SourceError::Insecure,
-            };
-            classified(mapped, &error)
-        })
+    tokio::task::spawn_blocking(move || {
+        let result = read_trusted_file(&owned, uid, FileTier::Private, maximum);
+        #[cfg(test)]
+        crate::private_read_witness::record(&owned, &result);
+        result
+    })
+    .await
+    .map_err(|join| classified(SourceError::Internal, &join))?
+    .map_err(|error| {
+        let mapped = match error {
+            FileHygieneError::Io { .. } => SourceError::Io,
+            FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
+            _ => SourceError::Insecure,
+        };
+        classified(mapped, &error)
+    })
 }
 
 async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, SourceError> {
@@ -2271,7 +2429,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
 }
 
 impl SourceError {
-    const fn category(&self) -> &'static str {
+    pub(crate) const fn category(&self) -> &'static str {
         match self {
             Self::Config => "configuration",
             Self::Insecure => "insecure-file",

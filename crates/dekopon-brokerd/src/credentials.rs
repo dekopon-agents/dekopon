@@ -19,7 +19,8 @@ use dekopon_broker_host::BoundCredential;
 use dekopon_core::{FileHygieneError, FileTier, Redacted, error_chain, read_trusted_file};
 use dekopon_http_host::ConfigurationError;
 use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshOutcome};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -48,13 +49,13 @@ pub(crate) const REAUTHORIZATION_CODES: [&str; 4] = [
     "refresh_token_expired",
 ];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 enum CredentialsApiVersion {
     #[serde(rename = "dekopon.dev/broker-credentials/v1alpha1")]
     V1Alpha1,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CredentialsFile {
     #[allow(
@@ -65,7 +66,7 @@ struct CredentialsFile {
     credentials: Vec<CredentialEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CredentialEntry {
     name: String,
@@ -91,7 +92,7 @@ struct CredentialEntry {
     permissions: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 enum CredentialKind {
     BearerToken,
@@ -109,22 +110,41 @@ impl CredentialKind {
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
+#[cfg(test)]
 pub(crate) async fn load(
     path: &Path,
     expected_uid: u32,
 ) -> Result<CredentialStore, CredentialsError> {
+    load_with_bytes(path, expected_uid)
+        .await
+        .map(|loaded| loaded.store)
+}
+
+pub(crate) struct LoadedCredentials {
+    pub(crate) store: CredentialStore,
+    pub(crate) references: serde_yaml::Value,
+    pub(crate) private_digest: [u8; 32],
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
+pub(crate) async fn load_with_bytes(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<LoadedCredentials, CredentialsError> {
     let owned = path.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || {
-        read_trusted_file(
+        let result = read_trusted_file(
             &owned,
             expected_uid,
             FileTier::Private,
             HARD_MAX_CREDENTIALS_BYTES,
-        )
+        );
+        #[cfg(test)]
+        crate::private_read_witness::record(&owned, &result);
+        result
     })
     .await
     .map_err(|join| CredentialsError::Read {
@@ -142,18 +162,68 @@ pub(crate) async fn load(
             source: insecure,
         },
     })?;
-    let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes)
-        .map_err(|source| CredentialsError::Decode { source })?;
-    let resolved = tokio::task::spawn_blocking(move || resolve(parsed, expected_uid))
-        .await
-        .map_err(|join| CredentialsError::Read {
+    let mut private_digest = Sha256::new();
+    digest_private(&mut private_digest, &bytes);
+    let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes).map_err(|source| {
+        let location = source
+            .location()
+            .map(|location| (location.line(), location.column()));
+        let message = source.to_string();
+        let description = if message.contains("unknown variant") {
+            "unknown variant"
+        } else if message.contains("unknown field") {
+            "unknown field"
+        } else if message.contains("missing field") {
+            "missing field"
+        } else if message.contains("invalid type") {
+            "invalid type"
+        } else {
+            "invalid document"
+        };
+        let diagnostic = location.map_or_else(
+            || description.to_owned(),
+            |(line, column)| format!("{description} at line {line}, column {column}"),
+        );
+        CredentialsError::Decode {
             path: path.to_path_buf(),
-            source: std::io::Error::other(join),
-        })??;
-    Ok(resolved)
+            diagnostic,
+        }
+    })?;
+    let references = serde_yaml::to_value(&parsed).map_err(|_source| CredentialsError::Decode {
+        path: path.to_path_buf(),
+        diagnostic: "invalid document".to_owned(),
+    })?;
+    let (resolved, private_digest) = tokio::task::spawn_blocking(move || {
+        resolve(parsed, expected_uid, &mut private_digest).map(|store| (store, private_digest))
+    })
+    .await
+    .map_err(|join| CredentialsError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(join),
+    })??;
+    Ok(LoadedCredentials {
+        store: resolved,
+        references,
+        private_digest: private_digest.finalize().into(),
+    })
 }
 
-fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, CredentialsError> {
+#[cfg(test)]
+pub(crate) fn references_from_bytes(bytes: &[u8]) -> serde_yaml::Value {
+    let parsed: CredentialsFile = serde_yaml::from_slice(bytes).expect("valid credential fixture");
+    serde_yaml::to_value(parsed).expect("typed reference serialization")
+}
+
+fn digest_private(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update(bytes.len().to_le_bytes());
+    digest.update(bytes);
+}
+
+fn resolve(
+    file: CredentialsFile,
+    expected_uid: u32,
+    private_digest: &mut Sha256,
+) -> Result<CredentialStore, CredentialsError> {
     if file.credentials.len() > HARD_MAX_CREDENTIALS {
         return Err(CredentialsError::TooMany {
             maximum: HARD_MAX_CREDENTIALS,
@@ -162,7 +232,7 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
     let mut problems = Vec::new();
     let mut entries = Vec::with_capacity(file.credentials.len());
     let mut seen = std::collections::BTreeSet::new();
-    for entry in file.credentials {
+    for (position, entry) in file.credentials.into_iter().enumerate() {
         let name = entry.name.clone();
         if name.is_empty()
             || name.len() > MAX_CREDENTIAL_NAME_BYTES
@@ -172,7 +242,8 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
                 .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
         {
             problems.push(format!(
-                "credential name {name:?} is empty, oversized, or contains whitespace"
+                "credential #{} name is empty, oversized, or contains whitespace",
+                position + 1
             ));
             continue;
         }
@@ -180,7 +251,7 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
             problems.push(format!("credential {name:?} is declared more than once"));
             continue;
         }
-        match resolve_entry(entry, expected_uid) {
+        match resolve_entry(entry, expected_uid, private_digest) {
             Ok(credential) => entries.push((name, credential)),
             Err(entry_problems) => problems.extend(entry_problems),
         }
@@ -194,6 +265,7 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
 fn resolve_entry(
     entry: CredentialEntry,
     expected_uid: u32,
+    private_digest: &mut Sha256,
 ) -> Result<StoredCredential, Vec<String>> {
     let name = entry.name;
     let kind = entry.kind;
@@ -285,7 +357,12 @@ fn resolve_entry(
             absent("secret", entry.secret.is_some(), &mut problems);
             absent("scheme", entry.scheme.is_some(), &mut problems);
             absent("authFile", entry.auth_file.is_some(), &mut problems);
-            resolve_github_app(CredentialEntry { name, ..entry }, expected_uid, problems)
+            resolve_github_app(
+                CredentialEntry { name, ..entry },
+                expected_uid,
+                private_digest,
+                problems,
+            )
         }
     }
 }
@@ -293,6 +370,7 @@ fn resolve_entry(
 fn resolve_github_app(
     entry: CredentialEntry,
     expected_uid: u32,
+    private_digest: &mut Sha256,
     mut problems: Vec<String>,
 ) -> Result<StoredCredential, Vec<String>> {
     let CredentialEntry {
@@ -336,7 +414,7 @@ fn resolve_github_app(
     else {
         return Err(problems);
     };
-    let key = match open_private_key(&name, &private_key, expected_uid) {
+    let key = match open_private_key(&name, &private_key, expected_uid, private_digest) {
         Ok(key) => key,
         Err(problem) => {
             problems.push(problem);
@@ -367,6 +445,7 @@ fn open_private_key(
     name: &str,
     private_key: &Path,
     expected_uid: u32,
+    private_digest: &mut Sha256,
 ) -> Result<GithubAppKey, String> {
     if private_key.is_relative() {
         return Err(format!(
@@ -380,8 +459,10 @@ fn open_private_key(
         expected_uid,
         FileTier::Private,
         HARD_MAX_GITHUB_APP_KEY_BYTES,
-    )
-    .map_err(|source| {
+    );
+    #[cfg(test)]
+    crate::private_read_witness::record(private_key, &pem);
+    let pem = pem.map_err(|source| {
         format!(
             "credential {name:?} privateKey {} is not trusted input ({}): {}",
             private_key.display(),
@@ -389,6 +470,7 @@ fn open_private_key(
             error_chain(&source)
         )
     })?;
+    digest_private(private_digest, &pem);
     GithubAppKey::from_pem(&pem).map_err(|source| {
         format!(
             "credential {name:?} privateKey {}: {source}",
@@ -448,14 +530,14 @@ fn open_auth_file(
         format!(
             "credential {name:?} authFile {} is not a Dekopon ChatGPT credential: {}",
             auth_file.display(),
-            error_chain(&source)
+            safe_chatgpt_diagnostic(&source)
         )
     })?;
     let status = credential.status().map_err(|source| {
         format!(
             "credential {name:?} authFile {} could not be inspected: {}",
             auth_file.display(),
-            error_chain(&source)
+            safe_chatgpt_diagnostic(&source)
         )
     })?;
     tracing::info!(
@@ -470,6 +552,18 @@ fn open_auth_file(
 }
 
 #[cfg(unix)]
+fn safe_chatgpt_diagnostic(error: &ChatGptError) -> String {
+    if let ChatGptError::ParseAuth { source, .. } = error {
+        format!(
+            "invalid JSON at line {}, column {}",
+            source.line(),
+            source.column()
+        )
+    } else {
+        "credential status unavailable".to_owned()
+    }
+}
+
 fn parent_is_owner_writable(parent: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -628,11 +722,8 @@ pub enum CredentialsError {
     },
     #[error("broker credentials are {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
-    #[error("broker credentials are not strict valid YAML/JSON")]
-    Decode {
-        #[source]
-        source: serde_yaml::Error,
-    },
+    #[error("broker credentials at {path} are not strict valid YAML/JSON ({diagnostic})")]
+    Decode { path: PathBuf, diagnostic: String },
     #[error("broker credentials name too many entries; maximum is {maximum}")]
     TooMany { maximum: usize },
     #[error("broker credentials are invalid: {}", problems.join("; "))]
@@ -768,6 +859,66 @@ credentials:
     }
 
     #[tokio::test]
+    async fn malformed_kind_diagnostic_keeps_path_but_never_echoes_file_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.yaml");
+        let sentinel = "fixture-sentinel-9f3c";
+        write_credentials(
+            directory.path(),
+            &VALID
+                .replace("kind: bearerToken", &format!("kind: {sentinel}"))
+                .replace("fixture-secret-value", sentinel),
+            0o600,
+        )
+        .await;
+        let error = load(&path, uid())
+            .await
+            .expect_err("invalid kind must refuse");
+        let chain = dekopon_core::error_chain(&error);
+        assert!(chain.contains(&path.display().to_string()), "{chain}");
+        assert!(
+            chain.contains("unknown variant at line 4, column 11"),
+            "{chain}"
+        );
+        assert!(!chain.contains(sentinel), "{chain}");
+        assert!(!format!("{error:?}").contains(sentinel));
+    }
+
+    #[tokio::test]
+    async fn tagged_secret_values_and_keys_never_affect_reference_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.yaml");
+        let mut digests = Vec::new();
+        for document in [
+            VALID.replace("fixture-secret-value", "!!bool fixture-secret-aaaa-0001"),
+            VALID.replace("fixture-secret-value", "fixture-secret-bbbb-0002"),
+            VALID.replace(
+                "secret: fixture-secret-value",
+                "!x secret: fixture-secret-aaaa-0001",
+            ),
+            VALID.replace("fixture-secret-value", "fixture-secret-bbbb-0002"),
+        ] {
+            write_credentials(directory.path(), &document, 0o600).await;
+            let super::LoadedCredentials { references, .. } = super::load_with_bytes(&path, uid())
+                .await
+                .expect("typed file boots");
+            let mut snapshot = crate::config::ConfigSnapshot::default();
+            snapshot
+                .record_authority_references(Some(&references), None)
+                .unwrap();
+            digests.push(snapshot.digest().unwrap());
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "core scalar tags cannot change digest"
+        );
+        assert_eq!(
+            digests[2], digests[3],
+            "tagged secret keys cannot change digest"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_structural_credential_problems_without_echoing_secrets() {
         let directory = tempfile::tempdir().expect("temporary directory");
         write_credentials(
@@ -811,6 +962,26 @@ credentials:
         load(&directory.path().join("credentials.yaml"), uid())
             .await
             .expect("a trusted auth file on an owner-only writable parent loads");
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_json_never_echoes_a_token_shaped_value() {
+        let directory = tempfile::tempdir().expect("directory");
+        let auth = write_auth_file(directory.path(), "broken", u64::MAX, 0o600).await;
+        let sentinel = "sensitive-refresh-token-in-invalid-field";
+        let document = chatgpt_document(u64::MAX).replace(
+            "\"fixture-refresh-token\"",
+            &format!("{{\"{sentinel}\": 1}}"),
+        );
+        tokio::fs::write(&auth, document)
+            .await
+            .expect("invalid auth JSON");
+        write_credentials(directory.path(), &chatgpt_credentials(&auth), 0o600).await;
+        let error = load(&directory.path().join("credentials.yaml"), uid())
+            .await
+            .expect_err("reject invalid auth JSON");
+        assert!(matches!(error, CredentialsError::Invalid { .. }));
+        assert!(!problems(&error).contains(sentinel));
     }
 
     #[tokio::test]

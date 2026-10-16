@@ -1,10 +1,10 @@
 use super::{Journal, JournalError, Line, duration_millis, millis, validated_lines};
+use crate::{config::memory::ResolvedPolicy, memory::generation::version};
 use dekopon_agent::{
     memory_tools::MemoryTools,
     prompt::{Pin, ReadRef},
 };
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -18,59 +18,35 @@ pub(crate) struct JournalMemoryTools<'a> {
     pub grant: String,
     pub versions: HashMap<String, String>,
 }
-impl JournalMemoryTools<'_> {
+impl<'a> JournalMemoryTools<'a> {
+    pub(crate) fn new(
+        journal: &'a Journal,
+        stem: String,
+        grant: String,
+        policy: &ResolvedPolicy,
+    ) -> Self {
+        let versions = policy
+            .routines
+            .iter()
+            .filter(|routine| policy.retain.contains(&routine.id))
+            .map(|routine| (routine.id.clone(), version(routine)))
+            .collect();
+        Self {
+            journal,
+            stem,
+            grant,
+            versions,
+        }
+    }
+
     fn eligible(&self, line: &Line) -> bool {
         line.grant == self.grant
             && line.at_ms
                 >= millis(SystemTime::now())
                     .saturating_sub(duration_millis(self.journal.age_for(&self.stem)))
     }
-    fn representation<'a>(&self, line: &'a Line, id: &str) -> Option<Cow<'a, str>> {
-        if line.source_eligibility
-            && line.representations.iter().any(|rep| {
-                rep.kind == "original"
-                    && rep.routine_id == id
-                    && self.versions.get(id) == Some(&rep.version)
-            })
-            && (line.user.is_some() || !line.exchanges.is_empty())
-        {
-            let mut text = line.user.clone().unwrap_or_default();
-            if let Some(answer) = &line.answer {
-                text.push('\n');
-                text.push_str(answer);
-            }
-            for exchange in &line.exchanges {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&format!(
-                    "[tool: {}, outcome: {}, exit: {:?}]",
-                    exchange.tool, exchange.outcome, exchange.exit_status
-                ));
-                for (label, parts) in [("request", &exchange.request), ("result", &exchange.result)]
-                {
-                    if let Some(part) = parts.iter().find(|rep| {
-                        rep.kind == "original"
-                            && rep.routine_id == id
-                            && self.versions.get(id) == Some(&rep.version)
-                            && rep.text.is_some()
-                    }) {
-                        text.push_str(&format!("\n[{label}] "));
-                        text.push_str(part.text.as_deref().unwrap_or_default());
-                    }
-                }
-            }
-            return Some(Cow::Owned(text));
-        }
-        line.representations
-            .iter()
-            .chain(
-                line.exchanges
-                    .iter()
-                    .flat_map(|exchange| exchange.request.iter().chain(&exchange.result)),
-            )
-            .find(|rep| rep.routine_id == id && self.versions.get(id) == Some(&rep.version))
-            .and_then(|rep| rep.text.as_deref().map(Cow::Borrowed))
+    fn representation(&self, line: &Line, id: &str) -> Option<String> {
+        super::body(line, id, self.versions.get(id)?)
     }
     fn refusal(&self, line: Option<&Line>) -> String {
         line.map_or_else(
@@ -78,7 +54,11 @@ impl JournalMemoryTools<'_> {
             |line| if !self.eligible(line) {
                 "record unavailable: expired or changed grant".into()
             } else {
-                format!("representation unavailable: missing, discarded or version mismatch; eligible representations: {}", line.availability.join(", "))
+                let mut eligible = self.versions.iter().filter_map(|(id, version)| {
+                    super::body(line, id, version).map(|_| id.as_str())
+                }).collect::<Vec<_>>();
+                eligible.sort_unstable();
+                format!("representation unavailable: missing, discarded or version mismatch; eligible representation IDs: {}", eligible.join(", "))
             },
         )
     }
@@ -94,10 +74,7 @@ impl JournalMemoryTools<'_> {
         })?;
         Ok(found)
     }
-    pub(super) fn mutate(
-        &self,
-        mut update: impl FnMut(&mut Line) -> bool,
-    ) -> Result<bool, JournalError> {
+    fn mutate(&self, mut update: impl FnMut(&mut Line) -> bool) -> Result<bool, JournalError> {
         let path = self.journal.path(&self.stem);
         let temporary = path.with_extension("memory-update");
         let result = (|| {
@@ -125,13 +102,7 @@ impl JournalMemoryTools<'_> {
                             total = total.saturating_add(fs::metadata(sibling)?.len());
                         }
                     }
-                    let cap = self
-                        .journal
-                        .agent_bytes
-                        .get(agent)
-                        .copied()
-                        .unwrap_or(self.journal.max_bytes_per_agent);
-                    if total > cap {
+                    if total > self.journal.agent_cap(agent) {
                         return Err(io::Error::other("memory update exceeds agent cap").into());
                     }
                 }
@@ -161,7 +132,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
         let result = if let Some(line) = line.as_ref().filter(|line| self.eligible(line)) {
             if let Some(text) = self.representation(line, representation_id) {
                 let selected = match range {
-                    None if text.len() <= 16 * 1024 => Some(text.as_ref()),
+                    None if text.len() <= 16 * 1024 => Some(text.as_str()),
                     Some((start, end)) => usize::try_from(start)
                         .ok()
                         .zip(usize::try_from(end).ok())

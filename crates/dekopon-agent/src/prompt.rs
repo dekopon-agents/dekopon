@@ -37,7 +37,7 @@ mod history;
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
-pub use context_portable::{EnvelopeSource, original_envelope_bytes, prefix_text, render_envelope};
+pub use context_portable::{BodySource, EnvelopeSource, prefix_text, render_body, render_envelope};
 pub use history::{
     ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, DEFAULT_MAX_BYTES,
     DEFAULT_MAX_TURNS, Exchange, History, HistoryLimits, PackedArena, Pin, RawAnswer, ReadRef,

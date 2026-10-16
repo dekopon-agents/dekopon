@@ -1,6 +1,7 @@
 {{- include "dekopon.validate" . -}}
 {{- $files := include "dekopon.managedFiles" . | fromYamlArray -}}
 {{- $seed := include "dekopon.seedFiles" . | fromYamlArray -}}
+{{- $private := include "dekopon.privateFiles" . | fromYamlArray -}}
 {{- $chatgptDir := include "dekopon.chatgptDir" . -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 {{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
@@ -19,7 +20,7 @@
 {{- if and .Values.gateway.enabled .Values.gateway.configDirectory.configMap -}}
 {{- $configDirs = append $configDirs (dict "dest" (printf "%s/gatewayd.d" $gcfg) "src" "/dekopon-gateway-d-source" "volume" "gateway-config-directory" "configMap" .Values.gateway.configDirectory.configMap "owner" "$gateway_uid" "group" "$gateway_gid" "globs" "*.yaml" "peers" false) -}}
 {{- end -}}
-{{- $sources := concat $files $seed -}}
+{{- $sources := concat $files $seed $private -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -129,6 +130,13 @@ spec:
                 rm -rf "{{ .dest }}"
               fi
 {{- end }}
+{{- if $private }}
+              if [ -d "{{ $cfg }}/private" ]; then
+                chown 0:0 "{{ $cfg }}/private"
+                chmod 0700 "{{ $cfg }}/private"
+                rm -rf "{{ $cfg }}/private"
+              fi
+{{- end }}
               rm -f {{ $cfg }}/* {{ $gcfg }}/*
 {{- if and .Values.gateway.enabled .Values.gateway.skills.configMap }}
 
@@ -153,6 +161,20 @@ spec:
               install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .file }}" "{{ $cfg }}/{{ .file }}"
               {{- end }}
               {{- end }}
+
+{{- if $private }}
+              mkdir -p "{{ $cfg }}/private"
+              chown "$uid:$gid" "{{ $cfg }}/private"
+              chmod 0700 "{{ $cfg }}/private"
+{{- range $private }}
+              install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .source }}" "{{ $cfg }}/private/{{ .file }}"
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $cfg }}/private/{{ .file }}")
+              if [ "$got" != "$uid:$gid:600:1:regular file" ]; then
+                echo "private file {{ .file }}: got $got, want $uid:$gid:600:1:regular file" >&2
+                rc=1
+              fi
+{{- end }}
+{{- end }}
 
               # Assert what the daemons assert, so a wrong file is an init failure naming the file
               # rather than a broker that starts and then refuses to serve. `stat` does not follow
@@ -271,6 +293,15 @@ spec:
                 rc=1
               fi
 {{- end }}
+
+              [ -d "{{ $state }}/{{ .Values.broker.oauth2Records.subdir }}" ] || mkdir -p "{{ $state }}/{{ .Values.broker.oauth2Records.subdir }}"
+              chown "$uid:$gid" "{{ $state }}/{{ .Values.broker.oauth2Records.subdir }}"
+              chmod 0700 "{{ $state }}/{{ .Values.broker.oauth2Records.subdir }}"
+              got=$(stat -c '%u:%a:%F' "{{ $state }}/{{ .Values.broker.oauth2Records.subdir }}")
+              if [ "$got" != "$uid:700:directory" ]; then
+                echo "oauth2 record directory: got $got, want $uid:700:directory" >&2
+                rc=1
+              fi
 {{- if include "dekopon.journalEnabled" . }}
 
               [ -d "{{ include "dekopon.journalDir" . }}" ] || mkdir -p "{{ include "dekopon.journalDir" . }}"

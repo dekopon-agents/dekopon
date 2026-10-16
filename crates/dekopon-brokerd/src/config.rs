@@ -296,9 +296,290 @@ impl ServerLimitsConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Disposition {
+    Swap,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Resident {
+    Storage,
+    Assets,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConfigSnapshot(BTreeMap<String, (Disposition, serde_yaml::Value)>);
+
+impl ConfigSnapshot {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(bytes)
+            .map_err(|source| ConfigError::Decode { source })?;
+        Ok(Self::from_mapping(&mapping))
+    }
+
+    pub(crate) fn from_mapping(mapping: &serde_yaml::Mapping) -> Self {
+        const SWAP: &[&str] = &[
+            "credentialsPath",
+            "secretMapPath",
+            "strict",
+            "identities",
+            "principals",
+            "agents",
+            "policiesPath",
+            "capabilities",
+        ];
+        Self(
+            mapping
+                .iter()
+                .filter_map(|(key, value)| {
+                    let key = key.as_str()?;
+                    let disposition = if SWAP.contains(&key) {
+                        Disposition::Swap
+                    } else {
+                        Disposition::Restart
+                    };
+                    Some((key.to_owned(), (disposition, value.clone())))
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) async fn record_sources(
+        &mut self,
+        policies: &str,
+        providers: &[PathBuf],
+        locked_prefix: usize,
+        ca_bundles: &[Vec<u8>],
+    ) -> Result<(), ConfigError> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt as _;
+
+        let policy_hash = Sha256::digest(policies.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.0.insert(
+            "policies".to_owned(),
+            (Disposition::Swap, serde_yaml::Value::String(policy_hash)),
+        );
+        let mut digests = Vec::with_capacity(providers.len());
+        for path in providers.iter().skip(locked_prefix) {
+            let mut file =
+                tokio::fs::File::open(path)
+                    .await
+                    .map_err(|source| ConfigError::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let count = file
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|source| ConfigError::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            let hash = digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            digests.push(serde_yaml::Value::String(format!(
+                "{}:{hash}",
+                path.display()
+            )));
+        }
+        self.0.insert(
+            "providerArtifacts".to_owned(),
+            (Disposition::Restart, serde_yaml::Value::Sequence(digests)),
+        );
+        let bundles = ca_bundles
+            .iter()
+            .map(|pem| {
+                serde_yaml::Value::String(
+                    Sha256::digest(pem)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                )
+            })
+            .collect();
+        self.0.insert(
+            "caBundles".to_owned(),
+            (Disposition::Restart, serde_yaml::Value::Sequence(bundles)),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn record_authority_references(
+        &mut self,
+        credentials: Option<&serde_yaml::Value>,
+        secret_map: Option<&[u8]>,
+    ) -> Result<(), ConfigError> {
+        if let Some(value) = credentials {
+            self.0.insert(
+                "credentialReferences".to_owned(),
+                (Disposition::Swap, value.clone()),
+            );
+        }
+        if let Some(bytes) = secret_map {
+            let value = serde_yaml::from_slice(bytes).map_err(|source: serde_yaml::Error| {
+                ConfigError::SecretMapDecode {
+                    diagnostic: format!(
+                        "invalid YAML/JSON at {}",
+                        source.location().map_or_else(
+                            || "unknown position".to_owned(),
+                            |location| format!(
+                                "line {}, column {}",
+                                location.line(),
+                                location.column()
+                            )
+                        )
+                    ),
+                }
+            })?;
+            self.0
+                .insert("secretMapReferences".to_owned(), (Disposition::Swap, value));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_lock(&mut self, lock: Option<&LoadedLock>) {
+        if let Some(lock) = lock {
+            self.0.insert(
+                "providerLockDigest".to_owned(),
+                (
+                    Disposition::Restart,
+                    serde_yaml::Value::String(lock.digest.clone()),
+                ),
+            );
+        }
+    }
+
+    pub(crate) fn digest(&self) -> Result<String, serde_json::Error> {
+        use sha2::{Digest as _, Sha256};
+        // Arbitrary provider settings can contain private values; their contents are not evidence.
+        let sources = self
+            .0
+            .iter()
+            .filter(|(key, _)| key.as_str() != "providerSettings")
+            .map(|(key, (_, value))| (key, value))
+            .collect::<BTreeMap<_, _>>();
+        let canonical = sources
+            .into_iter()
+            .map(|(key, value)| Ok((key, canonical_value(value)?)))
+            .collect::<Result<BTreeMap<_, serde_json::Value>, serde_json::Error>>()?;
+        let encoded = serde_json::to_vec(&canonical)?;
+        Ok(Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    pub(crate) fn changed_categories(&self, next: &Self) -> Vec<String> {
+        let null = serde_yaml::Value::Null;
+        self.0
+            .keys()
+            .chain(next.0.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|category| {
+                self.0
+                    .get(category.as_str())
+                    .map_or(&null, |(_, value)| value)
+                    != next
+                        .0
+                        .get(category.as_str())
+                        .map_or(&null, |(_, value)| value)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn keeps(&self, next: &Self, resident: Resident) -> bool {
+        let category = match resident {
+            Resident::Storage => "storage",
+            Resident::Assets => "assets",
+        };
+        let null = serde_yaml::Value::Null;
+        self.0.get(category).map_or(&null, |(_, value)| value)
+            == next.0.get(category).map_or(&null, |(_, value)| value)
+    }
+
+    pub(crate) fn restart_required(&self, next: &Self) -> Vec<String> {
+        let null = serde_yaml::Value::Null;
+        self.0
+            .keys()
+            .chain(next.0.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|category| {
+                let current = self.0.get(category.as_str());
+                let proposed = next.0.get(category.as_str());
+                let disposition = current.or(proposed).map(|(disposition, _)| disposition)?;
+                let old = current.map_or(&null, |(_, value)| value);
+                let new = proposed.map_or(&null, |(_, value)| value);
+                match disposition {
+                    Disposition::Swap => None,
+                    Disposition::Restart if old == new => None,
+                    Disposition::Restart => Some(match category.as_str() {
+                        "providerArtifacts" => "providers".to_owned(),
+                        "caBundles" => "http".to_owned(),
+                        _ => category.clone(),
+                    }),
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+fn canonical_value(value: &serde_yaml::Value) -> Result<serde_json::Value, serde_json::Error> {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let fields = mapping
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or(serde_json::to_string(key)?),
+                        canonical_value(value)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+            serde_json::to_value(fields)
+        }
+        serde_yaml::Value::Sequence(values) => {
+            let values = values
+                .iter()
+                .map(canonical_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            serde_json::to_value(values)
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            serde_json::to_value((tagged.tag.to_string(), canonical_value(&tagged.value)?))
+        }
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_) => serde_json::to_value(value),
+    }
+}
+
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub source: PathBuf,
+    pub(crate) snapshot: ConfigSnapshot,
     pub socket_path: PathBuf,
     pub credentials_path: Option<PathBuf>,
     pub secret_map_path: Option<PathBuf>,
@@ -326,20 +607,24 @@ pub struct ResolvedConfig {
 /// `Check` resolves the runtime-only paths (socket, credentials, secret map, storage and assets
 /// roots, the managed provider lock and store, extra CA bundles) without requiring them to exist and
 /// loads no managed provider lock; every other rule is the one boot applies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LoadMode {
+#[derive(Clone, Copy, Debug)]
+pub enum LoadMode<'a> {
     Boot,
+    Reload {
+        locked_providers: Option<&'a [LockedProviderSource]>,
+        provider_lock: Option<&'a LoadedLock>,
+    },
     Check,
 }
 
-impl LoadMode {
+impl LoadMode<'_> {
     fn runtime_path(
         self,
         path: PathBuf,
         boot: impl FnOnce(PathBuf) -> Result<PathBuf, ConfigError>,
     ) -> Result<PathBuf, ConfigError> {
         match self {
-            Self::Boot => boot(path),
+            Self::Boot | Self::Reload { .. } => boot(path),
             Self::Check => Ok(path),
         }
     }
@@ -361,7 +646,7 @@ pub async fn load(
 pub async fn load_in(
     path: impl AsRef<Path>,
     expected_uid: u32,
-    mode: LoadMode,
+    mode: LoadMode<'_>,
 ) -> Result<(ResolvedConfig, Option<ConfigError>), ConfigError> {
     let path = absolute(path.as_ref())?;
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
@@ -373,13 +658,27 @@ pub async fn load_in(
     if !config.capabilities.is_empty() && config.policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
     }
+    let snapshot = ConfigSnapshot::from_bytes(&bytes)?;
     let mut resolved = resolve(config, path, expected_uid, mode).await?;
+    resolved.snapshot = snapshot;
     if let Some(policies_path) = resolved.policies_path.clone() {
         let bytes = read_owner_only(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
         resolved.policies = String::from_utf8(bytes).map_err(|_| ConfigError::PolicyNotUtf8 {
             path: policies_path,
         })?;
     }
+    resolved
+        .snapshot
+        .record_sources(
+            &resolved.policies,
+            &resolved.providers,
+            resolved.locked_providers.as_ref().map_or(0, Vec::len),
+            &resolved.host_options.extra_ca_bundles,
+        )
+        .await?;
+    resolved
+        .snapshot
+        .record_lock(resolved.provider_lock.as_ref());
     Ok((resolved, None))
 }
 
@@ -397,7 +696,7 @@ const POLICY_EXTENSION: &str = "cedar";
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
-    mode: LoadMode,
+    mode: LoadMode<'_>,
 ) -> Result<(ResolvedConfig, Option<ConfigError>), ConfigError> {
     let fragments = fragments::scan_directory(&directory, expected_uid, FRAGMENT_EXTENSION)?;
     let policy_files = fragments::scan_directory(&directory, expected_uid, POLICY_EXTENSION)?;
@@ -420,11 +719,12 @@ async fn load_directory(
     }
     let (merged, refusal) = fragments::merge_reporting(parsed, &MERGE_RULES);
     let refusal = match (refusal, mode) {
-        (Some(refusal), LoadMode::Boot) => return Err(refusal.into()),
+        (Some(refusal), LoadMode::Boot | LoadMode::Reload { .. }) => return Err(refusal.into()),
         (refusal, _) => refusal.map(ConfigError::from),
     };
     // A later refusal is reported as the collision it may well be caused by.
     let later = |error: ConfigError, refusal: Option<ConfigError>| refusal.unwrap_or(error);
+    let snapshot = ConfigSnapshot::from_mapping(&merged);
     let config = match serde_yaml::from_value::<BrokerdConfig>(serde_yaml::Value::Mapping(merged)) {
         Ok(config) => config,
         Err(source) => return Err(later(ConfigError::Decode { source }, refusal)),
@@ -439,6 +739,7 @@ async fn load_directory(
         Ok(resolved) => resolved,
         Err(error) => return Err(later(error, refusal)),
     };
+    resolved.snapshot = snapshot;
     let mut policies = String::new();
     for path in policy_files {
         let bytes = read_owner_only(&path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
@@ -453,6 +754,18 @@ async fn load_directory(
         }
     }
     resolved.policies = policies;
+    resolved
+        .snapshot
+        .record_sources(
+            &resolved.policies,
+            &resolved.providers,
+            resolved.locked_providers.as_ref().map_or(0, Vec::len),
+            &resolved.host_options.extra_ca_bundles,
+        )
+        .await?;
+    resolved
+        .snapshot
+        .record_lock(resolved.provider_lock.as_ref());
     Ok((resolved, refusal))
 }
 
@@ -573,7 +886,7 @@ async fn resolve(
     config: BrokerdConfig,
     source: PathBuf,
     expected_uid: u32,
-    mode: LoadMode,
+    mode: LoadMode<'_>,
 ) -> Result<ResolvedConfig, ConfigError> {
     if config.provider_set.is_some() && !config.providers.is_empty() {
         return Err(ConfigError::MixedProviderSources);
@@ -586,7 +899,12 @@ async fn resolve(
             maximum: HARD_MAX_PROVIDERS,
         });
     }
-    if config.identities.is_empty() && mode == LoadMode::Boot {
+    if config.identities.is_empty()
+        && match mode {
+            LoadMode::Boot | LoadMode::Reload { .. } => true,
+            LoadMode::Check => false,
+        }
+    {
         return Err(ConfigError::NoIdentities);
     }
     let source_parent = source.parent().ok_or(ConfigError::MissingParent)?;
@@ -614,7 +932,7 @@ async fn resolve(
         .transpose()
     };
     let credentials_path = match mode {
-        LoadMode::Boot => canonical(config.credentials_path)?,
+        LoadMode::Boot | LoadMode::Reload { .. } => canonical(config.credentials_path)?,
         LoadMode::Check => config.credentials_path.map(resolve_path),
     };
     // The final path component is left uncanonicalized so the secret-map loader's O_NOFOLLOW check
@@ -671,13 +989,35 @@ async fn resolve(
                     source,
                 })
             };
-            let lock_path = mode.runtime_path(resolve_path(managed.lock_path), canonical)?;
+            let lock_path = match mode {
+                LoadMode::Reload {
+                    provider_lock: Some(lock),
+                    ..
+                } => lock.path.clone(),
+                LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Check => {
+                    mode.runtime_path(resolve_path(managed.lock_path), canonical)?
+                }
+            };
             let store_path = mode.runtime_path(resolve_path(managed.store_path), canonical)?;
             Ok::<_, ConfigError>((lock_path, store_path))
         })
         .transpose()?;
     let (locked_providers, provider_lock) = match (&managed_provider_paths, mode) {
         (None, _) | (Some(_), LoadMode::Check) => (None, None),
+        (
+            Some(_),
+            LoadMode::Reload {
+                locked_providers,
+                provider_lock,
+            },
+        ) => (
+            if provider_lock.is_some() {
+                locked_providers.map(<[LockedProviderSource]>::to_vec)
+            } else {
+                None
+            },
+            provider_lock.cloned(),
+        ),
         (Some((lock_path, store_path)), LoadMode::Boot) => {
             let (sources, digest) =
                 provider_manager::load_locked_digest(lock_path, store_path, expected_uid)
@@ -721,7 +1061,11 @@ async fn resolve(
             maximum: HARD_MAX_PROVIDERS,
         });
     }
-    if providers.is_empty() && (mode == LoadMode::Boot || managed_provider_paths.is_none()) {
+    let require_providers = match mode {
+        LoadMode::Boot => true,
+        LoadMode::Reload { .. } | LoadMode::Check => managed_provider_paths.is_none(),
+    };
+    if providers.is_empty() && require_providers {
         return Err(ConfigError::NoProviders);
     }
     let mut reserved = vec![source.clone(), socket_path.clone()];
@@ -828,8 +1172,9 @@ async fn resolve(
         if !path.is_absolute() {
             return Err(ConfigError::InvalidHttpsConfiguration);
         }
-        if mode == LoadMode::Check {
-            continue;
+        match mode {
+            LoadMode::Check => continue,
+            LoadMode::Boot | LoadMode::Reload { .. } => {}
         }
         let metadata =
             std::fs::metadata(path).map_err(|_error| ConfigError::InvalidHttpsConfiguration)?;
@@ -953,6 +1298,7 @@ async fn resolve(
 
     Ok(ResolvedConfig {
         source,
+        snapshot: ConfigSnapshot::default(),
         socket_path,
         credentials_path,
         secret_map_path,
@@ -970,7 +1316,13 @@ async fn resolve(
         host_options: BrokerHostOptions {
             cwasm_dir: managed_provider_paths
                 .as_ref()
-                .filter(|_| !config.compile_on_load && mode == LoadMode::Boot)
+                .filter(|_| {
+                    !config.compile_on_load
+                        && match mode {
+                            LoadMode::Boot | LoadMode::Reload { .. } => true,
+                            LoadMode::Check => false,
+                        }
+                })
                 .map(|(_, store)| store.join("cwasm")),
             compiled_cache_mode: dekopon_broker_host::CompiledCacheMode::Reader,
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
@@ -1021,6 +1373,8 @@ pub enum ConfigError {
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("secret map references could not be decoded: {diagnostic}")]
+    SecretMapDecode { diagnostic: String },
     #[error("configured path has no parent")]
     MissingParent,
     #[error("configured socket path has no file name")]
@@ -1146,4 +1500,20 @@ pub enum ConfigError {
         #[source]
         source: TelemetryError,
     },
+}
+
+#[cfg(test)]
+mod secret_map_reference_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_reference_yaml_does_not_echo_a_token_shaped_value() {
+        let sentinel = "sensitive-token-in-invalid-map-reference";
+        let bytes = format!("source: [{{invalid: {sentinel}}}");
+        let error = ConfigSnapshot::default()
+            .record_authority_references(None, Some(bytes.as_bytes()))
+            .expect_err("invalid YAML");
+        assert!(matches!(error, ConfigError::SecretMapDecode { .. }));
+        assert!(!dekopon_core::error_chain(&error).contains(sentinel));
+    }
 }

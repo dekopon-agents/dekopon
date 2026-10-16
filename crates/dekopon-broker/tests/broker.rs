@@ -351,7 +351,6 @@ async fn attested_broker(
     Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &format!(
                 "{}\n{}\n{}\n{}\n{}",
@@ -391,7 +390,6 @@ async fn policy_authorizes_and_audits_no_payloads() {
         "broker-test"
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
-        "policy-test".to_owned(),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
@@ -448,7 +446,6 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
         "broker-test"
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
-        "policy-test".to_owned(),
         probe_engine(
             &format!(
                 "{}\n{}",
@@ -513,7 +510,6 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
         "broker-test"
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
-        "policy-test".to_owned(),
         probe_engine("", ["caller"]),
         catalog([(
             "cli-probe.upper",
@@ -538,7 +534,6 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
         "broker-test"
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
-        "policy-test".to_owned(),
         probe_engine("", ["caller"]),
         catalog([(
             "cli-probe.upper",
@@ -570,7 +565,6 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
         "broker-test"
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
-        "policy-test".to_owned(),
         engine(
             "",
             ["caller"],
@@ -666,7 +660,6 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_engine(&policies),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
         CredentialStore::empty(),
@@ -927,7 +920,6 @@ async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
@@ -1027,7 +1019,6 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         "broker-test"
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
-        "policy-test".to_owned(),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
         CredentialStore::empty(),
@@ -1114,7 +1105,6 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
         CredentialStore::empty(),
@@ -1231,7 +1221,6 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            "policy-http-probe".to_owned(),
             engine(
                 &provider_policy("caller", "provider-test", "http-probe", "http-probe.purge"),
                 ["caller"],
@@ -1445,7 +1434,6 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
@@ -1544,7 +1532,6 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
@@ -1667,7 +1654,6 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            "policy-test".to_owned(),
             http_probe_secret_engine(&format!(
                 "{}\n{secret_policy}",
                 http_policy("caller", "provider-test", "http-probe.fetch")
@@ -1788,7 +1774,6 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_secret_engine(&policy),
         catalog([(
             "http-probe.fetch",
@@ -1889,7 +1874,6 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            "policy-test".to_owned(),
             http_probe_secret_engine(&format!(
                 "{}\n{policy}",
                 http_policy("caller", "provider-test", "http-probe.fetch")
@@ -1990,7 +1974,6 @@ fn basic_secret_broker(
     Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         http_probe_secret_engine(&policy),
         catalog([(
             "http-probe.fetch",
@@ -2190,7 +2173,6 @@ async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_i
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            "policy-test".to_owned(),
             engine(
                 &format!(
                     "{}\n{}",
@@ -2361,7 +2343,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
                 "broker-test"
                     .parse::<PrincipalId>()
                     .expect("valid broker principal"),
-                "policy-test".to_owned(),
                 http_probe_engine(""),
                 catalog([("http-probe.fetch", set)]).with_agent_credentials(
                     rebound.map_or_else(BTreeMap::new, |credential| {
@@ -2470,7 +2451,6 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
     let broker = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &format!(
                 "{}\n{}\n{}",
@@ -3199,6 +3179,29 @@ fn attestor_scopes_match_on_segment_boundaries() {
 }
 
 #[test]
+fn github_attestor_scopes_accept_canonical_owner_and_repo_namespaces() {
+    let owner = attestor_grant(["github.dekopon-agents"]);
+    owner.validate().expect("canonical GitHub owner scope");
+    let repo = attestor_grant(["github.dekopon-agents.my_repo"]);
+    repo.validate().expect("canonical GitHub repo scope");
+    let matched = ExternalSubject::github("dekopon-agents", "my_repo").unwrap();
+    assert!(owner.permits(&matched));
+    assert!(repo.permits(&matched));
+    assert!(!repo.permits(&ExternalSubject::github("dekopon-agents", "my_repo-extra").unwrap()));
+    for scope in [
+        "github.Owner".to_owned(),
+        format!("github.{}", "o".repeat(40)),
+    ] {
+        let error = attestor_grant([scope.as_str()])
+            .validate()
+            .expect_err("noncanonical owner scope");
+        assert!(
+            matches!(error, BrokerBuildError::InvalidAttestorScope { scope: rejected } if rejected == scope)
+        );
+    }
+}
+
+#[test]
 fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     let slack = subject(SLACK_SUBJECT);
     let telephone = subject("tel.16034700182");
@@ -3231,7 +3234,6 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
     let error = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.reverse"),
             ["caller"],
@@ -3264,7 +3266,6 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         let (broker, warnings) = Broker::start(
             probe_registry(BrokerHostLimits::default()).await,
             principal("broker-test"),
-            "policy-test".to_owned(),
             probe_engine(&policy, ["caller"]),
             catalog([(
                 "cli-probe.upper",
@@ -3321,7 +3322,6 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let broker = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &format!(
                 "{}\n{}",
@@ -3407,7 +3407,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     let error = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
@@ -3428,7 +3427,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     let (broker, warnings) = Broker::start(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
@@ -3470,7 +3468,6 @@ async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
     let (broker, _) = Broker::start(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller", "stranger"],
@@ -3528,7 +3525,6 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
     let (broker, _) = Broker::start(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
-        "policy-test".to_owned(),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
@@ -3578,7 +3574,6 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     let (broker, _) = Broker::start(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         engine("", ["caller"], [("cli-probe.upper", "cli-probe")]),
         catalog([(
             "cli-probe.upper",

@@ -31,6 +31,15 @@ pub(crate) fn version(routine: &Routine) -> String {
         .collect()
 }
 
+pub(crate) fn captured_bytes(turn: &ConversationTurn, include_chat: bool) -> u64 {
+    let chat = if include_chat { turn.bytes() as u64 } else { 0 };
+    turn.exchanges()
+        .iter()
+        .flat_map(|exchange| exchange.request.iter().chain(&exchange.result))
+        .map(|rep| rep.captured_bytes)
+        .fold(chat, u64::saturating_add)
+}
+
 fn derived(
     source: &Representation,
     routine: &Routine,
@@ -160,6 +169,7 @@ pub(crate) fn prepare(
     let source_rep = Representation::original(&source, "");
     let mut metadata = source_rep.clone();
     metadata.text = None;
+    metadata.captured_bytes = captured_bytes(turn, include_chat);
     if let Some(routine) = retained_original {
         metadata.routine_id.clone_from(&routine.id);
         metadata.version = version(routine);
@@ -279,6 +289,32 @@ pub(crate) struct PostReply<'a> {
     pub cancellation: &'a SessionCancellation,
 }
 
+pub(crate) fn report_policy(policy: &ResolvedPolicy, recall: crate::config::RecallSource) {
+    let mode = match policy.selection.mode {
+        crate::config::memory::SelectionMode::Fixed => "fixed",
+        crate::config::memory::SelectionMode::AgentPreference => "agentPreference",
+        crate::config::memory::SelectionMode::Decider => "decider",
+    };
+    let bound = |value| match value {
+        crate::config::memory::CaptureBound::Bytes(bytes) => bytes.get().to_string(),
+        crate::config::memory::CaptureBound::Word(_) => "uncapped".to_owned(),
+    };
+    tracing::info!(
+        event = "gateway_memory_policy",
+        mode,
+        recall = match recall {
+            crate::config::RecallSource::None => "none",
+            crate::config::RecallSource::Journal => "journal",
+            crate::config::RecallSource::Platform => "platform",
+        },
+        retained_routines = policy.retain.len(),
+        capture_user_bytes = %bound(policy.capture.user),
+        capture_assistant_bytes = %bound(policy.capture.assistant),
+        capture_tool_request_bytes = %bound(policy.capture.tool_request),
+        capture_tool_result_bytes = %bound(policy.capture.tool_result),
+    );
+}
+
 pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: ConversationTurn) {
     let PostReply {
         runner,
@@ -293,26 +329,8 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     };
     let journal = Arc::clone(journal);
     let policy = route.memory_policy.clone().unwrap_or_default();
-    let mode = match policy.selection.mode {
-        crate::config::memory::SelectionMode::Fixed => "fixed",
-        crate::config::memory::SelectionMode::AgentPreference => "agentPreference",
-        crate::config::memory::SelectionMode::Decider => "decider",
-    };
-    tracing::info!(
-        event = "gateway_memory_policy",
-        mode,
-        recall = match window.recall {
-            crate::config::RecallSource::None => "none",
-            crate::config::RecallSource::Journal => "journal",
-            crate::config::RecallSource::Platform => "platform",
-        },
-        retained_routines = policy.retain.len(),
-        capture_user_bytes = ?policy.capture.user,
-        capture_assistant_bytes = ?policy.capture.assistant,
-        capture_tool_request_bytes = ?policy.capture.tool_request,
-        capture_tool_result_bytes = ?policy.capture.tool_result,
-    );
     let models = Arc::clone(&runner.models);
+    let anchor = Arc::clone(&route.model);
     let metering = Arc::clone(&runner.metering);
     let agent = route.agent.clone();
     let runtime = tokio::runtime::Handle::current();
@@ -337,7 +355,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
                 |name| {
                     let config = generation_policy.models.get(name)?;
                     let client = models
-                        .client(config, runtime.clone(), cancel.clone())
+                        .client_anchored(&anchor, config, runtime.clone(), cancel.clone())
                         .ok()?;
                     Some(crate::metering::ChatProviderGovernor::wrap(
                         client, &metering, &agent, config,

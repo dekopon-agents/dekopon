@@ -1049,6 +1049,7 @@ dependencies = [
 name = "dekopon-gatewayd"
 version = "0.47.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -1154,6 +1155,7 @@ dependencies = [
 name = "dekopon-model-proxy"
 version = "0.47.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "bytes",
  "dekopon-core",

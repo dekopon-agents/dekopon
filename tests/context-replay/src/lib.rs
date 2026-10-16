@@ -1,7 +1,7 @@
 #[path = "../../../crates/dekopon-agent/src/prompt/context_portable.rs"]
 mod context_portable;
 use context_portable::{
-    EnvelopeSource, Exchange, Representation, fit_projected, original_envelope_bytes,
+    BodySource, EnvelopeSource, Exchange, Representation, fit_projected, render_body,
     render_envelope,
 };
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,8 @@ pub struct ReplayRecord {
     #[serde(default)]
     pub exchanges: Vec<Exchange>,
     pub pin: Option<String>,
+    pub source_eligibility: bool,
+    pub eligible: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -86,7 +88,7 @@ pub fn run(input: &ReplayInput) -> Result<Vec<Snapshot>, ReplayError> {
         || input.max_bytes > 65_536
         || input.steps.len() > 32
         || input.steps.iter().any(|step| {
-            step.id.is_empty()
+            step.id.parse::<u64>().is_err()
                 || !step.id.bytes().all(|b| b.is_ascii_digit())
                 || serde_json::to_vec(step).map_or(true, |encoded| encoded.len() > 4096)
         })
@@ -113,29 +115,26 @@ pub fn run(input: &ReplayInput) -> Result<Vec<Snapshot>, ReplayError> {
         }
         retained.push(step.clone());
         let choice = &event.response;
-        let rendered = render_envelope(
-            EnvelopeSource {
-                user: step.user.as_deref(),
-                answer: step.answer.as_deref(),
-                representations: &step.representations,
-                exchanges: &step.exchanges,
-            },
-            &choice.id,
-            &choice.version,
-            choice.is_original,
-        );
+        let source = BodySource {
+            user: step.user.as_deref(),
+            answer: step.answer.as_deref(),
+            source_eligibility: step.source_eligibility,
+            representations: &step.representations,
+            exchanges: &step.exchanges,
+        };
+        let rendered = render_body(source, &choice.id, &choice.version);
         if let Some(text) = rendered {
-            let split_original =
-                choice.is_original && step.exchanges.is_empty() && step.user.is_some();
-            let bytes = if split_original {
-                original_envelope_bytes(
-                    step.user.as_deref().unwrap_or_default(),
-                    step.answer.as_deref(),
-                    &[],
-                )
-            } else {
-                text.len()
-            };
+            let projected = render_envelope(
+                EnvelopeSource {
+                    record_id: step.id.parse().map_err(|_| ReplayError::InvalidInput)?,
+                    body: source,
+                    original_id: choice.is_original.then_some(choice.id.as_str()),
+                    eligible: &step.eligible,
+                },
+                &choice.id,
+                &text,
+            );
+            let bytes = projected.user.len() + projected.answer.as_ref().map_or(0, String::len);
             if let Some(drop_count) = fit_projected(
                 visible
                     .iter()
@@ -145,15 +144,10 @@ pub fn run(input: &ReplayInput) -> Result<Vec<Snapshot>, ReplayError> {
                 input.max_bytes,
             ) {
                 visible.drain(..drop_count);
-                let (user, answer) = if split_original {
-                    (step.user.clone().unwrap_or_default(), step.answer.clone())
-                } else {
-                    (text, None)
-                };
                 visible.push(VisibleTurn {
                     record_id: step.id.clone(),
-                    user,
-                    answer,
+                    user: projected.user,
+                    answer: projected.answer,
                 });
             } else {
                 omitted.push(step.id.clone());
@@ -186,6 +180,8 @@ mod tests {
             representations: vec![],
             exchanges: vec![],
             pin: None,
+            source_eligibility: true,
+            eligible: vec!["original".into()],
         };
         let mut input = ReplayInput {
             version: "v1".into(),

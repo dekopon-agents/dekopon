@@ -17,19 +17,17 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     Router,
-    body::to_bytes,
     extract::{RawQuery, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::Response,
     routing::{get, post},
 };
+#[cfg(test)]
+use axum::{body::to_bytes, http::header};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{StreamExt as _, future::BoxFuture};
-use hmac::{Hmac, KeyInit as _, Mac as _};
-use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use serde_json::{Value, json};
-use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{Instrument as _, Span};
 
@@ -41,20 +39,18 @@ use crate::{
         OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
         record_conversation, split_message,
+        webhook::{
+            self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
+            text_response,
+        },
     },
 };
 
-const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
-const MAX_WEBHOOK_HEADERS: usize = 32;
-const MAX_HEADER_BYTES: usize = 8 * 1024;
-const MAX_CONNECTION_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_QUERY_BYTES: usize = 2 * 1024;
 const MAX_QUERY_VALUE_BYTES: usize = 512;
 const MAX_MESSAGES_PER_DELIVERY: usize = 128;
 const MAX_QUEUED_MESSAGES: usize = 512;
 const WEBHOOK_QUEUE: usize = 64;
-const MAX_WEBHOOK_CONCURRENCY: usize = 16;
-const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const GRAPH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const TYPING_RENEW_INTERVAL: Duration = Duration::from_secs(20);
@@ -228,6 +224,41 @@ impl WhatsappTransport {
             server: tokio::task::JoinSet::new(),
         })
     }
+
+    pub(super) fn router(&self) -> Router {
+        Router::new()
+            .route(&self.callback_path, get(verify_subscription))
+            .route(&self.callback_path, post(receive_webhook))
+            .with_state(self.state.clone())
+    }
+
+    pub(super) fn shared_driver(&self) -> Arc<dyn ChatDriver> {
+        Arc::clone(&self.driver) as Arc<dyn ChatDriver>
+    }
+
+    pub(super) fn shared_name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) async fn shared_next(&mut self) -> Result<TransportEvent, TransportError> {
+        next_delivery(&mut self.pending, &mut self.receiver).await
+    }
+}
+
+async fn next_delivery(
+    pending: &mut VecDeque<QueuedDelivery>,
+    receiver: &mut mpsc::Receiver<QueuedDelivery>,
+) -> Result<TransportEvent, TransportError> {
+    loop {
+        if let Some(delivery) = pending.front_mut() {
+            if let Some(message) = delivery.messages.pop_front() {
+                return Ok(TransportEvent::Message(Box::new(message)));
+            }
+            pending.pop_front();
+            continue;
+        }
+        pending.push_back(receiver.recv().await.ok_or(TransportError::Closed)?);
+    }
 }
 
 impl ChatTransport for WhatsappTransport {
@@ -237,119 +268,27 @@ impl ChatTransport for WhatsappTransport {
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
-            if !self.server.is_empty() {
-                return Err(TransportError::Response);
-            }
-            let listener = tokio::net::TcpListener::bind(self.bind)
-                .await
-                .map_err(TransportError::Io)?;
-            let router = Router::new()
-                .route(&self.callback_path, get(verify_subscription))
-                .route(&self.callback_path, post(receive_webhook))
+            let router = self
+                .router()
                 .fallback(|| async { content_free(StatusCode::NOT_FOUND) })
                 .method_not_allowed_fallback(|| async {
                     content_free(StatusCode::METHOD_NOT_ALLOWED)
-                })
-                .with_state(self.state.clone());
-            let name = self.name.clone();
-            self.server.spawn(async move {
-                let mut connections = tokio::task::JoinSet::new();
-                let connection_limit = Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY));
-                loop {
-                    tokio::select! {
-                        accepted = listener.accept() => {
-                            let stream = match accepted {
-                                Ok((stream, _peer)) => stream,
-                                Err(error) => match classify_accept(&error) {
-                                    AcceptFailure::Connection => {
-                                        tracing::debug!(
-                                            event = "gateway_whatsapp_accept_failed",
-                                            transport = %name,
-                                            kind = "connection",
-                                            error = %error,
-                                        );
-                                        continue;
-                                    }
-                                    AcceptFailure::Exhausted => {
-                                        tracing::warn!(
-                                            event = "gateway_whatsapp_accept_failed",
-                                            transport = %name,
-                                            kind = "exhausted",
-                                            error = %error,
-                                        );
-                                        return;
-                                    }
-                                    AcceptFailure::Fatal => {
-                                        tracing::error!(
-                                            event = "gateway_whatsapp_listener_stopped",
-                                            transport = %name,
-                                            error = %error,
-                                        );
-                                        return;
-                                    }
-                                },
-                            };
-                            let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
-                                continue;
-                            };
-                            let service = TowerToHyperService::new(router.clone());
-                            connections.spawn(async move {
-                                let _connection_permit = connection_permit;
-                                let mut builder = hyper::server::conn::http1::Builder::new();
-                                builder
-                                    .max_headers(MAX_WEBHOOK_HEADERS)
-                                    .max_buf_size(MAX_CONNECTION_BUFFER_BYTES);
-                                let connection = builder.serve_connection(TokioIo::new(stream), service);
-                                // Header parsing is included in this deadline too, so a slow client
-                                // cannot hold a socket open longer than a fully buffered request
-                                // would allow.
-                                #[allow(
-                                    clippy::let_underscore_must_use,
-                                    reason = "the outcome is that one untrusted client's \
-                                              connection ended, by deadline or by hanging up; the \
-                                              router already recorded whatever it answered"
-                                )]
-                                let _ = tokio::time::timeout(WEBHOOK_REQUEST_TIMEOUT, connection).await;
-                            });
-                        }
-                        Some(_) = connections.join_next(), if !connections.is_empty() => {}
-                    }
-                }
-            });
+                });
+            webhook::listen(self.bind, router, self.name.clone(), &mut self.server).await?;
             Ok(TransportIdentity::default())
         })
     }
 
     fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
-            enum Source {
-                Delivery(QueuedDelivery),
-                ListenerStopped,
+            if self.server.is_empty() {
+                return Err(TransportError::Closed);
             }
-
-            loop {
-                if let Some(delivery) = self.pending.front_mut() {
-                    if let Some(message) = delivery.messages.pop_front() {
-                        return Ok(TransportEvent::Message(Box::new(message)));
-                    }
-                    self.pending.pop_front();
-                    continue;
-                }
-
-                if self.server.is_empty() {
-                    return Err(TransportError::Closed);
-                }
-                let source = tokio::select! {
-                    delivery = self.receiver.recv() => delivery
-                        .map_or(Source::ListenerStopped, Source::Delivery),
-                    _ = self.server.join_next() => Source::ListenerStopped,
-                };
-                match source {
-                    Source::Delivery(delivery) => self.pending.push_back(delivery),
-                    Source::ListenerStopped => {
-                        self.server.shutdown().await;
-                        return Err(TransportError::Closed);
-                    }
+            tokio::select! {
+                result = next_delivery(&mut self.pending, &mut self.receiver) => result,
+                _ = self.server.join_next() => {
+                    self.server.shutdown().await;
+                    Err(TransportError::Closed)
                 }
             }
         })
@@ -361,35 +300,6 @@ impl ChatTransport for WhatsappTransport {
 
     fn driver(&self) -> Arc<dyn ChatDriver> {
         Arc::clone(&self.driver) as Arc<dyn ChatDriver>
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AcceptFailure {
-    Connection,
-    Exhausted,
-    Fatal,
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-fn classify_accept(error: &io::Error) -> AcceptFailure {
-    match error.kind() {
-        io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::Interrupted
-        | io::ErrorKind::TimedOut
-        | io::ErrorKind::WouldBlock => AcceptFailure::Connection,
-        io::ErrorKind::OutOfMemory => AcceptFailure::Exhausted,
-        _ => match error.raw_os_error() {
-            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
-                AcceptFailure::Exhausted
-            }
-            _ => AcceptFailure::Fatal,
-        },
     }
 }
 
@@ -440,28 +350,21 @@ async fn process_webhook(
     _permit: tokio::sync::OwnedSemaphorePermit,
     received: &Span,
 ) -> Response {
-    if !headers_bounded(request.headers()) {
-        return refuse(state, Refusal::Oversize, StatusCode::BAD_REQUEST);
-    }
-    let Some(signature) = exact_signature(request.headers()) else {
-        return refuse(state, Refusal::Unsigned, StatusCode::UNAUTHORIZED);
-    };
-    if request
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_WEBHOOK_BODY_BYTES)
-    {
-        return refuse(state, Refusal::Oversize, StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let body = match to_bytes(request.into_body(), MAX_WEBHOOK_BODY_BYTES).await {
+    let body = match webhook::verified_body(request, state.app_secret.expose()).await {
         Ok(body) => body,
-        Err(_) => return refuse(state, Refusal::Oversize, StatusCode::PAYLOAD_TOO_LARGE),
+        Err(VerifyFailure::Headers) => {
+            return refuse(state, Refusal::Oversize, StatusCode::BAD_REQUEST);
+        }
+        Err(VerifyFailure::Unsigned) => {
+            return refuse(state, Refusal::Unsigned, StatusCode::UNAUTHORIZED);
+        }
+        Err(VerifyFailure::Oversize) => {
+            return refuse(state, Refusal::Oversize, StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        Err(VerifyFailure::Signature) => {
+            return refuse(state, Refusal::Signature, StatusCode::UNAUTHORIZED);
+        }
     };
-    if !valid_hmac_sha256(state.app_secret.expose(), &body, &signature) {
-        return refuse(state, Refusal::Signature, StatusCode::UNAUTHORIZED);
-    }
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
@@ -647,62 +550,6 @@ fn canonical_whatsapp_message_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-fn headers_bounded(headers: &HeaderMap) -> bool {
-    let mut count = 0_usize;
-    let mut bytes = 0_usize;
-    for (name, value) in headers {
-        count = count.saturating_add(1);
-        bytes = bytes
-            .saturating_add(name.as_str().len())
-            .saturating_add(value.as_bytes().len());
-        if count > MAX_WEBHOOK_HEADERS || bytes > MAX_HEADER_BYTES {
-            return false;
-        }
-    }
-    true
-}
-
-fn exact_signature(headers: &HeaderMap) -> Option<[u8; 32]> {
-    let values: Vec<_> = headers.get_all("x-hub-signature-256").iter().collect();
-    if values.len() != 1 {
-        return None;
-    }
-    let value = values[0].to_str().ok()?.strip_prefix("sha256=")?;
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        digest[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Some(digest)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn hmac_sha256(key: &[u8], body: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of every length");
-    mac.update(body);
-    mac.finalize().into_bytes().into()
-}
-
-fn valid_hmac_sha256(key: &[u8], body: &[u8], signature: &[u8]) -> bool {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of every length");
-    mac.update(body);
-    mac.verify_slice(signature).is_ok()
-}
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     let maximum = left.len().max(right.len());
@@ -730,22 +577,6 @@ fn exactly_one<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str
     let mut matches = fields.iter().filter(|(field, _)| field == name);
     let value = matches.next()?.1.as_str();
     matches.next().is_none().then_some(value)
-}
-
-fn content_free(status: StatusCode) -> Response {
-    text_response(status, String::new())
-}
-
-fn text_response(status: StatusCode, body: String) -> Response {
-    let mut response = (status, body).into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    response
 }
 
 struct WhatsappDriver {
@@ -964,6 +795,7 @@ async fn bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Transp
 
 #[cfg(test)]
 mod tests {
+    use crate::transport::webhook::hmac_sha256;
     use axum::body::Body;
 
     use super::*;
@@ -1007,27 +839,6 @@ mod tests {
             .header("x-hub-signature-256", signature(b"secret", body))
             .body(Body::from(body.to_vec()))
             .expect("request")
-    }
-
-    #[test]
-    fn hmac_matches_a_known_vector_and_uses_exact_raw_bytes() {
-        let compact = br#"{"object":"whatsapp_business_account"}"#;
-        let spaced = br#"{ "object": "whatsapp_business_account" }"#;
-        assert_ne!(
-            hmac_sha256(b"secret", compact),
-            hmac_sha256(b"secret", spaced)
-        );
-        assert!(valid_hmac_sha256(
-            b"secret",
-            compact,
-            &hmac_sha256(b"secret", compact),
-        ));
-        let known = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
-        let known: String = known.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(
-            known,
-            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
-        );
     }
 
     #[tokio::test]
@@ -1720,38 +1531,6 @@ mod tests {
             reasons.len(),
             Refusal::COUNT,
             "each reason has its own slot and its own name"
-        );
-    }
-
-    #[test]
-    fn accept_failures_distinguish_peer_errors_resource_exhaustion_and_listener_loss() {
-        for kind in [
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::ConnectionReset,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::WouldBlock,
-        ] {
-            assert_eq!(
-                classify_accept(&io::Error::from(kind)),
-                AcceptFailure::Connection,
-                "{kind:?} is one dead connection, not a dead listener"
-            );
-        }
-        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
-            assert_eq!(
-                classify_accept(&io::Error::from_raw_os_error(code)),
-                AcceptFailure::Exhausted,
-                "exhaustion recovers once something is freed"
-            );
-        }
-        assert_eq!(
-            classify_accept(&io::Error::from_raw_os_error(libc::EBADF)),
-            AcceptFailure::Fatal
-        );
-        assert_eq!(
-            classify_accept(&io::Error::from(io::ErrorKind::InvalidInput)),
-            AcceptFailure::Fatal
         );
     }
 

@@ -1,31 +1,62 @@
-use super::{
-    Journal, JournalError, JournalMemoryTools, Line, duration_millis, millis, validated_lines,
-};
+use super::{Backward, Journal, JournalError, Line, body, duration_millis, millis, remove};
 use crate::config::{
     MemoryWindow,
-    memory::{ResolvedPolicy, RoutineKind, SelectionMode},
+    memory::{ResolvedPolicy, RoutineKind, Selection, SelectionMode},
 };
-use dekopon_agent::prompt::{ConversationTurn, History, Selection};
+use dekopon_agent::prompt::{ConversationTurn, History};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
 use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ExitCode, Streams,
     TreeContext,
 };
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     io,
     time::SystemTime,
 };
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Evidence {
-    tool: String,
-    outcome: String,
-    exit: Option<i32>,
+    tool: EvidenceTool,
+    outcome: EvidenceOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_status: Option<u8>,
     age_ms: u64,
     bytes: u64,
     pinned: bool,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceTool {
+    Bash,
+    #[serde(rename = "none")]
+    Absent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceOutcome {
+    Success,
+    Failure,
+    #[serde(rename = "none")]
+    Absent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChooseInput<'a> {
+    backend: &'a str,
+    model: &'a str,
+    evidence: &'a [Evidence],
+    labels: &'a [String],
+    require_probabilities: bool,
+}
+
+const MAX_EVIDENCE: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Projection<'a> {
@@ -78,29 +109,37 @@ impl<I: CapabilityInvoker> CapabilityInvoker for Decider<'_, I> {
 
 pub(crate) fn decide<I: CapabilityInvoker>(
     runtime: &ShellRuntime<I>,
-    capability: &str,
+    selection: &Selection,
     available: &[String],
     evidence: &[Evidence],
 ) -> Result<String, &'static str> {
+    let (Some(capability), Some(backend), Some(model), Some(require_probabilities)) = (
+        selection.decision_capability.as_deref(),
+        selection.backend.as_deref(),
+        selection.model.as_deref(),
+        selection.require_probabilities,
+    ) else {
+        return Err("not-configured");
+    };
     if !runtime.invoker.is_granted(capability) {
         return Err("not-granted");
     }
-    let evidence: Vec<_> = evidence
-        .iter()
-        .map(|item| {
-            json!({
-                "tool": item.tool, "outcome": item.outcome, "exitStatus": item.exit,
-                "ageMs": item.age_ms, "bytes": item.bytes, "pinned": item.pinned
-            })
-        })
-        .collect();
+    if available.len() < 2 {
+        return Err("single-label");
+    }
+    let input = serde_json::to_value(ChooseInput {
+        backend,
+        model,
+        evidence: &evidence[evidence.len().saturating_sub(MAX_EVIDENCE)..],
+        labels: available,
+        require_probabilities,
+    })
+    .map_err(|_unencodable| "invalid-request")?;
     let decider = ShellRuntime {
         invoker: Decider {
             inner: &runtime.invoker,
             capability,
-            input: json!({
-                "available": available, "evidence": evidence
-            }),
+            input,
         },
         limits: runtime.limits,
         calls: runtime.calls.clone(),
@@ -121,53 +160,34 @@ pub(crate) fn decide<I: CapabilityInvoker>(
         .ok_or("invalid-response")
 }
 
-pub(super) fn original_envelope_bytes(turn: &ConversationTurn) -> usize {
-    dekopon_agent::prompt::original_envelope_bytes(turn.user(), turn.answer(), turn.exchanges())
-}
-
-fn envelope(line: &Line, id: &str, version: &str, is_original: bool) -> Option<String> {
-    dekopon_agent::prompt::render_envelope(
-        dekopon_agent::prompt::EnvelopeSource {
-            user: line.user.as_deref(),
-            answer: line.answer.as_deref(),
-            representations: &line.representations,
-            exchanges: &line.exchanges,
-        },
-        id,
-        version,
-        is_original,
-    )
-}
-
-fn representation<'a>(line: &'a Line, id: &str, policy: &'a ResolvedPolicy) -> Option<String> {
+fn text(line: &Line, id: &str, policy: &ResolvedPolicy) -> Option<String> {
     let routine = policy.routines.iter().find(|routine| routine.id == id)?;
-    let version = crate::memory::generation::version(routine);
-    line.availability
+    body(line, id, &crate::memory::generation::version(routine))
+}
+
+fn eligible_ids(line: &Line, policy: &ResolvedPolicy) -> Vec<String> {
+    policy
+        .retain
         .iter()
-        .any(|available| available == id || available.starts_with(&format!("{id}:part:")))
-        .then(|| envelope(line, id, &version, routine.kind == RoutineKind::Original))
-        .flatten()
+        .filter(|id| text(line, id, policy).is_some())
+        .cloned()
+        .collect()
 }
 
 fn evidence_for(line: &Line, now: u64) -> Evidence {
     let exchange = line.exchanges.first();
     Evidence {
-        tool: exchange.map_or_else(|| "none".to_owned(), |exchange| exchange.tool.clone()),
-        outcome: exchange.map_or_else(|| "none".to_owned(), |exchange| exchange.outcome.clone()),
-        exit: exchange.and_then(|exchange| exchange.exit_status),
+        tool: exchange.map_or(EvidenceTool::Absent, |_script| EvidenceTool::Bash),
+        outcome: match exchange {
+            None => EvidenceOutcome::Absent,
+            Some(exchange) if exchange.outcome == "success" => EvidenceOutcome::Success,
+            Some(_) => EvidenceOutcome::Failure,
+        },
+        exit_status: exchange
+            .and_then(|exchange| exchange.exit_status)
+            .and_then(|status| u8::try_from(status).ok()),
         age_ms: now.saturating_sub(line.at_ms),
-        bytes: line
-            .representations
-            .iter()
-            .map(|rep| rep.captured_bytes)
-            .sum::<u64>()
-            .saturating_add(
-                line.exchanges
-                    .iter()
-                    .flat_map(|exchange| exchange.request.iter().chain(&exchange.result))
-                    .map(|rep| rep.captured_bytes)
-                    .sum::<u64>(),
-            ),
+        bytes: line.original_bytes,
         pinned: line.pins.iter().any(|pin| pin.record_id == line.record_id),
     }
 }
@@ -182,10 +202,20 @@ fn original_id(policy: &ResolvedPolicy) -> Option<&str> {
         .map(|routine| routine.id.as_str())
 }
 
+struct Chosen {
+    requested: String,
+    actual: Option<String>,
+    reason: String,
+    original_bytes: u64,
+    replacement_bytes: u64,
+    pin: Option<String>,
+    pin_bytes: usize,
+}
+
 struct Fitted {
     history: History,
     records: VecDeque<Option<u64>>,
-    selections: HashMap<u64, Selection>,
+    chosen: BTreeMap<u64, Chosen>,
 }
 
 impl Fitted {
@@ -194,10 +224,10 @@ impl Fitted {
         if self.history.record_projected(turn) {
             for _ in 0..before + 1 - self.history.len() {
                 if let Some(Some(old)) = self.records.pop_front()
-                    && let Some(selection) = self.selections.get_mut(&old)
+                    && let Some(chosen) = self.chosen.get_mut(&old)
                 {
-                    selection.actual = None;
-                    selection.reason = Some("window-fit".into());
+                    chosen.actual = None;
+                    chosen.reason = "window-fit".to_owned();
                 }
             }
             self.records.push_back(record);
@@ -240,6 +270,129 @@ fn unpersisted(
         .collect()
 }
 
+struct Choice<'a> {
+    routine: &'a str,
+    authority: &'static str,
+    fallback_reason: Option<&'static str>,
+}
+
+fn envelope(
+    line: &Line,
+    id: &str,
+    text: &str,
+    original_id: Option<&str>,
+    eligible: &[String],
+) -> ConversationTurn {
+    let projected = dekopon_agent::prompt::render_envelope(
+        dekopon_agent::prompt::EnvelopeSource {
+            record_id: line.record_id,
+            body: dekopon_agent::prompt::BodySource {
+                user: line.user.as_deref(),
+                answer: line.answer.as_deref(),
+                source_eligibility: line.source_eligibility,
+                representations: &line.representations,
+                exchanges: &line.exchanges,
+            },
+            original_id,
+            eligible,
+        },
+        id,
+        text,
+    );
+    match projected.answer {
+        Some(answer) => ConversationTurn::completed(projected.user, answer),
+        None => ConversationTurn::unanswered(projected.user),
+    }
+}
+
+fn choose(
+    line: Line,
+    choice: &Choice<'_>,
+    policy: &ResolvedPolicy,
+    max_bytes: usize,
+) -> (Chosen, Option<ConversationTurn>) {
+    let Choice {
+        routine: choice,
+        authority,
+        fallback_reason,
+    } = *choice;
+    let original_id = original_id(policy);
+    let pin = line
+        .pins
+        .iter()
+        .find(|pin| pin.record_id == line.record_id)
+        .map(|pin| pin.representation_id.clone());
+    let requested = if authority == "decider" {
+        choice
+    } else {
+        pin.as_deref().unwrap_or(choice)
+    };
+    let eligible = eligible_ids(&line, policy);
+    let wrap = |id: &str, text: String| envelope(&line, id, &text, original_id, &eligible);
+    let original = original_id.and_then(|id| text(&line, id, policy).map(|text| wrap(id, text)));
+    let mut target = requested;
+    let mut replacement = text(&line, requested, policy).map(|text| wrap(requested, text));
+    if replacement.is_none()
+        && authority == "decider"
+        && let Some(fallback) = policy.selection.fallback.as_deref()
+    {
+        target = fallback;
+        replacement = text(&line, fallback, policy).map(|text| wrap(fallback, text));
+    }
+    let original_bytes = original
+        .as_ref()
+        .map_or(line.original_bytes, |turn| turn.bytes() as u64);
+    let replacement_bytes = replacement.as_ref().map_or(0, |turn| turn.bytes() as u64);
+    let savings = i128::from(original_bytes) - i128::from(replacement_bytes);
+    let automatic =
+        ((authority == "fixed" || authority == "fallback") && pin.is_none()) || target != requested;
+    let (actual, reason) = if replacement.is_none() {
+        (original_id.unwrap_or("original"), "unavailable")
+    } else if Some(target) != original_id && automatic && original.is_none() {
+        (target, "kept-replacement: original-unavailable")
+    } else if Some(target) != original_id && automatic && savings <= 0 {
+        (
+            original_id.unwrap_or("original"),
+            "kept-original: no-saving",
+        )
+    } else if target != requested {
+        (target, "fallback: choice-unavailable")
+    } else {
+        (target, fallback_reason.unwrap_or("selected"))
+    };
+    let pin_bytes = pin
+        .as_deref()
+        .and_then(|id| text(&line, id, policy).map(|text| wrap(id, text).bytes()))
+        .unwrap_or(0);
+    let turn = if Some(actual) == original_id {
+        original
+    } else {
+        replacement
+    };
+    let included = turn.as_ref().is_some_and(|turn| turn.bytes() <= max_bytes);
+    let reason = if turn.is_none() {
+        "representation-unavailable"
+    } else if !included {
+        "record-exceeds-budget"
+    } else if pin.as_deref().is_some_and(|pin| pin != actual) && authority == "decider" {
+        "decider-overrode-pin"
+    } else {
+        reason
+    };
+    (
+        Chosen {
+            requested: requested.to_owned(),
+            actual: included.then(|| actual.to_owned()),
+            reason: reason.to_owned(),
+            original_bytes,
+            replacement_bytes,
+            pin,
+            pin_bytes,
+        },
+        turn.filter(|_| included),
+    )
+}
+
 impl Journal {
     fn horizon(&self, input: &Projection<'_>) -> u64 {
         let now = millis(SystemTime::now());
@@ -247,102 +400,37 @@ impl Journal {
             .max(now.saturating_sub(duration_millis(input.window.forget_after)))
     }
 
-    fn eligible_lines(
+    fn tail(
         &self,
         input: &Projection<'_>,
-        persisted: &mut HashSet<u64>,
-    ) -> Result<VecDeque<(u64, Evidence, Vec<String>)>, JournalError> {
-        let _lock = self.lock.lock();
-        let mut lines = VecDeque::new();
-        let now = millis(SystemTime::now());
+        mut visit: impl FnMut(Line, bool) -> bool,
+    ) -> Result<(), JournalError> {
         let horizon = self.horizon(input);
-        match validated_lines(&self.path(input.stem), |line| {
-            persisted.insert(line.turn_id);
-            if line.grant != input.grant
-                || line.at_ms < horizon
-                || input.sealed_at.is_some_and(|at| line.at_ms <= millis(at))
-            {
-                lines.clear();
-            } else {
-                let available = input
-                    .policy
-                    .retain
-                    .iter()
-                    .filter(|id| representation(&line, id, input.policy).is_some())
-                    .cloned()
-                    .collect();
-                lines.push_back((line.record_id, evidence_for(&line, now), available));
-                if lines.len()
-                    > input
-                        .window
-                        .limits
-                        .max_turns
-                        .min(input.window.limits.max_bytes.max(1))
-                {
-                    lines.pop_front();
-                }
-            }
-            Ok(())
-        }) {
+        let _lock = self.lock.lock();
+        let path = self.path(input.stem);
+        let mut lines = match Backward::open(&path) {
+            Ok(lines) => lines,
             Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
-            })
-            | Ok(()) => Ok(lines),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn persist_selections(
-        &self,
-        input: &Projection<'_>,
-        selections: &HashMap<u64, Selection>,
-        fallback: Option<&str>,
-    ) {
-        let Projection {
-            stem,
-            grant,
-            policy,
-            ..
-        } = *input;
-        let tools = JournalMemoryTools {
-            journal: self,
-            stem: stem.to_owned(),
-            grant: grant.to_owned(),
-            versions: HashMap::new(),
+            }) => return Ok(()),
+            Err(error) => return Err(error),
         };
-        let _lock = self.lock.lock();
-        if let Err(error) = tools.mutate(|line| {
-            if line.grant != grant {
-                return false;
-            }
-            let Some(selection) = selections.get(&line.record_id) else {
-                return false;
+        loop {
+            let line = match lines.next_line() {
+                Ok(Some(line)) => line,
+                Ok(None) => return Ok(()),
+                Err(JournalError::Corrupt) => {
+                    remove(&path);
+                    return Err(JournalError::Corrupt);
+                }
+                Err(error) => return Err(error),
             };
-            let requested = selection.requested.as_deref().unwrap_or("none");
-            let original_bytes = line.original_bytes;
-            let replacement_bytes = if Some(requested) == original_id(policy) && line.exchanges.is_empty() {
-                original_bytes
-            } else { representation(line, requested, policy).map_or(0, |text| text.len()) };
-            let pin = line.pins.iter().find(|pin| pin.record_id == line.record_id)
-                .map(|pin| pin.representation_id.as_str());
-            let pin_bytes = pin.and_then(|id| representation(line, id, policy)).map_or(0, |text| text.len());
-            tracing::info!(event = "gateway_memory_selection", record_id = line.record_id,
-                requested, actual = selection.actual.as_deref().unwrap_or("omitted"),
-                original_bytes, replacement_bytes,
-                savings_bytes = i64::try_from(original_bytes).unwrap_or(i64::MAX)
-                    - i64::try_from(replacement_bytes).unwrap_or(i64::MAX),
-                reason = selection.reason.as_deref().unwrap_or("none"),
-                pin = pin.unwrap_or("none"), pin_bytes, pinned = pin.is_some(),
-                authority = selection.authority.as_str(), fallback_reason = fallback.unwrap_or("none"),
-                policy = ?policy.selection.mode);
-            line.selections = vec![selection.clone()];
-            true
-        }) {
-            tracing::warn!(
-                event = "gateway_memory_retention_failed",
-                reason = "selection-persistence",
-                category = error.label()
-            );
+            let eligible = line.grant == input.grant
+                && line.at_ms >= horizon
+                && input.sealed_at.is_none_or(|at| line.at_ms > millis(at));
+            if !visit(line, eligible) || !eligible {
+                return Ok(());
+            }
         }
     }
 
@@ -352,41 +440,51 @@ impl Journal {
         resident: &History,
         mut decide: impl FnMut(&[String], &[Evidence]) -> Result<String, &'static str>,
     ) -> Result<History, JournalError> {
-        let mut persisted = HashSet::new();
-        let lines = self.eligible_lines(&input, &mut persisted)?;
         let Projection {
-            stem,
-            grant,
             window,
             policy,
             sealed_at,
+            ..
         } = input;
         let horizon = self.horizon(&input);
+        let limit = window.limits.max_turns.min(window.limits.max_bytes.max(1));
+        let now = millis(SystemTime::now());
+        let mut persisted = HashSet::new();
+        let mut rows = Vec::new();
+        self.tail(&input, |line, eligible| {
+            persisted.insert(line.turn_id);
+            if eligible {
+                rows.push((
+                    line.record_id,
+                    evidence_for(&line, now),
+                    eligible_ids(&line, policy),
+                ));
+            }
+            rows.len() < limit
+        })?;
         let mut unpersisted = unpersisted(resident, &persisted, horizon, sealed_at);
         let mut fitted = Fitted {
             history: History::new(window.limits),
             records: VecDeque::new(),
-            selections: HashMap::new(),
+            chosen: BTreeMap::new(),
         };
-        if lines.is_empty() {
+        let Some(first) = rows.last().map(|row| row.0) else {
             unpersisted
                 .into_iter()
                 .for_each(|turn| fitted.push(turn, None));
             return Ok(fitted.history);
-        }
-        let selection = &policy.selection;
-        let original_id = original_id(policy);
-        let default = default_choice(policy);
+        };
+        rows.reverse();
         let available: Vec<String> = policy
             .retain
             .iter()
-            .filter(|id| lines.iter().any(|(_, _, ids)| ids.contains(id)))
+            .filter(|id| rows.iter().any(|(_, _, ids)| ids.contains(id)))
             .cloned()
             .collect();
-        let first = lines.front().map(|row| row.0).unwrap_or(0);
-        let last = lines.back().map(|row| row.0).unwrap_or(0);
-        let evidence: Vec<_> = lines.into_iter().map(|(_, evidence, _)| evidence).collect();
-        let (choice, authority, fallback_reason) = match selection.mode {
+        let last = rows.last().map_or(first, |row| row.0);
+        let evidence: Vec<_> = rows.into_iter().map(|(_, evidence, _)| evidence).collect();
+        let default = default_choice(policy);
+        let (routine, authority, fallback_reason) = match policy.selection.mode {
             SelectionMode::Fixed => (default.to_owned(), "fixed", None),
             SelectionMode::AgentPreference => (default.to_owned(), "agentPreference", None),
             SelectionMode::Decider => match decide(&available, &evidence) {
@@ -395,112 +493,63 @@ impl Journal {
                 Err(reason) => (default.to_owned(), "fallback", Some(reason)),
             },
         };
-        let _lock = self.lock.lock();
-        validated_lines(&self.path(stem), |line| {
-            if line.record_id < first
-                || line.record_id > last
-                || line.grant != grant
-                || line.at_ms < horizon
-                || sealed_at.is_some_and(|at| line.at_ms <= millis(at))
-            {
-                return Ok(());
+        let choice = Choice {
+            routine: &routine,
+            authority,
+            fallback_reason,
+        };
+        let mut projected = Vec::new();
+        self.tail(&input, |line, _eligible| {
+            if line.record_id < first {
+                return false;
             }
-            while let Some(turn) =
-                unpersisted.pop_front_if(|turn| turn.memory_id().unwrap_or(u64::MAX) < line.turn_id)
-            {
-                fitted.push(turn, None);
+            if line.record_id <= last {
+                let (record_id, turn_id) = (line.record_id, line.turn_id);
+                let (chosen, turn) = choose(line, &choice, policy, window.limits.max_bytes);
+                projected.push((record_id, turn_id, chosen, turn));
             }
-            let pin = line
-                .pins
-                .iter()
-                .find(|pin| pin.record_id == line.record_id)
-                .map(|pin| pin.representation_id.as_str());
-            let requested = if authority == "decider" {
-                choice.as_str()
-            } else {
-                pin.unwrap_or(&choice)
-            };
-            let original = original_id.and_then(|id| representation(&line, id, policy));
-            let replacement = representation(&line, requested, policy);
-            let original_bytes = if original.is_some() && line.exchanges.is_empty() {
-                line.user.as_ref().map_or(0, String::len)
-                    + line.answer.as_ref().map_or(0, String::len)
-            } else {
-                original.as_ref().map_or(line.original_bytes, String::len)
-            };
-            let replacement_bytes = replacement.as_ref().map_or(0, String::len);
-            let savings = i64::try_from(original_bytes).unwrap_or(i64::MAX)
-                - i64::try_from(replacement_bytes).unwrap_or(i64::MAX);
-            let automatic = authority == "fixed" || authority == "fallback";
-            let (actual, reason) = if replacement.is_none() {
-                (original_id.unwrap_or("original"), "unavailable")
-            } else if Some(requested) != original_id
-                && automatic
-                && pin.is_none()
-                && original.is_none()
-            {
-                (requested, "kept-replacement: original-unavailable")
-            } else if Some(requested) != original_id && automatic && pin.is_none() && savings <= 0 {
-                (
-                    original_id.unwrap_or("original"),
-                    "kept-original: no-saving",
-                )
-            } else {
-                (requested, fallback_reason.unwrap_or("selected"))
-            };
-            let sent = if Some(actual) == original_id {
-                original
-            } else {
-                replacement
-            };
-            let sent_bytes = if Some(actual) == original_id && line.exchanges.is_empty() {
-                original_bytes
-            } else {
-                sent.as_ref().map_or(0, String::len)
-            };
-            let included = sent
-                .as_ref()
-                .is_some_and(|_| sent_bytes <= window.limits.max_bytes);
-            let reason = if sent.is_none() {
-                "representation-unavailable"
-            } else if !included {
-                "record-exceeds-budget"
-            } else if pin.is_some_and(|pin| pin != actual) && authority == "decider" {
-                "decider-overrode-pin"
-            } else {
-                reason
-            };
-            fitted.selections.insert(
-                line.record_id,
-                Selection {
-                    requested: Some(requested.to_owned()),
-                    available: available.clone(),
-                    actual: included.then(|| actual.to_owned()),
-                    authority: authority.to_owned(),
-                    reason: Some(reason.to_owned()),
-                },
-            );
-            if let Some(text) = sent.filter(|_| included) {
-                let turn = if Some(actual) == original_id
-                    && line.exchanges.is_empty()
-                    && let Some(user) = line.user
-                {
-                    match line.answer {
-                        Some(answer) => ConversationTurn::completed(user, answer),
-                        None => ConversationTurn::unanswered(user),
-                    }
-                } else {
-                    ConversationTurn::unanswered(text)
-                };
-                fitted.push(turn, Some(line.record_id));
-            }
-            Ok(())
+            true
         })?;
-        drop(_lock);
+        for (record_id, turn_id, chosen, turn) in projected.into_iter().rev() {
+            while let Some(resident) =
+                unpersisted.pop_front_if(|turn| turn.memory_id().unwrap_or(u64::MAX) < turn_id)
+            {
+                fitted.push(resident, None);
+            }
+            fitted.chosen.insert(record_id, chosen);
+            if let Some(turn) = turn {
+                fitted.push(turn, Some(record_id));
+            }
+        }
         unpersisted
             .into_iter()
             .for_each(|turn| fitted.push(turn, None));
-        self.persist_selections(&input, &fitted.selections, fallback_reason);
+        let mode = match policy.selection.mode {
+            SelectionMode::Fixed => "fixed",
+            SelectionMode::AgentPreference => "agentPreference",
+            SelectionMode::Decider => "decider",
+        };
+        for (record_id, chosen) in &fitted.chosen {
+            tracing::info!(
+                event = "gateway_memory_selection",
+                record_id,
+                requested = chosen.requested,
+                actual = chosen.actual.as_deref().unwrap_or("omitted"),
+                original_bytes = chosen.original_bytes,
+                replacement_bytes = chosen.replacement_bytes,
+                savings_bytes = i64::try_from(
+                    i128::from(chosen.original_bytes) - i128::from(chosen.replacement_bytes)
+                )
+                .unwrap_or(i64::MIN),
+                reason = chosen.reason,
+                pin = chosen.pin.as_deref().unwrap_or("none"),
+                pin_bytes = chosen.pin_bytes,
+                pinned = chosen.pin.is_some(),
+                authority,
+                fallback_reason = fallback_reason.unwrap_or("none"),
+                policy = mode,
+            );
+        }
         Ok(fitted.history)
     }
 }

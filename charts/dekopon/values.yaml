@@ -90,7 +90,7 @@ initSecurityContext:
 #   <configDir>/gatewayd.yaml             0600 65533  (gateway-only volume)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
-#   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
+#   <catalogDir>/<catalog key>            root or gateway UID, no group/world write; root requires a read-only mount
 # A ConfigMap key holding extra PEM roots both daemons trust for their OTLP exporters, beside the
 # public roots; each gets it as OTEL_EXPORTER_OTLP_CERTIFICATE. For a receiver on a private CA.
 otlp:
@@ -170,8 +170,8 @@ broker:
     existingSecret: ""
     existingSecretKey: policies.cedar
 
-  # Provider secrets. The only file in this chart that is a secret at rest, and the one the
-  # permission rules are strictest about. Leave both empty when broker.yaml names no
+  # Provider credential bindings. This file and broker.privateFiles are broker-only secrets at
+  # rest, with the strictest permission rules. Leave both empty when broker.yaml names no
   # credentialsPath. Prefer existingSecret: putting a token in a values file puts it in the
   # release, in `helm get values`, and probably in Git.
   credentials:
@@ -307,6 +307,21 @@ broker:
   #   existingSecretKey: token
   secretBootstrapFiles: []
 
+  # Broker-only private keys and other Tier A files. Projected Secret keys are copied at pod
+  # start into <paths.configDir>/private as regular 0600 files under a broker-owned 0700 parent.
+  # Reference that copied path, never a projected Secret key (O_NOFOLLOW rejects its symlink).
+  # Annotate the Secret for Reloader so a changed key rolls the pod.
+  # - file: app-key.pem
+  #   existingSecret: broker-app-key
+  #   existingSecretKey: private-key
+  privateFiles: []
+
+  # Durable broker-owned directory on the state claim for oauth2Refresh recordPath. The broker
+  # mounts only this subtree, not the claim root or the gateway's credential directory.
+  oauth2Records:
+    subdir: broker-oauth2-records
+    mountPath: /var/lib/dekopon/oauth2-records
+
   resources:
     requests:
       cpu: 100m
@@ -363,8 +378,8 @@ gateway:
   configDirectory:
     configMap: ""
 
-  # catalogPath is the one file with no hygiene rules at all — dekopon-gatewayd reads it with a plain
-  # read_to_string. A ConfigMap mount is fine and nothing is copied.
+  # catalogPath and referenced instruction/skill files are checked for owner and mode; a root-owned
+  # ConfigMap key is accepted on a read-only mount. The chart does not copy catalog keys.
   catalog:
     inline: ""
     existingConfigMap: ""

@@ -7,16 +7,14 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use dekopon_agent::prompt::{
-    ConversationTurn, Exchange, History, Pin, ReadRef, Representation, Selection,
-};
+use dekopon_agent::prompt::{ConversationTurn, Exchange, History, Pin, ReadRef, Representation};
 use dekopon_core::AgentId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,7 +22,7 @@ use thiserror::Error;
 
 use crate::{
     asset::{AssetRef, AssetSourceRef, PendingAsset, RecalledAsset},
-    config::MemoryWindow,
+    config::{MemoryWindow, memory::ResolvedPolicy},
     conversation::SealedConversation,
 };
 
@@ -34,7 +32,6 @@ const FOLLOW_EXTENSION: &str = "followed";
 const MAX_FOLLOW_BYTES: u64 = 4096;
 const MAX_SEAL_BYTES: u64 = 4096;
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const LINE_SLACK_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum JournalError {
@@ -69,7 +66,7 @@ struct Line {
     next_record_id: u64,
     source_eligibility: bool,
     #[serde(default)]
-    original_bytes: usize,
+    original_bytes: u64,
     #[serde(default)]
     turn_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,8 +81,6 @@ struct Line {
     pins: Vec<Pin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     reads: Vec<ReadRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    selections: Vec<Selection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     availability: Vec<String>,
     // The conversation's whole inventory when the line was written; recall reads only the newest.
@@ -383,7 +378,7 @@ impl Journal {
         now: SystemTime,
     ) -> Result<Recalled, JournalError> {
         let _lock = self.lock.lock();
-        self.expire(now)?;
+        self.sweep(now, false)?;
         let seal_ms = self
             .read_seal(stem, window.forget_after)?
             .map(|seal| millis(seal.at));
@@ -442,51 +437,51 @@ impl Journal {
         &self,
         stem: &str,
         entry: &Entry<'_>,
-        window: MemoryWindow,
+        _window: MemoryWindow,
     ) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         let path = self.path(stem);
-        let next_record_id = match read_lines(&path) {
-            Ok(lines) => lines.last().map_or(1, |last| last.next_record_id),
+        let next_record_id = match Backward::open(&path).and_then(|mut lines| lines.next_line()) {
+            Ok(last) => last.map_or(1, |last| last.next_record_id),
             Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
             }) => 1,
+            Err(JournalError::Corrupt) => {
+                remove(&path);
+                return Err(JournalError::Corrupt);
+            }
             Err(error) => return Err(error),
         };
+        let default;
+        let prepared = match entry.prepared {
+            Some(prepared) => prepared,
+            None => {
+                default = super::generation::prepare(
+                    entry.turn,
+                    &ResolvedPolicy::default(),
+                    |_| None,
+                    true,
+                );
+                &default
+            }
+        };
+        let chat = prepared.original && prepared.include_chat;
         let mut line = Line {
             version: 2,
             at_ms: millis(entry.at),
             record_id: next_record_id,
             next_record_id: next_record_id.checked_add(1).ok_or(JournalError::Corrupt)?,
-            source_eligibility: entry.prepared.is_none_or(|prepared| prepared.original),
-            original_bytes: entry
-                .prepared
-                .filter(|prepared| !prepared.include_chat)
-                .map_or_else(|| selection::original_envelope_bytes(entry.turn), |_| 0),
+            source_eligibility: prepared.original,
+            original_bytes: super::generation::captured_bytes(entry.turn, prepared.include_chat),
             turn_id: entry.turn.memory_id().unwrap_or(0),
-            representations: entry
-                .prepared
-                .map_or_else(Vec::new, |prepared| prepared.representations.clone()),
-            exchanges: entry.prepared.map_or_else(
-                || entry.turn.exchanges().to_vec(),
-                |prepared| prepared.exchanges.clone(),
-            ),
+            representations: prepared.representations.clone(),
+            exchanges: prepared.exchanges.clone(),
             pins: Vec::new(),
             reads: Vec::new(),
-            selections: Vec::new(),
-            availability: entry.prepared.map_or_else(
-                || vec!["original".to_owned()],
-                |prepared| prepared.availability.clone(),
-            ),
+            availability: prepared.availability.clone(),
             grant: entry.grant.to_owned(),
-            user: entry
-                .prepared
-                .filter(|prepared| !prepared.original || !prepared.include_chat)
-                .map_or_else(|| Some(entry.turn.user().to_owned()), |_| None),
-            answer: entry
-                .prepared
-                .filter(|prepared| !prepared.original || !prepared.include_chat)
-                .map_or_else(|| entry.turn.answer().map(str::to_owned), |_| None),
+            user: chat.then(|| entry.turn.user().to_owned()),
+            answer: entry.turn.answer().filter(|_| chat).map(str::to_owned),
             assets: entry
                 .inventory
                 .iter()
@@ -516,6 +511,16 @@ impl Journal {
                 representation.source_record_id = next_record_id;
             }
         }
+        let encoded = encode_line(&line)?;
+        let agent = stem.split_once('/').map(|(agent, _)| agent);
+        if agent.is_some_and(|agent| encoded.len() as u64 > self.agent_cap(agent)) {
+            tracing::warn!(
+                event = "gateway_memory_retention_failed",
+                reason = "agent-byte-cap",
+                encoded_bytes = encoded.len()
+            );
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             DirBuilder::new()
                 .recursive(true)
@@ -527,21 +532,18 @@ impl Journal {
             .append(true)
             .mode(0o600)
             .open(&path)?;
-        let encoded = encode_line(&line)?;
         file.write_all(&encoded)?;
-        let bytes = file.metadata()?.len();
         drop(file);
-        if bytes > compaction_threshold(window) {
-            match compact(&path, self.age_for(stem), entry.at) {
-                Err(JournalError::Corrupt) => {
-                    remove(&path);
-                    return Err(JournalError::Corrupt);
-                }
-                result => result?,
+        let horizon = millis(entry.at).saturating_sub(duration_millis(self.age_for(stem)));
+        match sweep_file(&path, horizon) {
+            Err(JournalError::Corrupt) => {
+                remove(&path);
+                return Err(JournalError::Corrupt);
             }
-        }
-        if let Some((agent, _)) = stem.split_once('/')
-            && self.enforce_agent_cap(agent, Some((&path, line.record_id)))?
+            result => result?,
+        };
+        if let Some(agent) = agent
+            && self.enforce_agent_cap(agent, Some(&path))?
         {
             tracing::warn!(
                 event = "gateway_memory_retention_failed",
@@ -568,68 +570,68 @@ impl Journal {
     fn enforce_agent_cap(
         &self,
         agent: &str,
-        appended: Option<(&Path, u64)>,
+        appended: Option<&Path>,
     ) -> Result<bool, JournalError> {
-        let limit = self
-            .agent_bytes
-            .get(agent)
-            .copied()
-            .unwrap_or(self.max_bytes_per_agent);
+        let limit = self.agent_cap(agent);
         let directory = self.dir.join(agent);
         if !directory.exists() {
             return Ok(false);
         }
-        let mut paths = Vec::new();
+        let mut files = Vec::new();
         let mut total = 0u64;
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
             if is_journal_file(&path) {
                 let size = fs::metadata(&path)?.len();
                 total = total.saturating_add(size);
-                paths.push((path, size));
+                files.push((path, size, 0u64, None));
             }
         }
         if total <= limit {
             return Ok(false);
         }
-        let mut files = paths
-            .into_iter()
-            .map(|(path, size)| {
-                let lines = read_lines(&path)?;
-                Ok((path, size, lines, 0usize))
-            })
-            .collect::<Result<Vec<_>, JournalError>>()?;
-        let mut lost_append = false;
+        for (path, _, _, head) in &mut files {
+            *head = head_at(path, 0)?;
+        }
         while total > limit {
-            let oldest = files
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (path, _, lines, removed))| {
-                    lines.get(*removed).map(|line| (line.at_ms, path, index))
+            let Some((path, _, cut, head)) = files
+                .iter_mut()
+                .filter(|(_, _, _, head)| head.is_some())
+                .min_by(|left, right| {
+                    (left.3.map(|(at, _)| at), &left.0).cmp(&(right.3.map(|(at, _)| at), &right.0))
                 })
-                .min_by_key(|(at, path, _)| (*at, *path));
-            let Some((_, _, index)) = oldest else {
+            else {
                 break;
             };
-            let (path, size, lines, removed) = &mut files[index];
-            lost_append |= appended
-                .is_some_and(|(new_path, id)| new_path == path && lines[*removed].record_id == id);
-            let dropped = encode_line(&lines[*removed])?.len() as u64;
-            *removed += 1;
-            *size = size.saturating_sub(dropped);
-            total = total.saturating_sub(dropped);
+            let Some((_, end)) = *head else {
+                break;
+            };
+            total = total.saturating_sub(end - *cut);
+            *cut = end;
+            *head = head_at(path, end)?;
         }
-        for (path, _, lines, removed) in files {
-            if removed == 0 {
+        for (path, size, cut, _) in &files {
+            if *cut == 0 {
                 continue;
             }
-            if removed == lines.len() {
+            if *cut >= *size {
                 fs::remove_file(path)?;
             } else {
-                rewrite(&path, &lines[removed..])?;
+                keep_from(path, *cut)?;
             }
         }
-        Ok(lost_append)
+        Ok(appended.is_some_and(|appended| {
+            files
+                .iter()
+                .any(|(path, size, cut, _)| path == appended && cut >= size)
+        }))
+    }
+
+    fn agent_cap(&self, agent: &str) -> u64 {
+        self.agent_bytes
+            .get(agent)
+            .copied()
+            .unwrap_or(self.max_bytes_per_agent)
     }
 
     fn path(&self, stem: &str) -> PathBuf {
@@ -651,7 +653,10 @@ impl Journal {
                 for file in fs::read_dir(path)? {
                     let file = file?;
                     if is_journal_file(&file.path())
-                        && matches!(read_lines(&file.path()), Err(JournalError::Corrupt))
+                        && matches!(
+                            validated_lines(&file.path(), |_line| Ok(())),
+                            Err(JournalError::Corrupt)
+                        )
                     {
                         remove(&file.path());
                         tracing::warn!(event = "gateway_journal_reset", reason = "corrupt");
@@ -665,8 +670,12 @@ impl Journal {
         Ok(())
     }
 
-    // Follow markers expire by their lifecycle deadline, not the journal window's file mtime.
     fn expire(&self, now: SystemTime) -> Result<(), JournalError> {
+        self.sweep(now, true)
+    }
+
+    // Follow markers expire by their lifecycle deadline, not the journal window's file mtime.
+    fn sweep(&self, now: SystemTime, records: bool) -> Result<(), JournalError> {
         let cutoff = now.checked_sub(self.retention);
         let seal_cutoff = now.checked_sub(self.seal_retention);
         for entry in fs::read_dir(&self.dir)? {
@@ -684,7 +693,7 @@ impl Journal {
                         }) {
                             remove(&file_path);
                             tracing::info!(event = "gateway_journal_expired");
-                        } else {
+                        } else if records {
                             let age = self.age_for(&format!(
                                 "{}/{}",
                                 path.file_name().unwrap_or_default().to_string_lossy(),
@@ -793,12 +802,6 @@ pub(crate) fn grant_digest(granted: &[String]) -> String {
         .collect()
 }
 
-fn compaction_threshold(window: MemoryWindow) -> u64 {
-    (window.limits.max_bytes as u64)
-        .saturating_mul(2)
-        .saturating_add(LINE_SLACK_BYTES)
-}
-
 fn encode_line(line: &Line) -> Result<Vec<u8>, JournalError> {
     let mut encoded = serde_json::to_vec(line).map_err(io::Error::from)?;
     encoded.push(b'\n');
@@ -813,6 +816,97 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn checked(line: Line) -> Result<Line, JournalError> {
+    if line.version != 2
+        || line.next_record_id != line.record_id.saturating_add(1)
+        || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
+    {
+        return Err(JournalError::Corrupt);
+    }
+    Ok(line)
+}
+
+fn body(line: &Line, id: &str, version: &str) -> Option<String> {
+    dekopon_agent::prompt::render_body(
+        dekopon_agent::prompt::BodySource {
+            user: line.user.as_deref(),
+            answer: line.answer.as_deref(),
+            source_eligibility: line.source_eligibility,
+            representations: &line.representations,
+            exchanges: &line.exchanges,
+        },
+        id,
+        version,
+    )
+}
+
+struct Backward {
+    file: File,
+    end: u64,
+    newer: Option<u64>,
+}
+
+impl Backward {
+    fn open(path: &Path) -> Result<Self, JournalError> {
+        let file = File::open(path)?;
+        let end = file.metadata()?.len();
+        Ok(Self {
+            file,
+            end,
+            newer: None,
+        })
+    }
+
+    fn next_line(&mut self) -> Result<Option<Line>, JournalError> {
+        let Some(stop) = self.end.checked_sub(1) else {
+            return Ok(None);
+        };
+        let mut chunk = [0; 8192];
+        let mut cursor = stop;
+        let mut start = 0;
+        while cursor > 0 {
+            let from = cursor.saturating_sub(chunk.len() as u64);
+            let part = &mut chunk[..(cursor - from) as usize];
+            self.file.seek(SeekFrom::Start(from))?;
+            self.file.read_exact(part)?;
+            if let Some(index) = part.iter().rposition(|byte| *byte == b'\n') {
+                start = from + index as u64 + 1;
+                break;
+            }
+            cursor = from;
+        }
+        let mut bytes = vec![0; (stop - start) as usize];
+        self.file.seek(SeekFrom::Start(start))?;
+        self.file.read_exact(&mut bytes)?;
+        self.end = start;
+        let line = checked(
+            serde_json::from_slice::<Line>(&bytes).map_err(|_malformed| JournalError::Corrupt)?,
+        )?;
+        if self.newer.is_some_and(|newer| newer != line.next_record_id) {
+            return Err(JournalError::Corrupt);
+        }
+        self.newer = Some(line.record_id);
+        Ok(Some(line))
+    }
+}
+
+fn head_at(path: &Path, offset: u64) -> Result<Option<(u64, u64)>, JournalError> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut lines = serde_json::Deserializer::from_reader(BufReader::new(file)).into_iter::<Line>();
+    let Some(line) = lines
+        .next()
+        .transpose()
+        .map_err(|_malformed| JournalError::Corrupt)?
+    else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    observe_live_decoded(1);
+    let line = checked(line)?;
+    Ok(Some((line.at_ms, offset + lines.byte_offset() as u64 + 1)))
+}
+
 fn read_window(
     path: &Path,
     grant: &str,
@@ -821,42 +915,46 @@ fn read_window(
     horizon_ms: u64,
     age_horizon_ms: u64,
 ) -> Result<(History, Option<Line>), JournalError> {
-    let mut history = History::new(window.limits);
+    let mut lines = Backward::open(path)?;
+    let mut turns = Vec::new();
+    let mut bytes = 0_usize;
+    let mut records = 0_usize;
     let mut last = None;
-    let mut previous = None;
-    for item in
-        serde_json::Deserializer::from_reader(BufReader::new(File::open(path)?)).into_iter::<Line>()
-    {
-        let mut line = item.map_err(|_malformed| JournalError::Corrupt)?;
+    while let Some(mut line) = lines.next_line()? {
         #[cfg(test)]
         observe_live_decoded(1 + usize::from(last.is_some()));
-        if line.version != 2
-            || previous.is_some_and(|id| id != line.record_id)
-            || line.next_record_id != line.record_id.saturating_add(1)
-            || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
-        {
-            return Err(JournalError::Corrupt);
-        }
-        previous = Some(line.next_record_id);
         if line.grant != grant
             || line.at_ms < horizon_ms
             || line.at_ms < age_horizon_ms
             || seal_ms.is_some_and(|seal| line.at_ms <= seal)
         {
-            history = History::new(window.limits);
-            last = None;
-            continue;
+            break;
         }
-        if let Some(user) = line.user.take() {
-            let turn = match line.answer.take() {
+        records += 1;
+        let turn = line.user.take().map(|user| {
+            match line.answer.take() {
                 Some(answer) => ConversationTurn::completed(user, answer),
                 None => ConversationTurn::unanswered(user),
-            };
-            history.record(turn.with_memory_id(line.turn_id));
+            }
+            .with_memory_id(line.turn_id)
+            .clipped(window.limits.max_bytes)
+        });
+        last.get_or_insert(line);
+        if let Some(turn) = turn {
+            bytes = bytes.saturating_add(turn.bytes());
+            if bytes > window.limits.max_bytes {
+                break;
+            }
+            turns.push(turn);
         }
-        last = Some(line);
+        if records >= window.limits.max_turns {
+            break;
+        }
     }
-    Ok((history, last))
+    Ok((
+        History::from_turns(window.limits, turns.into_iter().rev()),
+        last,
+    ))
 }
 
 #[cfg(test)]
@@ -890,31 +988,15 @@ impl Drop for DecodedHold {
     }
 }
 
+#[cfg(test)]
 fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
-    let file = BufReader::new(File::open(path)?);
-    let lines: Vec<Line> = serde_json::Deserializer::from_reader(file)
-        .into_iter()
-        .collect::<Result<_, _>>()
-        .map_err(|_malformed| JournalError::Corrupt)?;
-    #[cfg(test)]
+    let mut lines = Vec::new();
+    validated_lines(path, |line| {
+        lines.push(line);
+        Ok(())
+    })?;
     observe_live_decoded(lines.len());
-    if lines.iter().any(|line| line.version != 2)
-        || lines
-            .windows(2)
-            .any(|pair| pair[0].next_record_id != pair[1].record_id)
-        || lines.iter().any(|line| {
-            line.next_record_id != line.record_id.saturating_add(1)
-                || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
-        })
-    {
-        return Err(JournalError::Corrupt);
-    }
     Ok(lines)
-}
-
-fn compact(path: &Path, max_age: Duration, now: SystemTime) -> Result<(), JournalError> {
-    let horizon = millis(now).saturating_sub(duration_millis(max_age));
-    rewrite_eligible(path, horizon)
 }
 
 fn validated_lines(
@@ -924,12 +1006,8 @@ fn validated_lines(
     let file = BufReader::new(File::open(path)?);
     let mut previous = None;
     for item in serde_json::Deserializer::from_reader(file).into_iter::<Line>() {
-        let line = item.map_err(|_malformed| JournalError::Corrupt)?;
-        if line.version != 2
-            || previous.is_some_and(|id| id != line.record_id)
-            || line.next_record_id != line.record_id.saturating_add(1)
-            || (!line.source_eligibility && (line.user.is_some() || line.answer.is_some()))
-        {
+        let line = checked(item.map_err(|_malformed| JournalError::Corrupt)?)?;
+        if previous.is_some_and(|id| id != line.record_id) {
             return Err(JournalError::Corrupt);
         }
         previous = Some(line.next_record_id);
@@ -941,23 +1019,9 @@ fn validated_lines(
 }
 
 fn sweep_file(path: &Path, horizon: u64) -> Result<bool, JournalError> {
-    let first = serde_json::Deserializer::from_reader(BufReader::new(File::open(path)?))
-        .into_iter::<Line>()
-        .next()
-        .transpose()
-        .map_err(|_malformed| JournalError::Corrupt)?;
-    let Some(first) = first else {
-        return Ok(false);
-    };
-    #[cfg(test)]
-    observe_live_decoded(1);
-    if first.version != 2 || first.next_record_id != first.record_id.saturating_add(1) {
-        return Err(JournalError::Corrupt);
-    }
-    if first.at_ms >= horizon {
+    if head_at(path, 0)?.is_none_or(|(at, _)| at >= horizon) {
         return Ok(false);
     }
-    drop(first);
     rewrite_eligible(path, horizon)?;
     if fs::metadata(path)?.len() == 0 {
         remove(path);
@@ -965,7 +1029,10 @@ fn sweep_file(path: &Path, horizon: u64) -> Result<bool, JournalError> {
     Ok(true)
 }
 
-fn rewrite_eligible(path: &Path, horizon: u64) -> Result<(), JournalError> {
+fn replace_with(
+    path: &Path,
+    fill: impl FnOnce(&mut File) -> Result<(), JournalError>,
+) -> Result<(), JournalError> {
     let temporary = path.with_extension("compact");
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -974,12 +1041,7 @@ fn rewrite_eligible(path: &Path, horizon: u64) -> Result<(), JournalError> {
             .truncate(true)
             .mode(0o600)
             .open(&temporary)?;
-        validated_lines(path, |line| {
-            if line.at_ms >= horizon {
-                file.write_all(&encode_line(&line)?)?;
-            }
-            Ok(())
-        })?;
+        fill(&mut file)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
@@ -991,21 +1053,34 @@ fn rewrite_eligible(path: &Path, horizon: u64) -> Result<(), JournalError> {
     result
 }
 
+fn rewrite_eligible(path: &Path, horizon: u64) -> Result<(), JournalError> {
+    replace_with(path, |file| {
+        validated_lines(path, |line| {
+            if line.at_ms >= horizon {
+                file.write_all(&encode_line(&line)?)?;
+            }
+            Ok(())
+        })
+    })
+}
+
+fn keep_from(path: &Path, offset: u64) -> Result<(), JournalError> {
+    replace_with(path, |file| {
+        let mut source = File::open(path)?;
+        source.seek(SeekFrom::Start(offset))?;
+        io::copy(&mut source, file)?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 fn rewrite(path: &Path, lines: &[Line]) -> Result<(), JournalError> {
-    let temporary = path.with_extension("compact");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    for line in lines {
-        file.write_all(&encode_line(line)?)?;
-    }
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, path)?;
-    Ok(())
+    replace_with(path, |file| {
+        for line in lines {
+            file.write_all(&encode_line(line)?)?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1140,6 +1215,115 @@ mod tests {
             .iter()
             .map(ConversationTurn::user)
             .collect()
+    }
+
+    fn corrupt_oldest_line_in_place(path: &Path) {
+        let bytes = fs::read(path).expect("journal bytes");
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("first record");
+        let mut file = File::options()
+            .write(true)
+            .open(path)
+            .expect("open first record");
+        file.write_all(&vec![b'!'; end])
+            .expect("overwrite first record in place");
+    }
+
+    #[test]
+    fn cold_recall_clips_the_newest_turn_and_never_reads_a_corrupt_older_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut limits = window();
+        limits.limits.max_turns = 40;
+        limits.limits.max_bytes = 1000;
+        append_turn(
+            &journal,
+            &stem,
+            now,
+            GRANT,
+            &ConversationTurn::completed("O", "old"),
+            &[],
+            limits,
+        );
+        append_turn(
+            &journal,
+            &stem,
+            now,
+            GRANT,
+            &ConversationTurn::completed("1".repeat(300), "a".repeat(300)),
+            &[],
+            limits,
+        );
+        let newest = ConversationTurn::completed("2".repeat(1500), "b".repeat(100));
+        append_turn(&journal, &stem, now, GRANT, &newest, &[], limits);
+        let path = journal.path(&stem);
+        corrupt_oldest_line_in_place(&path);
+        PEAK_LIVE_DECODED.with(|peak| peak.set(0));
+        let recalled = journal
+            .recall(&stem, GRANT, limits, now)
+            .expect("bounded cold recall");
+        let mut warm = History::new(limits.limits);
+        warm.record(newest.clone().with_memory_id(0));
+        assert_eq!(
+            recalled.history.turns(),
+            [newest.with_memory_id(0).clipped(1000)]
+        );
+        assert_eq!(recalled.history, warm);
+        assert_eq!(recalled.history.bytes(), 1000);
+        assert!(path.exists());
+        PEAK_LIVE_DECODED.with(|peak| assert!(peak.get() <= 2));
+    }
+
+    #[test]
+    fn cold_recall_counts_userless_records_before_a_corrupt_older_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut limits = window();
+        limits.limits.max_turns = 3;
+        append_turn(
+            &journal,
+            &stem,
+            now,
+            GRANT,
+            &ConversationTurn::completed("O", "old"),
+            &[],
+            limits,
+        );
+        for _ in 0..3 {
+            append_turn(
+                &journal,
+                &stem,
+                now,
+                GRANT,
+                &ConversationTurn::unanswered(""),
+                &[],
+                limits,
+            );
+        }
+        let path = journal.path(&stem);
+        let mut lines = read_lines(&path).expect("records");
+        for line in lines.iter_mut().skip(1) {
+            line.user = None;
+            line.answer = None;
+            line.source_eligibility = false;
+        }
+        let encoded: Vec<u8> = lines
+            .iter()
+            .flat_map(|line| encode_line(line).expect("v2 record"))
+            .collect();
+        fs::write(&path, encoded).expect("three eligible userless records");
+        corrupt_oldest_line_in_place(&path);
+        let recalled = journal
+            .recall(&stem, GRANT, limits, now)
+            .expect("bounded userless recall");
+        assert!(recalled.history.is_empty());
+        assert!(path.exists());
     }
 
     #[test]
@@ -1592,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_past_its_threshold_keeps_eligible_turns_and_the_snapshot() {
+    fn a_large_file_appends_without_rewriting_eligible_turns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -1603,7 +1787,23 @@ mod tests {
             append_with(&journal, &stem, now, GRANT, &filler, &inventory);
         }
         let bytes = fs::metadata(journal.path(&stem)).expect("file").len();
-        assert!(bytes > compaction_threshold(window()), "{bytes} bytes");
+        assert!(bytes > 64 * 1024, "{bytes} bytes");
+        let before = fs::metadata(journal.path(&stem)).expect("file");
+        PEAK_LIVE_DECODED.with(|peak| peak.set(0));
+        append_with(&journal, &stem, now, GRANT, &filler, &inventory);
+        PEAK_LIVE_DECODED.with(|peak| {
+            assert!(
+                peak.get() <= 2,
+                "append must decode only its own tail and head"
+            )
+        });
+        let after = fs::metadata(journal.path(&stem)).expect("file");
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            after.ino(),
+            before.ino(),
+            "an eligible tail append must not rewrite the file"
+        );
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(recalled.history.len(), 2, "two 400-byte turns fit 1 KiB");
         assert_eq!(recalled.assets.len(), 1);
@@ -1646,8 +1846,10 @@ mod tests {
         );
         fs::create_dir_all(journal.path(&stem).parent().unwrap()).unwrap();
         fs::write(journal.path(&stem), old).expect("old format");
-        let recalled = journal.recall(&stem, GRANT, window(), now).expect("reset");
-        assert!(recalled.history.is_empty());
+        assert!(matches!(
+            journal.recall(&stem, GRANT, window(), now),
+            Err(JournalError::Corrupt)
+        ));
         assert!(!journal.path(&stem).exists());
     }
 
@@ -1753,7 +1955,11 @@ mod tests {
                 .iter()
                 .all(|user| *user != "earlier")
         );
-        compact(&journal.path(&stem), age, now + age).unwrap();
+        rewrite_eligible(
+            &journal.path(&stem),
+            millis(now + age).saturating_sub(duration_millis(age)),
+        )
+        .unwrap();
         assert!(
             read_lines(&journal.path(&stem))
                 .unwrap()
@@ -1949,7 +2155,13 @@ mod tests {
                 .any(|part| part == b"source sentinel")
         );
         let record = read_lines(&path).unwrap().pop().unwrap();
-        assert_eq!(record.representations[0].text.as_deref(), Some("summary"));
+        assert_eq!(
+            record
+                .representations
+                .last()
+                .and_then(|rep| rep.text.as_deref()),
+            Some("summary")
+        );
         assert!(
             reopened
                 .recall(&stem, GRANT, window(), now)
@@ -1970,7 +2182,10 @@ mod tests {
         let before = fs::read(&path).unwrap();
         fs::create_dir(path.with_extension("compact")).unwrap();
         assert!(matches!(
-            compact(&path, RETENTION, now),
+            rewrite_eligible(
+                &path,
+                millis(now).saturating_sub(duration_millis(RETENTION))
+            ),
             Err(JournalError::Io { .. })
         ));
         assert_eq!(fs::read(path).unwrap(), before);
@@ -2167,5 +2382,243 @@ mod tests {
         assert!(journal.sealed(&stem, RETENTION).unwrap().is_none());
         journal.expire(SystemTime::now()).unwrap();
         assert!(!path.exists());
+    }
+
+    fn tear_last_line(path: &Path) {
+        let mut file = OpenOptions::new().append(true).open(path).expect("journal");
+        file.write_all(br#"{"version":2,"atMs":1"#)
+            .expect("torn line");
+    }
+
+    #[test]
+    fn a_torn_last_line_resets_the_file_at_append_so_the_next_append_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now, GRANT, "before");
+        tear_last_line(&journal.path(&stem));
+        let turn = ConversationTurn::completed("lost", "re: lost");
+        let entry = Entry {
+            prepared: None,
+            at: now,
+            grant: GRANT,
+            turn: &turn,
+            inventory: &[],
+            next_asset_id: 1,
+        };
+        assert!(matches!(
+            journal.append(&stem, &entry, window()),
+            Err(JournalError::Corrupt)
+        ));
+        assert!(!journal.path(&stem).exists());
+        append(&journal, &stem, now, GRANT, "after");
+        assert_eq!(
+            users(&journal.recall(&stem, GRANT, window(), now).expect("recall")),
+            ["after"]
+        );
+    }
+
+    #[test]
+    fn a_torn_last_line_resets_the_file_at_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let policy = ResolvedPolicy::default();
+        append(&journal, &stem, SystemTime::now(), GRANT, "before");
+        tear_last_line(&journal.path(&stem));
+        let projected = journal.project(
+            Projection {
+                stem: &stem,
+                grant: GRANT,
+                window: window(),
+                sealed_at: None,
+                policy: &policy,
+            },
+            &History::new(window().limits),
+            |_available, _evidence| Err("unused"),
+        );
+        assert!(matches!(projected, Err(JournalError::Corrupt)));
+        assert!(!journal.path(&stem).exists());
+    }
+
+    #[test]
+    fn a_turn_larger_than_the_agent_cap_is_refused_without_evicting_older_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let now = SystemTime::now();
+        let stem = key().journal_stem();
+        let other =
+            ConversationKey::shared(&"reviewer".parse().unwrap(), "slack", "other").journal_stem();
+        append(&journal, &stem, now - Duration::from_secs(2), GRANT, "kept");
+        append(
+            &journal,
+            &other,
+            now - Duration::from_secs(1),
+            GRANT,
+            "also kept",
+        );
+        let before = [
+            fs::read(journal.path(&stem)).unwrap(),
+            fs::read(journal.path(&other)).unwrap(),
+        ];
+        let cap = before.iter().map(|bytes| bytes.len() as u64).sum::<u64>() + 64;
+        journal.agent_bytes.insert("reviewer".into(), cap);
+        let (capture, _guard) = crate::tests::capture_spans();
+        append(&journal, &stem, now, GRANT, &"x".repeat(cap as usize));
+        let failures = capture.events_where(
+            "dekopon_gatewayd",
+            &[
+                ("event", "gateway_memory_retention_failed"),
+                ("reason", "agent-byte-cap"),
+            ],
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            [
+                fs::read(journal.path(&stem)).unwrap(),
+                fs::read(journal.path(&other)).unwrap()
+            ],
+            before
+        );
+    }
+
+    #[test]
+    fn memory_tools_offer_only_retained_routines_like_the_projection_label() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let mut policy = decider_policy();
+        append_represented(&journal, &stem, &policy, "first", &[(1, "summary text")]);
+        policy.retain.retain(|id| id != "summary");
+        let tools = JournalMemoryTools::new(&journal, stem, GRANT.into(), &policy);
+        assert_eq!(
+            tools.read(1, "summary", None),
+            "representation unavailable: missing, discarded or version mismatch; eligible representation IDs: original"
+        );
+    }
+
+    fn decider_policy() -> ResolvedPolicy {
+        use crate::config::memory::{Routine, RoutineKind, SelectionMode};
+        let mut policy = ResolvedPolicy::default();
+        for id in ["summary", "brief"] {
+            policy.routines.push(Routine {
+                id: id.into(),
+                kind: RoutineKind::Prefix,
+                max_bytes: std::num::NonZeroU64::new(1024),
+                model: None,
+                parts: None,
+            });
+            policy.retain.push(id.into());
+        }
+        policy.selection.mode = SelectionMode::Decider;
+        policy.selection.routine = None;
+        policy.selection.decision_capability = Some("decide.choose".into());
+        policy.selection.fallback = Some("summary".into());
+        policy
+    }
+
+    fn append_represented(
+        journal: &Journal,
+        stem: &str,
+        policy: &ResolvedPolicy,
+        user: &str,
+        replacements: &[(usize, &str)],
+    ) {
+        let turn = ConversationTurn::completed(user, "ok");
+        let version = |index: usize| crate::memory::generation::version(&policy.routines[index]);
+        let mut original = Representation::original(&format!("{user}\nok"), &version(0));
+        original.text = None;
+        let mut representations = vec![original];
+        let mut availability = vec!["original".to_owned()];
+        for (index, text) in replacements {
+            let id = policy.routines[*index].id.clone();
+            representations.push(Representation {
+                routine_id: id.clone(),
+                version: version(*index),
+                source_record_id: 0,
+                part: None,
+                kind: "prefix".into(),
+                captured_bytes: text.len() as u64,
+                text: Some((*text).to_owned()),
+            });
+            availability.push(id);
+        }
+        journal
+            .append(
+                stem,
+                &Entry {
+                    at: SystemTime::now(),
+                    grant: GRANT,
+                    turn: &turn,
+                    inventory: &[],
+                    next_asset_id: 1,
+                    prepared: Some(&crate::memory::generation::Prepared {
+                        include_chat: true,
+                        representations,
+                        exchanges: Vec::new(),
+                        original: true,
+                        availability,
+                        failed_routines: Vec::new(),
+                    }),
+                },
+                window(),
+            )
+            .expect("append");
+    }
+
+    #[test]
+    fn a_per_record_decider_fallback_is_sent_only_when_it_saves_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let policy = decider_policy();
+        append_represented(&journal, &stem, &policy, "first", &[(1, "s"), (2, "b")]);
+        append_represented(&journal, &stem, &policy, "second", &[(1, &"x".repeat(200))]);
+        append_represented(&journal, &stem, &policy, &"third".repeat(40), &[(1, "s")]);
+        let (capture, _guard) = crate::tests::capture_spans();
+        let projected = journal
+            .project(
+                Projection {
+                    stem: &stem,
+                    grant: GRANT,
+                    window: window(),
+                    sealed_at: None,
+                    policy: &policy,
+                },
+                &History::new(window().limits),
+                |_available, _evidence| Ok("brief".to_owned()),
+            )
+            .expect("projection");
+        assert_eq!(projected.turns().len(), 3);
+        let selection = |record: &str| {
+            let events = capture.events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_memory_selection"), ("record_id", record)],
+            );
+            assert_eq!(events.len(), 1, "{events:?}");
+            (
+                events[0].field("requested").map(str::to_owned),
+                events[0].field("actual").map(str::to_owned),
+                events[0].field("reason").map(str::to_owned),
+            )
+        };
+        let expect = |requested: &str, actual: &str, reason: &str| {
+            (
+                Some(requested.to_owned()),
+                Some(actual.to_owned()),
+                Some(reason.to_owned()),
+            )
+        };
+        assert_eq!(selection("1"), expect("brief", "brief", "selected"));
+        assert_eq!(
+            selection("2"),
+            expect("brief", "original", "kept-original: no-saving")
+        );
+        assert_eq!(
+            selection("3"),
+            expect("brief", "summary", "fallback: choice-unavailable")
+        );
     }
 }

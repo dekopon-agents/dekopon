@@ -29,12 +29,18 @@ use tokio::{
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use crate::config::HARD_MAX_CONNECTIONS;
+use crate::{Coordination, RECONCILIATION_OWNER, config::HARD_MAX_CONNECTIONS};
 
 #[derive(Clone, Debug)]
 pub struct MappedPeer {
     pub context: AuthenticatedContext,
     pub attestor: Option<AttestorGrant>,
+}
+
+impl MappedPeer {
+    pub(crate) fn is_reconciliation_owner(&self) -> bool {
+        self.attestor.is_some() && self.context.principal().as_str() == RECONCILIATION_OWNER
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,10 +74,17 @@ pub struct BrokerServer<A>
 where
     A: AuditLog,
 {
-    broker: Arc<Broker<A>>,
-    identities: Arc<BTreeMap<u32, MappedPeer>>,
+    source: ServerSource<A>,
     limits: ServerLimits,
     deadline: ShutdownDeadline,
+}
+
+enum ServerSource<A: AuditLog> {
+    Fixed {
+        broker: Arc<Broker<A>>,
+        identities: Arc<BTreeMap<u32, MappedPeer>>,
+    },
+    Generations(Arc<Coordination>),
 }
 
 impl<A> BrokerServer<A>
@@ -94,8 +107,10 @@ where
             return Err(ServerError::InvalidLimits);
         }
         Ok(Self {
-            broker,
-            identities: Arc::new(identities),
+            source: ServerSource::Fixed {
+                broker,
+                identities: Arc::new(identities),
+            },
             limits,
             deadline: ShutdownDeadline::default(),
         })
@@ -191,13 +206,32 @@ where
             );
             return;
         };
-        let broker = Arc::clone(&self.broker);
-        let identities = Arc::clone(&self.identities);
         let frame = self.limits.frame;
-        tasks.spawn(async move {
-            let _permit = permit;
-            handle(stream, &broker, &identities, frame).await
-        });
+        match &self.source {
+            ServerSource::Generations(coordination) => {
+                let coordination = Arc::clone(coordination);
+                let generation = coordination.active();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    handle(
+                        stream,
+                        &generation.ready.broker,
+                        &generation.ready.identities,
+                        frame,
+                        Some(&coordination),
+                    )
+                    .await
+                });
+            }
+            ServerSource::Fixed { broker, identities } => {
+                let broker = Arc::clone(broker);
+                let identities = Arc::clone(identities);
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    handle(stream, &broker, &identities, frame, None).await
+                });
+            }
+        }
     }
 
     // A peer whose connect completed before admission closed is already connected and may have
@@ -220,6 +254,22 @@ where
                 self.admit(stream, semaphore, refusal, tasks);
             }
         }
+    }
+}
+
+impl BrokerServer<dekopon_broker::TraceOnlyAuditLog> {
+    pub(crate) fn for_generations(
+        coordination: Arc<Coordination>,
+        limits: ServerLimits,
+    ) -> Result<Self, ServerError> {
+        let active = coordination.active();
+        let mut server = Self::new(
+            Arc::clone(&active.ready.broker),
+            active.ready.identities.clone(),
+            limits,
+        )?;
+        server.source = ServerSource::Generations(coordination);
+        Ok(server)
     }
 }
 
@@ -302,6 +352,7 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
         ProtocolError::DescriptorIndex => "descriptor-index",
         ProtocolError::DescriptorFlags { .. } => "descriptor-flags",
         ProtocolError::TooManyAssetRows => "too-many-asset-rows",
+        ProtocolError::InvalidGenerationDigest => "invalid-generation-digest",
     }
 }
 
@@ -393,6 +444,7 @@ async fn handle<A>(
     broker: &Broker<A>,
     identities: &BTreeMap<u32, MappedPeer>,
     limits: FrameLimits,
+    coordination: Option<&Coordination>,
 ) -> Result<(), ConnectionError>
 where
     A: AuditLog,
@@ -458,6 +510,37 @@ where
             return Err(ConnectionError::InvalidRequest);
         }
     };
+    let generation_request = matches!(
+        request.request,
+        BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration
+    );
+    if generation_request != (request.api_version == ProtocolVersion::V1Alpha3) {
+        return refuse_invalid_claim(&mut stream, limits).await;
+    }
+    if generation_request
+        && !(peer.is_reconciliation_owner()
+            && coordination.is_none_or(|coordination| coordination.owns(uid)))
+    {
+        tracing::warn!(
+            event = "broker_generation_refused",
+            peer.uid = uid,
+            reason = "not-reconciliation-owner",
+        );
+        return stream
+            .write_frame(
+                &ResponseEnvelope::error(
+                    ERROR_UNAUTHENTICATED,
+                    "peer is not the reconciliation owner",
+                ),
+                &[],
+                limits,
+            )
+            .await
+            .map_err(ConnectionError::Write);
+    }
     let context = &peer.context;
     let mut outputs = dekopon_broker_host::asset::AssetOutputs::default();
     let response = match request.request {
@@ -581,6 +664,52 @@ where
                     )
                 }
                 Err(error) => return write_broker_failure(&mut stream, limits, error).await,
+            }
+        }
+        BrokerRequest::PrepareGeneration { digest } => {
+            let (digest, outcome) = match coordination {
+                Some(owner) => owner.prepare(&digest, uid).await,
+                None => (digest, dekopon_broker_protocol::GenerationOutcome::Refused),
+            };
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
+            }
+        }
+        BrokerRequest::CommitGeneration { digest } => {
+            let outcome = coordination.map_or(
+                dekopon_broker_protocol::GenerationOutcome::Refused,
+                |owner| owner.commit(&digest, uid),
+            );
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
+            }
+        }
+        BrokerRequest::AbortGeneration { digest } => {
+            let outcome = coordination.map_or(
+                dekopon_broker_protocol::GenerationOutcome::Refused,
+                |owner| owner.abort(&digest, uid),
+            );
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
+            }
+        }
+        BrokerRequest::ObserveGeneration => {
+            let (digest, outcome) = match coordination {
+                Some(owner) => (
+                    owner.active().digest.clone(),
+                    dekopon_broker_protocol::GenerationOutcome::Active,
+                ),
+                None => (
+                    String::new(),
+                    dekopon_broker_protocol::GenerationOutcome::Refused,
+                ),
+            };
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
             }
         }
         BrokerRequest::UpcallResult { .. } => {
@@ -734,7 +863,11 @@ impl Upcaller<'_> {
             BrokerRequest::Capabilities { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
-            | BrokerRequest::RecordDeliveredTurn { .. } => Err(UpcallError::UnexpectedRequest),
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => Err(UpcallError::UnexpectedRequest),
         }
     }
 }
@@ -876,4 +1009,348 @@ pub enum ServerError {
     },
     #[error("broker connections did not finish within the shutdown grace period")]
     ShutdownTimeout,
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use crate::{
+        Mode,
+        tests::{ManagedBroker, POLICIES, write_owner_only},
+    };
+    use dekopon_broker::{AttestorGrant, AuthenticatedContext};
+    use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion, read_frame};
+    use dekopon_core::Actor;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    fn peer(principal: &str, attestor: Option<AttestorGrant>) -> MappedPeer {
+        let principal: dekopon_core::PrincipalId = principal.parse().unwrap();
+        MappedPeer {
+            context: AuthenticatedContext::new(principal.clone(), Actor::Service { principal })
+                .unwrap(),
+            attestor,
+        }
+    }
+
+    async fn exchange(
+        coordination: &Coordination,
+        mapped: MappedPeer,
+        other: MappedPeer,
+        request: BrokerRequest,
+    ) -> BrokerResponse {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let active = coordination.active();
+        let uid = client.peer_cred().unwrap().uid();
+        let identities = BTreeMap::from([(uid, mapped), (uid + 1, other)]);
+        let limits = FrameLimits::default();
+        let serve = handle(
+            server,
+            &active.ready.broker,
+            &identities,
+            limits,
+            Some(coordination),
+        );
+        let transact = async {
+            write_frame(
+                &mut client,
+                &RequestEnvelope {
+                    api_version: ProtocolVersion::V1Alpha3,
+                    request,
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+            read_frame::<_, ResponseEnvelope>(&mut client, limits)
+                .await
+                .unwrap()
+                .response
+        };
+        let (served, response) = tokio::join!(serve, transact);
+        served.unwrap();
+        response
+    }
+
+    async fn held_exchange(
+        coordination: &Coordination,
+        pinned: &Arc<crate::Candidate>,
+        (mut client, server): (UnixStream, UnixStream),
+        request: BrokerRequest,
+    ) -> BrokerResponse {
+        let limits = FrameLimits::default();
+        let serve = handle(
+            server,
+            &pinned.ready.broker,
+            &pinned.ready.identities,
+            limits,
+            Some(coordination),
+        );
+        let transact = async {
+            write_frame(
+                &mut client,
+                &RequestEnvelope {
+                    api_version: ProtocolVersion::V1Alpha3,
+                    request,
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+            read_frame::<_, ResponseEnvelope>(&mut client, limits)
+                .await
+                .unwrap()
+                .response
+        };
+        let (served, response) = tokio::join!(serve, transact);
+        served.unwrap();
+        response
+    }
+
+    async fn held_invocation(
+        coordination: &Coordination,
+        pinned: &Arc<crate::Candidate>,
+        (client, server): (UnixStream, UnixStream),
+    ) {
+        use dekopon_broker_protocol::{Attestation, InvocationOutcome, StreamDescriptors};
+        use std::os::fd::AsFd as _;
+
+        let limits = FrameLimits::default();
+        let (stdout, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = DescriptorStream::new(client);
+        let request = crate::tests::generation_invocation("held-before-revocation", false);
+        let claim = Attestation::for_subject(
+            "slack.t0123abc.u9xyz".parse().unwrap(),
+            "chat-agent".parse().unwrap(),
+        )
+        .bound_to(request.id.clone());
+        let serve = handle(
+            server,
+            &pinned.ready.broker,
+            &pinned.ready.identities,
+            limits,
+            Some(coordination),
+        );
+        let transact = async {
+            client
+                .write_frame(
+                    &RequestEnvelope::invoke(
+                        Some(claim),
+                        request,
+                        vec![],
+                        0,
+                        Some(StreamDescriptors { stdin: false }),
+                    ),
+                    &[stdout.as_fd()],
+                    limits,
+                )
+                .await
+                .unwrap();
+            drop(stdout);
+            let (response, descriptors) =
+                client.read_frame::<ResponseEnvelope>(limits).await.unwrap();
+            assert!(descriptors.is_empty());
+            response.response
+        };
+        let (served, response) = tokio::join!(serve, transact);
+        served.unwrap();
+        assert!(matches!(response, BrokerResponse::Invocation { result, .. }
+            if result.outcome == InvocationOutcome::Succeeded));
+        let mut output = Vec::new();
+        std::io::Read::read_to_end(&mut receiver, &mut output).unwrap();
+        assert_eq!(output, b"{\"text\":\"HELLO\"}\n");
+    }
+
+    fn unauthenticated(response: BrokerResponse) {
+        assert!(
+            matches!(response, BrokerResponse::Error { code, .. } if code == ERROR_UNAUTHENTICATED)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_gateway_attestor_peer_can_coordinate_generation_frames() {
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let coordination = Coordination::new(fixture.config(), active.unwrap());
+        let old = coordination.active().digest.clone();
+        write_owner_only(
+            &fixture.directory.path().join("policies.cedar"),
+            format!(
+                "{}\n@id(\"new\") permit(principal, action, resource);\n",
+                POLICIES.replace(
+                    "context.via == \"gateway\"",
+                    "context.via == \"dekopon-gatewayd\""
+                ),
+            )
+            .as_bytes(),
+        );
+        let (next, report) =
+            crate::load_candidate(&fixture.config(), Mode::Reload(&coordination.active())).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let next = next.unwrap().digest;
+        let owner = coordination.active().ready.identities[&crate::current_uid()].clone();
+        let strangers = [
+            peer("caller", None),
+            peer(
+                "dekopon-console",
+                Some(AttestorGrant {
+                    namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+                }),
+            ),
+        ];
+        let capture = dekopon_test_support::CaptureLayer::new();
+        async {
+            for stranger in &strangers {
+                for request in [
+                    BrokerRequest::PrepareGeneration { digest: old.clone() },
+                    BrokerRequest::CommitGeneration { digest: next.clone() },
+                    BrokerRequest::AbortGeneration { digest: next.clone() },
+                    BrokerRequest::ObserveGeneration,
+                ] {
+                    unauthenticated(exchange(&coordination, stranger.clone(), owner.clone(), request).await);
+                }
+                assert_eq!(coordination.active().digest, old);
+                assert!(matches!(exchange(&coordination, owner.clone(), stranger.clone(),
+                    BrokerRequest::CommitGeneration { digest: next.clone() }).await,
+                    BrokerResponse::Generation { outcome: GenerationOutcome::Refused, .. }));
+            }
+            assert!(matches!(exchange(&coordination, owner.clone(), strangers[0].clone(),
+                BrokerRequest::PrepareGeneration { digest: old.clone() }).await,
+                BrokerResponse::Generation { digest, outcome: GenerationOutcome::Prepared } if digest == next));
+            for stranger in &strangers {
+                unauthenticated(exchange(&coordination, stranger.clone(), owner.clone(),
+                    BrokerRequest::CommitGeneration { digest: next.clone() }).await);
+                unauthenticated(exchange(&coordination, stranger.clone(), owner.clone(),
+                    BrokerRequest::AbortGeneration { digest: next.clone() }).await);
+            }
+            assert_eq!(coordination.active().digest, old);
+            assert!(matches!(exchange(&coordination, owner.clone(), strangers[0].clone(),
+                BrokerRequest::CommitGeneration { digest: next.clone() }).await,
+                BrokerResponse::Generation { outcome: GenerationOutcome::Applied, .. }));
+            assert!(matches!(exchange(&coordination, owner.clone(), strangers[0].clone(),
+                BrokerRequest::ObserveGeneration).await,
+                BrokerResponse::Generation { digest, outcome: GenerationOutcome::Active } if digest == next));
+        }.with_subscriber(tracing_subscriber::registry().with(capture.clone())).await;
+        let refused = capture.events_where(
+            "dekopon_brokerd::server",
+            &[("event", "broker_generation_refused")],
+        );
+        assert_eq!(refused.len(), 12);
+        for record in refused {
+            assert_eq!(record.field("reason"), Some("not-reconciliation-owner"));
+            assert_eq!(
+                record.field("peer.uid"),
+                Some(crate::current_uid().to_string().as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn held_owner_sockets_lose_coordination_but_keep_captured_invocation() {
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let coordination = Coordination::new(fixture.config(), active.unwrap());
+        let pinned = coordination.active();
+        let old_digest = pinned.digest.clone();
+        let uid = crate::current_uid();
+        let sockets = (0..5)
+            .map(|_| UnixStream::pair().unwrap())
+            .collect::<Vec<_>>();
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.config()).unwrap()).unwrap();
+        document["identities"][0]["principal"] = serde_json::json!("caller");
+        document["identities"][0]["actor"] =
+            serde_json::json!({"type": "agent", "agent": "brokerd-test"});
+        document["identities"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("attestor");
+        crate::tests::write_config(&fixture.config(), &document);
+        write_owner_only(
+            &fixture.directory.path().join("policies.cedar"),
+            POLICIES
+                .split("@id(\"chat-agent-upper\")")
+                .next()
+                .unwrap()
+                .replace(
+                    "context.via == \"gateway\"",
+                    "context.via == \"dekopon-gatewayd\"",
+                )
+                .as_bytes(),
+        );
+        let (candidate, report) =
+            crate::load_candidate(&fixture.config(), Mode::Reload(&pinned)).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let next = candidate.unwrap().digest;
+        let owner = pinned.ready.identities[&uid].clone();
+        let stranger = peer("caller", None);
+        assert!(
+            matches!(exchange(&coordination, owner.clone(), stranger.clone(),
+            BrokerRequest::PrepareGeneration { digest: old_digest }).await,
+            BrokerResponse::Generation { digest, outcome: GenerationOutcome::Prepared } if digest == next)
+        );
+        assert!(matches!(
+            exchange(
+                &coordination,
+                owner,
+                stranger,
+                BrokerRequest::CommitGeneration {
+                    digest: next.clone()
+                }
+            )
+            .await,
+            BrokerResponse::Generation {
+                outcome: GenerationOutcome::Applied,
+                ..
+            }
+        ));
+        let committed = coordination.active();
+        assert_eq!(committed.digest, next);
+        assert!(!committed.ready.identities[&uid].is_reconciliation_owner());
+
+        let capture = dekopon_test_support::CaptureLayer::new();
+        async {
+            let mut held = sockets.into_iter();
+            for request in [
+                BrokerRequest::PrepareGeneration {
+                    digest: next.clone(),
+                },
+                BrokerRequest::CommitGeneration {
+                    digest: next.clone(),
+                },
+                BrokerRequest::AbortGeneration {
+                    digest: next.clone(),
+                },
+                BrokerRequest::ObserveGeneration,
+            ] {
+                unauthenticated(
+                    held_exchange(&coordination, &pinned, held.next().unwrap(), request).await,
+                );
+            }
+            held_invocation(&coordination, &pinned, held.next().unwrap()).await;
+        }
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+        let refused = capture.events_where(
+            "dekopon_brokerd::server",
+            &[("event", "broker_generation_refused")],
+        );
+        assert_eq!(refused.len(), 4);
+        for record in refused {
+            assert_eq!(record.field("reason"), Some("not-reconciliation-owner"));
+            assert_eq!(record.field("peer.uid"), Some(uid.to_string().as_str()));
+        }
+        assert_eq!(
+            coordination.prepare(&next, uid).await,
+            (next, GenerationOutcome::Refused)
+        );
+        let state = coordination.state.lock();
+        assert!(Arc::ptr_eq(&state.active, &committed));
+        assert!(state.prepared.is_none());
+    }
 }

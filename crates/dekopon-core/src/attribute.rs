@@ -5,7 +5,7 @@ use std::{
 
 pub const MAX_ATTRIBUTE_BYTES: usize = 4096;
 
-const TRUNCATION_MARKER: &str = "\u{2026}[truncated]";
+pub(crate) const TRUNCATION_MARKER: &str = "\u{2026}[truncated]";
 
 #[must_use]
 pub fn bounded_attribute(value: &str) -> Cow<'_, str> {

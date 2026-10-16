@@ -185,7 +185,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let broker = Broker::new(
         registry,
         principal("broker-test"),
-        "policy-test".to_owned(),
         PolicyEngine::new(POLICY, &world).expect("fixture policy validates"),
         ConstraintCatalog::new([(
             "http-probe.fetch"

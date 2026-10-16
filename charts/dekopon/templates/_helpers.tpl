@@ -266,6 +266,15 @@ cannot drift apart.
 {{- end }}
 {{- end -}}
 
+{{- define "dekopon.privateFiles" -}}
+{{- range .Values.broker.privateFiles }}
+- file: {{ .file }}
+  source: private-{{ .file }}
+  secret: {{ .existingSecret }}
+  key: {{ .existingSecretKey }}
+{{- end }}
+{{- end -}}
+
 {{- define "dekopon.peersFragment" -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 apiVersion: dekopon.dev/brokerd/v1alpha1
@@ -665,6 +674,18 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 {{- end -}}
 
+{{- $records := .Values.broker.oauth2Records -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" $records.subdir)) (eq $records.subdir .Values.broker.chatgpt.subdir) (eq $records.subdir .Values.gateway.chatgpt.subdir) (eq $records.subdir .Values.broker.providerSet.subdir) (eq $records.subdir .Values.gateway.journal.subdir) (eq $records.subdir .Values.gateway.wakes.subdir) -}}
+{{- fail "broker.oauth2Records.subdir must be a distinct non-dot state-claim segment" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $records.mountPath)) (ne (clean $records.mountPath) $records.mountPath) (not (hasPrefix (printf "%s/" .Values.paths.stateDir) $records.mountPath)) -}}
+{{- fail "broker.oauth2Records.mountPath must be a canonical path below paths.stateDir" -}}
+{{- end -}}
+{{- range $name, $path := dict "broker provider set" .Values.broker.providerSet.mountPath "broker ChatGPT" (include "dekopon.brokerChatgptDir" .) "gateway ChatGPT" (include "dekopon.chatgptDir" .) -}}
+{{- if or (eq (clean $records.mountPath) (clean $path)) (hasPrefix (printf "%s/" (clean $records.mountPath)) (clean $path)) (hasPrefix (printf "%s/" (clean $path)) (clean $records.mountPath)) -}}
+{{- fail (printf "broker.oauth2Records.mountPath overlaps %s" $name) -}}
+{{- end -}}
+{{- end -}}
 {{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "gatewayd.yaml" true "broker.d" true -}}
 {{- range (include "dekopon.seedFiles" . | fromYamlArray) -}}
 {{- $_ := set $bootstrapNames .source true -}}
@@ -683,6 +704,15 @@ broker that lands mid-invocation. */}}
 {{- end -}}
 
 {{- $secretSourceNames := dict "broker-config-directory" true "gateway-config-directory" true "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true "skills" true "skills-source" true -}}
+{{- range .Values.broker.privateFiles -}}
+{{- if or (not .file) (not .existingSecret) (not .existingSecretKey) (not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" .file)) -}}
+{{- fail "each broker.privateFiles entry requires a safe file segment, existingSecret and existingSecretKey" -}}
+{{- end -}}
+{{- if hasKey $bootstrapNames (printf "private-%s" .file) -}}
+{{- fail (printf "broker private file %q collides with another managed file" .file) -}}
+{{- end -}}
+{{- $_ := set $bootstrapNames (printf "private-%s" .file) true -}}
+{{- end -}}
 {{- range .Values.broker.secretSourceVolumes -}}
 {{- $source := . -}}
 {{- if or (not .name) (not .mountPath) (not (kindIs "map" .volume)) -}}
@@ -816,6 +846,9 @@ Arguments: dict "ctx" $ "sidecar" bool
       mountPath: {{ include "dekopon.brokerChatgptDir" $ }}
       subPath: {{ $.Values.broker.chatgpt.subdir }}
 {{- end }}
+    - name: state
+      mountPath: {{ $.Values.broker.oauth2Records.mountPath }}
+      subPath: {{ $.Values.broker.oauth2Records.subdir }}
 {{- if include "dekopon.providerSetEnabled" $ }}
     # The managed provider set, and only it: the generated lock and the content-addressed blob
     # store `dekopon-brokerd provider sync` wrote onto the claim before this pod rolled. A second

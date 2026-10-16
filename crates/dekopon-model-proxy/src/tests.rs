@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use crate::{
-    Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER, Upstream,
+    CurrentProxy, Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER,
+    Upstream,
 };
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
@@ -345,6 +346,57 @@ fn capture() -> (MeterRecords, CallSpans, tracing::subscriber::DefaultGuard) {
 
 const USAGE_ANSWER: &str = r#"{"id":"x","usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
 const CHAT_CALL: &str = r#"{"model":"glm-flash","messages":[],"stream":false}"#;
+
+#[tokio::test]
+async fn resident_router_resolves_each_request_against_the_current_model() {
+    let first = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let second = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let metering = metering(100_000);
+    let guests = || {
+        HashMap::from([(
+            SUBJECT.to_owned(),
+            Grant {
+                agent: "gylmar".parse().unwrap(),
+                models: BTreeSet::from(["glm-flash".to_owned()]),
+            },
+        )])
+    };
+    let build = |endpoint: &str| {
+        Arc::new(ModelProxy::new(models(endpoint, None), guests(), Arc::clone(&metering)).unwrap())
+    };
+    let current = Arc::new(arc_swap::ArcSwap::from(build(&first.url)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = ModelProxy::router_current(Arc::clone(&current));
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{url}/v1/chat/completions"))
+            .header(SUBJECT_HEADER, SUBJECT)
+            .header("authorization", "Bearer guest-sentinel")
+            .header("content-type", "application/json")
+            .body(CHAT_CALL)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        current.store(build(&second.url));
+    }
+    assert_eq!(first.requests.lock().len(), 1);
+    assert_eq!(second.requests.lock().len(), 1);
+    for upstream in [&first, &second] {
+        let request = upstream.request();
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        assert!(request.contains("authorization: Bearer sk-or-proxy\r\n"));
+        assert!(!request.contains("guest-sentinel"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(upstream.body().as_str()).unwrap()["model"],
+            "z-ai/glm-4.5-air"
+        );
+    }
+    task.abort();
+}
 
 #[tokio::test]
 async fn a_proxied_call_records_subject_session_model_and_outcome() {
@@ -994,4 +1046,10 @@ async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() 
 
 async fn json_body(response: reqwest::Response) -> serde_json::Value {
     serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+}
+
+impl CurrentProxy for Arc<arc_swap::ArcSwap<ModelProxy>> {
+    fn current(&self) -> Option<Arc<ModelProxy>> {
+        Some(self.load_full())
+    }
 }

@@ -198,25 +198,37 @@ impl ModelProxy {
         }
     }
 
-    pub fn router(self: Arc<Self>) -> Router {
+    pub fn router_current<C: CurrentProxy>(current: C) -> Router {
         Router::new()
             .route(
                 "/v1/messages",
-                post(|state, headers, body| handle(state, Dialect::Messages, headers, body)),
+                post(|state, headers, body| {
+                    handle_current::<C>(state, Dialect::Messages, headers, body)
+                }),
             )
             .route(
                 "/v1/messages/count_tokens",
-                post(|state, headers, body| handle(state, Dialect::CountTokens, headers, body)),
+                post(|state, headers, body| {
+                    handle_current::<C>(state, Dialect::CountTokens, headers, body)
+                }),
             )
             .route(
                 "/v1/responses",
-                post(|state, headers, body| handle(state, Dialect::Responses, headers, body)),
+                post(|state, headers, body| {
+                    handle_current::<C>(state, Dialect::Responses, headers, body)
+                }),
             )
             .route(
                 "/v1/chat/completions",
-                post(|state, headers, body| handle(state, Dialect::Chat, headers, body)),
+                post(|state, headers, body| {
+                    handle_current::<C>(state, Dialect::Chat, headers, body)
+                }),
             )
-            .with_state(self)
+            .with_state(current)
+    }
+
+    pub fn router(self: Arc<Self>) -> Router {
+        Self::router_current(self)
     }
 }
 
@@ -286,6 +298,31 @@ fn label<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
             value.len() <= MAX_LABEL_BYTES && value.bytes().all(|byte| matches!(byte, b' '..=b'~'))
         })
         .unwrap_or("")
+}
+
+pub trait CurrentProxy: Clone + Send + Sync + 'static {
+    fn current(&self) -> Option<Arc<ModelProxy>>;
+}
+
+impl CurrentProxy for Arc<ModelProxy> {
+    fn current(&self) -> Option<Arc<ModelProxy>> {
+        Some(Arc::clone(self))
+    }
+}
+
+async fn handle_current<C: CurrentProxy>(
+    State(current): State<C>,
+    dialect: Dialect,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    match current.current() {
+        Some(proxy) => handle(State(proxy), dialect, headers, body).await,
+        None => CallSpan::open(&headers).refused(dialect.sandbox(
+            Problem::Forbidden,
+            "this VM is granted no model. Ask the operator to grant its agent one.",
+        )),
+    }
 }
 
 async fn handle(

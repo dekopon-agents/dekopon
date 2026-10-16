@@ -35,6 +35,7 @@ pub struct LocalCatalog {
     /// Skills are read once at catalog load so a live session never touches the filesystem, and a
     /// broken skill fails the catalog, not a running session.
     skills: BTreeMap<AgentId, Vec<Skill>>,
+    files: Vec<(PathBuf, String)>,
 }
 
 impl LocalCatalog {
@@ -74,25 +75,25 @@ impl LocalCatalog {
             .iter()
             .map(|file| Ok((file.clone(), read(file)?)))
             .collect::<Result<Vec<_>, ConfigError>>()?;
-        Self::from_sources(path, &sources)
+        Self::from_sources(path, sources)
     }
 
     pub fn from_str(source: impl AsRef<Path>, contents: &str) -> Result<Self, ConfigError> {
         let source = source.as_ref();
-        Self::from_sources(source, &[(source.to_path_buf(), contents.to_owned())])
+        Self::from_sources(source, vec![(source.to_path_buf(), contents.to_owned())])
     }
 
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    fn from_sources(source: &Path, files: &[(PathBuf, String)]) -> Result<Self, ConfigError> {
+    fn from_sources(source: &Path, files: Vec<(PathBuf, String)>) -> Result<Self, ConfigError> {
         let source = source.to_path_buf();
         let source_name = source.display().to_string();
         let many = files.len() > 1;
         let mut resources = Vec::new();
 
-        for (file, contents) in files {
+        for (file, contents) in &files {
             let file_name = file
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -205,6 +206,7 @@ impl LocalCatalog {
             source,
             agents,
             skills,
+            files,
         })
     }
 
@@ -225,6 +227,11 @@ impl LocalCatalog {
     #[must_use]
     pub fn agent_skills(&self, id: &AgentId) -> &[Skill] {
         self.skills.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn files(&self) -> &[(PathBuf, String)] {
+        &self.files
     }
 }
 

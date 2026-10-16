@@ -221,7 +221,6 @@ one is the write's, pretty-printed and trimmed to the record's fields and its in
   "subject": "slack.t0123abcd.u0123abcd",
   "provider": "http-probe",
   "authorized.by": "local-broker",
-  "policy.revision": "conditional-write-2026-01",
   "policy.ids": "conditional-writer-surface",
   "policy.digest": "sha256:7c31…",
   "effect": "ExternalWrite",

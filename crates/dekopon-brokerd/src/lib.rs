@@ -16,12 +16,16 @@ mod assets;
 pub mod capabilities;
 
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
+const RECONCILIATION_OWNER: &str = "dekopon-gatewayd";
 mod config;
 mod credentials;
 mod github_app;
 mod lock_watch;
+#[cfg(test)]
+mod private_read_witness;
 mod provider_manager;
 mod reaper;
+mod refresh_scheduler;
 mod secrets;
 mod server;
 mod socket;
@@ -34,7 +38,7 @@ use std::{
     time::Duration,
 };
 
-use config::LoadMode;
+use config::{LoadMode, Resident};
 use dekopon_broker::{
     AuditLog, Broker, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
     Leniency, PolicyBuildError, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
@@ -42,7 +46,7 @@ use dekopon_broker::{
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
-use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, error_chain};
+use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, bounded_problems, error_chain};
 use dekopon_http_host::BoundCredential;
 use thiserror::Error;
 
@@ -103,19 +107,19 @@ where
     for warning in &report.warnings {
         warning.log();
     }
-    let Some(Candidate {
-        ready: Ready { broker, identities },
-        socket_path,
-        provider_lock,
-        limits,
-        storage,
-    }) = candidate
-    else {
+    let Some(candidate) = candidate else {
         return Err(BrokerdError::from_problems(report.problems));
     };
     let uid = current_uid();
-    let retention = broker.storage_retention_policies();
-    let server = BrokerServer::new(Arc::new(broker), identities, limits)?
+    let limits = candidate.limits;
+    let socket_path = candidate.socket_path.clone();
+    let provider_lock = candidate.provider_lock.clone();
+    let storage = candidate.storage.clone();
+    let coordination = Arc::new(Coordination::new(
+        config_path.as_ref().to_path_buf(),
+        candidate,
+    ));
+    let server = BrokerServer::for_generations(Arc::clone(&coordination), limits)?
         .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
@@ -136,7 +140,23 @@ where
         deadline.start(limits.shutdown_grace);
         result
     };
-    let result = reaper::serve(serving, storage, retention, deadline.clone()).await;
+    let result = refresh_scheduler::serve(
+        reaper::serve(
+            serving,
+            storage,
+            || {
+                coordination
+                    .active()
+                    .ready
+                    .broker
+                    .storage_retention_policies()
+            },
+            deadline.clone(),
+        ),
+        || coordination.active().ready.scheduled.clone(),
+        deadline.clone(),
+    )
+    .await;
 
     // Checking result before cleanup here is deliberate: propagating cleanup's error first would
     // mask the real failure and skip logging broker_stopped.
@@ -188,6 +208,7 @@ pub struct CheckProviders {
 pub struct CheckReport {
     pub problems: Vec<BrokerdError>,
     pub warnings: Vec<StartupWarning>,
+    private_sources: Vec<PathBuf>,
 }
 
 /// Runs the startup validation `run` runs, then stops: no socket, no credentials file, no secret
@@ -220,31 +241,236 @@ impl std::fmt::Display for Stage {
     }
 }
 
-enum Mode {
+enum Mode<'a> {
     Boot,
+    Reload(&'a Candidate),
     Check(Option<CheckProviders>),
 }
 
+/// Only boot opens the storage host and asset directory: opening takes the root's writer lock and
+/// empties the asset root, both of which the serving candidate owns while a reload is prepared.
+enum Residents<'a> {
+    Open,
+    Borrow(&'a Candidate),
+    Scratch,
+}
+
 struct Candidate {
+    digest: String,
+    fingerprint: Option<PrivateFingerprint>,
     ready: Ready,
     socket_path: PathBuf,
     provider_lock: Option<lock_watch::LoadedLock>,
     limits: ServerLimits,
     storage: Option<dekopon_storage_host::StorageHost>,
+    assets: Option<dekopon_http_host::asset::AssetDirectory>,
+    locked_providers: Option<Vec<dekopon_broker_host::LockedProviderSource>>,
+    snapshot: config::ConfigSnapshot,
+}
+
+struct Coordination {
+    config_path: PathBuf,
+    loading: tokio::sync::Semaphore,
+    state: parking_lot::Mutex<GenerationState>,
+}
+
+struct GenerationState {
+    active: Arc<Candidate>,
+    prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
+    reported: Option<RawCandidate>,
+}
+
+impl GenerationState {
+    fn unreported(&mut self, raw: RawCandidate) -> bool {
+        self.reported.replace(raw) != Some(raw)
+    }
+
+    fn owned_by(&self, uid: u32) -> bool {
+        self.active
+            .ready
+            .identities
+            .get(&uid)
+            .is_some_and(MappedPeer::is_reconciliation_owner)
+    }
+}
+
+impl Coordination {
+    fn new(config_path: PathBuf, active: Candidate) -> Self {
+        Self {
+            config_path,
+            loading: tokio::sync::Semaphore::new(1),
+            state: parking_lot::Mutex::new(GenerationState {
+                active: Arc::new(active),
+                prepared: None,
+                reported: None,
+            }),
+        }
+    }
+
+    fn active(&self) -> Arc<Candidate> {
+        Arc::clone(&self.state.lock().active)
+    }
+
+    fn owns(&self, uid: u32) -> bool {
+        self.state.lock().owned_by(uid)
+    }
+
+    async fn prepare(
+        &self,
+        expected_active: &str,
+        uid: u32,
+    ) -> (String, dekopon_broker_protocol::GenerationOutcome) {
+        use dekopon_broker_protocol::GenerationOutcome;
+        let Ok(_permit) = self.loading.acquire().await else {
+            return (self.active().digest.clone(), GenerationOutcome::Refused);
+        };
+        let active = {
+            let state = self.state.lock();
+            if state.active.digest != expected_active
+                || !state.owned_by(uid)
+                || state
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|(owner, _, _)| *owner != uid)
+            {
+                return (state.active.digest.clone(), GenerationOutcome::Refused);
+            }
+            Arc::clone(&state.active)
+        };
+        let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
+        let Some(next) = next else {
+            let entries = report
+                .problems
+                .iter()
+                .flat_map(reload_entries)
+                .collect::<Vec<_>>();
+            let count = entries.len();
+            let error = bounded_problems(entries.into_iter());
+            let raw = RawCandidate::of(
+                self.config_path.clone(),
+                report.private_sources,
+                error.clone(),
+            )
+            .await;
+            let unreported = self.state.lock().unreported(raw);
+            let unreadable = report.problems.iter().any(|problem| {
+                matches!(
+                    problem,
+                    BrokerdError::Config(config::ConfigError::Read { .. })
+                )
+            });
+            match (unreported, unreadable) {
+                (false, _) => {}
+                (true, true) => {
+                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error);
+                }
+                (true, false) => tracing::warn!(
+                    event = "broker_reload_refused",
+                    applied = false,
+                    problems = count,
+                    error = %error
+                ),
+            }
+            return (active.digest.clone(), GenerationOutcome::Refused);
+        };
+        let next = {
+            let mut state = self.state.lock();
+            if !Arc::ptr_eq(&state.active, &active)
+                || !state.owned_by(uid)
+                || state
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|(owner, _, _)| *owner != uid)
+            {
+                return (state.active.digest.clone(), GenerationOutcome::Refused);
+            }
+            state.reported = None;
+            if next.digest == state.active.digest
+                && next.fingerprint.is_some()
+                && next.fingerprint == state.active.fingerprint
+            {
+                state.prepared = None;
+                return (next.digest.clone(), GenerationOutcome::Active);
+            }
+            let next = Arc::new(next);
+            state.prepared = Some((uid, active, Arc::clone(&next)));
+            next
+        };
+        next.ready.scheduled.inspect_records().await;
+        (next.digest.clone(), GenerationOutcome::Prepared)
+    }
+
+    fn commit(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
+        use dekopon_broker_protocol::GenerationOutcome;
+        let mut state = self.state.lock();
+        if !state.owned_by(uid) {
+            return GenerationOutcome::Refused;
+        }
+        let Some((owner, base, next)) = state.prepared.take() else {
+            return GenerationOutcome::Refused;
+        };
+        if owner != uid || next.digest != digest || !Arc::ptr_eq(&base, &state.active) {
+            state.prepared = Some((owner, base, next));
+            return GenerationOutcome::Refused;
+        }
+        let categories = state.active.snapshot.changed_categories(&next.snapshot);
+        state.active = next;
+        tracing::info!(
+            event = "broker_reload_applied",
+            generation.digest = digest,
+            category.count = categories.len(),
+            categories = %categories.join(",")
+        );
+        GenerationOutcome::Applied
+    }
+
+    fn abort(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
+        use dekopon_broker_protocol::GenerationOutcome;
+        let mut state = self.state.lock();
+        if state.owned_by(uid)
+            && state
+                .prepared
+                .as_ref()
+                .is_some_and(|(owner, _, next)| *owner == uid && next.digest == digest)
+        {
+            state.prepared = None;
+            GenerationOutcome::Aborted
+        } else {
+            GenerationOutcome::Refused
+        }
+    }
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
 /// did not is reported as skipped.
-async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, CheckReport) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "independent validation stages aggregate failures before preparing a candidate"
+)]
+async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let uid = current_uid();
     let load_mode = match mode {
         Mode::Boot => LoadMode::Boot,
+        Mode::Reload(active) => LoadMode::Reload {
+            locked_providers: active.locked_providers.as_deref(),
+            provider_lock: active.provider_lock.as_ref(),
+        },
         Mode::Check(_) => LoadMode::Check,
     };
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
         Ok((config, refusal)) => {
             report.problems.extend(refusal.map(BrokerdError::from));
+            report.private_sources.extend(
+                [
+                    &config.credentials_path,
+                    &config.secret_map_path,
+                    &config.policies_path,
+                ]
+                .into_iter()
+                .flatten()
+                .cloned(),
+            );
             Some(config)
         }
         Err(error) => {
@@ -262,14 +488,15 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
         }
         return (None, report);
     };
-    let providers_resolved = match mode {
-        Mode::Boot => true,
+    let (providers_resolved, residents) = match mode {
+        Mode::Boot => (true, Residents::Open),
+        Mode::Reload(active) => (true, Residents::Borrow(active)),
         Mode::Check(providers) => {
             if config.identities.is_empty() {
                 report.warnings.push(StartupWarning::IdentitiesRequired);
             }
             // A Check load leaves a providerSet's providers for this function to resolve.
-            match (config.providers.is_empty(), providers) {
+            let resolved = match (config.providers.is_empty(), providers) {
                 (true, Some(providers)) => match resolve_provider_set(providers, uid).await {
                     Ok(sources) => {
                         config.providers = sources
@@ -293,9 +520,19 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
                     true
                 }
                 (false, None) => true,
-            }
+            };
+            (resolved, Residents::Scratch)
         }
     };
+    let restart_categories = match residents {
+        Residents::Borrow(active) => active.snapshot.restart_required(&config.snapshot),
+        Residents::Open | Residents::Scratch => Vec::new(),
+    };
+    if !restart_categories.is_empty() {
+        report.problems.push(BrokerdError::RestartRequired {
+            categories: restart_categories.clone(),
+        });
+    }
     let frame_limits = keep(
         &mut report.problems,
         config
@@ -304,32 +541,31 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
             .map_err(BrokerdError::from),
     );
     let mut scratch = None;
-    let runtime = match load_mode {
-        LoadMode::Boot => boot_runtime(&config, uid, &mut report.problems).await,
-        LoadMode::Check => match config.storage.as_ref().map(scratch_storage).transpose() {
-            Ok(storage) => {
-                let host = storage.as_ref().map(|(_, host)| host.clone());
-                scratch = storage;
-                Some(Runtime {
-                    credentials: match config.credentials_path {
-                        Some(_) => Credentials::Unchecked,
-                        None => Credentials::Loaded(CredentialStore::empty()),
-                    },
-                    secrets: match config.secret_map_path {
-                        Some(_) => Secrets::Unchecked,
-                        None => Secrets::Loaded(dekopon_broker::SecretCatalog::empty()),
-                    },
-                    storage: host,
-                    assets: None,
-                })
-            }
-            Err(error) => {
-                report.problems.push(error);
-                None
-            }
-        },
+    let runtime = match residents {
+        Residents::Open => boot_runtime(&mut config, uid, &mut report.problems).await,
+        Residents::Borrow(active) => {
+            reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
+        }
+        Residents::Scratch => {
+            keep(&mut report.problems, scratch_host(&config, &mut scratch)).map(|storage| Runtime {
+                credentials: match config.credentials_path {
+                    Some(_) => Credentials::Unchecked,
+                    None => Credentials::Loaded(CredentialStore::empty()),
+                },
+                secrets: match config.secret_map_path {
+                    Some(_) => Secrets::Unchecked,
+                    None => Secrets::Loaded(
+                        dekopon_broker::SecretCatalog::empty(),
+                        secrets::ScheduledCatalog::default(),
+                    ),
+                },
+                fingerprint: None,
+                storage,
+                assets: None,
+            })
+        }
     };
-    let (Some(frame_limits), Some(runtime), true) = (frame_limits, runtime, providers_resolved)
+    let (Some(frame_limits), Some(mut runtime), true) = (frame_limits, runtime, providers_resolved)
     else {
         report.skipped(Stage::Providers);
         return (None, report);
@@ -341,26 +577,50 @@ async fn load_candidate(config_path: &Path, mode: Mode) -> (Option<Candidate>, C
     };
     let socket_path = std::mem::take(&mut config.socket_path);
     let provider_lock = config.provider_lock.take();
+    let locked_providers = config.locked_providers.clone();
+    let reuse_registry = provider_lock.is_some() || restart_categories.is_empty();
     let storage = runtime.storage.clone();
+    let assets = runtime.assets.clone();
+    let fingerprint = runtime.fingerprint.take();
+    let snapshot = config.snapshot.clone();
+    let resident_registry = match residents {
+        Residents::Borrow(active) if reuse_registry => Some(active.ready.registry.clone()),
+        Residents::Open | Residents::Borrow(_) | Residents::Scratch => None,
+    };
     let prepared = prepare(
         config,
         frame_limits.max_frame_bytes,
         runtime,
         &mut report.warnings,
+        resident_registry,
     )
     .await;
     drop(scratch);
     match prepared {
-        Ok(ready) if report.problems.is_empty() => (
-            Some(Candidate {
-                ready,
-                socket_path,
-                provider_lock,
-                limits,
-                storage,
-            }),
-            report,
-        ),
+        Ok(ready) if report.problems.is_empty() => {
+            let digest = match snapshot.digest() {
+                Ok(digest) => digest,
+                Err(source) => {
+                    report.problems.push(BrokerdError::Snapshot { source });
+                    return (None, report);
+                }
+            };
+            (
+                Some(Candidate {
+                    digest,
+                    fingerprint,
+                    ready,
+                    socket_path,
+                    provider_lock,
+                    limits,
+                    storage,
+                    assets,
+                    locked_providers,
+                    snapshot,
+                }),
+                report,
+            )
+        }
         Ok(_) => (None, report),
         Err(problems) => {
             report.problems.extend(problems);
@@ -376,54 +636,14 @@ impl CheckReport {
 }
 
 async fn boot_runtime(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     problems: &mut Vec<BrokerdError>,
 ) -> Option<Runtime> {
-    match socket::validate_socket_parent(&config.socket_path, uid) {
-        // An owner-only socket under a private parent means other configured UIDs could never
-        // connect — the broker starts healthy while peers loop on EACCES — so every unreachable
-        // peer is checked at startup.
-        Ok(parent) if dekopon_broker_protocol::ipc_socket_mode(&parent) == 0o600 => {
-            let configured = config
-                .identities
-                .iter()
-                .map(|identity| identity.uid)
-                .filter(|peer| *peer != uid)
-                .collect::<Vec<_>>();
-            if !configured.is_empty() {
-                problems.push(BrokerdError::UnreachablePeerUids {
-                    configured,
-                    server: uid,
-                });
-            }
-        }
-        Ok(_) => {}
-        Err(error) => problems.push(error.into()),
+    let private = private_inputs(config, uid, problems).await;
+    if let Some(private) = &private {
+        private.scheduled.inspect_records().await;
     }
-    // A compilation cache holds compiled code the broker will execute. Anyone who can write into
-    // it can choose what the privileged process runs, so it must sit under a private parent.
-    if let Some(cache) = &config.host_options.cwasm_dir
-        && let Err(error) = socket::validate_private_parent(cache, uid)
-    {
-        problems.push(error.into());
-    }
-    let credentials = match &config.credentials_path {
-        Some(path) => keep(
-            problems,
-            credentials::load(path, uid)
-                .await
-                .map_err(BrokerdError::from),
-        ),
-        None => Some(CredentialStore::empty()),
-    };
-    let secrets = match &config.secret_map_path {
-        Some(path) => keep(
-            problems,
-            secrets::load(path, uid).await.map_err(BrokerdError::from),
-        ),
-        None => Some(dekopon_broker::SecretCatalog::empty()),
-    };
     let storage = keep(
         problems,
         config
@@ -463,12 +683,218 @@ async fn boot_runtime(
         ),
         None => Some(None),
     };
+    let (private, storage, assets) = (private?, storage?, assets?);
     Some(Runtime {
-        credentials: Credentials::Loaded(credentials?),
-        secrets: Secrets::Loaded(secrets?),
-        storage: storage?,
-        assets: assets?,
+        credentials: Credentials::Loaded(private.credentials),
+        secrets: Secrets::Loaded(private.secrets, private.scheduled),
+        fingerprint: Some(private.fingerprint),
+        storage,
+        assets,
     })
+}
+
+/// A changed `storage` or `assets` already refuses as restart-required, so the rest of the
+/// candidate is validated against a scratch host and no asset directory instead of opening either.
+async fn reload_runtime(
+    config: &mut ResolvedConfig,
+    uid: u32,
+    active: &Candidate,
+    scratch: &mut Option<tempfile::TempDir>,
+    problems: &mut Vec<BrokerdError>,
+) -> Option<Runtime> {
+    let private = private_inputs(config, uid, problems).await;
+    let storage = if active.snapshot.keeps(&config.snapshot, Resident::Storage) {
+        active.storage.clone()
+    } else {
+        keep(problems, scratch_host(config, scratch))?
+    };
+    let assets = if active.snapshot.keeps(&config.snapshot, Resident::Assets) {
+        active.assets.clone()
+    } else {
+        None
+    };
+    let private = private?;
+    Some(Runtime {
+        credentials: Credentials::Loaded(private.credentials),
+        secrets: Secrets::Loaded(private.secrets, private.scheduled),
+        fingerprint: Some(private.fingerprint),
+        storage,
+        assets,
+    })
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static AFTER_PRIVATE_READ: std::sync::Arc<dyn Fn() + Send + Sync>;
+}
+
+async fn private_inputs(
+    config: &mut ResolvedConfig,
+    uid: u32,
+    problems: &mut Vec<BrokerdError>,
+) -> Option<PrivateInputs> {
+    match socket::validate_socket_parent(&config.socket_path, uid) {
+        // An owner-only socket under a private parent means other configured UIDs could never
+        // connect — the broker starts healthy while peers loop on EACCES — so every unreachable
+        // peer is checked at startup.
+        Ok(parent) if dekopon_broker_protocol::ipc_socket_mode(&parent) == 0o600 => {
+            let configured = config
+                .identities
+                .iter()
+                .map(|identity| identity.uid)
+                .filter(|peer| *peer != uid)
+                .collect::<Vec<_>>();
+            if !configured.is_empty() {
+                problems.push(BrokerdError::UnreachablePeerUids {
+                    configured,
+                    server: uid,
+                });
+            }
+        }
+        Ok(_) => {}
+        Err(error) => problems.push(error.into()),
+    }
+    // A compilation cache holds compiled code the broker will execute. Anyone who can write into
+    // it can choose what the privileged process runs, so it must sit under a private parent.
+    if let Some(cache) = &config.host_options.cwasm_dir
+        && let Err(error) = socket::validate_private_parent(cache, uid)
+    {
+        problems.push(error.into());
+    }
+    let credentials = match &config.credentials_path {
+        Some(path) => keep(
+            problems,
+            credentials::load_with_bytes(path, uid)
+                .await
+                .map(Some)
+                .map_err(BrokerdError::from),
+        ),
+        None => Some(None),
+    };
+    let secrets = match &config.secret_map_path {
+        Some(path) => keep(
+            problems,
+            secrets::load_with_bytes(path, uid)
+                .await
+                .map(Some)
+                .map_err(BrokerdError::from),
+        ),
+        None => Some(None),
+    };
+    #[cfg(test)]
+    let _hook_ran = AFTER_PRIVATE_READ.try_with(|hook| hook()).is_ok();
+    let (Some(credentials), Some(secrets)) = (credentials, secrets) else {
+        return None;
+    };
+    if let Err(error) = config.snapshot.record_authority_references(
+        credentials.as_ref().map(|loaded| &loaded.references),
+        secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
+    ) {
+        problems.push(error.into());
+    }
+    let fingerprint = PrivateFingerprint::of(
+        credentials.as_ref().map(|loaded| &loaded.private_digest),
+        secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
+    );
+    let (catalog, scheduled) = secrets.map_or_else(
+        || {
+            (
+                dekopon_broker::SecretCatalog::empty(),
+                secrets::ScheduledCatalog::default(),
+            )
+        },
+        |(catalog, _, scheduled)| (catalog, scheduled),
+    );
+    Some(PrivateInputs {
+        credentials: credentials.map_or_else(CredentialStore::empty, |loaded| loaded.store),
+        secrets: catalog,
+        scheduled,
+        fingerprint,
+    })
+}
+
+struct PrivateInputs {
+    credentials: CredentialStore,
+    secrets: dekopon_broker::SecretCatalog,
+    scheduled: secrets::ScheduledCatalog,
+    fingerprint: PrivateFingerprint,
+}
+
+/// Held only in memory and never logged or sent: it tells a same-digest credential rotation from
+/// an unchanged reload poll without any private byte leaving the broker.
+#[derive(PartialEq, Eq)]
+struct PrivateFingerprint([u8; 32]);
+
+impl PrivateFingerprint {
+    fn of(credentials: Option<&[u8; 32]>, secret_map: Option<&[u8]>) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        match credentials {
+            Some(digest) => {
+                hasher.update([1]);
+                hasher.update(digest);
+            }
+            None => hasher.update([0]),
+        }
+        match secret_map {
+            Some(bytes) => {
+                hasher.update([1]);
+                hasher.update(bytes);
+            }
+            None => hasher.update([0]),
+        }
+        Self(hasher.finalize().into())
+    }
+}
+
+const MAX_RAW_SOURCE_BYTES: u64 = 16 << 20;
+
+/// In memory only, never logged or sent: it covers private bytes and exists to tell one refused
+/// candidate from another.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RawCandidate([u8; 32]);
+
+impl RawCandidate {
+    async fn of(config: PathBuf, private: Vec<PathBuf>, refusal: String) -> Self {
+        use std::io::Read as _;
+
+        use sha2::{Digest as _, Sha256};
+        let digest = tokio::task::spawn_blocking(move || {
+            let mut paths = std::fs::read_dir(&config).map_or_else(
+                |_| vec![config.clone()],
+                |entries| {
+                    entries
+                        .filter_map(|entry| Some(entry.ok()?.path()))
+                        .collect()
+                },
+            );
+            paths.sort();
+            paths.extend(private);
+            let mut hasher = Sha256::new();
+            for path in paths {
+                let bytes = std::fs::metadata(&path)
+                    .and_then(|metadata| {
+                        if !metadata.is_file() {
+                            return Err(std::io::ErrorKind::InvalidInput.into());
+                        }
+                        let mut bytes = Vec::new();
+                        std::fs::File::open(&path)?
+                            .take(MAX_RAW_SOURCE_BYTES)
+                            .read_to_end(&mut bytes)?;
+                        Ok(bytes)
+                    })
+                    .unwrap_or_else(|error| error.to_string().into_bytes());
+                for part in [path.as_os_str().as_encoded_bytes(), &bytes] {
+                    hasher.update(part.len().to_le_bytes());
+                    hasher.update(part);
+                }
+            }
+            hasher.update(refusal.as_bytes());
+            hasher.finalize().into()
+        })
+        .await;
+        Self(digest.unwrap_or_default())
+    }
 }
 
 async fn resolve_provider_set(
@@ -504,6 +930,18 @@ async fn resolve_provider_set(
         .map_err(BrokerdError::ProviderSet)
 }
 
+fn scratch_host(
+    config: &ResolvedConfig,
+    scratch: &mut Option<tempfile::TempDir>,
+) -> Result<Option<dekopon_storage_host::StorageHost>, BrokerdError> {
+    let Some(storage) = &config.storage else {
+        return Ok(None);
+    };
+    let (directory, host) = scratch_storage(storage)?;
+    *scratch = Some(directory);
+    Ok(Some(host))
+}
+
 /// Provider storage is opened in a throwaway directory so storage-backed constraints and chat
 /// memory are validated against a real host without touching the configured root.
 fn scratch_storage(
@@ -530,20 +968,23 @@ enum Credentials {
 }
 
 enum Secrets {
-    Loaded(dekopon_broker::SecretCatalog),
+    Loaded(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog),
     Unchecked,
 }
 
 struct Runtime {
     credentials: Credentials,
     secrets: Secrets,
+    fingerprint: Option<PrivateFingerprint>,
     storage: Option<dekopon_storage_host::StorageHost>,
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
 }
 
 struct Ready {
-    broker: Broker<TraceOnlyAuditLog>,
+    broker: Arc<Broker<TraceOnlyAuditLog>>,
+    scheduled: secrets::ScheduledCatalog,
     identities: BTreeMap<u32, MappedPeer>,
+    registry: BrokerProviderRegistry,
 }
 
 /// Every problem found before the broker is built is returned together; the policy and the
@@ -557,29 +998,43 @@ async fn prepare(
     max_frame_bytes: usize,
     runtime: Runtime,
     warnings: &mut Vec<StartupWarning>,
+    resident_registry: Option<BrokerProviderRegistry>,
 ) -> Result<Ready, Vec<BrokerdError>> {
     let uid = current_uid();
-    for provider in &config.providers {
+    // Locked artifacts were checked at boot; a pruned old blob is not a new authority source.
+    for provider in config
+        .providers
+        .iter()
+        .skip(if resident_registry.is_some() {
+            config.locked_providers.as_ref().map_or(0, Vec::len)
+        } else {
+            0
+        })
+    {
         socket::validate_owned_file(provider, uid).map_err(|error| vec![error.into()])?;
     }
-    let mut registry = match config.locked_providers {
-        Some(sources) => {
-            BrokerProviderRegistry::load_locked_with_options(
-                sources,
-                config.host_limits,
-                runtime.storage,
-                &config.host_options,
-            )
-            .await
-        }
-        None => {
-            BrokerProviderRegistry::load_with_options(
-                config.providers,
-                config.host_limits,
-                runtime.storage,
-                &config.host_options,
-            )
-            .await
+    let mut registry = if let Some(registry) = resident_registry {
+        Ok(registry)
+    } else {
+        match config.locked_providers {
+            Some(sources) => {
+                BrokerProviderRegistry::load_locked_with_options(
+                    sources,
+                    config.host_limits,
+                    runtime.storage,
+                    &config.host_options,
+                )
+                .await
+            }
+            None => {
+                BrokerProviderRegistry::load_with_options(
+                    config.providers,
+                    config.host_limits,
+                    runtime.storage,
+                    &config.host_options,
+                )
+                .await
+            }
         }
     }
     .map_err(|error| vec![BrokerdError::Host(error)])?;
@@ -632,9 +1087,9 @@ async fn prepare(
         })
         .map_err(|source| BrokerdError::Policy { source }),
     );
-    let (secret_catalog, secrets_unchecked) = match runtime.secrets {
-        Secrets::Loaded(catalog) => (Some(catalog), false),
-        Secrets::Unchecked => (None, true),
+    let (secret_catalog, scheduled, secrets_unchecked) = match runtime.secrets {
+        Secrets::Loaded(catalog, scheduled) => (Some(catalog), Some(scheduled), false),
+        Secrets::Unchecked => (None, None, true),
     };
     let policy = world.and_then(|world| {
         let world = world.with_secrets(
@@ -696,20 +1151,17 @@ async fn prepare(
                 .map(|(agent, binding)| (agent, binding.credentials))
                 .collect(),
         );
-    // The revision stamped on receipts and audit records is the policy set's own fingerprint, so
-    // it moves exactly when authorization can.
-    let revision = policy.digest().to_owned();
     let leniency = if config.strict {
         Leniency::Strict
     } else {
         Leniency::Tolerant
     };
+    let shared_registry = registry.clone();
     let (broker, broker_warnings) = Broker::start(
         registry,
         BROKER_PRINCIPAL
             .parse()
             .expect("the broker principal is a valid identifier"),
-        revision,
         policy,
         constraints,
         credential_store,
@@ -746,7 +1198,12 @@ async fn prepare(
     }
     validate_capability_responses(&broker, &identities, max_frame_bytes)
         .map_err(|error| vec![error])?;
-    Ok(Ready { broker, identities })
+    Ok(Ready {
+        broker: Arc::new(broker),
+        scheduled: scheduled.unwrap_or_default(),
+        identities,
+        registry: shared_registry,
+    })
 }
 
 fn keep<T>(problems: &mut Vec<BrokerdError>, result: Result<T, BrokerdError>) -> Option<T> {
@@ -998,6 +1455,11 @@ pub enum BrokerdError {
     Assets(#[source] assets::AssetsStartupError),
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),
+    #[error("broker generation snapshot could not be encoded")]
+    Snapshot {
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("broker provider metadata could not be encoded")]
     ManifestMetadata {
         #[source]
@@ -1034,6 +1496,8 @@ pub enum BrokerdError {
     Server(#[from] ServerError),
     #[error("{}", render_errors(.problems))]
     Startup { problems: Vec<BrokerdError> },
+    #[error("broker configuration changed restart-required categories: {categories:?}")]
+    RestartRequired { categories: Vec<String> },
     #[error("the configuration names a providerSet; check it with --provider-set and --store")]
     ProviderSetRequired,
     #[error("the configuration names provider paths; --provider-set does not apply to it")]
@@ -1064,6 +1528,33 @@ impl BrokerdError {
             }
             (None, _) => Self::Startup { problems },
         }
+    }
+}
+
+fn reload_entries(problem: &BrokerdError) -> Vec<String> {
+    if let BrokerdError::Credentials(CredentialsError::Invalid { problems }) = problem {
+        problems
+            .iter()
+            .map(|item| format!("broker credentials are invalid: {item}"))
+            .collect()
+    } else if let BrokerdError::Secrets(SecretMapError::Validation { problems }) = problem {
+        problems
+            .iter()
+            .map(|item| format!("private secret map has conflicts: {item}"))
+            .collect()
+    } else if let BrokerdError::Capabilities { problems } = problem {
+        problems
+            .iter()
+            .map(|item| format!("capability configuration is invalid: {item}"))
+            .collect()
+    } else if let BrokerdError::Config(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else if let BrokerdError::Credentials(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else if let BrokerdError::Secrets(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else {
+        vec![problem.to_string()]
     }
 }
 

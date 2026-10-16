@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{config, current_uid, socket};
 
-const POLICIES: &str = r#"
+pub(super) const POLICIES: &str = r#"
 @id("chat-agent-session")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"agent.prompt",
@@ -32,12 +32,12 @@ fn probe_capabilities() -> serde_json::Value {
     })
 }
 
-fn write_owner_only(path: &Path, contents: &[u8]) {
+pub(super) fn write_owner_only(path: &Path, contents: &[u8]) {
     fs::write(path, contents).expect("write fixture");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
 }
 
-fn write_config(path: &Path, document: &serde_json::Value) {
+pub(super) fn write_config(path: &Path, document: &serde_json::Value) {
     write_owner_only(
         path,
         &serde_json::to_vec(document).expect("config serializes"),
@@ -1257,7 +1257,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let broker = Broker::new(
         registry,
         "broker-test".parse().expect("valid broker principal"),
-        "policy-test".to_owned(),
         PolicyEngine::new(POLICIES, &world).expect("fixture policy validates"),
         catalog,
         CredentialStore::empty(),
@@ -1602,6 +1601,1512 @@ fn example_path(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+#[test]
+fn broker_categories_refuse_resident_changes_and_allow_authority_references() {
+    let original = serde_yaml::from_str::<serde_yaml::Mapping>(
+        "socketPath: broker.sock\ncredentialsPath: a\nproviders: [provider.wasm]\n",
+    )
+    .unwrap();
+    let active = config::ConfigSnapshot::from_mapping(&original);
+    for (key, value, expected) in [
+        ("socketPath", "elsewhere.sock", "socketPath"),
+        (
+            "providerSettings",
+            "{cli-probe: {key: changed}}",
+            "providerSettings",
+        ),
+        (
+            "telemetry",
+            "{endpoint: http://localhost:4318}",
+            "telemetry",
+        ),
+        ("http", "{plaintextHosts: [localhost]}", "http"),
+        ("serverLimits", "{maxConnections: 12}", "serverLimits"),
+        (
+            "assets",
+            "{rootPath: different, maxInFlightBytes: 12}",
+            "assets",
+        ),
+        ("storage", "{rootPath: different}", "storage"),
+        ("chatMemory", "{enabled: true}", "chatMemory"),
+    ] {
+        let mut edited = original.clone();
+        edited.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::from_str::<serde_yaml::Value>(value).unwrap(),
+        );
+        let next = config::ConfigSnapshot::from_mapping(&edited);
+        assert_eq!(active.restart_required(&next), [expected], "{key}");
+    }
+    for key in [
+        "apiVersion",
+        "providers",
+        "providerSet",
+        "compileOnLoad",
+        "hostLimits",
+        "brokerLimits",
+    ] {
+        let mut edited = original.clone();
+        edited.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::Value::String("changed".to_owned()),
+        );
+        let next = config::ConfigSnapshot::from_mapping(&edited);
+        assert_eq!(active.restart_required(&next), [key], "{key}");
+    }
+    for key in [
+        "credentialsPath",
+        "secretMapPath",
+        "strict",
+        "identities",
+        "principals",
+        "agents",
+        "policiesPath",
+        "capabilities",
+    ] {
+        let mut edited = original.clone();
+        edited.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::Value::String("changed".to_owned()),
+        );
+        let next = config::ConfigSnapshot::from_mapping(&edited);
+        assert!(active.restart_required(&next).is_empty(), "{key}");
+    }
+}
+
+#[test]
+fn an_unlisted_config_category_refuses_in_either_direction() {
+    let original =
+        serde_yaml::from_str::<serde_yaml::Mapping>("socketPath: broker.sock\n").unwrap();
+    let mut edited = original.clone();
+    edited.insert(
+        serde_yaml::Value::String("futureEffectiveInput".to_owned()),
+        serde_yaml::Value::String("value".to_owned()),
+    );
+    let active = config::ConfigSnapshot::from_mapping(&original);
+    let proposed = config::ConfigSnapshot::from_mapping(&edited);
+    assert_eq!(active.restart_required(&proposed), ["futureEffectiveInput"]);
+    assert_eq!(proposed.restart_required(&active), ["futureEffectiveInput"]);
+    edited.insert(
+        serde_yaml::Value::String("futureEffectiveInput".to_owned()),
+        serde_yaml::Value::Null,
+    );
+    let omitted = config::ConfigSnapshot::from_mapping(&edited);
+    assert!(active.restart_required(&omitted).is_empty());
+}
+
+#[test]
+fn activation_digest_excludes_arbitrary_provider_setting_values() {
+    let original: serde_yaml::Mapping = serde_yaml::from_str(
+        "providerSettings: {cli-probe: {private: sentinel-secret-one}}\npoliciesPath: policy.cedar\n"
+    ).unwrap();
+    let changed: serde_yaml::Mapping = serde_yaml::from_str(
+        "providerSettings: {cli-probe: {private: sentinel-secret-two}}\npoliciesPath: policy.cedar\n"
+    ).unwrap();
+    let old = config::ConfigSnapshot::from_mapping(&original);
+    let new = config::ConfigSnapshot::from_mapping(&changed);
+    assert_eq!(old.digest().unwrap(), new.digest().unwrap());
+    assert_eq!(old.restart_required(&new), ["providerSettings"]);
+}
+
+#[tokio::test]
+async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cli-probe.wasm");
+    write_owner_only(&path, b"fixture");
+    let mapping = serde_yaml::from_str::<serde_yaml::Mapping>(
+        "http: {extraCABundles: [/same/path]}\nproviders: [cli-probe.wasm]\n",
+    )
+    .unwrap();
+    let mut active = config::ConfigSnapshot::from_mapping(&mapping);
+    let mut next = active.clone();
+    active
+        .record_sources("", std::slice::from_ref(&path), 0, &[b"first CA".to_vec()])
+        .await
+        .unwrap();
+    next.record_sources("", std::slice::from_ref(&path), 0, &[b"second CA".to_vec()])
+        .await
+        .unwrap();
+    assert_eq!(active.restart_required(&next), ["http"]);
+}
+
+#[tokio::test]
+async fn broker_projection_does_not_relax_owner_only_source_rules() {
+    use super::{BrokerdError, Mode};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.yaml");
+    let generation = root.path().join("..2026");
+    fs::create_dir(&generation).unwrap();
+    write_config(
+        &generation.join("broker.yaml"),
+        &attested_document(current_uid()),
+    );
+    std::os::unix::fs::symlink("..2026", root.path().join("..data")).unwrap();
+    std::os::unix::fs::symlink("..data/broker.yaml", &path).unwrap();
+    for report in [
+        super::check(&path, None).await,
+        super::load_candidate(&path, Mode::Boot).await.1,
+    ] {
+        assert!(
+            report.problems.iter().any(|problem| matches!(
+                problem,
+                BrokerdError::Config(config::ConfigError::Read { path: refused, source })
+                    if refused == &path && source.raw_os_error() == Some(libc::ELOOP)
+            )),
+            "{report:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reload_refuses_resident_category_and_invalid_authority_without_replacing_active() {
+    use super::{BrokerdError, Mode};
+    use dekopon_broker::PolicyBuildError;
+
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.path().join("broker.yaml");
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    let cedar = root.path().join("policies.cedar");
+    write_owner_only(&cedar, POLICIES.as_bytes());
+    let mut document = attested_document(current_uid());
+    document["identities"].as_array_mut().unwrap().truncate(1);
+    write_config(&path, &document);
+    let (active, report) = super::load_candidate(&path, Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("boot candidate");
+    let digest = active.ready.broker.policy_digest().to_owned();
+
+    document["serverLimits"] = json!({"maxConnections": 12});
+    write_config(&path, &document);
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
+
+    document.as_object_mut().unwrap().remove("serverLimits");
+    write_config(&path, &document);
+    write_owner_only(&root.path().join("cli-probe.wasm"), b"not a component");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::RestartRequired { categories } if categories == &["providers"])));
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+
+    write_owner_only(&cedar, b"not cedar");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Policy {
+            source: PolicyBuildError::Parse { .. }
+        }
+    )));
+
+    write_owner_only(&cedar, format!("{POLICIES}\n@id(\"unrecognized\") permit(principal in Dekopon::Group::\"strangers\", action, resource);\n").as_bytes());
+    document["capabilities"]["cli-probe"]["constraints"] = json!({});
+    write_config(&path, &document);
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } } if group == "strangers")));
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Capabilities { problems } if problems.iter().any(|problem| matches!(problem,
+            super::capabilities::CapabilityProblem::MissingField { field: "timeoutMs", .. })) )));
+
+    document["capabilities"] = probe_capabilities();
+    document["identities"][0]["attestor"] = json!({"namespaces": []});
+    write_config(&path, &document);
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Config(config::ConfigError::Attestor { .. })
+    )));
+
+    document["identities"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("attestor");
+    write_config(&path, &document);
+    write_owner_only(
+        &cedar,
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let (next, report) = super::load_candidate(&path, Mode::Reload(&active))
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(
+        capture
+            .events_where("dekopon_broker_host", &[("provider", "cli-probe")])
+            .is_empty()
+    );
+    assert_ne!(next.unwrap().ready.broker.policy_digest(), digest);
+}
+
+struct ResidentFixture {
+    root: tempfile::TempDir,
+    path: std::path::PathBuf,
+    cedar: std::path::PathBuf,
+    document: serde_json::Value,
+    active: super::Candidate,
+    live: std::path::PathBuf,
+}
+
+impl ResidentFixture {
+    async fn boot() -> Self {
+        Self::boot_with(|_, _| {}).await
+    }
+
+    async fn boot_with(configure: impl FnOnce(&Path, &mut serde_json::Value)) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("broker.yaml");
+        let cedar = root.path().join("policies.cedar");
+        let component =
+            fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+        write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+        write_owner_only(&cedar, POLICIES.as_bytes());
+        let mut document = attested_document(current_uid());
+        document["identities"] = json!([{
+            "uid": current_uid(),
+            "principal": "dekopon-gatewayd",
+            "actor": {"type": "service", "principal": "dekopon-gatewayd"},
+            "attestor": {}
+        }]);
+        let mut storage =
+            serde_json::to_value(dekopon_storage_host::StorageLimits::default()).unwrap();
+        storage["rootPath"] = json!("provider-storage");
+        document["storage"] = storage;
+        document["assets"] = json!({"rootPath": "assets", "maxInFlightBytes": 1_048_576});
+        configure(root.path(), &mut document);
+        write_config(&path, &document);
+        let (active, report) = super::load_candidate(&path, super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let live = root.path().join("assets/live");
+        write_owner_only(&live, b"active asset");
+        Self {
+            root,
+            path,
+            cedar,
+            document,
+            active: active.expect("boot with storage and assets"),
+            live,
+        }
+    }
+}
+
+#[tokio::test]
+async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepare() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ResidentFixture::boot().await;
+    let old_digest = fixture.active.digest.clone();
+    let old_policy = fixture.active.ready.broker.policy_digest().to_owned();
+    write_owner_only(
+        &fixture.cedar,
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (next, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let next_digest = next.unwrap().digest;
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        let uid = current_uid();
+        assert_eq!(owner.commit(&next_digest, uid), GenerationOutcome::Refused);
+        assert_eq!(
+            owner.prepare(&next_digest, uid).await,
+            (old_digest.clone(), GenerationOutcome::Refused)
+        );
+        assert_eq!(
+            owner.prepare(&old_digest, uid).await,
+            (next_digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.active().ready.broker.policy_digest(), old_policy);
+        assert_eq!(owner.commit(&old_digest, uid), GenerationOutcome::Refused);
+        assert_eq!(
+            owner.abort(&next_digest, uid + 1),
+            GenerationOutcome::Refused
+        );
+        assert_eq!(
+            owner.commit(&next_digest, uid + 1),
+            GenerationOutcome::Refused
+        );
+        assert_eq!(owner.abort(&next_digest, uid), GenerationOutcome::Aborted);
+        assert_eq!(owner.commit(&next_digest, uid), GenerationOutcome::Refused);
+        assert_eq!(owner.active().digest, old_digest);
+        assert_eq!(
+            owner.prepare(&old_digest, uid).await,
+            (next_digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.commit(&next_digest, uid), GenerationOutcome::Applied);
+        assert_eq!(owner.active().digest, next_digest);
+        assert_ne!(owner.active().ready.broker.policy_digest(), old_policy);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(
+        applied[0].field("generation.digest"),
+        Some(next_digest.as_str())
+    );
+    assert_eq!(applied[0].field("category.count"), Some("1"));
+    assert_eq!(applied[0].field("categories"), Some("policies"));
+    assert!(
+        capture
+            .events_where(
+                "dekopon_broker::audit",
+                &[("audit.event", "broker_reload_applied")]
+            )
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn unreadable_reload_source_reports_monitor_failure_not_activation() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ResidentFixture::boot().await;
+    let old_digest = fixture.active.digest.clone();
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    fs::remove_file(&fixture.path).unwrap();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old_digest, current_uid()).await,
+            (old_digest.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, old_digest);
+    let failed = capture.events_where(
+        "dekopon_brokerd",
+        &[("event", "broker_reload_monitor_failed")],
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].field("applied"), Some("false"));
+    let reason = failed[0]
+        .field("error")
+        .expect("sanitized monitor diagnostic");
+    assert!(reason.contains("broker configuration"), "{reason}");
+    assert!(
+        reason.contains(&fixture.path.display().to_string()),
+        "{reason}"
+    );
+    assert!(
+        capture
+            .events_where("dekopon_brokerd", &[("event", "broker_reload_applied")])
+            .is_empty()
+    );
+}
+
+#[test]
+fn broker_reload_diagnostics_do_not_walk_untrusted_source_errors() {
+    let problem = super::BrokerdError::Config(config::ConfigError::Read {
+        path: "broker.yaml".into(),
+        source: std::io::Error::other("private-source-sentinel"),
+    });
+    let entries = super::reload_entries(&problem);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0],
+        "broker configuration is invalid: could not read broker configuration at broker.yaml"
+    );
+    assert!(!entries[0].contains("private-source-sentinel"));
+}
+
+#[test]
+fn private_map_and_capability_aggregates_flatten_before_the_record_bound() {
+    let secrets = super::BrokerdError::Secrets(super::SecretMapError::Validation {
+        problems: (0..12).map(|index| format!("conflict #{index}")).collect(),
+    });
+    let entries = super::reload_entries(&secrets);
+    assert_eq!(entries.len(), 12);
+    assert!(dekopon_core::bounded_problems(entries.into_iter()).ends_with("and 4 more"));
+
+    let capabilities = super::BrokerdError::Capabilities {
+        problems: (0..12)
+            .map(|_| super::capabilities::CapabilityProblem::MissingField {
+                capability: "test-capability".parse().unwrap(),
+                field: "scope",
+            })
+            .collect(),
+    };
+    let entries = super::reload_entries(&capabilities);
+    assert_eq!(entries.len(), 12);
+    assert!(dekopon_core::bounded_problems(entries.into_iter()).ends_with("and 4 more"));
+}
+
+#[tokio::test]
+async fn twelve_invalid_credentials_render_eight_individual_refusal_reasons() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let source = (0..12).map(|index| format!(
+        "  - name: 'invalid name {index}'\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-secret-value\n"
+    )).collect::<String>();
+    write_owner_only(
+        &credential,
+        format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n{source}")
+            .as_bytes(),
+    );
+    let old = owner.active().digest.clone();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("problems"), Some("12"));
+    let reason = refused[0].field("error").unwrap();
+    assert_eq!(reason.matches("credential #").count(), 8, "{reason}");
+    assert!(reason.ends_with("and 4 more"), "{reason}");
+    assert!(!reason.contains("invalid name"));
+}
+
+#[tokio::test]
+async fn broker_refusal_repeats_only_after_a_distinct_edit_or_repair() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ResidentFixture::boot().await;
+    let old = fixture.active.digest.clone();
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let invalid = format!("{POLICIES}\n@id(\"broken\") permit(principal, action, resource\n");
+    write_owner_only(&fixture.cedar, invalid.as_bytes());
+    async {
+        for _ in 0..3 {
+            assert_eq!(
+                owner.prepare(&old, current_uid()).await,
+                (old.clone(), GenerationOutcome::Refused)
+            );
+        }
+        let refused =
+            || capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+        assert_eq!(refused().len(), 1);
+        write_owner_only(&fixture.cedar, format!("{invalid}\n").as_bytes());
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+        assert_eq!(refused().len(), 2);
+        write_owner_only(&fixture.cedar, POLICIES.as_bytes());
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Active)
+        );
+        write_owner_only(&fixture.cedar, format!("{invalid}\n").as_bytes());
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+        assert_eq!(refused().len(), 3);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, old);
+}
+
+#[tokio::test]
+async fn invalid_credential_name_never_enters_reload_or_boot_diagnostics() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const SENTINEL: &str = "sentinel invalid secret name";
+    let (broker, credential, owner) = generation_with_private_credential().await;
+    let old = owner.active().digest.clone();
+    let invalid = format!(
+        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: '{SENTINEL}'\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-second-long-enough\n"
+    );
+    write_owner_only(&credential, invalid.as_bytes());
+    let (candidate, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&owner.active())).await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        super::BrokerdError::Credentials(super::credentials::CredentialsError::Invalid { .. })
+    )));
+    let error = dekopon_core::error_chain(&super::BrokerdError::from_problems(report.problems));
+    assert!(error.contains("credential #1"), "{error}");
+    assert!(!error.contains(SENTINEL));
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&old, current_uid()).await,
+            (old.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    let reason = refused[0].field("error").unwrap();
+    assert!(reason.contains("credential #1"), "{reason}");
+    assert!(!reason.contains(SENTINEL));
+}
+
+async fn generation_with_private_credential()
+-> (ManagedBroker, std::path::PathBuf, super::Coordination) {
+    generation_with_credentials(|_| {
+        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n".to_owned()
+    })
+    .await
+}
+
+async fn generation_with_credentials(
+    credentials: impl FnOnce(&Path) -> String,
+) -> (ManagedBroker, std::path::PathBuf, super::Coordination) {
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let credential = broker.directory.path().join("credentials.yaml");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["credentialsPath"] = json!("credentials.yaml");
+    write_config(&broker.config(), &document);
+    write_owner_only(
+        &credential,
+        credentials(&broker.directory.path().canonicalize().unwrap()).as_bytes(),
+    );
+    let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let owner = super::Coordination::new(broker.config(), candidate.expect("boot generation"));
+    (broker, credential, owner)
+}
+
+#[tokio::test]
+async fn unchanged_private_inputs_do_not_stage_or_emit_a_broker_activation() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let (_broker, _credentials, owner) = generation_with_private_credential().await;
+    let digest = owner.active().digest.clone();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        let uid = current_uid();
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+        assert!(owner.state.lock().prepared.is_none());
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Refused);
+        assert_eq!(owner.active().digest, digest);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert!(
+        capture
+            .events_where("dekopon_brokerd", &[("event", "broker_reload_applied")])
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn same_digest_credential_rotation_commits_once_and_next_poll_is_active() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let digest = owner.active().digest.clone();
+    write_owner_only(
+        &credential,
+        b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-after-long-enough\n",
+    );
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        let uid = current_uid();
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
+        assert_eq!(owner.active().digest, digest);
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+        assert!(owner.state.lock().prepared.is_none());
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].field("generation.digest"), Some(digest.as_str()));
+}
+
+#[tokio::test]
+async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_per_poll() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
+    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
+        let key = directory.join("github-app.pem");
+        write_owner_only(&key, KEY);
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
+            key.display()
+        )
+    })
+    .await;
+    let key = broker.directory.path().join("github-app.pem");
+    let reads = super::private_read_witness::TrackedRead::new(&key);
+    let digest = owner.active().digest.clone();
+    let uid = current_uid();
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Active)
+    );
+    assert_eq!(reads.count(), 1, "one key read per prepare");
+    write_owner_only(&key, &[b"\n".as_slice(), KEY].concat());
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(reads.count(), 3, "one key read per prepare");
+    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
+    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
+        let key = directory.join("github-app.pem");
+        write_owner_only(&key, KEY);
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
+            key.display()
+        )
+    })
+    .await;
+    let key = broker
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("github-app.pem");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let digest = owner.active().digest.clone();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&digest, current_uid()).await,
+            (digest.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, digest);
+    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    let error = refused[0].field("error").expect("refusal reason");
+    assert!(
+        error.contains(&format!(
+            "credential \"app\" privateKey {} is not trusted input (insecure-mode)",
+            key.display()
+        )),
+        "{error}"
+    );
+    assert!(error.contains("has mode 0644"), "{error}");
+    assert!(!error.contains("PRIVATE KEY"), "{error}");
+}
+
+#[tokio::test]
+async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_per_poll() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let record = broker
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("record.json");
+    write_owner_only(&record, b"{\"state\":");
+    let bindings = broker.directory.path().join("bindings.yaml");
+    let map = |revision: &str| {
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:com.xrl:secret:test:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            record.display()
+        )
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    write_owner_only(&bindings, map("one").as_bytes());
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let reported = || {
+        capture
+            .events_where(
+                "dekopon_brokerd",
+                &[("event", "broker_credential_record_invalid")],
+            )
+            .len()
+    };
+    async {
+        let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        assert_eq!(reported(), 1, "boot reports the record");
+        let owner = super::Coordination::new(broker.config(), active.unwrap());
+        let digest = owner.active().digest.clone();
+        let uid = current_uid();
+        for _ in 0..2 {
+            assert_eq!(
+                owner.prepare(&digest, uid).await,
+                (digest.clone(), GenerationOutcome::Active)
+            );
+        }
+        assert_eq!(reported(), 1, "an unchanged poll does not inspect");
+        write_owner_only(&bindings, map("two").as_bytes());
+        let (next, outcome) = owner.prepare(&digest, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&next, uid).await,
+            (next.clone(), GenerationOutcome::Active)
+        );
+        assert_eq!(reported(), 2, "a committed change reports once");
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+}
+
+#[tokio::test]
+async fn unchanged_poll_reads_the_private_file_once_before_answering_active() {
+    use dekopon_broker_protocol::GenerationOutcome;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let tracked = super::private_read_witness::TrackedRead::new(&credential);
+    let digest = owner.active().digest.clone();
+    let prepared = owner.prepare(&digest, current_uid()).await;
+    assert_eq!(tracked.count(), 1, "one validated private read per prepare");
+    assert_eq!(prepared, (digest, GenerationOutcome::Active));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reaper_sweeps_with_the_committed_generation_retention() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits};
+    use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
+    use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest};
+
+    let fixture = ResidentFixture::boot_with(|root, document| {
+        write_owner_only(
+            &root.join("storage-probe.wasm"),
+            &fs::read(example_path(
+                "examples/providers/storage-probe-provider.wasm",
+            ))
+            .unwrap(),
+        );
+        document["providers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("storage-probe.wasm"));
+        document["capabilities"]["storage-probe"] = json!({
+            "constraints": {
+                "timeoutMs": 30_000,
+                "storage": {"interface": "durable-files", "access": "read-write", "scope": "agent"}
+            },
+            "capabilities": {"storage-probe.run": {}}
+        });
+    })
+    .await;
+    let host = fixture.active.storage.as_ref().unwrap().clone();
+    let request = StorageGrantRequest::new(
+        "reaper-invocation".parse().unwrap(),
+        "storage-probe.run".parse().unwrap(),
+        "storage-probe".parse().unwrap(),
+        StorageInterface::DurableFiles,
+        StorageAccess::ReadWrite,
+        StorageScope::Agent,
+        "chat-agent".parse().unwrap(),
+        dekopon_core::ExternalSubject::slack("T123", "U123").unwrap(),
+        "slack",
+        "work",
+        "c123",
+        "c123:123.456",
+        ContinuityPolicy::Stable,
+        vec![],
+    );
+    drop(host.grant(request).unwrap());
+    let namespace = fixture.root.path().join("provider-storage/namespaces");
+    let resource = fs::read_dir(&namespace)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::File::options()
+        .write(true)
+        .open(resource.join("last-used"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    drop(host);
+    let ResidentFixture {
+        root,
+        path,
+        mut document,
+        active,
+        ..
+    } = fixture;
+    drop(active);
+    let broker = ManagedBroker {
+        directory: root,
+        component_digest: String::new(),
+        component_bytes: 0,
+    };
+    let task = broker.serve(std::future::pending());
+    broker.ready(&task).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (old, GenerationOutcome::Active) = client.observe_generation().await.unwrap() else {
+        panic!("boot generation active");
+    };
+    assert!(resource.exists(), "boot retention keeps expired storage");
+    document["capabilities"]["storage-probe"]["constraints"]["storage"]["retention"] =
+        json!({"mode": "idle-ttl", "idleTtlMs": 60_000});
+    write_config(&path, &document);
+    let (next, GenerationOutcome::Prepared) = client.prepare_generation(old).await.unwrap() else {
+        panic!("updated retention prepared");
+    };
+    assert_eq!(
+        client.commit_generation(next).await.unwrap(),
+        GenerationOutcome::Applied
+    );
+    tokio::time::advance(std::time::Duration::from_secs(12 * 60 * 60)).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while resource.exists() && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !resource.exists(),
+        "the next production sweep must use committed retention"
+    );
+    task.abort();
+    task.await.unwrap_err();
+}
+
+#[tokio::test]
+async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let credentials = broker.directory.path().join("credentials.yaml");
+    let bindings = broker.directory.path().join("bindings.yaml");
+    let secret = broker.directory.path().join("token");
+    write_owner_only(&secret, b"fixture-token");
+    let credential = |host: &str| {
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [{host}]\n    secret: fixture-value-long-enough\n"
+        )
+    };
+    let map = |host: &str| {
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [{host}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            secret.display()
+        )
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["credentialsPath"] = json!("credentials.yaml");
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test", "b.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    write_owner_only(&credentials, credential("a.example.test").as_bytes());
+    write_owner_only(&bindings, map("a.example.test").as_bytes());
+    let credential_reads = super::private_read_witness::TrackedRead::new(&credentials);
+    let binding_reads = super::private_read_witness::TrackedRead::new(&bindings);
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(credential_reads.count(), 1, "boot credentials read once");
+    assert_eq!(binding_reads.count(), 1, "boot secret map read once");
+    let active = active.unwrap();
+    let mut observed = active.snapshot.clone();
+    observed
+        .record_authority_references(
+            Some(&super::credentials::references_from_bytes(
+                &credential_reads.last_bytes(),
+            )),
+            Some(&binding_reads.last_bytes()),
+        )
+        .unwrap();
+    assert_eq!(
+        active.digest,
+        observed.digest().unwrap(),
+        "boot reference digest comes from runtime input"
+    );
+    credential_reads.reset();
+    binding_reads.reset();
+    let owner = super::Coordination::new(broker.config(), active);
+    let old = owner.active().digest.clone();
+    write_owner_only(&credentials, credential("b.example.test").as_bytes());
+    write_owner_only(&bindings, map("b.example.test").as_bytes());
+    let uid = current_uid();
+    let (digest, outcome) = owner.prepare(&old, uid).await;
+    assert_eq!(outcome, GenerationOutcome::Prepared);
+    assert_eq!(credential_reads.count(), 1, "prepare credentials read once");
+    assert_eq!(binding_reads.count(), 1, "prepare secret map read once");
+    let mut observed = owner
+        .state
+        .lock()
+        .prepared
+        .as_ref()
+        .unwrap()
+        .2
+        .snapshot
+        .clone();
+    observed
+        .record_authority_references(
+            Some(&super::credentials::references_from_bytes(
+                &credential_reads.last_bytes(),
+            )),
+            Some(&binding_reads.last_bytes()),
+        )
+        .unwrap();
+    assert_eq!(
+        digest,
+        observed.digest().unwrap(),
+        "prepared digest comes from runtime input"
+    );
+    assert_ne!(digest, old);
+    assert_eq!(owner.abort(&digest, uid), GenerationOutcome::Aborted);
+    let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        write_owner_only(&credentials, b"not-a-credential-map");
+        write_owner_only(&bindings, b"not-a-secret-map");
+    });
+    let (prepared, outcome) = super::AFTER_PRIVATE_READ
+        .scope(hook, owner.prepare(&old, uid))
+        .await;
+    assert_eq!(
+        (prepared.clone(), outcome),
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(owner.commit(&prepared, uid), GenerationOutcome::Applied);
+    assert_eq!(owner.active().digest, digest);
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest, GenerationOutcome::Refused)
+    );
+}
+
+#[tokio::test]
+async fn boot_digest_ignores_core_tags_secret_values_and_tagged_secret_keys() {
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let credentials = broker.directory.path().join("credentials.yaml");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["credentialsPath"] = json!("credentials.yaml");
+    write_config(&broker.config(), &document);
+    let mut digests = Vec::new();
+    for secret in [
+        "secret: !!bool fixture-secret-aaaa-0001",
+        "secret: fixture-secret-bbbb-0002",
+        "!x secret: fixture-secret-aaaa-0001",
+    ] {
+        write_owner_only(
+            &credentials,
+            format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    {secret}\n").as_bytes(),
+        );
+        let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        digests.push(candidate.expect("validated boot candidate").digest);
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "secret values and scalar tags cannot change digest"
+    );
+    assert_eq!(
+        digests[0], digests[2],
+        "tagged secret keys cannot change digest"
+    );
+}
+
+#[tokio::test]
+async fn authority_reference_edits_change_digest_but_secret_material_does_not() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = root.path().join("credentials.yaml");
+    let bindings = root.path().join("bindings.yaml");
+    let credential = |destination: &str, secret: &str| {
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    destinations: [{destination}]\n    secret: {secret}\n"
+        )
+    };
+    let map = |destination: &str| {
+        format!("secrets:\n  - drn: example\n    bindings:\n      - destination: {destination}\n")
+    };
+    write_owner_only(&credentials, credential("first", "one").as_bytes());
+    write_owner_only(&bindings, map("first").as_bytes());
+    let snapshot = || {
+        let mut snapshot = super::config::ConfigSnapshot::default();
+        snapshot
+            .record_authority_references(
+                Some(&super::credentials::references_from_bytes(
+                    &std::fs::read(&credentials).unwrap(),
+                )),
+                Some(&std::fs::read(&bindings).unwrap()),
+            )
+            .unwrap();
+        snapshot.digest().unwrap()
+    };
+    let initial = snapshot();
+    write_owner_only(&credentials, credential("second", "one").as_bytes());
+    let destination = snapshot();
+    assert_ne!(initial, destination);
+    write_owner_only(&bindings, map("second").as_bytes());
+    let binding = snapshot();
+    assert_ne!(destination, binding);
+    write_owner_only(&credentials, credential("second", "two").as_bytes());
+    assert_eq!(binding, snapshot());
+    write_owner_only(
+        &credentials,
+        b"credentials:\n  - secret: two\n    destinations: [second]\n    kind: bearerToken\n    name: key\napiVersion: dekopon.dev/broker-credentials/v1alpha1\n",
+    );
+    assert_eq!(binding, snapshot());
+    write_owner_only(
+        &bindings,
+        b"secrets:\n  - bindings:\n      - destination: second\n    drn: example\n",
+    );
+    assert_eq!(binding, snapshot());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_serve_observes_edited_configuration_without_claiming_preparation() {
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits, GenerationOutcome};
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let first = broker.serve(std::future::pending());
+    broker.ready(&first).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (old, GenerationOutcome::Active) = client.observe_generation().await.unwrap() else {
+        panic!("first serve has an active generation");
+    };
+    first.abort();
+    first.await.unwrap_err();
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (expected, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let expected = expected.unwrap().digest;
+    let second = broker.serve(std::future::pending());
+    broker.ready(&second).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (prepared, outcome) = client.observe_generation().await.unwrap();
+    assert_eq!(outcome, GenerationOutcome::Active);
+    assert_ne!(prepared, old);
+    assert_eq!(
+        prepared, expected,
+        "second serve activates the edited candidate"
+    );
+    assert_eq!(
+        client.commit_generation(prepared).await.unwrap(),
+        GenerationOutcome::Refused
+    );
+    second.abort();
+    second.await.unwrap_err();
+}
+
+pub(super) fn generation_invocation(
+    id: &str,
+    piped: bool,
+) -> dekopon_broker_protocol::InvocationRequest {
+    use dekopon_broker_protocol::InvocationRequest;
+    InvocationRequest {
+        id: id.parse().unwrap(),
+        capability: "cli-probe.upper".parse().unwrap(),
+        trace_parent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+            .parse()
+            .unwrap(),
+        secret_use: None,
+        input: json!({"text": "hello", "piped": piped}),
+    }
+}
+
+#[tokio::test]
+async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() {
+    use dekopon_broker_protocol::{
+        Attestation, BrokerClient, FrameLimits, GenerationOutcome, InvocationOutcome, InvokeAssets,
+        Streams,
+    };
+    use tracing_subscriber::prelude::*;
+
+    let fixture = ManagedBroker::gateway();
+    fixture.publish_lock('1');
+    let (active, report) = super::load_candidate(&fixture.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.unwrap();
+    let old_policy = active.ready.broker.policy_digest().to_owned();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(super::serve(
+        fixture.config(),
+        async {
+            stopped.await.unwrap();
+        },
+        super::ShutdownDeadline::default(),
+        LOCK_POLL,
+    ));
+    fixture.ready(&task).await;
+    let client =
+        BrokerClient::new(fixture.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (old_digest, outcome) = client.observe_generation().await.unwrap();
+    assert_eq!(outcome, GenerationOutcome::Active);
+    write_owner_only(
+        &fixture.directory.path().join("policies.cedar"),
+        POLICIES
+            .split("@id(\"chat-agent-upper\")")
+            .next()
+            .unwrap()
+            .replace(
+                "context.via == \"gateway\"",
+                "context.via == \"dekopon-gatewayd\"",
+            )
+            .as_bytes(),
+    );
+    let (next, report) =
+        super::load_candidate(&fixture.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let digest = next.unwrap().digest;
+    let claim = Attestation::for_subject(
+        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "chat-agent".parse().unwrap(),
+    );
+    let (stdin, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (stdout, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+    let old_client = client.clone();
+    let old_leg = tokio::spawn(async move {
+        old_client
+            .invoke(
+                Some(claim.clone()),
+                generation_invocation("leg-old", true),
+                InvokeAssets {
+                    streams: Some(Streams {
+                        stdin: Some(stdin.into()),
+                        stdout: stdout.into(),
+                    }),
+                    ..Default::default()
+                },
+                async |_upcall| unreachable!(),
+            )
+            .await
+            .unwrap()
+            .result
+            .outcome
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while capture
+            .events_where(
+                "dekopon_broker::audit",
+                &[
+                    ("audit.event", "broker.decision"),
+                    ("invocation.id", "leg-old"),
+                    ("decision.allowed", "true"),
+                ],
+            )
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!old_leg.is_finished());
+    assert_eq!(
+        client.prepare_generation(old_digest).await.unwrap(),
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(
+        client.commit_generation(digest.clone()).await.unwrap(),
+        GenerationOutcome::Applied
+    );
+    assert_eq!(
+        client.observe_generation().await.unwrap(),
+        (digest, GenerationOutcome::Active)
+    );
+    let denied = client
+        .invoke(
+            Some(Attestation::for_subject(
+                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "chat-agent".parse().unwrap(),
+            )),
+            generation_invocation("leg-new", false),
+            InvokeAssets::default(),
+            async |_upcall| unreachable!(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
+    std::io::Write::write_all(&mut feeder, b"hello").unwrap();
+    drop(feeder);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), old_leg)
+            .await
+            .unwrap()
+            .unwrap(),
+        InvocationOutcome::Succeeded
+    );
+    let old_decision = capture.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("audit.event", "broker.decision"),
+            ("invocation.id", "leg-old"),
+        ],
+    );
+    assert_eq!(
+        old_decision[0].field("policy.digest"),
+        Some(old_policy.as_str())
+    );
+    let new_decision = capture.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("audit.event", "broker.decision"),
+            ("invocation.id", "leg-new"),
+        ],
+    );
+    assert_ne!(
+        new_decision[0].field("policy.digest"),
+        Some(old_policy.as_str())
+    );
+    let mut output = Vec::new();
+    std::io::Read::read_to_end(&mut receiver, &mut output).unwrap();
+    assert_eq!(output, b"{\"text\":\"HELLOHELLO\"}\n");
+    stop.send(()).unwrap();
+    stopped_within(task).await.unwrap();
+}
+
+#[tokio::test]
+async fn peer_identity_edit_is_published_with_the_broker_generation() {
+    use dekopon_broker_protocol::{
+        Attestation, BrokerClient, ClientError, ERROR_UNAUTHENTICATED, FrameLimits,
+        GenerationOutcome,
+    };
+    let fixture = ManagedBroker::gateway();
+    fixture.publish_lock('1');
+    let (active, report) = super::load_candidate(&fixture.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = fixture.serve(async {
+        stopped.await.unwrap();
+    });
+    fixture.ready(&task).await;
+    let client =
+        BrokerClient::new(fixture.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let claim = Attestation::for_subject(
+        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "chat-agent".parse().unwrap(),
+    );
+    client.session_surface(Some(claim.clone())).await.unwrap();
+    let (old, GenerationOutcome::Active) = client.observe_generation().await.unwrap() else {
+        panic!("boot generation must be active");
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.config()).unwrap()).unwrap();
+    document["identities"][0]["attestor"] = json!({"namespaces": ["slack.other"]});
+    write_config(&fixture.config(), &document);
+    let (next, report) =
+        super::load_candidate(&fixture.config(), super::Mode::Reload(&active.unwrap())).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let digest = next.unwrap().digest;
+    assert_eq!(
+        client.prepare_generation(old).await.unwrap(),
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(
+        client.commit_generation(digest.clone()).await.unwrap(),
+        GenerationOutcome::Applied
+    );
+    assert_eq!(
+        client.observe_generation().await.unwrap(),
+        (digest, GenerationOutcome::Active)
+    );
+    assert!(matches!(client.session_surface(Some(claim)).await,
+        Err(ClientError::Remote { code, .. }) if code == ERROR_UNAUTHENTICATED));
+    stop.send(()).unwrap();
+    stopped_within(task).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_valid_policy_reload_prepares_with_an_active_storage_writer() {
+    let fixture = ResidentFixture::boot().await;
+    write_owner_only(
+        &fixture.cedar,
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(
+        prepared.is_some(),
+        "valid policy edit must prepare alongside the active writer"
+    );
+    assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
+}
+
+#[tokio::test]
+async fn a_refused_policy_reload_keeps_the_live_asset() {
+    use super::BrokerdError;
+    use dekopon_broker::PolicyBuildError;
+    let fixture = ResidentFixture::boot().await;
+    write_owner_only(&fixture.cedar, b"not cedar");
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(prepared.is_none());
+    assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Policy {
+            source: PolicyBuildError::Parse { .. }
+        }
+    )));
+}
+
+#[tokio::test]
+async fn changed_storage_refuses_without_creating_the_candidate_root() {
+    use super::BrokerdError;
+    let mut fixture = ResidentFixture::boot().await;
+    fixture.document["storage"]["rootPath"] = json!("other-storage");
+    write_config(&fixture.path, &fixture.document);
+    let (prepared, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+    assert!(prepared.is_none());
+    assert!(matches!(report.problems.as_slice(),
+        [BrokerdError::RestartRequired { categories }] if categories == &["storage"]));
+    assert!(!fixture.root.path().join("other-storage").exists());
+}
+
+#[tokio::test]
+async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
+    use super::{BrokerdError, Mode};
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let path = root.path().join("broker.yaml");
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    write_owner_only(&root.path().join("policies.cedar"), POLICIES.as_bytes());
+    let mut document = attested_document(current_uid());
+    document["identities"].as_array_mut().unwrap().truncate(1);
+    write_config(&path, &document);
+    let (active, report) = super::load_candidate(&path, Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.unwrap();
+    write_owner_only(
+        &root.path().join("bad-credentials.yaml"),
+        b"not-a-credential-map",
+    );
+    write_owner_only(&root.path().join("bad-secrets.yaml"), b"not-a-secret-map");
+    document["credentialsPath"] = json!("bad-credentials.yaml");
+    document["secretMapPath"] = json!("bad-secrets.yaml");
+    write_config(&path, &document);
+    let checked = super::check(&path, None).await;
+    assert!(checked.problems.is_empty(), "{checked:?}");
+    for report in [
+        super::load_candidate(&path, Mode::Boot).await.1,
+        super::load_candidate(&path, Mode::Reload(&active)).await.1,
+    ] {
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, BrokerdError::Credentials(_)))
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| matches!(problem, BrokerdError::Secrets(_)))
+        );
+    }
+
+    write_config(
+        &root.path().join("valid-credentials.yaml"),
+        &json!({
+            "apiVersion": super::CREDENTIALS_API_VERSION,
+            "credentials": [{
+                "name": "present", "kind": "bearerToken", "scheme": "Bearer",
+                "destinations": ["api.example.com"], "secret": "fixture-value-long-enough"
+            }]
+        }),
+    );
+    document["credentialsPath"] = json!("valid-credentials.yaml");
+    document.as_object_mut().unwrap().remove("secretMapPath");
+    document["capabilities"]["cli-probe"]["credential"] = json!("present");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["api.example.com"], "allowedMethods": ["GET"],
+        "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    document["agents"] = json!({"chat-agent": {"credentials": {"present": "absent"}}});
+    write_config(&path, &document);
+    let checked = super::check(&path, None).await;
+    assert!(checked.problems.is_empty(), "{checked:?}");
+    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(
+        report.problems.iter().any(|problem| matches!(problem,
+        BrokerdError::Broker(dekopon_broker::BrokerBuildError::UnknownCredential { name, .. })
+            if name == "absent")),
+        "{report:?}"
+    );
+}
+
 #[tokio::test]
 async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
     use super::{BrokerdError, Mode};
@@ -1806,14 +3311,14 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     assert!(!credentials.exists());
 }
 
-struct ManagedBroker {
-    directory: tempfile::TempDir,
+pub(super) struct ManagedBroker {
+    pub(super) directory: tempfile::TempDir,
     component_digest: String,
     component_bytes: usize,
 }
 
 impl ManagedBroker {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let uid = current_uid();
         let directory = tempfile::tempdir().expect("create managed broker fixture");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -1862,7 +3367,30 @@ impl ManagedBroker {
         }
     }
 
-    fn config(&self) -> std::path::PathBuf {
+    pub(super) fn gateway() -> Self {
+        let fixture = Self::new();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.config()).unwrap()).unwrap();
+        document["identities"] = json!([{
+            "uid": current_uid(),
+            "principal": "dekopon-gatewayd",
+            "actor": {"type": "service", "principal": "dekopon-gatewayd"},
+            "attestor": {}
+        }]);
+        write_config(&fixture.config(), &document);
+        write_owner_only(
+            &fixture.directory.path().join("policies.cedar"),
+            POLICIES
+                .replace(
+                    "context.via == \"gateway\"",
+                    "context.via == \"dekopon-gatewayd\"",
+                )
+                .as_bytes(),
+        );
+        fixture
+    }
+
+    pub(super) fn config(&self) -> std::path::PathBuf {
         self.directory.path().join("broker.yaml")
     }
 
@@ -1874,7 +3402,7 @@ impl ManagedBroker {
         self.directory.path().join("broker.sock")
     }
 
-    fn publish_lock(&self, revision: char) {
+    pub(super) fn publish_lock(&self, revision: char) {
         let staged = self.directory.path().join("providers.lock.yaml.staged");
         write_owner_only(
             &staged,
@@ -1911,6 +3439,194 @@ impl ManagedBroker {
         .await
         .expect("broker binds its socket");
     }
+}
+
+#[tokio::test]
+async fn lock_only_replacement_keeps_reload_candidate_on_the_active_registry() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("managed provider boot candidate");
+    let loaded = active.provider_lock.as_ref().expect("active provider lock");
+
+    broker.publish_lock('2');
+    let current = super::provider_manager::lock_digest(&broker.lock(), current_uid())
+        .await
+        .unwrap();
+    assert_ne!(current, loaded.digest);
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let next = next.expect("lock-only change belongs to lock_watch, not reload refusal");
+    assert_eq!(
+        next.provider_lock
+            .as_ref()
+            .expect("carried provider lock")
+            .digest,
+        loaded.digest
+    );
+}
+
+#[tokio::test]
+async fn restart_required_managed_edit_never_loads_another_provider() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["serverLimits"] = json!({"maxConnections": 12});
+    write_config(&broker.config(), &document);
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let (_, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active.unwrap()))
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        super::BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
+    assert!(
+        capture
+            .events_where("dekopon_broker_host", &[("provider", "cli-probe")])
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reload_uses_active_managed_registry_without_the_lock_file() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("managed boot candidate");
+    fs::remove_file(broker.lock()).unwrap();
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(next.is_some());
+}
+
+#[tokio::test]
+async fn reload_uses_active_managed_registry_without_pruned_old_blob() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let active = active.expect("managed boot candidate");
+    fs::remove_file(
+        broker
+            .directory
+            .path()
+            .join("store/blobs/sha256")
+            .join(format!("{}.wasm", broker.component_digest)),
+    )
+    .unwrap();
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(next.is_some());
+}
+
+#[tokio::test]
+async fn managed_to_direct_provider_checks_candidate_manifest() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document.as_object_mut().unwrap().remove("providerSet");
+    document["providers"] = json!(["bad.wasm"]);
+    write_owner_only(
+        &broker.directory.path().join("bad.wasm"),
+        b"not a component",
+    );
+    write_config(&broker.config(), &document);
+    let (_, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active.unwrap())).await;
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, super::BrokerdError::Host(_))),
+        "{report:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_generation_handshake_observes_only_confirmed_activation() {
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits, GenerationOutcome};
+    let broker = ManagedBroker::new();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["identities"] = json!([{
+        "uid": current_uid(),
+        "principal": "dekopon-gatewayd",
+        "actor": {"type": "service", "principal": "dekopon-gatewayd"},
+        "attestor": {}
+    }]);
+    write_config(&broker.config(), &document);
+    broker.publish_lock('1');
+    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let task = broker.serve(std::future::pending());
+    broker.ready(&task).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (old, outcome) = client.observe_generation().await.unwrap();
+    assert_eq!(outcome, GenerationOutcome::Active);
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (next, report) =
+        super::load_candidate(&broker.config(), super::Mode::Reload(&active.unwrap())).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let digest = next.unwrap().digest;
+    assert_ne!(old, digest);
+    assert_eq!(
+        client.commit_generation(digest.clone()).await.unwrap(),
+        GenerationOutcome::Refused
+    );
+    assert_eq!(
+        client.prepare_generation(digest.clone()).await.unwrap(),
+        (old.clone(), GenerationOutcome::Refused)
+    );
+    assert_eq!(
+        client.prepare_generation(old.clone()).await.unwrap(),
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(
+        client.observe_generation().await.unwrap(),
+        (old.clone(), GenerationOutcome::Active)
+    );
+    assert_eq!(
+        client.commit_generation(old.clone()).await.unwrap(),
+        GenerationOutcome::Refused
+    );
+    assert_eq!(
+        client.abort_generation(digest.clone()).await.unwrap(),
+        GenerationOutcome::Aborted
+    );
+    assert_eq!(
+        client.commit_generation(digest.clone()).await.unwrap(),
+        GenerationOutcome::Refused
+    );
+    assert_eq!(
+        client.prepare_generation(old.clone()).await.unwrap(),
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(
+        client.commit_generation(digest.clone()).await.unwrap(),
+        GenerationOutcome::Applied
+    );
+    assert_eq!(
+        client.observe_generation().await.unwrap(),
+        (digest, GenerationOutcome::Active)
+    );
+    task.abort();
+    task.await.unwrap_err();
 }
 
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);

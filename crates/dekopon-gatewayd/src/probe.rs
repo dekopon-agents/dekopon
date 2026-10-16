@@ -1,4 +1,6 @@
-use std::{ffi::OsString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, time::Duration};
+use std::{
+    borrow::Cow, ffi::OsString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, time::Duration,
+};
 
 use dekopon_model::{
     control::TurnControl,
@@ -105,20 +107,25 @@ pub(crate) async fn probe(
     config: &ResolvedConfig,
     routes: Option<&RoutingTable>,
     scope: &ProbeScope,
+    active_models: Option<&[ModelConfig]>,
     vendor: &Vendor,
     report: &mut CheckReport,
 ) {
-    let baseline = match scope {
-        ProbeScope::Every => None,
-        ProbeScope::ChangedFrom(path) => {
-            match config::load_in(path, crate::current_uid(), config::LoadMode::Check).await {
-                Ok((against, _)) => Some(against.models),
-                Err(source) => {
-                    report.warnings.push(CheckWarning::Baseline {
-                        path: path.clone(),
-                        source,
-                    });
-                    None
+    let baseline = if let Some(models) = active_models {
+        Some(Cow::Borrowed(models))
+    } else {
+        match scope {
+            ProbeScope::Every => None,
+            ProbeScope::ChangedFrom(path) => {
+                match config::load_in(path, crate::current_uid(), config::LoadMode::Check).await {
+                    Ok((against, _)) => Some(Cow::Owned(against.models)),
+                    Err(source) => {
+                        report.warnings.push(CheckWarning::Baseline {
+                            path: path.clone(),
+                            source,
+                        });
+                        None
+                    }
                 }
             }
         }

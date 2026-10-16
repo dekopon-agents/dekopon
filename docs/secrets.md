@@ -261,11 +261,11 @@ configured CA. `secureFile` and `kubernetesProjection` take neither field.
 ```yaml
 source:
   kind: oauth2Refresh
-  recordPath: /var/lib/dekopon/broker-chatgpt/example-oauth2.json
+  recordPath: /var/lib/dekopon/oauth2-records/example-oauth2.json
   tokenEndpoint: https://auth.example/oauth/token
   clientId: public-client-id
   refresh: lazy # or scheduled; omitted is lazy
-  seedPath: /run/dekopon-private/example-refresh-seed # optional broker-private file
+  seedPath: /etc/dekopon/private/example-refresh-seed # optional broker-private file
   timeoutMs: 10000
 ```
 
@@ -282,8 +282,14 @@ Every authorized resolution takes the sibling `.lock`, re-reads the record, and 
 token until 60 seconds before expiry; then it sends one bare OAuth refresh-token grant to the
 configured endpoint, writes the replacement `0600` file by atomic rename, and returns the access
 token. An omitted response `refresh_token` retains the predecessor; no in-memory token cache exists.
-`scheduled` is accepted in configuration but idle rotation does not ship yet; refresh
-happens on use, as with `lazy`. Two DRNs may share one record and lock only when their
+`lazy` never refreshes an idle record. In `scheduled` mode the broker checks due records
+without provider traffic and refreshes at the earlier of `lastRefresh + 22 hours` or
+`expiresAt - 2 hours`, even when the access token has more than 60 seconds remaining.
+That has a cost: an endpoint whose `expires_in` is 2 hours or less saves records that are already
+due, so a `scheduled` source rotates its refresh token on every five-minute tick.
+A failed attempt retries after five minutes while the record stays Live; a restart recomputes
+due from the durable record. The scheduler reads the active broker generation on each tick,
+uses the same record lock as authorized use, and drains an in-flight attempt at shutdown. Two DRNs may share one record and lock only when their
 `tokenEndpoint`, `clientId` and `seedPath` match. The record needs its own file-name stem: the broker writes
 `<stem>.tmp-<pid>` beside it and sweeps `<stem>.tmp-*` under the lock, so a sibling with the same
 stem (for example ChatGPT `auth.json` beside `auth.oauth`) shares those temporaries. The configured
@@ -303,7 +309,8 @@ response body or serialized record is `malformed`.
 If saving a rotated token fails, the resolution refuses and logs no path or credential value.
 A later attempt may retry; after a restart the on-disk predecessor may be spent again, receive a
 reused-token response and seal, requiring a fresh seed. There is no durable spent marker.
-Malformed records refuse per use; reset by deleting the record and providing a new seed.
+Malformed records refuse per use and produce a bounded boot error; all sealed records produce
+one boot audit event. Reset by deleting the record and providing a new seed.
 
 The broker image is distroless: it has no shell, `cat`, `mv`, or `tar`, so neither `kubectl exec` with
 `sh` nor `kubectl cp` works. To enroll or reset from a trusted local `record.json`, stop the broker
@@ -313,7 +320,7 @@ deployment's broker pod from the listing before scaling. The chart's generated s
 `<deployment>-state` unless `state.existingClaim` overrides it. Pause any controller that would
 restore the deployment's replicas while the broker is stopped. The example assumes the
 broker has a writable state mount at `paths.stateDir` (`/var/lib/dekopon`) with subdirectory
-`broker-chatgpt` and record file `example-oauth2.json`; adjust the maintenance pod's `subPath` and
+`broker-oauth2-records` and record file `example-oauth2.json`; adjust the maintenance pod's `subPath` and
 both `/record/...` paths to match the owner-controlled map and the broker's writable mount. That
 subdirectory must already exist on the claim, owned by broker UID 65532 and writable by it.
 Use the chart's pinned `initImage` (BusyBox), not the distroless broker image:
@@ -324,7 +331,7 @@ kubectl -n <namespace> scale deployment/<deployment> --replicas=0
 kubectl -n <namespace> wait --for=delete pod/<broker-pod> --timeout=180s
 kubectl -n <namespace> run oauth2-record-reset --restart=Never --attach --stdin \
   --image=busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23 \
-  --overrides='{"apiVersion":"v1","spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532},"containers":[{"name":"oauth2-record-reset","image":"busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23","stdin":true,"stdinOnce":true,"command":["/bin/sh","-c","set -eu; umask 077; cat > /record/example-oauth2.tmp && mv /record/example-oauth2.tmp /record/example-oauth2.json"],"volumeMounts":[{"name":"state","mountPath":"/record","subPath":"broker-chatgpt"}]}],"volumes":[{"name":"state","persistentVolumeClaim":{"claimName":"<state-claim>"}}]}}' \
+  --overrides='{"apiVersion":"v1","spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532},"containers":[{"name":"oauth2-record-reset","image":"busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23","stdin":true,"stdinOnce":true,"command":["/bin/sh","-c","set -eu; umask 077; cat > /record/example-oauth2.tmp && mv /record/example-oauth2.tmp /record/example-oauth2.json"],"volumeMounts":[{"name":"state","mountPath":"/record","subPath":"broker-oauth2-records"}]}],"volumes":[{"name":"state","persistentVolumeClaim":{"claimName":"<state-claim>"}}]}}' \
   < record.json
 kubectl -n <namespace> delete pod oauth2-record-reset --wait=true
 kubectl -n <namespace> scale deployment/<deployment> --replicas=1

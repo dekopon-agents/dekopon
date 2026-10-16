@@ -58,8 +58,18 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `privateConversation`; explicit `sharedConversation` shares one exact agent/transport/conversation
   window. `memory: { mode: oneShot }` starts each session without prior history.
   `sessions.memory` resolves retention/arena bounds and per-agent representation policies;
-  journal-backed routes may override the agent policy with `routes[].memory.policy`.
+  journal-backed routes may override the agent policy with `routes[].memory.policy`. A `decider`
+  selection also names the decision provider's `backend`, `model` and `requireProbabilities`.
   Without a journal, persistent routes remain window-only and config-check warns once.
+  `githubWebhook` configuration requires `name`, `bind` and `secretEnv` (the name of a nonblank
+  environment credential); its path is fixed at `/webhooks/github`. A GitHub route must set
+  nonempty, unique `githubEvents` from `pull_request` and `workflow_run`, a canonical
+  `conversation` thread selector and `memory: { mode: oneShot }`. Non-GitHub routes cannot set
+  `githubEvents`. First route match precedes event filtering. The verified GitHub POST mount
+  shares WhatsApp's listener when both use the same bind; GitHub alone binds that port. It
+  verifies raw-body HMAC-SHA256 before parsing repository identity, acknowledges accepted,
+  ignored and recent-duplicate deliveries, and retries queue saturation with HTTP 503. Replies
+  are silent; a route still requires a fresh broker-authorized session. See [gateway configuration](../../docs/gatewayd.md).
   Shared turns carry gateway-authored participant labels naming each sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share

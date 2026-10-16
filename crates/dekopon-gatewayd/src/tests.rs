@@ -1,3 +1,51 @@
+#[expect(
+    clippy::too_many_arguments,
+    reason = "existing serving fixtures share one test setup"
+)]
+pub(crate) async fn serve<F>(
+    runner: Arc<SessionRunner>,
+    routes: Arc<RoutingTable>,
+    identities: Arc<BTreeMap<String, TransportIdentity>>,
+    drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+    stop_words: Arc<Vec<String>>,
+    receiver: mpsc::Receiver<TransportEvent>,
+    shutdown: F,
+    grace: Duration,
+    collector: crate::collection::Collector,
+) -> crate::ServeOutcome
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    crate::gateway::Gateway::new(runner, routes, identities, drivers, stop_words)
+        .serve(receiver, shutdown, grace, collector)
+        .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "existing dispatch fixtures share one test setup"
+)]
+pub(crate) fn dispatch(
+    runner: &Arc<SessionRunner>,
+    routes: &Arc<RoutingTable>,
+    identities: &BTreeMap<String, TransportIdentity>,
+    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
+    stop_words: &[String],
+    sessions: &mut tokio::task::JoinSet<()>,
+    collector: &mut crate::collection::Collector,
+    follow_pending: &mut crate::follow::Debounce,
+    message: InboundMessage,
+) {
+    crate::gateway::Gateway::new(
+        Arc::clone(runner),
+        Arc::clone(routes),
+        Arc::new(identities.clone()),
+        Arc::new(drivers.clone()),
+        Arc::new(stop_words.to_vec()),
+    )
+    .dispatch(sessions, collector, follow_pending, message);
+}
+
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -110,7 +158,7 @@ fn generated_images(count: usize) -> Vec<GeneratedImage> {
     (0..count).map(|_| generated_image()).collect()
 }
 
-fn document(directory: &Path) -> Value {
+pub(crate) fn document(directory: &Path) -> Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "catalogPath": directory.join("dekopon.yaml"),
@@ -149,7 +197,7 @@ fn write_config(directory: &Path, document: &Value) -> PathBuf {
     path
 }
 
-async fn load(
+pub(crate) async fn load(
     directory: &Path,
     document: &Value,
 ) -> Result<crate::ResolvedConfig, config::ConfigError> {
@@ -176,11 +224,508 @@ fn only_route_problem(error: &RouteError) -> &RouteProblem {
     &error.problems[0]
 }
 
-fn temporary() -> tempfile::TempDir {
+pub(crate) fn temporary() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
         .expect("private temporary directory");
     directory
+}
+
+#[tokio::test]
+async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_snapshot() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let old_sources = gateway_sources(&active).await;
+    let mut edited = document(root.path());
+    edited["broker"]["serverUid"] = json!(502);
+    edited["sessions"] = json!({"maxConcurrent": 7});
+    write_config(root.path(), &edited);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &old_sources)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(
+        report.problems.iter().any(|problem| matches!(problem,
+            crate::GatewaydError::Config(ConfigError::RestartRequired { categories })
+                if categories == &["broker", "sessions"]
+        )),
+        "{report:?}"
+    );
+    assert_eq!(
+        old_sources.config.0.get(&path),
+        Some(&serde_json::to_vec(&document(root.path())).unwrap())
+    );
+    write_config(root.path(), &document(root.path()));
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &old_sources)),
+    )
+    .await;
+    assert!(candidate.is_some(), "{report:?}");
+}
+
+#[tokio::test]
+async fn active_reload_ignores_unset_transport_token_but_still_checks_model_credentials() {
+    const BOT_TOKEN: &str = "DEKOPON_GATEWAYD_TEST_UNSET_RELOAD_BOT_E82C";
+    const MODEL_KEY: &str = "DEKOPON_GATEWAYD_TEST_UNSET_RELOAD_MODEL_E82C";
+    assert!(std::env::var_os(BOT_TOKEN).is_none());
+    assert!(std::env::var_os(MODEL_KEY).is_none());
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["transports"] = json!([{
+        "name": "dev", "kind": "telegramLongPoll", "botTokenEnv": BOT_TOKEN,
+        "endpoint": "http://127.0.0.1:1"
+    }]);
+    let path = write_config(root.path(), &config);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let sources = gateway_sources(&active).await;
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &sources)),
+    )
+    .await;
+    let candidate = candidate.unwrap_or_else(|| panic!("active reload rejected: {report:?}"));
+    assert!(
+        candidate.prepared.is_none(),
+        "reload must not build transports"
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, crate::GatewaydError::Startup { .. }))
+    );
+
+    config["models"][0]["apiKeyEnv"] = json!(MODEL_KEY);
+    write_config(root.path(), &config);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &sources)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem,
+            crate::StartupProblem::ModelCredential(error) if error.variable == MODEL_KEY
+        ))
+    )), "model credential must still be checked: {report:?}");
+}
+
+#[tokio::test]
+async fn snapshot_classifies_resident_changes_separately_from_models_and_indicators() {
+    let root = temporary();
+    let path = write_config(root.path(), &document(root.path()));
+    let before = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    let mut edited = document(root.path());
+    edited["broker"]["serverUid"] = json!(502);
+    edited["sessions"] = json!({"maxConcurrent": 7, "indicators": {"mode": "off"}});
+    edited["models"][0]["model"] = json!("changed-qwen");
+    edited["telemetry"] = serde_json::Value::Null;
+    write_config(root.path(), &edited);
+    let after = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    let changes = before.changes(&after).unwrap();
+    assert_eq!(changes.restart_required, ["broker", "sessions"]);
+    assert_eq!(changes.swap, ["models", "indicators"]);
+    edited = document(root.path());
+    edited["metering"] = json!({});
+    edited["sessions"] = json!({});
+    edited["telemetry"] = serde_json::Value::Null;
+    write_config(root.path(), &edited);
+    let equivalent = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    assert_eq!(
+        before.changes(&equivalent).unwrap(),
+        config::GatewayChanges::default()
+    );
+    edited["sessions"]["maxConcurrent"] = json!(config::SessionsConfig::default().max_concurrent);
+    write_config(root.path(), &edited);
+    let explicit_default = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    assert_eq!(
+        before.changes(&explicit_default).unwrap(),
+        config::GatewayChanges::default()
+    );
+    edited["futureLive"] = json!(true);
+    write_config(root.path(), &edited);
+    let unknown = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    assert!(matches!(
+        before.changes(&unknown),
+        Err(ConfigError::UnclassifiedSource)
+    ));
+    edited = document(root.path());
+    edited["transports"][0]["indicators"] = json!({"mode": "off"});
+    write_config(root.path(), &edited);
+    config::load(&path, crate::current_uid())
+        .await
+        .expect("05 indicator schema resolves");
+    let indicators = config::GatewaySources {
+        config: config::source_snapshot(&path, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::SourceSnapshot(Default::default()),
+    };
+    let changes = before.changes(&indicators).unwrap();
+    assert!(changes.restart_required.is_empty());
+    assert_eq!(changes.swap, ["indicators"]);
+}
+
+#[tokio::test]
+async fn instruction_source_change_is_part_of_the_prepared_catalog_snapshot() {
+    let root = temporary();
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        catalog_text(true, Some("reasoning")).replace(
+            "instructions: Answer briefly and never claim authority.",
+            "instructionsFile: instructions.txt",
+        ),
+    )
+    .unwrap();
+    let instructions = root.path().join("instructions.txt");
+    fs::write(&instructions, "use current evidence").unwrap();
+    let path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let snapshot = gateway_sources(&active).await;
+    assert_eq!(
+        snapshot.catalog.0.get(&instructions).map(Vec::as_slice),
+        Some(b"use current evidence".as_slice())
+    );
+    fs::write(&instructions, "use older evidence").unwrap();
+    assert!(
+        !snapshot
+            .still_current(&path, &catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn catalog_snapshot_refuses_sources_changed_after_catalog_load() {
+    for changed in [
+        "instructions",
+        "skill",
+        "resource",
+        "new resource",
+        "new catalog file",
+    ] {
+        let root = temporary();
+        let directory = root.path().join("catalog");
+        fs::create_dir(&directory).unwrap();
+        let skill = mounted_skill(&directory.join("skills"), "counting");
+        let text = catalog_text(true, Some("reasoning")).replace(
+            "instructions: Answer briefly and never claim authority.",
+            "instructionsFile: instructions.txt",
+        );
+        fs::write(
+            directory.join("agent.yaml"),
+            format!("{text}  skills:\n    - skills/counting\n"),
+        )
+        .unwrap();
+        let instructions = directory.join("instructions.txt");
+        fs::write(&instructions, "original instructions").unwrap();
+        let catalog = LocalCatalog::load(&directory).unwrap();
+        match changed {
+            "instructions" => fs::write(&instructions, "new instructions").unwrap(),
+            "skill" => fs::write(
+                skill.source().join("SKILL.md"),
+                format!(
+                    "{}\nNew body.\n",
+                    fs::read_to_string(skill.source().join("SKILL.md")).unwrap()
+                ),
+            )
+            .unwrap(),
+            "resource" => fs::write(
+                skill.source().join("references/table.md"),
+                "changed resource",
+            )
+            .unwrap(),
+            "new resource" => fs::write(
+                skill.source().join("references/more.md"),
+                "another resource",
+            )
+            .unwrap(),
+            "new catalog file" => fs::write(
+                directory.join("second.yaml"),
+                text.replace("name: reviewer", "name: second"),
+            )
+            .unwrap(),
+            _ => unreachable!("test cases are closed"),
+        }
+        assert!(
+            matches!(
+                config::source_snapshot(&directory, Some(&catalog), crate::current_uid()).await,
+                Err(ConfigError::ChangedDuringLoad)
+            ),
+            "{changed}"
+        );
+        let repaired = LocalCatalog::load(&directory).unwrap();
+        let snapshot = config::source_snapshot(&directory, Some(&repaired), crate::current_uid())
+            .await
+            .unwrap();
+        let id = "reviewer".parse().unwrap();
+        assert_eq!(
+            snapshot.0.get(&instructions).map(Vec::as_slice),
+            repaired
+                .agent(&id)
+                .unwrap()
+                .spec
+                .instructions
+                .as_ref()
+                .map(String::as_bytes)
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_snapshot_includes_skill_resource_membership() {
+    let root = temporary();
+    let skill = mounted_skill(&root.path().join("skills"), "counting");
+    let catalog_path = root.path().join("dekopon.yaml");
+    fs::write(
+        &catalog_path,
+        format!(
+            "{}  skills:\n    - skills/counting\n",
+            catalog_text(true, Some("reasoning"))
+        ),
+    )
+    .unwrap();
+    let path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let old = gateway_sources(&active).await;
+    let resource = skill.source().join("references/table.md");
+    assert_eq!(
+        old.catalog.0.get(&resource).map(Vec::as_slice),
+        Some(b"one two three\n".as_slice())
+    );
+    let added = skill.source().join("references/more.md");
+    fs::write(&added, "new reference").unwrap();
+    assert!(
+        !old.still_current(&path, &catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    let new = gateway_sources(&active).await;
+    assert!(new.catalog.0.contains_key(&added));
+    assert_eq!(old.changes(&new).unwrap().swap, ["catalog"]);
+}
+
+#[tokio::test]
+async fn gateway_source_snapshot_changes_for_bytes_and_directory_membership() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let first = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    let path = directory.join("host.yaml");
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] = b' ';
+    fs::write(&path, bytes).unwrap();
+    fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    let second = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+    let added = directory.join("more.yaml");
+    fs::write(&added, b"apiVersion: dekopon/v1\n").unwrap();
+    let third = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    assert_ne!(second, third);
+    fs::remove_file(added).unwrap();
+    assert_eq!(
+        second,
+        config::source_snapshot(&directory, None, crate::current_uid())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_changed_gateway_source_permission_or_missing_file_cannot_prepare() {
+    let root = temporary();
+    let path = write_config(root.path(), &document(root.path()));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(
+        config::source_snapshot(&path, None, crate::current_uid()).await,
+        Err(ConfigError::InsecureFile {
+            source: dekopon_core::FileHygieneError::InsecureMode { .. },
+            ..
+        })
+    ));
+    fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        config::source_snapshot(&path, None, crate::current_uid()).await,
+        Err(ConfigError::Read { .. })
+    ));
+}
+
+#[tokio::test]
+async fn regular_gateway_source_read_checks_injected_root_and_mount_ownership() {
+    let root = temporary();
+    let path = write_config(root.path(), &document(root.path()));
+    let bytes = fs::read(&path).unwrap();
+    let uid = crate::current_uid();
+    let read_as = |owner, read_only| {
+        config::read_gateway_regular_file_at(
+            &path,
+            65533,
+            owner,
+            read_only,
+            |file, accepted_uid, tier, maximum| {
+                assert_eq!(accepted_uid, owner);
+                dekopon_core::read_trusted_file(file, uid, tier, maximum)
+            },
+        )
+    };
+    assert_eq!(read_as(0, true).unwrap(), bytes);
+    assert!(matches!(
+        read_as(0, false),
+        Err(dekopon_core::FileHygieneError::WrongOwner {
+            owner: 0,
+            expected: 65533,
+            ..
+        })
+    ));
+    assert_eq!(read_as(65533, false).unwrap(), bytes);
+    assert_eq!(
+        config::read_config_file(path.clone(), uid).await.unwrap(),
+        bytes
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(
+        read_as(0, true),
+        Err(dekopon_core::FileHygieneError::InsecureMode { .. })
+    ));
+}
+
+#[test]
+fn a_projection_switch_during_read_is_a_changed_candidate() {
+    let root = temporary();
+    for generation in ["..old", "..new"] {
+        let directory = root.path().join(generation);
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("gateway.yaml"), b"valid bytes").unwrap();
+    }
+    let data = root.path().join("..data");
+    let path = root.path().join("gateway.yaml");
+    std::os::unix::fs::symlink("..old", &data).unwrap();
+    std::os::unix::fs::symlink("..data/gateway.yaml", &path).unwrap();
+    assert!(matches!(
+        config::read_gateway_projection_with(&path, crate::current_uid(), true, || {
+            let next = root.path().join("..next");
+            std::os::unix::fs::symlink("..new", &next).unwrap();
+            fs::rename(next, &data).unwrap();
+        }),
+        Err(ConfigError::ChangedDuringLoad)
+    ));
+}
+
+#[test]
+fn a_read_only_projection_follows_the_replaced_data_generation() {
+    let root = temporary();
+    for (generation, contents) in [
+        ("..old", b"first".as_slice()),
+        ("..new", b"second".as_slice()),
+    ] {
+        let directory = root.path().join(generation);
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("gateway.yaml"), contents).unwrap();
+    }
+    let data = root.path().join("..data");
+    let key = root.path().join("gateway.yaml");
+    std::os::unix::fs::symlink("..old", &data).unwrap();
+    std::os::unix::fs::symlink("..data/gateway.yaml", &key).unwrap();
+    assert_eq!(
+        config::read_gateway_projection_at(&key, crate::current_uid(), true).unwrap(),
+        b"first"
+    );
+    std::os::unix::fs::symlink("..new", root.path().join("..next")).unwrap();
+    fs::rename(root.path().join("..next"), &data).unwrap();
+    assert_eq!(
+        config::read_gateway_projection_at(&key, crate::current_uid(), true).unwrap(),
+        b"second"
+    );
+    fs::set_permissions(
+        root.path().join("..new/gateway.yaml"),
+        fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    assert!(matches!(
+        config::read_gateway_projection_at(&key, crate::current_uid(), true),
+        Err(ConfigError::InsecureFile {
+            source: dekopon_core::FileHygieneError::InsecureMode { .. },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_writable_projection_is_refused_even_when_its_target_is_valid() {
+    let root = temporary();
+    let generation = root.path().join("..2026_10_15");
+    fs::create_dir(&generation).expect("generation");
+    fs::write(
+        generation.join("gateway.yaml"),
+        serde_json::to_vec(&document(root.path())).unwrap(),
+    )
+    .expect("projection contents");
+    std::os::unix::fs::symlink("..2026_10_15", root.path().join("..data")).expect("data link");
+    std::os::unix::fs::symlink("..data/gateway.yaml", root.path().join("gateway.yaml"))
+        .expect("key link");
+    let error = config::load(root.path().join("gateway.yaml"), crate::current_uid())
+        .await
+        .expect_err("writable projection cannot be trusted");
+    assert!(matches!(error, ConfigError::InsecureProjection { .. }));
 }
 
 #[tokio::test]
@@ -385,7 +930,8 @@ async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_
     input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
         "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
         "routines": [{"id": "original", "kind": "original"}], "retain": ["original"],
-        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original"}
+        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original",
+            "backend": "openrouter-luna", "model": "openai/gpt-6-luna-decisions", "requireProbabilities": false}
     }});
     let error = load(directory.path(), &input)
         .await
@@ -438,7 +984,7 @@ async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
     assert!(reports(&error, |problem| matches!(
         problem,
         ConfigProblem::MemoryPolicy {
-            problem: crate::config::memory::PolicyProblem::UnknownModel(_),
+            problem: crate::config::memory::PolicyProblem::UnknownModel,
             ..
         }
     )));
@@ -502,6 +1048,97 @@ async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
 }
 
 #[tokio::test]
+async fn a_decider_selection_requires_its_provider_profile_and_label_safe_routine_ids() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"journal": {"path": "journal"}});
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "original", "kind": "original"}, {"id": "head_1.k-b", "kind": "prefix", "maxBytes": 512}],
+        "retain": ["original", "head_1.k-b"],
+        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original",
+            "backend": "openrouter-jev", "model": "typesafe/jev-1.13", "requireProbabilities": true}
+    }});
+    let config = load(directory.path(), &input)
+        .await
+        .expect("complete decider profile");
+    let selection = &config.routes[0]
+        .memory_policy
+        .as_ref()
+        .expect("policy")
+        .selection;
+    assert_eq!(selection.backend.as_deref(), Some("openrouter-jev"));
+    assert_eq!(selection.model.as_deref(), Some("typesafe/jev-1.13"));
+    assert_eq!(selection.require_probabilities, Some(true));
+    for key in ["backend", "model", "requireProbabilities"] {
+        let mut missing = input.clone();
+        missing["routes"][0]["memory"]["policy"]["selection"]
+            .as_object_mut()
+            .expect("selection")
+            .remove(key);
+        let error = load(directory.path(), &missing)
+            .await
+            .expect_err("incomplete decider profile");
+        assert!(reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::MemoryPolicy {
+                problem: crate::config::memory::PolicyProblem::Invalid("selection"),
+                ..
+            }
+        )));
+    }
+    let mut fixed = input.clone();
+    fixed["routes"][0]["memory"]["policy"]["selection"] = json!({"mode": "fixed", "routine": "original",
+        "backend": "openrouter-jev", "model": "typesafe/jev-1.13", "requireProbabilities": false});
+    let error = load(directory.path(), &fixed)
+        .await
+        .expect_err("decider profile outside decider mode");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Invalid("selection"),
+            ..
+        }
+    )));
+    for id in ["has space", "a/b", "é", &"x".repeat(129)] {
+        let mut unsafe_id = input.clone();
+        unsafe_id["routes"][0]["memory"]["policy"]["routines"][1]["id"] = json!(id);
+        unsafe_id["routes"][0]["memory"]["policy"]["retain"][1] = json!(id);
+        let error = load(directory.path(), &unsafe_id)
+            .await
+            .expect_err("routine ID outside the label charset");
+        assert!(reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::MemoryPolicy {
+                problem: crate::config::memory::PolicyProblem::Invalid("routine id"),
+                ..
+            }
+        )));
+    }
+    let mut crowded = input.clone();
+    let routines: Vec<Value> = (0..33)
+        .map(|index| json!({"id": format!("p{index}"), "kind": "prefix", "maxBytes": 64}))
+        .chain([json!({"id": "original", "kind": "original"})])
+        .collect();
+    let retain: Vec<Value> = routines
+        .iter()
+        .map(|routine| routine["id"].clone())
+        .collect();
+    crowded["routes"][0]["memory"]["policy"]["routines"] = Value::Array(routines);
+    crowded["routes"][0]["memory"]["policy"]["retain"] = Value::Array(retain);
+    let error = load(directory.path(), &crowded)
+        .await
+        .expect_err("more retained routines than decider labels");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Invalid("decider labels"),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
     let directory = temporary();
     for (key, value, replacement) in [
@@ -523,7 +1160,7 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
         let error = load(directory.path(), &document)
             .await
             .expect_err("retired key");
-        let ConfigError::Decode { source } = error else {
+        let ConfigError::Decode { source, .. } = error else {
             panic!("decode refusal")
         };
         assert!(source.to_string().contains(key));
@@ -707,7 +1344,7 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 
     let invalid: [RefusalCase; 6] = [
         ("appSecretEnv", &["pasted secret"], |problem| {
-            matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
+            matches!(problem, ConfigProblem::InvalidEnvironmentName)
         }),
         ("bind", &["127.0.0.1:0"], |problem| {
             matches!(problem, ConfigProblem::InvalidWhatsappBind { .. })
@@ -751,6 +1388,958 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
     load(directory.path(), &document)
         .await
         .expect("WhatsApp supports PNG replies");
+}
+
+#[tokio::test]
+async fn webhook_mounts_are_distinct_by_bind_and_path() {
+    let directory = temporary();
+    let whatsapp = |name: &str, port: u16| {
+        json!({
+            "kind": "whatsappCloudApi", "name": name,
+            "bind": format!("127.0.0.1:{port}"), "callbackPath": "/webhooks/whatsapp",
+            "appSecretEnv": "PATH", "verifyTokenEnv": "PATH", "accessTokenEnv": "PATH",
+            "wabaId": "123", "phoneNumberId": "456", "graphApiVersion": "v23.0"
+        })
+    };
+    let github = |port: u16| {
+        json!({
+            "kind": "githubWebhook", "name": "github", "bind": format!("127.0.0.1:{port}"),
+            "secretEnv": "PATH"
+        })
+    };
+    let mut doc = document(directory.path());
+    doc["transports"] = json!([
+        doc["transports"][0],
+        whatsapp("wa1", 9080),
+        whatsapp("wa2", 9081)
+    ]);
+    load(directory.path(), &doc)
+        .await
+        .expect("two WhatsApp binds may use the same path");
+
+    doc["transports"].as_array_mut().unwrap().push(github(9081));
+    let resolved = load(directory.path(), &doc)
+        .await
+        .expect("GitHub may share either WhatsApp bind");
+    let prepared = crate::prepare(&resolved, &crate::routes::RoutingTable::default())
+        .expect("both WhatsApp listeners and the selected GitHub mount build");
+    assert_eq!(prepared.transports.len(), 3);
+    assert!(
+        prepared
+            .transports
+            .iter()
+            .any(|transport| transport.name() == "wa1")
+    );
+    let github_mount = prepared
+        .transports
+        .iter()
+        .filter(|transport| transport.name() == "github")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        github_mount.len(),
+        1,
+        "one GitHub mount for its matching bind"
+    );
+    assert_eq!(
+        github_mount[0]
+            .sibling_driver()
+            .as_ref()
+            .map(|(name, _)| name.as_str()),
+        Some("wa2")
+    );
+    assert!(github_mount[0].sibling_fetcher().is_some());
+
+    doc["transports"][3]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
+    let resolved = load(directory.path(), &doc)
+        .await
+        .expect("structurally valid");
+    let error = match crate::prepare(&resolved, &crate::routes::RoutingTable::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("missing GitHub secret must be attributed to GitHub"),
+    };
+    assert!(matches!(error, crate::GatewaydError::Startup { problems }
+        if matches!(problems.as_slice(), [crate::StartupProblem::Transport {
+            transport, source: crate::transport::TransportError::MissingCredential { name }
+        }] if transport == "github" && name == "CC07_S2_ABSENT_SECRET")));
+    doc["transports"][3]["secretEnv"] = json!("PATH");
+
+    doc["transports"] = json!([doc["transports"][0], github(9082), whatsapp("wa1", 9080)]);
+    assert!(reports(
+        &load(directory.path(), &doc).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::GithubBindNotShared { name } if name == "github")
+    ));
+
+    doc["transports"] = json!([
+        doc["transports"][0],
+        whatsapp("wa1", 9080),
+        whatsapp("wa2", 9080)
+    ]);
+    assert!(reports(
+        &load(directory.path(), &doc).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::ConflictingWebhookMount { name } if name == "wa2")
+    ));
+}
+
+#[tokio::test]
+async fn distinct_whatsapp_paths_on_one_bind_refuse_duplicate_github_mount() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    let whatsapp = json!({
+        "kind": "whatsappCloudApi", "name": "wa1", "bind": "127.0.0.1:9080",
+        "callbackPath": "/webhooks/whatsapp", "appSecretEnv": "PATH",
+        "verifyTokenEnv": "PATH", "accessTokenEnv": "PATH", "wabaId": "123",
+        "phoneNumberId": "456", "graphApiVersion": "v23.0"
+    });
+    let mut second = whatsapp.clone();
+    second["name"] = json!("wa2");
+    second["callbackPath"] = json!("/webhooks/whatsapp2");
+    doc["transports"] = json!([
+        doc["transports"][0], whatsapp, second,
+        {"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080",
+         "secretEnv": "PATH"}
+    ]);
+    let error = load(directory.path(), &doc)
+        .await
+        .expect_err("two listener-owning WhatsApp transports may not claim one bind");
+    assert!(reports(&error, |problem| matches!(problem,
+        ConfigProblem::SharedWhatsappBind { bind, transports }
+            if bind.port() == 9080 && transports == &["wa1", "wa2"])));
+    assert!(!reports(&error, |problem| matches!(problem,
+        ConfigProblem::GithubBindNotShared { name }
+        | ConfigProblem::ConflictingWebhookMount { name } if name == "github")));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one config fixture checks structure and boot credential outcomes"
+)]
+async fn github_config_checks_structure_before_boot_secret_and_mount() {
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080", "secretEnv": "CC07_S2_ABSENT_SECRET"});
+    doc["routes"][0]["transport"] = json!("github");
+    doc["routes"][0]["conversation"] =
+        json!({"kind": ["thread"], "container": "owner", "ids": ["owner.repo"]});
+    doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+    doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let path = write_config(directory.path(), &doc);
+    if std::env::var_os("CC07_S2_BLANK_BOOT_CHILD").is_some() {
+        let (candidate, report) =
+            crate::load_candidate(&path, None, config::LoadMode::Boot, None).await;
+        assert!(candidate.is_none());
+        assert!(report.problems.iter().any(|problem| matches!(problem,
+            crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem,
+                crate::StartupProblem::Transport { transport, source: crate::transport::TransportError::EmptyCredential { name } }
+                    if transport == "github" && name == "CC07_S2_ABSENT_SECRET"
+            ))
+        )));
+        std::process::exit(42);
+    }
+    let (candidate, report) =
+        crate::load_candidate(&path, None, config::LoadMode::Check, None).await;
+    assert!(candidate.is_some(), "{report:?}");
+    assert!(report.warnings.iter().any(|warning| matches!(warning, crate::CheckWarning::TransportCredential { transport, variable } if transport == "github" && variable == "CC07_S2_ABSENT_SECRET")));
+    let (candidate, report) =
+        crate::load_candidate(&path, None, config::LoadMode::Boot, None).await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport { source: crate::transport::TransportError::MissingCredential { .. }, .. })))));
+    let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "tests::github_config_checks_structure_before_boot_secret_and_mount",
+        ])
+        .env("CC07_S2_BLANK_BOOT_CHILD", "1")
+        .env("CC07_S2_ABSENT_SECRET", "")
+        .output()
+        .expect("blank-credential boot fixture");
+    assert!(
+        child.status.code() == Some(42),
+        "blank-credential boot child: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    assert!(matches!(
+        crate::build_transport(
+            &resolved.transports[0],
+            &resolved,
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+            &mut HashMap::new()
+        ),
+        Err(crate::transport::TransportError::MissingCredential { .. })
+    ));
+    assert!(!std::env::var("PATH").expect("Cargo test PATH").is_empty());
+    doc["transports"][0]["secretEnv"] = json!("PATH");
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    assert!(
+        crate::build_transport(
+            &resolved.transports[0],
+            &resolved,
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+            &mut HashMap::new()
+        )
+        .is_ok()
+    );
+    doc["transports"][0]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
+    for field in ["name", "bind", "secretEnv"] {
+        for present in [false, true] {
+            let mut bad = doc.clone();
+            if present {
+                bad["transports"][0][field] = serde_json::Value::Null;
+            } else {
+                bad["transports"][0].as_object_mut().unwrap().remove(field);
+            }
+            assert!(
+                matches!(
+                    load(directory.path(), &bad).await,
+                    Err(ConfigError::Decode { .. })
+                ),
+                "{field} must be present and non-null"
+            );
+        }
+    }
+    let mut bad = doc.clone();
+    bad["routes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("githubEvents");
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::InvalidGithubEvents { route: 0 })
+    ));
+    for events in [
+        json!(null),
+        json!([]),
+        json!(["pull_request", "pull_request"]),
+        json!(["unknown"]),
+    ] {
+        let mut bad = doc.clone();
+        bad["routes"][0]["githubEvents"] = events;
+        assert!(load(directory.path(), &bad).await.is_err());
+    }
+    let mut bad = doc.clone();
+    bad["routes"][0]["conversation"]["ids"] = json!(["Owner.repo"]);
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |problem| matches!(
+            problem,
+            ConfigProblem::InvalidRouteConversation { route: 0, .. }
+        )
+    ));
+    let mut bad = doc.clone();
+    bad["transports"][0]["bind"] = json!("127.0.0.1:0");
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::InvalidGithubBind { name } if name == "github")
+    ));
+    let mut bad = doc.clone();
+    bad["transports"][0]["callbackPath"] = json!("/webhooks/github");
+    assert!(matches!(
+        load(directory.path(), &bad).await,
+        Err(ConfigError::Decode { .. })
+    ));
+    let mut bad = doc.clone();
+    bad["transports"].as_array_mut().unwrap().push(json!({
+        "kind": "whatsappCloudApi", "name": "whatsapp", "bind": "127.0.0.1:9081",
+        "callbackPath": "/webhooks/whatsapp", "appSecretEnv": "W_APP",
+        "verifyTokenEnv": "W_VERIFY", "accessTokenEnv": "W_ACCESS",
+        "wabaId": "123", "phoneNumberId": "456", "graphApiVersion": "v23.0"
+    }));
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::GithubBindNotShared { name } if name == "github")
+    ));
+    let mut bad = doc.clone();
+    bad["routes"][0]["transport"] = json!("dev");
+    bad["transports"].as_array_mut().unwrap().push(json!({
+        "name": "dev", "kind": "local", "socketPath": directory.path().join("dev.sock")
+    }));
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::InvalidGithubEvents { route: 0 })
+    ));
+    let mut bad = doc.clone();
+    bad["routes"][0]["memory"] = json!({"mode": "persistent"});
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::GithubRequiresOneShot { .. })
+    ));
+    let mut bad = doc.clone();
+    bad["routes"][0]["conversation"]["ids"] = json!(["owner.dotted.repo"]);
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::InvalidRouteConversation { .. })
+    ));
+}
+
+#[tokio::test]
+async fn github_first_selector_wins_before_event_filter() {
+    use crate::config::GithubEvent;
+    use dekopon_broker_protocol::{Conversation, ConversationKind};
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080", "secretEnv": "CC07_S2_ABSENT_SECRET"});
+    let mut first = doc["routes"][0].clone();
+    first["transport"] = json!("github");
+    first["memory"] = json!({"mode": "oneShot"});
+    first["conversation"] =
+        json!({"kind": ["thread"], "container": "owner", "ids": ["owner.repo"]});
+    first["githubEvents"] = json!(["pull_request"]);
+    let mut second = first.clone();
+    second["githubEvents"] = json!(["workflow_run"]);
+    doc["routes"] = json!([first, second]);
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    let catalog =
+        dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml")).unwrap();
+    let routes = crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap();
+    let conversation = Conversation {
+        kind: ConversationKind::Thread,
+        container: Some("owner".into()),
+        id: "owner.repo".into(),
+        thread: Some("guid".into()),
+    };
+    let subject = dekopon_core::ExternalSubject::github("owner", "repo").unwrap();
+    assert!(
+        routes
+            .github_route("github", &conversation, &subject, GithubEvent::WorkflowRun)
+            .is_none()
+    );
+    assert_eq!(
+        routes
+            .github_route("github", &conversation, &subject, GithubEvent::PullRequest)
+            .unwrap()
+            .route_index,
+        0
+    );
+    assert!(
+        routes
+            .github_route(
+                "github",
+                &Conversation {
+                    id: "owner.other".into(),
+                    ..conversation
+                },
+                &subject,
+                GithubEvent::PullRequest
+            )
+            .is_none()
+    );
+}
+
+async fn signed_github_request(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    body: &[u8],
+    signature: &str,
+    guid: &str,
+) -> reqwest::StatusCode {
+    client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .header("x-github-delivery", guid)
+        .header("x-github-event", "pull_request")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("POST")
+        .status()
+}
+
+async fn signed_reload_delivery(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    guid: &str,
+    event: &str,
+    repo: &str,
+) -> reqwest::StatusCode {
+    use crate::transport::webhook::hmac_sha256;
+    let claim = if event == "pull_request" {
+        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
+            "action":"opened","number":7,"pull_request":{"head":{"sha":"abc123"}}})
+    } else {
+        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
+            "action":"completed","workflow_run":{"id":5,"head_sha":"abc123","conclusion":"success"}})
+    };
+    let body = serde_json::to_vec(&claim).unwrap();
+    let signature: String = hmac_sha256(b"secret", &body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .header("x-github-delivery", guid)
+        .header("x-github-event", event)
+        .body(body)
+        .send()
+        .await
+        .expect("signed webhook delivery")
+        .status()
+}
+
+#[tokio::test]
+async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
+    use crate::{gateway::CurrentGeneration, transport::github::GithubTransport};
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    config["transports"][0] = json!({"kind":"githubWebhook", "name":"github",
+        "bind":address.to_string(), "secretEnv":"PATH"});
+    config["routes"][0]["transport"] = json!("github");
+    config["routes"][0]["memory"] = json!({"mode":"oneShot"});
+    config["routes"][0]["conversation"] = json!({"kind":["thread"],
+        "container":"owner", "ids":["owner.repo"]});
+    config["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let mut control = config["routes"][0].clone();
+    control["conversation"]["ids"] = json!(["owner.control"]);
+    config["routes"].as_array_mut().unwrap().push(control);
+    let path = write_config(root.path(), &config);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response()]);
+    let generation = CurrentGeneration::boot(
+        Arc::new(candidate.routes.clone()),
+        Arc::new(candidate.config.stop_words.clone()),
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::serving(
+        runner,
+        generation.clone(),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let mut transport =
+        GithubTransport::new("github".into(), address, "secret".into(), generation, None);
+    transport.connect().await.unwrap();
+    let client = reqwest::Client::new();
+    let send = |guid, event, repo| signed_reload_delivery(&client, address, guid, event, repo);
+    assert_eq!(
+        send("run-before", "workflow_run", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "initially unconfigured workflow event must not enter the queue"
+    );
+    assert_eq!(
+        send("control-before", "pull_request", "CONTROL").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(control_before) = transport.next().await.unwrap() else {
+        panic!("control before reload")
+    };
+    assert_eq!(control_before.subject.canonical(), "github.owner.control");
+    config["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        send("run-added", "workflow_run", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(added) =
+        tokio::time::timeout(Duration::from_secs(1), transport.next())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("new event admitted")
+    };
+    assert_eq!(added.subject.canonical(), "github.owner.repo");
+    assert_eq!(added.message_id.to_string(), "run-added");
+    assert_eq!(
+        send("pr-before-remove", "pull_request", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(before_remove) = transport.next().await.unwrap() else {
+        panic!("PR before removal")
+    };
+    assert_eq!(before_remove.message_id.to_string(), "pr-before-remove");
+    config["routes"][0]["githubEvents"] = json!(["workflow_run"]);
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        send("pr-removed", "pull_request", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "removed event must not enter the queue despite 200-on-ignore"
+    );
+    assert_eq!(
+        send("control-after", "pull_request", "CONTROL").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(control_after) =
+        tokio::time::timeout(Duration::from_secs(1), transport.next())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("control after reload")
+    };
+    assert_eq!(control_after.subject.canonical(), "github.owner.control");
+    assert_eq!(control_after.message_id.to_string(), "control-after");
+}
+
+async fn authorize_github_fixture(
+    inbound: Box<crate::transport::InboundMessage>,
+    route: &crate::routes::BoundRoute,
+    gate: &SessionGate,
+    broker: &mut dekopon_test_support::BrokerFixture,
+) {
+    use dekopon_broker_protocol::{
+        Attestation, BrokerClient, ChatScopeClaim, FrameLimits, RequestEnvelope,
+    };
+    let crate::session::Admit::Admitted(admission, inbound, _) =
+        gate.admit(route, *inbound, crate::collection::Dispositions(vec![]))
+    else {
+        panic!("the delivery must start a new authorized session, not steer or queue");
+    };
+    let claim = Attestation::for_chat(
+        inbound.subject,
+        "reviewer".parse().unwrap(),
+        ChatScopeClaim {
+            transport: inbound.transport.parse().unwrap(),
+            kind: inbound.transport_kind,
+            conversation: inbound.conversation,
+            trigger: inbound.message_id.trigger(),
+        },
+    );
+    let client = BrokerClient::new(
+        broker.socket(),
+        crate::current_uid(),
+        FrameLimits::default(),
+    )
+    .unwrap();
+    let leg = dekopon_agent::BrokerLeg::connect(client, Some(claim.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        leg.effective_capabilities().len(),
+        1,
+        "the fresh leg has a broker-granted surface"
+    );
+    drop(leg);
+    assert_eq!(
+        broker.request().await,
+        RequestEnvelope::capabilities(Some(claim))
+    );
+    drop(admission);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one mounted socket exercises queue saturation, eviction and restart in order"
+)]
+async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_eviction() {
+    use crate::transport::{
+        ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
+    };
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": address.to_string(), "secretEnv": "PATH"});
+    doc["routes"][0]["transport"] = json!("github");
+    doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+    doc["routes"][0]["conversation"] =
+        json!({"kind": ["thread"], "container": "owner", "ids": ["owner.repo"]});
+    doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let mut second = doc["routes"][0].clone();
+    second["githubEvents"] = json!(["workflow_run"]);
+    doc["routes"].as_array_mut().unwrap().push(second);
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    let catalog =
+        dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml")).unwrap();
+    let routes =
+        std::sync::Arc::new(crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap());
+    let body = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"abcdef"}}}),
+    )
+    .unwrap();
+    let signature: String = hmac_sha256(b"secret", &body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let client = reqwest::Client::new();
+    let mut transport = GithubTransport::new(
+        "github".into(),
+        address,
+        "secret".into(),
+        crate::gateway::CurrentGeneration::boot(std::sync::Arc::clone(&routes), Arc::default()),
+        None,
+    );
+    transport.connect().await.unwrap();
+    for guid in ["first", "first"] {
+        assert_eq!(
+            signed_github_request(&client, address, &body, &signature, guid).await,
+            reqwest::StatusCode::OK
+        );
+    }
+    let TransportEvent::Message(message) = transport.next().await.unwrap() else {
+        panic!("queued turn")
+    };
+    assert_eq!(message.subject.canonical(), "github.owner.repo");
+    assert_eq!(message.conversation.key(), "owner.repo:first");
+    let mut broker = dekopon_test_support::BrokerFixture::answering(
+        directory.path(),
+        [
+            dekopon_broker_protocol::ResponseEnvelope::chat_capabilities(
+                vec![capability("repo.read")],
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+                Some("repo-principal".parse().unwrap()),
+            ),
+            dekopon_broker_protocol::ResponseEnvelope::chat_capabilities(
+                vec![capability("repo.read")],
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+                Some("repo-principal".parse().unwrap()),
+            ),
+        ],
+    );
+    let first_subject = message.subject.clone();
+    let route = routes.route(&message).expect("routed repo").clone();
+    let gate = SessionGate::new(1);
+    authorize_github_fixture(message, &route, &gate, &mut broker).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "a duplicate must not enqueue a second turn"
+    );
+    let other_body = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OTHER"},"name":"REPO"},
+        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"abcdef"}}}),
+    )
+    .unwrap();
+    let other_signature: String = hmac_sha256(b"secret", &other_body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        signed_github_request(
+            &client,
+            address,
+            &other_body,
+            &other_signature,
+            "different-repo"
+        )
+        .await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "another signed repo cannot use the first repo's route"
+    );
+    let run_body = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"completed", "workflow_run":{"id":5,"head_sha":"abc","conclusion":"success"}}),
+    )
+    .unwrap();
+    let run_signature: String = hmac_sha256(b"secret", &run_body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let run_status = client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={run_signature}"))
+        .header("x-github-delivery", "run-guid")
+        .header("x-github-event", "workflow_run")
+        .body(run_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(run_status.status(), reqwest::StatusCode::OK);
+    let pending_run = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"requested", "workflow_run":{"id":6,"head_sha":"abc","conclusion":null}}),
+    )
+    .unwrap();
+    let pending_signature: String = hmac_sha256(b"secret", &pending_run)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pending_status = client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={pending_signature}"))
+        .header("x-github-delivery", "pending-run-guid")
+        .header("x-github-event", "workflow_run")
+        .body(pending_run)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_status.status(),
+        reqwest::StatusCode::OK,
+        "a signed in-progress run with a null conclusion is ignored, not malformed"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "the first selected route lacks workflow_run; the later route cannot claim it"
+    );
+    let concurrent = futures_util::future::join_all(
+        (0..16).map(|_| signed_github_request(&client, address, &body, &signature, "simultaneous")),
+    )
+    .await;
+    assert!(
+        concurrent
+            .iter()
+            .all(|status| *status == reqwest::StatusCode::OK)
+    );
+    let TransportEvent::Message(only) = transport.next().await.unwrap() else {
+        panic!("one accepted concurrent turn")
+    };
+    assert_eq!(only.message_id.to_string(), "simultaneous");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err()
+    );
+    for index in 0..64 {
+        assert_eq!(
+            signed_github_request(
+                &client,
+                address,
+                &body,
+                &signature,
+                &format!("queue-{index}")
+            )
+            .await,
+            reqwest::StatusCode::OK
+        );
+    }
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "retry").await,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let TransportEvent::Message(_) = transport.next().await.unwrap() else {
+        panic!("release queue slot")
+    };
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "retry").await,
+        reqwest::StatusCode::OK
+    );
+    for _ in 0..64 {
+        let TransportEvent::Message(_) = transport.next().await.unwrap() else {
+            panic!("queued message")
+        };
+    }
+    for index in 0..1024 {
+        assert_eq!(
+            signed_github_request(
+                &client,
+                address,
+                &body,
+                &signature,
+                &format!("evict-{index}")
+            )
+            .await,
+            reqwest::StatusCode::OK
+        );
+        let TransportEvent::Message(_) = transport.next().await.unwrap() else {
+            panic!("eviction input")
+        };
+    }
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "first").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(evicted) = transport.next().await.unwrap() else {
+        panic!("evicted GUID is accepted")
+    };
+    assert_eq!(evicted.message_id.to_string(), "first");
+    drop(transport);
+    tokio::task::yield_now().await;
+    let mut restarted = GithubTransport::new(
+        "github".into(),
+        address,
+        "secret".into(),
+        crate::gateway::CurrentGeneration::boot(routes, Arc::default()),
+        None,
+    );
+    restarted.connect().await.unwrap();
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "first").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(second) = restarted.next().await.unwrap() else {
+        panic!("restart accepts second turn")
+    };
+    assert_eq!(second.subject, first_subject);
+    authorize_github_fixture(second, &route, &gate, &mut broker).await;
+}
+
+#[tokio::test]
+async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
+    use crate::transport::{
+        ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
+        whatsapp::WhatsappTransport,
+    };
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let wa = WhatsappTransport::new(
+        "wa".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "wa-secret".into(),
+        "verify".into(),
+        "access".into(),
+        crate::LivenessSettings::default(),
+    )
+    .unwrap();
+    let combined = GithubTransport::new(
+        "github".into(),
+        address,
+        "gh-secret".into(),
+        crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+        Some(wa),
+    );
+    let mut drivers = BTreeMap::new();
+    let mut fetchers = HashMap::new();
+    let mut owners = HashMap::new();
+    let mut combined =
+        crate::register_transport(Box::new(combined), &mut drivers, &mut fetchers, &mut owners);
+    assert!(drivers.contains_key("github") && drivers.contains_key("wa"));
+    assert!(fetchers.contains_key("wa"));
+    assert!(!fetchers.contains_key("github"));
+    let lone = WhatsappTransport::new(
+        "wa-alone".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "wa-secret".into(),
+        "verify".into(),
+        "access".into(),
+        crate::LivenessSettings::default(),
+    )
+    .unwrap();
+    let _lone = crate::register_transport(Box::new(lone), &mut drivers, &mut fetchers, &mut owners);
+    assert!(drivers.contains_key("wa-alone") && fetchers.contains_key("wa-alone"));
+    combined.connect().await.unwrap();
+    let client = reqwest::Client::new();
+    let challenge = client
+        .get(format!(
+            "http://{address}/wa?hub.mode=subscribe&hub.verify_token=verify&hub.challenge=ok"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.text().await.unwrap(), "ok");
+    let body = serde_json::to_vec(
+        &json!({"object":"whatsapp_business_account", "entry":[{"id":"123",
+        "changes":[{"field":"messages","value":{"messaging_product":"whatsapp",
+        "metadata":{"phone_number_id":"456"},"contacts":[{"wa_id":"1603"}],
+        "messages":[{"id":"wamid.1","from":"1603","type":"text","text":{"body":"hello"}}]}}]}]}),
+    )
+    .unwrap();
+    let signature: String = hmac_sha256(b"wa-secret", &body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let response = client
+        .post(format!("http://{address}/wa"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        matches!(combined.next().await.unwrap(), TransportEvent::Connected { name, .. } if name == "wa")
+    );
+    let TransportEvent::Message(message) = combined.next().await.unwrap() else {
+        panic!("WhatsApp still queues")
+    };
+    assert_eq!(message.subject.canonical(), "whatsapp.1603");
+}
+
+#[tokio::test]
+async fn a_wake_store_interval_must_exceed_the_routed_script_timeout() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["routes"][0]["wakes"] = json!(true);
+    config["routes"][0]["limits"]["scriptTimeoutMs"] = json!(300_000);
+    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 300_000});
+    let error = load(directory.path(), &config)
+        .await
+        .expect_err("equal intervals overlap");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::WakeIntervalWithinScriptTimeout {
+            route: 0,
+            min_interval_ms: 300_000,
+            script_timeout_ms: 300_000
+        }
+    )));
+    config["sessions"]["wakes"]["minIntervalMs"] = json!(360_000);
+    load(directory.path(), &config)
+        .await
+        .expect("longer interval loads");
 }
 
 #[tokio::test]
@@ -862,7 +2451,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         let error = load(directory.path(), &mutate(&patch))
             .await
             .expect_err("retired key");
-        assert!(matches!(error, ConfigError::Decode { source }
+        assert!(matches!(error, ConfigError::Decode { source, .. }
             if source.to_string().contains("imageGenerator")));
     }
 
@@ -955,11 +2544,11 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             json!({"/transports": [{"name": "dev", "kind": "telegramLongPoll",
             "botTokenEnv": "12345:AAH-actual-secret-value"}]}),
-            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
+            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName),
         ),
         (
             json!({"/models/0/apiKeyEnv": "sk-live-not-a-variable"}),
-            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName { .. }),
+            |problem| matches!(problem, ConfigProblem::InvalidEnvironmentName),
         ),
         (
             json!({"/routes/0/indicators": {"mode": "native", "statusText": true}}),
@@ -1265,8 +2854,15 @@ async fn a_permanent_transport_failure_stops_the_gateway_and_preserves_its_cause
         catalog_text(true, Some("reasoning")),
     )
     .expect("write catalog");
-    let (broker, mut observed) =
-        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let mut responses = listings(2, &["cli-probe.upper"]);
+    responses[1] = ResponseEnvelope {
+        api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
+        response: dekopon_broker_protocol::BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: dekopon_broker_protocol::GenerationOutcome::Active,
+        },
+    };
+    let (broker, mut observed) = stub_broker(directory.path(), responses).await;
     let mut document = document(directory.path());
     document["broker"]["serverUid"] = json!(broker.server_uid);
     let paths = [
@@ -1311,7 +2907,20 @@ async fn a_permanent_transport_failure_stops_the_gateway_and_preserves_its_cause
             "not a socket"
         );
     }
-    assert!(observed.try_recv().is_ok(), "startup broker probe ran");
+    assert!(matches!(
+        observed.try_recv(),
+        Ok(RequestEnvelope {
+            request: BrokerRequest::Capabilities { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        observed.try_recv(),
+        Ok(RequestEnvelope {
+            request: BrokerRequest::ObserveGeneration,
+            ..
+        })
+    ));
     assert!(
         observed.try_recv().is_err(),
         "startup sends no retired report"
@@ -1681,7 +3290,7 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
     );
 }
 
-fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
+pub(crate) fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
     let class = model_class.map_or(String::new(), |class| format!("  modelClass: {class}\n"));
     format!(
         "apiVersion: dekopon.dev/v1alpha1\n\
@@ -2123,9 +3732,9 @@ impl ModelScript {
 }
 
 impl ModelFactory for Arc<ModelScript> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -2790,6 +4399,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
             ids: None,
         },
         subjects: None,
+        github_events: None,
         agent: "reviewer".parse().expect("valid agent fixture"),
         description: "Reviews things".to_owned(),
         model_class: Some("reasoning".to_owned()),
@@ -3149,9 +4759,9 @@ impl InterruptibleModel {
 }
 
 impl ModelFactory for Arc<InterruptibleModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -3258,9 +4868,9 @@ impl BlockedModel {
 }
 
 impl ModelFactory for Arc<BlockedModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -6224,9 +7834,9 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -7083,9 +8693,9 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -13068,7 +14678,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
         }}]}]
     }))
     .expect("the delivery serializes");
-    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let digest = crate::transport::webhook::hmac_sha256(b"secret", &body);
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
@@ -13149,7 +14759,7 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
             })).collect::<Vec<_>>()
         }}]}]
     })).unwrap();
-    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let digest = crate::transport::webhook::hmac_sha256(b"secret", &body);
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     let response = reqwest::Client::new()
         .post(format!("http://{address}/wa"))
@@ -13493,9 +15103,9 @@ impl ChatModel for FailingStreamModel {
 }
 
 impl ModelFactory for Arc<FailingStreamModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -13504,9 +15114,9 @@ impl ModelFactory for Arc<FailingStreamModel> {
 }
 
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -13684,9 +15294,9 @@ impl ModelFactory for Arc<ParkedBuild> {
         reason = "both halves are the test's own rendezvous: an unobserved entry signal fails \
                   wait_until_building, and a release that never arrives is bounded by the timeout"
     )]
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -14801,7 +16411,7 @@ fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_five_seconds() {
         let mut collector = burst_collector(configured);
         let photo = burst_photo("");
         let start = photo.received_at;
-        let result = collector.offer(0, photo);
+        let result = collector.offer(crate::collection::tests::route("a"), photo);
         if expected == 0 {
             assert!(matches!(result, Offered::Immediate(_)));
             assert!(collector.deadline().is_none());
@@ -14848,14 +16458,14 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
         let mut photo = burst_photo(caption);
         photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
         assert!(matches!(
-            collector.offer(0, photo),
+            collector.offer(crate::collection::tests::route("a"), photo),
             crate::collection::Offered::Pending
         ));
     }
     let mut prompt = burst_photo("edit these three together");
     prompt.assets.clear();
     assert!(matches!(
-        collector.offer(0, prompt),
+        collector.offer(crate::collection::tests::route("a"), prompt),
         crate::collection::Offered::Pending
     ));
     assert_eq!(models.requests(), 0);
@@ -14912,7 +16522,7 @@ async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refus
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut collector = burst_collector(None);
     assert!(matches!(
-        collector.offer(0, burst_photo("edit")),
+        collector.offer(crate::collection::tests::route("a"), burst_photo("edit")),
         crate::collection::Offered::Pending
     ));
     assert!(observed.try_recv().is_err());
@@ -15190,7 +16800,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
         slack.connect().await.unwrap();
         let message = next_message(&mut slack).await;
         let mut collector = burst_collector(None);
-        match collector.offer(0, message) {
+        match collector.offer(crate::collection::tests::route("a"), message) {
             Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
             Offered::Refused(_, "input-limit") if count == 11 => {}
             _ => panic!("Slack native array was split or queued"),
@@ -15221,7 +16831,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
         .unwrap();
         discord.connect().await.unwrap();
         let message = next_message(&mut discord).await;
-        match collector.offer(0, message) {
+        match collector.offer(crate::collection::tests::route("a"), message) {
             Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
             Offered::Refused(_, "input-limit") if count == 11 => {}
             _ => panic!("Discord native array was split or queued"),
@@ -15294,8 +16904,16 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         lead,
     );
     assert!(collector.deadline().is_some());
+    let route = routes.route(&member).expect("bound topic route").clone();
+    let identity = |message: &InboundMessage| crate::collection::RouteIdentity::of(&route, message);
+    assert!(collector.is_native_continuation(&identity(&member), &member));
+    let mut other = route.clone();
+    other.agent = "other".parse().unwrap();
     assert!(
-        !collector.is_native_continuation(1, &member),
+        !collector.is_native_continuation(
+            &crate::collection::RouteIdentity::of(&other, &member),
+            &member
+        ),
         "different bound route"
     );
     for axis in 0..3 {
@@ -15305,7 +16923,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             1 => outsider.native_group = Some("other-group".into()),
             _ => outsider.conversation.thread = Some("43".into()),
         }
-        assert!(!collector.is_native_continuation(0, &outsider));
+        assert!(!collector.is_native_continuation(&identity(&outsider), &outsider));
         crate::dispatch(
             &runner,
             &routes,
@@ -15351,7 +16969,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         }
     );
     assert!(
-        !collector.is_native_continuation(0, &member),
+        !collector.is_native_continuation(&identity(&member), &member),
         "sealed group cannot lend addressing"
     );
 }
@@ -15678,6 +17296,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 mod generation;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/reload_evidence.rs"]
+mod reload_evidence;
 #[path = "tests/selection.rs"]
 mod selection;
 #[path = "tests/steering.rs"]
@@ -16456,7 +18076,10 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            (
+                "user",
+                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nwhat broke?"
+            ),
             ("assistant", "Two things broke."),
             ("user", "and the second one?"),
         ]),
@@ -16513,7 +18136,8 @@ async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message(
         );
     }
     assert_eq!(prompt[1], ("user".to_owned(), prompt[1].1.clone()));
-    assert!(prompt[1].1.starts_with("four photos"));
+    assert!(prompt[1].1.starts_with("[memory: {\"recordId\":1,"));
+    assert!(prompt[1].1.contains("four photos"));
 }
 
 type Asked = (Option<String>, Option<String>, usize);
@@ -17619,7 +19243,7 @@ async fn check_reports_an_unknown_route_agent_beside_a_fragment_collision() {
         crate::GatewaydError::Route(RouteError { problems })
             if problems.iter().any(|problem| matches!(
                 problem,
-                RouteProblem::UnknownAgent { agent } if agent == "nobody"
+                RouteProblem::UnknownAgent { .. }
             ))
     )));
 }
@@ -17681,14 +19305,16 @@ fn spawn_fake_vendor() -> FakeVendor {
                         .expect("probe names its model")
                         .to_owned();
                 recorded.lock().push(model.clone());
-                let (status, content_type, response) = if model == "vendor/refused" {
+                let (status, content_type, response) = if model == "vendor/refused"
+                    || model == "vendor/outage"
+                {
                     let authorization = headers
                         .lines()
                         .find(|line| line.to_ascii_lowercase().starts_with("authorization"))
                         .unwrap_or_default()
                         .to_owned();
                     (
-                        "400 Bad Request",
+                        if model == "vendor/outage" { "503 Service Unavailable" } else { "400 Bad Request" },
                         "application/json",
                         json!({ "error": { "message": format!("no endpoints for this model; you sent {authorization}") } })
                             .to_string(),
@@ -17767,7 +19393,7 @@ async fn check_reports_a_collision_an_unknown_agent_and_a_refused_model_together
     assert!(matches!(
         &report.problems[1],
         crate::GatewaydError::Route(RouteError { problems })
-            if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { agent }] if agent == "nobody")
+            if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { .. }])
     ));
     let crate::GatewaydError::Probe(problem) = &report.problems[2] else {
         panic!("the third problem is the probe: {:?}", report.problems[2]);
@@ -17804,6 +19430,1307 @@ async fn check_reports_a_collision_an_unknown_agent_and_a_refused_model_together
     {
         assert!(!line.contains(PROBE_KEY), "{line}");
     }
+}
+
+#[tokio::test]
+async fn malformed_single_file_names_the_file_without_model_or_route_diagnostics() {
+    let root = temporary();
+    let path = root.path().join("gateway.yaml");
+    fs::write(&path, "models: [\n").unwrap();
+    let report = crate::check(&path, None, Some(&crate::ProbeScope::Every)).await;
+    assert!(
+        matches!(report.problems.as_slice(), [crate::GatewaydError::Config(
+        ConfigError::Decode { path: Some(failed), .. }
+    )] if failed == &path)
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::Skipped {
+            stage: crate::Stage::Routes
+        }
+    )));
+}
+
+#[tokio::test]
+async fn a_fragment_conflict_and_resolve_refusal_are_both_reported() {
+    let root = temporary();
+    let directory = check_fixture(
+        root.path(),
+        "reviewer",
+        &[(
+            "collision.yaml",
+            json!({"apiVersion": config::CONFIG_API_VERSION, "catalogPath": "/elsewhere.yaml", "models": [{"name": "", "kind": "openaiCompatible", "endpoint": "http://127.0.0.1:11434/v1", "model": "qwen3", "timeoutMs": 120_000}]}),
+        )],
+    );
+    let report = crate::check(&directory, None, None).await;
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Fragments(
+            dekopon_core::fragments::FragmentError::Conflicts { .. }
+        ))
+    )));
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|problem| matches!(problem, ConfigProblem::UnnamedModel))
+    )));
+}
+
+#[tokio::test]
+async fn malformed_fragment_reports_only_its_file_without_inventing_model_or_route_ids() {
+    let root = temporary();
+    let directory = check_fixture(root.path(), "reviewer", &[]);
+    let path = directory.join("broken.yaml");
+    fs::write(&path, "models: [\n").expect("malformed fragment");
+    let report = crate::check(&directory, None, Some(&crate::ProbeScope::Every)).await;
+    assert!(
+        matches!(report.problems.as_slice(), [crate::GatewaydError::Config(
+        ConfigError::DecodeFragment { path: failed, .. }
+    )] if failed == &path)
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        crate::CheckWarning::Skipped {
+            stage: crate::Stage::Routes
+        }
+    )));
+    let bad = config::source_snapshot(&directory, None, crate::current_uid())
+        .await
+        .unwrap();
+    assert_eq!(
+        bad,
+        config::source_snapshot(&directory, None, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    fs::write(
+        &path,
+        format!("apiVersion: {}\n", config::CONFIG_API_VERSION),
+    )
+    .unwrap();
+    assert_ne!(
+        bad,
+        config::source_snapshot(&directory, None, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    let repaired = crate::check(&directory, None, None).await;
+    assert!(repaired.problems.is_empty(), "{repaired:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+            ResponseEnvelope::capabilities(Vec::new(), Vec::new(), BTreeMap::new()),
+        ],
+    )
+    .await;
+    let model = BlockedModel::new("old turn");
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let driver = Arc::new(RecordingDriver::default());
+    let old = route(model_config());
+    let current = Arc::new(arc_swap::ArcSwap::from(Arc::new(old.clone())));
+    let selected = Arc::clone(&current);
+    let running = tokio::spawn(crate::session::run_session_resolving(
+        Arc::clone(&runner),
+        old.clone(),
+        message("first"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        String::new(),
+        move |_, _queued| Some(((*selected.load_full()).clone(), String::new())),
+    ));
+    model.wait_until_entered().await;
+    let queued = message_from("tel.999", "next");
+    let second = crate::session::run_session_resolving(
+        runner,
+        old.clone(),
+        queued,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        String::new(),
+        move |_, _queued| None,
+    );
+    second.await;
+    let mut new_route = old;
+    new_route.steering = crate::config::Steering::Boundary;
+    new_route.agent = "different-agent".parse().expect("valid new route agent");
+    current.store(Arc::new(new_route));
+    model.release();
+    running
+        .await
+        .expect("old invocation and queued refusal finish");
+    assert_eq!(
+        driver.replies(),
+        ["old turn", crate::session::UNAUTHORIZED_REPLY]
+    );
+    assert!(matches!(
+        observed.try_recv(),
+        Ok(RequestEnvelope {
+            request: BrokerRequest::Capabilities { attestation: Some(attestation) },
+            ..
+        }) if attestation.agent.as_str() == "reviewer"
+    ));
+    assert!(matches!(
+        observed.try_recv(),
+        Ok(RequestEnvelope {
+            request: BrokerRequest::Capabilities { attestation: Some(attestation) },
+            ..
+        }) if attestation.agent.as_str() == "different-agent"
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "a refused grant starts no model or broker effect"
+    );
+}
+
+#[tokio::test]
+async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() {
+    use dekopon_broker_protocol::{
+        BrokerRequest, BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+
+    for (preparation, confirmation, published, same_broker_digest, gateway_edit) in [
+        (
+            GenerationOutcome::Prepared,
+            GenerationOutcome::Refused,
+            false,
+            false,
+            true,
+        ),
+        (
+            GenerationOutcome::Prepared,
+            GenerationOutcome::Applied,
+            true,
+            false,
+            true,
+        ),
+        (
+            GenerationOutcome::Prepared,
+            GenerationOutcome::Applied,
+            true,
+            true,
+            true,
+        ),
+        (
+            GenerationOutcome::Prepared,
+            GenerationOutcome::Applied,
+            true,
+            false,
+            false,
+        ),
+        (
+            GenerationOutcome::Prepared,
+            GenerationOutcome::Applied,
+            false,
+            true,
+            false,
+        ),
+        (
+            GenerationOutcome::Active,
+            GenerationOutcome::Refused,
+            true,
+            true,
+            true,
+        ),
+        (
+            GenerationOutcome::Active,
+            GenerationOutcome::Refused,
+            false,
+            true,
+            false,
+        ),
+    ] {
+        let root = temporary();
+        fs::write(
+            root.path().join("dekopon.yaml"),
+            catalog_text(true, Some("reasoning")),
+        )
+        .unwrap();
+        let mut document = document(root.path());
+        document["broker"]["serverUid"] = json!(crate::current_uid());
+        let path = write_config(root.path(), &document);
+        let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+        let initial = candidate.routes.route(&message("before")).unwrap().steering;
+        let next_broker = if same_broker_digest { "b" } else { "a" }.repeat(64);
+        let response = |outcome| ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: next_broker.clone(),
+                outcome,
+            },
+        };
+        let mut broker =
+            BrokerFixture::answering(root.path(), [response(preparation), response(confirmation)]);
+        let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+        let mut gateway = crate::gateway::Gateway::new(
+            runner,
+            Arc::new(candidate.routes.clone()),
+            Arc::new(BTreeMap::new()),
+            Arc::new(BTreeMap::new()),
+            Arc::new(Vec::new()),
+        )
+        .with_reload(path.clone(), candidate, "b".repeat(64))
+        .unwrap();
+        if gateway_edit {
+            document["routes"][0]["steering"] = json!("boundary");
+            document["stopWords"] = json!(["halt"]);
+            write_config(root.path(), &document);
+        }
+        let prior_digest = gateway.digest_for_test();
+        let (capture, _guard) = capture_spans();
+        gateway.reconcile().await;
+        assert_eq!(
+            gateway.digest_for_test() != prior_digest,
+            published && (gateway_edit || !same_broker_digest)
+        );
+        let (selected, words) = gateway.snapshot_for_test(&message("after")).unwrap();
+        assert_eq!(
+            selected.steering == crate::config::Steering::Boundary,
+            published && gateway_edit
+        );
+        assert_eq!(
+            words.iter().any(|word| word == "halt"),
+            published && gateway_edit
+        );
+        if !published {
+            assert_eq!(
+                gateway.route_for_test(&message("after")).unwrap().steering,
+                initial
+            );
+            assert!(
+                capture
+                    .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                    .is_empty()
+            );
+        } else {
+            let applied =
+                capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
+            assert_eq!(applied.len(), 1);
+            assert_eq!(applied[0].field("generation.digest").unwrap().len(), 64);
+            if gateway_edit {
+                assert_eq!(applied[0].field("category.count"), Some("2"));
+                assert_eq!(applied[0].field("categories"), Some("routes,stopWords"));
+            }
+        }
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        if preparation == GenerationOutcome::Prepared {
+            assert!(matches!(
+                broker.request().await.request,
+                BrokerRequest::CommitGeneration { .. }
+            ));
+        } else {
+            assert!(broker.recorded().is_empty(), "Active is not committed");
+        }
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one reload fixture carries two generations and all resident owners"
+)]
+async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    let other = catalog_text(true, Some("reasoning")).replace("name: reviewer", "name: other");
+    let catalog = root.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    fs::write(
+        catalog.join("reviewer.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    fs::write(catalog.join("other.yaml"), other).unwrap();
+    let mut document = document(root.path());
+    document["catalogPath"] = json!(catalog);
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["sessions"]["wakes"] = json!({"path":"wakes.jsonl", "minIntervalMs":300_000});
+    document["routes"][0]["wakes"] = json!(true);
+    let mut other_route = document["routes"][0].clone();
+    other_route["agent"] = json!("other");
+    other_route["conversation"]["ids"] = json!(["other"]);
+    document["routes"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, other_route);
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response()]);
+    let configured = Arc::new(crate::session::ConfiguredModels::default());
+    let mut runner = runner_with(
+        candidate.config.broker.clone(),
+        Arc::clone(&configured) as Arc<dyn ModelFactory>,
+        4,
+    );
+    Arc::get_mut(&mut runner).unwrap().wakes = Some(Arc::new(
+        crate::wake::WakeStore::open(candidate.config.wakes.as_ref().unwrap()).unwrap(),
+    ));
+    let private = private_conversation_key("dev", "dev", SUBJECT);
+    let shared = ConversationKey::shared(&"reviewer".parse().unwrap(), "dev", "dev");
+    let grant = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
+        commit(
+            &runner.conversations,
+            key,
+            &grant,
+            window(),
+            ConversationTurn::completed(text, "answer"),
+            now,
+        );
+    }
+    let mut gateway = crate::gateway::Gateway::new(
+        Arc::clone(&runner),
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let first = gateway.route_for_test(&message("first")).unwrap();
+    let job_capacity = runner.jobs.free_permits();
+    let owner = crate::jobs::JobOwner::of(&message("job"));
+    let anchor = crate::wake::Anchor::for_job(&message("job"), &first.agent).unwrap();
+    let (running_job, _signal) = runner
+        .jobs
+        .admit(owner.clone(), anchor, None, Arc::from("still running"))
+        .unwrap();
+    let asset_seed = runner
+        .conversations
+        .begin(&private, &grant, window(), None, now);
+    let access = asset_seed.assets.clone();
+    let arriving = runner.assets.assets_for_access(
+        &access,
+        vec![pending("kept.png", "image/png", 10)],
+        true,
+        now,
+    );
+    assert_eq!(arriving.arrived, [1]);
+    drop(asset_seed);
+    let old_generation = gateway.generation_for_test();
+    let other = old_generation.routes_for_test();
+    let old_model = Arc::clone(&first.model);
+    runner
+        .models
+        .client_bound(
+            &old_model,
+            tokio::runtime::Handle::current(),
+            tokio::sync::watch::channel(false).1,
+        )
+        .unwrap();
+    let old_client = configured.bound_client_for_test(&old_model).unwrap();
+    let (capture, _guard) = capture_spans();
+    for (index, version) in ["next", "newer"].into_iter().enumerate() {
+        document["models"][0]["model"] = json!(version);
+        write_config(root.path(), &document);
+        gateway.reconcile().await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        let selected = gateway.route_for_test(&message("after")).unwrap();
+        assert!(!Arc::ptr_eq(&selected.model, &old_model));
+        runner
+            .models
+            .client_bound(
+                &selected.model,
+                tokio::runtime::Handle::current(),
+                tokio::sync::watch::channel(false).1,
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &configured.bound_client_for_test(&selected.model).unwrap(),
+            &old_client
+        ));
+        let applied =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
+        assert_eq!(applied.len(), index + 1);
+        assert_eq!(applied[index].field("generation.digest").unwrap().len(), 64);
+        assert!(Arc::ptr_eq(gateway.runner_for_test(), &runner));
+        assert!(Arc::ptr_eq(
+            &gateway.runner_for_test().assets,
+            &runner.assets
+        ));
+        assert!(Arc::ptr_eq(&gateway.runner_for_test().jobs, &runner.jobs));
+        assert!(Arc::ptr_eq(
+            gateway.runner_for_test().wakes.as_ref().unwrap(),
+            runner.wakes.as_ref().unwrap()
+        ));
+        assert_eq!(gateway.runner_for_test().conversations.tracked(), 2);
+        assert_eq!(runner.jobs.list(&owner).len(), 1);
+        assert_eq!(
+            runner
+                .assets
+                .assets_for_access(&access, Vec::new(), true, now)
+                .inventory[0]
+                .name,
+            "kept.png"
+        );
+        for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
+            let history = runner
+                .conversations
+                .begin(key, &grant, window(), None, now)
+                .history;
+            assert_eq!(history.turns()[0].user(), text);
+        }
+        assert_eq!(other.len(), 2);
+        let mut other_message = message("unrelated");
+        other_message.conversation.id = "other".into();
+        assert_eq!(
+            gateway
+                .route_for_test(&other_message)
+                .unwrap()
+                .agent
+                .as_str(),
+            "other"
+        );
+    }
+    drop(running_job);
+    assert_eq!(runner.jobs.free_permits(), job_capacity);
+}
+
+#[tokio::test]
+async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_old_owner() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let first_path = root.path().join("first-auth.json");
+    let next_path = root.path().join("next-auth.json");
+    let fixture = serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"});
+    for path in [&first_path, &next_path] {
+        fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    }
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["models"][0] = json!({"name":"codex","kind":"chatgptSubscription","model":"first","authFile":first_path,"timeoutMs":2000,"classes":["reasoning"]});
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response(), response()]);
+    let configured = Arc::new(crate::session::ConfiguredModels::default());
+    let runner = runner_with(
+        candidate.config.broker.clone(),
+        Arc::clone(&configured) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload_owners(
+        path.clone(),
+        candidate,
+        "b".repeat(64),
+        crate::gateway::ResidentModels {
+            credentials: Arc::clone(&configured),
+            metering: Arc::new(dekopon_model_token_governor::Metering::new(
+                Vec::new(),
+                dekopon_model_token_governor::Metering::system_clock(),
+            )),
+            proxy: None,
+        },
+    )
+    .unwrap();
+    let first = configured
+        .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+        .unwrap();
+    let old = Arc::downgrade(&first);
+    document["models"][0]["model"] = json!("second");
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        &first,
+        &configured
+            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+            .unwrap()
+    ));
+    document["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        &first,
+        &configured
+            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+            .unwrap()
+    ));
+    document["models"][0]["authFile"] = json!(next_path);
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    let next = configured
+        .chatgpt_credential(Some(&next_path), Duration::from_secs(2))
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &next));
+    drop(first);
+    configured.retire();
+    assert!(old.upgrade().is_none());
+    assert_eq!(configured.credential_owners_for_test(), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn collected_media_never_crosses_a_removed_or_replaced_route() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    for scenario in ["removed", "replaced", "reordered"] {
+        let root = temporary();
+        let catalog = root.path().join("catalog");
+        fs::create_dir(&catalog).unwrap();
+        fs::write(
+            catalog.join("reviewer.yaml"),
+            catalog_text(true, Some("reasoning")),
+        )
+        .unwrap();
+        fs::write(
+            catalog.join("other.yaml"),
+            catalog_text(true, Some("reasoning")).replace("name: reviewer", "name: other"),
+        )
+        .unwrap();
+        let mut document = document(root.path());
+        document["catalogPath"] = json!(catalog);
+        document["broker"]["serverUid"] = json!(crate::current_uid());
+        let path = write_config(root.path(), &document);
+        let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+        let mut responses = vec![ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }];
+        if scenario == "reordered" {
+            responses.push(ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            ));
+        }
+        let mut broker = BrokerFixture::answering(root.path(), responses);
+        let model = ModelScript::forbidden();
+        let runner = runner(candidate.config.broker.clone(), Arc::clone(&model), 4);
+        let driver = Arc::new(RecordingDriver::default());
+        let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+        drivers.insert("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>);
+        let gateway = crate::gateway::Gateway::new(
+            runner,
+            Arc::new(candidate.routes.clone()),
+            Arc::new(BTreeMap::new()),
+            Arc::new(drivers),
+            Arc::new(Vec::new()),
+        )
+        .with_reload(path.clone(), candidate, "b".repeat(64))
+        .unwrap();
+        let (capture, _guard) = capture_spans();
+        let (tx, rx) = mpsc::channel(4);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(gateway.serve(
+            rx,
+            async move {
+                stopped.await.expect("shutdown sender stays alive");
+            },
+            Duration::from_secs(1),
+            crate::collection::Collector::new(&[], 4),
+        ));
+        for text in ["first", "second"] {
+            let mut inbound = message(text);
+            inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+            inbound.native_group = Some("group".into());
+            tx.send(TransportEvent::Message(Box::new(inbound)))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        let mut new_route = document["routes"][0].clone();
+        new_route["agent"] = json!("other");
+        match scenario {
+            "replaced" => document["routes"][0] = new_route,
+            "removed" => {
+                document["routes"].as_array_mut().unwrap().remove(0);
+                document["routes"].as_array_mut().unwrap().push(new_route);
+            }
+            "reordered" => {
+                new_route["conversation"]["ids"] = json!(["other"]);
+                document["routes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, new_route);
+            }
+            _ => unreachable!(),
+        }
+        write_config(root.path(), &document);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        for _ in 0..50 {
+            if !capture
+                .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            capture
+                .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                .len(),
+            1
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        if scenario == "reordered" {
+            assert!(matches!(
+                broker.request().await.request,
+                BrokerRequest::Capabilities { .. }
+            ));
+        } else {
+            assert!(
+                broker.recorded().is_empty(),
+                "no broker session on the replacement route"
+            );
+            assert_eq!(model.requests(), 0);
+            assert!(driver.replies().is_empty());
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_gatewayd",
+                        &[
+                            ("event", "gateway_input_disposition"),
+                            ("outcome", "route-lost")
+                        ]
+                    )
+                    .len(),
+                2
+            );
+        }
+        stop.send(()).unwrap();
+        assert!(matches!(
+            serving.await.unwrap(),
+            crate::ServeOutcome::Shutdown
+        ));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let listener = UnixListener::bind(root.path().join("broker.sock")).unwrap();
+    fs::set_permissions(
+        root.path().join("broker.sock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let (requests_tx, mut requests) = mpsc::channel(4);
+    let broker_task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tx = requests_tx.clone();
+            connections.spawn(async move {
+                let mut stream = DescriptorStream::new(stream);
+                let (request, _) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
+                    .await
+                    .unwrap();
+                tx.send(request.request).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+    drivers.insert("dev".to_owned(), Arc::new(RecordingDriver::default()));
+    let gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(gateway.serve(
+        rx,
+        async move {
+            stopped.await.expect("shutdown sender stays alive");
+        },
+        Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), requests.recv()).await,
+        Ok(Some(BrokerRequest::PrepareGeneration { .. }))
+    ));
+    tx.send(TransportEvent::Message(Box::new(message(
+        "while broker is blocked",
+    ))))
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), requests.recv()).await,
+            Ok(Some(BrokerRequest::Capabilities { .. }))
+        ),
+        "routed inbound must reach broker while reload is blocked"
+    );
+    stop.send(()).unwrap();
+    assert!(matches!(
+        serving.await.unwrap(),
+        crate::ServeOutcome::Shutdown
+    ));
+    broker_task.abort();
+    broker_task.await.unwrap_err();
+}
+
+#[tokio::test]
+async fn dispatched_message_starts_on_its_captured_generation_after_route_removal() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }],
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+    drivers.insert("dev".to_owned(), Arc::new(RecordingDriver::default()));
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let dispatched = gateway.generation_for_test();
+    document["routes"][0]["conversation"]["kind"] = json!(["channel"]);
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(gateway.route_for_test(&message("not routed now")).is_none());
+    let mut sessions = tokio::task::JoinSet::new();
+    gateway.start_with_generation_for_test(
+        &mut sessions,
+        &dispatched,
+        message("already dispatched"),
+    );
+    assert!(
+        matches!(
+            broker.request().await.request,
+            BrokerRequest::Capabilities { .. }
+        ),
+        "the message admitted on the captured route must start"
+    );
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn refused_broker_digest_is_adopted_for_next_prepare_and_publication() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let old = "b".repeat(64);
+    let current = "c".repeat(64);
+    let response = |outcome| ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: current.clone(),
+            outcome,
+        },
+    };
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [
+            response(GenerationOutcome::Refused),
+            response(GenerationOutcome::Active),
+        ],
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, old.clone())
+    .unwrap();
+    let prior = gateway.digest_for_test();
+    document["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &document);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    assert!(
+        matches!(broker.request().await.request, BrokerRequest::PrepareGeneration { digest } if digest == old)
+    );
+    assert_eq!(
+        gateway.digest_for_test(),
+        prior,
+        "refusal is not publication"
+    );
+    gateway.reconcile().await;
+    assert!(
+        matches!(broker.request().await.request, BrokerRequest::PrepareGeneration { digest } if digest == current)
+    );
+    assert!(broker.recorded().is_empty(), "Active needs no commit");
+    assert_eq!(gateway.broker_digest_for_test(), current);
+    assert_ne!(gateway.digest_for_test(), prior);
+    assert_eq!(
+        gateway.route_for_test(&message("new")).unwrap().steering,
+        crate::config::Steering::Boundary
+    );
+    assert_eq!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn yaml_mapping_key_order_does_not_publish_a_new_gateway_generation() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+
+    let root = temporary();
+    let catalog = root.path().join("dekopon.yaml");
+    fs::write(&catalog, catalog_text(true, Some("reasoning"))).unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = root.path().join("gateway.yaml");
+    fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let broker_digest = "b".repeat(64);
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: broker_digest.clone(),
+                outcome: GenerationOutcome::Active,
+            },
+        }],
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, broker_digest)
+    .unwrap();
+    let before = gateway.digest_for_test();
+
+    let mut config: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let root_mapping = config.as_mapping_mut().unwrap();
+    let version = root_mapping.remove("apiVersion").unwrap();
+    root_mapping.insert("apiVersion".into(), version);
+    let route = config["routes"][0].as_mapping_mut().unwrap();
+    let agent = route.remove("agent").unwrap();
+    route.insert("agent".into(), agent);
+    fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let mut agent: serde_yaml::Value =
+        serde_yaml::from_slice(&fs::read(&catalog).unwrap()).unwrap();
+    let metadata = agent.as_mapping_mut().unwrap().remove("metadata").unwrap();
+    agent
+        .as_mapping_mut()
+        .unwrap()
+        .insert("metadata".into(), metadata);
+    let spec = agent["spec"].as_mapping_mut().unwrap();
+    let description = spec.remove("description").unwrap();
+    spec.insert("description".into(), description);
+    fs::write(&catalog, serde_yaml::to_string(&agent).unwrap()).unwrap();
+
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    assert_eq!(
+        gateway.digest_for_test(),
+        before,
+        "mapping order is not effective config"
+    );
+    assert!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+            .is_empty()
+    );
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(
+        broker.recorded().is_empty(),
+        "unchanged broker response needs no commit"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_commit_confirmation_requires_observation_before_gateway_publication() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let mut sequence = 0;
+    let mut broker = BrokerFixture::scripted(root.path(), move |_, _| {
+        sequence += 1;
+        let response = match sequence {
+            1 => BrokerResponse::Generation {
+                digest: "a".repeat(64),
+                outcome: GenerationOutcome::Prepared,
+            },
+            2 => BrokerResponse::Error {
+                code: "confirmation-lost".into(),
+                message: "unavailable".into(),
+            },
+            3 => BrokerResponse::Error {
+                code: "observation-lost".into(),
+                message: "unavailable".into(),
+            },
+            _ => BrokerResponse::Generation {
+                digest: "a".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        };
+        Some((
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                response,
+            },
+            Vec::new(),
+        ))
+    });
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    document["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &document);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    assert_eq!(
+        gateway
+            .route_for_test(&message("still old"))
+            .unwrap()
+            .steering,
+        crate::config::Steering::Abort
+    );
+    assert!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+            .is_empty()
+    );
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::CommitGeneration { .. }
+    ));
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::ObserveGeneration
+    ));
+    gateway.reconcile().await;
+    assert_eq!(
+        gateway
+            .route_for_test(&message("confirmed later"))
+            .unwrap()
+            .steering,
+        crate::config::Steering::Boundary
+    );
+    assert_eq!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+            .len(),
+        1
+    );
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::ObserveGeneration
+    ));
+}
+
+async fn gateway_sources(config: &crate::ResolvedConfig) -> config::GatewaySources {
+    let catalog = LocalCatalog::load(&config.catalog_path).unwrap();
+    config::GatewaySources {
+        config: config::source_snapshot(&config.source, None, crate::current_uid())
+            .await
+            .unwrap(),
+        catalog: config::source_snapshot(
+            &config.catalog_path,
+            Some(&catalog),
+            crate::current_uid(),
+        )
+        .await
+        .unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(openrouter_model("router", "vendor/kept", 5_000));
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let sources = gateway_sources(&active).await;
+    document["models"][1]["model"] = json!("vendor/refused");
+    write_config(root.path(), &document);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        crate::GatewaydError::Probe(problem) if problem.model == "router"
+    )));
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/refused"]);
+}
+
+#[tokio::test]
+async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_repair_does() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let live_path = write_config(root.path(), &document(root.path()));
+    let active = config::load(&live_path, crate::current_uid())
+        .await
+        .unwrap();
+    let sources = gateway_sources(&active).await;
+    let mut candidate = document(root.path());
+    for (model, status) in [("vendor/refused", 400), ("vendor/outage", 503)] {
+        candidate["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(openrouter_model("router", model, 5_000));
+        let path = write_config(root.path(), &candidate);
+        let (prepared, report) = crate::load_candidate_against(
+            &path,
+            None,
+            config::LoadMode::Boot,
+            Some((&crate::ProbeScope::Every, &environment)),
+            Some((&active, &sources)),
+        )
+        .await;
+        assert!(prepared.is_none());
+        assert!(report.problems.iter().any(|problem| matches!(problem,
+            crate::GatewaydError::Probe(problem)
+                if matches!(&problem.source, crate::ProbeError::Vendor(InferenceError::Provider(failure))
+                    if failure.status == Some(status))
+        )), "{report:?}");
+        candidate["models"].as_array_mut().unwrap().pop();
+    }
+    candidate["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(openrouter_model("router", "vendor/accepted", 5_000));
+    candidate["models"].as_array_mut().unwrap().push(json!({
+        "kind": "chatgptSubscription", "name": "subscription", "model": "gpt-test", "timeoutMs": 5_000
+    }));
+    let path = write_config(root.path(), &candidate);
+    let (prepared, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources)),
+    )
+    .await;
+    let prepared = prepared.expect("repair prepares a full candidate");
+    assert!(prepared.sources.config.0.contains_key(&path));
+    assert!(
+        prepared
+            .sources
+            .catalog
+            .0
+            .contains_key(&root.path().join("dekopon.yaml"))
+    );
+    assert!(
+        prepared
+            .sources
+            .still_current(&path, &prepared.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    fs::write(root.path().join("dekopon.yaml"), "changed while preparing").unwrap();
+    assert!(
+        !prepared
+            .sources
+            .still_current(&path, &prepared.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    assert!(
+        prepared
+            .sources
+            .still_current(&path, &prepared.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap()
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(warning,
+        crate::CheckWarning::NotProbed { model, reason: crate::NotProbed::SubscriptionAuth }
+            if model == "subscription"
+    )));
+    assert_eq!(
+        vendor.asked.lock().as_slice(),
+        ["vendor/refused", "vendor/outage", "vendor/accepted"]
+    );
 }
 
 #[tokio::test]
@@ -17961,9 +20888,9 @@ async fn a_model_over_budget_error_keeps_the_failed_outcome_and_text() {
     };
     struct RefusedBuild(Refusal);
     impl ModelFactory for RefusedBuild {
-        fn build(
+        fn build_bound(
             &self,
-            _model: &ModelConfig,
+            _model: &Arc<ModelConfig>,
             _runtime: tokio::runtime::Handle,
             _cancel: tokio::sync::watch::Receiver<bool>,
         ) -> Result<SharedModel, SessionError> {
@@ -18559,10 +21486,18 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     let directory = temporary();
     let journal_dir = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
-    let models = ModelScript::new([script_call("printf result-sentinel"), answer("done")]);
+    let models = ModelScript::new([
+        script_call("printf result-sentinel"),
+        answer("done"),
+        answer("done again"),
+    ]);
     let runner = journaled_runner(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
     let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
     route.memory_policy = Some(crate::config::ResolvedPolicy::default());
+    crate::memory::generation::report_policy(
+        route.memory_policy.as_ref().unwrap(),
+        RecallSource::Platform,
+    );
     let inbound = message("do the work");
     let key = ConversationKey::private(
         &route.agent,
@@ -18575,7 +21510,7 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         Arc::clone(&runner),
         route.clone(),
         inbound,
-        driver as Arc<dyn ChatDriver>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
@@ -18587,17 +21522,9 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         Instant::now(),
     );
     let turn = remembered.history.turns().first().expect("committed turn");
-    let exchange = turn.exchanges().first().expect("script exchange captured");
-    assert_eq!(
-        exchange.request[0].text.as_deref(),
-        Some("printf result-sentinel")
-    );
     assert!(
-        exchange.result[0]
-            .text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("result-sentinel")
+        turn.exchanges().is_empty(),
+        "the resident window excludes durable tool bytes"
     );
     assert_eq!(turn.user(), "do the work");
     assert_eq!(turn.answer(), Some("done"));
@@ -18633,10 +21560,27 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     assert!(read.contains("outcome: success, exit: Some(0)"), "{read}");
     assert!(!read.contains("do the work"));
     assert!(!read.contains("done"));
+    let refused = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        line["recordId"].as_u64().unwrap(),
+        "missing",
+        None,
+    );
+    assert!(
+        refused.contains("eligible representation IDs: original"),
+        "{refused}"
+    );
     assert!(line["user"].is_null());
     assert!(line["answer"].is_null());
     assert!(!bytes.contains("do the work"));
     assert!(!bytes.contains("done"));
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message("follow-up"),
+        driver as Arc<dyn ChatDriver>,
+    )
+    .await;
     let policy = capture.events_where(
         "dekopon_gatewayd",
         &[("event", "gateway_memory_policy"), ("recall", "platform")],

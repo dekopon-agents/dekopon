@@ -1,24 +1,50 @@
 {
-  "version": "v1",
-  "configId": "synthetic-v1",
+  "version": "v2",
+  "configId": "synthetic-v2",
   "maxTurns": 3,
-  "maxBytes": 100,
+  "maxBytes": 600,
   "steps": [
     {
       "id": "9007199254740993",
       "user": "Fact: amber kite",
       "answer": "Remembered.",
-      "representations": [],
+      "representations": [
+        {
+          "routineId": "original",
+          "version": "v1",
+          "sourceRecordId": 0,
+          "kind": "original",
+          "capturedBytes": 28,
+          "text": "Fact: amber kite\nRemembered."
+        }
+      ],
       "exchanges": [],
-      "pin": null
+      "pin": null,
+      "sourceEligibility": true,
+      "eligible": [
+        "original"
+      ]
     },
     {
       "id": "9007199254740994",
       "user": "distractor one",
       "answer": "ok",
-      "representations": [],
+      "representations": [
+        {
+          "routineId": "original",
+          "version": "v1",
+          "sourceRecordId": 0,
+          "kind": "original",
+          "capturedBytes": 17,
+          "text": "distractor one\nok"
+        }
+      ],
       "exchanges": [],
-      "pin": null
+      "pin": null,
+      "sourceEligibility": true,
+      "eligible": [
+        "original"
+      ]
     },
     {
       "id": "9007199254740995",
@@ -35,46 +61,102 @@
         }
       ],
       "exchanges": [],
-      "pin": null
+      "pin": null,
+      "sourceEligibility": true,
+      "eligible": [
+        "short"
+      ]
     },
     {
       "id": "9007199254740996",
       "user": "distractor two",
       "answer": "ok",
-      "representations": [],
+      "representations": [
+        {
+          "routineId": "original",
+          "version": "v1",
+          "sourceRecordId": 0,
+          "kind": "original",
+          "capturedBytes": 17,
+          "text": "distractor two\nok"
+        }
+      ],
       "exchanges": [],
-      "pin": null
+      "pin": null,
+      "sourceEligibility": true,
+      "eligible": [
+        "original"
+      ]
     },
     {
       "id": "9007199254740997",
-      "user": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "user": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
       "answer": null,
-      "representations": [],
+      "representations": [
+        {
+          "routineId": "original",
+          "version": "v1",
+          "sourceRecordId": 0,
+          "kind": "original",
+          "capturedBytes": 800,
+          "text": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        }
+      ],
       "exchanges": [],
-      "pin": "original"
+      "pin": "original",
+      "sourceEligibility": true,
+      "eligible": [
+        "original"
+      ]
     },
     {
       "id": "9007199254740998",
       "user": "follow-up user",
       "answer": "assistant reply",
-      "representations": [],
+      "representations": [
+        {
+          "routineId": "original",
+          "version": "v1",
+          "sourceRecordId": 0,
+          "kind": "original",
+          "capturedBytes": 30,
+          "text": "follow-up user\nassistant reply"
+        }
+      ],
       "exchanges": [],
-      "pin": null
+      "pin": null,
+      "sourceEligibility": true,
+      "eligible": [
+        "original"
+      ]
     }
   ],
   "cassette": [
     {
       "request": {
-        "version": "v1",
-        "configId": "synthetic-v1",
+        "version": "v2",
+        "configId": "synthetic-v2",
         "ordinal": 0,
         "input": {
           "id": "9007199254740993",
           "user": "Fact: amber kite",
           "answer": "Remembered.",
-          "representations": [],
+          "representations": [
+            {
+              "routineId": "original",
+              "version": "v1",
+              "sourceRecordId": 0,
+              "kind": "original",
+              "capturedBytes": 28,
+              "text": "Fact: amber kite\nRemembered."
+            }
+          ],
           "exchanges": [],
-          "pin": null
+          "pin": null,
+          "sourceEligibility": true,
+          "eligible": [
+            "original"
+          ]
         }
       },
       "response": {
@@ -85,16 +167,29 @@
     },
     {
       "request": {
-        "version": "v1",
-        "configId": "synthetic-v1",
+        "version": "v2",
+        "configId": "synthetic-v2",
         "ordinal": 1,
         "input": {
           "id": "9007199254740994",
           "user": "distractor one",
           "answer": "ok",
-          "representations": [],
+          "representations": [
+            {
+              "routineId": "original",
+              "version": "v1",
+              "sourceRecordId": 0,
+              "kind": "original",
+              "capturedBytes": 17,
+              "text": "distractor one\nok"
+            }
+          ],
           "exchanges": [],
-          "pin": null
+          "pin": null,
+          "sourceEligibility": true,
+          "eligible": [
+            "original"
+          ]
         }
       },
       "response": {
@@ -105,8 +200,8 @@
     },
     {
       "request": {
-        "version": "v1",
-        "configId": "synthetic-v1",
+        "version": "v2",
+        "configId": "synthetic-v2",
         "ordinal": 2,
         "input": {
           "id": "9007199254740995",
@@ -123,7 +218,11 @@
             }
           ],
           "exchanges": [],
-          "pin": null
+          "pin": null,
+          "sourceEligibility": true,
+          "eligible": [
+            "short"
+          ]
         }
       },
       "response": {
@@ -134,16 +233,29 @@
     },
     {
       "request": {
-        "version": "v1",
-        "configId": "synthetic-v1",
+        "version": "v2",
+        "configId": "synthetic-v2",
         "ordinal": 3,
         "input": {
           "id": "9007199254740996",
           "user": "distractor two",
           "answer": "ok",
-          "representations": [],
+          "representations": [
+            {
+              "routineId": "original",
+              "version": "v1",
+              "sourceRecordId": 0,
+              "kind": "original",
+              "capturedBytes": 17,
+              "text": "distractor two\nok"
+            }
+          ],
           "exchanges": [],
-          "pin": null
+          "pin": null,
+          "sourceEligibility": true,
+          "eligible": [
+            "original"
+          ]
         }
       },
       "response": {
@@ -154,16 +266,29 @@
     },
     {
       "request": {
-        "version": "v1",
-        "configId": "synthetic-v1",
+        "version": "v2",
+        "configId": "synthetic-v2",
         "ordinal": 4,
         "input": {
           "id": "9007199254740997",
-          "user": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+          "user": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
           "answer": null,
-          "representations": [],
+          "representations": [
+            {
+              "routineId": "original",
+              "version": "v1",
+              "sourceRecordId": 0,
+              "kind": "original",
+              "capturedBytes": 800,
+              "text": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+            }
+          ],
           "exchanges": [],
-          "pin": "original"
+          "pin": "original",
+          "sourceEligibility": true,
+          "eligible": [
+            "original"
+          ]
         }
       },
       "response": {
@@ -174,16 +299,29 @@
     },
     {
       "request": {
-        "version": "v1",
-        "configId": "synthetic-v1",
+        "version": "v2",
+        "configId": "synthetic-v2",
         "ordinal": 5,
         "input": {
           "id": "9007199254740998",
           "user": "follow-up user",
           "answer": "assistant reply",
-          "representations": [],
+          "representations": [
+            {
+              "routineId": "original",
+              "version": "v1",
+              "sourceRecordId": 0,
+              "kind": "original",
+              "capturedBytes": 30,
+              "text": "follow-up user\nassistant reply"
+            }
+          ],
           "exchanges": [],
-          "pin": null
+          "pin": null,
+          "sourceEligibility": true,
+          "eligible": [
+            "original"
+          ]
         }
       },
       "response": {

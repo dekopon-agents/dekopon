@@ -19,6 +19,7 @@ mod collection;
 mod config;
 mod conversation;
 mod follow;
+mod gateway;
 mod jobs;
 mod memory;
 use memory::journal;
@@ -39,14 +40,13 @@ use std::{
     future::Future,
     path::Path,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
-use dekopon_broker_protocol::{BrokerClient, ConversationKind};
+use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinSet, time::timeout};
-use tracing::Instrument as _;
+use tokio::{sync::mpsc, task::JoinSet};
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
@@ -69,13 +69,13 @@ use crate::{
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{
-        CancelOutcome, ConfiguredModels, ModelCache, ModelCredentialError, SessionGate,
-        SessionRunner, model_bearer_token,
+        ConfiguredModels, ModelCache, ModelCredentialError, SessionGate, SessionRunner,
+        model_bearer_token,
     },
     transport::{
-        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, InboundMessage, MessageId,
-        ThreadOwnership, TransportEvent, TransportIdentity,
+        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, ThreadOwnership, TransportEvent,
         discord::{DiscordTransport, MessageContent},
+        github::GithubTransport,
         local::LocalTransport,
         slack::SlackTransport,
         telegram::TelegramTransport,
@@ -100,21 +100,42 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
+async fn boot_candidate(config_path: &Path) -> Result<(Candidate, Prepared), GatewaydError> {
+    let (candidate, report) = load_candidate(config_path, None, config::LoadMode::Boot, None).await;
+    let Some((candidate, prepared)) = candidate.and_then(|mut candidate| {
+        candidate
+            .prepared
+            .take()
+            .map(|prepared| (candidate, prepared))
+    }) else {
+        return Err(GatewaydError::from_problems(report.problems));
+    };
+    if !candidate
+        .sources
+        .still_current(config_path, &candidate.config.catalog_path, current_uid())
+        .await?
+    {
+        return Err(config::ConfigError::ChangedDuringLoad.into());
+    }
+    Ok((candidate, prepared))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "gateway boot owns resident transports and reload owners until shutdown"
+)]
 pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
-    let (candidate, report) =
-        load_candidate(config_path.as_ref(), None, config::LoadMode::Boot, None).await;
-    let Some(Candidate {
-        config,
-        routes,
-        transports: built_transports,
-    }) = candidate
-    else {
-        return Err(GatewaydError::from_problems(report.problems));
-    };
-    let routes = Arc::new(routes);
+    let (
+        candidate,
+        Prepared {
+            transports: built_transports,
+            generation,
+        },
+    ) = boot_candidate(config_path.as_ref()).await?;
+    let config = &candidate.config;
 
     let broker_client = BrokerClient::new(
         &config.broker.socket_path,
@@ -126,6 +147,13 @@ where
         .capabilities()
         .await
         .map_err(GatewaydError::BrokerProbe)?;
+    let (broker_digest, outcome) = broker_client
+        .observe_generation()
+        .await
+        .map_err(GatewaydError::BrokerProbe)?;
+    if outcome != dekopon_broker_protocol::GenerationOutcome::Active {
+        return Err(GatewaydError::BrokerGeneration);
+    }
     tracing::info!(
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
@@ -136,19 +164,25 @@ where
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
     let mut readers = JoinSet::new();
     for transport in built_transports {
-        let transport = transport::recovery::RecoveringTransport::new(transport);
-        let name = transport.name().to_owned();
-        drivers.insert(name.clone(), transport.driver());
-        if let Some(fetcher) = transport.asset_fetcher() {
-            asset_fetchers.insert(name.clone(), fetcher);
-        }
-        if let Some(ownership) = transport.thread_ownership() {
-            thread_ownership.insert(name, ownership);
-        }
+        let transport = register_transport(
+            transport,
+            &mut drivers,
+            &mut asset_fetchers,
+            &mut thread_ownership,
+        );
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
     let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    if journal.is_some() {
+        for route in &config.routes {
+            if let (Some(window), Some(policy)) =
+                (route.memory.window(), route.memory_policy.as_ref())
+            {
+                memory::generation::report_policy(policy, window.recall);
+            }
+        }
+    }
     let wakes = match config.wakes.clone() {
         Some(wakes) => Some(Arc::new(
             tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
@@ -188,12 +222,12 @@ where
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
     });
-    let mut owned_tasks = start_metering_tasks(&config, &configured, &metering).await?;
+    let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
 
     tracing::info!(
         event = "gateway_started",
         transport.count = config.transports.len(),
-        route.count = routes.len()
+        route.count = candidate.routes.len()
     );
 
     let mut terminal = Ok(());
@@ -201,18 +235,33 @@ where
         terminal = supervise_transports(&mut readers, shutdown).await;
         readers.abort_all();
     };
-    let outcome = serve(
+    let shutdown_grace = config.shutdown_grace;
+    let collector = collection::Collector::new(&config.transports, config.sessions.max_concurrent);
+    let proxy_listener = config.proxy.clone();
+    let gateway = gateway::Gateway::serving(
         runner,
-        routes,
+        generation,
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
-        Arc::new(config.stop_words.clone()),
-        receiver,
-        stopped,
-        config.shutdown_grace,
-        collection::Collector::new(&config.transports, config.sessions.max_concurrent),
     )
-    .await;
+    .with_reload_owners(
+        config_path.as_ref().to_path_buf(),
+        candidate,
+        broker_digest,
+        gateway::ResidentModels {
+            credentials: configured,
+            metering,
+            proxy: boot_proxy,
+        },
+    )?;
+    if let Some(resolved) = &proxy_listener {
+        proxy::listen(resolved, gateway.proxy_router(), &mut owned_tasks)
+            .await
+            .map_err(GatewaydError::Proxy)?;
+    }
+    let outcome = gateway
+        .serve(receiver, stopped, shutdown_grace, collector)
+        .await;
     readers.abort_all();
     owned_tasks.shutdown().await;
     while let Some(result) = readers.join_next().await {
@@ -313,25 +362,18 @@ async fn load_follow_table(
     Ok(Some(Arc::new(table)))
 }
 
-/// The restore task and the guest model proxy listener, owned by the gateway and aborted at
-/// shutdown.
-async fn start_metering_tasks(
+fn start_metering_tasks(
     config: &ResolvedConfig,
     configured: &ConfiguredModels,
     metering: &Arc<dekopon_model_token_governor::Metering>,
-) -> Result<JoinSet<()>, GatewaydError> {
+) -> Result<(JoinSet<()>, Option<Arc<dekopon_model_proxy::ModelProxy>>), GatewaydError> {
     let mut owned_tasks = JoinSet::new();
-    if let Some(resolved) = &config.proxy {
-        proxy::start(
-            resolved,
-            &config.models,
-            configured,
-            metering,
-            &mut owned_tasks,
-        )
-        .await
+    let boot_proxy = config
+        .proxy
+        .as_ref()
+        .map(|resolved| proxy::build(resolved, &config.models, configured, metering))
+        .transpose()
         .map_err(GatewaydError::Proxy)?;
-    }
     meter_restore::spawn(
         metering,
         config.metering.restore.clone(),
@@ -341,13 +383,14 @@ async fn start_metering_tasks(
             .and_then(|telemetry| telemetry.settings.ca_certificate().map(<[u8]>::to_vec)),
         &mut owned_tasks,
     );
-    Ok(owned_tasks)
+    Ok((owned_tasks, boot_proxy))
 }
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
     pub problems: Vec<GatewaydError>,
     pub warnings: Vec<CheckWarning>,
+    pub(crate) raw: config::RawCandidate,
 }
 
 #[derive(Debug, Error)]
@@ -407,9 +450,10 @@ pub async fn check(
 }
 
 pub(crate) struct Candidate {
+    pub(crate) sources: config::GatewaySources,
     pub(crate) config: ResolvedConfig,
     pub(crate) routes: RoutingTable,
-    pub(crate) transports: Vec<Box<dyn ChatTransport>>,
+    pub(crate) prepared: Option<Prepared>,
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
@@ -420,21 +464,24 @@ pub(crate) async fn load_candidate(
     mode: config::LoadMode,
     probe: Option<(&ProbeScope, &probe::Vendor)>,
 ) -> (Option<Candidate>, CheckReport) {
+    load_candidate_against(config_path, catalog_path, mode, probe, None).await
+}
+
+pub(crate) async fn load_candidate_against(
+    config_path: &Path,
+    catalog_path: Option<&Path>,
+    mode: config::LoadMode,
+    probe: Option<(&ProbeScope, &probe::Vendor)>,
+    active: Option<(&ResolvedConfig, &config::GatewaySources)>,
+) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
-    let config = match config::load_in(config_path, current_uid(), mode).await {
-        Ok((config, refusals)) => {
-            report
-                .problems
-                .extend(refusals.into_iter().map(GatewaydError::from));
-            Some(config)
-        }
-        Err(error) => {
-            report.problems.push(error.into());
-            None
-        }
-    };
-    let catalog = match catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()))
-    {
+    let before_config = config::source_snapshot(config_path, None, current_uid()).await;
+    let (config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
+    report
+        .problems
+        .extend(refusals.into_iter().map(GatewaydError::from));
+    let catalog_path = catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()));
+    let catalog = match catalog_path {
         Some(path) => match LocalCatalog::load(path) {
             Ok(catalog) => Some(catalog),
             Err(error) => {
@@ -447,6 +494,17 @@ pub(crate) async fn load_candidate(
             None
         }
     };
+    let raw_catalog = match (&catalog, catalog_path) {
+        (Some(catalog), _) => {
+            Some(config::source_snapshot(catalog.source(), Some(catalog), current_uid()).await)
+        }
+        (None, Some(path)) => Some(config::source_snapshot(path, None, current_uid()).await),
+        (None, None) => None,
+    };
+    report.raw = config::RawCandidate::of(
+        before_config.as_ref(),
+        raw_catalog.as_ref().map(Result::as_ref),
+    );
     let routes = match (&config, &catalog) {
         (Some(config), Some(catalog)) => match RoutingTable::bind(config, catalog) {
             Ok(routes) => Some(routes),
@@ -460,7 +518,7 @@ pub(crate) async fn load_candidate(
             None
         }
     };
-    let transports = match (&config, &routes) {
+    let prepared = match (&config, &routes) {
         (Some(config), Some(routes)) => {
             if mode == config::LoadMode::Check
                 && config.journal.is_none()
@@ -468,26 +526,84 @@ pub(crate) async fn load_candidate(
             {
                 report.warnings.push(CheckWarning::MemoryWithoutJournal);
             }
-            credentials(config, routes, mode, &mut report)
+            if active.is_none() {
+                credentials(config, routes, mode, &mut report)
+            } else {
+                let problems = model_credential_problems(routes.bound_models(), model_bearer_token);
+                if !problems.is_empty() {
+                    report.problems.push(GatewaydError::Startup { problems });
+                }
+                None
+            }
         }
         (None, _) | (_, None) => {
             report.skipped(Stage::Credentials);
-            Vec::new()
+            None
         }
     };
+    let reload_scope = ProbeScope::Every;
+    let probe = probe.or_else(|| active.map(|_| (&reload_scope, &probe::Vendor::LIVE)));
     match (probe, &config) {
         (Some((scope, vendor)), Some(config)) => {
-            probe::probe(config, routes.as_ref(), scope, vendor, &mut report).await;
+            probe::probe(
+                config,
+                routes.as_ref(),
+                scope,
+                active.map(|(config, _)| config.models.as_slice()),
+                vendor,
+                &mut report,
+            )
+            .await;
         }
         (Some(_), None) => report.skipped(Stage::Probe),
         (None, _) => {}
     }
-    let candidate = match (config, routes) {
-        (Some(config), Some(routes)) if report.problems.is_empty() => Some(Candidate {
-            config,
-            routes,
-            transports,
-        }),
+    let candidate = match (config, routes, catalog) {
+        (Some(config), Some(routes), Some(catalog)) if report.problems.is_empty() => {
+            let after_config = config::source_snapshot(config_path, None, current_uid()).await;
+            let after_catalog =
+                config::source_snapshot(catalog.source(), Some(&catalog), current_uid()).await;
+            match (before_config, after_config, after_catalog) {
+                (Ok(before), Ok(after), Ok(catalog_after)) if before == after => {
+                    let sources = config::GatewaySources {
+                        config: after,
+                        catalog: catalog_after,
+                    };
+                    let changes = active.map(|(_, old)| old.changes(&sources)).transpose();
+                    match changes {
+                        Ok(Some(changes)) if !changes.restart_required.is_empty() => {
+                            report.problems.push(
+                                config::ConfigError::RestartRequired {
+                                    categories: changes.restart_required,
+                                }
+                                .into(),
+                            );
+                            None
+                        }
+                        Ok(_) => Some(Candidate {
+                            sources,
+                            config,
+                            routes,
+                            prepared,
+                        }),
+                        Err(error) => {
+                            report.problems.push(error.into());
+                            None
+                        }
+                    }
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                    report.problems.push(error.into());
+                    None
+                }
+                _ => {
+                    report
+                        .problems
+                        .push(config::ConfigError::ChangedDuringLoad.into());
+                    None
+                }
+            }
+        }
         _ => None,
     };
     (candidate, report)
@@ -504,10 +620,10 @@ fn credentials(
     routes: &RoutingTable,
     mode: config::LoadMode,
     report: &mut CheckReport,
-) -> Vec<Box<dyn ChatTransport>> {
+) -> Option<Prepared> {
     match mode {
         config::LoadMode::Boot => match prepare(config, routes) {
-            Ok(Prepared { transports }) => return transports,
+            Ok(prepared) => return Some(prepared),
             Err(error) => report.problems.push(error),
         },
         config::LoadMode::Check => {
@@ -539,7 +655,7 @@ fn credentials(
             }
         }
     }
-    Vec::new()
+    None
 }
 
 fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
@@ -557,6 +673,7 @@ fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
             access_token_env,
             ..
         } => vec![app_secret_env, verify_token_env, access_token_env],
+        TransportConfig::GithubWebhook { secret_env, .. } => vec![secret_env],
         TransportConfig::Local { .. } => Vec::new(),
     }
 }
@@ -567,474 +684,14 @@ enum ServeOutcome {
     TransportsLost,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one serving loop owns the bounded wake, collection and follow deadlines"
-)]
-async fn serve<F>(
-    runner: Arc<SessionRunner>,
-    routes: Arc<RoutingTable>,
-    mut identities: Arc<BTreeMap<String, TransportIdentity>>,
-    drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
-    stop_words: Arc<Vec<String>>,
-    mut receiver: mpsc::Receiver<TransportEvent>,
-    shutdown: F,
-    grace: Duration,
-    mut collector: collection::Collector,
-) -> ServeOutcome
-where
-    F: Future<Output = ()> + Send,
-{
-    let mut sessions = JoinSet::new();
-    let mut follow_pending = follow::Debounce::default();
-    let mut ticks = JoinSet::new();
-    let mut wakes = runner.wakes.clone();
-    let mut notices = runner.jobs.take_notices();
-    tokio::pin!(shutdown);
-    let mut outcome = ServeOutcome::Shutdown;
-
-    loop {
-        while let Some(result) = sessions.try_join_next() {
-            observe_session(result);
-        }
-        let deadline = collector.deadline();
-        let follow_deadline = follow_pending.deadline();
-        let wake_deadline = wakes.as_ref().and_then(|store| store.next_at()).map(|at| {
-            tokio::time::Instant::now() + at.duration_since(SystemTime::now()).unwrap_or_default()
-        });
-        tokio::select! {
-            biased;
-            () = &mut shutdown => break,
-            () = async {
-                match wake_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let Some(store) = wakes.clone() else { continue };
-                let reading = Arc::clone(&store);
-                let due = tokio::task::spawn_blocking(move || reading.take_due(SystemTime::now())).await;
-                match due {
-                    Ok(Ok(due)) => {
-                        for fired in due.fired {
-                            start_wake(&runner, &routes, &drivers, &mut sessions, fired);
-                        }
-                        for tick in due.ticks {
-                            spawn_tick(&runner, &routes, &store, &mut ticks, tick);
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped");
-                        wakes = None;
-                    }
-                    Err(_) => {
-                        tracing::error!(event = "gateway_wake_store_failed", wakes = "stopped");
-                        wakes = None;
-                    }
-                }
-            },
-            Some(result) = ticks.join_next() => {
-                match result {
-                    Ok(Some(fired)) => start_wake(&runner, &routes, &drivers, &mut sessions, fired),
-                    Ok(None) => {}
-                    Err(_) => tracing::error!(event = "gateway_wake_task_failed"),
-                }
-            },
-            () = async {
-                match follow_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                for message in follow_pending.due(tokio::time::Instant::now()) {
-                    if let Some(route) = routes.route(&message)
-                        && let Some(table) = runner.follow.as_ref()
-                    {
-                        let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
-                        if matches!(table.ticket(&key, SystemTime::now()), follow::FollowTicket::Active { .. }) {
-                            start_session(&runner, &routes, &drivers, &mut sessions, message);
-                        }
-                    }
-                }
-            },
-            () = async {
-                match deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                for message in collector.take_due(tokio::time::Instant::now()) {
-                    start_session(&runner, &routes, &drivers, &mut sessions, message);
-                }
-            },
-            Some(message) = notices.recv() => {
-                let MessageId::Job { agent, .. } = &message.message_id else {
-                    continue;
-                };
-                let answering = routes.route(&message).is_some_and(|route| {
-                    route.job_timeout.is_some() && &route.agent == agent
-                });
-                if answering && drivers.contains_key(&message.transport) {
-                    start_session(&runner, &routes, &drivers, &mut sessions, message);
-                } else if let Some(notice) = jobs::Notice::of(&message) {
-                    notice.record("dropped");
-                }
-            },
-            event = receiver.recv() => {
-                let Some(event) = event else {
-                    outcome = ServeOutcome::TransportsLost;
-                    break;
-                };
-                match event {
-                    TransportEvent::Connected { name, identity } => {
-                        Arc::make_mut(&mut identities).insert(name, identity);
-                    }
-                    TransportEvent::Message(message) => {
-                        let received = message.receive_span.clone();
-                        received.in_scope(|| {
-                            dispatch(
-                                &runner,
-                                &routes,
-                                &identities,
-                                &drivers,
-                                &stop_words,
-                                &mut sessions,
-                                &mut collector,
-                                &mut follow_pending,
-                                *message,
-                            );
-                        });
-                    }
-                    TransportEvent::CancelRequested(request) => {
-                        if collector.cancel(&request) {
-                            tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via));
-                        }
-                        cancel_session(&runner, &request);
-                    },
-                }
-            }
-        }
-    }
-
-    drop(notices);
-    collector.shutdown();
-    drop(follow_pending);
-    runner.jobs.seal();
-
-    // A tick that fires here has already retired its row, so its wake must still start.
-    if timeout(grace, async {
-        while let Some(result) = ticks.join_next().await {
-            if let Ok(Some(fired)) = result {
-                start_wake(&runner, &routes, &drivers, &mut sessions, fired);
-            }
-        }
-        while let Some(result) = sessions.join_next().await {
-            observe_session(result);
-        }
-    })
-    .await
-    .is_err()
-    {
-        tracing::warn!(event = "gateway_sessions_abandoned");
-        // A blocking probe cannot be aborted; the runtime's shutdown timeout bounds it.
-        ticks.detach_all();
-        sessions.abort_all();
-        while sessions.join_next().await.is_some() {}
-    }
-    outcome
-}
+#[cfg(test)]
+pub(crate) use tests::{dispatch, serve};
 
 fn observe_session(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result
         && !error.is_cancelled()
     {
         tracing::error!(event = "gateway_session_task_failed");
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "one dispatch entry owns stop handling, addressing, and bounded collection"
-)]
-fn dispatch(
-    runner: &Arc<SessionRunner>,
-    routes: &Arc<RoutingTable>,
-    identities: &BTreeMap<String, TransportIdentity>,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    stop_words: &[String],
-    sessions: &mut JoinSet<()>,
-    collector: &mut collection::Collector,
-    follow_pending: &mut follow::Debounce,
-    message: InboundMessage,
-) {
-    // Checked before the route lookup and the addressed filter: a reload can unroute a conversation
-    // whose person still owns jobs, and a channel stop word like the bot mention plus stop would
-    // otherwise be dropped as unaddressed; only this sender's running or pending work may be stopped.
-    if transport::is_stop_word(
-        identities.get(&message.transport),
-        &message.text,
-        stop_words,
-    ) {
-        let mut banished = false;
-        if let Some(route) = routes.route(&message)
-            && route.follow
-            && let Some(table) = runner.follow.as_ref()
-        {
-            let key = follow::follow_key(
-                &route.transport,
-                route.agent.as_str(),
-                &route.conversation,
-                &message.conversation.key(),
-            );
-            follow_pending.remove(&key);
-            if matches!(
-                table.ticket(&key, SystemTime::now()),
-                follow::FollowTicket::Active { .. }
-            ) {
-                table.suspend(&key);
-                banished = true;
-                let table = Arc::clone(table);
-                let index = route.route_index;
-                sessions.spawn(async move {
-                    match tokio::task::spawn_blocking(move || table.leave(&key)).await {
-                        Ok(Ok(())) => tracing::info!(
-                            audit.event = "gateway.follow",
-                            operation = "banished",
-                            route = index
-                        ),
-                        _ => tracing::warn!(
-                            audit.event = "gateway.follow",
-                            operation = "refused",
-                            route = index,
-                            reason = "persistence"
-                        ),
-                    }
-                });
-            }
-        }
-        let request = CancelRequest {
-            transport: message.transport.clone(),
-            conversation_id: message.conversation.key(),
-            subject: message.subject.canonical(),
-            via: dekopon_agent::CancelVia::StopReply,
-        };
-        let stopped = runner.gate.cancel(&request);
-        let pending_cancelled = collector.cancel(&request) || stopped.dropped;
-        let active_outcome = stopped.running;
-        let jobs_stopped = runner.jobs.cancel_owner(&request);
-        if pending_cancelled {
-            if matches!(
-                active_outcome,
-                CancelOutcome::NoSession | CancelOutcome::OtherSubject | CancelOutcome::Completing
-            ) && let Some(driver) = drivers.get(&message.transport).cloned()
-                && let Some(reply) = runner.gate.refusal()
-            {
-                let receipt = message.receive_span.clone();
-                sessions.spawn(
-                    async move {
-                        let _reply = reply;
-                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
-                    }
-                    .instrument(receipt),
-                );
-            }
-            return;
-        }
-        match active_outcome {
-            CancelOutcome::Cancelled => {
-                tracing::info!(
-                    event = "gateway_session_stop_requested",
-                    transport = %request.transport,
-                    via = "stop-reply"
-                );
-                return;
-            }
-            outcome @ (CancelOutcome::AlreadyCancelled | CancelOutcome::Completing) => {
-                tracing::debug!(
-                    event = "gateway_session_stop_ignored",
-                    transport = %request.transport,
-                    reason = outcome.ignored_reason()
-                );
-                return;
-            }
-            CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
-        }
-        if jobs_stopped {
-            if let Some(driver) = drivers.get(&message.transport).cloned()
-                && let Some(reply) = runner.gate.refusal()
-            {
-                let receipt = message.receive_span.clone();
-                sessions.spawn(
-                    async move {
-                        let _reply = reply;
-                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
-                    }
-                    .instrument(receipt),
-                );
-            }
-            return;
-        }
-        if banished {
-            return;
-        }
-    }
-    let Some((route_id, _)) = routes.route_index(&message) else {
-        tracing::debug!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "unrouted",
-            conversation.kind = message.conversation.kind.as_str(),
-            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
-        );
-        return;
-    };
-    let addressed = message.addressed.unwrap_or_else(|| {
-        identities
-            .get(&message.transport)
-            .is_some_and(|identity| identity.is_addressed(&message.text))
-    });
-    let inherited_thread = message
-        .thread_continuation
-        .as_ref()
-        .is_some_and(|continuation| continuation.inherited);
-    if addressed
-        && let Some(route) = routes.route(&message)
-        && route.follow
-    {
-        let key = follow::follow_key(
-            &route.transport,
-            route.agent.as_str(),
-            &route.conversation,
-            &message.conversation.key(),
-        );
-        follow_pending.cancel(&key, &message.subject);
-    }
-    if message.conversation.kind != ConversationKind::DirectMessage
-        && !addressed
-        && !inherited_thread
-        && !collector.is_native_continuation(route_id, &message)
-    {
-        if let Some(route) = routes.route(&message)
-            && route.follow
-            && let Some(table) = runner.follow.as_ref()
-        {
-            let key = follow::follow_key(
-                &route.transport,
-                route.agent.as_str(),
-                &route.conversation,
-                &message.conversation.key(),
-            );
-            if matches!(
-                table.ticket(&key, SystemTime::now()),
-                follow::FollowTicket::Active { .. }
-            ) {
-                if !follow_pending.offer(key, message, tokio::time::Instant::now()) {
-                    tracing::info!(
-                        audit.event = "gateway.follow",
-                        operation = "refused",
-                        route = route_id,
-                        reason = "capacity"
-                    );
-                }
-                return;
-            }
-        }
-        tracing::debug!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "not-addressed"
-        );
-        return;
-    }
-    match collector.offer(route_id, message) {
-        collection::Offered::Pending => {}
-        collection::Offered::Immediate(message) => {
-            start_session(runner, routes, drivers, sessions, message)
-        }
-        collection::Offered::Refused(message, reason) => {
-            collection::disposition(&message.receive_span, reason);
-            if let Some(driver) = drivers.get(&message.transport).cloned()
-                && let Some(permit) = runner.gate.refusal()
-            {
-                let receipt = message.receive_span.clone();
-                sessions.spawn(async move {
-                    let _permit = permit;
-                    let reply = match reason {
-                        "collection-full" => "Busy collecting other requests. Please try again shortly.",
-                        "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
-                        "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
-                        _ => "Input refused: too many attachments or messages, or too much text. Please send a smaller request.",
-                    };
-                    session::answer(&driver, &message, reply).await;
-                }.instrument(receipt));
-            }
-        }
-    }
-}
-
-fn start_session(
-    runner: &Arc<SessionRunner>,
-    routes: &RoutingTable,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    sessions: &mut JoinSet<()>,
-    message: InboundMessage,
-) {
-    let Some(route) = routes.route(&message) else {
-        collection::disposition(&message.receive_span, "route-lost");
-        return;
-    };
-    let Some(driver) = drivers.get(&message.transport).cloned() else {
-        message
-            .receive_span
-            .in_scope(|| tracing::error!(event = "gateway_message_ignored", reason = "no-driver"));
-        collection::disposition(&message.receive_span, "no-driver");
-        return;
-    };
-    sessions.spawn(session::run_session(
-        Arc::clone(runner),
-        route.clone(),
-        message,
-        driver,
-    ));
-}
-
-/// A wake whose route no longer answers as its agent is delivered as its note, so the person still
-/// hears what they asked to be reminded of.
-fn start_wake(
-    runner: &Arc<SessionRunner>,
-    routes: &RoutingTable,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    sessions: &mut JoinSet<()>,
-    fired: wake::Fired,
-) {
-    let agent = fired.agent().clone();
-    let id = fired.id();
-    let message = fired.into_inbound();
-    let answering = routes
-        .route(&message)
-        .is_some_and(|route| route.wakes && route.agent == agent);
-    let receipt = message.receive_span.clone();
-    receipt.in_scope(|| tracing::info!(event = "gateway_wake_fired", wake.id = %id));
-    if answering {
-        start_session(runner, routes, drivers, sessions, message);
-        return;
-    }
-    receipt.in_scope(|| tracing::warn!(event = "gateway_wake_orphaned", wake.id = %id));
-    if let Some(driver) = drivers.get(&message.transport).cloned()
-        && let MessageId::Wake { notice, .. } = &message.message_id
-    {
-        let notice = notice.clone();
-        sessions.spawn(
-            async move {
-                session::answer(&driver, &message, &notice).await;
-            }
-            .instrument(receipt),
-        );
     }
 }
 
@@ -1108,6 +765,30 @@ const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
         dekopon_agent::CancelVia::Button => "button",
         dekopon_agent::CancelVia::StopReply => "stop-reply",
     }
+}
+
+fn register_transport(
+    transport: Box<dyn ChatTransport>,
+    drivers: &mut BTreeMap<String, Arc<dyn ChatDriver>>,
+    asset_fetchers: &mut HashMap<String, Arc<dyn AssetFetcher>>,
+    thread_ownership: &mut HashMap<String, Arc<dyn ThreadOwnership>>,
+) -> transport::recovery::RecoveringTransport {
+    let transport = transport::recovery::RecoveringTransport::new(transport);
+    let name = transport.name().to_owned();
+    drivers.insert(name.clone(), transport.driver());
+    if let Some((sibling, driver)) = transport.sibling_driver() {
+        drivers.insert(sibling, driver);
+    }
+    if let Some((sibling, fetcher)) = transport.sibling_fetcher() {
+        asset_fetchers.insert(sibling, fetcher);
+    }
+    if let Some(fetcher) = transport.asset_fetcher() {
+        asset_fetchers.insert(name.clone(), fetcher);
+    }
+    if let Some(ownership) = transport.thread_ownership() {
+        thread_ownership.insert(name, ownership);
+    }
+    transport
 }
 
 async fn read_transport(
@@ -1208,9 +889,49 @@ mod openrouter_startup_tests {
 
 fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, GatewaydError> {
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
+    let generation = gateway::CurrentGeneration::boot(
+        Arc::new(routes.clone()),
+        Arc::new(config.stop_words.clone()),
+    );
+    let whatsapp_binds = config
+        .transports
+        .iter()
+        .filter_map(|spec| match spec {
+            TransportConfig::WhatsappCloudApi { bind, .. } => Some(*bind),
+            TransportConfig::GithubWebhook { .. }
+            | TransportConfig::SlackSocketMode { .. }
+            | TransportConfig::DiscordGateway { .. }
+            | TransportConfig::TelegramLongPoll { .. }
+            | TransportConfig::Local { .. } => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut github_mounts = HashMap::new();
+    for spec in &config.transports {
+        if let TransportConfig::GithubWebhook {
+            name,
+            bind,
+            secret_env,
+        } = spec
+            && whatsapp_binds.contains(bind)
+        {
+            match transport::read_credential(secret_env) {
+                Ok(secret) => {
+                    github_mounts.insert(*bind, (name.clone(), secret));
+                }
+                Err(source) => problems.push(StartupProblem::Transport {
+                    transport: name.clone(),
+                    source,
+                }),
+            }
+        }
+    }
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
-        match build_transport(spec, config) {
+        if matches!(spec, TransportConfig::GithubWebhook { bind, .. } if whatsapp_binds.contains(bind))
+        {
+            continue;
+        }
+        match build_transport(spec, config, &generation, &mut github_mounts) {
             Ok(transport) => transports.push(transport),
             Err(source) => problems.push(StartupProblem::Transport {
                 transport: spec.name().to_owned(),
@@ -1219,19 +940,25 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
         }
     }
     if problems.is_empty() {
-        Ok(Prepared { transports })
+        Ok(Prepared {
+            transports,
+            generation,
+        })
     } else {
         Err(GatewaydError::Startup { problems })
     }
 }
 
-struct Prepared {
+pub(crate) struct Prepared {
     transports: Vec<Box<dyn ChatTransport>>,
+    generation: gateway::CurrentGeneration,
 }
 
 fn build_transport(
     spec: &TransportConfig,
     config: &ResolvedConfig,
+    generation: &gateway::CurrentGeneration,
+    github_mounts: &mut HashMap<std::net::SocketAddr, (String, String)>,
 ) -> Result<Box<dyn ChatTransport>, TransportError> {
     let surface = |liveness: &LivenessConfig| {
         let mut settings = liveness.settings();
@@ -1247,6 +974,17 @@ fn build_transport(
         settings
     };
     Ok(match spec {
+        TransportConfig::GithubWebhook {
+            name,
+            secret_env,
+            bind,
+        } => Box::new(GithubTransport::new(
+            name.clone(),
+            *bind,
+            transport::read_credential(secret_env)?,
+            generation.clone(),
+            None,
+        )),
         TransportConfig::SlackSocketMode {
             name,
             app_token_env,
@@ -1295,21 +1033,33 @@ fn build_transport(
             liveness,
             graph_endpoint,
             ..
-        } => Box::new(WhatsappTransport::new(
-            name.clone(),
-            *bind,
-            callback_path.clone(),
-            waba_id.clone(),
-            phone_number_id.clone(),
-            graph_api_version.clone(),
-            graph_endpoint
-                .clone()
-                .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
-            transport::read_credential(app_secret_env)?,
-            transport::read_credential(verify_token_env)?,
-            transport::read_credential(access_token_env)?,
-            surface(liveness),
-        )?),
+        } => {
+            let whatsapp = WhatsappTransport::new(
+                name.clone(),
+                *bind,
+                callback_path.clone(),
+                waba_id.clone(),
+                phone_number_id.clone(),
+                graph_api_version.clone(),
+                graph_endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+                transport::read_credential(app_secret_env)?,
+                transport::read_credential(verify_token_env)?,
+                transport::read_credential(access_token_env)?,
+                surface(liveness),
+            )?;
+            match github_mounts.remove(bind) {
+                Some((name, secret)) => Box::new(GithubTransport::new(
+                    name,
+                    *bind,
+                    secret,
+                    generation.clone(),
+                    Some(whatsapp),
+                )),
+                None => Box::new(whatsapp),
+            }
+        }
         TransportConfig::TelegramLongPoll {
             name,
             bot_token_env,
@@ -1348,6 +1098,8 @@ pub enum GatewaydError {
     Startup { problems: Vec<StartupProblem> },
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
+    #[error("broker generation was not active")]
+    BrokerGeneration,
     #[error("{}", render_problems(.problems))]
     TransportConnect {
         problems: Vec<TransportConnectProblem>,

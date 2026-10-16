@@ -9,8 +9,8 @@ use thiserror::Error;
 use crate::{
     cache_key,
     config::{
-        MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, ResolvedPolicy, Steering,
-        render_problems,
+        GithubEvent, MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, ResolvedPolicy,
+        Steering, render_problems,
     },
     progress::ProgressDetail,
     transport::InboundMessage,
@@ -27,6 +27,7 @@ pub(crate) struct BoundRoute {
     pub transport: String,
     pub conversation: ConversationMatch,
     pub subjects: Option<Vec<ExternalSubject>>,
+    pub github_events: Option<Vec<GithubEvent>>,
     pub agent: AgentId,
     pub description: String,
     pub model_class: Option<String>,
@@ -42,10 +43,6 @@ pub(crate) struct BoundRoute {
     pub steering: Steering,
     pub progress_notes: bool,
     pub memory: MemoryPolicy,
-    #[allow(
-        dead_code,
-        reason = "resolved policy is consumed by later memory integration"
-    )]
     pub memory_policy: Option<ResolvedPolicy>,
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
@@ -81,13 +78,12 @@ impl RoutingTable {
         let mut problems = Vec::new();
         for (route_index, route) in config.routes.iter().enumerate() {
             let Some(agent) = catalog.agent(&route.agent) else {
-                problems.push(RouteProblem::UnknownAgent {
-                    agent: route.agent.to_string(),
-                });
+                problems.push(RouteProblem::UnknownAgent { route: route_index });
                 continue;
             };
             if !agent.spec.enabled {
                 problems.push(RouteProblem::DisabledAgent {
+                    route: route_index,
                     agent: route.agent.to_string(),
                 });
                 continue;
@@ -96,17 +92,17 @@ impl RoutingTable {
                 Some(name) => models
                     .iter()
                     .find(|model| model.name() == name)
-                    .ok_or_else(|| RouteProblem::UnknownModel {
-                        model: name.clone(),
-                    }),
+                    .ok_or(RouteProblem::UnknownModel { route: route_index }),
                 None => match agent.spec.model_class.as_deref() {
                     None => Err(RouteProblem::NoModelClass {
+                        route: route_index,
                         agent: route.agent.to_string(),
                     }),
                     Some(class) => models
                         .iter()
                         .find(|model| model.classes().iter().any(|offered| offered == class))
                         .ok_or_else(|| RouteProblem::NoModelForClass {
+                            route: route_index,
                             agent: route.agent.to_string(),
                             class: class.to_owned(),
                         }),
@@ -124,6 +120,7 @@ impl RoutingTable {
                 transport: route.transport.clone(),
                 conversation: route.conversation.clone(),
                 subjects: route.subjects.clone(),
+                github_events: route.github_events.clone(),
                 agent: route.agent.clone(),
                 description: agent.spec.description.clone(),
                 model_class: agent.spec.model_class.clone(),
@@ -176,6 +173,23 @@ impl RoutingTable {
     /// Declaration order is the only precedence rule, with no specificity ranking, so an operator
     /// reads top to bottom to see which route wins; a catch-all still needs dispatch's own
     /// addressing check.
+    pub(crate) fn github_route(
+        &self,
+        transport: &str,
+        conversation: &Conversation,
+        subject: &ExternalSubject,
+        event: GithubEvent,
+    ) -> Option<&BoundRoute> {
+        self.find(transport, conversation, subject)
+            .map(|(_, route)| route)
+            .filter(|route| {
+                route
+                    .github_events
+                    .as_ref()
+                    .is_some_and(|events| events.contains(&event))
+            })
+    }
+
     pub fn route(&self, message: &InboundMessage) -> Option<&BoundRoute> {
         self.route_index(message).map(|(_, route)| route)
     }
@@ -223,16 +237,22 @@ pub struct RouteError {
 
 #[derive(Debug, Error)]
 pub enum RouteProblem {
-    #[error("route names agent {agent:?}, which is not in the catalog")]
-    UnknownAgent { agent: String },
-    #[error("route names agent {agent:?}, which the catalog disables")]
-    DisabledAgent { agent: String },
-    #[error("route names model {model:?}, which is not configured")]
-    UnknownModel { model: String },
+    #[error("routes[{route}] names an agent which is not in the catalog")]
+    UnknownAgent { route: usize },
+    #[error("routes[{route}] names agent {agent:?}, which the catalog disables")]
+    DisabledAgent { route: usize, agent: String },
+    #[error("routes[{route}] names a model which is not configured")]
+    UnknownModel { route: usize },
     #[error(
-        "agent {agent:?} declares no modelClass and its route names no model, so no model can serve it"
+        "routes[{route}]: agent {agent:?} declares no modelClass and its route names no model, so no model can serve it"
     )]
-    NoModelClass { agent: String },
-    #[error("agent {agent:?} needs model class {class:?}, which no configured model offers")]
-    NoModelForClass { agent: String, class: String },
+    NoModelClass { route: usize, agent: String },
+    #[error(
+        "routes[{route}]: agent {agent:?} needs model class {class:?}, which no configured model offers"
+    )]
+    NoModelForClass {
+        route: usize,
+        agent: String,
+        class: String,
+    },
 }

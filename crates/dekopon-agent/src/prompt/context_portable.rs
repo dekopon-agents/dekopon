@@ -97,87 +97,94 @@ pub fn fit_projected(
     ))
 }
 
-fn append_exchanges(
-    output: &mut String,
-    exchanges: &[Exchange],
-    mut selected: impl FnMut(&Representation) -> bool,
-) {
-    for exchange in exchanges {
-        output.push_str(&format!(
-            "\n[tool: {}, outcome: {}, exit: {:?}]",
+#[derive(Clone, Copy)]
+pub struct BodySource<'a> {
+    pub user: Option<&'a str>,
+    pub answer: Option<&'a str>,
+    pub source_eligibility: bool,
+    pub representations: &'a [Representation],
+    pub exchanges: &'a [Exchange],
+}
+
+pub fn render_body(source: BodySource<'_>, id: &str, version: &str) -> Option<String> {
+    let matches = |rep: &&Representation| rep.routine_id == id && rep.version == version;
+    let mut reps = source.representations.iter().filter(matches).peekable();
+    let original = reps.peek()?.kind == "original";
+    let mut text = if original {
+        if !source.source_eligibility {
+            return None;
+        }
+        match (&source.user, &source.answer) {
+            (Some(user), Some(answer)) => format!("{user}\n{answer}"),
+            (Some(user), None) => user.to_string(),
+            (None, _) => String::new(),
+        }
+    } else {
+        reps.filter_map(|rep| rep.text.as_deref()).collect()
+    };
+    if text.is_empty() && (!original || source.exchanges.is_empty()) {
+        return None;
+    }
+    for exchange in source.exchanges {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[tool: {}, outcome: {}, exit: {:?}]",
             exchange.tool, exchange.outcome, exchange.exit_status
         ));
         for (label, parts) in [("request", &exchange.request), ("result", &exchange.result)] {
             let content: String = parts
                 .iter()
-                .filter(|rep| selected(rep))
+                .filter(matches)
                 .filter_map(|rep| rep.text.as_deref())
                 .collect();
             if !content.is_empty() {
-                output.push_str(&format!("\n[{label}] {content}"));
+                text.push_str(&format!("\n[{label}] {content}"));
             }
         }
     }
-}
-
-pub fn original_envelope_bytes(user: &str, answer: Option<&str>, exchanges: &[Exchange]) -> usize {
-    if exchanges.is_empty() {
-        return user.len().saturating_add(answer.map_or(0, str::len));
-    }
-    let mut output = user.to_owned();
-    if let Some(answer) = answer {
-        output.push('\n');
-        output.push_str(answer);
-    }
-    append_exchanges(&mut output, exchanges, |rep| rep.kind == "original");
-    output.len()
+    Some(text)
 }
 
 pub struct EnvelopeSource<'a> {
-    pub user: Option<&'a str>,
-    pub answer: Option<&'a str>,
-    pub representations: &'a [Representation],
-    pub exchanges: &'a [Exchange],
+    pub record_id: u64,
+    pub body: BodySource<'a>,
+    pub original_id: Option<&'a str>,
+    pub eligible: &'a [String],
 }
 
-pub fn render_envelope(
-    source: EnvelopeSource<'_>,
-    id: &str,
-    version: &str,
-    is_original: bool,
-) -> Option<String> {
-    let EnvelopeSource {
-        user,
-        answer,
-        representations,
-        exchanges,
-    } = source;
-    let text: String = representations
-        .iter()
-        .filter(|rep| rep.routine_id == id && rep.version == version && rep.text.is_some())
-        .map(|rep| rep.text.as_deref().unwrap_or_default())
-        .collect();
-    if (is_original && user.is_none()) || (!is_original && text.is_empty()) {
-        return None;
+pub struct ProjectedTurn {
+    pub user: String,
+    pub answer: Option<String>,
+}
+
+pub fn render_envelope(source: EnvelopeSource<'_>, id: &str, text: &str) -> ProjectedTurn {
+    let label = format!(
+        "[memory: {}]\n",
+        serde_json::json!({
+            "recordId": source.record_id,
+            "representationId": id,
+            "eligibleRepresentationIds": source.eligible,
+            "omittedBytes": source.body.representations.iter()
+                .find(|rep| rep.routine_id == id && rep.text.is_some())
+                .map_or(0, Representation::omitted_bytes),
+        })
+    );
+    if Some(id) == source.original_id
+        && source.body.exchanges.is_empty()
+        && let Some(user) = source.body.user
+    {
+        ProjectedTurn {
+            user: format!("{label}{user}"),
+            answer: source.body.answer.map(str::to_owned),
+        }
+    } else {
+        ProjectedTurn {
+            user: format!("{label}{text}"),
+            answer: None,
+        }
     }
-    let mut output = match (user, answer) {
-        (Some(user), Some(answer)) if is_original => format!("{user}\n{answer}"),
-        (Some(user), None) if is_original => user.to_owned(),
-        _ => text.clone(),
-    };
-    append_exchanges(&mut output, exchanges, |rep| {
-        rep.routine_id == id && rep.version == version
-    });
-    if !is_original {
-        output = format!(
-            "[memory: routine={id}, omitted={} bytes]\n{output}",
-            representations
-                .iter()
-                .find(|rep| rep.routine_id == id)
-                .map_or(0, Representation::omitted_bytes)
-        );
-    }
-    Some(output)
 }
 
 #[cfg(test)]
@@ -194,53 +201,80 @@ mod tests {
     }
 
     #[test]
-    fn envelope_preserves_user_assistant_and_tool_order() {
-        let exchange = Exchange {
+    fn body_requires_matching_version_and_source_eligibility() {
+        let reps = [Representation::original("a\nb", "v1")];
+        let source = BodySource {
+            user: Some("a"),
+            answer: Some("b"),
+            source_eligibility: true,
+            representations: &reps,
+            exchanges: &[],
+        };
+        assert_eq!(
+            render_body(source, "original", "v1").as_deref(),
+            Some("a\nb")
+        );
+        assert_eq!(render_body(source, "original", "stale"), None);
+        assert_eq!(
+            render_body(
+                BodySource {
+                    source_eligibility: false,
+                    ..source
+                },
+                "original",
+                "v1"
+            ),
+            None
+        );
+        let eligible = vec!["original".to_owned()];
+        let projected = render_envelope(
+            EnvelopeSource {
+                record_id: 9_007_199_254_740_993,
+                body: source,
+                original_id: Some("original"),
+                eligible: &eligible,
+            },
+            "original",
+            "a\nb",
+        );
+        assert_eq!(projected.answer.as_deref(), Some("b"));
+        let (label, user) = projected.user.split_once('\n').expect("label then user");
+        assert_eq!(user, "a");
+        let label: serde_json::Value = serde_json::from_str(
+            label
+                .strip_prefix("[memory: ")
+                .expect("memory label")
+                .strip_suffix(']')
+                .expect("label end"),
+        )
+        .expect("JSON label");
+        assert_eq!(
+            label,
+            serde_json::json!({"recordId": 9_007_199_254_740_993u64, "representationId": "original", "eligibleRepresentationIds": ["original"], "omittedBytes": 0})
+        );
+    }
+
+    #[test]
+    fn tool_only_original_has_no_leading_newline() {
+        let reps = [Representation::original("", "v1")];
+        let exchanges = [Exchange {
             tool: "echo".into(),
             request: vec![Representation::original("ask", "v1")],
             result: vec![Representation::original("reply", "v1")],
             outcome: "ok".into(),
             exit_status: Some(0),
+        }];
+        let source = BodySource {
+            user: None,
+            answer: None,
+            source_eligibility: true,
+            representations: &reps,
+            exchanges: &exchanges,
         };
-        let output = render_envelope(
-            EnvelopeSource {
-                user: Some("user"),
-                answer: Some("assistant"),
-                representations: &[],
-                exchanges: std::slice::from_ref(&exchange),
-            },
-            "original",
-            "v1",
-            true,
-        );
         assert_eq!(
-            output.as_deref(),
-            Some(
-                "user\nassistant\n[tool: echo, outcome: ok, exit: Some(0)]\n[request] ask\n[result] reply"
-            )
+            render_body(source, "original", "v1").as_deref(),
+            Some("[tool: echo, outcome: ok, exit: Some(0)]\n[request] ask\n[result] reply")
         );
-        assert_eq!(
-            original_envelope_bytes("user", Some("assistant"), std::slice::from_ref(&exchange)),
-            output.expect("original envelope exists").len()
-        );
-    }
-
-    #[test]
-    fn original_without_exchanges_retains_historical_fit_count() {
-        let text = render_envelope(
-            EnvelopeSource {
-                user: Some("a"),
-                answer: Some("b"),
-                representations: &[],
-                exchanges: &[],
-            },
-            "original",
-            "v1",
-            true,
-        )
-        .expect("original envelope exists");
-        assert_eq!(text, "a\nb");
-        assert_eq!(original_envelope_bytes("a", Some("b"), &[]), 2);
     }
 
     #[test]

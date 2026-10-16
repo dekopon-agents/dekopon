@@ -20,6 +20,11 @@ for (let i = 0; i < nativeSteps.length; i++) {
 assert.equal(nativeSteps[0].retained[0].id, '9007199254740993');
 assert.equal(nativeSteps[0].modelVisible[0].recordId, '9007199254740993');
 assert.equal(nativeSteps[0].modelVisible[0].answer, 'Remembered.');
+assert.equal(nativeSteps[0].modelVisible[0].user.includes('"recordId":9007199254740993'), true);
+for (const step of nativeSteps) {
+  const bytes = step.modelVisible.reduce((sum, turn) => sum + Buffer.byteLength(turn.user) + Buffer.byteLength(turn.answer ?? ''), 0);
+  assert.ok(bytes <= input.maxBytes);
+}
 assert.equal(nativeSteps[3].modelVisible.some(x => x.recordId === '9007199254740993'), false);
 assert.equal(nativeSteps[4].retained.length, 5);
 assert.equal(nativeSteps[4].modelVisible.some(x => x.recordId === '9007199254740997'), false);
@@ -28,7 +33,7 @@ for (const mutation of [
   x => x.cassette.shift(),
   x => { x.cassette[0].request.configId = 'other'; },
   x => { x.cassette[0].request.input.user = 'changed'; },
-  x => { x.cassette[0].request.version = 'v2'; },
+  x => { x.cassette[0].request.version = 'different-version'; },
   x => { [x.cassette[0], x.cassette[1]] = [x.cassette[1], x.cassette[0]]; },
 ]) {
   const bad = structuredClone(input);

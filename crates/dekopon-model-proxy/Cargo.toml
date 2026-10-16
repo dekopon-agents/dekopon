@@ -35,6 +35,7 @@ tracing.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
+arc-swap.workspace = true
 dekopon-test-support = { path = "../dekopon-test-support" }
 rcgen.workspace = true
 tempfile.workspace = true
