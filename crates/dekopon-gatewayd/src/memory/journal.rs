@@ -2394,4 +2394,127 @@ mod tests {
         journal.expire(SystemTime::now()).unwrap();
         assert!(!path.exists());
     }
+
+    fn decider_policy() -> ResolvedPolicy {
+        use crate::config::memory::{Routine, RoutineKind, SelectionMode};
+        let mut policy = ResolvedPolicy::default();
+        for id in ["summary", "brief"] {
+            policy.routines.push(Routine {
+                id: id.into(),
+                kind: RoutineKind::Prefix,
+                max_bytes: std::num::NonZeroU64::new(1024),
+                model: None,
+                parts: None,
+            });
+            policy.retain.push(id.into());
+        }
+        policy.selection.mode = SelectionMode::Decider;
+        policy.selection.routine = None;
+        policy.selection.decision_capability = Some("decide.choose".into());
+        policy.selection.fallback = Some("summary".into());
+        policy
+    }
+
+    fn append_represented(
+        journal: &Journal,
+        stem: &str,
+        policy: &ResolvedPolicy,
+        user: &str,
+        replacements: &[(usize, &str)],
+    ) {
+        let turn = ConversationTurn::completed(user, "ok");
+        let version = |index: usize| crate::memory::generation::version(&policy.routines[index]);
+        let mut original = Representation::original(&format!("{user}\nok"), &version(0));
+        original.text = None;
+        let mut representations = vec![original];
+        let mut availability = vec!["original".to_owned()];
+        for (index, text) in replacements {
+            let id = policy.routines[*index].id.clone();
+            representations.push(Representation {
+                routine_id: id.clone(),
+                version: version(*index),
+                source_record_id: 0,
+                part: None,
+                kind: "prefix".into(),
+                captured_bytes: text.len() as u64,
+                text: Some((*text).to_owned()),
+            });
+            availability.push(id);
+        }
+        journal
+            .append(
+                stem,
+                &Entry {
+                    at: SystemTime::now(),
+                    grant: GRANT,
+                    turn: &turn,
+                    inventory: &[],
+                    next_asset_id: 1,
+                    prepared: Some(&crate::memory::generation::Prepared {
+                        include_chat: true,
+                        representations,
+                        exchanges: Vec::new(),
+                        original: true,
+                        availability,
+                        failed_routines: Vec::new(),
+                    }),
+                },
+                window(),
+            )
+            .expect("append");
+    }
+
+    #[test]
+    fn a_per_record_decider_fallback_is_sent_only_when_it_saves_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let policy = decider_policy();
+        append_represented(&journal, &stem, &policy, "first", &[(1, "s"), (2, "b")]);
+        append_represented(&journal, &stem, &policy, "second", &[(1, &"x".repeat(200))]);
+        append_represented(&journal, &stem, &policy, &"third".repeat(40), &[(1, "s")]);
+        let (capture, _guard) = crate::tests::capture_spans();
+        let projected = journal
+            .project(
+                Projection {
+                    stem: &stem,
+                    grant: GRANT,
+                    window: window(),
+                    sealed_at: None,
+                    policy: &policy,
+                },
+                &History::new(window().limits),
+                |_available, _evidence| Ok("brief".to_owned()),
+            )
+            .expect("projection");
+        assert_eq!(projected.turns().len(), 3);
+        let selection = |record: &str| {
+            let events = capture.events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_memory_selection"), ("record_id", record)],
+            );
+            assert_eq!(events.len(), 1, "{events:?}");
+            (
+                events[0].field("requested").map(str::to_owned),
+                events[0].field("actual").map(str::to_owned),
+                events[0].field("reason").map(str::to_owned),
+            )
+        };
+        let expect = |requested: &str, actual: &str, reason: &str| {
+            (
+                Some(requested.to_owned()),
+                Some(actual.to_owned()),
+                Some(reason.to_owned()),
+            )
+        };
+        assert_eq!(selection("1"), expect("brief", "brief", "selected"));
+        assert_eq!(
+            selection("2"),
+            expect("brief", "original", "kept-original: no-saving")
+        );
+        assert_eq!(
+            selection("3"),
+            expect("brief", "summary", "fallback: choice-unavailable")
+        );
+    }
 }

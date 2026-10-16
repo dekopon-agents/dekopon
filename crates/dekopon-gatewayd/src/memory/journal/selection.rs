@@ -302,12 +302,13 @@ fn choose(
         .map_or(line.original_bytes, |turn| turn.bytes() as u64);
     let replacement_bytes = replacement.as_ref().map_or(0, |turn| turn.bytes() as u64);
     let savings = i128::from(original_bytes) - i128::from(replacement_bytes);
-    let automatic = authority == "fixed" || authority == "fallback";
+    let automatic =
+        ((authority == "fixed" || authority == "fallback") && pin.is_none()) || target != requested;
     let (actual, reason) = if replacement.is_none() {
         (original_id.unwrap_or("original"), "unavailable")
-    } else if Some(target) != original_id && automatic && pin.is_none() && original.is_none() {
+    } else if Some(target) != original_id && automatic && original.is_none() {
         (target, "kept-replacement: original-unavailable")
-    } else if Some(target) != original_id && automatic && pin.is_none() && savings <= 0 {
+    } else if Some(target) != original_id && automatic && savings <= 0 {
         (
             original_id.unwrap_or("original"),
             "kept-original: no-saving",
