@@ -858,16 +858,11 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
     match problem {
         GatewaydError::Config(config::ConfigError::Invalid { path, problems }) => problems
             .iter()
-            .map(|item| {
-                (
-                    "configuration",
-                    format!("{}: {}", path.display(), error_chain(item)),
-                )
-            })
+            .map(|item| ("configuration", format!("{}: {}", path.display(), item)))
             .collect(),
         GatewaydError::Route(crate::routes::RouteError { problems }) => problems
             .iter()
-            .map(|item| ("route", error_chain(item)))
+            .map(|item| ("route", item.to_string()))
             .collect(),
         GatewaydError::Config(_)
         | GatewaydError::Catalog(_)
@@ -1089,6 +1084,45 @@ mod snapshot_tests {
     use dekopon_model_token_governor::Tokens;
     use dekopon_test_support::LoopbackServer;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn proxy_tls_source_bytes_never_enter_a_flattened_reload_record() {
+        const SENTINEL: &str = "SENTINEL";
+        let path = PathBuf::from("gateway.yaml");
+        let (capture, _guard) = crate::tests::capture_spans();
+        for (index, source) in [
+            rustls::pki_types::pem::Error::MissingSectionEnd {
+                end_marker: b"PRIVATE KEY----- SENTINEL".to_vec(),
+            },
+            rustls::pki_types::pem::Error::Base64Decode(SENTINEL.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let problem = GatewaydError::Config(config::ConfigError::Invalid {
+                path: path.clone(),
+                problems: vec![config::ConfigProblem::Proxy(
+                    crate::proxy::ProxyProblem::Tls(dekopon_model_proxy::tls::TlsError::Read {
+                        path: path.clone(),
+                        source,
+                    }),
+                )],
+            });
+            let entries = reload_entries(&problem);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, "configuration");
+            let expected = format!("{}: proxy TLS files are unusable", path.display());
+            assert_eq!(entries[0].1, expected);
+            tracing::warn!(event = "gateway_reload_refused", applied = false, error = %entries[0].1);
+            let refused =
+                capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+            assert_eq!(refused.len(), index + 1);
+            let reason = refused[index].field("error").unwrap();
+            assert_eq!(reason, expected);
+            assert!(!reason.contains(SENTINEL));
+            assert!(!reason.contains("83, 69, 78"));
+        }
+    }
 
     #[test]
     fn probe_reload_record_omits_vendor_model_but_boot_retains_its_diagnostic() {

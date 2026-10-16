@@ -1547,8 +1547,14 @@ fn reload_entries(problem: &BrokerdError) -> Vec<String> {
             .iter()
             .map(|item| format!("capability configuration is invalid: {item}"))
             .collect()
+    } else if let BrokerdError::Config(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else if let BrokerdError::Credentials(error) = problem {
+        vec![format!("{problem}: {error}")]
+    } else if let BrokerdError::Secrets(error) = problem {
+        vec![format!("{problem}: {error}")]
     } else {
-        vec![error_chain(problem)]
+        vec![problem.to_string()]
     }
 }
 

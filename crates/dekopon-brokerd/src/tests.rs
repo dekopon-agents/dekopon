@@ -2014,6 +2014,21 @@ async fn unreadable_reload_source_reports_monitor_failure_not_activation() {
 }
 
 #[test]
+fn broker_reload_diagnostics_do_not_walk_untrusted_source_errors() {
+    let problem = super::BrokerdError::Config(config::ConfigError::Read {
+        path: "broker.yaml".into(),
+        source: std::io::Error::other("private-source-sentinel"),
+    });
+    let entries = super::reload_entries(&problem);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0],
+        "broker configuration is invalid: could not read broker configuration at broker.yaml"
+    );
+    assert!(!entries[0].contains("private-source-sentinel"));
+}
+
+#[test]
 fn private_map_and_capability_aggregates_flatten_before_the_record_bound() {
     let secrets = super::BrokerdError::Secrets(super::SecretMapError::Validation {
         problems: (0..12).map(|index| format!("conflict #{index}")).collect(),
