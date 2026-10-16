@@ -1869,7 +1869,12 @@ impl ResidentFixture {
         write_owner_only(&root.path().join("cli-probe.wasm"), &component);
         write_owner_only(&cedar, POLICIES.as_bytes());
         let mut document = attested_document(current_uid());
-        document["identities"].as_array_mut().unwrap().truncate(1);
+        document["identities"] = json!([{
+            "uid": current_uid(),
+            "principal": "dekopon-gatewayd",
+            "actor": {"type": "service", "principal": "dekopon-gatewayd"},
+            "attestor": {}
+        }]);
         let mut storage =
             serde_json::to_value(dekopon_storage_host::StorageLimits::default()).unwrap();
         storage["rootPath"] = json!("provider-storage");

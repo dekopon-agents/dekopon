@@ -38,7 +38,7 @@ pub struct MappedPeer {
 }
 
 impl MappedPeer {
-    fn is_reconciliation_owner(&self) -> bool {
+    pub(crate) fn is_reconciliation_owner(&self) -> bool {
         self.attestor.is_some() && self.context.principal().as_str() == RECONCILIATION_OWNER
     }
 }
@@ -499,7 +499,10 @@ where
     if generation_request != (request.api_version == ProtocolVersion::V1Alpha3) {
         return refuse_invalid_claim(&mut stream, limits).await;
     }
-    if generation_request && !peer.is_reconciliation_owner() {
+    if generation_request
+        && !(peer.is_reconciliation_owner()
+            && coordination.is_none_or(|coordination| coordination.owns(uid)))
+    {
         tracing::warn!(
             event = "broker_generation_refused",
             peer.uid = uid,

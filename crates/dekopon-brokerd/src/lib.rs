@@ -273,6 +273,16 @@ struct GenerationState {
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
 }
 
+impl GenerationState {
+    fn owned_by(&self, uid: u32) -> bool {
+        self.active
+            .ready
+            .identities
+            .get(&uid)
+            .is_some_and(MappedPeer::is_reconciliation_owner)
+    }
+}
+
 impl Coordination {
     fn new(config_path: PathBuf, active: Candidate) -> Self {
         Self {
@@ -289,6 +299,10 @@ impl Coordination {
         Arc::clone(&self.state.lock().active)
     }
 
+    fn owns(&self, uid: u32) -> bool {
+        self.state.lock().owned_by(uid)
+    }
+
     async fn prepare(
         &self,
         expected_active: &str,
@@ -298,17 +312,19 @@ impl Coordination {
         let Ok(_permit) = self.loading.acquire().await else {
             return (self.active().digest.clone(), GenerationOutcome::Refused);
         };
-        let active = self.active();
-        if active.digest != expected_active
-            || self
-                .state
-                .lock()
-                .prepared
-                .as_ref()
-                .is_some_and(|(owner, _, _)| *owner != uid)
-        {
-            return (active.digest.clone(), GenerationOutcome::Refused);
-        }
+        let active = {
+            let state = self.state.lock();
+            if state.active.digest != expected_active
+                || !state.owned_by(uid)
+                || state
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|(owner, _, _)| *owner != uid)
+            {
+                return (state.active.digest.clone(), GenerationOutcome::Refused);
+            }
+            Arc::clone(&state.active)
+        };
         let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
         let Some(next) = next else {
             tracing::warn!(
@@ -320,6 +336,7 @@ impl Coordination {
         };
         let mut state = self.state.lock();
         if !Arc::ptr_eq(&state.active, &active)
+            || !state.owned_by(uid)
             || state
                 .prepared
                 .as_ref()
@@ -335,6 +352,9 @@ impl Coordination {
     fn commit(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
         use dekopon_broker_protocol::GenerationOutcome;
         let mut state = self.state.lock();
+        if !state.owned_by(uid) {
+            return GenerationOutcome::Refused;
+        }
         let Some((owner, base, next)) = state.prepared.take() else {
             return GenerationOutcome::Refused;
         };
@@ -350,10 +370,11 @@ impl Coordination {
     fn abort(&self, digest: &str, uid: u32) -> dekopon_broker_protocol::GenerationOutcome {
         use dekopon_broker_protocol::GenerationOutcome;
         let mut state = self.state.lock();
-        if state
-            .prepared
-            .as_ref()
-            .is_some_and(|(owner, _, next)| *owner == uid && next.digest == digest)
+        if state.owned_by(uid)
+            && state
+                .prepared
+                .as_ref()
+                .is_some_and(|(owner, _, next)| *owner == uid && next.digest == digest)
         {
             state.prepared = None;
             GenerationOutcome::Aborted
