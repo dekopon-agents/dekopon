@@ -112,14 +112,11 @@ where
     let socket_path = candidate.socket_path.clone();
     let provider_lock = candidate.provider_lock.clone();
     let storage = candidate.storage.clone();
-    let broker = Arc::clone(&candidate.ready.broker);
-    let identities = candidate.ready.identities.clone();
     let coordination = Arc::new(Coordination::new(
         config_path.as_ref().to_path_buf(),
         candidate,
     ));
-    let server = BrokerServer::new(broker, identities, limits)?
-        .with_coordination(Arc::clone(&coordination))
+    let server = BrokerServer::for_generations(Arc::clone(&coordination), limits)?
         .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
@@ -421,6 +418,19 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
         }
         return (None, report);
     };
+    if !matches!(mode, Mode::Check(_)) {
+        if let Err(error) = config
+            .snapshot
+            .record_authority_references(
+                config.credentials_path.as_deref(),
+                config.secret_map_path.as_deref(),
+                uid,
+            )
+            .await
+        {
+            report.problems.push(error.into());
+        }
+    }
     let (providers_resolved, residents) = match mode {
         Mode::Boot => (true, Residents::Open),
         Mode::Reload(active) => (true, Residents::Borrow(active)),

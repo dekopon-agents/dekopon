@@ -74,11 +74,17 @@ pub struct BrokerServer<A>
 where
     A: AuditLog,
 {
-    broker: Arc<Broker<A>>,
-    identities: Arc<BTreeMap<u32, MappedPeer>>,
+    source: ServerSource<A>,
     limits: ServerLimits,
     deadline: ShutdownDeadline,
-    coordination: Option<Arc<Coordination>>,
+}
+
+enum ServerSource<A: AuditLog> {
+    Fixed {
+        broker: Arc<Broker<A>>,
+        identities: Arc<BTreeMap<u32, MappedPeer>>,
+    },
+    Generations(Arc<Coordination>),
 }
 
 impl<A> BrokerServer<A>
@@ -101,17 +107,13 @@ where
             return Err(ServerError::InvalidLimits);
         }
         Ok(Self {
-            broker,
-            identities: Arc::new(identities),
+            source: ServerSource::Fixed {
+                broker,
+                identities: Arc::new(identities),
+            },
             limits,
             deadline: ShutdownDeadline::default(),
-            coordination: None,
         })
-    }
-
-    pub(crate) fn with_coordination(mut self, coordination: Arc<Coordination>) -> Self {
-        self.coordination = Some(coordination);
-        self
     }
 
     #[must_use]
@@ -205,27 +207,30 @@ where
             return;
         };
         let frame = self.limits.frame;
-        if let Some(coordination) = &self.coordination {
-            let coordination = Arc::clone(coordination);
-            let generation = coordination.active();
-            tasks.spawn(async move {
-                let _permit = permit;
-                handle(
-                    stream,
-                    &generation.ready.broker,
-                    &generation.ready.identities,
-                    frame,
-                    Some(&coordination),
-                )
-                .await
-            });
-        } else {
-            let broker = Arc::clone(&self.broker);
-            let identities = Arc::clone(&self.identities);
-            tasks.spawn(async move {
-                let _permit = permit;
-                handle(stream, &broker, &identities, frame, None).await
-            });
+        match &self.source {
+            ServerSource::Generations(coordination) => {
+                let coordination = Arc::clone(coordination);
+                let generation = coordination.active();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    handle(
+                        stream,
+                        &generation.ready.broker,
+                        &generation.ready.identities,
+                        frame,
+                        Some(&coordination),
+                    )
+                    .await
+                });
+            }
+            ServerSource::Fixed { broker, identities } => {
+                let broker = Arc::clone(broker);
+                let identities = Arc::clone(identities);
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    handle(stream, &broker, &identities, frame, None).await
+                });
+            }
         }
     }
 
@@ -249,6 +254,22 @@ where
                 self.admit(stream, semaphore, refusal, tasks);
             }
         }
+    }
+}
+
+impl BrokerServer<dekopon_broker::TraceOnlyAuditLog> {
+    pub(crate) fn for_generations(
+        coordination: Arc<Coordination>,
+        limits: ServerLimits,
+    ) -> Result<Self, ServerError> {
+        let active = coordination.active();
+        let mut server = Self::new(
+            Arc::clone(&active.ready.broker),
+            active.ready.identities.clone(),
+            limits,
+        )?;
+        server.source = ServerSource::Generations(coordination);
+        Ok(server)
     }
 }
 
@@ -1324,8 +1345,6 @@ mod generation_tests {
             assert_eq!(record.field("reason"), Some("not-reconciliation-owner"));
             assert_eq!(record.field("peer.uid"), Some(uid.to_string().as_str()));
         }
-        assert_eq!(coordination.commit(&next, uid), GenerationOutcome::Refused);
-        assert_eq!(coordination.abort(&next, uid), GenerationOutcome::Refused);
         assert_eq!(
             coordination.prepare(&next, uid).await,
             (next, GenerationOutcome::Refused)

@@ -419,6 +419,75 @@ impl ConfigSnapshot {
         Ok(())
     }
 
+    pub(crate) async fn record_authority_references(
+        &mut self,
+        credentials: Option<&Path>,
+        secret_map: Option<&Path>,
+        uid: u32,
+    ) -> Result<(), ConfigError> {
+        if let Some(path) = credentials {
+            let path = path.to_path_buf();
+            let bytes = tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || {
+                    read_trusted_file(
+                        &path,
+                        uid,
+                        FileTier::Private,
+                        crate::credentials::HARD_MAX_CREDENTIALS_BYTES,
+                    )
+                }
+            })
+            .await
+            .map_err(|source| ConfigError::Read {
+                path: path.clone(),
+                source: io::Error::other(source),
+            })?
+            .map_err(|source| trusted_read_error(&path, source))?;
+            let mut value: serde_yaml::Value =
+                serde_yaml::from_slice(&bytes).map_err(|source| ConfigError::Decode { source })?;
+            if let Some(entries) = value
+                .get_mut("credentials")
+                .and_then(serde_yaml::Value::as_sequence_mut)
+            {
+                for entry in entries {
+                    if let Some(fields) = entry.as_mapping_mut() {
+                        fields.remove(serde_yaml::Value::String("secret".to_owned()));
+                    }
+                }
+            }
+            self.0.insert(
+                "credentialReferences".to_owned(),
+                (Disposition::Swap, value),
+            );
+        }
+        if let Some(path) = secret_map {
+            let path = path.to_path_buf();
+            let bytes = tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || {
+                    read_trusted_file(
+                        &path,
+                        uid,
+                        FileTier::Private,
+                        crate::secrets::HARD_MAX_SECRET_MAP_BYTES,
+                    )
+                }
+            })
+            .await
+            .map_err(|source| ConfigError::Read {
+                path: path.clone(),
+                source: io::Error::other(source),
+            })?
+            .map_err(|source| trusted_read_error(&path, source))?;
+            let value =
+                serde_yaml::from_slice(&bytes).map_err(|source| ConfigError::Decode { source })?;
+            self.0
+                .insert("secretMapReferences".to_owned(), (Disposition::Swap, value));
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_lock(&mut self, lock: Option<&LoadedLock>) {
         if let Some(lock) = lock {
             self.0.insert(
@@ -440,7 +509,11 @@ impl ConfigSnapshot {
             .filter(|(key, _)| key.as_str() != "providerSettings")
             .map(|(key, (_, value))| (key, value))
             .collect::<BTreeMap<_, _>>();
-        let encoded = serde_json::to_vec(&sources)?;
+        let canonical = sources
+            .into_iter()
+            .map(|(key, value)| Ok((key, serde_json::to_value(value)?)))
+            .collect::<Result<BTreeMap<_, serde_json::Value>, serde_json::Error>>()?;
+        let encoded = serde_json::to_vec(&canonical)?;
         Ok(Sha256::digest(encoded)
             .iter()
             .map(|byte| format!("{byte:02x}"))

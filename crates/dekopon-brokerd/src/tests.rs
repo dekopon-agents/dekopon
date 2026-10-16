@@ -1958,32 +1958,79 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
 }
 
 #[tokio::test]
-async fn abandoned_preparation_cannot_claim_an_activation() {
-    use dekopon_broker_protocol::GenerationOutcome;
-    let fixture = ResidentFixture::boot().await;
+async fn authority_reference_edits_change_digest_but_secret_material_does_not() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = root.path().join("credentials.yaml");
+    let bindings = root.path().join("bindings.yaml");
+    let credential = |destination: &str, secret: &str| {
+        format!(
+            "credentials:\n  - name: key\n    destinations: [{destination}]\n    secret: {secret}\n"
+        )
+    };
+    let map = |destination: &str| {
+        format!("secrets:\n  - drn: example\n    bindings:\n      - destination: {destination}\n")
+    };
+    let uid = current_uid();
+    write_owner_only(&credentials, credential("first", "one").as_bytes());
+    write_owner_only(&bindings, map("first").as_bytes());
+    let snapshot = || async {
+        let mut snapshot = super::config::ConfigSnapshot::default();
+        snapshot
+            .record_authority_references(Some(&credentials), Some(&bindings), uid)
+            .await
+            .unwrap();
+        snapshot.digest().unwrap()
+    };
+    let initial = snapshot().await;
+    write_owner_only(&credentials, credential("second", "one").as_bytes());
+    let destination = snapshot().await;
+    assert_ne!(initial, destination);
+    write_owner_only(&bindings, map("second").as_bytes());
+    let binding = snapshot().await;
+    assert_ne!(destination, binding);
+    write_owner_only(&credentials, credential("second", "two").as_bytes());
+    assert_eq!(binding, snapshot().await);
     write_owner_only(
-        &fixture.cedar,
+        &credentials,
+        b"credentials:\n  - secret: two\n    destinations: [second]\n    name: key\n",
+    );
+    assert_eq!(binding, snapshot().await);
+    write_owner_only(
+        &bindings,
+        b"secrets:\n  - bindings:\n      - destination: second\n    drn: example\n",
+    );
+    assert_eq!(binding, snapshot().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_serve_observes_edited_configuration_without_claiming_preparation() {
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits, GenerationOutcome};
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let first = broker.serve(std::future::pending());
+    broker.ready(&first).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (old, GenerationOutcome::Active) = client.observe_generation().await.unwrap() else {
+        panic!("first serve has an active generation");
+    };
+    first.abort();
+    first.await.unwrap_err();
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
         format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
     );
-    let (next, report) =
-        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
-    assert!(report.problems.is_empty(), "{report:?}");
-    let digest = next.unwrap().digest;
-    let old = fixture.active.digest.clone();
-    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    let second = broker.serve(std::future::pending());
+    broker.ready(&second).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (prepared, outcome) = client.observe_generation().await.unwrap();
+    assert_eq!(outcome, GenerationOutcome::Active);
+    assert_ne!(prepared, old);
     assert_eq!(
-        owner.prepare(&old, current_uid()).await,
-        (digest.clone(), GenerationOutcome::Prepared)
-    );
-    assert_eq!(owner.active().digest, old);
-    let active = owner.active();
-    drop(owner);
-    let active = std::sync::Arc::try_unwrap(active).ok().unwrap();
-    let replacement = super::Coordination::new(fixture.path.clone(), active);
-    assert_eq!(
-        replacement.commit(&digest, current_uid()),
+        client.commit_generation(prepared).await.unwrap(),
         GenerationOutcome::Refused
     );
+    second.abort();
+    second.await.unwrap_err();
 }
 
 pub(super) fn generation_invocation(
