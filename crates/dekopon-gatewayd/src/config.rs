@@ -17,8 +17,9 @@ use dekopon_broker_protocol::{
     ConversationKindMatch, ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT,
     DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError, ResolvedBrokerSocket,
 };
+use dekopon_config::{Projection, ProjectionError};
 use dekopon_core::{
-    AgentId, ExternalSubject, FileHygieneError, FileTier, Projection, ProjectionError,
+    AgentId, ExternalSubject, FileHygieneError, FileTier,
     fragments::{self, FragmentError, MergeRules},
     read_trusted_file,
 };

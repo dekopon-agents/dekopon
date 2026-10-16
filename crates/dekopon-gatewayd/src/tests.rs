@@ -649,7 +649,7 @@ async fn regular_gateway_source_read_checks_injected_root_and_mount_ownership() 
 }
 
 fn read_projection(path: &Path, after_read: impl FnOnce()) -> Result<Vec<u8>, ConfigError> {
-    let projection = dekopon_core::Projection::verify(path, crate::current_uid(), true)
+    let projection = dekopon_config::Projection::verify(path, crate::current_uid(), true)
         .map_err(config::projection_refusal)?;
     config::read_projected_file(path, &projection, after_read)
 }
@@ -715,7 +715,8 @@ fn a_projected_skill_directory_snapshots_the_listing_of_its_data_generation() {
     std::os::unix::fs::symlink("..2026_10_16", root.path().join("..data")).unwrap();
     let entry = root.path().join("pull-request-review");
     std::os::unix::fs::symlink("..data/pull-request-review", &entry).unwrap();
-    let projection = dekopon_core::Projection::verify(&entry, crate::current_uid(), true).unwrap();
+    let projection =
+        dekopon_config::Projection::verify(&entry, crate::current_uid(), true).unwrap();
     let mut expected = Vec::new();
     for name in ["SKILL.md", "references"] {
         expected.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());

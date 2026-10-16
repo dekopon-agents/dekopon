@@ -33,11 +33,6 @@ pub enum ProjectionError {
     },
 }
 
-#[must_use]
-pub fn effective_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-
 impl Projection {
     /// Only a claim: [`Projection::resolve`] decides whether it holds.
     #[must_use]

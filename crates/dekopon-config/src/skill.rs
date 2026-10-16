@@ -8,9 +8,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dekopon_core::{Projection, ProjectionError, SkillId, SkillIdError};
+use dekopon_core::{SkillId, SkillIdError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::{Projection, ProjectionError};
 
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 pub const MAX_SKILL_FILE_BYTES: usize = 64 * 1024;
@@ -137,7 +139,7 @@ struct FrontMatter {
 
 pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
     load_skill_with(directory.as_ref(), |entry| {
-        Projection::resolve(entry, dekopon_core::effective_uid())
+        Projection::resolve(entry, rustix::process::geteuid().as_raw())
     })
 }
 
@@ -567,12 +569,15 @@ mod tests {
 
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-    use dekopon_core::Projection;
-
     use super::{
         MAX_SKILL_DESCRIPTION_BYTES, MAX_SKILL_FILE_BYTES, MAX_SKILL_RESOURCES, SKILL_FILE_NAME,
         SkillError, load_skill, load_skill_with,
     };
+    use crate::Projection;
+
+    fn uid() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
 
     const SKILL: &str = "---\nname: pull-request-review\ndescription: Use when reviewing a pull request; covers what to read and how to comment.\nlicense: MIT\nmetadata:\n  author: dekopon\n  version: 2\n---\n\n# Pull request review\n\nRead the diff before commenting.\n";
 
@@ -678,7 +683,7 @@ mod tests {
     fn an_atomic_writer_projection_loads_through_its_data_generation() {
         let (_root, entry) = atomic_writer_mount();
 
-        let skill = load_projected(&entry, dekopon_core::effective_uid(), true)
+        let skill = load_projected(&entry, uid(), true)
             .expect("a read-only projection owned by this uid loads");
 
         assert_eq!(skill.name().as_str(), "pull-request-review");
@@ -699,7 +704,7 @@ mod tests {
     #[test]
     fn a_live_skill_edit_loads_the_next_generation_and_a_mid_read_switch_refuses() {
         let (root, entry) = atomic_writer_mount();
-        let uid = dekopon_core::effective_uid();
+        let uid = uid();
         assert_eq!(
             load_projected(&entry, uid, true).expect("first").body(),
             "first"
@@ -739,7 +744,7 @@ mod tests {
     #[test]
     fn a_projection_link_that_leaves_the_mount_is_refused() {
         let (root, entry) = atomic_writer_mount();
-        let uid = dekopon_core::effective_uid();
+        let uid = uid();
         let outside = tempfile::tempdir().expect("outside directory");
         generation(outside.path(), "skills", "outside", &[]);
 
@@ -777,7 +782,7 @@ mod tests {
     #[test]
     fn a_writable_projection_is_refused() {
         let (root, entry) = atomic_writer_mount();
-        let uid = dekopon_core::effective_uid();
+        let uid = uid();
         assert!(matches!(
             load_projected(&entry, uid, false),
             Err(SkillError::InsecureProjection { .. })
@@ -805,7 +810,7 @@ mod tests {
     #[test]
     fn a_projection_owned_by_another_uid_is_refused() {
         let (_root, entry) = atomic_writer_mount();
-        let foreign = dekopon_core::effective_uid().wrapping_add(1);
+        let foreign = uid().wrapping_add(1);
         assert!(matches!(
             load_projected(&entry, foreign, true),
             Err(SkillError::InsecureProjection { .. })

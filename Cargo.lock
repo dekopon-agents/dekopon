@@ -1038,6 +1038,7 @@ version = "0.47.0"
 dependencies = [
  "dekopon-core",
  "dekopon-protocol",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1051,7 +1052,6 @@ version = "0.47.0"
 dependencies = [
  "base64 0.23.1",
  "libc",
- "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",
