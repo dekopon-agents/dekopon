@@ -3179,6 +3179,29 @@ fn attestor_scopes_match_on_segment_boundaries() {
 }
 
 #[test]
+fn github_attestor_scopes_accept_canonical_owner_and_repo_namespaces() {
+    let owner = attestor_grant(["github.dekopon-agents"]);
+    owner.validate().expect("canonical GitHub owner scope");
+    let repo = attestor_grant(["github.dekopon-agents.my_repo"]);
+    repo.validate().expect("canonical GitHub repo scope");
+    let matched = ExternalSubject::github("dekopon-agents", "my_repo").unwrap();
+    assert!(owner.permits(&matched));
+    assert!(repo.permits(&matched));
+    assert!(!repo.permits(&ExternalSubject::github("dekopon-agents", "my_repo-extra").unwrap()));
+    for scope in [
+        "github.Owner".to_owned(),
+        format!("github.{}", "o".repeat(40)),
+    ] {
+        let error = attestor_grant([scope.as_str()])
+            .validate()
+            .expect_err("noncanonical owner scope");
+        assert!(
+            matches!(error, BrokerBuildError::InvalidAttestorScope { scope: rejected } if rejected == scope)
+        );
+    }
+}
+
+#[test]
 fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     let slack = subject(SLACK_SUBJECT);
     let telephone = subject("tel.16034700182");

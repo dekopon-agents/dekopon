@@ -1193,6 +1193,55 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 }
 
 #[tokio::test]
+async fn webhook_mounts_are_distinct_by_bind_and_path() {
+    let directory = temporary();
+    let whatsapp = |name: &str, port: u16| {
+        json!({
+            "kind": "whatsappCloudApi", "name": name,
+            "bind": format!("127.0.0.1:{port}"), "callbackPath": "/webhooks/whatsapp",
+            "appSecretEnv": "W_APP", "verifyTokenEnv": "W_VERIFY", "accessTokenEnv": "W_ACCESS",
+            "wabaId": "123", "phoneNumberId": "456", "graphApiVersion": "v23.0"
+        })
+    };
+    let github = |port: u16| {
+        json!({
+            "kind": "githubWebhook", "name": "github", "bind": format!("127.0.0.1:{port}"),
+            "secretEnv": "GH_SECRET"
+        })
+    };
+    let mut doc = document(directory.path());
+    doc["transports"] = json!([
+        doc["transports"][0],
+        whatsapp("wa1", 9080),
+        whatsapp("wa2", 9081)
+    ]);
+    load(directory.path(), &doc)
+        .await
+        .expect("two WhatsApp binds may use the same path");
+
+    doc["transports"].as_array_mut().unwrap().push(github(9081));
+    load(directory.path(), &doc)
+        .await
+        .expect("GitHub may share either WhatsApp bind");
+
+    doc["transports"] = json!([doc["transports"][0], github(9082), whatsapp("wa1", 9080)]);
+    assert!(reports(
+        &load(directory.path(), &doc).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::ConflictingWebhookMount { name } if name == "github")
+    ));
+
+    doc["transports"] = json!([
+        doc["transports"][0],
+        whatsapp("wa1", 9080),
+        whatsapp("wa2", 9080)
+    ]);
+    assert!(reports(
+        &load(directory.path(), &doc).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::ConflictingWebhookMount { name } if name == "wa2")
+    ));
+}
+
+#[tokio::test]
 async fn github_config_checks_structure_before_boot_secret_and_mount() {
     let directory = temporary();
     fs::write(
@@ -1291,6 +1340,21 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         assert!(load(directory.path(), &bad).await.is_err());
     }
     let mut bad = doc.clone();
+    bad["routes"][0]["conversation"]["ids"] = json!(["Owner.repo"]);
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |problem| matches!(
+            problem,
+            ConfigProblem::InvalidRouteConversation { route: 0, .. }
+        )
+    ));
+    let mut bad = doc.clone();
+    bad["transports"][0]["bind"] = json!("127.0.0.1:0");
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::InvalidGithubBind { name } if name == "github")
+    ));
+    let mut bad = doc.clone();
     bad["transports"][0]["callbackPath"] = json!("/webhooks/github");
     assert!(matches!(
         load(directory.path(), &bad).await,
@@ -1306,6 +1370,15 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
     assert!(reports(
         &load(directory.path(), &bad).await.unwrap_err(),
         |p| matches!(p, ConfigProblem::ConflictingWebhookMount { .. })
+    ));
+    let mut bad = doc.clone();
+    bad["routes"][0]["transport"] = json!("dev");
+    bad["transports"].as_array_mut().unwrap().push(json!({
+        "name": "dev", "kind": "local", "socketPath": directory.path().join("dev.sock")
+    }));
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |problem| matches!(problem, ConfigProblem::InvalidGithubEvents { route: 0 })
     ));
     let mut bad = doc.clone();
     bad["routes"][0]["memory"] = json!({"mode": "persistent"});
