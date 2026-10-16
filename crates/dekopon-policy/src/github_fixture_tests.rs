@@ -32,7 +32,11 @@ when { context.via == "gateway" && context.agent == "reviewer" };"#;
         target: PolicyTarget::Capability {
             capability: name.parse().unwrap(),
             provider: provider.parse().unwrap(),
-            effect: EffectKind::ReadOnly,
+            effect: if name == "turso.exec" {
+                EffectKind::ExternalWrite
+            } else {
+                EffectKind::ReadOnly
+            },
             risk: RiskLevel::Low,
         },
         context: PolicyContext {
