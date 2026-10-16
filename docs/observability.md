@@ -648,8 +648,11 @@ WhatsApp events at `info` or above include:
 | `gateway_whatsapp_webhook_refused` | warn | `transport`, `reason` (`unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`, `verification`, `unavailable`), `status`, `suppressed` |
 | `gateway_whatsapp_accept_failed` | debug for `kind=connection`, warn for `kind=exhausted` | `transport`, `kind`, `error` |
 | `gateway_whatsapp_listener_stopped` | error | `transport`, `error` |
+| `gateway_github_webhook_refused` | warn, rate-limited | `transport`, `reason` (`headers`, `unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`), `status`, `suppressed` |
 | `gateway_whatsapp_reply_partial` | warn | `transport`, `category`, `delivered` |
 | `gateway_whatsapp_media_refused` | warn | fixed local `reason` (HTTP status, destination, metadata, size, signature, JSON, timeout/connect/body/request); JSON `line`/`column` or URL-parser `cause` when applicable, never raw response or signed URL |
+
+The accept/listener event names remain WhatsApp-prefixed on the shared socket, including when a GitHub mount is present. GitHub ignored/duplicate events are identifier-free debug lines, never a delivery record.
 
 `suppressed` is the count this line stands for: each reason is emitted at most once a minute, and
 the next emission carries how many refusals were folded into the gap. A misconfigured app secret is

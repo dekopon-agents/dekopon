@@ -174,13 +174,6 @@ impl RoutingTable {
     /// Declaration order is the only precedence rule, with no specificity ranking, so an operator
     /// reads top to bottom to see which route wins; a catch-all still needs dispatch's own
     /// addressing check.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "S3 mounts the verified webhook and calls this first-match event filter"
-        )
-    )]
     pub(crate) fn github_route(
         &self,
         transport: &str,
