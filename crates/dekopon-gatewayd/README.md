@@ -69,7 +69,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   shares WhatsApp's listener when both use the same bind; GitHub alone binds that port. It
   verifies raw-body HMAC-SHA256 before parsing repository identity, acknowledges accepted,
   ignored and recent-duplicate deliveries, and retries queue saturation with HTTP 503. Replies
-  are silent; a route still requires a fresh broker-authorized session. See [gateway configuration](../../docs/gatewayd.md).
+  are silent; a route still requires a fresh broker-authorized `agent.prompt` session before inference. A signed run report alone authorizes no fix or post, and the transport never posts even on failure. See [gateway configuration](../../docs/gatewayd.md).
   Shared turns carry gateway-authored participant labels naming each sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share
