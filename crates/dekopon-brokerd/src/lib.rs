@@ -256,6 +256,7 @@ enum Residents<'a> {
 
 struct Candidate {
     digest: String,
+    fingerprint: Option<PrivateFingerprint>,
     ready: Ready,
     socket_path: PathBuf,
     provider_lock: Option<lock_watch::LoadedLock>,
@@ -347,6 +348,13 @@ impl Coordination {
                 .is_some_and(|(owner, _, _)| *owner != uid)
         {
             return (state.active.digest.clone(), GenerationOutcome::Refused);
+        }
+        if next.digest == state.active.digest
+            && next.fingerprint.is_some()
+            && next.fingerprint == state.active.fingerprint
+        {
+            state.prepared = None;
+            return (next.digest.clone(), GenerationOutcome::Active);
         }
         let digest = next.digest.clone();
         state.prepared = Some((uid, active, Arc::new(next)));
@@ -496,12 +504,13 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                         secrets::ScheduledCatalog::default(),
                     ),
                 },
+                fingerprint: None,
                 storage,
                 assets: None,
             })
         }
     };
-    let (Some(frame_limits), Some(runtime), true) = (frame_limits, runtime, providers_resolved)
+    let (Some(frame_limits), Some(mut runtime), true) = (frame_limits, runtime, providers_resolved)
     else {
         report.skipped(Stage::Providers);
         return (None, report);
@@ -517,6 +526,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     let reuse_registry = provider_lock.is_some() || restart_categories.is_empty();
     let storage = runtime.storage.clone();
     let assets = runtime.assets.clone();
+    let fingerprint = runtime.fingerprint.take();
     let snapshot = config.snapshot.clone();
     let resident_registry = match residents {
         Residents::Borrow(active) if reuse_registry => Some(active.ready.registry.clone()),
@@ -543,6 +553,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
             (
                 Some(Candidate {
                     digest,
+                    fingerprint,
                     ready,
                     socket_path,
                     provider_lock,
@@ -574,7 +585,7 @@ async fn boot_runtime(
     uid: u32,
     problems: &mut Vec<BrokerdError>,
 ) -> Option<Runtime> {
-    let (credentials, secrets) = private_inputs(config, uid, problems).await;
+    let private = private_inputs(config, uid, problems).await;
     let storage = keep(
         problems,
         config
@@ -614,14 +625,13 @@ async fn boot_runtime(
         ),
         None => Some(None),
     };
+    let (private, storage, assets) = (private?, storage?, assets?);
     Some(Runtime {
-        credentials: Credentials::Loaded(credentials?),
-        secrets: {
-            let (catalog, scheduled) = secrets?;
-            Secrets::Loaded(catalog, scheduled)
-        },
-        storage: storage?,
-        assets: assets?,
+        credentials: Credentials::Loaded(private.credentials),
+        secrets: Secrets::Loaded(private.secrets, private.scheduled),
+        fingerprint: Some(private.fingerprint),
+        storage,
+        assets,
     })
 }
 
@@ -634,7 +644,7 @@ async fn reload_runtime(
     scratch: &mut Option<tempfile::TempDir>,
     problems: &mut Vec<BrokerdError>,
 ) -> Option<Runtime> {
-    let (credentials, secrets) = private_inputs(config, uid, problems).await;
+    let private = private_inputs(config, uid, problems).await;
     let storage = if active.snapshot.keeps(&config.snapshot, Resident::Storage) {
         active.storage.clone()
     } else {
@@ -645,12 +655,11 @@ async fn reload_runtime(
     } else {
         None
     };
+    let private = private?;
     Some(Runtime {
-        credentials: Credentials::Loaded(credentials?),
-        secrets: {
-            let (catalog, scheduled) = secrets?;
-            Secrets::Loaded(catalog, scheduled)
-        },
+        credentials: Credentials::Loaded(private.credentials),
+        secrets: Secrets::Loaded(private.secrets, private.scheduled),
+        fingerprint: Some(private.fingerprint),
         storage,
         assets,
     })
@@ -665,10 +674,7 @@ async fn private_inputs(
     config: &mut ResolvedConfig,
     uid: u32,
     problems: &mut Vec<BrokerdError>,
-) -> (
-    Option<CredentialStore>,
-    Option<(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog)>,
-) {
+) -> Option<PrivateInputs> {
     match socket::validate_socket_parent(&config.socket_path, uid) {
         // An owner-only socket under a private parent means other configured UIDs could never
         // connect — the broker starts healthy while peers loop on EACCES — so every unreachable
@@ -702,42 +708,85 @@ async fn private_inputs(
             problems,
             credentials::load_with_bytes(path, uid)
                 .await
-                .map(|(store, references)| (store, Some(references)))
+                .map(Some)
                 .map_err(BrokerdError::from),
         ),
-        None => Some((CredentialStore::empty(), None)),
+        None => Some(None),
     };
     let secrets = match &config.secret_map_path {
         Some(path) => keep(
             problems,
             secrets::load_with_bytes(path, uid)
                 .await
-                .map(|(catalog, bytes, scheduled)| ((catalog, scheduled), Some(bytes)))
+                .map(Some)
                 .map_err(BrokerdError::from),
         ),
-        None => Some((
-            (
-                dekopon_broker::SecretCatalog::empty(),
-                secrets::ScheduledCatalog::default(),
-            ),
-            None,
-        )),
+        None => Some(None),
     };
     #[cfg(test)]
     let _hook_ran = AFTER_PRIVATE_READ.try_with(|hook| hook()).is_ok();
-    if let (Some((_, credential_references)), Some((_, secret_map_bytes))) =
-        (&credentials, &secrets)
-        && let Err(error) = config.snapshot.record_authority_references(
-            credential_references.as_ref(),
-            secret_map_bytes.as_deref(),
-        )
-    {
+    let (Some(credentials), Some(secrets)) = (credentials, secrets) else {
+        return None;
+    };
+    if let Err(error) = config.snapshot.record_authority_references(
+        credentials.as_ref().map(|loaded| &loaded.references),
+        secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
+    ) {
         problems.push(error.into());
     }
-    (
-        credentials.map(|(store, _)| store),
-        secrets.map(|(catalog, _)| catalog),
-    )
+    let fingerprint = PrivateFingerprint::of(
+        credentials.as_ref().map(|loaded| &loaded.file_digest),
+        secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
+    );
+    let (catalog, scheduled) = secrets.map_or_else(
+        || {
+            (
+                dekopon_broker::SecretCatalog::empty(),
+                secrets::ScheduledCatalog::default(),
+            )
+        },
+        |(catalog, _, scheduled)| (catalog, scheduled),
+    );
+    Some(PrivateInputs {
+        credentials: credentials.map_or_else(CredentialStore::empty, |loaded| loaded.store),
+        secrets: catalog,
+        scheduled,
+        fingerprint,
+    })
+}
+
+struct PrivateInputs {
+    credentials: CredentialStore,
+    secrets: dekopon_broker::SecretCatalog,
+    scheduled: secrets::ScheduledCatalog,
+    fingerprint: PrivateFingerprint,
+}
+
+/// Held only in memory and never logged or sent: it tells a same-digest credential rotation from
+/// an unchanged reload poll without any private byte leaving the broker.
+#[derive(PartialEq, Eq)]
+struct PrivateFingerprint([u8; 32]);
+
+impl PrivateFingerprint {
+    fn of(credentials: Option<&[u8; 32]>, secret_map: Option<&[u8]>) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        match credentials {
+            Some(digest) => {
+                hasher.update([1]);
+                hasher.update(digest);
+            }
+            None => hasher.update([0]),
+        }
+        match secret_map {
+            Some(bytes) => {
+                hasher.update([1]);
+                hasher.update(bytes);
+            }
+            None => hasher.update([0]),
+        }
+        Self(hasher.finalize().into())
+    }
 }
 
 async fn resolve_provider_set(
@@ -818,6 +867,7 @@ enum Secrets {
 struct Runtime {
     credentials: Credentials,
     secrets: Secrets,
+    fingerprint: Option<PrivateFingerprint>,
     storage: Option<dekopon_storage_host::StorageHost>,
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
 }
