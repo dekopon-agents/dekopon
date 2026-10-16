@@ -18535,6 +18535,13 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
         (
             GenerationOutcome::Prepared,
             GenerationOutcome::Applied,
+            true,
+            false,
+            false,
+        ),
+        (
+            GenerationOutcome::Prepared,
+            GenerationOutcome::Applied,
             false,
             true,
             false,
@@ -18590,14 +18597,22 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
             document["stopWords"] = json!(["halt"]);
             write_config(root.path(), &document);
         }
+        let prior_digest = gateway.digest_for_test();
         let (capture, _guard) = capture_spans();
         gateway.reconcile().await;
+        assert_eq!(
+            gateway.digest_for_test() != prior_digest,
+            published && (gateway_edit || !same_broker_digest)
+        );
         let (selected, words) = gateway.snapshot_for_test(&message("after")).unwrap();
         assert_eq!(
             selected.steering == crate::config::Steering::Boundary,
-            published
+            published && gateway_edit
         );
-        assert_eq!(words.iter().any(|word| word == "halt"), published);
+        assert_eq!(
+            words.iter().any(|word| word == "halt"),
+            published && gateway_edit
+        );
         if !published {
             assert_eq!(
                 gateway.route_for_test(&message("after")).unwrap().steering,

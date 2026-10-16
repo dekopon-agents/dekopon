@@ -49,8 +49,13 @@ struct ReloadState {
     pending: Option<(String, String)>,
 }
 
-fn serving_digest(candidate: &Candidate) -> Result<String, config::ConfigError> {
+fn serving_digest(
+    candidate: &Candidate,
+    broker_digest: &str,
+) -> Result<String, config::ConfigError> {
     let mut hasher = Sha256::new();
+    hasher.update((broker_digest.len() as u64).to_be_bytes());
+    hasher.update(broker_digest.as_bytes());
     let mapping = config::merged_mapping(&candidate.sources.config)?;
     let encoded =
         serde_json::to_vec(&mapping).map_err(|_error| config::ConfigError::UnclassifiedSource)?;
@@ -110,7 +115,7 @@ impl Gateway {
         candidate: Candidate,
         broker_digest: String,
     ) -> Result<Self, config::ConfigError> {
-        let gateway_digest = serving_digest(&candidate)?;
+        let gateway_digest = serving_digest(&candidate, &broker_digest)?;
         let sources = Arc::new(candidate.sources);
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
@@ -158,10 +163,6 @@ impl Gateway {
         let old_gateway = state.gateway_digest.clone();
         let old_broker = state.broker_digest.clone();
         let pending = state.pending.clone();
-        let digest = match serving_digest(&candidate) {
-            Ok(digest) => digest,
-            Err(_) => return,
-        };
         let broker = &candidate.config.broker;
         let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
         else {
@@ -180,6 +181,10 @@ impl Gateway {
                 tracing::warn!(event = "gateway_reload_monitor_failed");
                 return;
             }
+            let digest = match serving_digest(&candidate, pending_broker) {
+                Ok(digest) => digest,
+                Err(_) => return,
+            };
             if observed == *pending_broker && digest == *pending_gateway {
                 if candidate
                     .sources
@@ -222,6 +227,10 @@ impl Gateway {
                     return;
                 }
             };
+        let digest = match serving_digest(&candidate, &broker_digest) {
+            Ok(digest) => digest,
+            Err(_) => return,
+        };
         match outcome {
             GenerationOutcome::Active if broker_digest == expected_broker => {
                 if digest != old_gateway {
@@ -332,6 +341,11 @@ impl Gateway {
         message: &InboundMessage,
     ) -> Option<crate::routes::BoundRoute> {
         self.active.load().routes.route(message).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn digest_for_test(&self) -> String {
+        self.active.load()._digest.clone()
     }
 
     #[cfg(test)]
