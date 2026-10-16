@@ -254,6 +254,33 @@ async fn generation_uses_the_agents_metered_model_budget() {
     );
 }
 
+#[test]
+fn capacity_eviction_keeps_the_committed_publication_but_a_new_grant_invalidates_it() {
+    let store = ConversationStore::new(0);
+    let key = private_conversation_key("dev", "conversation", SUBJECT);
+    let allowed = granted(&["cli-probe.upper"]);
+    let other = granted(&["cli-probe.lower"]);
+    let first = store.begin(&key, &allowed, window(), None, Instant::now());
+    let generation = first.assets.generation().expect("persistent generation");
+    let access = first.assets.clone();
+    assert!(first.lease.commit(
+        window(),
+        ConversationTurn::completed("one", "reply"),
+        TakenIn {
+            newest: None,
+            steers: Vec::new(),
+            recalled: None
+        },
+        &first.cache_key,
+        Instant::now()
+    ));
+    assert!(store.publication_eligible(&key, &allowed, generation));
+    let replacement = store.begin(&key, &other, window(), None, Instant::now());
+    assert!(!store.publication_eligible(&key, &allowed, generation));
+    drop(replacement);
+    drop(access);
+}
+
 struct SlowModel(Arc<SlowSummary>);
 
 struct SlowSummary {

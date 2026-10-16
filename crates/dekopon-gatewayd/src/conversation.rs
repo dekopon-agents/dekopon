@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     fmt,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -157,6 +157,7 @@ struct Slot {
 struct StoreState {
     next_generation: u64,
     slots: HashMap<ConversationKey, Slot>,
+    capacity_retired: HashMap<ConversationKey, (u64, Vec<String>, Weak<AssetFence>)>,
 }
 
 /// The lease and asset token only bound this generation's history and assets; neither authorizes
@@ -356,6 +357,7 @@ impl ConversationStore {
             state: Mutex::new(StoreState {
                 next_generation: 1,
                 slots: HashMap::new(),
+                capacity_retired: HashMap::new(),
             }),
         }
     }
@@ -419,6 +421,7 @@ impl ConversationStore {
 
         let recalled = recalled.filter(|history| !history.is_empty());
         if !state.slots.contains_key(key) {
+            state.capacity_retired.remove(key);
             let generation = allocate_generation(&mut state);
             let asset_fence = Arc::new(AssetFence::new());
             let cache_key = cache_key::for_conversation();
@@ -498,6 +501,24 @@ impl ConversationStore {
         }
     }
 
+    pub(crate) fn publication_eligible(
+        &self,
+        key: &ConversationKey,
+        granted: &[String],
+        generation: u64,
+    ) -> bool {
+        let state = self.state.lock();
+        if let Some(slot) = state.slots.get(key) {
+            return slot.generation == generation && slot.granted == granted;
+        }
+        state
+            .capacity_retired
+            .get(key)
+            .is_some_and(|(id, expected, fence)| {
+                *id == generation && expected == granted && fence.strong_count() > 0
+            })
+    }
+
     pub fn snapshot(
         &self,
         key: &ConversationKey,
@@ -516,6 +537,7 @@ impl ConversationStore {
     pub fn remove(&self, key: &ConversationKey, reason: EvictionReason) -> bool {
         let mut state = self.state.lock();
         let removed = state.slots.remove(key);
+        state.capacity_retired.remove(key);
         let had_history = removed.as_ref().is_some_and(|slot| slot.live.is_some());
         if let Some(slot) = removed {
             slot.asset_fence.deactivate();
@@ -562,6 +584,17 @@ impl ConversationStore {
             };
             if let Some(slot) = state.slots.remove(&oldest) {
                 slot.asset_fence.deactivate();
+                state
+                    .capacity_retired
+                    .retain(|_, (_, _, fence)| fence.strong_count() > 0);
+                state.capacity_retired.insert(
+                    oldest,
+                    (
+                        slot.generation,
+                        slot.granted,
+                        Arc::downgrade(&slot.asset_fence),
+                    ),
+                );
             }
             evicted(EvictionReason::Capacity);
         }

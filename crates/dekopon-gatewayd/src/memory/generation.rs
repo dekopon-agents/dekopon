@@ -296,14 +296,17 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     let grant = journal::grant_digest(granted);
     let inventory = runner.assets.inventory(access);
     let next_asset_id = access.next_asset_id();
-    let access = access.clone();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
-    let published = tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&subscriber, || {
-            let _entered = span.enter();
-            let prepared = policy.as_ref().map(|policy| {
-                prepare(&turn, policy, |name| {
+    let generation_policy = policy.clone();
+    let generation_turn = turn.clone();
+    let generation_subscriber = subscriber.clone();
+    let generation_span = span.clone();
+    let generated = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&generation_subscriber, || {
+            let _entered = generation_span.enter();
+            generation_policy.as_ref().map(|policy| {
+                prepare(&generation_turn, policy, |name| {
                     let config = policy.models.get(name)?;
                     let client = models
                         .client(config, runtime.clone(), cancel.clone())
@@ -312,23 +315,45 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
                         client, &metering, &agent, config,
                     ))
                 })
-            });
-            if let Some(prepared) = &prepared {
-                for failed in &prepared.failed_routines {
-                    tracing::warn!(
-                        event = "gateway_memory_deviation",
-                        reason = "generation-failed",
-                        routine = %failed.chars().take(64).collect::<String>()
-                    );
-                }
-            }
-            if !access.is_active() {
-                tracing::warn!(
-                    event = "gateway_memory_retention_failed",
-                    reason = "stale-generation"
-                );
-                return Ok(());
-            }
+            })
+        })
+    })
+    .await;
+    let prepared = match generated {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            tracing::warn!(
+                event = "gateway_memory_deviation",
+                reason = "generation-task"
+            );
+            policy
+                .as_ref()
+                .map(|policy| prepare(&turn, policy, |_| None))
+        }
+    };
+    if let Some(prepared) = &prepared {
+        for failed in &prepared.failed_routines {
+            tracing::warn!(
+                event = "gateway_memory_deviation",
+                reason = "generation-failed",
+                routine = %failed.chars().take(64).collect::<String>()
+            );
+        }
+    }
+    if !access.generation().is_some_and(|generation| {
+        runner
+            .conversations
+            .publication_eligible(key, granted, generation)
+    }) {
+        tracing::warn!(
+            event = "gateway_memory_retention_failed",
+            reason = "stale-generation"
+        );
+        return;
+    }
+    let published = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&subscriber, || {
+            let _entered = span.enter();
             journal.append(
                 &stem,
                 &journal::Entry {

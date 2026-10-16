@@ -191,8 +191,12 @@ impl AssetAccess {
         fence.is_active().then(|| operation(&self.key))
     }
 
-    pub(crate) fn is_active(&self) -> bool {
+    fn is_active(&self) -> bool {
         self.with_active(|_| ()).is_some()
+    }
+
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.key.generation
     }
 
     fn weak_fence(&self) -> Option<Weak<AssetFence>> {
