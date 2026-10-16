@@ -3732,9 +3732,9 @@ impl ModelScript {
 }
 
 impl ModelFactory for Arc<ModelScript> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -4759,9 +4759,9 @@ impl InterruptibleModel {
 }
 
 impl ModelFactory for Arc<InterruptibleModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -4868,9 +4868,9 @@ impl BlockedModel {
 }
 
 impl ModelFactory for Arc<BlockedModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -7834,9 +7834,9 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -8693,9 +8693,9 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -15103,9 +15103,9 @@ impl ChatModel for FailingStreamModel {
 }
 
 impl ModelFactory for Arc<FailingStreamModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -15114,9 +15114,9 @@ impl ModelFactory for Arc<FailingStreamModel> {
 }
 
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -15294,9 +15294,9 @@ impl ModelFactory for Arc<ParkedBuild> {
         reason = "both halves are the test's own rendezvous: an unobserved entry signal fails \
                   wait_until_building, and a release that never arrives is bounded by the timeout"
     )]
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -20880,9 +20880,9 @@ async fn a_model_over_budget_error_keeps_the_failed_outcome_and_text() {
     };
     struct RefusedBuild(Refusal);
     impl ModelFactory for RefusedBuild {
-        fn build(
+        fn build_bound(
             &self,
-            _model: &ModelConfig,
+            _model: &Arc<ModelConfig>,
             _runtime: tokio::runtime::Handle,
             _cancel: tokio::sync::watch::Receiver<bool>,
         ) -> Result<SharedModel, SessionError> {
