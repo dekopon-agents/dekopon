@@ -145,21 +145,12 @@ where
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
     let mut readers = JoinSet::new();
     for transport in built_transports {
-        let transport = transport::recovery::RecoveringTransport::new(transport);
-        let name = transport.name().to_owned();
-        drivers.insert(name.clone(), transport.driver());
-        if let Some((sibling, driver)) = transport.sibling_driver() {
-            drivers.insert(sibling, driver);
-        }
-        if let Some((sibling, fetcher)) = transport.sibling_fetcher() {
-            asset_fetchers.insert(sibling, fetcher);
-        }
-        if let Some(fetcher) = transport.asset_fetcher() {
-            asset_fetchers.insert(name.clone(), fetcher);
-        }
-        if let Some(ownership) = transport.thread_ownership() {
-            thread_ownership.insert(name, ownership);
-        }
+        let transport = register_transport(
+            transport,
+            &mut drivers,
+            &mut asset_fetchers,
+            &mut thread_ownership,
+        );
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
@@ -779,6 +770,30 @@ const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
         dekopon_agent::CancelVia::Button => "button",
         dekopon_agent::CancelVia::StopReply => "stop-reply",
     }
+}
+
+fn register_transport(
+    transport: Box<dyn ChatTransport>,
+    drivers: &mut BTreeMap<String, Arc<dyn ChatDriver>>,
+    asset_fetchers: &mut HashMap<String, Arc<dyn AssetFetcher>>,
+    thread_ownership: &mut HashMap<String, Arc<dyn ThreadOwnership>>,
+) -> transport::recovery::RecoveringTransport {
+    let transport = transport::recovery::RecoveringTransport::new(transport);
+    let name = transport.name().to_owned();
+    drivers.insert(name.clone(), transport.driver());
+    if let Some((sibling, driver)) = transport.sibling_driver() {
+        drivers.insert(sibling, driver);
+    }
+    if let Some((sibling, fetcher)) = transport.sibling_fetcher() {
+        asset_fetchers.insert(sibling, fetcher);
+    }
+    if let Some(fetcher) = transport.asset_fetcher() {
+        asset_fetchers.insert(name.clone(), fetcher);
+    }
+    if let Some(ownership) = transport.thread_ownership() {
+        thread_ownership.insert(name, ownership);
+    }
+    transport
 }
 
 async fn read_transport(
