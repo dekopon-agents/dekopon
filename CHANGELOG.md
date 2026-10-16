@@ -7,6 +7,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.35.0] - 2026-10-16
+
+### Added
+
+- `broker.privateFiles` copies broker-only Secret keys into `<configDir>/private` as `0600` files under a broker-owned `0700` parent that the gateway never mounts, and `broker.oauth2Records` gives `oauth2Refresh` records a durable broker-owned subdirectory of the state claim, so both stay owner-only across restarts.
+
+### Changed
+
+- Chart 0.35.0 targets core v0.48.0 and pins the verified v0.48.0 stock image index.
+
 ## [0.48.0] - 2026-10-16
 
 ### Added
