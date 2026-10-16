@@ -229,24 +229,7 @@ impl ModelProxy {
     }
 
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route(
-                "/v1/messages",
-                post(|state, headers, body| handle(state, Dialect::Messages, headers, body)),
-            )
-            .route(
-                "/v1/messages/count_tokens",
-                post(|state, headers, body| handle(state, Dialect::CountTokens, headers, body)),
-            )
-            .route(
-                "/v1/responses",
-                post(|state, headers, body| handle(state, Dialect::Responses, headers, body)),
-            )
-            .route(
-                "/v1/chat/completions",
-                post(|state, headers, body| handle(state, Dialect::Chat, headers, body)),
-            )
-            .with_state(self)
+        Self::router_current(self)
     }
 }
 
@@ -320,6 +303,12 @@ fn label<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
 
 pub trait CurrentProxy: Clone + Send + Sync + 'static {
     fn current(&self) -> Option<Arc<ModelProxy>>;
+}
+
+impl CurrentProxy for Arc<ModelProxy> {
+    fn current(&self) -> Option<Arc<ModelProxy>> {
+        Some(Arc::clone(self))
+    }
 }
 
 impl CurrentProxy for Arc<ArcSwap<ModelProxy>> {
