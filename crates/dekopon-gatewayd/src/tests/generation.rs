@@ -414,7 +414,16 @@ async fn admission_remains_held_until_generation_and_append_finish() {
     let stem = key.journal_stem();
     let bytes = fs::read_to_string(journal.path().join(&stem).with_extension("jsonl"))
         .expect("both turns on disk");
-    let last: Value = serde_json::from_str(bytes.lines().last().expect("second record")).unwrap();
+    let records: Vec<Value> = bytes
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("v2 record"))
+        .collect();
+    assert_eq!(records.len(), 2, "both admitted turns were appended once");
+    assert_eq!(
+        records[0]["grant"],
+        crate::journal::grant_digest(&granted(&["cli-probe.upper"]))
+    );
+    let last = &records[1];
     assert_eq!(
         last["grant"],
         crate::journal::grant_digest(&granted(&["cli-probe.lower"]))
