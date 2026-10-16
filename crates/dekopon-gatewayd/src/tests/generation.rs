@@ -45,9 +45,12 @@ fn one_shot_parts_are_ordered_bounded_and_a_failed_summary_keeps_no_original() {
         r#"{"parts":[{"id":"core","text":"first"},{"id":"detail","text":"second"}]}"#,
     )]);
     let policy = policy("progressiveOneShot", &["summary"]);
-    let prepared = prepare(&captured_turn(), &policy, |_| {
-        Some(Arc::new(ScriptedModel(Arc::clone(&model))))
-    });
+    let prepared = prepare(
+        &captured_turn(),
+        &policy,
+        |_| Some(Arc::new(ScriptedModel(Arc::clone(&model)))),
+        true,
+    );
     assert_eq!(model.requests(), 1);
     assert_eq!(
         prepared
@@ -78,9 +81,12 @@ fn one_shot_parts_are_ordered_bounded_and_a_failed_summary_keeps_no_original() {
     );
 
     let failing = ModelScript::new([]);
-    let prepared = prepare(&captured_turn(), &policy, |_| {
-        Some(Arc::new(ScriptedModel(Arc::clone(&failing))))
-    });
+    let prepared = prepare(
+        &captured_turn(),
+        &policy,
+        |_| Some(Arc::new(ScriptedModel(Arc::clone(&failing)))),
+        true,
+    );
     assert_eq!(failing.requests(), 1);
     assert_eq!(prepared.availability, ["summary:generation-failed"]);
     assert_eq!(prepared.representations.len(), 1);
@@ -94,9 +100,12 @@ fn one_shot_parts_are_ordered_bounded_and_a_failed_summary_keeps_no_original() {
     let oversized = ModelScript::new([answer(
         r#"{"parts":[{"id":"core","text":"abcdefgh🦀"},{"id":"detail","text":"123456789"}]}"#,
     )]);
-    let bounded = prepare(&captured_turn(), &policy, |_| {
-        Some(Arc::new(ScriptedModel(Arc::clone(&oversized))))
-    });
+    let bounded = prepare(
+        &captured_turn(),
+        &policy,
+        |_| Some(Arc::new(ScriptedModel(Arc::clone(&oversized)))),
+        true,
+    );
     let texts: Vec<_> = bounded
         .representations
         .iter()
@@ -113,6 +122,7 @@ fn turducken_parts_receive_prior_parts_and_keep_a_successful_prefix_after_failur
         &captured_turn(),
         &policy("progressiveTurducken", &["summary"]),
         |_| Some(Arc::new(ScriptedModel(Arc::clone(&model)))),
+        true,
     );
     assert_eq!(model.requests(), 2);
     assert!(model.prompt(1)[1].1.contains("Earlier parts:\nfirst"));

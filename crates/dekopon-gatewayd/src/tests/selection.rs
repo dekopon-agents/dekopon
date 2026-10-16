@@ -238,6 +238,7 @@ async fn selected_summary_with_limit(
                 inventory: &[],
                 next_asset_id: 1,
                 prepared: Some(&generation::Prepared {
+                    include_chat: true,
                     representations: vec![meta, replacement],
                     exchanges: if summary_only {
                         vec![Exchange {

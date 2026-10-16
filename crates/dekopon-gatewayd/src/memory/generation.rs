@@ -14,6 +14,7 @@ use std::{ops::ControlFlow, sync::Arc, time::SystemTime};
 use crate::config::memory::{ResolvedPolicy, Routine, RoutineKind};
 
 pub(crate) struct Prepared {
+    pub include_chat: bool,
     pub representations: Vec<Representation>,
     pub exchanges: Vec<Exchange>,
     pub original: bool,
@@ -131,6 +132,7 @@ pub(crate) fn prepare(
     turn: &ConversationTurn,
     policy: &ResolvedPolicy,
     mut model_for: impl FnMut(&str) -> Option<crate::session::SharedModel>,
+    include_chat: bool,
 ) -> Prepared {
     let routines: Vec<_> = policy
         .routines
@@ -150,9 +152,13 @@ pub(crate) fn prepare(
         exchange.request = project(&exchange.request, &routines, retained_original);
         exchange.result = project(&exchange.result, &routines, retained_original);
     }
-    let source = serde_json::json!({
-        "user": turn.user(), "answer": turn.answer(), "exchanges": turn.exchanges(),
-    })
+    let source = if include_chat {
+        serde_json::json!({
+            "user": turn.user(), "answer": turn.answer(), "exchanges": turn.exchanges(),
+        })
+    } else {
+        serde_json::json!({"exchanges": turn.exchanges()})
+    }
     .to_string();
     let source_rep = Representation::original(&source, "");
     let mut metadata = source_rep.clone();
@@ -258,6 +264,7 @@ pub(crate) fn prepare(
         }
     }
     Prepared {
+        include_chat,
         representations,
         exchanges,
         original,
@@ -289,6 +296,21 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     };
     let journal = Arc::clone(journal);
     let policy = route.memory_policy.clone().unwrap_or_default();
+    let mode = match policy.selection.mode {
+        crate::config::memory::SelectionMode::Fixed => "fixed",
+        crate::config::memory::SelectionMode::AgentPreference => "agentPreference",
+        crate::config::memory::SelectionMode::Decider => "decider",
+    };
+    tracing::info!(
+        event = "gateway_memory_policy",
+        mode,
+        recall = if window.recall == crate::config::RecallSource::Journal { "journal" } else { "platform" },
+        retained_routines = policy.retain.len(),
+        capture_user_bytes = ?policy.capture.user,
+        capture_assistant_bytes = ?policy.capture.assistant,
+        capture_tool_request_bytes = ?policy.capture.tool_request,
+        capture_tool_result_bytes = ?policy.capture.tool_result,
+    );
     let models = Arc::clone(&runner.models);
     let metering = Arc::clone(&runner.metering);
     let agent = route.agent.clone();
@@ -300,6 +322,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     let next_asset_id = access.next_asset_id();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
+    let include_chat = window.recall == crate::config::RecallSource::Journal;
     let generation_policy = policy.clone();
     let generation_turn = turn.clone();
     let generation_subscriber = subscriber.clone();
@@ -307,15 +330,20 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     let generated = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&generation_subscriber, || {
             let _entered = generation_span.enter();
-            Some(prepare(&generation_turn, &generation_policy, |name| {
-                let config = generation_policy.models.get(name)?;
-                let client = models
-                    .client(config, runtime.clone(), cancel.clone())
-                    .ok()?;
-                Some(crate::metering::ChatProviderGovernor::wrap(
-                    client, &metering, &agent, config,
-                ))
-            }))
+            Some(prepare(
+                &generation_turn,
+                &generation_policy,
+                |name| {
+                    let config = generation_policy.models.get(name)?;
+                    let client = models
+                        .client(config, runtime.clone(), cancel.clone())
+                        .ok()?;
+                    Some(crate::metering::ChatProviderGovernor::wrap(
+                        client, &metering, &agent, config,
+                    ))
+                },
+                include_chat,
+            ))
         })
     })
     .await;
@@ -326,7 +354,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
                 event = "gateway_memory_deviation",
                 reason = "generation-task"
             );
-            Some(prepare(&turn, &policy, |_| None))
+            Some(prepare(&turn, &policy, |_| None, include_chat))
         }
     };
     if let Some(prepared) = &prepared {

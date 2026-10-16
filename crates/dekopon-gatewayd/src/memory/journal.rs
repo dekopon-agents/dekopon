@@ -459,7 +459,10 @@ impl Journal {
             record_id: next_record_id,
             next_record_id: next_record_id.checked_add(1).ok_or(JournalError::Corrupt)?,
             source_eligibility: entry.prepared.is_none_or(|prepared| prepared.original),
-            original_bytes: selection::original_envelope_bytes(entry.turn),
+            original_bytes: entry
+                .prepared
+                .filter(|prepared| !prepared.include_chat)
+                .map_or_else(|| selection::original_envelope_bytes(entry.turn), |_| 0),
             turn_id: entry.turn.memory_id().unwrap_or(0),
             representations: entry
                 .prepared
@@ -478,11 +481,11 @@ impl Journal {
             grant: entry.grant.to_owned(),
             user: entry
                 .prepared
-                .filter(|prepared| !prepared.original)
+                .filter(|prepared| !prepared.original || !prepared.include_chat)
                 .map_or_else(|| Some(entry.turn.user().to_owned()), |_| None),
             answer: entry
                 .prepared
-                .filter(|prepared| !prepared.original)
+                .filter(|prepared| !prepared.original || !prepared.include_chat)
                 .map_or_else(|| entry.turn.answer().map(str::to_owned), |_| None),
             assets: entry
                 .inventory

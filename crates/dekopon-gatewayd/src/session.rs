@@ -2028,7 +2028,7 @@ async fn session(
         && let Some(turn) = turn
         && let Some(lease) = conversation_lease
     {
-        let journaled = (window.recall == RecallSource::Journal).then(|| turn.clone());
+        let journaled = runner.journal.as_ref().map(|_| turn.clone());
         let taken = TakenIn {
             newest: newest_seen,
             steers: std::mem::take(&mut *steers.taken.lock()),
@@ -2036,7 +2036,6 @@ async fn session(
         };
         if lease.commit(window, turn, taken, &cache_key, Instant::now())
             && let Some(turn) = journaled
-            && runner.journal.is_some()
         {
             pending_journal = Some((turn, window));
         }

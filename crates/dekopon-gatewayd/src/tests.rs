@@ -18489,6 +18489,7 @@ async fn a_sealed_conversation_stays_sealed_after_a_restart() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_chat() {
+    let (capture, _guard) = capture_spans();
     let directory = temporary();
     let journal_dir = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
@@ -18525,10 +18526,26 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     assert_eq!(exchange.result[0].text.as_deref(), Some(""));
     assert_eq!(turn.user(), "do the work");
     assert_eq!(turn.answer(), Some("done"));
-    assert!(
-        !journal_dir.path().join(route.agent.as_str()).exists(),
-        "platform chat remains supplied by the platform, not duplicated in the journal"
+    let bytes = fs::read_to_string(
+        journal_dir
+            .path()
+            .join(key.journal_stem())
+            .with_extension("jsonl"),
+    )
+    .expect("platform exchanges persist");
+    let line: Value = serde_json::from_str(bytes.trim()).expect("versioned turn");
+    assert_eq!(line["exchanges"][0]["request"][0]["text"], "true");
+    assert!(line["user"].is_null());
+    assert!(line["answer"].is_null());
+    assert!(!bytes.contains("do the work"));
+    assert!(!bytes.contains("done"));
+    let policy = capture.events_where(
+        "dekopon_gatewayd",
+        &[("event", "gateway_memory_policy"), ("recall", "platform")],
     );
+    assert_eq!(policy.len(), 1);
+    assert_eq!(policy[0].field("mode"), Some("fixed"));
+    assert!(!format!("{policy:?}").contains("do the work"));
 }
 
 #[tokio::test(start_paused = true)]
