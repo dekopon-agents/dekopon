@@ -228,8 +228,8 @@ pub enum PolicyProblem {
     Bound(&'static str),
     #[error("memory policy has an invalid {0}")]
     Invalid(&'static str),
-    #[error("memory routine names unknown model {0}")]
-    UnknownModel(String),
+    #[error("memory routine names an unknown model")]
+    UnknownModel,
     #[error("memory routine model {0} is proxy-only")]
     ProxyOnlyModel(String),
 }
@@ -357,7 +357,7 @@ pub fn resolve_policy(
                     return Err(PolicyProblem::Invalid("routine model"));
                 };
                 if !models.contains(model) {
-                    return Err(PolicyProblem::UnknownModel(model.clone()));
+                    return Err(PolicyProblem::UnknownModel);
                 }
                 if proxy_only.contains(model) {
                     return Err(PolicyProblem::ProxyOnlyModel(model.clone()));

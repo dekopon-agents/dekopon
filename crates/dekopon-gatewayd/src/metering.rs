@@ -181,10 +181,14 @@ impl RestoreConfig {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MeteringProblem {
-    #[error("metering budget names {agent:?}, which no route serves")]
-    UnknownAgent { agent: String },
-    #[error("metering budget for {agent:?} names unknown model {model:?}")]
-    UnknownModel { agent: String, model: String },
+    #[error("metering.budgets entry #{entry} names an agent no route serves")]
+    UnknownAgent { entry: usize },
+    #[error("metering.budgets entry #{entry}{} names an unknown model at models[{model}]", agent.as_ref().map_or_else(String::new, |agent| format!(" (agent {agent})")))]
+    UnknownModel {
+        entry: usize,
+        agent: Option<AgentId>,
+        model: usize,
+    },
     #[error("metering budget for {agent:?} lists no meters")]
     EmptyMeters { agent: String },
     #[error("metering budget for {agent:?} lists no models; omit models to cover every model")]
@@ -229,15 +233,11 @@ pub(crate) fn resolve(
         return ResolvedMetering::default();
     };
     let mut budgets = Vec::with_capacity(config.budgets.len());
-    for (agent, budget) in config.budgets {
-        let id = agent
-            .parse::<AgentId>()
-            .ok()
-            .filter(|_| agents.contains(&agent));
+    for (index, (agent, budget)) in config.budgets.into_iter().enumerate() {
+        let parsed = agent.parse::<AgentId>().ok();
+        let id = parsed.clone().filter(|_| agents.contains(&agent));
         if id.is_none() {
-            problems.push(MeteringProblem::UnknownAgent {
-                agent: agent.clone(),
-            });
+            problems.push(MeteringProblem::UnknownAgent { entry: index + 1 });
         }
         if budget.meters.is_empty() {
             problems.push(MeteringProblem::EmptyMeters {
@@ -249,11 +249,12 @@ pub(crate) fn resolve(
                 agent: agent.clone(),
             });
         }
-        for model in budget.models.iter().flatten() {
-            if !models.contains(model) {
+        for (model, name) in budget.models.iter().flatten().enumerate() {
+            if !models.contains(name) {
                 problems.push(MeteringProblem::UnknownModel {
-                    agent: agent.clone(),
-                    model: model.clone(),
+                    entry: index + 1,
+                    agent: parsed.clone(),
+                    model,
                 });
             }
         }
@@ -933,9 +934,7 @@ mod tests {
         assert_eq!(
             problems,
             [
-                MeteringProblem::UnknownAgent {
-                    agent: "ghost".to_owned()
-                },
+                MeteringProblem::UnknownAgent { entry: 1 },
                 MeteringProblem::EmptyMeters {
                     agent: "idle".to_owned()
                 },
@@ -943,8 +942,9 @@ mod tests {
                     agent: "idle".to_owned()
                 },
                 MeteringProblem::UnknownModel {
-                    agent: "reviewer".to_owned(),
-                    model: "nope".to_owned()
+                    entry: 3,
+                    agent: Some("reviewer".parse().unwrap()),
+                    model: 0
                 },
                 MeteringProblem::ZeroLimit {
                     agent: "reviewer".to_owned(),

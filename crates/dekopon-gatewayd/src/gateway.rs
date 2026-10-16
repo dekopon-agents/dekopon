@@ -854,6 +854,37 @@ fn reload_problem(problem: &GatewaydError) -> String {
     }
 }
 
+fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
+    match problem {
+        GatewaydError::Config(config::ConfigError::Invalid { path, problems }) => problems
+            .iter()
+            .map(|item| {
+                (
+                    "configuration",
+                    format!("{}: {}", path.display(), error_chain(item)),
+                )
+            })
+            .collect(),
+        GatewaydError::Route(crate::routes::RouteError { problems }) => problems
+            .iter()
+            .map(|item| ("route", error_chain(item)))
+            .collect(),
+        GatewaydError::Config(_)
+        | GatewaydError::Catalog(_)
+        | GatewaydError::Startup { .. }
+        | GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Probe(_)
+        | GatewaydError::Problems { .. } => vec![(reload_reason(problem), reload_problem(problem))],
+    }
+}
+
 impl ReloadState {
     async fn run(mut self) {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -875,28 +906,37 @@ impl ReloadState {
         )
         .await;
         let Some(candidate) = candidate else {
-            let error = bounded_problems(report.problems.iter().map(reload_problem));
+            let entries = report
+                .problems
+                .iter()
+                .flat_map(reload_entries)
+                .collect::<Vec<_>>();
+            let error = bounded_problems(entries.iter().map(|(_, reason)| reason.clone()));
             if self.unreported(report.raw.refusing(&error)) {
-                let categories = report
-                    .problems
+                let categories = entries
                     .iter()
                     .take(MAX_RENDERED_PROBLEMS)
-                    .map(reload_reason)
+                    .map(|(category, _)| *category)
                     .collect::<Vec<_>>();
                 tracing::warn!(
                     event = "gateway_reload_refused",
                     applied = false,
-                    problems = report.problems.len(),
+                    problems = entries.len(),
                     categories = %categories.join(","),
                     error = %error
                 );
             }
             return;
         };
-        let raw = report.raw.refusing("");
-        if let Err(unsettled) = self.activate(candidate).await
-            && self.unreported(raw)
-        {
+        let raw = report.raw;
+        if let Err(unsettled) = self.activate(candidate).await {
+            let identity = match &unsettled {
+                Unsettled::Monitor => "monitor",
+                Unsettled::Refused(reason) => reason,
+            };
+            if !self.unreported(raw.refusing(identity)) {
+                return;
+            }
             match unsettled {
                 Unsettled::Monitor => tracing::warn!(event = "gateway_reload_monitor_failed"),
                 Unsettled::Refused(reason) => {

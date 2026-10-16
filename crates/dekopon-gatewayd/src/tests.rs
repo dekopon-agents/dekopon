@@ -984,7 +984,7 @@ async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
     assert!(reports(&error, |problem| matches!(
         problem,
         ConfigProblem::MemoryPolicy {
-            problem: crate::config::memory::PolicyProblem::UnknownModel(_),
+            problem: crate::config::memory::PolicyProblem::UnknownModel,
             ..
         }
     )));

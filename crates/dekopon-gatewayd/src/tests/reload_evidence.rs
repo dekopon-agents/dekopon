@@ -233,6 +233,171 @@ async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
 }
 
 #[tokio::test]
+async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnostics() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    const KEY: &str = "untrusted budget key sentinel";
+    const MODEL: &str = "untrusted-budget-model-sentinel";
+    const ROUTINE: &str = "untrusted-routine-model-sentinel";
+    let meter = json!({"meters": [{"kind": "fixed", "limit": 10, "period": "1d"}]});
+    config["metering"] = json!({"budgets": {
+        "reviewer": {"models": [MODEL], "meters": [{"kind": "fixed", "limit": 10, "period": "1d"}]}
+    }});
+    config["metering"]["budgets"][KEY] = meter;
+    config["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "summary", "kind": "progressiveOneShot", "model": ROUTINE,
+            "parts": [{"id": "short", "maxBytes": 100}, {"id": "long", "maxBytes": 200}]}],
+        "retain": ["summary"], "selection": {"mode": "fixed", "routine": "summary"}
+    }});
+    write_config(root.path(), &config);
+    let report = crate::check(&path, None, None).await;
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(config::ConfigError::Invalid { .. })
+    )));
+    let boot = dekopon_core::error_chain(&crate::GatewaydError::from_problems(report.problems));
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    let reason = refused[0].field("error").unwrap();
+    for sentinel in [KEY, MODEL, ROUTINE] {
+        assert!(!reason.contains(sentinel), "reload echoed {sentinel}");
+        assert!(!boot.contains(sentinel), "boot echoed {sentinel}");
+    }
+    assert!(reason.contains("metering.budgets entry #"), "{reason}");
+    assert!(
+        reason.contains("memory routine names an unknown model"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_monitor_outcome_does_not_mask_a_later_refusal_for_the_same_sources() {
+    use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    config["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &config);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    let response = ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Refused,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response.clone(), response]);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_reload_monitor_failed")]
+            )
+            .len(),
+        1
+    );
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("reason"), Some("broker-prepare"));
+}
+
+#[tokio::test]
+async fn twelve_invalid_budgets_render_eight_individual_reasons() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    let budgets = (0..12)
+        .map(|index| {
+            (
+                format!("unknown-{index:02}"),
+                json!({"meters": [{"kind": "fixed", "limit": 10, "period": "1d"}]}),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    config["metering"] = json!({"budgets": budgets});
+    write_config(root.path(), &config);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("problems"), Some("12"));
+    let reason = refused[0].field("error").unwrap();
+    assert_eq!(
+        reason.matches("metering.budgets entry #").count(),
+        8,
+        "{reason}"
+    );
+    assert!(reason.ends_with("and 4 more"), "{reason}");
+}
+
+#[tokio::test]
 async fn gateway_refusal_identifies_each_unknown_route_without_echoing_its_value() {
     let root = temporary();
     fs::write(

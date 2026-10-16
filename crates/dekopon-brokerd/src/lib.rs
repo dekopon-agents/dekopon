@@ -339,8 +339,13 @@ impl Coordination {
         };
         let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
         let Some(next) = next else {
-            let error =
-                bounded_problems(report.problems.iter().map(|problem| error_chain(problem)));
+            let entries = report
+                .problems
+                .iter()
+                .flat_map(reload_entries)
+                .collect::<Vec<_>>();
+            let count = entries.len();
+            let error = bounded_problems(entries.into_iter());
             let raw = RawCandidate::of(
                 self.config_path.clone(),
                 report.private_sources,
@@ -357,12 +362,12 @@ impl Coordination {
             match (unreported, unreadable) {
                 (false, _) => {}
                 (true, true) => {
-                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false);
+                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error);
                 }
                 (true, false) => tracing::warn!(
                     event = "broker_reload_refused",
                     applied = false,
-                    problems = report.problems.len(),
+                    problems = count,
                     error = %error
                 ),
             }
@@ -1523,6 +1528,27 @@ impl BrokerdError {
             }
             (None, _) => Self::Startup { problems },
         }
+    }
+}
+
+fn reload_entries(problem: &BrokerdError) -> Vec<String> {
+    if let BrokerdError::Credentials(CredentialsError::Invalid { problems }) = problem {
+        problems
+            .iter()
+            .map(|item| format!("broker credentials are invalid: {item}"))
+            .collect()
+    } else if let BrokerdError::Secrets(SecretMapError::Validation { problems }) = problem {
+        problems
+            .iter()
+            .map(|item| format!("private secret map has conflicts: {item}"))
+            .collect()
+    } else if let BrokerdError::Capabilities { problems } = problem {
+        problems
+            .iter()
+            .map(|item| format!("capability configuration is invalid: {item}"))
+            .collect()
+    } else {
+        vec![error_chain(problem)]
     }
 }
 
