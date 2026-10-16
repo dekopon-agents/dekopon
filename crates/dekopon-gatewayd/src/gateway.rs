@@ -805,7 +805,7 @@ impl Gateway {
             route.clone(),
             message,
             driver,
-            move |message| active.load().routes.route(message).cloned(),
+            move |message, _queued| active.load().routes.route(message).cloned(),
         ));
     }
 

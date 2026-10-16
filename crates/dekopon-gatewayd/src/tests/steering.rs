@@ -309,7 +309,7 @@ fn dequeued_speaker_uses_the_current_route_and_not_the_queued_route() {
     changed.steering = Steering::Abort;
     changed.route_index += 1;
     let (admission, followup) = admission
-        .next_or_release_resolving(|_| Some(changed.clone()))
+        .next_or_release_resolving(|_, _queued| Some(changed.clone()))
         .expect("queued turn is admitted under the new route");
     assert_eq!(followup.route.route_index, changed.route_index);
     assert_eq!(followup.route.steering, Steering::Abort);
@@ -329,7 +329,11 @@ fn a_deleted_queued_route_disposes_its_receipt_without_starting_a_turn() {
     let mut queued = message_from("tel.999", "orphan");
     queued.constituents.push(queued.receive_span.clone());
     assert!(matches!(admit(&gate, &old, queued), Admit::Queued));
-    assert!(admission.next_or_release_resolving(|_| None).is_none());
+    assert!(
+        admission
+            .next_or_release_resolving(|_, _queued| None)
+            .is_none()
+    );
     assert_eq!(
         capture
             .events_where(

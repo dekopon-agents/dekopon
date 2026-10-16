@@ -18459,7 +18459,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         message("first"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        move |_| Some((*selected.load_full()).clone()),
+        move |_, _queued| Some((*selected.load_full()).clone()),
     ));
     model.wait_until_entered().await;
     let queued = message_from("tel.999", "next");
@@ -18468,7 +18468,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         queued,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        move |_| None,
+        move |_, _queued| None,
     );
     second.await;
     let mut new_route = old;

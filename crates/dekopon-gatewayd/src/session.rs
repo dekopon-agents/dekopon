@@ -546,13 +546,12 @@ impl SessionAdmission {
 
     #[cfg(test)]
     pub(crate) fn next_or_release(self) -> Option<(Self, FollowUp)> {
-        let route = (*self.route).clone();
-        self.next_or_release_resolving(move |_| Some(route.clone()))
+        self.next_or_release_resolving(|_, queued| Some(queued.clone()))
     }
 
     pub(crate) fn next_or_release_resolving(
         mut self,
-        resolve: impl Fn(&InboundMessage) -> Option<BoundRoute>,
+        resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<BoundRoute>,
     ) -> Option<(Self, FollowUp)> {
         let next = {
             let mut entries = self.in_flight.lock();
@@ -602,7 +601,7 @@ impl SessionAdmission {
             }
             let mut found = None;
             while let Some(mut next) = running.follow_ups.pop_front() {
-                let Some(route) = resolve(&next.message) else {
+                let Some(route) = resolve(&next.message, &next.route) else {
                     next.receipts.finish("route-lost");
                     continue;
                 };
@@ -1224,8 +1223,8 @@ pub(crate) fn run_session(
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
 ) -> impl std::future::Future<Output = ()> + Send {
-    run_session_resolving(runner, route.clone(), message, driver, move |_| {
-        Some(route.clone())
+    run_session_resolving(runner, route, message, driver, |_, queued| {
+        Some(queued.clone())
     })
 }
 
@@ -1234,7 +1233,7 @@ pub(crate) fn run_session_resolving(
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-    resolve: impl Fn(&InboundMessage) -> Option<BoundRoute> + Send + 'static,
+    resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<BoundRoute> + Send + 'static,
 ) -> impl std::future::Future<Output = ()> + Send {
     let receipts = Dispositions(message.constituents.clone());
     async move {
