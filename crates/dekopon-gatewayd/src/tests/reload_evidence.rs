@@ -290,8 +290,11 @@ async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnost
         "{reason}"
     );
 
-    // Both a malformed key and a syntactically valid but unserved key must remain private
-    // across every validation branch, including empty lists and invalid meter specifications.
+    assert!(
+        reason.contains("(agent reviewer) names an unknown model at models[0]"),
+        "{reason}"
+    );
+
     const VALID_UNSERVED: &str = "unserved-agent-sentinel";
     config["metering"] = json!({"budgets": {}});
     config["metering"]["budgets"][KEY] = json!({"models": [], "meters": []});
@@ -323,6 +326,28 @@ async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnost
         reason.contains("period shorter than one minute"),
         "{reason}"
     );
+    for sentinel in [KEY, VALID_UNSERVED] {
+        assert!(!reason.contains(sentinel), "reload echoed {sentinel}");
+        assert!(!boot.contains(sentinel), "boot echoed {sentinel}");
+    }
+
+    config["metering"]["budgets"][VALID_UNSERVED]["meters"] = json!([
+        {"kind": "fixed", "limit": 0, "period": "400d"}
+    ]);
+    write_config(root.path(), &config);
+    let report = crate::check(&path, None, None).await;
+    let boot = dekopon_core::error_chain(&crate::GatewaydError::from_problems(report.problems));
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 3);
+    let reason = refused[2].field("error").unwrap();
+    for diagnostic in [
+        "meter 0 must have a limit above zero",
+        "meter 0 has a period longer than 366 days",
+    ] {
+        assert!(reason.contains(diagnostic), "reload missing {diagnostic}");
+        assert!(boot.contains(diagnostic), "boot missing {diagnostic}");
+    }
     for sentinel in [KEY, VALID_UNSERVED] {
         assert!(!reason.contains(sentinel), "reload echoed {sentinel}");
         assert!(!boot.contains(sentinel), "boot echoed {sentinel}");
