@@ -948,6 +948,7 @@ fn read_window(
                 None => ConversationTurn::unanswered(user),
             }
             .with_memory_id(line.turn_id)
+            .clipped(window.limits.max_bytes)
         });
         last.get_or_insert(line);
         if let Some(turn) = turn {

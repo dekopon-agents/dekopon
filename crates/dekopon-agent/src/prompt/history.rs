@@ -395,6 +395,21 @@ impl ConversationTurn {
     }
 
     #[must_use]
+    pub fn clipped(mut self, max_bytes: usize) -> Self {
+        const MARKER: &str = "[…]";
+        if self.bytes() > max_bytes
+            && let Some(prefix_bytes) = max_bytes
+                .checked_sub(self.answer.as_ref().map_or(0, |answer| answer.0.len()))
+                .and_then(|remaining| remaining.checked_sub(MARKER.len()))
+        {
+            self.user
+                .truncate(self.user.floor_char_boundary(prefix_bytes));
+            self.user.push_str(MARKER);
+        }
+        self
+    }
+
+    #[must_use]
     pub fn with_memory_id(mut self, id: u64) -> Self {
         self.memory_id = Some(id);
         self
@@ -510,20 +525,8 @@ impl History {
         true
     }
 
-    pub fn record(&mut self, mut turn: ConversationTurn) {
-        const MARKER: &str = "[…]";
-        if turn.bytes() > self.limits.max_bytes
-            && let Some(prefix_bytes) = self
-                .limits
-                .max_bytes
-                .checked_sub(turn.answer.as_ref().map_or(0, |answer| answer.0.len()))
-                .and_then(|remaining| remaining.checked_sub(MARKER.len()))
-        {
-            turn.user
-                .truncate(turn.user.floor_char_boundary(prefix_bytes));
-            turn.user.push_str(MARKER);
-        }
-        self.turns.push(turn);
+    pub fn record(&mut self, turn: ConversationTurn) {
+        self.turns.push(turn.clipped(self.limits.max_bytes));
         self.trim();
     }
 
