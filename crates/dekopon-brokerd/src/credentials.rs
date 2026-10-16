@@ -123,7 +123,7 @@ pub(crate) async fn load(
 pub(crate) struct LoadedCredentials {
     pub(crate) store: CredentialStore,
     pub(crate) references: serde_yaml::Value,
-    pub(crate) file_digest: [u8; 32],
+    pub(crate) private_digest: [u8; 32],
 }
 
 #[expect(
@@ -162,7 +162,8 @@ pub(crate) async fn load_with_bytes(
             source: insecure,
         },
     })?;
-    let file_digest = Sha256::digest(&bytes).into();
+    let mut private_digest = Sha256::new();
+    digest_private(&mut private_digest, &bytes);
     let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes).map_err(|source| {
         let location = source
             .location()
@@ -192,16 +193,18 @@ pub(crate) async fn load_with_bytes(
         path: path.to_path_buf(),
         diagnostic: "invalid document".to_owned(),
     })?;
-    let resolved = tokio::task::spawn_blocking(move || resolve(parsed, expected_uid))
-        .await
-        .map_err(|join| CredentialsError::Read {
-            path: path.to_path_buf(),
-            source: std::io::Error::other(join),
-        })??;
+    let (resolved, private_digest) = tokio::task::spawn_blocking(move || {
+        resolve(parsed, expected_uid, &mut private_digest).map(|store| (store, private_digest))
+    })
+    .await
+    .map_err(|join| CredentialsError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(join),
+    })??;
     Ok(LoadedCredentials {
         store: resolved,
         references,
-        file_digest,
+        private_digest: private_digest.finalize().into(),
     })
 }
 
@@ -211,7 +214,16 @@ pub(crate) fn references_from_bytes(bytes: &[u8]) -> serde_yaml::Value {
     serde_yaml::to_value(parsed).expect("typed reference serialization")
 }
 
-fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, CredentialsError> {
+fn digest_private(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update(bytes.len().to_le_bytes());
+    digest.update(bytes);
+}
+
+fn resolve(
+    file: CredentialsFile,
+    expected_uid: u32,
+    private_digest: &mut Sha256,
+) -> Result<CredentialStore, CredentialsError> {
     if file.credentials.len() > HARD_MAX_CREDENTIALS {
         return Err(CredentialsError::TooMany {
             maximum: HARD_MAX_CREDENTIALS,
@@ -238,7 +250,7 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
             problems.push(format!("credential {name:?} is declared more than once"));
             continue;
         }
-        match resolve_entry(entry, expected_uid) {
+        match resolve_entry(entry, expected_uid, private_digest) {
             Ok(credential) => entries.push((name, credential)),
             Err(entry_problems) => problems.extend(entry_problems),
         }
@@ -252,6 +264,7 @@ fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, 
 fn resolve_entry(
     entry: CredentialEntry,
     expected_uid: u32,
+    private_digest: &mut Sha256,
 ) -> Result<StoredCredential, Vec<String>> {
     let name = entry.name;
     let kind = entry.kind;
@@ -343,7 +356,12 @@ fn resolve_entry(
             absent("secret", entry.secret.is_some(), &mut problems);
             absent("scheme", entry.scheme.is_some(), &mut problems);
             absent("authFile", entry.auth_file.is_some(), &mut problems);
-            resolve_github_app(CredentialEntry { name, ..entry }, expected_uid, problems)
+            resolve_github_app(
+                CredentialEntry { name, ..entry },
+                expected_uid,
+                private_digest,
+                problems,
+            )
         }
     }
 }
@@ -351,6 +369,7 @@ fn resolve_entry(
 fn resolve_github_app(
     entry: CredentialEntry,
     expected_uid: u32,
+    private_digest: &mut Sha256,
     mut problems: Vec<String>,
 ) -> Result<StoredCredential, Vec<String>> {
     let CredentialEntry {
@@ -394,7 +413,7 @@ fn resolve_github_app(
     else {
         return Err(problems);
     };
-    let key = match open_private_key(&name, &private_key, expected_uid) {
+    let key = match open_private_key(&name, &private_key, expected_uid, private_digest) {
         Ok(key) => key,
         Err(problem) => {
             problems.push(problem);
@@ -425,6 +444,7 @@ fn open_private_key(
     name: &str,
     private_key: &Path,
     expected_uid: u32,
+    private_digest: &mut Sha256,
 ) -> Result<GithubAppKey, String> {
     if private_key.is_relative() {
         return Err(format!(
@@ -438,8 +458,10 @@ fn open_private_key(
         expected_uid,
         FileTier::Private,
         HARD_MAX_GITHUB_APP_KEY_BYTES,
-    )
-    .map_err(|source| {
+    );
+    #[cfg(test)]
+    crate::private_read_witness::record(private_key, &pem);
+    let pem = pem.map_err(|source| {
         format!(
             "credential {name:?} privateKey {} is not trusted input ({}): {}",
             private_key.display(),
@@ -447,6 +469,7 @@ fn open_private_key(
             error_chain(&source)
         )
     })?;
+    digest_private(private_digest, &pem);
     GithubAppKey::from_pem(&pem).map_err(|source| {
         format!(
             "credential {name:?} privateKey {}: {source}",

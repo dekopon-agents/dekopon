@@ -315,6 +315,30 @@ impl ScheduledCatalog {
         }
     }
 
+    pub(crate) async fn inspect_records(&self) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        for (drn, entry) in &resolver.entries {
+            if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                let path = record_path.clone();
+                let drn = drn.clone();
+                let uid = resolver.expected_uid;
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                if tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        oauth2::inspect_boot(&path, uid, &drn)
+                    })
+                })
+                .await
+                .is_err()
+                {
+                    tracing::error!(event = "broker_credential_record_inspection_failed");
+                }
+            }
+        }
+    }
+
     pub(crate) fn entries(&self) -> Vec<(SecretDrn, PathBuf, bool)> {
         let mut records = BTreeMap::new();
         for (drn, path, has_seed) in self
@@ -1669,23 +1693,6 @@ async fn validate_map(
                 client,
             },
         );
-    }
-    for (drn, entry) in &resolved_entries {
-        if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
-            let path = record_path.clone();
-            let drn = drn.clone();
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            if tokio::task::spawn_blocking(move || {
-                tracing::dispatcher::with_default(&dispatch, || {
-                    oauth2::inspect_boot(&path, expected_uid, &drn)
-                })
-            })
-            .await
-            .is_err()
-            {
-                tracing::error!(event = "broker_credential_record_inspection_failed");
-            }
-        }
     }
     let resolver = Arc::new(MapResolver {
         entries: resolved_entries,

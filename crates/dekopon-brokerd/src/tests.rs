@@ -1964,6 +1964,15 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
 
 async fn generation_with_private_credential()
 -> (ManagedBroker, std::path::PathBuf, super::Coordination) {
+    generation_with_credentials(|_| {
+        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n".to_owned()
+    })
+    .await
+}
+
+async fn generation_with_credentials(
+    credentials: impl FnOnce(&Path) -> String,
+) -> (ManagedBroker, std::path::PathBuf, super::Coordination) {
     let broker = ManagedBroker::gateway();
     broker.publish_lock('1');
     let credential = broker.directory.path().join("credentials.yaml");
@@ -1973,7 +1982,7 @@ async fn generation_with_private_credential()
     write_config(&broker.config(), &document);
     write_owner_only(
         &credential,
-        b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n",
+        credentials(&broker.directory.path().canonicalize().unwrap()).as_bytes(),
     );
     let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
@@ -2041,6 +2050,120 @@ async fn same_digest_credential_rotation_commits_once_and_next_poll_is_active() 
     let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].field("generation.digest"), Some(digest.as_str()));
+}
+
+#[tokio::test]
+async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_per_poll() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
+    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
+        let key = directory.join("github-app.pem");
+        write_owner_only(&key, KEY);
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
+            key.display()
+        )
+    })
+    .await;
+    let key = broker.directory.path().join("github-app.pem");
+    let reads = super::private_read_witness::TrackedRead::new(&key);
+    let digest = owner.active().digest.clone();
+    let uid = current_uid();
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Active)
+    );
+    assert_eq!(reads.count(), 1, "one key read per prepare");
+    write_owner_only(&key, &[b"\n".as_slice(), KEY].concat());
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(reads.count(), 3, "one key read per prepare");
+    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+}
+
+#[tokio::test]
+async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_per_poll() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let record = broker
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("record.json");
+    write_owner_only(&record, b"{\"state\":");
+    let bindings = broker.directory.path().join("bindings.yaml");
+    let map = |revision: &str| {
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:com.xrl:secret:test:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            record.display()
+        )
+    };
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    write_owner_only(&bindings, map("one").as_bytes());
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let reported = || {
+        capture
+            .events_where(
+                "dekopon_brokerd",
+                &[("event", "broker_credential_record_invalid")],
+            )
+            .len()
+    };
+    async {
+        let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        assert_eq!(reported(), 1, "boot reports the record");
+        let owner = super::Coordination::new(broker.config(), active.unwrap());
+        let digest = owner.active().digest.clone();
+        let uid = current_uid();
+        for _ in 0..2 {
+            assert_eq!(
+                owner.prepare(&digest, uid).await,
+                (digest.clone(), GenerationOutcome::Active)
+            );
+        }
+        assert_eq!(reported(), 1, "an unchanged poll does not inspect");
+        write_owner_only(&bindings, map("two").as_bytes());
+        let (next, outcome) = owner.prepare(&digest, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&next, uid).await,
+            (next.clone(), GenerationOutcome::Active)
+        );
+        assert_eq!(reported(), 2, "a committed change reports once");
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
 }
 
 #[tokio::test]
