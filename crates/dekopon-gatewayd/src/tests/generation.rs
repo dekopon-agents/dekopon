@@ -411,6 +411,11 @@ async fn admission_remains_held_until_generation_and_append_finish() {
         driver.replies(),
         ["delivered before summary", "second delivered"]
     );
+    assert_eq!(
+        model.calls.load(Ordering::SeqCst),
+        3,
+        "one attempt per turn and summary part"
+    );
     let stem = key.journal_stem();
     let bytes = fs::read_to_string(journal.path().join(&stem).with_extension("jsonl"))
         .expect("both turns on disk");
