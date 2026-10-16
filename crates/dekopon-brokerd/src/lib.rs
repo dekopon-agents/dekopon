@@ -688,7 +688,7 @@ async fn private_inputs(
             problems,
             credentials::load_with_bytes(path, uid)
                 .await
-                .map(|(store, bytes)| (store, Some(bytes)))
+                .map(|(store, references)| (store, Some(references)))
                 .map_err(BrokerdError::from),
         ),
         None => Some((CredentialStore::empty(), None)),
@@ -705,10 +705,12 @@ async fn private_inputs(
     };
     #[cfg(test)]
     let _hook_ran = AFTER_PRIVATE_READ.try_with(|hook| hook()).is_ok();
-    if let (Some((_, credential_bytes)), Some((_, secret_map_bytes))) = (&credentials, &secrets)
-        && let Err(error) = config
-            .snapshot
-            .record_authority_references(credential_bytes.as_deref(), secret_map_bytes.as_deref())
+    if let (Some((_, credential_references)), Some((_, secret_map_bytes))) =
+        (&credentials, &secrets)
+        && let Err(error) = config.snapshot.record_authority_references(
+            credential_references.as_ref(),
+            secret_map_bytes.as_deref(),
+        )
     {
         problems.push(error.into());
     }

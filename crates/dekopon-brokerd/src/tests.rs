@@ -1965,11 +1965,11 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
 #[tokio::test(start_paused = true)]
 async fn reaper_sweeps_with_the_committed_generation_retention() {
     use dekopon_broker_protocol::GenerationOutcome;
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits};
     use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
     use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest};
-    use tokio::sync::oneshot;
 
-    let mut fixture = ResidentFixture::boot_with(|root, document| {
+    let fixture = ResidentFixture::boot_with(|root, document| {
         write_owner_only(
             &root.join("storage-probe.wasm"),
             &fs::read(example_path(
@@ -2021,57 +2021,48 @@ async fn reaper_sweeps_with_the_committed_generation_retention() {
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH)
         .unwrap();
-    let owner = std::sync::Arc::new(super::Coordination::new(
-        fixture.path.clone(),
-        fixture.active,
-    ));
-    let old = owner.active().digest.clone();
-    let (stop, stopped) = oneshot::channel();
-    let (first, sampled) = oneshot::channel();
-    let first = std::sync::Mutex::new(Some(first));
-    let reaper_owner = std::sync::Arc::clone(&owner);
-    let task = tokio::spawn(super::reaper::serve(
-        async {
-            stopped.await.unwrap();
-            Ok(())
-        },
-        Some(host),
-        move || {
-            if let Some(first) = first.lock().unwrap().take() {
-                first.send(()).expect("sweep sampler is still waiting");
-            }
-            reaper_owner
-                .active()
-                .ready
-                .broker
-                .storage_retention_policies()
-        },
-        super::ShutdownDeadline::default(),
-    ));
-    sampled.await.unwrap();
+    drop(host);
+    let ResidentFixture {
+        root,
+        path,
+        mut document,
+        active,
+        ..
+    } = fixture;
+    drop(active);
+    let broker = ManagedBroker {
+        directory: root,
+        component_digest: String::new(),
+        component_bytes: 0,
+    };
+    let task = broker.serve(std::future::pending());
+    broker.ready(&task).await;
+    let client = BrokerClient::new(broker.socket(), current_uid(), FrameLimits::default()).unwrap();
+    let (old, GenerationOutcome::Active) = client.observe_generation().await.unwrap() else {
+        panic!("boot generation active");
+    };
     assert!(resource.exists(), "boot retention keeps expired storage");
-    fixture.document["capabilities"]["storage-probe"]["constraints"]["storage"]["retention"] =
+    document["capabilities"]["storage-probe"]["constraints"]["storage"]["retention"] =
         json!({"mode": "idle-ttl", "idleTtlMs": 60_000});
-    write_config(&fixture.path, &fixture.document);
-    let (next, outcome) = owner.prepare(&old, current_uid()).await;
-    assert_eq!(outcome, GenerationOutcome::Prepared);
+    write_config(&path, &document);
+    let (next, GenerationOutcome::Prepared) = client.prepare_generation(old).await.unwrap() else {
+        panic!("updated retention prepared");
+    };
     assert_eq!(
-        owner.commit(&next, current_uid()),
+        client.commit_generation(next).await.unwrap(),
         GenerationOutcome::Applied
     );
     tokio::time::advance(std::time::Duration::from_secs(12 * 60 * 60)).await;
-    for _ in 0..10_000 {
-        if !resource.exists() {
-            break;
-        }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while resource.exists() && std::time::Instant::now() < deadline {
         tokio::task::yield_now().await;
     }
     assert!(
         !resource.exists(),
-        "the next sweep must use the committed retention"
+        "the next production sweep must use committed retention"
     );
-    stop.send(()).unwrap();
-    task.await.unwrap().unwrap();
+    task.abort();
+    task.await.unwrap_err();
 }
 
 #[tokio::test]
@@ -2116,7 +2107,9 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
     let mut observed = active.snapshot.clone();
     observed
         .record_authority_references(
-            Some(&credential_reads.last_bytes()),
+            Some(&super::credentials::references_from_bytes(
+                &credential_reads.last_bytes(),
+            )),
             Some(&binding_reads.last_bytes()),
         )
         .unwrap();
@@ -2147,7 +2140,9 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
         .clone();
     observed
         .record_authority_references(
-            Some(&credential_reads.last_bytes()),
+            Some(&super::credentials::references_from_bytes(
+                &credential_reads.last_bytes(),
+            )),
             Some(&binding_reads.last_bytes()),
         )
         .unwrap();
@@ -2178,13 +2173,46 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
 }
 
 #[tokio::test]
+async fn boot_digest_ignores_core_tags_secret_values_and_tagged_secret_keys() {
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let credentials = broker.directory.path().join("credentials.yaml");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["credentialsPath"] = json!("credentials.yaml");
+    write_config(&broker.config(), &document);
+    let mut digests = Vec::new();
+    for secret in [
+        "secret: !!bool fixture-secret-aaaa-0001",
+        "secret: fixture-secret-bbbb-0002",
+        "!x secret: fixture-secret-aaaa-0001",
+    ] {
+        write_owner_only(
+            &credentials,
+            format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    {secret}\n").as_bytes(),
+        );
+        let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        digests.push(candidate.expect("validated boot candidate").digest);
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "secret values and scalar tags cannot change digest"
+    );
+    assert_eq!(
+        digests[0], digests[2],
+        "tagged secret keys cannot change digest"
+    );
+}
+
+#[tokio::test]
 async fn authority_reference_edits_change_digest_but_secret_material_does_not() {
     let root = tempfile::tempdir().unwrap();
     let credentials = root.path().join("credentials.yaml");
     let bindings = root.path().join("bindings.yaml");
     let credential = |destination: &str, secret: &str| {
         format!(
-            "credentials:\n  - name: key\n    destinations: [{destination}]\n    secret: {secret}\n"
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    destinations: [{destination}]\n    secret: {secret}\n"
         )
     };
     let map = |destination: &str| {
@@ -2196,7 +2224,9 @@ async fn authority_reference_edits_change_digest_but_secret_material_does_not() 
         let mut snapshot = super::config::ConfigSnapshot::default();
         snapshot
             .record_authority_references(
-                Some(&std::fs::read(&credentials).unwrap()),
+                Some(&super::credentials::references_from_bytes(
+                    &std::fs::read(&credentials).unwrap(),
+                )),
                 Some(&std::fs::read(&bindings).unwrap()),
             )
             .unwrap();
@@ -2213,7 +2243,7 @@ async fn authority_reference_edits_change_digest_but_secret_material_does_not() 
     assert_eq!(binding, snapshot());
     write_owner_only(
         &credentials,
-        b"credentials:\n  - secret: two\n    destinations: [second]\n    name: key\n",
+        b"credentials:\n  - secret: two\n    destinations: [second]\n    kind: bearerToken\n    name: key\napiVersion: dekopon.dev/broker-credentials/v1alpha1\n",
     );
     assert_eq!(binding, snapshot());
     write_owner_only(

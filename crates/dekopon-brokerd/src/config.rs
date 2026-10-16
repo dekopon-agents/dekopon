@@ -419,28 +419,15 @@ impl ConfigSnapshot {
         Ok(())
     }
 
-    /// Takes the bytes the runtime was validated from, never a path: a second read could name a rotated file.
     pub(crate) fn record_authority_references(
         &mut self,
-        credentials: Option<&[u8]>,
+        credentials: Option<&serde_yaml::Value>,
         secret_map: Option<&[u8]>,
     ) -> Result<(), ConfigError> {
-        if let Some(bytes) = credentials {
-            let mut value: serde_yaml::Value =
-                serde_yaml::from_slice(bytes).map_err(|source| ConfigError::Decode { source })?;
-            if let Some(entries) = value
-                .get_mut("credentials")
-                .and_then(serde_yaml::Value::as_sequence_mut)
-            {
-                for entry in entries {
-                    if let Some(fields) = entry.as_mapping_mut() {
-                        fields.remove(serde_yaml::Value::String("secret".to_owned()));
-                    }
-                }
-            }
+        if let Some(value) = credentials {
             self.0.insert(
                 "credentialReferences".to_owned(),
-                (Disposition::Swap, value),
+                (Disposition::Swap, value.clone()),
             );
         }
         if let Some(bytes) = secret_map {
