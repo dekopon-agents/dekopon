@@ -648,7 +648,7 @@ pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) {
             if std::fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
         Err(error) => {
-            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category())
+            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed")
         }
         Ok(OAuth2Record::Live { .. }) => {}
     }

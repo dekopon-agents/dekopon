@@ -54,7 +54,10 @@ fn boot_inspection_reports_each_sealed_drn_and_malformed_record_without_values()
         capture
             .events_where(
                 "dekopon_brokerd::secrets::oauth2",
-                &[("event", "broker_credential_record_invalid")]
+                &[
+                    ("event", "broker_credential_record_invalid"),
+                    ("instruction", "delete the record and provide a new seed")
+                ]
             )
             .len(),
         1
