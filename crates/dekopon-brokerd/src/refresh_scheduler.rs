@@ -87,6 +87,7 @@ where
                     if !drained {
                         // The endpoint may already have spent this rotation, so the deadline waits for it instead of aborting.
                         while attempts.join_next().await.is_some() {}
+                        result?;
                         return Err(BrokerdError::Server(ServerError::ShutdownTimeout));
                     }
                     return result;

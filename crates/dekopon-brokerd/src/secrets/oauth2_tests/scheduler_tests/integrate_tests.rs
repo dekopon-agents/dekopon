@@ -122,6 +122,55 @@ async fn shutdown_deadline_waits_for_a_started_rotation() {
     assert_eq!(api.requests().len(), 1);
 }
 
+#[tokio::test]
+async fn a_server_failure_survives_a_drain_past_the_shutdown_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    write_record(&path, 100_000);
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let (entered, ready) = std::sync::mpsc::channel::<()>();
+    let api = TokenApi::serving(move |_| {
+        entered.send(()).expect("notify");
+        parked.recv().expect("release");
+        success()
+    });
+    let scheduled = scheduled_resolver(&path, &api.endpoint, &["one"]);
+    let deadline = ShutdownDeadline::default();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(refresh_scheduler::serve_with_clock(
+        async {
+            stopped.await.expect("stop");
+            Err(crate::BrokerdError::Server(crate::ServerError::Accept {
+                source: std::io::ErrorKind::ConnectionAborted.into(),
+            }))
+        },
+        move || scheduled.clone(),
+        deadline.clone(),
+        Arc::new(|| 22 * 3600),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ready.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("endpoint reached");
+    deadline.start(Duration::from_millis(200));
+    stop.send(()).expect("stop receiver");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    release.send(()).expect("release");
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("bounded")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(crate::BrokerdError::Server(
+            crate::ServerError::Accept { .. }
+        ))
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_malformed_scheduled_record_is_not_reported_on_each_tick() {
     let dir = tempfile::tempdir().unwrap();
