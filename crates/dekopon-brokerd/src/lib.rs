@@ -418,8 +418,8 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
         }
         return (None, report);
     };
-    if !matches!(mode, Mode::Check(_)) {
-        if let Err(error) = config
+    if !matches!(mode, Mode::Check(_))
+        && let Err(error) = config
             .snapshot
             .record_authority_references(
                 config.credentials_path.as_deref(),
@@ -427,9 +427,8 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                 uid,
             )
             .await
-        {
-            report.problems.push(error.into());
-        }
+    {
+        report.problems.push(error.into());
     }
     let (providers_resolved, residents) = match mode {
         Mode::Boot => (true, Residents::Open),
