@@ -62,8 +62,7 @@ where
             }
             let uid = crate::socket::current_uid();
             let record = path.clone();
-            let inspected =
-                tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid, now)).await;
+            let inspected = tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid)).await;
             let due = match inspected {
                 Ok(Ok(Some(due))) => due <= now || seed_on_boot,
                 Ok(Ok(None)) => seed_on_boot,

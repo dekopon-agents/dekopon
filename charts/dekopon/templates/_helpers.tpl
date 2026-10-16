@@ -705,7 +705,7 @@ broker that lands mid-invocation. */}}
 
 {{- $secretSourceNames := dict "broker-config-directory" true "gateway-config-directory" true "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true "skills" true "skills-source" true -}}
 {{- range .Values.broker.privateFiles -}}
-{{- if or (not .file) (not .existingSecret) (not .existingSecretKey) (not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" .file)) (eq .file "..") -}}
+{{- if or (not .file) (not .existingSecret) (not .existingSecretKey) (not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" .file)) -}}
 {{- fail "each broker.privateFiles entry requires a safe file segment, existingSecret and existingSecretKey" -}}
 {{- end -}}
 {{- if hasKey $bootstrapNames (printf "private-%s" .file) -}}
