@@ -3029,9 +3029,7 @@ pub enum ConfigProblem {
     },
     #[error("GitHub transport {name:?} must bind an explicit nonzero port")]
     InvalidGithubBind { name: String },
-    #[error(
-        "GitHub transport {name:?} must share a WhatsApp listener bind and use a distinct callback path"
-    )]
+    #[error("GitHub transport {name:?} must bind the same address as a WhatsApp transport")]
     GithubBindNotShared { name: String },
     #[error("webhook transport {name:?} conflicts with another listener bind or callback path")]
     ConflictingWebhookMount { name: String },

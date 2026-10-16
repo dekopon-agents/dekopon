@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
 use axum::{
     Router,
     body::Body,
@@ -229,24 +228,7 @@ impl ModelProxy {
     }
 
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route(
-                "/v1/messages",
-                post(|state, headers, body| handle(state, Dialect::Messages, headers, body)),
-            )
-            .route(
-                "/v1/messages/count_tokens",
-                post(|state, headers, body| handle(state, Dialect::CountTokens, headers, body)),
-            )
-            .route(
-                "/v1/responses",
-                post(|state, headers, body| handle(state, Dialect::Responses, headers, body)),
-            )
-            .route(
-                "/v1/chat/completions",
-                post(|state, headers, body| handle(state, Dialect::Chat, headers, body)),
-            )
-            .with_state(self)
+        Self::router_current(self)
     }
 }
 
@@ -322,9 +304,9 @@ pub trait CurrentProxy: Clone + Send + Sync + 'static {
     fn current(&self) -> Option<Arc<ModelProxy>>;
 }
 
-impl CurrentProxy for Arc<ArcSwap<ModelProxy>> {
+impl CurrentProxy for Arc<ModelProxy> {
     fn current(&self) -> Option<Arc<ModelProxy>> {
-        Some(self.load_full())
+        Some(Arc::clone(self))
     }
 }
 

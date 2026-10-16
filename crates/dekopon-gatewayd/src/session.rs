@@ -99,23 +99,12 @@ type AdmissionKey = (String, String);
 pub(crate) type SharedModel = Arc<dyn ChatModel + Send + Sync>;
 
 pub(crate) trait ModelFactory: Send + Sync {
-    fn build(
-        &self,
-        model: &ModelConfig,
-        runtime: tokio::runtime::Handle,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<SharedModel, SessionError> {
-        self.build_bound(&Arc::new(model.clone()), runtime, cancel)
-    }
-
     fn build_bound(
         &self,
         model: &Arc<ModelConfig>,
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<SharedModel, SessionError> {
-        self.build(model, runtime, cancel)
-    }
+    ) -> Result<SharedModel, SessionError>;
 
     fn build_anchored(
         &self,
@@ -124,7 +113,7 @@ pub(crate) trait ModelFactory: Send + Sync {
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
-        self.build(model, runtime, cancel)
+        self.build_bound(&Arc::new(model.clone()), runtime, cancel)
     }
 
     fn retire(&self) {}

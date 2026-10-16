@@ -300,9 +300,9 @@ struct SlowSummary {
 }
 
 impl ModelFactory for Arc<SlowSummary> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {

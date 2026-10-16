@@ -1458,9 +1458,9 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
         Ok(_) => panic!("missing GitHub secret must be attributed to GitHub"),
     };
     assert!(matches!(error, crate::GatewaydError::Startup { problems }
-        if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport {
+        if matches!(problems.as_slice(), [crate::StartupProblem::Transport {
             transport, source: crate::transport::TransportError::MissingCredential { name }
-        } if transport == "github" && name == "CC07_S2_ABSENT_SECRET"))));
+        }] if transport == "github" && name == "CC07_S2_ABSENT_SECRET")));
     doc["transports"][3]["secretEnv"] = json!("PATH");
 
     doc["transports"] = json!([doc["transports"][0], github(9082), whatsapp("wa1", 9080)]);
@@ -1568,7 +1568,8 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+            &mut HashMap::new()
         ),
         Err(crate::transport::TransportError::MissingCredential { .. })
     ));
@@ -1579,7 +1580,8 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+            &mut HashMap::new()
         )
         .is_ok()
     );
@@ -3730,9 +3732,9 @@ impl ModelScript {
 }
 
 impl ModelFactory for Arc<ModelScript> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -4757,9 +4759,9 @@ impl InterruptibleModel {
 }
 
 impl ModelFactory for Arc<InterruptibleModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -4866,9 +4868,9 @@ impl BlockedModel {
 }
 
 impl ModelFactory for Arc<BlockedModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -7832,9 +7834,9 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -8691,9 +8693,9 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -15101,9 +15103,9 @@ impl ChatModel for FailingStreamModel {
 }
 
 impl ModelFactory for Arc<FailingStreamModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -15112,9 +15114,9 @@ impl ModelFactory for Arc<FailingStreamModel> {
 }
 
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -15292,9 +15294,9 @@ impl ModelFactory for Arc<ParkedBuild> {
         reason = "both halves are the test's own rendezvous: an unobserved entry signal fails \
                   wait_until_building, and a release that never arrives is bounded by the timeout"
     )]
-    fn build(
+    fn build_bound(
         &self,
-        _model: &ModelConfig,
+        _model: &Arc<ModelConfig>,
         _runtime: tokio::runtime::Handle,
         _cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
@@ -16409,7 +16411,7 @@ fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_five_seconds() {
         let mut collector = burst_collector(configured);
         let photo = burst_photo("");
         let start = photo.received_at;
-        let result = collector.offer(0, photo);
+        let result = collector.offer(crate::collection::tests::route("a"), photo);
         if expected == 0 {
             assert!(matches!(result, Offered::Immediate(_)));
             assert!(collector.deadline().is_none());
@@ -16456,14 +16458,14 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
         let mut photo = burst_photo(caption);
         photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
         assert!(matches!(
-            collector.offer(0, photo),
+            collector.offer(crate::collection::tests::route("a"), photo),
             crate::collection::Offered::Pending
         ));
     }
     let mut prompt = burst_photo("edit these three together");
     prompt.assets.clear();
     assert!(matches!(
-        collector.offer(0, prompt),
+        collector.offer(crate::collection::tests::route("a"), prompt),
         crate::collection::Offered::Pending
     ));
     assert_eq!(models.requests(), 0);
@@ -16520,7 +16522,7 @@ async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refus
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut collector = burst_collector(None);
     assert!(matches!(
-        collector.offer(0, burst_photo("edit")),
+        collector.offer(crate::collection::tests::route("a"), burst_photo("edit")),
         crate::collection::Offered::Pending
     ));
     assert!(observed.try_recv().is_err());
@@ -16798,7 +16800,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
         slack.connect().await.unwrap();
         let message = next_message(&mut slack).await;
         let mut collector = burst_collector(None);
-        match collector.offer(0, message) {
+        match collector.offer(crate::collection::tests::route("a"), message) {
             Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
             Offered::Refused(_, "input-limit") if count == 11 => {}
             _ => panic!("Slack native array was split or queued"),
@@ -16829,7 +16831,7 @@ async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refuse
         .unwrap();
         discord.connect().await.unwrap();
         let message = next_message(&mut discord).await;
-        match collector.offer(0, message) {
+        match collector.offer(crate::collection::tests::route("a"), message) {
             Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
             Offered::Refused(_, "input-limit") if count == 11 => {}
             _ => panic!("Discord native array was split or queued"),
@@ -16902,8 +16904,16 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         lead,
     );
     assert!(collector.deadline().is_some());
+    let route = routes.route(&member).expect("bound topic route").clone();
+    let identity = |message: &InboundMessage| crate::collection::RouteIdentity::of(&route, message);
+    assert!(collector.is_native_continuation(&identity(&member), &member));
+    let mut other = route.clone();
+    other.agent = "other".parse().unwrap();
     assert!(
-        !collector.is_native_continuation(1, &member),
+        !collector.is_native_continuation(
+            &crate::collection::RouteIdentity::of(&other, &member),
+            &member
+        ),
         "different bound route"
     );
     for axis in 0..3 {
@@ -16913,7 +16923,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             1 => outsider.native_group = Some("other-group".into()),
             _ => outsider.conversation.thread = Some("43".into()),
         }
-        assert!(!collector.is_native_continuation(0, &outsider));
+        assert!(!collector.is_native_continuation(&identity(&outsider), &outsider));
         crate::dispatch(
             &runner,
             &routes,
@@ -16959,7 +16969,7 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         }
     );
     assert!(
-        !collector.is_native_continuation(0, &member),
+        !collector.is_native_continuation(&identity(&member), &member),
         "sealed group cannot lend addressing"
     );
 }
@@ -20878,9 +20888,9 @@ async fn a_model_over_budget_error_keeps_the_failed_outcome_and_text() {
     };
     struct RefusedBuild(Refusal);
     impl ModelFactory for RefusedBuild {
-        fn build(
+        fn build_bound(
             &self,
-            _model: &ModelConfig,
+            _model: &Arc<ModelConfig>,
             _runtime: tokio::runtime::Handle,
             _cancel: tokio::sync::watch::Receiver<bool>,
         ) -> Result<SharedModel, SessionError> {
