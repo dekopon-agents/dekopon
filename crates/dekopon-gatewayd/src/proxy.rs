@@ -303,7 +303,7 @@ fn wire_model(model: &ModelConfig) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     use dekopon_broker_protocol::BrokerSocketDiscovery;
@@ -313,10 +313,10 @@ mod tests {
     use super::*;
     use crate::config::{ConfigError, ConfigProblem, GatewaydConfig};
 
-    const JAIL: &str = "spiffe://homelab/ns/vm-runner/sa/vm-runner-jail";
+    pub(crate) const JAIL: &str = "spiffe://homelab/ns/vm-runner/sa/vm-runner-jail";
 
-    struct Pki {
-        directory: tempfile::TempDir,
+    pub(crate) struct Pki {
+        pub(crate) directory: tempfile::TempDir,
         server_ca: CertifiedIssuer<'static, KeyPair>,
         jail: (String, String),
     }
@@ -350,7 +350,7 @@ mod tests {
         )
     }
 
-    fn pki() -> Pki {
+    pub(crate) fn pki() -> Pki {
         let directory = tempfile::TempDir::new().unwrap();
         let server_ca = issuer();
         let jail_ca = issuer();
