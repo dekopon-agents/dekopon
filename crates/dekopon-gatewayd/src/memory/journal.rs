@@ -1228,6 +1228,115 @@ mod tests {
             .collect()
     }
 
+    fn corrupt_oldest_line_in_place(path: &Path) {
+        let bytes = fs::read(path).expect("journal bytes");
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("first record");
+        let mut file = File::options()
+            .write(true)
+            .open(path)
+            .expect("open first record");
+        file.write_all(&vec![b'!'; end])
+            .expect("overwrite first record in place");
+    }
+
+    #[test]
+    fn cold_recall_clips_the_newest_turn_and_never_reads_a_corrupt_older_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut limits = window();
+        limits.limits.max_turns = 40;
+        limits.limits.max_bytes = 1000;
+        append_turn(
+            &journal,
+            &stem,
+            now,
+            GRANT,
+            &ConversationTurn::completed("O", "old"),
+            &[],
+            limits,
+        );
+        append_turn(
+            &journal,
+            &stem,
+            now,
+            GRANT,
+            &ConversationTurn::completed("1".repeat(300), "a".repeat(300)),
+            &[],
+            limits,
+        );
+        let newest = ConversationTurn::completed("2".repeat(1500), "b".repeat(100));
+        append_turn(&journal, &stem, now, GRANT, &newest, &[], limits);
+        let path = journal.path(&stem);
+        corrupt_oldest_line_in_place(&path);
+        PEAK_LIVE_DECODED.with(|peak| peak.set(0));
+        let recalled = journal
+            .recall(&stem, GRANT, limits, now)
+            .expect("bounded cold recall");
+        let mut warm = History::new(limits.limits);
+        warm.record(newest.clone().with_memory_id(0));
+        assert_eq!(
+            recalled.history.turns(),
+            [newest.with_memory_id(0).clipped(1000)]
+        );
+        assert_eq!(recalled.history, warm);
+        assert_eq!(recalled.history.bytes(), 1000);
+        assert!(path.exists());
+        PEAK_LIVE_DECODED.with(|peak| assert!(peak.get() <= 2));
+    }
+
+    #[test]
+    fn cold_recall_counts_userless_records_before_a_corrupt_older_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        let mut limits = window();
+        limits.limits.max_turns = 3;
+        append_turn(
+            &journal,
+            &stem,
+            now,
+            GRANT,
+            &ConversationTurn::completed("O", "old"),
+            &[],
+            limits,
+        );
+        for _ in 0..3 {
+            append_turn(
+                &journal,
+                &stem,
+                now,
+                GRANT,
+                &ConversationTurn::unanswered(""),
+                &[],
+                limits,
+            );
+        }
+        let path = journal.path(&stem);
+        let mut lines = read_lines(&path).expect("records");
+        for line in lines.iter_mut().skip(1) {
+            line.user = None;
+            line.answer = None;
+            line.source_eligibility = false;
+        }
+        let encoded: Vec<u8> = lines
+            .iter()
+            .flat_map(|line| encode_line(line).expect("v2 record"))
+            .collect();
+        fs::write(&path, encoded).expect("three eligible userless records");
+        corrupt_oldest_line_in_place(&path);
+        let recalled = journal
+            .recall(&stem, GRANT, limits, now)
+            .expect("bounded userless recall");
+        assert!(recalled.history.is_empty());
+        assert!(path.exists());
+    }
+
     #[test]
     fn cold_recall_and_old_record_lookup_decode_at_most_two_records() {
         let dir = tempfile::tempdir().expect("tempdir");
