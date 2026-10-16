@@ -603,41 +603,55 @@ async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
 async fn a_fired_wake_with_no_route_sends_only_the_orphan_notice() {
     let directory = temporary();
     let store = wake_store(directory.path());
-    let now = SystemTime::now();
-    once(&store, "check the PR", now);
-    let fired = store
-        .take_due(now + Duration::from_secs(2))
-        .expect("readable")
-        .fired
-        .pop()
-        .expect("due");
+    once(
+        &store,
+        "check the PR",
+        SystemTime::now() - Duration::from_secs(2),
+    );
     let driver = Arc::new(RecordingDriver::default());
     let drivers: BTreeMap<String, Arc<dyn ChatDriver>> =
         BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let models = ModelScript::new([]);
     let runner = runner_with_wakes(
         ResolvedBroker {
             socket_path: directory.path().join("absent.sock"),
             server_uid: crate::current_uid(),
             frame: FrameLimits::default(),
         },
-        Arc::clone(&models),
+        ModelScript::forbidden(),
         &store,
     );
-    let mut sessions = tokio::task::JoinSet::new();
-    crate::start_wake(
-        &runner,
-        &crate::routes::RoutingTable::default(),
-        &drivers,
-        &mut sessions,
-        fired,
+    let (_sender, receiver) = mpsc::channel(4);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(crate::serve(
+        runner,
+        Arc::new(crate::routes::RoutingTable::default()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+        receiver,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+        Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !driver.replies().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the due wake reaches its original chat");
+    shutdown_tx.send(()).expect("serving shutdown receiver");
+    assert_eq!(
+        serving.await.expect("serving joins"),
+        crate::ServeOutcome::Shutdown
     );
-    sessions
-        .join_next()
-        .await
-        .expect("notice task")
-        .expect("joined");
     assert_eq!(driver.replies(), ["check the PR"]);
+    assert!(store.list(anchor().subject(), SystemTime::now()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
