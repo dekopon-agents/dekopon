@@ -7,6 +7,8 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, ConversationKind, GenerationOutcome};
+use dekopon_model_proxy::ModelProxy;
+use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
@@ -40,6 +42,12 @@ pub(crate) struct ServingGeneration {
     _broker_digest: String,
 }
 
+pub(crate) struct ResidentModels {
+    pub(crate) credentials: Arc<session::ConfiguredModels>,
+    pub(crate) metering: Arc<Metering>,
+    pub(crate) proxy: Option<Arc<ArcSwap<ModelProxy>>>,
+}
+
 struct ReloadState {
     active: Arc<ArcSwap<ServingGeneration>>,
     path: PathBuf,
@@ -47,6 +55,9 @@ struct ReloadState {
     sources: Arc<config::GatewaySources>,
     broker_digest: String,
     gateway_digest: String,
+    credentials: Arc<session::ConfiguredModels>,
+    metering: Arc<Metering>,
+    proxy: Option<Arc<ArcSwap<ModelProxy>>>,
     pending: Option<(String, String)>,
 }
 
@@ -123,6 +134,13 @@ fn serving_digest(
         .collect())
 }
 
+#[cfg(test)]
+impl ServingGeneration {
+    pub(crate) fn routes_for_test(&self) -> &RoutingTable {
+        &self.routes
+    }
+}
+
 impl Gateway {
     pub(crate) fn new(
         runner: Arc<SessionRunner>,
@@ -146,11 +164,31 @@ impl Gateway {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_reload(
+        self,
+        path: PathBuf,
+        candidate: Candidate,
+        broker_digest: String,
+    ) -> Result<Self, config::ConfigError> {
+        self.with_reload_owners(
+            path,
+            candidate,
+            broker_digest,
+            ResidentModels {
+                credentials: Arc::new(session::ConfiguredModels::default()),
+                metering: Arc::new(Metering::new(Vec::new(), Metering::system_clock())),
+                proxy: None,
+            },
+        )
+    }
+
+    pub(crate) fn with_reload_owners(
         mut self,
         path: PathBuf,
         candidate: Candidate,
         broker_digest: String,
+        owners: ResidentModels,
     ) -> Result<Self, config::ConfigError> {
         let gateway_digest = serving_digest(&candidate, &broker_digest)?;
         let sources = Arc::new(candidate.sources);
@@ -168,6 +206,9 @@ impl Gateway {
             sources,
             broker_digest,
             gateway_digest,
+            credentials: owners.credentials,
+            metering: owners.metering,
+            proxy: owners.proxy,
             pending: None,
         });
         Ok(self)
@@ -178,6 +219,11 @@ impl Gateway {
         if let Some(reload) = self.reload.as_mut() {
             reload.reconcile().await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runner_for_test(&self) -> &Arc<SessionRunner> {
+        &self.runner
     }
 
     #[cfg(test)]
@@ -526,7 +572,7 @@ impl Gateway {
                 return;
             }
         }
-        let Some((route_id, _)) = generation.routes.route_index(&message) else {
+        let Some((route_id, route)) = generation.routes.route_index(&message) else {
             tracing::debug!(
                 event = "gateway_message_ignored",
                 transport = %message.transport,
@@ -560,7 +606,7 @@ impl Gateway {
         if message.conversation.kind != ConversationKind::DirectMessage
             && !addressed
             && !inherited_thread
-            && !collector.is_native_continuation(route_id, &message)
+            && !collector.is_native_continuation(route, &message)
         {
             if let Some(route) = generation.routes.route(&message)
                 && route.follow
@@ -594,7 +640,7 @@ impl Gateway {
             );
             return;
         }
-        match collector.offer(route_id, message) {
+        match collector.offer(route, message) {
             collection::Offered::Pending => {}
             collection::Offered::Immediate(message) => {
                 self.start_session(sessions, &generation, message);
@@ -707,6 +753,29 @@ impl ReloadState {
             );
             return;
         };
+        let refreshed_proxy = if candidate.config.models != self.config.models {
+            match (self.proxy.as_ref(), candidate.config.proxy.as_ref()) {
+                (Some(_), Some(proxy)) => match crate::proxy::build(
+                    proxy,
+                    &candidate.config.models,
+                    &self.credentials,
+                    &self.metering,
+                ) {
+                    Ok(proxy) => Some(proxy),
+                    Err(_) => {
+                        tracing::warn!(
+                            event = "gateway_reload_refused",
+                            applied = false,
+                            reason = "proxy-model"
+                        );
+                        return;
+                    }
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
         let broker = &candidate.config.broker;
         let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
         else {
@@ -729,7 +798,7 @@ impl ReloadState {
                 return;
             };
             if observed == pending_broker && digest == pending_gateway {
-                self.settle(candidate, observed, digest);
+                self.settle(candidate, observed, digest, refreshed_proxy);
                 return;
             }
             self.broker_digest = observed;
@@ -749,7 +818,7 @@ impl ReloadState {
         };
         match outcome {
             GenerationOutcome::Active if broker_digest == expected_broker => {
-                self.settle(candidate, broker_digest, digest);
+                self.settle(candidate, broker_digest, digest, refreshed_proxy);
                 return;
             }
             GenerationOutcome::Prepared => {}
@@ -786,16 +855,25 @@ impl ReloadState {
             );
             return;
         }
-        self.settle(candidate, broker_digest, digest);
+        self.settle(candidate, broker_digest, digest, refreshed_proxy);
     }
 
-    fn settle(&mut self, candidate: Candidate, broker_digest: String, digest: String) {
+    fn settle(
+        &mut self,
+        candidate: Candidate,
+        broker_digest: String,
+        digest: String,
+        refreshed_proxy: Option<Arc<ModelProxy>>,
+    ) {
         self.pending = None;
         if digest == self.gateway_digest {
             self.broker_digest = broker_digest;
             return;
         }
         let sources = Arc::new(candidate.sources);
+        if let (Some(current), Some(proxy)) = (&self.proxy, refreshed_proxy) {
+            current.store(proxy);
+        }
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
             stop_words: Arc::new(candidate.config.stop_words.clone()),

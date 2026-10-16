@@ -19548,6 +19548,148 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
     }
 }
 
+#[tokio::test]
+async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    let other = catalog_text(true, Some("reasoning")).replace("name: reviewer", "name: other");
+    let catalog = root.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    fs::write(
+        catalog.join("reviewer.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    fs::write(catalog.join("other.yaml"), other).unwrap();
+    let mut document = document(root.path());
+    document["catalogPath"] = json!(catalog);
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["sessions"]["wakes"] = json!({"path":"wakes.jsonl", "minIntervalMs":300_000});
+    document["routes"][0]["wakes"] = json!(true);
+    let mut other_route = document["routes"][0].clone();
+    other_route["agent"] = json!("other");
+    other_route["conversation"]["ids"] = json!(["other"]);
+    document["routes"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, other_route);
+    let path = write_config(root.path(), &document);
+    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response()]);
+    let configured = Arc::new(crate::session::ConfiguredModels::default());
+    let mut runner = runner_with(
+        candidate.config.broker.clone(),
+        Arc::clone(&configured) as Arc<dyn ModelFactory>,
+        4,
+    );
+    Arc::get_mut(&mut runner).unwrap().wakes = Some(Arc::new(
+        crate::wake::WakeStore::open(candidate.config.wakes.as_ref().unwrap()).unwrap(),
+    ));
+    let private = private_conversation_key("dev", "dev", SUBJECT);
+    let shared = ConversationKey::shared(&"reviewer".parse().unwrap(), "dev", "dev");
+    let grant = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
+        commit(
+            &runner.conversations,
+            key,
+            &grant,
+            window(),
+            ConversationTurn::completed(text, "answer"),
+            now,
+        );
+    }
+    let mut gateway = crate::gateway::Gateway::new(
+        Arc::clone(&runner),
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let first = gateway.route_for_test(&message("first")).unwrap();
+    let old_generation = gateway.generation_for_test();
+    let other = old_generation.routes_for_test();
+    let old_model = Arc::clone(&first.model);
+    runner
+        .models
+        .client_bound(
+            &old_model,
+            tokio::runtime::Handle::current(),
+            tokio::sync::watch::channel(false).1,
+        )
+        .unwrap();
+    let old_client = configured.bound_client_for_test(&old_model).unwrap();
+    let (capture, _guard) = capture_spans();
+    for (index, version) in ["next", "newer"].into_iter().enumerate() {
+        document["models"][0]["model"] = json!(version);
+        write_config(root.path(), &document);
+        gateway.reconcile().await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        let selected = gateway.route_for_test(&message("after")).unwrap();
+        assert!(!Arc::ptr_eq(&selected.model, &old_model));
+        runner
+            .models
+            .client_bound(
+                &selected.model,
+                tokio::runtime::Handle::current(),
+                tokio::sync::watch::channel(false).1,
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &configured.bound_client_for_test(&selected.model).unwrap(),
+            &old_client
+        ));
+        let applied =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
+        assert_eq!(applied.len(), index + 1);
+        assert_eq!(applied[index].field("generation.digest").unwrap().len(), 64);
+        assert!(Arc::ptr_eq(gateway.runner_for_test(), &runner));
+        assert!(Arc::ptr_eq(
+            &gateway.runner_for_test().assets,
+            &runner.assets
+        ));
+        assert!(Arc::ptr_eq(&gateway.runner_for_test().jobs, &runner.jobs));
+        assert!(Arc::ptr_eq(
+            gateway.runner_for_test().wakes.as_ref().unwrap(),
+            runner.wakes.as_ref().unwrap()
+        ));
+        assert_eq!(gateway.runner_for_test().conversations.tracked(), 2);
+        for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
+            let history = runner
+                .conversations
+                .begin(key, &grant, window(), None, now)
+                .history;
+            assert_eq!(history.turns()[0].user(), text);
+        }
+        assert_eq!(other.len(), 2);
+        let mut other_message = message("unrelated");
+        other_message.conversation.id = "other".into();
+        assert_eq!(
+            gateway
+                .route_for_test(&other_message)
+                .unwrap()
+                .agent
+                .as_str(),
+            "other"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
     let root = temporary();

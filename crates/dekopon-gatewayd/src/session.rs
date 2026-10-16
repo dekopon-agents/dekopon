@@ -105,11 +105,23 @@ pub(crate) trait ModelFactory: Send + Sync {
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError>;
+
+    fn build_bound(
+        &self,
+        model: &Arc<ModelConfig>,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        self.build(model, runtime, cancel)
+    }
 }
+
+type BoundClients = HashMap<usize, (std::sync::Weak<ModelConfig>, Arc<ModelClient>)>;
 
 #[derive(Default)]
 pub(crate) struct ConfiguredModels {
-    clients: Mutex<HashMap<String, Arc<ModelClient>>>,
+    clients: Mutex<Vec<(ModelConfig, Arc<ModelClient>)>>,
+    bound_clients: Mutex<BoundClients>,
     /// One credential instance per auth file path, shared across every model naming it, so a second
     /// instance cannot spend a refresh token the first already rotated and retired.
     chatgpt_credentials:
@@ -151,6 +163,17 @@ pub(crate) fn model_credential(
 }
 
 impl ConfiguredModels {
+    #[cfg(test)]
+    pub(crate) fn bound_client_for_test(
+        &self,
+        model: &Arc<ModelConfig>,
+    ) -> Option<Arc<ModelClient>> {
+        self.bound_clients
+            .lock()
+            .get(&(Arc::as_ptr(model) as usize))
+            .map(|(_, client)| Arc::clone(client))
+    }
+
     pub(crate) fn chatgpt_credential(
         &self,
         auth_file: Option<&std::path::Path>,
@@ -253,19 +276,79 @@ impl ConfiguredModels {
 }
 
 impl ModelFactory for ConfiguredModels {
+    fn build_bound(
+        &self,
+        model: &Arc<ModelConfig>,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        let key = Arc::as_ptr(model) as usize;
+        let cached = self
+            .bound_clients
+            .lock()
+            .get(&key)
+            .and_then(|(owner, client)| {
+                owner
+                    .upgrade()
+                    .filter(|owner| Arc::ptr_eq(owner, model))
+                    .map(|_| Arc::clone(client))
+            });
+        let client = match cached {
+            Some(client) => client,
+            None => {
+                let built = self.construct(model)?;
+                let mut clients = self.bound_clients.lock();
+                clients.retain(|index, (owner, _)| {
+                    owner.strong_count() > 0
+                        && (*index != key
+                            || owner
+                                .upgrade()
+                                .is_some_and(|owner| Arc::ptr_eq(&owner, model)))
+                });
+                Arc::clone(
+                    &clients
+                        .entry(key)
+                        .or_insert_with(|| (Arc::downgrade(model), built))
+                        .1,
+                )
+            }
+        };
+        let timeout = model
+            .timeout_ms()
+            .ok_or_else(|| SessionError::ProxyOnlyModel {
+                model: model.name().to_owned(),
+            })?;
+        Ok(Arc::new(BlockingModel::new(
+            client,
+            runtime,
+            cancel,
+            Duration::from_millis(timeout),
+        )))
+    }
+
     fn build(
         &self,
         model: &ModelConfig,
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
-        let cached = self.clients.lock().get(model.name()).cloned();
+        let cached = self
+            .clients
+            .lock()
+            .iter()
+            .find(|(key, _)| key == model)
+            .map(|(_, client)| Arc::clone(client));
         let client = match cached {
             Some(client) => client,
             None => {
                 let built = self.construct(model)?;
                 let mut clients = self.clients.lock();
-                Arc::clone(clients.entry(model.name().to_owned()).or_insert(built))
+                if let Some((_, client)) = clients.iter().find(|(key, _)| key == model) {
+                    Arc::clone(client)
+                } else {
+                    clients.push((model.clone(), Arc::clone(&built)));
+                    built
+                }
             }
         };
         let timeout_ms = model
@@ -289,6 +372,15 @@ impl ModelCache {
     pub(crate) fn new(factory: Arc<dyn ModelFactory>) -> Self {
         Self { factory }
     }
+    pub(crate) fn client_bound(
+        &self,
+        model: &Arc<ModelConfig>,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        self.factory.build_bound(model, runtime, cancel)
+    }
+
     pub(crate) fn client(
         &self,
         model: &ModelConfig,
@@ -1916,7 +2008,7 @@ async fn session(
     let result = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = blocking_span.enter();
-            let model = match models.client(&model_config, model_runtime, model_cancel) {
+            let model = match models.client_bound(&model_config, model_runtime, model_cancel) {
                 Ok(model) => ChatProviderGovernor::wrap(model, &metering, &agent_id, &model_config),
                 Err(error) => return (Err(error), None, Vec::new()),
             };
@@ -2740,7 +2832,7 @@ mod model_factory_tests {
     }
 
     #[test]
-    fn the_real_factory_shares_pools_by_configured_name_only() {
+    fn the_real_factory_shares_pools_by_matching_configurations() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let factory = ConfiguredModels::default();
         let bind = |name| {
@@ -2753,13 +2845,35 @@ mod model_factory_tests {
                 .unwrap()
         };
         let first = bind("one");
-        let first_pool = Arc::clone(factory.clients.lock().get("one").unwrap());
+        let first_pool = Arc::clone(
+            &factory
+                .clients
+                .lock()
+                .iter()
+                .find(|(model, _)| model.name() == "one")
+                .unwrap()
+                .1,
+        );
         let again = bind("one");
         let other = bind("two");
         assert!(!Arc::ptr_eq(&first, &again));
         let clients = factory.clients.lock();
-        assert!(Arc::ptr_eq(&first_pool, clients.get("one").unwrap()));
-        assert!(!Arc::ptr_eq(&first_pool, clients.get("two").unwrap()));
+        assert!(Arc::ptr_eq(
+            &first_pool,
+            &clients
+                .iter()
+                .find(|(model, _)| model.name() == "one")
+                .unwrap()
+                .1
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_pool,
+            &clients
+                .iter()
+                .find(|(model, _)| model.name() == "two")
+                .unwrap()
+                .1
+        ));
         drop(clients);
         assert!(!Arc::ptr_eq(&first, &other));
         assert_eq!(factory.clients.lock().len(), 2);
@@ -2791,8 +2905,65 @@ mod model_factory_tests {
         let cache = factory.clients.lock();
         assert_eq!(cache.len(), 1);
         assert!(matches!(
-            cache.get("codex"),
-            Some(client) if matches!(client.as_ref(), ModelClient::Codex(_))
+            cache.iter().find(|(model, _)| model.name() == "codex"),
+            Some((_, client)) if matches!(client.as_ref(), ModelClient::Codex(_))
+        ));
+    }
+
+    #[test]
+    fn two_model_generations_keep_one_credential_owner_and_distinct_same_name_clients() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let factory = ConfiguredModels::default();
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"})).unwrap()).unwrap();
+        let config = |model: &str| {
+            Arc::new(serde_json::from_value::<ModelConfig>(serde_json::json!({"kind":"chatgptSubscription", "name":"codex", "model":model, "timeoutMs":2000, "authFile":path})).unwrap())
+        };
+        let first = config("old");
+        let second = config("new");
+        let third = config("newer");
+        let credential = factory
+            .chatgpt_credential(Some(&path), Duration::from_secs(2))
+            .unwrap();
+        for model in [&first, &second, &third, &first] {
+            factory
+                .build_bound(
+                    model,
+                    runtime.handle().clone(),
+                    tokio::sync::watch::channel(false).1,
+                )
+                .unwrap();
+        }
+        assert_eq!(factory.bound_clients.lock().len(), 3);
+        assert_eq!(factory.chatgpt_credentials.lock().len(), 1);
+        assert!(Arc::ptr_eq(
+            &credential,
+            &factory
+                .chatgpt_credential(Some(&path), Duration::from_secs(2))
+                .unwrap()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"version":1,"access":"rotated-synthetic","refresh":"rotated-synthetic","expiresAt":u64::MAX,"accountId":"synthetic"})).unwrap()).unwrap();
+        let adopted = credential
+            .force_refresh(&dekopon_core::Redacted::new("synthetic".to_owned()))
+            .unwrap();
+        assert_eq!(
+            adopted.refresh,
+            Some(dekopon_model::chatgpt::RefreshOutcome::Adopted)
+        );
+        assert_eq!(
+            factory
+                .chatgpt_credential(Some(&path), Duration::from_secs(2))
+                .unwrap()
+                .current()
+                .unwrap()
+                .refresh,
+            None
+        );
+        let clients = factory.bound_clients.lock();
+        assert!(!Arc::ptr_eq(
+            &clients[&(Arc::as_ptr(&first) as usize)].1,
+            &clients[&(Arc::as_ptr(&second) as usize)].1
         ));
     }
 

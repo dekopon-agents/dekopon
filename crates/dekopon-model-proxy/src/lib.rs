@@ -21,6 +21,7 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::ArcSwap;
 use axum::{
     Router,
     body::Body,
@@ -198,6 +199,33 @@ impl ModelProxy {
         }
     }
 
+    pub fn router_current(current: Arc<ArcSwap<Self>>) -> Router {
+        Router::new()
+            .route(
+                "/v1/messages",
+                post(|state, headers, body| {
+                    handle_current(state, Dialect::Messages, headers, body)
+                }),
+            )
+            .route(
+                "/v1/messages/count_tokens",
+                post(|state, headers, body| {
+                    handle_current(state, Dialect::CountTokens, headers, body)
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(|state, headers, body| {
+                    handle_current(state, Dialect::Responses, headers, body)
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|state, headers, body| handle_current(state, Dialect::Chat, headers, body)),
+            )
+            .with_state(current)
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route(
@@ -286,6 +314,16 @@ fn label<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
             value.len() <= MAX_LABEL_BYTES && value.bytes().all(|byte| matches!(byte, b' '..=b'~'))
         })
         .unwrap_or("")
+}
+
+async fn handle_current(
+    State(current): State<Arc<ArcSwap<ModelProxy>>>,
+    dialect: Dialect,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let proxy = current.load_full();
+    handle(State(proxy), dialect, headers, body).await
 }
 
 async fn handle(

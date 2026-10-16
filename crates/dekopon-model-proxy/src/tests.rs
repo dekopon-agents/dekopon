@@ -347,6 +347,48 @@ const USAGE_ANSWER: &str = r#"{"id":"x","usage":{"prompt_tokens":5,"completion_t
 const CHAT_CALL: &str = r#"{"model":"glm-flash","messages":[],"stream":false}"#;
 
 #[tokio::test]
+async fn resident_router_resolves_each_request_against_the_current_model() {
+    let first = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let second = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let metering = metering(100_000);
+    let guests = || {
+        HashMap::from([(
+            SUBJECT.to_owned(),
+            Grant {
+                agent: "gylmar".parse().unwrap(),
+                models: BTreeSet::from(["glm-flash".to_owned()]),
+            },
+        )])
+    };
+    let build = |endpoint: &str| {
+        Arc::new(ModelProxy::new(models(endpoint, None), guests(), Arc::clone(&metering)).unwrap())
+    };
+    let current = Arc::new(arc_swap::ArcSwap::from(build(&first.url)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = ModelProxy::router_current(Arc::clone(&current));
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{url}/v1/chat/completions"))
+            .header(SUBJECT_HEADER, SUBJECT)
+            .header("content-type", "application/json")
+            .body(CHAT_CALL)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        current.store(build(&second.url));
+    }
+    assert_eq!(first.requests.lock().len(), 1);
+    assert_eq!(second.requests.lock().len(), 1);
+    assert!(first.request().contains("z-ai/glm-4.5-air"));
+    assert!(second.request().contains("z-ai/glm-4.5-air"));
+    task.abort();
+}
+
+#[tokio::test]
 async fn a_proxied_call_records_subject_session_model_and_outcome() {
     let (_, spans, _guard) = capture();
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;

@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
@@ -177,13 +178,29 @@ pub(crate) async fn start(
     credentials: &ConfiguredModels,
     metering: &Arc<Metering>,
     tasks: &mut tokio::task::JoinSet<()>,
-) -> Result<std::net::SocketAddr, ProxyStartError> {
-    start_with(proxy, models, credentials, metering, tasks, |variable| {
-        std::env::var_os(variable)
-    })
-    .await
+) -> Result<Arc<ArcSwap<ModelProxy>>, ProxyStartError> {
+    let current = Arc::new(ArcSwap::from(build(proxy, models, credentials, metering)?));
+    let _address = listen(
+        proxy,
+        ModelProxy::router_current(Arc::clone(&current)),
+        tasks,
+    )
+    .await?;
+    Ok(current)
 }
 
+pub(crate) fn build(
+    proxy: &ResolvedProxy,
+    models: &[ModelConfig],
+    credentials: &ConfiguredModels,
+    metering: &Arc<Metering>,
+) -> Result<Arc<ModelProxy>, ProxyStartError> {
+    build_with(proxy, models, credentials, metering, |variable| {
+        std::env::var_os(variable)
+    })
+}
+
+#[cfg(test)]
 pub(crate) async fn start_with(
     proxy: &ResolvedProxy,
     models: &[ModelConfig],
@@ -192,6 +209,17 @@ pub(crate) async fn start_with(
     tasks: &mut tokio::task::JoinSet<()>,
     resolve: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<std::net::SocketAddr, ProxyStartError> {
+    let router = build_with(proxy, models, credentials, metering, resolve)?.router();
+    listen(proxy, router, tasks).await
+}
+
+fn build_with(
+    proxy: &ResolvedProxy,
+    models: &[ModelConfig],
+    credentials: &ConfiguredModels,
+    metering: &Arc<Metering>,
+    resolve: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Arc<ModelProxy>, ProxyStartError> {
     let granted = proxy
         .guests
         .values()
@@ -255,7 +283,18 @@ pub(crate) async fn start_with(
             )
         })
         .collect::<HashMap<_, _>>();
-    let router = Arc::new(ModelProxy::new(upstreams, guests, Arc::clone(metering))?).router();
+    Ok(Arc::new(ModelProxy::new(
+        upstreams,
+        guests,
+        Arc::clone(metering),
+    )?))
+}
+
+async fn listen(
+    proxy: &ResolvedProxy,
+    router: axum::Router,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Result<std::net::SocketAddr, ProxyStartError> {
     let listener =
         Listener::bind(proxy.bind, proxy.files.clone(), proxy.jail_identity.clone()).await?;
     let address =

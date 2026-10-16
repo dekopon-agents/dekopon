@@ -113,6 +113,10 @@ async fn boot_candidate(config_path: &Path) -> Result<Candidate, GatewaydError> 
     Ok(candidate)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "gateway boot owns resident transports and reload owners until shutdown"
+)]
 pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
@@ -207,7 +211,8 @@ where
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
     });
-    let mut owned_tasks = start_metering_tasks(config, &configured, &metering).await?;
+    let (mut owned_tasks, proxy_current) =
+        start_metering_tasks(config, &configured, &metering).await?;
 
     tracing::info!(
         event = "gateway_started",
@@ -229,7 +234,16 @@ where
         Arc::new(drivers),
         Arc::new(config.stop_words.clone()),
     )
-    .with_reload(config_path.as_ref().to_path_buf(), candidate, broker_digest)?
+    .with_reload_owners(
+        config_path.as_ref().to_path_buf(),
+        candidate,
+        broker_digest,
+        gateway::ResidentModels {
+            credentials: configured,
+            metering,
+            proxy: proxy_current,
+        },
+    )?
     .serve(receiver, stopped, shutdown_grace, collector)
     .await;
     readers.abort_all();
@@ -338,19 +352,29 @@ async fn start_metering_tasks(
     config: &ResolvedConfig,
     configured: &ConfiguredModels,
     metering: &Arc<dekopon_model_token_governor::Metering>,
-) -> Result<JoinSet<()>, GatewaydError> {
+) -> Result<
+    (
+        JoinSet<()>,
+        Option<Arc<arc_swap::ArcSwap<dekopon_model_proxy::ModelProxy>>>,
+    ),
+    GatewaydError,
+> {
     let mut owned_tasks = JoinSet::new();
-    if let Some(resolved) = &config.proxy {
-        proxy::start(
-            resolved,
-            &config.models,
-            configured,
-            metering,
-            &mut owned_tasks,
+    let proxy_current = if let Some(resolved) = &config.proxy {
+        Some(
+            proxy::start(
+                resolved,
+                &config.models,
+                configured,
+                metering,
+                &mut owned_tasks,
+            )
+            .await
+            .map_err(GatewaydError::Proxy)?,
         )
-        .await
-        .map_err(GatewaydError::Proxy)?;
-    }
+    } else {
+        None
+    };
     meter_restore::spawn(
         metering,
         config.metering.restore.clone(),
@@ -360,7 +384,7 @@ async fn start_metering_tasks(
             .and_then(|telemetry| telemetry.settings.ca_certificate().map(<[u8]>::to_vec)),
         &mut owned_tasks,
     );
-    Ok(owned_tasks)
+    Ok((owned_tasks, proxy_current))
 }
 
 #[derive(Debug, Default)]
