@@ -214,6 +214,121 @@ async fn transient_due_attempt_retries_after_five_minutes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn reboot_recomputes_a_failed_due_attempt_from_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    write_record(&path, 100_000);
+    let api = TokenApi::serving(|count| {
+        if count == 1 {
+            ("503 Service Unavailable", "{}".to_owned())
+        } else {
+            (
+                "200 OK",
+                json!({"access_token":NEW_ACCESS,"refresh_token":NEW_REFRESH,"expires_in":86400})
+                    .to_string(),
+            )
+        }
+    });
+    let mut entry = resolver(&path, &api.endpoint, &["one"]);
+    let mut source = source_value(&path, &api.endpoint);
+    source["refresh"] = json!("scheduled");
+    entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
+    let scheduled = ScheduledCatalog {
+        resolver: Some(Arc::new(entry)),
+    };
+    for expected in [1, 2] {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let current = scheduled.clone();
+        let task = tokio::spawn(refresh_scheduler::serve_with_clock(
+            async {
+                stopped.await.expect("stop");
+                Ok(())
+            },
+            move || current.clone(),
+            ShutdownDeadline::default(),
+            Arc::new(|| 22 * 3600),
+        ));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while api.requests().len() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("boot due request");
+        if expected == 2 {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    if record["lastRefresh"] == 22 * 3600 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("persist on reboot");
+        }
+        stop.send(()).expect("stop receiver");
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(api.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn shutdown_drains_an_in_flight_scheduled_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    write_record(&path, 100_000);
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let (entered, ready) = std::sync::mpsc::channel::<()>();
+    let api = TokenApi::serving(move |_| {
+        entered.send(()).expect("notify endpoint arrival");
+        parked.recv().expect("release endpoint");
+        (
+            "200 OK",
+            json!({"access_token":NEW_ACCESS,"refresh_token":NEW_REFRESH,"expires_in":86400})
+                .to_string(),
+        )
+    });
+    let mut entry = resolver(&path, &api.endpoint, &["one"]);
+    let mut source = source_value(&path, &api.endpoint);
+    source["refresh"] = json!("scheduled");
+    entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
+    let scheduled = ScheduledCatalog {
+        resolver: Some(Arc::new(entry)),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(refresh_scheduler::serve_with_clock(
+        async {
+            stopped.await.expect("stop");
+            Ok(())
+        },
+        move || scheduled.clone(),
+        ShutdownDeadline::default(),
+        Arc::new(|| 22 * 3600),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ready.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("endpoint received due attempt");
+    stop.send(()).expect("stop receiver");
+    tokio::task::yield_now().await;
+    let still_draining = !task.is_finished();
+    release.send(()).expect("release parked endpoint");
+    assert!(still_draining);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("drained before deadline")
+        .unwrap()
+        .unwrap();
+    let record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["lastRefresh"], 22 * 3600);
+}
+
+#[tokio::test(start_paused = true)]
 async fn idle_scheduler_rotates_without_provider_traffic_and_stops_with_server() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
