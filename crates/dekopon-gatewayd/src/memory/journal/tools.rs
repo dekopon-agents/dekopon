@@ -33,15 +33,18 @@ impl JournalMemoryTools<'_> {
                     && self.versions.get(id) == Some(&rep.version)
             })
         {
-            return line.user.as_deref().map(|user| {
-                let mut text = user.to_owned();
+            if line.user.is_some() || !line.exchanges.is_empty() {
+                let mut text = line.user.clone().unwrap_or_default();
                 if let Some(answer) = &line.answer {
                     text.push('\n');
                     text.push_str(answer);
                 }
                 for exchange in &line.exchanges {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
                     text.push_str(&format!(
-                        "\n[tool: {}, outcome: {}, exit: {:?}]",
+                        "[tool: {}, outcome: {}, exit: {:?}]",
                         exchange.tool, exchange.outcome, exchange.exit_status
                     ));
                     for (label, parts) in
@@ -58,8 +61,8 @@ impl JournalMemoryTools<'_> {
                         }
                     }
                 }
-                Cow::Owned(text)
-            });
+                return Some(Cow::Owned(text));
+            }
         }
         line.representations
             .iter()

@@ -18487,13 +18487,79 @@ async fn a_sealed_conversation_stays_sealed_after_a_restart() {
     }
 }
 
+#[tokio::test]
+async fn a_journal_less_session_offers_no_memory_tools() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("still works")]);
+    let runner = runner(broker, Arc::clone(&model), 4);
+    let route = persistent_route(model_config(), recall_window(RecallSource::None));
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        message("question"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["still works"]);
+    let tools = model.tool_names(0);
+    for name in ["read_memory_record", "set_memory_pin", "clear_memory_pin"] {
+        assert!(
+            !tools.iter().any(|tool| tool == name),
+            "{name} must not be offered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn append_failure_preserves_the_delivered_reply_without_a_journal_record() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("delivered")]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let inbound = message("question");
+    let stem = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    )
+    .journal_stem();
+    fs::write(
+        journal_dir.path().join(route.agent.as_str()),
+        b"not a directory",
+    )
+    .expect("block append directory");
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["delivered"]);
+    assert_eq!(model.requests(), 1);
+    assert!(!journal_dir.path().join(format!("{stem}.jsonl")).exists());
+    let failed = capture.events_where(
+        "dekopon_gatewayd",
+        &[("event", "gateway_journal_append_failed")],
+    );
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].field("reason"), Some("io"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_chat() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
     let journal_dir = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
-    let models = ModelScript::new([script_call("true"), answer("done")]);
+    let models = ModelScript::new([script_call("printf result-sentinel"), answer("done")]);
     let runner = journaled_runner(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
     let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
     route.memory_policy = Some(crate::config::ResolvedPolicy::default());
@@ -18522,8 +18588,17 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     );
     let turn = remembered.history.turns().first().expect("committed turn");
     let exchange = turn.exchanges().first().expect("script exchange captured");
-    assert_eq!(exchange.request[0].text.as_deref(), Some("true"));
-    assert_eq!(exchange.result[0].text.as_deref(), Some(""));
+    assert_eq!(
+        exchange.request[0].text.as_deref(),
+        Some("printf result-sentinel")
+    );
+    assert!(
+        exchange.result[0]
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("result-sentinel")
+    );
     assert_eq!(turn.user(), "do the work");
     assert_eq!(turn.answer(), Some("done"));
     let bytes = fs::read_to_string(
@@ -18534,7 +18609,30 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     )
     .expect("platform exchanges persist");
     let line: Value = serde_json::from_str(bytes.trim()).expect("versioned turn");
-    assert_eq!(line["exchanges"][0]["request"][0]["text"], "true");
+    assert_eq!(
+        line["exchanges"][0]["request"][0]["text"],
+        "printf result-sentinel"
+    );
+    let version =
+        crate::memory::generation::version(&route.memory_policy.as_ref().unwrap().routines[0]);
+    let tools = crate::journal::JournalMemoryTools {
+        journal: runner.journal.as_ref().unwrap(),
+        stem: key.journal_stem(),
+        grant: crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+        versions: [("original".to_owned(), version)].into(),
+    };
+    let read = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        line["recordId"].as_u64().unwrap(),
+        "original",
+        None,
+    );
+    assert!(read.contains("[request] printf result-sentinel"), "{read}");
+    assert!(read.contains("[result]"), "{read}");
+    assert!(read.contains("result-sentinel"), "{read}");
+    assert!(read.contains("outcome: success"), "{read}");
+    assert!(!read.contains("do the work"));
+    assert!(!read.contains("done"));
     assert!(line["user"].is_null());
     assert!(line["answer"].is_null());
     assert!(!bytes.contains("do the work"));
