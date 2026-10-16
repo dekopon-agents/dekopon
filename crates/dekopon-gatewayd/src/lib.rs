@@ -116,13 +116,10 @@ pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), Ga
 where
     F: Future<Output = ()> + Send,
 {
-    let Candidate {
-        config,
-        routes,
-        transports: built_transports,
-        sources: _,
-    } = boot_candidate(config_path.as_ref()).await?;
-    let routes = Arc::new(routes);
+    let mut candidate = boot_candidate(config_path.as_ref()).await?;
+    let built_transports = std::mem::take(&mut candidate.transports);
+    let routes = Arc::new(candidate.routes.clone());
+    let config = &candidate.config;
 
     let broker_client = BrokerClient::new(
         &config.broker.socket_path,
@@ -134,6 +131,13 @@ where
         .capabilities()
         .await
         .map_err(GatewaydError::BrokerProbe)?;
+    let (broker_digest, outcome) = broker_client
+        .observe_generation()
+        .await
+        .map_err(GatewaydError::BrokerProbe)?;
+    if outcome != dekopon_broker_protocol::GenerationOutcome::Active {
+        return Err(GatewaydError::BrokerGeneration);
+    }
     tracing::info!(
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
@@ -205,7 +209,7 @@ where
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
     });
-    let mut owned_tasks = start_metering_tasks(&config, &configured, &metering).await?;
+    let mut owned_tasks = start_metering_tasks(config, &configured, &metering).await?;
 
     tracing::info!(
         event = "gateway_started",
@@ -218,6 +222,8 @@ where
         terminal = supervise_transports(&mut readers, shutdown).await;
         readers.abort_all();
     };
+    let shutdown_grace = config.shutdown_grace;
+    let collector = collection::Collector::new(&config.transports, config.sessions.max_concurrent);
     let outcome = gateway::Gateway::new(
         runner,
         routes,
@@ -225,12 +231,8 @@ where
         Arc::new(drivers),
         Arc::new(config.stop_words.clone()),
     )
-    .serve(
-        receiver,
-        stopped,
-        config.shutdown_grace,
-        collection::Collector::new(&config.transports, config.sessions.max_concurrent),
-    )
+    .with_reload(config_path.as_ref().to_path_buf(), candidate, broker_digest)?
+    .serve(receiver, stopped, shutdown_grace, collector)
     .await;
     readers.abort_all();
     owned_tasks.shutdown().await;
@@ -641,57 +643,7 @@ enum ServeOutcome {
 }
 
 #[cfg(test)]
-use transport::{InboundMessage, TransportIdentity};
-
-#[cfg(test)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "preserves the existing serving test callers"
-)]
-async fn serve<F>(
-    runner: Arc<SessionRunner>,
-    routes: Arc<RoutingTable>,
-    identities: Arc<BTreeMap<String, TransportIdentity>>,
-    drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
-    stop_words: Arc<Vec<String>>,
-    receiver: mpsc::Receiver<TransportEvent>,
-    shutdown: F,
-    grace: Duration,
-    collector: collection::Collector,
-) -> ServeOutcome
-where
-    F: Future<Output = ()> + Send,
-{
-    gateway::Gateway::new(runner, routes, identities, drivers, stop_words)
-        .serve(receiver, shutdown, grace, collector)
-        .await
-}
-
-#[cfg(test)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "preserves the existing dispatch test callers"
-)]
-fn dispatch(
-    runner: &Arc<SessionRunner>,
-    routes: &Arc<RoutingTable>,
-    identities: &BTreeMap<String, TransportIdentity>,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    stop_words: &[String],
-    sessions: &mut JoinSet<()>,
-    collector: &mut collection::Collector,
-    follow_pending: &mut follow::Debounce,
-    message: InboundMessage,
-) {
-    gateway::Gateway::new(
-        Arc::clone(runner),
-        Arc::clone(routes),
-        Arc::new(identities.clone()),
-        Arc::new(drivers.clone()),
-        Arc::new(stop_words.to_vec()),
-    )
-    .dispatch(sessions, collector, follow_pending, message);
-}
+pub(crate) use tests::{dispatch, serve};
 
 fn observe_session(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result
@@ -1011,6 +963,8 @@ pub enum GatewaydError {
     Startup { problems: Vec<StartupProblem> },
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
+    #[error("broker generation was not active")]
+    BrokerGeneration,
     #[error("{}", render_problems(.problems))]
     TransportConnect {
         problems: Vec<TransportConnectProblem>,

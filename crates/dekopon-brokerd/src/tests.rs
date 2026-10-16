@@ -1962,6 +1962,99 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
     );
 }
 
+async fn generation_with_private_credential()
+-> (ManagedBroker, std::path::PathBuf, super::Coordination) {
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let credential = broker.directory.path().join("credentials.yaml");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["credentialsPath"] = json!("credentials.yaml");
+    write_config(&broker.config(), &document);
+    write_owner_only(
+        &credential,
+        b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n",
+    );
+    let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let owner = super::Coordination::new(broker.config(), candidate.expect("boot generation"));
+    (broker, credential, owner)
+}
+
+#[tokio::test]
+async fn unchanged_private_inputs_do_not_stage_or_emit_a_broker_activation() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let (_broker, _credentials, owner) = generation_with_private_credential().await;
+    let digest = owner.active().digest.clone();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        let uid = current_uid();
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+        assert!(owner.state.lock().prepared.is_none());
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Refused);
+        assert_eq!(owner.active().digest, digest);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert!(
+        capture
+            .events_where("dekopon_brokerd", &[("event", "broker_reload_applied")])
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn same_digest_credential_rotation_commits_once_and_next_poll_is_active() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let digest = owner.active().digest.clone();
+    write_owner_only(
+        &credential,
+        b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-after-long-enough\n",
+    );
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        let uid = current_uid();
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
+        assert_eq!(owner.active().digest, digest);
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+        assert!(owner.state.lock().prepared.is_none());
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].field("generation.digest"), Some(digest.as_str()));
+}
+
+#[tokio::test]
+async fn unchanged_poll_reads_the_private_file_once_before_answering_active() {
+    use dekopon_broker_protocol::GenerationOutcome;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let tracked = super::private_read_witness::TrackedRead::new(&credential);
+    let digest = owner.active().digest.clone();
+    let prepared = owner.prepare(&digest, current_uid()).await;
+    assert_eq!(tracked.count(), 1, "one validated private read per prepare");
+    assert_eq!(prepared, (digest, GenerationOutcome::Active));
+}
+
 #[tokio::test(start_paused = true)]
 async fn reaper_sweeps_with_the_committed_generation_retention() {
     use dekopon_broker_protocol::GenerationOutcome;

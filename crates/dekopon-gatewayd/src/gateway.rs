@@ -5,12 +5,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use dekopon_broker_protocol::ConversationKind;
+use arc_swap::ArcSwap;
+use dekopon_broker_protocol::{BrokerClient, ConversationKind, GenerationOutcome};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tracing::Instrument as _;
 
 use crate::{
-    ServeOutcome, cancel_session, collection, follow, jobs, observe_session,
+    Candidate, ServeOutcome, cancel_session, collection, config, follow, jobs, observe_session,
     routes::RoutingTable,
     session::{self, CancelOutcome, SessionRunner},
     spawn_tick,
@@ -23,10 +26,59 @@ use crate::{
 
 pub(crate) struct Gateway {
     runner: Arc<SessionRunner>,
-    routes: Arc<RoutingTable>,
+    active: Arc<ArcSwap<ServingGeneration>>,
+    reload: Option<ReloadState>,
     identities: Arc<BTreeMap<String, TransportIdentity>>,
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+}
+
+struct ServingGeneration {
+    routes: Arc<RoutingTable>,
     stop_words: Arc<Vec<String>>,
+    _sources: Option<Arc<config::GatewaySources>>,
+    _digest: String,
+    _broker_digest: String,
+}
+
+struct ReloadState {
+    path: PathBuf,
+    config: config::ResolvedConfig,
+    sources: Arc<config::GatewaySources>,
+    broker_digest: String,
+    gateway_digest: String,
+    pending: Option<(String, String)>,
+}
+
+fn serving_digest(candidate: &Candidate) -> Result<String, config::ConfigError> {
+    let mut hasher = Sha256::new();
+    let mapping = config::merged_mapping(&candidate.sources.config)?;
+    let encoded =
+        serde_json::to_vec(&mapping).map_err(|_error| config::ConfigError::UnclassifiedSource)?;
+    hasher.update((encoded.len() as u64).to_be_bytes());
+    hasher.update(encoded);
+    for (path, bytes) in &candidate.sources.catalog.0 {
+        let effective = match (
+            path == &candidate.config.catalog_path,
+            path.extension().and_then(|extension| extension.to_str()),
+        ) {
+            (true, Some("yaml" | "yml" | "json")) => {
+                let value: serde_yaml::Value = serde_yaml::from_slice(bytes)
+                    .map_err(|_error| config::ConfigError::UnclassifiedSource)?;
+                serde_json::to_vec(&value)
+                    .map_err(|_error| config::ConfigError::UnclassifiedSource)?
+            }
+            _ => bytes.clone(),
+        };
+        hasher.update((path.as_os_str().len() as u64).to_be_bytes());
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update((effective.len() as u64).to_be_bytes());
+        hasher.update(effective);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 impl Gateway {
@@ -39,13 +91,265 @@ impl Gateway {
     ) -> Self {
         Self {
             runner,
-            routes,
+            active: Arc::new(ArcSwap::from_pointee(ServingGeneration {
+                routes,
+                stop_words,
+                _sources: None,
+                _digest: String::new(),
+                _broker_digest: String::new(),
+            })),
+            reload: None,
             identities,
             drivers,
-            stop_words,
         }
     }
 
+    pub(crate) fn with_reload(
+        mut self,
+        path: PathBuf,
+        candidate: Candidate,
+        broker_digest: String,
+    ) -> Result<Self, config::ConfigError> {
+        let gateway_digest = serving_digest(&candidate)?;
+        let sources = Arc::new(candidate.sources);
+        self.active.store(Arc::new(ServingGeneration {
+            routes: Arc::new(candidate.routes),
+            stop_words: Arc::new(candidate.config.stop_words.clone()),
+            _sources: Some(Arc::clone(&sources)),
+            _digest: gateway_digest.clone(),
+            _broker_digest: broker_digest.clone(),
+        }));
+        self.reload = Some(ReloadState {
+            path,
+            config: candidate.config,
+            sources,
+            broker_digest,
+            gateway_digest,
+            pending: None,
+        });
+        Ok(self)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one broker-first coordination transaction owns confirmation and publication"
+    )]
+    pub(crate) async fn reconcile(&mut self) {
+        let Some(state) = self.reload.as_ref() else {
+            return;
+        };
+        let path = state.path.clone();
+        let (candidate, report) = crate::load_candidate_against(
+            &path,
+            None,
+            config::LoadMode::Boot,
+            None,
+            Some((&state.config, &state.sources)),
+        )
+        .await;
+        let Some(candidate) = candidate else {
+            tracing::warn!(
+                event = "gateway_reload_refused",
+                applied = false,
+                problems = report.problems.len()
+            );
+            return;
+        };
+        let old_gateway = state.gateway_digest.clone();
+        let old_broker = state.broker_digest.clone();
+        let pending = state.pending.clone();
+        let digest = match serving_digest(&candidate) {
+            Ok(digest) => digest,
+            Err(_) => return,
+        };
+        let broker = &candidate.config.broker;
+        let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
+        else {
+            tracing::warn!(event = "gateway_reload_monitor_failed");
+            return;
+        };
+        if let Some((pending_broker, pending_gateway)) = &pending {
+            let (observed, outcome) = match client.observe_generation().await {
+                Ok(observation) => observation,
+                Err(_) => {
+                    tracing::warn!(event = "gateway_reload_monitor_failed");
+                    return;
+                }
+            };
+            if outcome != GenerationOutcome::Active {
+                tracing::warn!(event = "gateway_reload_monitor_failed");
+                return;
+            }
+            if observed == *pending_broker && digest == *pending_gateway {
+                if candidate
+                    .sources
+                    .still_current(&path, &candidate.config.catalog_path, crate::current_uid())
+                    .await
+                    .unwrap_or(false)
+                {
+                    if digest == old_gateway {
+                        if let Some(active) = self.reload.as_mut() {
+                            active.broker_digest = observed;
+                            active.pending = None;
+                        }
+                    } else {
+                        self.publish(path, candidate, observed, digest);
+                    }
+                }
+                return;
+            }
+            if observed != old_broker && observed != *pending_broker {
+                tracing::warn!(event = "gateway_reload_monitor_failed");
+                return;
+            }
+            let Some(active) = self.reload.as_mut() else {
+                return;
+            };
+            if observed == *pending_broker {
+                active.broker_digest = observed;
+            }
+            active.pending = None;
+        }
+        let Some(active) = self.reload.as_ref() else {
+            return;
+        };
+        let expected_broker = active.broker_digest.clone();
+        let (broker_digest, outcome) =
+            match client.prepare_generation(expected_broker.clone()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(event = "gateway_reload_monitor_failed");
+                    return;
+                }
+            };
+        match outcome {
+            GenerationOutcome::Active if broker_digest == expected_broker => {
+                if digest != old_gateway {
+                    if candidate
+                        .sources
+                        .still_current(&path, &candidate.config.catalog_path, crate::current_uid())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        self.publish(path, candidate, broker_digest, digest);
+                    } else {
+                        tracing::warn!(
+                            event = "gateway_reload_refused",
+                            applied = false,
+                            reason = "source-changed"
+                        );
+                    }
+                }
+                return;
+            }
+            GenerationOutcome::Prepared => {}
+            GenerationOutcome::Active
+            | GenerationOutcome::Refused
+            | GenerationOutcome::Applied
+            | GenerationOutcome::Aborted => {
+                tracing::warn!(
+                    event = "gateway_reload_refused",
+                    applied = false,
+                    reason = "broker-prepare"
+                );
+                return;
+            }
+        }
+        if !candidate
+            .sources
+            .still_current(&path, &candidate.config.catalog_path, crate::current_uid())
+            .await
+            .unwrap_or(false)
+        {
+            if !matches!(
+                client.abort_generation(broker_digest).await,
+                Ok(GenerationOutcome::Aborted)
+            ) {
+                tracing::warn!(event = "gateway_reload_monitor_failed");
+            }
+            tracing::warn!(
+                event = "gateway_reload_refused",
+                applied = false,
+                reason = "source-changed"
+            );
+            return;
+        }
+        let confirmed = match client.commit_generation(broker_digest.clone()).await {
+            Ok(GenerationOutcome::Applied) => true,
+            Ok(_) => false,
+            Err(_) => matches!(client.observe_generation().await,
+                Ok((observed, GenerationOutcome::Active)) if observed == broker_digest),
+        };
+        if !confirmed {
+            if let Some(active) = self.reload.as_mut() {
+                active.pending = Some((broker_digest, digest));
+            }
+            tracing::warn!(
+                event = "gateway_reload_refused",
+                applied = false,
+                reason = "broker-confirmation"
+            );
+            return;
+        }
+        if digest == old_gateway {
+            if let Some(active) = self.reload.as_mut() {
+                active.broker_digest = broker_digest;
+            }
+        } else {
+            self.publish(path, candidate, broker_digest, digest);
+        }
+    }
+
+    fn publish(
+        &mut self,
+        path: PathBuf,
+        candidate: Candidate,
+        broker_digest: String,
+        digest: String,
+    ) {
+        let sources = Arc::new(candidate.sources);
+        self.active.store(Arc::new(ServingGeneration {
+            routes: Arc::new(candidate.routes),
+            stop_words: Arc::new(candidate.config.stop_words.clone()),
+            _sources: Some(Arc::clone(&sources)),
+            _digest: digest.clone(),
+            _broker_digest: broker_digest.clone(),
+        }));
+        self.reload = Some(ReloadState {
+            path,
+            config: candidate.config,
+            sources,
+            broker_digest,
+            gateway_digest: digest.clone(),
+            pending: None,
+        });
+        tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_for_test(
+        &self,
+        message: &InboundMessage,
+    ) -> Option<crate::routes::BoundRoute> {
+        self.active.load().routes.route(message).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(
+        &self,
+        message: &InboundMessage,
+    ) -> Option<(crate::routes::BoundRoute, Arc<Vec<String>>)> {
+        let active = self.active.load();
+        Some((
+            active.routes.route(message)?.clone(),
+            Arc::clone(&active.stop_words),
+        ))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bounded serving select owns all event sources and shutdown"
+    )]
     pub(crate) async fn serve<F>(
         mut self,
         mut receiver: mpsc::Receiver<TransportEvent>,
@@ -57,6 +361,9 @@ impl Gateway {
         F: Future<Output = ()> + Send,
     {
         let mut sessions = JoinSet::new();
+        let mut reload_tick = tokio::time::interval(Duration::from_secs(2));
+        reload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reload_tick.reset();
         let mut follow_pending = follow::Debounce::default();
         let mut ticks = JoinSet::new();
         let mut wakes = self.runner.wakes.clone();
@@ -77,6 +384,7 @@ impl Gateway {
             tokio::select! {
                 biased;
                 () = &mut shutdown => break,
+                _ = reload_tick.tick(), if self.reload.is_some() => self.reconcile().await,
                 () = async {
                     match wake_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -92,7 +400,7 @@ impl Gateway {
                                 self.start_wake(&mut sessions, fired);
                             }
                             for tick in due.ticks {
-                                spawn_tick(&self.runner, &self.routes, &store, &mut ticks, tick);
+                                spawn_tick(&self.runner, &self.active.load().routes, &store, &mut ticks, tick);
                             }
                         }
                         Ok(Err(error)) => {
@@ -119,7 +427,7 @@ impl Gateway {
                     }
                 } => {
                     for message in follow_pending.due(tokio::time::Instant::now()) {
-                        if let Some(route) = self.routes.route(&message)
+                        if let Some(route) = self.active.load().routes.route(&message)
                             && let Some(table) = self.runner.follow.as_ref()
                         {
                             let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
@@ -143,7 +451,7 @@ impl Gateway {
                     let MessageId::Job { agent, .. } = &message.message_id else {
                         continue;
                     };
-                    let answering = self.routes.route(&message).is_some_and(|route| {
+                    let answering = self.active.load().routes.route(&message).is_some_and(|route| {
                         route.job_timeout.is_some() && &route.agent == agent
                     });
                     if answering && self.drivers.contains_key(&message.transport) {
@@ -225,13 +533,14 @@ impl Gateway {
         // Checked before the route lookup and the addressed filter: a reload can unroute a conversation
         // whose person still owns jobs, and a channel stop word like the bot mention plus stop would
         // otherwise be dropped as unaddressed; only this sender's running or pending work may be stopped.
+        let generation = self.active.load();
         if transport::is_stop_word(
             self.identities.get(&message.transport),
             &message.text,
-            &self.stop_words,
+            &generation.stop_words,
         ) {
             let mut banished = false;
-            if let Some(route) = self.routes.route(&message)
+            if let Some(route) = generation.routes.route(&message)
                 && route.follow
                 && let Some(table) = self.runner.follow.as_ref()
             {
@@ -335,7 +644,7 @@ impl Gateway {
                 return;
             }
         }
-        let Some((route_id, _)) = self.routes.route_index(&message) else {
+        let Some((route_id, _)) = generation.routes.route_index(&message) else {
             tracing::debug!(
                 event = "gateway_message_ignored",
                 transport = %message.transport,
@@ -355,7 +664,7 @@ impl Gateway {
             .as_ref()
             .is_some_and(|continuation| continuation.inherited);
         if addressed
-            && let Some(route) = self.routes.route(&message)
+            && let Some(route) = generation.routes.route(&message)
             && route.follow
         {
             let key = follow::follow_key(
@@ -371,7 +680,7 @@ impl Gateway {
             && !inherited_thread
             && !collector.is_native_continuation(route_id, &message)
         {
-            if let Some(route) = self.routes.route(&message)
+            if let Some(route) = generation.routes.route(&message)
                 && route.follow
                 && let Some(table) = self.runner.follow.as_ref()
             {
@@ -428,7 +737,8 @@ impl Gateway {
     }
 
     fn start_session(&self, sessions: &mut JoinSet<()>, message: InboundMessage) {
-        let Some(route) = self.routes.route(&message) else {
+        let generation = self.active.load();
+        let Some(route) = generation.routes.route(&message) else {
             collection::disposition(&message.receive_span, "route-lost");
             return;
         };
@@ -439,11 +749,13 @@ impl Gateway {
             collection::disposition(&message.receive_span, "no-driver");
             return;
         };
-        sessions.spawn(session::run_session(
+        let active = Arc::clone(&self.active);
+        sessions.spawn(session::run_session_resolving(
             Arc::clone(&self.runner),
             route.clone(),
             message,
             driver,
+            move |message| active.load().routes.route(message).cloned(),
         ));
     }
 
@@ -454,6 +766,8 @@ impl Gateway {
         let id = fired.id();
         let message = fired.into_inbound();
         let answering = self
+            .active
+            .load()
             .routes
             .route(&message)
             .is_some_and(|route| route.wakes && route.agent == agent);
