@@ -62,18 +62,11 @@ where
             }
             let uid = crate::socket::current_uid();
             let record = path.clone();
-            let inspected =
-                tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid, now)).await;
+            let inspected = tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid)).await;
             let due = match inspected {
-                Err(_) => false,
-                Ok(result) => match result {
-                    Ok(Some(due)) => due <= now || seed_on_boot,
-                    Ok(None) => seed_on_boot,
-                    Err(error) => {
-                        tracing::warn!(event = "broker_credential_record_invalid", credential = %drn, category = error.category());
-                        false
-                    }
-                },
+                Ok(Ok(Some(due))) => due <= now || seed_on_boot,
+                Ok(Ok(None)) => seed_on_boot,
+                Ok(Err(_)) | Err(_) => false,
             };
             if !due {
                 continue;
@@ -93,6 +86,7 @@ where
                     if !drained {
                         // The endpoint may already have spent this rotation, so the deadline waits for it instead of aborting.
                         while attempts.join_next().await.is_some() {}
+                        result?;
                         return Err(BrokerdError::Server(ServerError::ShutdownTimeout));
                     }
                     return result;

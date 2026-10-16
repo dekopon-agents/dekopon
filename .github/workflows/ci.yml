@@ -525,6 +525,8 @@ jobs:
             --entry "dekopon-chart-$version"
       - name: Lint the chart
         run: helm lint charts/dekopon
+      - name: Render broker private files
+        run: python3 charts/dekopon/ci/test-private-files.py
       - name: Render with default and realistic values
         shell: bash
         run: |

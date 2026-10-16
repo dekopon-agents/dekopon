@@ -648,24 +648,23 @@ pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) {
             if std::fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
         Err(error) => {
-            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category())
+            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed")
         }
         Ok(OAuth2Record::Live { .. }) => {}
     }
 }
 
-pub(crate) fn due_at(path: &Path, uid: u32, now: u64) -> Result<Option<u64>, SourceError> {
+pub(crate) fn due_at(path: &Path, uid: u32) -> Result<Option<u64>, SourceError> {
     match read_record(path, uid) {
         Ok(OAuth2Record::Live {
             expires_at,
             last_refresh,
             ..
-        }) => {
-            let due = last_refresh
+        }) => Ok(Some(
+            last_refresh
                 .saturating_add(CYCLE)
-                .min(expires_at.saturating_sub(BUFFER));
-            Ok(Some(if due <= now { now } else { due }))
-        }
+                .min(expires_at.saturating_sub(BUFFER)),
+        )),
         Ok(OAuth2Record::Sealed { .. }) => Ok(None),
         Err(SourceError::Io)
             if std::fs::symlink_metadata(path)
