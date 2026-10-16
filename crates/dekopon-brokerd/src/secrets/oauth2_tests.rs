@@ -36,6 +36,8 @@ use super::{
     SourceError, validate_map,
 };
 
+mod scheduler_tests;
+
 const OLD_REFRESH: &str = "old-refresh-private-sentinel";
 const NEW_REFRESH: &str = "new-refresh-private-sentinel";
 const NEW_ACCESS: &str = "new-access-private-sentinel";
@@ -689,7 +691,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
             }];
         }
     }
-    let catalog = validate_map(
+    let (catalog, _) = validate_map(
         file,
         &dir.path().join("map.json"),
         rustix::process::geteuid().as_raw(),
@@ -1180,6 +1182,7 @@ async fn injected_clock_drives_record_expiry_and_refresh_time() {
             let now = Arc::clone(&now);
             move || now.load(Ordering::SeqCst)
         }),
+        scheduled: false,
     };
     assert_eq!(
         super::oauth2::resolve_with_clock(inputs).await.unwrap(),

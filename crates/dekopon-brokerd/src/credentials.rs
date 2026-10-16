@@ -494,14 +494,14 @@ fn open_auth_file(
         format!(
             "credential {name:?} authFile {} is not a Dekopon ChatGPT credential: {}",
             auth_file.display(),
-            error_chain(&source)
+            safe_chatgpt_diagnostic(&source)
         )
     })?;
     let status = credential.status().map_err(|source| {
         format!(
             "credential {name:?} authFile {} could not be inspected: {}",
             auth_file.display(),
-            error_chain(&source)
+            safe_chatgpt_diagnostic(&source)
         )
     })?;
     tracing::info!(
@@ -516,6 +516,18 @@ fn open_auth_file(
 }
 
 #[cfg(unix)]
+fn safe_chatgpt_diagnostic(error: &ChatGptError) -> String {
+    if let ChatGptError::ParseAuth { source, .. } = error {
+        format!(
+            "invalid JSON at line {}, column {}",
+            source.line(),
+            source.column()
+        )
+    } else {
+        "credential status unavailable".to_owned()
+    }
+}
+
 fn parent_is_owner_writable(parent: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -914,6 +926,26 @@ credentials:
         load(&directory.path().join("credentials.yaml"), uid())
             .await
             .expect("a trusted auth file on an owner-only writable parent loads");
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_json_never_echoes_a_token_shaped_value() {
+        let directory = tempfile::tempdir().expect("directory");
+        let auth = write_auth_file(directory.path(), "broken", u64::MAX, 0o600).await;
+        let sentinel = "sensitive-refresh-token-in-invalid-field";
+        let document = chatgpt_document(u64::MAX).replace(
+            "\"fixture-refresh-token\"",
+            &format!("{{\"{sentinel}\": 1}}"),
+        );
+        tokio::fs::write(&auth, document)
+            .await
+            .expect("invalid auth JSON");
+        write_credentials(directory.path(), &chatgpt_credentials(&auth), 0o600).await;
+        let error = load(&directory.path().join("credentials.yaml"), uid())
+            .await
+            .expect_err("reject invalid auth JSON");
+        assert!(matches!(error, CredentialsError::Invalid { .. }));
+        assert!(!problems(&error).contains(sentinel));
     }
 
     #[tokio::test]

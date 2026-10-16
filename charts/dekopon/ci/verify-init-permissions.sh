@@ -85,11 +85,16 @@ for c,uid in ((gateway,65533),(broker,65532)):
 gm={m["name"]:m for m in gateway["volumeMounts"]}
 bm={m["name"]:m for m in broker["volumeMounts"]}
 # Neither daemon mounts the claim root. Each reaches only its own subPath views of it: a credential
-# subdirectory when that family is enabled, and for the broker the managed provider set when that is
-# enabled. A mount of the claim itself has no subPath and fails here.
-claim_views={"broker-chatgpt":"/var/lib/dekopon/broker-chatgpt","providers":"/var/lib/dekopon/providers"}
+# subdirectory when that family is enabled, and the broker-only OAuth records and managed provider
+# set. A mount of the claim itself has no subPath and fails here.
+records={"name":"state","mountPath":"/var/lib/dekopon/oauth2-records","subPath":"broker-oauth2-records"}
+claim_views={"broker-chatgpt":"/var/lib/dekopon/broker-chatgpt","providers":"/var/lib/dekopon/providers",
+             "broker-oauth2-records":records["mountPath"]}
 broker_state=[m for m in broker["volumeMounts"] if m["name"]=="state"]
 gateway_state=[m for m in gateway["volumeMounts"] if m["name"]=="state"]
+assert broker_state.count(records)==1, broker_state
+assert all(m["mountPath"]!=records["mountPath"] and m.get("subPath")!=records["subPath"]
+           for m in gateway["volumeMounts"]), gateway["volumeMounts"]
 for m in broker_state:
     assert claim_views.get(m.get("subPath"))==m["mountPath"], m
 for m in gateway_state:

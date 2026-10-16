@@ -431,8 +431,21 @@ impl ConfigSnapshot {
             );
         }
         if let Some(bytes) = secret_map {
-            let value =
-                serde_yaml::from_slice(bytes).map_err(|source| ConfigError::Decode { source })?;
+            let value = serde_yaml::from_slice(bytes).map_err(|source: serde_yaml::Error| {
+                ConfigError::SecretMapDecode {
+                    diagnostic: format!(
+                        "invalid YAML/JSON at {}",
+                        source.location().map_or_else(
+                            || "unknown position".to_owned(),
+                            |location| format!(
+                                "line {}, column {}",
+                                location.line(),
+                                location.column()
+                            )
+                        )
+                    ),
+                }
+            })?;
             self.0
                 .insert("secretMapReferences".to_owned(), (Disposition::Swap, value));
         }
@@ -1340,6 +1353,8 @@ pub enum ConfigError {
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("secret map references could not be decoded: {diagnostic}")]
+    SecretMapDecode { diagnostic: String },
     #[error("configured path has no parent")]
     MissingParent,
     #[error("configured socket path has no file name")]
@@ -1465,4 +1480,20 @@ pub enum ConfigError {
         #[source]
         source: TelemetryError,
     },
+}
+
+#[cfg(test)]
+mod secret_map_reference_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_reference_yaml_does_not_echo_a_token_shaped_value() {
+        let sentinel = "sensitive-token-in-invalid-map-reference";
+        let bytes = format!("source: [{{invalid: {sentinel}}}");
+        let error = ConfigSnapshot::default()
+            .record_authority_references(None, Some(bytes.as_bytes()))
+            .expect_err("invalid YAML");
+        assert!(matches!(error, ConfigError::SecretMapDecode { .. }));
+        assert!(!dekopon_core::error_chain(&error).contains(sentinel));
+    }
 }
