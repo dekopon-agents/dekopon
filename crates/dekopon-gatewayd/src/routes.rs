@@ -10,8 +10,7 @@ use crate::{
     cache_key,
     config::{
         GithubEvent, MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, ResolvedPolicy,
-        Steering,
-        render_problems,
+        Steering, render_problems,
     },
     progress::ProgressDetail,
     transport::InboundMessage,
