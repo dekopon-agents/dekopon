@@ -30,6 +30,7 @@ pub(crate) mod local;
 pub(crate) mod recovery;
 pub(crate) mod slack;
 pub(crate) mod telegram;
+pub(crate) mod webhook;
 pub(crate) mod whatsapp;
 
 pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;

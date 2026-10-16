@@ -1018,6 +1018,30 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 }
 
 #[tokio::test]
+async fn a_wake_store_interval_must_exceed_the_routed_script_timeout() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["routes"][0]["wakes"] = json!(true);
+    config["routes"][0]["limits"]["scriptTimeoutMs"] = json!(300_000);
+    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 300_000});
+    let error = load(directory.path(), &config)
+        .await
+        .expect_err("equal intervals overlap");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::WakeIntervalWithinScriptTimeout {
+            route: 0,
+            min_interval_ms: 300_000,
+            script_timeout_ms: 300_000
+        }
+    )));
+    config["sessions"]["wakes"]["minIntervalMs"] = json!(360_000);
+    load(directory.path(), &config)
+        .await
+        .expect("longer interval loads");
+}
+
+#[tokio::test]
 async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
     let directory = temporary();
     let mut document = document(directory.path());

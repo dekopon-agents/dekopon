@@ -171,6 +171,98 @@ fn a_baseline_never_fires_and_a_broken_probe_is_never_stored() {
     ));
 }
 
+struct ChecksStatus(u8);
+
+impl dekopon_shell::CapabilityInvoker for ChecksStatus {
+    fn granted(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn command_words(&self) -> Vec<String> {
+        vec!["gh".to_owned()]
+    }
+
+    fn run_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        _stdin_piped: bool,
+    ) -> Option<dekopon_shell::CommandRun> {
+        assert_eq!(word, "gh");
+        assert_eq!(argv, ["pr", "checks", "-R", "owner/repo", "42"]);
+        Some(dekopon_shell::CommandRun::Rendered {
+            stdout: "check table must not enter the probe".to_owned(),
+            stderr: String::new(),
+            status: self.0,
+        })
+    }
+
+    fn invoke(
+        &self,
+        _: dekopon_shell::CommandProposal,
+        _streams: dekopon_shell::Streams,
+        _tree: &dekopon_shell::TreeContext,
+    ) -> dekopon_shell::CapabilityCallResult {
+        dekopon_shell::secret_use_unsupported()
+    }
+}
+
+#[test]
+fn checks_recipe_waits_on_pending_fires_with_one_word_and_stops_on_errors() {
+    let script = "gh pr checks -R owner/repo 42 > /dev/null; s=$?; case $s in 0) echo pass; exit 0;; 1) echo fail; exit 0;; 8) exit 1;; *) exit $s;; esac";
+    let limits = dekopon_shell::Limits::default();
+    for (status, word) in [(0, "pass"), (1, "fail")] {
+        let probe = Probe::baseline(script.to_owned(), &ChecksStatus(8), limits).expect("wait");
+        assert_eq!(
+            probe.tick(&ChecksStatus(status), limits),
+            Verdict::Fire {
+                output: word.to_owned()
+            }
+        );
+    }
+    let probe = Probe::baseline(script.to_owned(), &ChecksStatus(8), limits).expect("wait");
+    assert_eq!(
+        probe.tick(&ChecksStatus(8), limits),
+        Verdict::Wait {
+            output: String::new()
+        }
+    );
+    let directory = temporary();
+    let store = wake_store(directory.path());
+    let now = SystemTime::now();
+    store
+        .register(
+            anchor(),
+            "check the PR".to_owned(),
+            now,
+            Schedule::Watch {
+                probe,
+                every: Duration::from_secs(60),
+                until: Duration::from_secs(600),
+            },
+        )
+        .expect("registered");
+    let due = now + Duration::from_secs(61);
+    let tick = store
+        .take_due(due)
+        .expect("readable")
+        .ticks
+        .pop()
+        .expect("due");
+    let verdict = tick.run(&ChecksStatus(2), limits);
+    assert!(matches!(&verdict, Verdict::Failed { exit, .. } if exit.get() == 2));
+    let Resolved::Fired(fired) = tick.resolve(&store, verdict, due).expect("resolved") else {
+        panic!("a failed check must retire the watch")
+    };
+    let inbound = fired.into_inbound();
+    assert!(inbound.text.contains("stopped because its probe exited 2"));
+    assert!(matches!(&inbound.message_id, MessageId::Wake { notice, .. }
+        if notice.starts_with("check the PR") && !notice.ends_with("\n\npass") && !notice.ends_with("\n\nfail")));
+    assert!(!inbound.text.contains("[gateway: the probe printed:]\npass"));
+    assert!(!inbound.text.contains("[gateway: the probe printed:]\nfail"));
+    assert!(store.list(anchor().subject(), due).is_empty());
+}
+
 #[test]
 fn a_local_chat_cannot_anchor_a_wake() {
     assert!(Anchor::from_inbound(&message("later"), &route(model_config()).agent).is_none());
@@ -330,6 +422,57 @@ fn pending_wakes_survive_a_restart_and_a_corrupt_store_refuses_to_start() {
     ));
 }
 
+#[test]
+fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
+    let directory = temporary();
+    let now = SystemTime::now();
+    {
+        let store = wake_store(directory.path());
+        store
+            .register(
+                anchor(),
+                "check the PR".to_owned(),
+                now,
+                Schedule::Watch {
+                    probe: Probe::baseline(
+                        "echo pass; exit 0".to_owned(),
+                        &NoProviders,
+                        dekopon_shell::Limits::default(),
+                    )
+                    .expect("baseline"),
+                    every: Duration::from_secs(60),
+                    until: Duration::from_secs(600),
+                },
+            )
+            .expect("registered");
+    }
+    let store = wake_store(directory.path());
+    let due = now + Duration::from_secs(61);
+    let tick = store
+        .take_due(due)
+        .expect("readable")
+        .ticks
+        .pop()
+        .expect("restored watch");
+    let verdict = tick.run(&NoProviders, dekopon_shell::Limits::default());
+    assert_eq!(
+        verdict,
+        Verdict::Fire {
+            output: "pass".to_owned()
+        }
+    );
+    let fired = tick.resolve(&store, verdict, due).expect("resolved");
+    let Resolved::Fired(fired) = fired else {
+        panic!("a terminal check must fire")
+    };
+    let inbound = fired.into_inbound();
+    assert_eq!(inbound.transport, anchor().transport().to_string());
+    assert_eq!(inbound.subject, anchor().subject().clone());
+    assert_eq!(inbound.conversation, anchor().conversation().clone());
+    assert_eq!(inbound.reply, slack_message("anchor").reply);
+    assert!(inbound.text.contains("pass"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_carries_prev_between_read_only_ticks_and_fires_once() {
     let directory = temporary();
@@ -454,6 +597,61 @@ async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
     assert!(prompt.starts_with("[gateway: wake 1 fired."), "{prompt}");
     assert!(prompt.contains("check the PR"), "{prompt}");
     assert_eq!(triggers(&mut observed), [Trigger::Wake]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fired_wake_with_no_route_sends_only_the_orphan_notice() {
+    let directory = temporary();
+    let store = wake_store(directory.path());
+    once(
+        &store,
+        "check the PR",
+        SystemTime::now() - Duration::from_secs(2),
+    );
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers: BTreeMap<String, Arc<dyn ChatDriver>> =
+        BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let runner = runner_with_wakes(
+        ResolvedBroker {
+            socket_path: directory.path().join("absent.sock"),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        ModelScript::forbidden(),
+        &store,
+    );
+    let (_sender, receiver) = mpsc::channel(4);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(crate::serve(
+        runner,
+        Arc::new(crate::routes::RoutingTable::default()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+        receiver,
+        async move {
+            shutdown_rx.await.expect("shutdown signal");
+        },
+        Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !driver.replies().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the due wake reaches its original chat");
+    shutdown_tx.send(()).expect("serving shutdown receiver");
+    assert_eq!(
+        serving.await.expect("serving joins"),
+        crate::ServeOutcome::Shutdown
+    );
+    assert_eq!(driver.replies(), ["check the PR"]);
+    assert!(store.list(anchor().subject(), SystemTime::now()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
