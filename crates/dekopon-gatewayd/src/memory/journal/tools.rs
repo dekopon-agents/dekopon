@@ -1,4 +1,5 @@
 use super::{Journal, JournalError, Line, duration_millis, millis, validated_lines};
+use crate::{config::memory::ResolvedPolicy, memory::generation::version};
 use dekopon_agent::{
     memory_tools::MemoryTools,
     prompt::{Pin, ReadRef},
@@ -17,7 +18,27 @@ pub(crate) struct JournalMemoryTools<'a> {
     pub grant: String,
     pub versions: HashMap<String, String>,
 }
-impl JournalMemoryTools<'_> {
+impl<'a> JournalMemoryTools<'a> {
+    pub(crate) fn new(
+        journal: &'a Journal,
+        stem: String,
+        grant: String,
+        policy: &ResolvedPolicy,
+    ) -> Self {
+        let versions = policy
+            .routines
+            .iter()
+            .filter(|routine| policy.retain.contains(&routine.id))
+            .map(|routine| (routine.id.clone(), version(routine)))
+            .collect();
+        Self {
+            journal,
+            stem,
+            grant,
+            versions,
+        }
+    }
+
     fn eligible(&self, line: &Line) -> bool {
         line.grant == self.grant
             && line.at_ms

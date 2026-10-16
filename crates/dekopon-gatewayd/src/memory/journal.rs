@@ -2457,6 +2457,22 @@ mod tests {
         assert!(!journal.path(&stem).exists());
     }
 
+    #[test]
+    fn memory_tools_offer_only_retained_routines_like_the_projection_label() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let mut policy = decider_policy();
+        append_represented(&journal, &stem, &policy, "first", &[(1, "summary text")]);
+        policy.retain.retain(|id| id != "summary");
+        let tools = JournalMemoryTools::new(&journal, stem, GRANT.into(), &policy);
+        assert_eq!(
+            tools.read(1, "summary", None),
+            "representation unavailable: missing, discarded or version mismatch; eligible representation IDs: original"
+        );
+    }
+
     fn decider_policy() -> ResolvedPolicy {
         use crate::config::memory::{Routine, RoutineKind, SelectionMode};
         let mut policy = ResolvedPolicy::default();

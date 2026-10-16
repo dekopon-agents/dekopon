@@ -1876,19 +1876,6 @@ async fn session(
         .cloned();
     let memory_stem = key.journal_stem();
     let memory_grant = journal::grant_digest(&granted);
-    let memory_versions: std::collections::HashMap<_, _> = route
-        .memory_policy
-        .clone()
-        .unwrap_or_default()
-        .routines
-        .iter()
-        .map(|routine| {
-            (
-                routine.id.clone(),
-                crate::memory::generation::version(routine),
-            )
-        })
-        .collect();
     let selection_policy = route.memory_policy.clone().unwrap_or_default();
     let selection_seal = sealed.map(|seal| seal.at);
     let selection_window = window.filter(|window| window.recall == RecallSource::Journal);
@@ -1950,14 +1937,14 @@ async fn session(
             // Withholding the agent-config view here removes the structured dump but not the underlying
             // instructions, which are still the system prompt, so this is not secrecy from a determined
             // user.
-            let memory_tools = memory_journal
-                .as_ref()
-                .map(|journal| journal::JournalMemoryTools {
+            let memory_tools = memory_journal.as_ref().map(|journal| {
+                journal::JournalMemoryTools::new(
                     journal,
-                    stem: memory_stem,
-                    grant: memory_grant,
-                    versions: memory_versions,
-                });
+                    memory_stem,
+                    memory_grant,
+                    &selection_policy,
+                )
+            });
             if let Some(tools) = memory_tools.as_ref() {
                 inputs = inputs.with_memory_tools(tools);
             }
