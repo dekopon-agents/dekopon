@@ -717,6 +717,7 @@ mod tests {
             );
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].field("category"), Some("token-endpoint-rejected"));
+            assert_eq!(events[0].field("error"), None);
             assert_eq!(
                 events[0].field("message"),
                 Some("a GitHub App installation token could not be minted")
