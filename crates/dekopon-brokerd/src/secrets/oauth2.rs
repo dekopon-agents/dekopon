@@ -223,18 +223,22 @@ pub(super) async fn resolve_for(
     .await
 }
 
-pub(super) async fn resolve_with_clock(inputs: RefreshInputs) -> Result<Vec<u8>, SourceError> {
-    let span = tracing::Span::current();
+pub(super) fn refresh_task(
+    inputs: RefreshInputs,
+    span: tracing::Span,
+) -> impl Future<Output = Result<Vec<u8>, SourceError>> + Send + 'static {
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    run(inputs, span.clone())
+        .instrument(span)
+        .with_subscriber(dispatch)
+}
+
+pub(super) async fn resolve_with_clock(inputs: RefreshInputs) -> Result<Vec<u8>, SourceError> {
     #[expect(
         clippy::disallowed_methods,
         reason = "owner: the broker request awaits the handle; bound: one refresh per authorized resolution, with a bounded HTTP deadline; the task must persist a spent rotation even if the caller drops"
     )]
-    let task = tokio::task::spawn(
-        run(inputs, span.clone())
-            .instrument(span)
-            .with_subscriber(dispatch),
-    );
+    let task = tokio::task::spawn(refresh_task(inputs, tracing::Span::current()));
     task.await
         .map_err(|source| classified(SourceError::Internal, &source))?
 }

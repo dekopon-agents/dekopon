@@ -316,7 +316,9 @@ impl ScheduledCatalog {
     }
 
     pub(crate) fn entries(&self) -> Vec<(SecretDrn, PathBuf, bool)> {
-        self.resolver
+        let mut records = BTreeMap::new();
+        for (drn, path, has_seed) in self
+            .resolver
             .iter()
             .flat_map(|resolver| &resolver.entries)
             .filter_map(|(drn, entry)| match &entry.source {
@@ -342,14 +344,31 @@ impl ScheduledCatalog {
                 | SecretSource::KubernetesTokenRequest { .. }
                 | SecretSource::KubernetesApi { .. } => None,
             })
+        {
+            records.entry(path).or_insert((drn, has_seed));
+        }
+        records
+            .into_iter()
+            .map(|(path, (drn, has_seed))| (drn, path, has_seed))
             .collect()
     }
 
-    pub(crate) async fn refresh(
+    pub(crate) fn refresh(
         &self,
         drn: &SecretDrn,
         clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    ) -> Result<(), SourceError> {
+    ) -> impl Future<Output = Result<(), SourceError>> + Send + 'static {
+        let catalog = self.clone();
+        let drn = drn.clone();
+        async move { catalog.refresh_task(&drn, clock)?.await.map(drop) }
+    }
+
+    fn refresh_task(
+        &self,
+        drn: &SecretDrn,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<impl Future<Output = Result<Vec<u8>, SourceError>> + Send + 'static, SourceError>
+    {
         let resolver = self.resolver.as_ref().ok_or(SourceError::Missing)?;
         let entry = resolver.entries.get(drn).ok_or(SourceError::Missing)?;
         let SecretSource::OAuth2Refresh {
@@ -367,21 +386,21 @@ impl ScheduledCatalog {
             credential = %drn, trigger = "scheduled", outcome = tracing::field::Empty,
             secret.source.kind = "oauth2-refresh", duration_ms = tracing::field::Empty,
             credential.expires_at_unix_ms = tracing::field::Empty);
-        let _ = oauth2::resolve_with_clock(oauth2::RefreshInputs {
-            credential: Some(drn.clone()),
-            path: record_path.clone(),
-            seed_path: seed_path.clone(),
-            endpoint: token_endpoint.clone(),
-            client_id: client_id.clone(),
-            timeout: Duration::from_millis(*timeout_ms),
-            uid: resolver.expected_uid,
-            client: entry.client.clone(),
-            clock,
-            scheduled: true,
-        })
-        .instrument(span)
-        .await?;
-        Ok(())
+        Ok(oauth2::refresh_task(
+            oauth2::RefreshInputs {
+                credential: Some(drn.clone()),
+                path: record_path.clone(),
+                seed_path: seed_path.clone(),
+                endpoint: token_endpoint.clone(),
+                client_id: client_id.clone(),
+                timeout: Duration::from_millis(*timeout_ms),
+                uid: resolver.expected_uid,
+                client: entry.client.clone(),
+                clock,
+                scheduled: true,
+            },
+            span,
+        ))
     }
 }
 

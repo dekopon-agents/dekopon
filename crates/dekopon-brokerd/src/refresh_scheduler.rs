@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
-use dekopon_core::SecretDrn;
-use tokio::time::MissedTickBehavior;
+use tokio::{task::JoinSet, time::MissedTickBehavior};
+use tracing::instrument::WithSubscriber as _;
 
 use crate::{
     BrokerdError, ServerError, ShutdownDeadline,
-    secrets::{self, oauth2},
+    secrets::{self, SourceError, oauth2},
 };
 
 const TICK: Duration = Duration::from_secs(5 * 60);
@@ -35,7 +35,8 @@ where
     tokio::pin!(server);
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut retry = BTreeMap::<SecretDrn, u64>::new();
+    let mut retry = BTreeMap::<PathBuf, u64>::new();
+    let mut attempts = JoinSet::<Result<(), SourceError>>::new();
     let mut generation: Option<secrets::ScheduledCatalog> = None;
     loop {
         tokio::select! {
@@ -52,16 +53,17 @@ where
         }
         generation = Some(current.clone());
         let entries = current.entries();
-        retry.retain(|drn, _| entries.iter().any(|(key, _, _)| key == drn));
+        retry.retain(|record, _| entries.iter().any(|(_, path, _)| path == record));
         for (drn, path, has_seed) in entries {
             let seed_on_boot = new_generation && has_seed;
             let now = now_seconds();
-            if retry.get(&drn).is_some_and(|until| now < *until) {
+            if retry.get(&path).is_some_and(|until| now < *until) {
                 continue;
             }
             let uid = crate::socket::current_uid();
+            let record = path.clone();
             let inspected =
-                tokio::task::spawn_blocking(move || oauth2::due_at(&path, uid, now)).await;
+                tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid, now)).await;
             let due = match inspected {
                 Err(_) => false,
                 Ok(result) => match result {
@@ -76,24 +78,31 @@ where
             if !due {
                 continue;
             }
-            let attempt = current.refresh(&drn, Arc::clone(&now_seconds));
-            tokio::pin!(attempt);
+            attempts.spawn(
+                current
+                    .refresh(&drn, Arc::clone(&now_seconds))
+                    .with_current_subscriber(),
+            );
             tokio::select! {
                 biased;
                 result = &mut server => {
-                    let drain = match deadline.get() {
-                        Some(until) => tokio::time::timeout_at(until, attempt).await.is_ok(),
-                        None => { drop(attempt.await); true },
+                    let drained = match deadline.get() {
+                        Some(until) => tokio::time::timeout_at(until, attempts.join_next()).await.is_ok(),
+                        None => { attempts.join_next().await; true },
                     };
-                    if !drain { return Err(BrokerdError::Server(ServerError::ShutdownTimeout)); }
+                    if !drained {
+                        attempts.shutdown().await;
+                        return Err(BrokerdError::Server(ServerError::ShutdownTimeout));
+                    }
                     return result;
                 }
-                result = &mut attempt => {
-                    if let Err(error) = result {
-                        tracing::warn!(event = "broker_credential_scheduled_failed", credential = %drn, category = error.category());
-                        retry.insert(drn.clone(), now.saturating_add(oauth2::retry_seconds()));
-                    } else {
-                        retry.remove(&drn);
+                Some(joined) = attempts.join_next() => {
+                    match joined.unwrap_or(Err(SourceError::Internal)) {
+                        Ok(()) => { retry.remove(&path); }
+                        Err(error) => {
+                            tracing::warn!(event = "broker_credential_scheduled_failed", credential = %drn, category = error.category());
+                            retry.insert(path, now.saturating_add(oauth2::retry_seconds()));
+                        }
                     }
                 }
             }
