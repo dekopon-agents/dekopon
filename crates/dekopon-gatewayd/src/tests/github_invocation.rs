@@ -238,7 +238,7 @@ async fn github_model_failure_does_not_post_or_invoke_a_fix() {
     assert_eq!(
         requests.len(),
         1,
-        "a claimed run cannot call a write capability"
+        "model failure after the capability listing makes no broker invocation"
     );
     assert!(matches!(
         requests[0].request,
