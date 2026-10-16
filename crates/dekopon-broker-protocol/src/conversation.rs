@@ -159,6 +159,18 @@ impl Conversation {
                     && self.id == subject.subject()
                     && thread.is_none()
             }
+            ChatTransportKind::Github => {
+                subject.service() == SubjectService::Github
+                    && self.kind == ConversationKind::Thread
+                    && container == subject.tenant()
+                    && self.id
+                        == format!(
+                            "{}.{}",
+                            subject.tenant().unwrap_or_default(),
+                            subject.subject()
+                        )
+                    && thread.is_some_and(lowercase_scope_value)
+            }
             ChatTransportKind::Local => {
                 container.is_none_or(lowercase_scope_value)
                     && lowercase_scope_value(&self.id)
@@ -185,8 +197,15 @@ impl ChatTransportKind {
                 | ConversationKind::Channel
                 | ConversationKind::Thread,
             ) => true,
-            (Self::Whatsapp, ConversationKind::DirectMessage) => true,
-            (Self::Discord | Self::Telegram, ConversationKind::GroupDirectMessage)
+            (Self::Whatsapp, ConversationKind::DirectMessage)
+            | (Self::Github, ConversationKind::Thread) => true,
+            (
+                Self::Github,
+                ConversationKind::DirectMessage
+                | ConversationKind::GroupDirectMessage
+                | ConversationKind::Channel,
+            )
+            | (Self::Discord | Self::Telegram, ConversationKind::GroupDirectMessage)
             | (
                 Self::Whatsapp,
                 ConversationKind::GroupDirectMessage
@@ -385,6 +404,7 @@ fn canonical_id_for(transport: ChatTransportKind, value: &str) -> bool {
             ChatTransportKind::Discord => canonical_unsigned_decimal(value),
             ChatTransportKind::Telegram => canonical_signed_decimal(value),
             ChatTransportKind::Whatsapp => canonical_meta_decimal(value),
+            ChatTransportKind::Github => canonical_github_id(value),
             ChatTransportKind::Local => lowercase_scope_value(value),
         }
 }
@@ -395,9 +415,24 @@ fn canonical_container_for(transport: ChatTransportKind, value: &str) -> bool {
             ChatTransportKind::Slack => lowercase_token(value),
             ChatTransportKind::Discord => canonical_unsigned_decimal(value),
             ChatTransportKind::Whatsapp => canonical_whatsapp_container(value),
+            ChatTransportKind::Github => github_segment(value, 39),
             ChatTransportKind::Local => lowercase_scope_value(value),
             ChatTransportKind::Telegram => false,
         }
+}
+
+fn github_segment(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn canonical_github_id(value: &str) -> bool {
+    value
+        .split_once('.')
+        .is_some_and(|(owner, repo)| github_segment(owner, 39) && github_segment(repo, 100))
 }
 
 /// `waba:phoneNumberId`, the pair Meta authenticates a Cloud API delivery under.
@@ -527,6 +562,52 @@ mod local_selector_tests {
         ChatTransportKind, ConversationKind, ConversationKindMatch, ConversationMatch,
         ConversationMatchProblem,
     };
+
+    #[test]
+    fn github_thread_is_bound_to_its_subject_owner_and_repo() {
+        use super::Conversation;
+        use dekopon_core::ExternalSubject;
+        let subject = ExternalSubject::github("a", "x").unwrap();
+        let conversation = Conversation {
+            kind: ConversationKind::Thread,
+            container: Some("a".into()),
+            id: "a.x".into(),
+            thread: Some("delivery-guid".into()),
+        };
+        assert!(conversation.is_canonical_for(ChatTransportKind::Github, &subject));
+        assert!(!conversation.is_canonical_for(
+            ChatTransportKind::Github,
+            &ExternalSubject::github("b", "x").unwrap()
+        ));
+        assert_ne!(
+            conversation.key(),
+            Conversation {
+                container: Some("b".into()),
+                id: "b.x".into(),
+                ..conversation.clone()
+            }
+            .key()
+        );
+        let selector = ConversationMatch {
+            kind: ConversationKindMatch::Kinds(vec![ConversationKind::Thread]),
+            container: Some("a".into()),
+            ids: Some(vec!["a.x".into()]),
+        };
+        assert!(selector.validate(ChatTransportKind::Github).is_empty());
+        assert!(selector.matches(&conversation));
+        assert!(!selector.matches(&Conversation {
+            id: "a.other".into(),
+            ..conversation.clone()
+        }));
+        assert!(
+            !ConversationMatch {
+                ids: Some(vec!["a.x.y".into()]),
+                ..selector
+            }
+            .validate(ChatTransportKind::Github)
+            .is_empty()
+        );
+    }
 
     #[test]
     fn a_local_id_containing_a_colon_is_one_id_rather_than_a_thread_form() {

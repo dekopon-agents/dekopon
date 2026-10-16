@@ -2556,6 +2556,7 @@ pub(crate) fn delivery_identity(
                 message: message_id.to_owned(),
             })
         }
+        dekopon_broker_protocol::ChatTransportKind::Github => None,
         dekopon_broker_protocol::ChatTransportKind::Local => {
             let mut fields = message_id.rsplitn(3, '-');
             let sequence = fields.next()?.parse().ok()?;

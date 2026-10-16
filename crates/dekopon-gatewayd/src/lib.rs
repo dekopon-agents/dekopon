@@ -630,6 +630,7 @@ fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
             access_token_env,
             ..
         } => vec![app_secret_env, verify_token_env, access_token_env],
+        TransportConfig::GithubWebhook { secret_env, .. } => vec![secret_env],
         TransportConfig::Local { .. } => Vec::new(),
     }
 }
@@ -910,6 +911,14 @@ fn build_transport(
         settings
     };
     Ok(match spec {
+        TransportConfig::GithubWebhook {
+            name, secret_env, ..
+        } => {
+            let _secret = transport::read_credential(secret_env)?;
+            return Err(TransportError::NotMountableInThisBuild {
+                transport: name.clone(),
+            });
+        }
         TransportConfig::SlackSocketMode {
             name,
             app_token_env,

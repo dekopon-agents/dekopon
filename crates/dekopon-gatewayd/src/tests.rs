@@ -1193,6 +1193,172 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 }
 
 #[tokio::test]
+async fn github_config_checks_structure_before_boot_secret_and_mount() {
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080", "secretEnv": "CC07_S2_ABSENT_SECRET"});
+    doc["routes"][0]["transport"] = json!("github");
+    doc["routes"][0]["conversation"] =
+        json!({"kind": ["thread"], "container": "owner", "ids": ["owner.repo"]});
+    doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+    doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let path = write_config(directory.path(), &doc);
+    let (candidate, report) =
+        crate::load_candidate(&path, None, config::LoadMode::Check, None).await;
+    assert!(candidate.is_some(), "{report:?}");
+    assert!(report.warnings.iter().any(|warning| matches!(warning, crate::CheckWarning::TransportCredential { transport, variable } if transport == "github" && variable == "CC07_S2_ABSENT_SECRET")));
+    let (candidate, report) =
+        crate::load_candidate(&path, None, config::LoadMode::Boot, None).await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport { source: crate::transport::TransportError::MissingCredential { .. }, .. })))));
+    assert!(matches!(
+        crate::transport::credential_from("CC07_S2_ABSENT_SECRET", Some("".into())),
+        Err(crate::transport::TransportError::EmptyCredential { .. })
+    ));
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    assert!(matches!(
+        crate::build_transport(&resolved.transports[0], &resolved),
+        Err(crate::transport::TransportError::MissingCredential { .. })
+    ));
+    assert!(!std::env::var("PATH").expect("Cargo test PATH").is_empty());
+    doc["transports"][0]["secretEnv"] = json!("PATH");
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    assert!(
+        matches!(crate::build_transport(&resolved.transports[0], &resolved), Err(crate::transport::TransportError::NotMountableInThisBuild { transport }) if transport == "github")
+    );
+    doc["transports"][0]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
+    for (field, value) in [
+        ("secretEnv", serde_json::Value::Null),
+        ("bind", serde_json::Value::Null),
+    ] {
+        let mut bad = doc.clone();
+        bad["transports"][0][field] = value;
+        assert!(matches!(
+            load(directory.path(), &bad).await,
+            Err(ConfigError::Decode { .. })
+        ));
+    }
+    for events in [
+        json!(null),
+        json!([]),
+        json!(["pull_request", "pull_request"]),
+        json!(["unknown"]),
+    ] {
+        let mut bad = doc.clone();
+        bad["routes"][0]["githubEvents"] = events;
+        assert!(load(directory.path(), &bad).await.is_err());
+    }
+    let mut bad = doc.clone();
+    bad["transports"][0]["callbackPath"] = json!("/webhooks/github");
+    assert!(matches!(
+        load(directory.path(), &bad).await,
+        Err(ConfigError::Decode { .. })
+    ));
+    let mut bad = doc.clone();
+    bad["transports"].as_array_mut().unwrap().push(json!({
+        "kind": "whatsappCloudApi", "name": "whatsapp", "bind": "127.0.0.1:9081",
+        "callbackPath": "/webhooks/whatsapp", "appSecretEnv": "W_APP",
+        "verifyTokenEnv": "W_VERIFY", "accessTokenEnv": "W_ACCESS",
+        "wabaId": "123", "phoneNumberId": "456", "graphApiVersion": "v23.0"
+    }));
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::ConflictingWebhookMount { .. })
+    ));
+    let mut bad = doc.clone();
+    bad["routes"][0]["memory"] = json!({"mode": "persistent"});
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::GithubRequiresOneShot { .. })
+    ));
+    let mut bad = doc.clone();
+    bad["routes"][0]["conversation"]["ids"] = json!(["owner.dotted.repo"]);
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::InvalidRouteConversation { .. })
+    ));
+}
+
+#[tokio::test]
+async fn broken_gateway_document_has_parser_error_without_route_indices() {
+    let directory = temporary();
+    let path = directory.path().join("dekopon-gatewayd.yaml");
+    fs::write(&path, "routes: [\n  - {transport: github\n").unwrap();
+    let (candidate, report) =
+        crate::load_candidate(&path, None, config::LoadMode::Check, None).await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Config(ConfigError::Decode { .. })
+    )));
+    assert!(!report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Config(ConfigError::Invalid { problems, .. }) if problems.iter().any(|p| matches!(p, ConfigProblem::InvalidGithubEvents { .. } | ConfigProblem::GithubRequiresOneShot { .. })))));
+}
+
+#[tokio::test]
+async fn github_first_selector_wins_before_event_filter() {
+    use crate::config::GithubEvent;
+    use dekopon_broker_protocol::{Conversation, ConversationKind};
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080", "secretEnv": "CC07_S2_ABSENT_SECRET"});
+    let mut first = doc["routes"][0].clone();
+    first["transport"] = json!("github");
+    first["memory"] = json!({"mode": "oneShot"});
+    first["conversation"] =
+        json!({"kind": ["thread"], "container": "owner", "ids": ["owner.repo"]});
+    first["githubEvents"] = json!(["pull_request"]);
+    let mut second = first.clone();
+    second["githubEvents"] = json!(["workflow_run"]);
+    doc["routes"] = json!([first, second]);
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    let catalog =
+        dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml")).unwrap();
+    let routes = crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap();
+    let conversation = Conversation {
+        kind: ConversationKind::Thread,
+        container: Some("owner".into()),
+        id: "owner.repo".into(),
+        thread: Some("guid".into()),
+    };
+    let subject = dekopon_core::ExternalSubject::github("owner", "repo").unwrap();
+    assert!(
+        routes
+            .github_route("github", &conversation, &subject, GithubEvent::WorkflowRun)
+            .is_none()
+    );
+    assert_eq!(
+        routes
+            .github_route("github", &conversation, &subject, GithubEvent::PullRequest)
+            .unwrap()
+            .route_index,
+        0
+    );
+    assert!(
+        routes
+            .github_route(
+                "github",
+                &Conversation {
+                    id: "owner.other".into(),
+                    ..conversation
+                },
+                &subject,
+                GithubEvent::PullRequest
+            )
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn a_wake_store_interval_must_exceed_the_routed_script_timeout() {
     let directory = temporary();
     let mut config = document(directory.path());
@@ -3253,6 +3419,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
             ids: None,
         },
         subjects: None,
+        github_events: None,
         agent: "reviewer".parse().expect("valid agent fixture"),
         description: "Reviews things".to_owned(),
         model_class: Some("reasoning".to_owned()),

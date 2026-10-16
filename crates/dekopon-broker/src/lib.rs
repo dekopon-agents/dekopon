@@ -4183,6 +4183,7 @@ fn render_chat_slots(
         ChatTransportKind::Discord
         | ChatTransportKind::Telegram
         | ChatTransportKind::Whatsapp
+        | ChatTransportKind::Github
         | ChatTransportKind::Local => id.to_owned(),
     };
     for slot in http.template_slots() {
