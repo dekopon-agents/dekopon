@@ -279,6 +279,64 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
 }
 
 #[tokio::test]
+async fn active_reload_ignores_unset_transport_token_but_still_checks_model_credentials() {
+    const BOT_TOKEN: &str = "DEKOPON_GATEWAYD_TEST_UNSET_RELOAD_BOT_E82C";
+    const MODEL_KEY: &str = "DEKOPON_GATEWAYD_TEST_UNSET_RELOAD_MODEL_E82C";
+    assert!(std::env::var_os(BOT_TOKEN).is_none());
+    assert!(std::env::var_os(MODEL_KEY).is_none());
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["transports"] = json!([{
+        "name": "dev", "kind": "telegramLongPoll", "botTokenEnv": BOT_TOKEN,
+        "endpoint": "http://127.0.0.1:1"
+    }]);
+    let path = write_config(root.path(), &config);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let sources = gateway_sources(&active).await;
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &sources)),
+    )
+    .await;
+    let candidate = candidate.unwrap_or_else(|| panic!("active reload rejected: {report:?}"));
+    assert!(
+        candidate.transports.is_empty(),
+        "reload must not build transports"
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|problem| matches!(problem, crate::GatewaydError::Startup { .. }))
+    );
+
+    config["models"][0]["apiKeyEnv"] = json!(MODEL_KEY);
+    write_config(root.path(), &config);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        Some((&active, &sources)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(problem,
+        crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem,
+            crate::StartupProblem::ModelCredential(error) if error.variable == MODEL_KEY
+        ))
+    )), "model credential must still be checked: {report:?}");
+}
+
+#[tokio::test]
 async fn snapshot_classifies_resident_changes_separately_from_models_and_indicators() {
     let root = temporary();
     let path = write_config(root.path(), &document(root.path()));
@@ -18642,6 +18700,229 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
             assert!(broker.recorded().is_empty(), "Active is not committed");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let listener = UnixListener::bind(root.path().join("broker.sock")).unwrap();
+    fs::set_permissions(
+        root.path().join("broker.sock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let (requests_tx, mut requests) = mpsc::channel(4);
+    let broker_task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tx = requests_tx.clone();
+            connections.spawn(async move {
+                let mut stream = DescriptorStream::new(stream);
+                let (request, _) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
+                    .await
+                    .unwrap();
+                tx.send(request.request).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+    drivers.insert("dev".to_owned(), Arc::new(RecordingDriver::default()));
+    let gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(gateway.serve(
+        rx,
+        async move {
+            stopped.await.expect("shutdown sender stays alive");
+        },
+        Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), requests.recv()).await,
+        Ok(Some(BrokerRequest::PrepareGeneration { .. }))
+    ));
+    tx.send(TransportEvent::Message(Box::new(message(
+        "while broker is blocked",
+    ))))
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), requests.recv()).await,
+            Ok(Some(BrokerRequest::Capabilities { .. }))
+        ),
+        "routed inbound must reach broker while reload is blocked"
+    );
+    stop.send(()).unwrap();
+    assert!(matches!(
+        serving.await.unwrap(),
+        crate::ServeOutcome::Shutdown
+    ));
+    broker_task.abort();
+    broker_task.await.unwrap_err();
+}
+
+#[tokio::test]
+async fn dispatched_message_starts_on_its_captured_generation_after_route_removal() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }],
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+    drivers.insert("dev".to_owned(), Arc::new(RecordingDriver::default()));
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let dispatched = gateway.generation_for_test();
+    document["routes"][0]["conversation"]["kind"] = json!(["channel"]);
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(gateway.route_for_test(&message("not routed now")).is_none());
+    let mut sessions = tokio::task::JoinSet::new();
+    gateway.start_with_generation_for_test(
+        &mut sessions,
+        &dispatched,
+        message("already dispatched"),
+    );
+    assert!(
+        matches!(
+            broker.request().await.request,
+            BrokerRequest::Capabilities { .. }
+        ),
+        "the message admitted on the captured route must start"
+    );
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn refused_broker_digest_is_adopted_for_next_prepare_and_publication() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &document);
+    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let old = "b".repeat(64);
+    let current = "c".repeat(64);
+    let response = |outcome| ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: current.clone(),
+            outcome,
+        },
+    };
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [
+            response(GenerationOutcome::Refused),
+            response(GenerationOutcome::Active),
+        ],
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, old.clone())
+    .unwrap();
+    let prior = gateway.digest_for_test();
+    document["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &document);
+    let (capture, _guard) = capture_spans();
+    gateway.reconcile().await;
+    assert!(
+        matches!(broker.request().await.request, BrokerRequest::PrepareGeneration { digest } if digest == old)
+    );
+    assert_eq!(
+        gateway.digest_for_test(),
+        prior,
+        "refusal is not publication"
+    );
+    gateway.reconcile().await;
+    assert!(
+        matches!(broker.request().await.request, BrokerRequest::PrepareGeneration { digest } if digest == current)
+    );
+    assert!(broker.recorded().is_empty(), "Active needs no commit");
+    assert_eq!(gateway.broker_digest_for_test(), current);
+    assert_ne!(gateway.digest_for_test(), prior);
+    assert_eq!(
+        gateway.route_for_test(&message("new")).unwrap().steering,
+        crate::config::Steering::Boundary
+    );
+    assert_eq!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

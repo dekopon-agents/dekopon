@@ -32,7 +32,7 @@ pub(crate) struct Gateway {
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
 }
 
-struct ServingGeneration {
+pub(crate) struct ServingGeneration {
     routes: Arc<RoutingTable>,
     stop_words: Arc<Vec<String>>,
     _sources: Option<Arc<config::GatewaySources>>,
@@ -191,6 +191,26 @@ impl Gateway {
     #[cfg(test)]
     pub(crate) fn digest_for_test(&self) -> String {
         self.active.load()._digest.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn broker_digest_for_test(&self) -> String {
+        self.active.load()._broker_digest.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation_for_test(&self) -> Arc<ServingGeneration> {
+        self.active.load_full()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_generation_for_test(
+        &self,
+        sessions: &mut JoinSet<()>,
+        generation: &ServingGeneration,
+        message: InboundMessage,
+    ) {
+        self.start_session(sessions, generation, message);
     }
 
     #[cfg(test)]
