@@ -213,6 +213,11 @@ async fn selected_summary_with_limit(
         outcome: "succeeded".into(),
         exit_status: Some(0),
     }]);
+    let turn = if summary_only {
+        turn.with_memory_id(crate::journal::mint_turn_id())
+    } else {
+        turn
+    };
     let inbound = message("next question");
     let key = ConversationKey::private(
         &route.agent,
@@ -258,6 +263,17 @@ async fn selected_summary_with_limit(
         )
         .unwrap();
     if summary_only {
+        let seed =
+            runner
+                .conversations
+                .begin(&key, &granted(&granted_ids), window, None, Instant::now());
+        assert!(seed.lease.commit(
+            window,
+            turn.clone(),
+            TakenIn::default(),
+            &seed.cache_key,
+            Instant::now()
+        ));
         let disk =
             std::fs::read_to_string(journal_dir.path().join(format!("{stem}.jsonl"))).unwrap();
         assert!(
@@ -450,6 +466,210 @@ async fn pinned_expanding_check_log_summary_is_sent_with_its_negative_savings() 
         None,
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_selected_omission_never_replays_its_resident_original() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let mut broker = BrokerFixture::answering(
+        directory.path(),
+        [ResponseEnvelope::chat_capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            None,
+        )],
+    );
+    let client = ResolvedBroker {
+        socket_path: broker.socket().to_owned(),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let model = ModelScript::new([answer("follow-up")]);
+    let runner = journaled_runner(client, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let mut window = recall_window(RecallSource::Journal);
+    window.limits.max_bytes = 30;
+    let mut route = persistent_route(model_config(), window);
+    route.memory_policy = Some(ResolvedPolicy::default());
+    let inbound = message("next question");
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    );
+    let grant = crate::journal::grant_digest(&granted(&["cli-probe.upper"]));
+    let turn = ConversationTurn::completed("X".repeat(40), "ok")
+        .with_memory_id(crate::journal::mint_turn_id());
+    runner
+        .journal
+        .as_ref()
+        .unwrap()
+        .append(
+            &key.journal_stem(),
+            &Entry {
+                at: SystemTime::now(),
+                grant: &grant,
+                turn: &turn,
+                inventory: &[],
+                next_asset_id: 1,
+                prepared: None,
+            },
+            window,
+        )
+        .unwrap();
+    let seed = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window,
+        None,
+        Instant::now(),
+    );
+    assert!(seed.lease.commit(
+        window,
+        turn,
+        TakenIn::default(),
+        &seed.cache_key,
+        Instant::now()
+    ));
+    run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        model.prompt(0)[1..],
+        [("user".into(), "next question".into())]
+    );
+    let omitted = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_memory_selection"),
+            ("record_id", "1"),
+            ("actual", "omitted"),
+            ("reason", "record-exceeds-budget"),
+        ],
+    );
+    assert_eq!(
+        omitted.len(),
+        1,
+        "selection cannot claim omission while replaying resident text"
+    );
+    assert_eq!(broker.recorded().len(), 1);
+}
+
+#[tokio::test]
+async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let mut broker = BrokerFixture::answering(
+        directory.path(),
+        [ResponseEnvelope::chat_capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            None,
+        )],
+    );
+    let client = ResolvedBroker {
+        socket_path: broker.socket().to_owned(),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let model = ModelScript::new([answer("follow-up")]);
+    let runner = journaled_runner(client, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let window = recall_window(RecallSource::Journal);
+    let mut route = persistent_route(model_config(), window);
+    route.memory_policy = Some(ResolvedPolicy::default());
+    let inbound = message("next question");
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    );
+    let grant_ids = granted(&["cli-probe.upper"]);
+    let grant = crate::journal::grant_digest(&grant_ids);
+    let older =
+        ConversationTurn::completed("older", "ok").with_memory_id(crate::journal::mint_turn_id());
+    runner
+        .journal
+        .as_ref()
+        .unwrap()
+        .append(
+            &key.journal_stem(),
+            &Entry {
+                at: SystemTime::now(),
+                grant: &grant,
+                turn: &older,
+                inventory: &[],
+                next_asset_id: 1,
+                prepared: None,
+            },
+            window,
+        )
+        .unwrap();
+    let first = runner
+        .conversations
+        .begin(&key, &grant_ids, window, None, Instant::now());
+    assert!(first.lease.commit(
+        window,
+        older,
+        TakenIn::default(),
+        &first.cache_key,
+        Instant::now()
+    ));
+    let newer =
+        ConversationTurn::completed("newer", "ok").with_memory_id(crate::journal::mint_turn_id());
+    let next = runner
+        .conversations
+        .begin(&key, &grant_ids, window, None, Instant::now());
+    assert!(next.lease.commit(
+        window,
+        newer,
+        TakenIn::default(),
+        &next.cache_key,
+        Instant::now()
+    ));
+    run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        model.prompt(0)[1..],
+        [
+            ("user".into(), "older".into()),
+            ("assistant".into(), "ok".into()),
+            ("user".into(), "newer".into()),
+            ("assistant".into(), "ok".into()),
+            ("user".into(), "next question".into())
+        ]
+    );
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[
+                    ("event", "gateway_memory_selection"),
+                    ("record_id", "1"),
+                    ("actual", "original"),
+                    ("reason", "selected")
+                ]
+            )
+            .len(),
+        1
+    );
+    assert_eq!(broker.recorded().len(), 1);
 }
 
 #[tokio::test]
