@@ -57,7 +57,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
                 attachment = Some(file);
                 ResponseEnvelope::invocation(serde_json::from_value(json!({
                     "invocation":request["invocation"]["id"],
-                    "decision":{"decisionId":"asset-test", "authorizedBy":"broker", "policyRevision":"test"},
+                    "decision":{"decisionId":"asset-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                     "outcome":"Succeeded"
                 })).unwrap(), vec![NewAsset { descriptor:0, content_type:"image/heic".into(), encoding:AssetEncoding::Identity, bytes:4, sha256:String::new() }], vec![], vec![])
             } else {
@@ -78,7 +78,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
                 assert_eq!(bytes, [0, 1, 2, 255]);
                 ResponseEnvelope::invocation(serde_json::from_value(json!({
                     "invocation":request["invocation"]["id"],
-                    "decision":{"decisionId":"asset-test", "authorizedBy":"broker", "policyRevision":"test"},
+                    "decision":{"decisionId":"asset-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                     "outcome":"Failed", "exitStatus":141
                 })).unwrap(), vec![], vec![], vec![])
             };
@@ -250,7 +250,7 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
                     .unwrap();
                     ResponseEnvelope::invocation(serde_json::from_value(json!({
                         "invocation": request["invocation"]["id"],
-                        "decision": {"decisionId":"wire-test", "authorizedBy":"broker", "policyRevision":"test"},
+                        "decision": {"decisionId":"wire-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                         "outcome":"Failed", "exitStatus":141
                     })).unwrap(), vec![], vec![], vec![])
                 }
