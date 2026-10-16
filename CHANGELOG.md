@@ -1,5 +1,9 @@
 # Console changelog
 
+## 0.13.0
+
+- Changed: Target published Dekopon 0.48.0 with exact crates.io pins for all ten authored core dependencies; a 0.37 console cannot decode a 0.48 broker's decision references, which carry `policyDigest` instead of `policyRevision`.
+
 ## 0.12.0
 
 - Changed: Target published Dekopon 0.37.0 with exact crates.io pins for all ten authored core dependencies; a 0.36 console cannot decode a 0.37 broker's capabilities answer.
