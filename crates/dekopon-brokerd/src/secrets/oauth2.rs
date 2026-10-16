@@ -16,6 +16,9 @@ use tracing::{Instrument as _, instrument::WithSubscriber as _};
 use super::{SourceError, classified};
 
 const RECORD_BYTES: usize = 64 * 1024;
+const CYCLE: u64 = 22 * 60 * 60;
+const BUFFER: u64 = 2 * 60 * 60;
+const RETRY: u64 = 5 * 60;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(
@@ -60,6 +63,15 @@ enum SealCause {
     BootstrapReflected,
 }
 
+impl SealCause {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::ReauthorizationRequired => "reauthorization-required",
+            Self::BootstrapReflected => "bootstrap-reflected",
+        }
+    }
+}
+
 impl OAuth2Record {
     fn access(&self) -> Result<&Redacted<String>, SourceError> {
         match self {
@@ -91,6 +103,7 @@ pub(super) struct RefreshInputs {
     pub(super) uid: u32,
     pub(super) client: reqwest::Client,
     pub(super) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub(super) scheduled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +218,7 @@ pub(super) async fn resolve_for(
         uid,
         client: client.clone(),
         clock: Arc::new(now_seconds),
+        scheduled: false,
     })
     .await
 }
@@ -360,6 +374,10 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one lock-held transaction serializes seed adoption, HTTP refresh, sealing and persistence"
+)]
 async fn refresh(
     opened: OpenedRecord,
     inputs: RefreshInputs,
@@ -374,6 +392,7 @@ async fn refresh(
         uid,
         client,
         clock,
+        scheduled,
     } = inputs;
     let seed = match seed_path {
         Some(seed_path) => match tokio::fs::symlink_metadata(&seed_path).await {
@@ -413,7 +432,20 @@ async fn refresh(
                 SourceError::Missing
             });
         };
-        if clock() < expires_at.saturating_sub(60) {
+        let due = if scheduled {
+            let OAuth2Record::Live { last_refresh, .. } =
+                opened.record.as_ref().ok_or(SourceError::Missing)?
+            else {
+                return Err(SourceError::ReauthorizationRequired);
+            };
+            clock()
+                >= last_refresh
+                    .saturating_add(CYCLE)
+                    .min(expires_at.saturating_sub(BUFFER))
+        } else {
+            clock() >= expires_at.saturating_sub(60)
+        };
+        if !due {
             if super::bootstrap_reflected(
                 access.expose().as_bytes(),
                 &[
@@ -603,6 +635,48 @@ async fn post(
     .map_err(|source| classified(SourceError::Timeout, &source))?
 }
 
-fn now_seconds() -> u64 {
+pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) {
+    match read_record(path, uid) {
+        Ok(OAuth2Record::Sealed { since, cause, .. }) => {
+            tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential, since, cause = cause.label(), instruction = "provide a new seed" }, "OAuth refresh sealed at boot");
+        }
+        Err(SourceError::Io)
+            if std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => {
+            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category())
+        }
+        Ok(OAuth2Record::Live { .. }) => {}
+    }
+}
+
+pub(crate) fn due_at(path: &Path, uid: u32, now: u64) -> Result<Option<u64>, SourceError> {
+    match read_record(path, uid) {
+        Ok(OAuth2Record::Live {
+            expires_at,
+            last_refresh,
+            ..
+        }) => {
+            let due = last_refresh
+                .saturating_add(CYCLE)
+                .min(expires_at.saturating_sub(BUFFER));
+            Ok(Some(if due <= now { now } else { due }))
+        }
+        Ok(OAuth2Record::Sealed { .. }) => Ok(None),
+        Err(SourceError::Io)
+            if std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) const fn retry_seconds() -> u64 {
+    RETRY
+}
+
+pub(crate) fn now_seconds() -> u64 {
     u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0)
 }

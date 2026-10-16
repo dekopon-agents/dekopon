@@ -25,6 +25,7 @@ mod lock_watch;
 mod private_read_witness;
 mod provider_manager;
 mod reaper;
+mod refresh_scheduler;
 mod secrets;
 mod server;
 mod socket;
@@ -139,16 +140,20 @@ where
         deadline.start(limits.shutdown_grace);
         result
     };
-    let result = reaper::serve(
-        serving,
-        storage,
-        || {
-            coordination
-                .active()
-                .ready
-                .broker
-                .storage_retention_policies()
-        },
+    let result = refresh_scheduler::serve(
+        reaper::serve(
+            serving,
+            storage,
+            || {
+                coordination
+                    .active()
+                    .ready
+                    .broker
+                    .storage_retention_policies()
+            },
+            deadline.clone(),
+        ),
+        || coordination.active().ready.scheduled.clone(),
         deadline.clone(),
     )
     .await;
@@ -486,7 +491,10 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                 },
                 secrets: match config.secret_map_path {
                     Some(_) => Secrets::Unchecked,
-                    None => Secrets::Loaded(dekopon_broker::SecretCatalog::empty()),
+                    None => Secrets::Loaded(
+                        dekopon_broker::SecretCatalog::empty(),
+                        secrets::ScheduledCatalog::default(),
+                    ),
                 },
                 storage,
                 assets: None,
@@ -608,7 +616,10 @@ async fn boot_runtime(
     };
     Some(Runtime {
         credentials: Credentials::Loaded(credentials?),
-        secrets: Secrets::Loaded(secrets?),
+        secrets: {
+            let (catalog, scheduled) = secrets?;
+            Secrets::Loaded(catalog, scheduled)
+        },
         storage: storage?,
         assets: assets?,
     })
@@ -636,7 +647,10 @@ async fn reload_runtime(
     };
     Some(Runtime {
         credentials: Credentials::Loaded(credentials?),
-        secrets: Secrets::Loaded(secrets?),
+        secrets: {
+            let (catalog, scheduled) = secrets?;
+            Secrets::Loaded(catalog, scheduled)
+        },
         storage,
         assets,
     })
@@ -653,7 +667,7 @@ async fn private_inputs(
     problems: &mut Vec<BrokerdError>,
 ) -> (
     Option<CredentialStore>,
-    Option<dekopon_broker::SecretCatalog>,
+    Option<(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog)>,
 ) {
     match socket::validate_socket_parent(&config.socket_path, uid) {
         // An owner-only socket under a private parent means other configured UIDs could never
@@ -698,10 +712,16 @@ async fn private_inputs(
             problems,
             secrets::load_with_bytes(path, uid)
                 .await
-                .map(|(catalog, bytes)| (catalog, Some(bytes)))
+                .map(|(catalog, bytes, scheduled)| ((catalog, scheduled), Some(bytes)))
                 .map_err(BrokerdError::from),
         ),
-        None => Some((dekopon_broker::SecretCatalog::empty(), None)),
+        None => Some((
+            (
+                dekopon_broker::SecretCatalog::empty(),
+                secrets::ScheduledCatalog::default(),
+            ),
+            None,
+        )),
     };
     #[cfg(test)]
     let _hook_ran = AFTER_PRIVATE_READ.try_with(|hook| hook()).is_ok();
@@ -791,7 +811,7 @@ enum Credentials {
 }
 
 enum Secrets {
-    Loaded(dekopon_broker::SecretCatalog),
+    Loaded(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog),
     Unchecked,
 }
 
@@ -804,6 +824,7 @@ struct Runtime {
 
 struct Ready {
     broker: Arc<Broker<TraceOnlyAuditLog>>,
+    scheduled: secrets::ScheduledCatalog,
     identities: BTreeMap<u32, MappedPeer>,
     registry: BrokerProviderRegistry,
 }
@@ -908,9 +929,9 @@ async fn prepare(
         })
         .map_err(|source| BrokerdError::Policy { source }),
     );
-    let (secret_catalog, secrets_unchecked) = match runtime.secrets {
-        Secrets::Loaded(catalog) => (Some(catalog), false),
-        Secrets::Unchecked => (None, true),
+    let (secret_catalog, scheduled, secrets_unchecked) = match runtime.secrets {
+        Secrets::Loaded(catalog, scheduled) => (Some(catalog), Some(scheduled), false),
+        Secrets::Unchecked => (None, None, true),
     };
     let policy = world.and_then(|world| {
         let world = world.with_secrets(
@@ -1021,6 +1042,7 @@ async fn prepare(
         .map_err(|error| vec![error])?;
     Ok(Ready {
         broker: Arc::new(broker),
+        scheduled: scheduled.unwrap_or_default(),
         identities,
         registry: shared_registry,
     })
