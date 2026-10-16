@@ -150,7 +150,7 @@ pub(super) async fn verified_body(request: Request, secret: &[u8]) -> Result<Byt
     }
     let body = to_bytes(request.into_body(), MAX_WEBHOOK_BODY_BYTES)
         .await
-        .map_err(|_| VerifyFailure::Oversize)?;
+        .map_err(|_error| VerifyFailure::Oversize)?;
     if !valid_hmac_sha256(secret, &body, &signature) {
         return Err(VerifyFailure::Signature);
     }
