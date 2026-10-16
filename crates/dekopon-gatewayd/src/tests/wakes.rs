@@ -391,6 +391,55 @@ fn pending_wakes_survive_a_restart_and_a_corrupt_store_refuses_to_start() {
     ));
 }
 
+#[test]
+fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
+    let directory = temporary();
+    let now = SystemTime::now();
+    {
+        let store = wake_store(directory.path());
+        store
+            .register(
+                anchor(),
+                "check the PR".to_owned(),
+                now,
+                Schedule::Watch {
+                    probe: Probe::baseline(
+                        "echo pass; exit 0".to_owned(),
+                        &NoProviders,
+                        dekopon_shell::Limits::default(),
+                    )
+                    .expect("baseline"),
+                    every: Duration::from_secs(60),
+                    until: Duration::from_secs(600),
+                },
+            )
+            .expect("registered");
+    }
+    let store = wake_store(directory.path());
+    let due = now + Duration::from_secs(61);
+    let tick = store
+        .take_due(due)
+        .expect("readable")
+        .ticks
+        .pop()
+        .expect("restored watch");
+    let verdict = tick.run(&NoProviders, dekopon_shell::Limits::default());
+    assert_eq!(
+        verdict,
+        Verdict::Fire {
+            output: "pass".to_owned()
+        }
+    );
+    let fired = tick.resolve(&store, verdict, due).expect("resolved");
+    let Resolved::Fired(fired) = fired else {
+        panic!("a terminal check must fire")
+    };
+    let inbound = fired.into_inbound();
+    assert_eq!(inbound.transport, anchor().transport().to_string());
+    assert_eq!(inbound.subject, anchor().subject().clone());
+    assert!(inbound.text.contains("pass"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watch_carries_prev_between_read_only_ticks_and_fires_once() {
     let directory = temporary();
