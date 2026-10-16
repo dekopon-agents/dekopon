@@ -582,7 +582,13 @@ fn canonical_value(value: &serde_yaml::Value) -> Result<serde_json::Value, serde
                 .collect::<Result<Vec<_>, _>>()?;
             serde_json::to_value(values)
         }
-        _ => serde_json::to_value(value),
+        serde_yaml::Value::Tagged(tagged) => {
+            serde_json::to_value((tagged.tag.to_string(), canonical_value(&tagged.value)?))
+        }
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_) => serde_json::to_value(value),
     }
 }
 
