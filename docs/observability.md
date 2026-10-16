@@ -435,7 +435,7 @@ two further spans of its own:
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
@@ -458,7 +458,9 @@ the receive span measures receipt and dispatch rather than the session it starte
 Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and is
 recorded once the payload has been parsed far enough to carry one. A receipt that routes nothing
 closes without it, which is the trace that answers "why did the bot not reply"; so does a refused
-WhatsApp delivery. Each accepted WhatsApp message has a distinct `transport.receive` child under
+WhatsApp delivery. GitHub records its delivery GUID and conversation coordinates only for a
+successfully accepted enqueue; ignored, duplicate and queue-full requests carry no identifiers.
+Each accepted WhatsApp message has a distinct `transport.receive` child under
 the signed delivery span, carrying its native `message.id` and conversation coordinates. Execution
 nests under that message receipt; for a collected burst, it nests under the lead receipt and links
 to every constituent receipt. This preserves distinguishable input and disposition evidence even

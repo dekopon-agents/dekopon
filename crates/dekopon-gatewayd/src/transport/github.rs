@@ -190,8 +190,6 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         return webhook::content_free(StatusCode::OK);
     };
     let receipt = received.in_scope(|| receive_span(ChatTransportKind::Github));
-    receipt.record("message.id", &delivery);
-    record_conversation(&receipt, &conversation);
     let message = InboundMessage {
         transport: state.name.clone(),
         transport_kind: ChatTransportKind::Github,
@@ -205,15 +203,23 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         thread_continuation: None,
         reply: ReplyTarget::GithubTrace,
         liveness: None,
-        receive_span: receipt,
+        receive_span: receipt.clone(),
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
         folded: Vec::new(),
     };
     let mut accepted = state.accepted.lock();
-    // try_send and insertion happen under one lock: a failed enqueue never consumes a GUID.
-    match accepted.insert_if_absent(&delivery, || state.sender.try_send(message).is_ok()) {
+    // Reserve under the dedupe lock before recording identity: a full queue cannot consume a GUID.
+    match accepted.insert_if_absent(&delivery, || {
+        let Ok(permit) = state.sender.try_reserve() else {
+            return false;
+        };
+        receipt.record("message.id", &delivery);
+        record_conversation(&receipt, &message.conversation);
+        permit.send(message);
+        true
+    }) {
         Ok(true) => {}
         Ok(false) => {
             tracing::debug!(event = "gateway_github_duplicate");
@@ -615,6 +621,93 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "no unselected run starts a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_queue_full_never_record_unaccepted_identity() {
+        use dekopon_test_support::Record;
+        let directory = crate::tests::temporary();
+        std::fs::write(
+            directory.path().join("dekopon.yaml"),
+            crate::tests::catalog_text(true, Some("reasoning")),
+        )
+        .expect("catalog");
+        let mut doc = crate::tests::document(directory.path());
+        doc["transports"][0] = json!({"kind":"githubWebhook", "name":"github",
+            "bind":"127.0.0.1:9080", "secretEnv":"PATH"});
+        doc["routes"][0]["transport"] = json!("github");
+        doc["routes"][0]["memory"] = json!({"mode":"oneShot"});
+        doc["routes"][0]["conversation"] = json!({"kind":["thread"],
+            "container":"owner", "ids":["owner.repo"]});
+        doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+        let resolved = crate::tests::load(directory.path(), &doc)
+            .await
+            .expect("config");
+        let catalog = dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml"))
+            .expect("catalog");
+        let routes = RoutingTable::bind(&resolved, &catalog).expect("route");
+        let (mut state, _unused) = state();
+        state.routes = Arc::new(routes);
+        let (sender, mut receiver) = mpsc::channel(1);
+        state.sender = sender;
+        let (capture, _guard) = crate::tests::capture_spans();
+        let body = serde_json::to_vec(&pr()).expect("signed JSON");
+        let count = || {
+            let records = capture.records();
+            (
+                records
+                    .iter()
+                    .filter(|record| {
+                        matches!(record, Record::Span { .. })
+                            && record.field("message.id").is_some()
+                    })
+                    .count(),
+                records
+                    .iter()
+                    .filter(|record| {
+                        matches!(record, Record::Span { .. })
+                            && record.field("conversation.thread").is_some()
+                    })
+                    .count(),
+            )
+        };
+        for (guid, status, expected) in [
+            ("first", StatusCode::OK, (1, 1)),
+            ("first", StatusCode::OK, (1, 1)),
+            ("retry", StatusCode::SERVICE_UNAVAILABLE, (1, 1)),
+        ] {
+            assert_eq!(
+                process(
+                    &state,
+                    signed(&body, b"secret", guid, "pull_request"),
+                    &receive_span(ChatTransportKind::Github)
+                )
+                .await
+                .status(),
+                status
+            );
+            assert_eq!(
+                count(),
+                expected,
+                "only successfully accepted deliveries record identity"
+            );
+        }
+        let _accepted = receiver.try_recv().expect("free one slot");
+        assert_eq!(
+            process(
+                &state,
+                signed(&body, b"secret", "retry", "pull_request"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            count(),
+            (2, 2),
+            "the retry records identity only after acceptance"
         );
     }
 

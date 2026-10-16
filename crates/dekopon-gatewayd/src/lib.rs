@@ -896,12 +896,14 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
-        if matches!(spec, TransportConfig::GithubWebhook { .. })
-            && config
-                .transports
-                .iter()
-                .any(|other| matches!(other, TransportConfig::WhatsappCloudApi { .. }))
+        if let TransportConfig::GithubWebhook { name, bind, secret_env } = spec
+            && config.transports.iter().any(|other| {
+                matches!(other, TransportConfig::WhatsappCloudApi { bind: whatsapp_bind, .. } if whatsapp_bind == bind)
+            })
         {
+            if let Err(source) = transport::read_credential(secret_env) {
+                problems.push(StartupProblem::Transport { transport: name.clone(), source });
+            }
             continue;
         }
         match build_transport(spec, config, routes) {
@@ -1024,7 +1026,7 @@ fn build_transport(
             }) = config
                 .transports
                 .iter()
-                .find(|spec| matches!(spec, TransportConfig::GithubWebhook { .. }))
+                .find(|spec| matches!(spec, TransportConfig::GithubWebhook { bind: github_bind, .. } if github_bind == bind))
             {
                 Box::new(GithubTransport::new(
                     name.clone(),

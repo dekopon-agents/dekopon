@@ -105,7 +105,7 @@ enum AcceptFailure {
     Fatal,
 }
 
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "std::io::ErrorKind is non-exhaustive; an unknown kind is still classified by its OS error"
 )]

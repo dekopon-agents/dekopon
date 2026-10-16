@@ -110,7 +110,7 @@ fn generated_images(count: usize) -> Vec<GeneratedImage> {
     (0..count).map(|_| generated_image()).collect()
 }
 
-fn document(directory: &Path) -> Value {
+pub(crate) fn document(directory: &Path) -> Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "catalogPath": directory.join("dekopon.yaml"),
@@ -149,7 +149,7 @@ fn write_config(directory: &Path, document: &Value) -> PathBuf {
     path
 }
 
-async fn load(
+pub(crate) async fn load(
     directory: &Path,
     document: &Value,
 ) -> Result<crate::ResolvedConfig, config::ConfigError> {
@@ -176,7 +176,7 @@ fn only_route_problem(error: &RouteError) -> &RouteProblem {
     &error.problems[0]
 }
 
-fn temporary() -> tempfile::TempDir {
+pub(crate) fn temporary() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
         .expect("private temporary directory");
@@ -1291,14 +1291,14 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
         json!({
             "kind": "whatsappCloudApi", "name": name,
             "bind": format!("127.0.0.1:{port}"), "callbackPath": "/webhooks/whatsapp",
-            "appSecretEnv": "W_APP", "verifyTokenEnv": "W_VERIFY", "accessTokenEnv": "W_ACCESS",
+            "appSecretEnv": "PATH", "verifyTokenEnv": "PATH", "accessTokenEnv": "PATH",
             "wabaId": "123", "phoneNumberId": "456", "graphApiVersion": "v23.0"
         })
     };
     let github = |port: u16| {
         json!({
             "kind": "githubWebhook", "name": "github", "bind": format!("127.0.0.1:{port}"),
-            "secretEnv": "GH_SECRET"
+            "secretEnv": "PATH"
         })
     };
     let mut doc = document(directory.path());
@@ -1312,14 +1312,55 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
         .expect("two WhatsApp binds may use the same path");
 
     doc["transports"].as_array_mut().unwrap().push(github(9081));
-    load(directory.path(), &doc)
+    let resolved = load(directory.path(), &doc)
         .await
         .expect("GitHub may share either WhatsApp bind");
+    let prepared = crate::prepare(&resolved, &crate::routes::RoutingTable::default())
+        .expect("both WhatsApp listeners and the selected GitHub mount build");
+    assert_eq!(prepared.transports.len(), 3);
+    assert!(
+        prepared
+            .transports
+            .iter()
+            .any(|transport| transport.name() == "wa1")
+    );
+    let github_mount = prepared
+        .transports
+        .iter()
+        .filter(|transport| transport.name() == "github")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        github_mount.len(),
+        1,
+        "one GitHub mount for its matching bind"
+    );
+    assert_eq!(
+        github_mount[0]
+            .sibling_driver()
+            .as_ref()
+            .map(|(name, _)| name.as_str()),
+        Some("wa2")
+    );
+    assert!(github_mount[0].sibling_fetcher().is_some());
+
+    doc["transports"][3]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
+    let resolved = load(directory.path(), &doc)
+        .await
+        .expect("structurally valid");
+    let error = match crate::prepare(&resolved, &crate::routes::RoutingTable::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("missing GitHub secret must be attributed to GitHub"),
+    };
+    assert!(matches!(error, crate::GatewaydError::Startup { problems }
+        if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport {
+            transport, source: crate::transport::TransportError::MissingCredential { name }
+        } if transport == "github" && name == "CC07_S2_ABSENT_SECRET"))));
+    doc["transports"][3]["secretEnv"] = json!("PATH");
 
     doc["transports"] = json!([doc["transports"][0], github(9082), whatsapp("wa1", 9080)]);
     assert!(reports(
         &load(directory.path(), &doc).await.unwrap_err(),
-        |problem| matches!(problem, ConfigProblem::ConflictingWebhookMount { name } if name == "github")
+        |problem| matches!(problem, ConfigProblem::GithubBindNotShared { name } if name == "github")
     ));
 
     doc["transports"] = json!([
@@ -2919,7 +2960,7 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
     );
 }
 
-fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
+pub(crate) fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
     let class = model_class.map_or(String::new(), |class| format!("  modelClass: {class}\n"));
     format!(
         "apiVersion: dekopon.dev/v1alpha1\n\

@@ -2017,7 +2017,7 @@ pub(crate) fn resolve(
             .into_iter()
             .filter(|(_, bind)| !whatsapp_binds.contains(bind))
         {
-            problems.push(ConfigProblem::ConflictingWebhookMount { name });
+            problems.push(ConfigProblem::GithubBindNotShared { name });
         }
     }
 
@@ -2976,6 +2976,10 @@ pub enum ConfigProblem {
     },
     #[error("GitHub transport {name:?} must bind an explicit nonzero port")]
     InvalidGithubBind { name: String },
+    #[error(
+        "GitHub transport {name:?} must share a WhatsApp listener bind and use a distinct callback path"
+    )]
+    GithubBindNotShared { name: String },
     #[error("webhook transport {name:?} conflicts with another listener bind or callback path")]
     ConflictingWebhookMount { name: String },
     #[error("routes[{route}]: githubEvents must be nonempty, unique and GitHub-only")]
