@@ -17,6 +17,7 @@ use dekopon_broker_protocol::{
     ConversationKindMatch, ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT,
     DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError, ResolvedBrokerSocket,
 };
+use dekopon_config::{Projection, ProjectionError};
 use dekopon_core::{
     AgentId, ExternalSubject, FileHygieneError, FileTier,
     fragments::{self, FragmentError, MergeRules},
@@ -1589,6 +1590,12 @@ async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, 
         path: path.clone(),
         source,
     })?;
+    if metadata.file_type().is_symlink()
+        && std::fs::metadata(&path).is_ok_and(|target| target.is_dir())
+    {
+        let projection = Projection::resolve(&path, expected_uid).map_err(projection_refusal)?;
+        return read_projected_listing(&path, &projection);
+    }
     if !metadata.is_dir() {
         return read_config_file(path, expected_uid).await;
     }
@@ -1604,22 +1611,20 @@ async fn read_source_entry(path: PathBuf, expected_uid: u32) -> Result<Vec<u8>, 
     {
         return Err(ConfigError::InsecureProjection { path });
     }
-    let mut names = std::fs::read_dir(&path)
-        .map_err(|source| ConfigError::Read {
-            path: path.clone(),
-            source,
-        })?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name())
-                .map_err(|source| ConfigError::Read {
-                    path: path.clone(),
-                    source,
-                })
-        })
+    listing_bytes(&path, &sorted_names(&path)?)
+}
+
+fn sorted_names(directory: &Path) -> Result<Vec<std::ffi::OsString>, ConfigError> {
+    let read_error = |source| ConfigError::Read {
+        path: directory.to_path_buf(),
+        source,
+    };
+    let mut names = std::fs::read_dir(directory)
+        .map_err(read_error)?
+        .map(|entry| entry.map(|entry| entry.file_name()).map_err(read_error))
         .collect::<Result<Vec<_>, _>>()?;
     names.sort();
-    listing_bytes(&path, &names)
+    Ok(names)
 }
 
 fn listing_bytes(path: &Path, sorted: &[std::ffi::OsString]) -> Result<Vec<u8>, ConfigError> {
@@ -1644,84 +1649,18 @@ fn listing_bytes(path: &Path, sorted: &[std::ffi::OsString]) -> Result<Vec<u8>, 
 }
 
 fn read_gateway_projection(path: &Path, expected_uid: u32) -> Result<Vec<u8>, ConfigError> {
-    let root = path.parent().ok_or(ConfigError::MissingParent)?;
-    let read_only = rustix::fs::statvfs(root)
-        .map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source: source.into(),
-        })?
-        .f_flag
-        .contains(rustix::fs::StatVfsMountFlags::RDONLY);
-    read_gateway_projection_at(path, expected_uid, read_only)
+    let projection = Projection::resolve(path, expected_uid).map_err(projection_refusal)?;
+    read_projected_file(path, &projection, || {})
 }
 
-pub(crate) fn read_gateway_projection_at(
+pub(crate) fn read_projected_file(
     path: &Path,
-    expected_uid: u32,
-    read_only: bool,
-) -> Result<Vec<u8>, ConfigError> {
-    read_gateway_projection_with(path, expected_uid, read_only, || {})
-}
-
-pub(crate) fn read_gateway_projection_with(
-    path: &Path,
-    expected_uid: u32,
-    read_only: bool,
+    projection: &Projection,
     after_read: impl FnOnce(),
 ) -> Result<Vec<u8>, ConfigError> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let insecure = || ConfigError::InsecureProjection {
-        path: path.to_path_buf(),
-    };
-    let read_error = |source| ConfigError::Read {
-        path: path.to_path_buf(),
-        source,
-    };
-    let root = path.parent().ok_or_else(insecure)?;
-    let root_metadata = std::fs::symlink_metadata(root).map_err(read_error)?;
-    if !read_only
-        || !root_metadata.is_dir()
-        || root_metadata.uid() != 0 && root_metadata.uid() != expected_uid
-    {
-        return Err(insecure());
-    }
-    let link = std::fs::symlink_metadata(path).map_err(read_error)?;
-    let data_link = std::fs::symlink_metadata(root.join("..data")).map_err(read_error)?;
-    if !link.file_type().is_symlink()
-        || !data_link.file_type().is_symlink()
-        || link.uid() != 0 && link.uid() != expected_uid
-        || data_link.uid() != 0 && data_link.uid() != expected_uid
-        || std::fs::read_link(path).map_err(read_error)?
-            != Path::new("..data").join(path.file_name().ok_or_else(insecure)?)
-    {
-        return Err(insecure());
-    }
-    let generation = std::fs::read_link(root.join("..data")).map_err(read_error)?;
-    if !matches!(
-        generation.components().collect::<Vec<_>>().as_slice(),
-        [std::path::Component::Normal(_)]
-    ) {
-        return Err(insecure());
-    }
-    let directory = root.join(&generation);
-    let metadata = std::fs::symlink_metadata(&directory).map_err(read_error)?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0 && metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o022 != 0
-    {
-        return Err(insecure());
-    }
-    let target = directory.join(path.file_name().ok_or_else(insecure)?);
-    let owner = std::fs::symlink_metadata(&target)
-        .map_err(read_error)?
-        .uid();
-    if owner != 0 && owner != expected_uid {
-        return Err(insecure());
-    }
     let bytes = read_trusted_file(
-        &target,
-        owner,
+        projection.target(),
+        projection.owner(),
         FileTier::NotWorldWritable,
         HARD_MAX_CONFIG_BYTES,
     )
@@ -1730,10 +1669,25 @@ pub(crate) fn read_gateway_projection_with(
         source,
     })?;
     after_read();
-    if std::fs::read_link(root.join("..data")).map_err(read_error)? != generation {
-        return Err(ConfigError::ChangedDuringLoad);
-    }
+    projection.confirm().map_err(projection_refusal)?;
     Ok(bytes)
+}
+
+pub(crate) fn read_projected_listing(
+    path: &Path,
+    projection: &Projection,
+) -> Result<Vec<u8>, ConfigError> {
+    let bytes = listing_bytes(path, &sorted_names(projection.target())?)?;
+    projection.confirm().map_err(projection_refusal)?;
+    Ok(bytes)
+}
+
+pub(crate) fn projection_refusal(error: ProjectionError) -> ConfigError {
+    match error {
+        ProjectionError::Untrusted { path } => ConfigError::InsecureProjection { path },
+        ProjectionError::Switched { .. } => ConfigError::ChangedDuringLoad,
+        ProjectionError::Io { path, source } => ConfigError::Read { path, source },
+    }
 }
 
 pub(crate) fn read_gateway_regular_file_at(

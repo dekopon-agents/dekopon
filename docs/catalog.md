@@ -128,7 +128,11 @@ sorted by that path. Hidden entries (a leading `.`) are skipped as editor and ve
 residue. A symbolic link anywhere in the tree, the skill directory itself included, is refused
 rather than followed, because a link is how content escapes the directory that was reviewed; so is
 anything that is neither a regular file nor a directory, and any file name or file content that is
-not UTF-8.
+not UTF-8. The one exception is a skill directory that is an entry of a read-only Kubernetes
+ConfigMap projection (`<mount>/<skill>` linked to `..data/<skill>`): it loads from the generation
+`..data` names when every link, directory and file is owned by root or the daemon's UID and none is
+group- or world-writable, and the next reload picks up a changed ConfigMap. See
+[gateway source trust](security-model.md#current-gateway-posture).
 
 Every bound is fixed before a byte is read: `SKILL.md` is at most 64 KiB including its front
 matter; each resource is at most 256 KiB; a skill carries at most 64 resources, at most 1 MiB in

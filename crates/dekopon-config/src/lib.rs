@@ -21,8 +21,10 @@ use serde::Deserialize;
 use serde_yaml::Value;
 use thiserror::Error;
 
+mod projection;
 pub mod skill;
 
+pub use projection::{Projection, ProjectionError};
 pub use skill::{Skill, SkillError, SkillResource, load_skill};
 
 pub const CONFIG_ENV: &str = "DEKOPON_CONFIG";
