@@ -1,4 +1,4 @@
-use crate::{
+use dekopon_core::context::{
     EnvelopeSource, Exchange, Representation, fit_projected, original_envelope_bytes,
     render_envelope,
 };
@@ -210,3 +210,6 @@ mod tests {
         assert_eq!(run(&input), Err(ReplayError::MismatchedEvent));
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+mod wasm;

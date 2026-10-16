@@ -22,7 +22,6 @@ clap.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-config.workspace = true
-dekopon-context.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-model-proxy.workspace = true

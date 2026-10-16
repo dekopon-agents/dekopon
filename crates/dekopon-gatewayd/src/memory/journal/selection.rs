@@ -122,12 +122,12 @@ pub(crate) fn decide<I: CapabilityInvoker>(
 }
 
 pub(super) fn original_envelope_bytes(turn: &ConversationTurn) -> usize {
-    dekopon_context::original_envelope_bytes(turn.user(), turn.answer(), turn.exchanges())
+    dekopon_core::context::original_envelope_bytes(turn.user(), turn.answer(), turn.exchanges())
 }
 
 fn envelope(line: &Line, id: &str, version: &str, is_original: bool) -> Option<String> {
-    dekopon_context::render_envelope(
-        dekopon_context::EnvelopeSource {
+    dekopon_core::context::render_envelope(
+        dekopon_core::context::EnvelopeSource {
             user: line.user.as_deref(),
             answer: line.answer.as_deref(),
             representations: &line.representations,

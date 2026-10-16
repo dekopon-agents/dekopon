@@ -1,4 +1,4 @@
-use dekopon_context::replay::{ReplayInput, run};
+use crate::{ReplayInput, run};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]

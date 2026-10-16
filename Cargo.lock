@@ -881,7 +881,6 @@ dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-config",
- "dekopon-context",
  "dekopon-core",
  "dekopon-model",
  "dekopon-model-token-governor",
@@ -1047,23 +1046,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon-context"
-version = "0.47.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "dekopon-context-wasm"
-version = "0.47.0"
-dependencies = [
- "dekopon-context",
- "serde_json",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "dekopon-core"
 version = "0.47.0"
 dependencies = [
@@ -1088,7 +1070,6 @@ dependencies = [
  "dekopon-broker-protocol",
  "dekopon-brokerd",
  "dekopon-config",
- "dekopon-context",
  "dekopon-core",
  "dekopon-model",
  "dekopon-model-proxy",

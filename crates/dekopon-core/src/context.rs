@@ -180,8 +180,6 @@ pub fn render_envelope(
     Some(output)
 }
 
-pub mod replay;
-
 #[cfg(test)]
 mod tests {
     use super::*;

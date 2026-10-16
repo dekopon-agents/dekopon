@@ -1,4 +1,4 @@
-use dekopon_context::replay::{ReplayInput, run};
+use context_replay::{ReplayInput, run};
 use std::io::{self, Read};
 fn main() {
     let mut input = String::new();
