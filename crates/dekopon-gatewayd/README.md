@@ -65,9 +65,11 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   environment credential); its path is fixed at `/webhooks/github`. A GitHub route must set
   nonempty, unique `githubEvents` from `pull_request` and `workflow_run`, a canonical
   `conversation` thread selector and `memory: { mode: oneShot }`. Non-GitHub routes cannot set
-  `githubEvents`. First route match precedes event filtering. **This S2 build does not mount
-  GitHub:** check warns about the credential, and boot requires it but then refuses that named
-  transport as not mountable until the verified ingress step ships. See [gateway configuration](../../docs/gatewayd.md).
+  `githubEvents`. First route match precedes event filtering. The verified GitHub POST mount
+  shares WhatsApp's listener when both use the same bind; GitHub alone binds that port. It
+  verifies raw-body HMAC-SHA256 before parsing repository identity, acknowledges accepted,
+  ignored and recent-duplicate deliveries, and retries queue saturation with HTTP 503. Replies
+  are silent; a route still requires a fresh broker-authorized session. See [gateway configuration](../../docs/gatewayd.md).
   Shared turns carry gateway-authored participant labels naming each sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share

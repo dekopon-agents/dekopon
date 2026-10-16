@@ -25,6 +25,7 @@ use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 pub(crate) mod discord;
+pub(crate) mod github;
 mod hydration;
 pub(crate) mod local;
 pub(crate) mod recovery;
@@ -274,6 +275,7 @@ pub(crate) enum ReplyTarget {
     WhatsApp {
         recipient: String,
     },
+    GithubTrace,
     Local {
         connection: u64,
     },
@@ -350,6 +352,14 @@ fn remove_ascii_insensitive(text: &str, needle: &str) -> String {
 
 pub(crate) trait ChatTransport: Send {
     fn name(&self) -> &str;
+
+    fn sibling_driver(&self) -> Option<(String, Arc<dyn ChatDriver>)> {
+        None
+    }
+
+    fn sibling_fetcher(&self) -> Option<(String, Arc<dyn AssetFetcher>)> {
+        None
+    }
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>>;
 
@@ -621,8 +631,6 @@ pub enum TransportError {
     EmptyCredential { name: String },
     #[error("credential environment variable {name} is not UTF-8")]
     NonUtf8Credential { name: String },
-    #[error("transport {transport:?} is not mountable in this build")]
-    NotMountableInThisBuild { transport: String },
     #[error("chat service request failed")]
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("chat service returned an error: {code}")]
@@ -667,7 +675,6 @@ impl TransportError {
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
-            Self::NotMountableInThisBuild { .. } => "not-mountable-in-this-build",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::DisallowedIntents => "disallowed-intents",
@@ -851,6 +858,22 @@ impl SeenIds {
         }
     }
 
+    pub(crate) fn insert_if_absent(
+        &mut self,
+        key: &str,
+        accept: impl FnOnce() -> bool,
+    ) -> Result<bool, ()> {
+        if self.seen.contains(key) {
+            return Ok(false);
+        }
+        if !accept() {
+            return Err(());
+        }
+        let inserted = self.insert(key.to_owned());
+        debug_assert!(inserted);
+        Ok(true)
+    }
+
     pub(crate) fn insert(&mut self, key: String) -> bool {
         if !self.seen.insert(key.clone()) {
             return false;
@@ -992,6 +1015,17 @@ mod tests {
         }
         let drawn: HashSet<u64> = (0..64).map(|_| jitter_below(u64::MAX)).collect();
         assert!(drawn.len() > 1, "the jitter is the same value every time");
+    }
+
+    #[test]
+    fn failed_acceptance_never_consumes_a_recent_delivery_id() {
+        let mut seen = SeenIds::new(1024);
+        assert!(matches!(seen.insert_if_absent("guid", || false), Err(())));
+        assert!(matches!(seen.insert_if_absent("guid", || true), Ok(true)));
+        assert!(matches!(
+            seen.insert_if_absent("guid", || panic!("duplicate must not enqueue")),
+            Ok(false)
+        ));
     }
 
     #[test]

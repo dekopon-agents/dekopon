@@ -75,6 +75,7 @@ use crate::{
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, ChatTransport, ThreadOwnership, TransportEvent,
         discord::{DiscordTransport, MessageContent},
+        github::GithubTransport,
         local::LocalTransport,
         slack::SlackTransport,
         telegram::TelegramTransport,
@@ -148,15 +149,12 @@ where
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
     let mut readers = JoinSet::new();
     for transport in built_transports {
-        let transport = transport::recovery::RecoveringTransport::new(transport);
-        let name = transport.name().to_owned();
-        drivers.insert(name.clone(), transport.driver());
-        if let Some(fetcher) = transport.asset_fetcher() {
-            asset_fetchers.insert(name.clone(), fetcher);
-        }
-        if let Some(ownership) = transport.thread_ownership() {
-            thread_ownership.insert(name, ownership);
-        }
+        let transport = register_transport(
+            transport,
+            &mut drivers,
+            &mut asset_fetchers,
+            &mut thread_ownership,
+        );
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
@@ -734,6 +732,30 @@ const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
     }
 }
 
+fn register_transport(
+    transport: Box<dyn ChatTransport>,
+    drivers: &mut BTreeMap<String, Arc<dyn ChatDriver>>,
+    asset_fetchers: &mut HashMap<String, Arc<dyn AssetFetcher>>,
+    thread_ownership: &mut HashMap<String, Arc<dyn ThreadOwnership>>,
+) -> transport::recovery::RecoveringTransport {
+    let transport = transport::recovery::RecoveringTransport::new(transport);
+    let name = transport.name().to_owned();
+    drivers.insert(name.clone(), transport.driver());
+    if let Some((sibling, driver)) = transport.sibling_driver() {
+        drivers.insert(sibling, driver);
+    }
+    if let Some((sibling, fetcher)) = transport.sibling_fetcher() {
+        asset_fetchers.insert(sibling, fetcher);
+    }
+    if let Some(fetcher) = transport.asset_fetcher() {
+        asset_fetchers.insert(name.clone(), fetcher);
+    }
+    if let Some(ownership) = transport.thread_ownership() {
+        thread_ownership.insert(name, ownership);
+    }
+    transport
+}
+
 async fn read_transport(
     mut transport: Box<dyn ChatTransport>,
     sender: mpsc::Sender<TransportEvent>,
@@ -834,7 +856,17 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
-        match build_transport(spec, config) {
+        if let TransportConfig::GithubWebhook { name, bind, secret_env } = spec
+            && config.transports.iter().any(|other| {
+                matches!(other, TransportConfig::WhatsappCloudApi { bind: whatsapp_bind, .. } if whatsapp_bind == bind)
+            })
+        {
+            if let Err(source) = transport::read_credential(secret_env) {
+                problems.push(StartupProblem::Transport { transport: name.clone(), source });
+            }
+            continue;
+        }
+        match build_transport(spec, config, routes) {
             Ok(transport) => transports.push(transport),
             Err(source) => problems.push(StartupProblem::Transport {
                 transport: spec.name().to_owned(),
@@ -856,6 +888,7 @@ struct Prepared {
 fn build_transport(
     spec: &TransportConfig,
     config: &ResolvedConfig,
+    routes: &RoutingTable,
 ) -> Result<Box<dyn ChatTransport>, TransportError> {
     let surface = |liveness: &LivenessConfig| {
         let mut settings = liveness.settings();
@@ -872,13 +905,16 @@ fn build_transport(
     };
     Ok(match spec {
         TransportConfig::GithubWebhook {
-            name, secret_env, ..
-        } => {
-            let _secret = transport::read_credential(secret_env)?;
-            return Err(TransportError::NotMountableInThisBuild {
-                transport: name.clone(),
-            });
-        }
+            name,
+            secret_env,
+            bind,
+        } => Box::new(GithubTransport::new(
+            name.clone(),
+            *bind,
+            transport::read_credential(secret_env)?,
+            Arc::new(routes.clone()),
+            None,
+        )),
         TransportConfig::SlackSocketMode {
             name,
             app_token_env,
@@ -927,21 +963,42 @@ fn build_transport(
             liveness,
             graph_endpoint,
             ..
-        } => Box::new(WhatsappTransport::new(
-            name.clone(),
-            *bind,
-            callback_path.clone(),
-            waba_id.clone(),
-            phone_number_id.clone(),
-            graph_api_version.clone(),
-            graph_endpoint
-                .clone()
-                .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
-            transport::read_credential(app_secret_env)?,
-            transport::read_credential(verify_token_env)?,
-            transport::read_credential(access_token_env)?,
-            surface(liveness),
-        )?),
+        } => {
+            let whatsapp = WhatsappTransport::new(
+                name.clone(),
+                *bind,
+                callback_path.clone(),
+                waba_id.clone(),
+                phone_number_id.clone(),
+                graph_api_version.clone(),
+                graph_endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::WHATSAPP_GRAPH_ENDPOINT.to_owned()),
+                transport::read_credential(app_secret_env)?,
+                transport::read_credential(verify_token_env)?,
+                transport::read_credential(access_token_env)?,
+                surface(liveness),
+            )?;
+            if let Some(TransportConfig::GithubWebhook {
+                name,
+                bind,
+                secret_env,
+            }) = config
+                .transports
+                .iter()
+                .find(|spec| matches!(spec, TransportConfig::GithubWebhook { bind: github_bind, .. } if github_bind == bind))
+            {
+                Box::new(GithubTransport::new(
+                    name.clone(),
+                    *bind,
+                    transport::read_credential(secret_env)?,
+                    Arc::new(routes.clone()),
+                    Some(whatsapp),
+                ))
+            } else {
+                Box::new(whatsapp)
+            }
+        }
         TransportConfig::TelegramLongPoll {
             name,
             bot_token_env,

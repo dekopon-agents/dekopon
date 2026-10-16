@@ -23,11 +23,7 @@ use axum::{
     routing::{get, post},
 };
 #[cfg(test)]
-use axum::{
-    body::to_bytes,
-    http::{HeaderMap, header},
-    response::IntoResponse,
-};
+use axum::{body::to_bytes, http::header};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{StreamExt as _, future::BoxFuture};
@@ -228,6 +224,41 @@ impl WhatsappTransport {
             server: tokio::task::JoinSet::new(),
         })
     }
+
+    pub(super) fn router(&self) -> Router {
+        Router::new()
+            .route(&self.callback_path, get(verify_subscription))
+            .route(&self.callback_path, post(receive_webhook))
+            .with_state(self.state.clone())
+    }
+
+    pub(super) fn shared_driver(&self) -> Arc<dyn ChatDriver> {
+        Arc::clone(&self.driver) as Arc<dyn ChatDriver>
+    }
+
+    pub(super) fn shared_name(&self) -> &str {
+        &self.name
+    }
+
+    pub(super) async fn shared_next(&mut self) -> Result<TransportEvent, TransportError> {
+        next_delivery(&mut self.pending, &mut self.receiver).await
+    }
+}
+
+async fn next_delivery(
+    pending: &mut VecDeque<QueuedDelivery>,
+    receiver: &mut mpsc::Receiver<QueuedDelivery>,
+) -> Result<TransportEvent, TransportError> {
+    loop {
+        if let Some(delivery) = pending.front_mut() {
+            if let Some(message) = delivery.messages.pop_front() {
+                return Ok(TransportEvent::Message(Box::new(message)));
+            }
+            pending.pop_front();
+            continue;
+        }
+        pending.push_back(receiver.recv().await.ok_or(TransportError::Closed)?);
+    }
 }
 
 impl ChatTransport for WhatsappTransport {
@@ -237,14 +268,12 @@ impl ChatTransport for WhatsappTransport {
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
-            let router = Router::new()
-                .route(&self.callback_path, get(verify_subscription))
-                .route(&self.callback_path, post(receive_webhook))
+            let router = self
+                .router()
                 .fallback(|| async { content_free(StatusCode::NOT_FOUND) })
                 .method_not_allowed_fallback(|| async {
                     content_free(StatusCode::METHOD_NOT_ALLOWED)
-                })
-                .with_state(self.state.clone());
+                });
             webhook::listen(self.bind, router, self.name.clone(), &mut self.server).await?;
             Ok(TransportIdentity::default())
         })
@@ -252,34 +281,14 @@ impl ChatTransport for WhatsappTransport {
 
     fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
-            enum Source {
-                Delivery(QueuedDelivery),
-                ListenerStopped,
+            if self.server.is_empty() {
+                return Err(TransportError::Closed);
             }
-
-            loop {
-                if let Some(delivery) = self.pending.front_mut() {
-                    if let Some(message) = delivery.messages.pop_front() {
-                        return Ok(TransportEvent::Message(Box::new(message)));
-                    }
-                    self.pending.pop_front();
-                    continue;
-                }
-
-                if self.server.is_empty() {
-                    return Err(TransportError::Closed);
-                }
-                let source = tokio::select! {
-                    delivery = self.receiver.recv() => delivery
-                        .map_or(Source::ListenerStopped, Source::Delivery),
-                    _ = self.server.join_next() => Source::ListenerStopped,
-                };
-                match source {
-                    Source::Delivery(delivery) => self.pending.push_back(delivery),
-                    Source::ListenerStopped => {
-                        self.server.shutdown().await;
-                        return Err(TransportError::Closed);
-                    }
+            tokio::select! {
+                result = next_delivery(&mut self.pending, &mut self.receiver) => result,
+                _ = self.server.join_next() => {
+                    self.server.shutdown().await;
+                    Err(TransportError::Closed)
                 }
             }
         })
@@ -541,11 +550,6 @@ fn canonical_whatsapp_message_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-#[cfg(test)]
-pub(crate) use webhook::hmac_sha256;
-#[cfg(test)]
-use webhook::{AcceptFailure, classify_accept, valid_hmac_sha256};
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     let maximum = left.len().max(right.len());
@@ -791,6 +795,7 @@ async fn bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Transp
 
 #[cfg(test)]
 mod tests {
+    use crate::transport::webhook::hmac_sha256;
     use axum::body::Body;
 
     use super::*;
@@ -834,27 +839,6 @@ mod tests {
             .header("x-hub-signature-256", signature(b"secret", body))
             .body(Body::from(body.to_vec()))
             .expect("request")
-    }
-
-    #[test]
-    fn hmac_matches_a_known_vector_and_uses_exact_raw_bytes() {
-        let compact = br#"{"object":"whatsapp_business_account"}"#;
-        let spaced = br#"{ "object": "whatsapp_business_account" }"#;
-        assert_ne!(
-            hmac_sha256(b"secret", compact),
-            hmac_sha256(b"secret", spaced)
-        );
-        assert!(valid_hmac_sha256(
-            b"secret",
-            compact,
-            &hmac_sha256(b"secret", compact),
-        ));
-        let known = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
-        let known: String = known.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(
-            known,
-            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
-        );
     }
 
     #[tokio::test]
@@ -1547,38 +1531,6 @@ mod tests {
             reasons.len(),
             Refusal::COUNT,
             "each reason has its own slot and its own name"
-        );
-    }
-
-    #[test]
-    fn accept_failures_distinguish_peer_errors_resource_exhaustion_and_listener_loss() {
-        for kind in [
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::ConnectionReset,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::WouldBlock,
-        ] {
-            assert_eq!(
-                classify_accept(&io::Error::from(kind)),
-                AcceptFailure::Connection,
-                "{kind:?} is one dead connection, not a dead listener"
-            );
-        }
-        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
-            assert_eq!(
-                classify_accept(&io::Error::from_raw_os_error(code)),
-                AcceptFailure::Exhausted,
-                "exhaustion recovers once something is freed"
-            );
-        }
-        assert_eq!(
-            classify_accept(&io::Error::from_raw_os_error(libc::EBADF)),
-            AcceptFailure::Fatal
-        );
-        assert_eq!(
-            classify_accept(&io::Error::from(io::ErrorKind::InvalidInput)),
-            AcceptFailure::Fatal
         );
     }
 

@@ -435,7 +435,7 @@ two further spans of its own:
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
@@ -458,7 +458,9 @@ the receive span measures receipt and dispatch rather than the session it starte
 Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and is
 recorded once the payload has been parsed far enough to carry one. A receipt that routes nothing
 closes without it, which is the trace that answers "why did the bot not reply"; so does a refused
-WhatsApp delivery. Each accepted WhatsApp message has a distinct `transport.receive` child under
+WhatsApp delivery. GitHub records its delivery GUID and conversation coordinates only for a
+successfully accepted enqueue; ignored, duplicate and queue-full requests carry no identifiers.
+Each accepted WhatsApp message has a distinct `transport.receive` child under
 the signed delivery span, carrying its native `message.id` and conversation coordinates. Execution
 nests under that message receipt; for a collected burst, it nests under the lead receipt and links
 to every constituent receipt. This preserves distinguishable input and disposition evidence even
@@ -648,8 +650,11 @@ WhatsApp events at `info` or above include:
 | `gateway_whatsapp_webhook_refused` | warn | `transport`, `reason` (`unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`, `verification`, `unavailable`), `status`, `suppressed` |
 | `gateway_whatsapp_accept_failed` | debug for `kind=connection`, warn for `kind=exhausted` | `transport`, `kind`, `error` |
 | `gateway_whatsapp_listener_stopped` | error | `transport`, `error` |
+| `gateway_github_webhook_refused` | warn, rate-limited | `transport`, `reason` (`headers`, `unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`), `status`, `suppressed` |
 | `gateway_whatsapp_reply_partial` | warn | `transport`, `category`, `delivered` |
 | `gateway_whatsapp_media_refused` | warn | fixed local `reason` (HTTP status, destination, metadata, size, signature, JSON, timeout/connect/body/request); JSON `line`/`column` or URL-parser `cause` when applicable, never raw response or signed URL |
+
+The accept/listener event names remain WhatsApp-prefixed on the shared socket, including when a GitHub mount is present. GitHub ignored/duplicate events are identifier-free debug lines, never a delivery record.
 
 `suppressed` is the count this line stands for: each reason is emitted at most once a minute, and
 the next emission carries how many refusals were folded into the gap. A misconfigured app secret is

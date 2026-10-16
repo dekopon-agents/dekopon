@@ -99,7 +99,7 @@ pub(super) async fn listen(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AcceptFailure {
+enum AcceptFailure {
     Connection,
     Exhausted,
     Fatal,
@@ -107,9 +107,9 @@ pub(super) enum AcceptFailure {
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
+    reason = "std::io::ErrorKind is non-exhaustive; an unknown kind is still classified by its OS error"
 )]
-pub(super) fn classify_accept(error: &io::Error) -> AcceptFailure {
+fn classify_accept(error: &io::Error) -> AcceptFailure {
     match error.kind() {
         io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
@@ -157,7 +157,7 @@ pub(super) async fn verified_body(request: Request, secret: &[u8]) -> Result<Byt
     Ok(body)
 }
 
-fn headers_bounded(headers: &HeaderMap) -> bool {
+pub(super) fn headers_bounded(headers: &HeaderMap) -> bool {
     let mut count = 0_usize;
     let mut bytes = 0_usize;
     for (name, value) in headers {
@@ -172,7 +172,7 @@ fn headers_bounded(headers: &HeaderMap) -> bool {
     true
 }
 
-pub(super) fn exact_signature(headers: &HeaderMap) -> Option<[u8; 32]> {
+fn exact_signature(headers: &HeaderMap) -> Option<[u8; 32]> {
     let values: Vec<_> = headers.get_all("x-hub-signature-256").iter().collect();
     if values.len() != 1 {
         return None;
@@ -207,7 +207,7 @@ pub(crate) fn hmac_sha256(key: &[u8], body: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-pub(super) fn valid_hmac_sha256(key: &[u8], body: &[u8], signature: &[u8]) -> bool {
+fn valid_hmac_sha256(key: &[u8], body: &[u8], signature: &[u8]) -> bool {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of every length");
     mac.update(body);
     mac.verify_slice(signature).is_ok()
@@ -227,4 +227,85 @@ pub(super) fn text_response(status: StatusCode, body: String) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[test]
+    fn hmac_matches_a_known_vector_and_uses_exact_raw_bytes() {
+        let compact = br#"{"object":"whatsapp_business_account"}"#;
+        let spaced = br#"{ "object": "whatsapp_business_account" }"#;
+        assert_ne!(
+            hmac_sha256(b"secret", compact),
+            hmac_sha256(b"secret", spaced)
+        );
+        assert!(valid_hmac_sha256(
+            b"secret",
+            compact,
+            &hmac_sha256(b"secret", compact)
+        ));
+        let known = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
+        let known: String = known.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            known,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn accept_failures_distinguish_peer_errors_resource_exhaustion_and_listener_loss() {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(
+                classify_accept(&io::Error::from(kind)),
+                AcceptFailure::Connection
+            );
+        }
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                classify_accept(&io::Error::from_raw_os_error(code)),
+                AcceptFailure::Exhausted
+            );
+        }
+        assert_eq!(
+            classify_accept(&io::Error::from_raw_os_error(libc::EBADF)),
+            AcceptFailure::Fatal
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_headers_and_body_refuse_before_hmac() {
+        let mut builder = Request::builder();
+        for index in 0..33 {
+            builder = builder.header(format!("x-test-{index}"), "v");
+        }
+        let request = builder.body(Body::empty()).expect("request");
+        assert!(matches!(
+            verified_body(request, b"secret").await,
+            Err(VerifyFailure::Headers)
+        ));
+        for chunked in [false, true] {
+            let body = vec![0_u8; MAX_WEBHOOK_BODY_BYTES + 1];
+            let mut builder = Request::builder().header(
+                "x-hub-signature-256",
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            if !chunked {
+                builder = builder.header("content-length", body.len());
+            }
+            let request = builder.body(Body::from(body)).expect("request");
+            assert!(matches!(
+                verified_body(request, b"secret").await,
+                Err(VerifyFailure::Oversize)
+            ));
+        }
+    }
 }

@@ -98,8 +98,24 @@ impl ChatTransport for RecoveringTransport {
         self.inner.name()
     }
 
+    fn sibling_driver(&self) -> Option<(String, Arc<dyn ChatDriver>)> {
+        self.inner.sibling_driver()
+    }
+
+    fn sibling_fetcher(&self) -> Option<(String, Arc<dyn AssetFetcher>)> {
+        self.inner.sibling_fetcher()
+    }
+
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(self.open())
+    }
+
+    fn reconnect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
+        Box::pin(self.open())
+    }
+
+    fn retryable(&self, error: &TransportError) -> bool {
+        self.inner.retryable(error)
     }
 
     fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {

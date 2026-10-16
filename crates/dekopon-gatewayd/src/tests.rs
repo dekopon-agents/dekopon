@@ -158,7 +158,7 @@ fn generated_images(count: usize) -> Vec<GeneratedImage> {
     (0..count).map(|_| generated_image()).collect()
 }
 
-fn document(directory: &Path) -> Value {
+pub(crate) fn document(directory: &Path) -> Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "catalogPath": directory.join("dekopon.yaml"),
@@ -197,7 +197,7 @@ fn write_config(directory: &Path, document: &Value) -> PathBuf {
     path
 }
 
-async fn load(
+pub(crate) async fn load(
     directory: &Path,
     document: &Value,
 ) -> Result<crate::ResolvedConfig, config::ConfigError> {
@@ -224,7 +224,7 @@ fn only_route_problem(error: &RouteError) -> &RouteProblem {
     &error.problems[0]
 }
 
-fn temporary() -> tempfile::TempDir {
+pub(crate) fn temporary() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
         .expect("private temporary directory");
@@ -1397,14 +1397,14 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
         json!({
             "kind": "whatsappCloudApi", "name": name,
             "bind": format!("127.0.0.1:{port}"), "callbackPath": "/webhooks/whatsapp",
-            "appSecretEnv": "W_APP", "verifyTokenEnv": "W_VERIFY", "accessTokenEnv": "W_ACCESS",
+            "appSecretEnv": "PATH", "verifyTokenEnv": "PATH", "accessTokenEnv": "PATH",
             "wabaId": "123", "phoneNumberId": "456", "graphApiVersion": "v23.0"
         })
     };
     let github = |port: u16| {
         json!({
             "kind": "githubWebhook", "name": "github", "bind": format!("127.0.0.1:{port}"),
-            "secretEnv": "GH_SECRET"
+            "secretEnv": "PATH"
         })
     };
     let mut doc = document(directory.path());
@@ -1418,14 +1418,55 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
         .expect("two WhatsApp binds may use the same path");
 
     doc["transports"].as_array_mut().unwrap().push(github(9081));
-    load(directory.path(), &doc)
+    let resolved = load(directory.path(), &doc)
         .await
         .expect("GitHub may share either WhatsApp bind");
+    let prepared = crate::prepare(&resolved, &crate::routes::RoutingTable::default())
+        .expect("both WhatsApp listeners and the selected GitHub mount build");
+    assert_eq!(prepared.transports.len(), 3);
+    assert!(
+        prepared
+            .transports
+            .iter()
+            .any(|transport| transport.name() == "wa1")
+    );
+    let github_mount = prepared
+        .transports
+        .iter()
+        .filter(|transport| transport.name() == "github")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        github_mount.len(),
+        1,
+        "one GitHub mount for its matching bind"
+    );
+    assert_eq!(
+        github_mount[0]
+            .sibling_driver()
+            .as_ref()
+            .map(|(name, _)| name.as_str()),
+        Some("wa2")
+    );
+    assert!(github_mount[0].sibling_fetcher().is_some());
+
+    doc["transports"][3]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
+    let resolved = load(directory.path(), &doc)
+        .await
+        .expect("structurally valid");
+    let error = match crate::prepare(&resolved, &crate::routes::RoutingTable::default()) {
+        Err(error) => error,
+        Ok(_) => panic!("missing GitHub secret must be attributed to GitHub"),
+    };
+    assert!(matches!(error, crate::GatewaydError::Startup { problems }
+        if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport {
+            transport, source: crate::transport::TransportError::MissingCredential { name }
+        } if transport == "github" && name == "CC07_S2_ABSENT_SECRET"))));
+    doc["transports"][3]["secretEnv"] = json!("PATH");
 
     doc["transports"] = json!([doc["transports"][0], github(9082), whatsapp("wa1", 9080)]);
     assert!(reports(
         &load(directory.path(), &doc).await.unwrap_err(),
-        |problem| matches!(problem, ConfigProblem::ConflictingWebhookMount { name } if name == "github")
+        |problem| matches!(problem, ConfigProblem::GithubBindNotShared { name } if name == "github")
     ));
 
     doc["transports"] = json!([
@@ -1440,6 +1481,39 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
 }
 
 #[tokio::test]
+async fn distinct_whatsapp_paths_on_one_bind_refuse_duplicate_github_mount() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    let whatsapp = json!({
+        "kind": "whatsappCloudApi", "name": "wa1", "bind": "127.0.0.1:9080",
+        "callbackPath": "/webhooks/whatsapp", "appSecretEnv": "PATH",
+        "verifyTokenEnv": "PATH", "accessTokenEnv": "PATH", "wabaId": "123",
+        "phoneNumberId": "456", "graphApiVersion": "v23.0"
+    });
+    let mut second = whatsapp.clone();
+    second["name"] = json!("wa2");
+    second["callbackPath"] = json!("/webhooks/whatsapp2");
+    doc["transports"] = json!([
+        doc["transports"][0], whatsapp, second,
+        {"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080",
+         "secretEnv": "PATH"}
+    ]);
+    let error = load(directory.path(), &doc)
+        .await
+        .expect_err("two listener-owning WhatsApp transports may not claim one bind");
+    assert!(reports(&error, |problem| matches!(problem,
+        ConfigProblem::SharedWhatsappBind { bind, transports }
+            if bind.port() == 9080 && transports == &["wa1", "wa2"])));
+    assert!(!reports(&error, |problem| matches!(problem,
+        ConfigProblem::GithubBindNotShared { name }
+        | ConfigProblem::ConflictingWebhookMount { name } if name == "github")));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one config fixture checks structure and boot credential outcomes"
+)]
 async fn github_config_checks_structure_before_boot_secret_and_mount() {
     let directory = temporary();
     fs::write(
@@ -1491,14 +1565,23 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
     );
     let resolved = load(directory.path(), &doc).await.unwrap();
     assert!(matches!(
-        crate::build_transport(&resolved.transports[0], &resolved),
+        crate::build_transport(
+            &resolved.transports[0],
+            &resolved,
+            &crate::routes::RoutingTable::default()
+        ),
         Err(crate::transport::TransportError::MissingCredential { .. })
     ));
     assert!(!std::env::var("PATH").expect("Cargo test PATH").is_empty());
     doc["transports"][0]["secretEnv"] = json!("PATH");
     let resolved = load(directory.path(), &doc).await.unwrap();
     assert!(
-        matches!(crate::build_transport(&resolved.transports[0], &resolved), Err(crate::transport::TransportError::NotMountableInThisBuild { transport }) if transport == "github")
+        crate::build_transport(
+            &resolved.transports[0],
+            &resolved,
+            &crate::routes::RoutingTable::default()
+        )
+        .is_ok()
     );
     doc["transports"][0]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
     for field in ["name", "bind", "secretEnv"] {
@@ -1567,7 +1650,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
     }));
     assert!(reports(
         &load(directory.path(), &bad).await.unwrap_err(),
-        |p| matches!(p, ConfigProblem::ConflictingWebhookMount { .. })
+        |p| matches!(p, ConfigProblem::GithubBindNotShared { name } if name == "github")
     ));
     let mut bad = doc.clone();
     bad["routes"][0]["transport"] = json!("dev");
@@ -1649,6 +1732,415 @@ async fn github_first_selector_wins_before_event_filter() {
             )
             .is_none()
     );
+}
+
+async fn signed_github_request(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    body: &[u8],
+    signature: &str,
+    guid: &str,
+) -> reqwest::StatusCode {
+    client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .header("x-github-delivery", guid)
+        .header("x-github-event", "pull_request")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("POST")
+        .status()
+}
+
+async fn authorize_github_fixture(
+    inbound: Box<crate::transport::InboundMessage>,
+    route: &crate::routes::BoundRoute,
+    gate: &SessionGate,
+    broker: &mut dekopon_test_support::BrokerFixture,
+) {
+    use dekopon_broker_protocol::{
+        Attestation, BrokerClient, ChatScopeClaim, FrameLimits, RequestEnvelope,
+    };
+    let crate::session::Admit::Admitted(admission, inbound, _) =
+        gate.admit(route, *inbound, crate::collection::Dispositions(vec![]))
+    else {
+        panic!("the delivery must start a new authorized session, not steer or queue");
+    };
+    let claim = Attestation::for_chat(
+        inbound.subject,
+        "reviewer".parse().unwrap(),
+        ChatScopeClaim {
+            transport: inbound.transport.parse().unwrap(),
+            kind: inbound.transport_kind,
+            conversation: inbound.conversation,
+            trigger: inbound.message_id.trigger(),
+        },
+    );
+    let client = BrokerClient::new(
+        broker.socket(),
+        crate::current_uid(),
+        FrameLimits::default(),
+    )
+    .unwrap();
+    let leg = dekopon_agent::BrokerLeg::connect(client, Some(claim.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        leg.effective_capabilities().len(),
+        1,
+        "the fresh leg has a broker-granted surface"
+    );
+    drop(leg);
+    assert_eq!(
+        broker.request().await,
+        RequestEnvelope::capabilities(Some(claim))
+    );
+    drop(admission);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one mounted socket exercises queue saturation, eviction and restart in order"
+)]
+async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_eviction() {
+    use crate::transport::{
+        ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
+    };
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": address.to_string(), "secretEnv": "PATH"});
+    doc["routes"][0]["transport"] = json!("github");
+    doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+    doc["routes"][0]["conversation"] =
+        json!({"kind": ["thread"], "container": "owner", "ids": ["owner.repo"]});
+    doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let mut second = doc["routes"][0].clone();
+    second["githubEvents"] = json!(["workflow_run"]);
+    doc["routes"].as_array_mut().unwrap().push(second);
+    let resolved = load(directory.path(), &doc).await.unwrap();
+    let catalog =
+        dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml")).unwrap();
+    let routes =
+        std::sync::Arc::new(crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap());
+    let body = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"abcdef"}}}),
+    )
+    .unwrap();
+    let signature: String = hmac_sha256(b"secret", &body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let client = reqwest::Client::new();
+    let mut transport = GithubTransport::new(
+        "github".into(),
+        address,
+        "secret".into(),
+        std::sync::Arc::clone(&routes),
+        None,
+    );
+    transport.connect().await.unwrap();
+    for guid in ["first", "first"] {
+        assert_eq!(
+            signed_github_request(&client, address, &body, &signature, guid).await,
+            reqwest::StatusCode::OK
+        );
+    }
+    let TransportEvent::Message(message) = transport.next().await.unwrap() else {
+        panic!("queued turn")
+    };
+    assert_eq!(message.subject.canonical(), "github.owner.repo");
+    assert_eq!(message.conversation.key(), "owner.repo:first");
+    let mut broker = dekopon_test_support::BrokerFixture::answering(
+        directory.path(),
+        [
+            dekopon_broker_protocol::ResponseEnvelope::chat_capabilities(
+                vec![capability("repo.read")],
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+                Some("repo-principal".parse().unwrap()),
+            ),
+            dekopon_broker_protocol::ResponseEnvelope::chat_capabilities(
+                vec![capability("repo.read")],
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+                Some("repo-principal".parse().unwrap()),
+            ),
+        ],
+    );
+    let first_subject = message.subject.clone();
+    let route = routes.route(&message).expect("routed repo").clone();
+    let gate = SessionGate::new(1);
+    authorize_github_fixture(message, &route, &gate, &mut broker).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "a duplicate must not enqueue a second turn"
+    );
+    let other_body = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OTHER"},"name":"REPO"},
+        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"abcdef"}}}),
+    )
+    .unwrap();
+    let other_signature: String = hmac_sha256(b"secret", &other_body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        signed_github_request(
+            &client,
+            address,
+            &other_body,
+            &other_signature,
+            "different-repo"
+        )
+        .await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "another signed repo cannot use the first repo's route"
+    );
+    let run_body = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"completed", "workflow_run":{"id":5,"head_sha":"abc","conclusion":"success"}}),
+    )
+    .unwrap();
+    let run_signature: String = hmac_sha256(b"secret", &run_body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let run_status = client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={run_signature}"))
+        .header("x-github-delivery", "run-guid")
+        .header("x-github-event", "workflow_run")
+        .body(run_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(run_status.status(), reqwest::StatusCode::OK);
+    let pending_run = serde_json::to_vec(
+        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
+        "action":"requested", "workflow_run":{"id":6,"head_sha":"abc","conclusion":null}}),
+    )
+    .unwrap();
+    let pending_signature: String = hmac_sha256(b"secret", &pending_run)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let pending_status = client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={pending_signature}"))
+        .header("x-github-delivery", "pending-run-guid")
+        .header("x-github-event", "workflow_run")
+        .body(pending_run)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_status.status(),
+        reqwest::StatusCode::OK,
+        "a signed in-progress run with a null conclusion is ignored, not malformed"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "the first selected route lacks workflow_run; the later route cannot claim it"
+    );
+    let concurrent = futures_util::future::join_all(
+        (0..16).map(|_| signed_github_request(&client, address, &body, &signature, "simultaneous")),
+    )
+    .await;
+    assert!(
+        concurrent
+            .iter()
+            .all(|status| *status == reqwest::StatusCode::OK)
+    );
+    let TransportEvent::Message(only) = transport.next().await.unwrap() else {
+        panic!("one accepted concurrent turn")
+    };
+    assert_eq!(only.message_id.to_string(), "simultaneous");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
+            .await
+            .is_err()
+    );
+    for index in 0..64 {
+        assert_eq!(
+            signed_github_request(
+                &client,
+                address,
+                &body,
+                &signature,
+                &format!("queue-{index}")
+            )
+            .await,
+            reqwest::StatusCode::OK
+        );
+    }
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "retry").await,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let TransportEvent::Message(_) = transport.next().await.unwrap() else {
+        panic!("release queue slot")
+    };
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "retry").await,
+        reqwest::StatusCode::OK
+    );
+    for _ in 0..64 {
+        let TransportEvent::Message(_) = transport.next().await.unwrap() else {
+            panic!("queued message")
+        };
+    }
+    for index in 0..1024 {
+        assert_eq!(
+            signed_github_request(
+                &client,
+                address,
+                &body,
+                &signature,
+                &format!("evict-{index}")
+            )
+            .await,
+            reqwest::StatusCode::OK
+        );
+        let TransportEvent::Message(_) = transport.next().await.unwrap() else {
+            panic!("eviction input")
+        };
+    }
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "first").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(evicted) = transport.next().await.unwrap() else {
+        panic!("evicted GUID is accepted")
+    };
+    assert_eq!(evicted.message_id.to_string(), "first");
+    drop(transport);
+    tokio::task::yield_now().await;
+    let mut restarted =
+        GithubTransport::new("github".into(), address, "secret".into(), routes, None);
+    restarted.connect().await.unwrap();
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "first").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(second) = restarted.next().await.unwrap() else {
+        panic!("restart accepts second turn")
+    };
+    assert_eq!(second.subject, first_subject);
+    authorize_github_fixture(second, &route, &gate, &mut broker).await;
+}
+
+#[tokio::test]
+async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
+    use crate::transport::{
+        ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
+        whatsapp::WhatsappTransport,
+    };
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let wa = WhatsappTransport::new(
+        "wa".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "wa-secret".into(),
+        "verify".into(),
+        "access".into(),
+        crate::LivenessSettings::default(),
+    )
+    .unwrap();
+    let combined = GithubTransport::new(
+        "github".into(),
+        address,
+        "gh-secret".into(),
+        std::sync::Arc::new(crate::routes::RoutingTable::default()),
+        Some(wa),
+    );
+    let mut drivers = BTreeMap::new();
+    let mut fetchers = HashMap::new();
+    let mut owners = HashMap::new();
+    let mut combined =
+        crate::register_transport(Box::new(combined), &mut drivers, &mut fetchers, &mut owners);
+    assert!(drivers.contains_key("github") && drivers.contains_key("wa"));
+    assert!(fetchers.contains_key("wa"));
+    assert!(!fetchers.contains_key("github"));
+    let lone = WhatsappTransport::new(
+        "wa-alone".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "wa-secret".into(),
+        "verify".into(),
+        "access".into(),
+        crate::LivenessSettings::default(),
+    )
+    .unwrap();
+    let _lone = crate::register_transport(Box::new(lone), &mut drivers, &mut fetchers, &mut owners);
+    assert!(drivers.contains_key("wa-alone") && fetchers.contains_key("wa-alone"));
+    combined.connect().await.unwrap();
+    let client = reqwest::Client::new();
+    let challenge = client
+        .get(format!(
+            "http://{address}/wa?hub.mode=subscribe&hub.verify_token=verify&hub.challenge=ok"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.text().await.unwrap(), "ok");
+    let body = serde_json::to_vec(
+        &json!({"object":"whatsapp_business_account", "entry":[{"id":"123",
+        "changes":[{"field":"messages","value":{"messaging_product":"whatsapp",
+        "metadata":{"phone_number_id":"456"},"contacts":[{"wa_id":"1603"}],
+        "messages":[{"id":"wamid.1","from":"1603","type":"text","text":{"body":"hello"}}]}}]}]}),
+    )
+    .unwrap();
+    let signature: String = hmac_sha256(b"wa-secret", &body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let response = client
+        .post(format!("http://{address}/wa"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        matches!(combined.next().await.unwrap(), TransportEvent::Connected { name, .. } if name == "wa")
+    );
+    let TransportEvent::Message(message) = combined.next().await.unwrap() else {
+        panic!("WhatsApp still queues")
+    };
+    assert_eq!(message.subject.canonical(), "whatsapp.1603");
 }
 
 #[tokio::test]
@@ -2623,7 +3115,7 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
     );
 }
 
-fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
+pub(crate) fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
     let class = model_class.map_or(String::new(), |class| format!("  modelClass: {class}\n"));
     format!(
         "apiVersion: dekopon.dev/v1alpha1\n\
@@ -14011,7 +14503,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
         }}]}]
     }))
     .expect("the delivery serializes");
-    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let digest = crate::transport::webhook::hmac_sha256(b"secret", &body);
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
@@ -14092,7 +14584,7 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
             })).collect::<Vec<_>>()
         }}]}]
     })).unwrap();
-    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let digest = crate::transport::webhook::hmac_sha256(b"secret", &body);
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     let response = reqwest::Client::new()
         .post(format!("http://{address}/wa"))
