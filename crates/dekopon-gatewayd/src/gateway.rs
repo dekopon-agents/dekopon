@@ -41,6 +41,7 @@ struct ServingGeneration {
 }
 
 struct ReloadState {
+    active: Arc<ArcSwap<ServingGeneration>>,
     path: PathBuf,
     config: config::ResolvedConfig,
     sources: Arc<config::GatewaySources>,
@@ -161,6 +162,7 @@ impl Gateway {
             _broker_digest: broker_digest.clone(),
         }));
         self.reload = Some(ReloadState {
+            active: Arc::clone(&self.active),
             path,
             config: candidate.config,
             sources,
@@ -171,204 +173,11 @@ impl Gateway {
         Ok(self)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one broker-first coordination transaction owns confirmation and publication"
-    )]
+    #[cfg(test)]
     pub(crate) async fn reconcile(&mut self) {
-        let Some(state) = self.reload.as_ref() else {
-            return;
-        };
-        let path = state.path.clone();
-        let (candidate, report) = crate::load_candidate_against(
-            &path,
-            None,
-            config::LoadMode::Boot,
-            None,
-            Some((&state.config, &state.sources)),
-        )
-        .await;
-        let Some(candidate) = candidate else {
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                problems = report.problems.len()
-            );
-            return;
-        };
-        let old_gateway = state.gateway_digest.clone();
-        let old_broker = state.broker_digest.clone();
-        let pending = state.pending.clone();
-        let broker = &candidate.config.broker;
-        let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
-        else {
-            tracing::warn!(event = "gateway_reload_monitor_failed");
-            return;
-        };
-        if let Some((pending_broker, pending_gateway)) = &pending {
-            let (observed, outcome) = match client.observe_generation().await {
-                Ok(observation) => observation,
-                Err(_) => {
-                    tracing::warn!(event = "gateway_reload_monitor_failed");
-                    return;
-                }
-            };
-            if outcome != GenerationOutcome::Active {
-                tracing::warn!(event = "gateway_reload_monitor_failed");
-                return;
-            }
-            let digest = match serving_digest(&candidate, pending_broker) {
-                Ok(digest) => digest,
-                Err(_) => return,
-            };
-            if observed == *pending_broker && digest == *pending_gateway {
-                if candidate
-                    .sources
-                    .still_current(&path, &candidate.config.catalog_path, crate::current_uid())
-                    .await
-                    .unwrap_or(false)
-                {
-                    if digest == old_gateway {
-                        if let Some(active) = self.reload.as_mut() {
-                            active.broker_digest = observed;
-                            active.pending = None;
-                        }
-                    } else {
-                        self.publish(path, candidate, observed, digest);
-                    }
-                }
-                return;
-            }
-            if observed != old_broker && observed != *pending_broker {
-                tracing::warn!(event = "gateway_reload_monitor_failed");
-                return;
-            }
-            let Some(active) = self.reload.as_mut() else {
-                return;
-            };
-            if observed == *pending_broker {
-                active.broker_digest = observed;
-            }
-            active.pending = None;
+        if let Some(reload) = self.reload.as_mut() {
+            reload.reconcile().await;
         }
-        let Some(active) = self.reload.as_ref() else {
-            return;
-        };
-        let expected_broker = active.broker_digest.clone();
-        let (broker_digest, outcome) =
-            match client.prepare_generation(expected_broker.clone()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(event = "gateway_reload_monitor_failed");
-                    return;
-                }
-            };
-        let digest = match serving_digest(&candidate, &broker_digest) {
-            Ok(digest) => digest,
-            Err(_) => return,
-        };
-        match outcome {
-            GenerationOutcome::Active if broker_digest == expected_broker => {
-                if digest != old_gateway {
-                    if candidate
-                        .sources
-                        .still_current(&path, &candidate.config.catalog_path, crate::current_uid())
-                        .await
-                        .unwrap_or(false)
-                    {
-                        self.publish(path, candidate, broker_digest, digest);
-                    } else {
-                        tracing::warn!(
-                            event = "gateway_reload_refused",
-                            applied = false,
-                            reason = "source-changed"
-                        );
-                    }
-                }
-                return;
-            }
-            GenerationOutcome::Prepared => {}
-            GenerationOutcome::Active
-            | GenerationOutcome::Refused
-            | GenerationOutcome::Applied
-            | GenerationOutcome::Aborted => {
-                tracing::warn!(
-                    event = "gateway_reload_refused",
-                    applied = false,
-                    reason = "broker-prepare"
-                );
-                return;
-            }
-        }
-        if !candidate
-            .sources
-            .still_current(&path, &candidate.config.catalog_path, crate::current_uid())
-            .await
-            .unwrap_or(false)
-        {
-            if !matches!(
-                client.abort_generation(broker_digest).await,
-                Ok(GenerationOutcome::Aborted)
-            ) {
-                tracing::warn!(event = "gateway_reload_monitor_failed");
-            }
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                reason = "source-changed"
-            );
-            return;
-        }
-        let confirmed = match client.commit_generation(broker_digest.clone()).await {
-            Ok(GenerationOutcome::Applied) => true,
-            Ok(_) => false,
-            Err(_) => matches!(client.observe_generation().await,
-                Ok((observed, GenerationOutcome::Active)) if observed == broker_digest),
-        };
-        if !confirmed {
-            if let Some(active) = self.reload.as_mut() {
-                active.pending = Some((broker_digest, digest));
-            }
-            tracing::warn!(
-                event = "gateway_reload_refused",
-                applied = false,
-                reason = "broker-confirmation"
-            );
-            return;
-        }
-        if digest == old_gateway {
-            if let Some(active) = self.reload.as_mut() {
-                active.broker_digest = broker_digest;
-            }
-        } else {
-            self.publish(path, candidate, broker_digest, digest);
-        }
-    }
-
-    fn publish(
-        &mut self,
-        path: PathBuf,
-        candidate: Candidate,
-        broker_digest: String,
-        digest: String,
-    ) {
-        let sources = Arc::new(candidate.sources);
-        self.active.store(Arc::new(ServingGeneration {
-            routes: Arc::new(candidate.routes),
-            stop_words: Arc::new(candidate.config.stop_words.clone()),
-            _sources: Some(Arc::clone(&sources)),
-            _digest: digest.clone(),
-            _broker_digest: broker_digest.clone(),
-        }));
-        self.reload = Some(ReloadState {
-            path,
-            config: candidate.config,
-            sources,
-            broker_digest,
-            gateway_digest: digest.clone(),
-            pending: None,
-        });
-        tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
     }
 
     #[cfg(test)]
@@ -411,9 +220,10 @@ impl Gateway {
         F: Future<Output = ()> + Send,
     {
         let mut sessions = JoinSet::new();
-        let mut reload_tick = tokio::time::interval(Duration::from_secs(2));
-        reload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        reload_tick.reset();
+        let mut reloading = JoinSet::new();
+        if let Some(reload) = self.reload.take() {
+            reloading.spawn(reload.run());
+        }
         let mut follow_pending = follow::Debounce::default();
         let mut ticks = JoinSet::new();
         let mut wakes = self.runner.wakes.clone();
@@ -434,7 +244,6 @@ impl Gateway {
             tokio::select! {
                 biased;
                 () = &mut shutdown => break,
-                _ = reload_tick.tick(), if self.reload.is_some() => self.reconcile().await,
                 () = async {
                     match wake_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -477,12 +286,13 @@ impl Gateway {
                     }
                 } => {
                     for message in follow_pending.due(tokio::time::Instant::now()) {
-                        if let Some(route) = self.active.load().routes.route(&message)
+                        let generation = self.active.load();
+                        if let Some(route) = generation.routes.route(&message)
                             && let Some(table) = self.runner.follow.as_ref()
                         {
                             let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
                             if matches!(table.ticket(&key, SystemTime::now()), follow::FollowTicket::Active { .. }) {
-                                self.start_session(&mut sessions, message);
+                                self.start_session(&mut sessions, &generation, message);
                             }
                         }
                     }
@@ -494,18 +304,19 @@ impl Gateway {
                     }
                 } => {
                     for message in collector.take_due(tokio::time::Instant::now()) {
-                        self.start_session(&mut sessions, message);
+                        self.start_session(&mut sessions, &self.active.load(), message);
                     }
                 },
                 Some(message) = notices.recv() => {
                     let MessageId::Job { agent, .. } = &message.message_id else {
                         continue;
                     };
-                    let answering = self.active.load().routes.route(&message).is_some_and(|route| {
+                    let generation = self.active.load();
+                    let answering = generation.routes.route(&message).is_some_and(|route| {
                         route.job_timeout.is_some() && &route.agent == agent
                     });
                     if answering && self.drivers.contains_key(&message.transport) {
-                        self.start_session(&mut sessions, message);
+                        self.start_session(&mut sessions, &generation, message);
                     } else if let Some(notice) = jobs::Notice::of(&message) {
                         notice.record("dropped");
                     }
@@ -541,6 +352,7 @@ impl Gateway {
             }
         }
 
+        reloading.shutdown().await;
         drop(notices);
         collector.shutdown();
         drop(follow_pending);
@@ -764,7 +576,9 @@ impl Gateway {
         }
         match collector.offer(route_id, message) {
             collection::Offered::Pending => {}
-            collection::Offered::Immediate(message) => self.start_session(sessions, message),
+            collection::Offered::Immediate(message) => {
+                self.start_session(sessions, &generation, message);
+            }
             collection::Offered::Refused(message, reason) => {
                 collection::disposition(&message.receive_span, reason);
                 if let Some(driver) = self.drivers.get(&message.transport).cloned()
@@ -786,8 +600,12 @@ impl Gateway {
         }
     }
 
-    fn start_session(&self, sessions: &mut JoinSet<()>, message: InboundMessage) {
-        let generation = self.active.load();
+    fn start_session(
+        &self,
+        sessions: &mut JoinSet<()>,
+        generation: &ServingGeneration,
+        message: InboundMessage,
+    ) {
         let Some(route) = generation.routes.route(&message) else {
             collection::disposition(&message.receive_span, "route-lost");
             return;
@@ -815,16 +633,15 @@ impl Gateway {
         let agent = fired.agent().clone();
         let id = fired.id();
         let message = fired.into_inbound();
-        let answering = self
-            .active
-            .load()
+        let generation = self.active.load();
+        let answering = generation
             .routes
             .route(&message)
             .is_some_and(|route| route.wakes && route.agent == agent);
         let receipt = message.receive_span.clone();
         receipt.in_scope(|| tracing::info!(event = "gateway_wake_fired", wake.id = %id));
         if answering {
-            self.start_session(sessions, message);
+            self.start_session(sessions, &generation, message);
             return;
         }
         receipt.in_scope(|| tracing::warn!(event = "gateway_wake_orphaned", wake.id = %id));
@@ -839,5 +656,137 @@ impl Gateway {
                 .instrument(receipt),
             );
         }
+    }
+}
+
+impl ReloadState {
+    async fn run(mut self) {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.reset();
+        loop {
+            tick.tick().await;
+            self.reconcile().await;
+        }
+    }
+
+    async fn reconcile(&mut self) {
+        let (candidate, report) = crate::load_candidate_against(
+            &self.path,
+            None,
+            config::LoadMode::Boot,
+            None,
+            Some((&self.config, &self.sources)),
+        )
+        .await;
+        let Some(candidate) = candidate else {
+            tracing::warn!(
+                event = "gateway_reload_refused",
+                applied = false,
+                problems = report.problems.len()
+            );
+            return;
+        };
+        let broker = &candidate.config.broker;
+        let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
+        else {
+            tracing::warn!(event = "gateway_reload_monitor_failed");
+            return;
+        };
+        if let Some((pending_broker, pending_gateway)) = self.pending.clone() {
+            let (observed, outcome) = match client.observe_generation().await {
+                Ok(observation) => observation,
+                Err(_) => {
+                    tracing::warn!(event = "gateway_reload_monitor_failed");
+                    return;
+                }
+            };
+            if outcome != GenerationOutcome::Active {
+                tracing::warn!(event = "gateway_reload_monitor_failed");
+                return;
+            }
+            let Ok(digest) = serving_digest(&candidate, &pending_broker) else {
+                return;
+            };
+            if observed == pending_broker && digest == pending_gateway {
+                self.settle(candidate, observed, digest);
+                return;
+            }
+            self.broker_digest = observed;
+            self.pending = None;
+        }
+        let expected_broker = self.broker_digest.clone();
+        let (broker_digest, outcome) =
+            match client.prepare_generation(expected_broker.clone()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(event = "gateway_reload_monitor_failed");
+                    return;
+                }
+            };
+        let Ok(digest) = serving_digest(&candidate, &broker_digest) else {
+            return;
+        };
+        match outcome {
+            GenerationOutcome::Active if broker_digest == expected_broker => {
+                self.settle(candidate, broker_digest, digest);
+                return;
+            }
+            GenerationOutcome::Prepared => {}
+            GenerationOutcome::Refused => {
+                self.broker_digest = broker_digest;
+                tracing::warn!(
+                    event = "gateway_reload_refused",
+                    applied = false,
+                    reason = "broker-prepare"
+                );
+                return;
+            }
+            GenerationOutcome::Active | GenerationOutcome::Applied | GenerationOutcome::Aborted => {
+                tracing::warn!(
+                    event = "gateway_reload_refused",
+                    applied = false,
+                    reason = "broker-prepare"
+                );
+                return;
+            }
+        }
+        let confirmed = match client.commit_generation(broker_digest.clone()).await {
+            Ok(GenerationOutcome::Applied) => true,
+            Ok(_) => false,
+            Err(_) => matches!(client.observe_generation().await,
+                Ok((observed, GenerationOutcome::Active)) if observed == broker_digest),
+        };
+        if !confirmed {
+            self.pending = Some((broker_digest, digest));
+            tracing::warn!(
+                event = "gateway_reload_refused",
+                applied = false,
+                reason = "broker-confirmation"
+            );
+            return;
+        }
+        self.settle(candidate, broker_digest, digest);
+    }
+
+    fn settle(&mut self, candidate: Candidate, broker_digest: String, digest: String) {
+        self.pending = None;
+        if digest == self.gateway_digest {
+            self.broker_digest = broker_digest;
+            return;
+        }
+        let sources = Arc::new(candidate.sources);
+        self.active.store(Arc::new(ServingGeneration {
+            routes: Arc::new(candidate.routes),
+            stop_words: Arc::new(candidate.config.stop_words.clone()),
+            _sources: Some(Arc::clone(&sources)),
+            _digest: digest.clone(),
+            _broker_digest: broker_digest.clone(),
+        }));
+        self.config = candidate.config;
+        self.sources = sources;
+        self.broker_digest = broker_digest;
+        tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
+        self.gateway_digest = digest;
     }
 }

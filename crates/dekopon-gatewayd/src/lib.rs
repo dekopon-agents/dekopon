@@ -493,7 +493,15 @@ pub(crate) async fn load_candidate_against(
             {
                 report.warnings.push(CheckWarning::MemoryWithoutJournal);
             }
-            credentials(config, routes, mode, &mut report)
+            if active.is_none() {
+                credentials(config, routes, mode, &mut report)
+            } else {
+                let problems = model_credential_problems(routes.bound_models(), model_bearer_token);
+                if !problems.is_empty() {
+                    report.problems.push(GatewaydError::Startup { problems });
+                }
+                Vec::new()
+            }
         }
         (None, _) | (_, None) => {
             report.skipped(Stage::Credentials);
