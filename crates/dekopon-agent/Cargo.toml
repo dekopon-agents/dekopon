@@ -21,6 +21,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-process.workspace = true
 # Loaded skills: the session shows a model text `dekopon-config` already read and bounded.
 dekopon-config.workspace = true
+dekopon-context.workspace = true
 dekopon-core = { workspace = true, features = ["native"] }
 dekopon-model.workspace = true
 dekopon-model-token-governor.workspace = true

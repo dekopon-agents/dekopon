@@ -12,30 +12,8 @@ use arc_swap::ArcSwap;
 use dekopon_model::model::{AssistantTurn, ModelMessage, assistant_message};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Representation {
-    pub routine_id: String,
-    pub version: String,
-    pub source_record_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub part: Option<String>,
-    pub kind: String,
-    pub captured_bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Exchange {
-    pub tool: String,
-    pub request: Vec<Representation>,
-    pub result: Vec<Representation>,
-    pub outcome: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_status: Option<i32>,
-}
+pub use dekopon_context::{Exchange, Representation};
+use dekopon_context::{eviction_count, fit_projected};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -300,41 +278,6 @@ impl RawAnswer {
     }
 }
 
-impl Representation {
-    #[must_use]
-    pub fn original(text: &str, version: &str) -> Self {
-        Self {
-            routine_id: "original".into(),
-            version: version.into(),
-            source_record_id: 0,
-            part: None,
-            kind: "original".into(),
-            captured_bytes: text.len() as u64,
-            text: Some(text.into()),
-        }
-    }
-
-    #[must_use]
-    pub fn prefix(text: &str, max_bytes: usize, routine_id: &str, version: &str) -> Self {
-        let cut = text.floor_char_boundary(max_bytes.min(text.len()));
-        Self {
-            routine_id: routine_id.into(),
-            version: version.into(),
-            source_record_id: 0,
-            part: None,
-            kind: "prefix".into(),
-            captured_bytes: text.len() as u64,
-            text: Some(text[..cut].into()),
-        }
-    }
-
-    #[must_use]
-    pub fn omitted_bytes(&self) -> u64 {
-        self.captured_bytes
-            .saturating_sub(self.text.as_ref().map_or(0, |text| text.len() as u64))
-    }
-}
-
 impl From<String> for RawAnswer {
     fn from(answer: String) -> Self {
         Self(answer)
@@ -492,11 +435,23 @@ impl History {
     }
 
     pub fn record_projected(&mut self, turn: ConversationTurn) -> bool {
-        if turn.bytes() > self.limits.max_bytes {
-            return false;
+        if self.limits.max_turns == 0 {
+            if turn.bytes() > self.limits.max_bytes {
+                return false;
+            }
+            self.turns.clear();
+            return true;
         }
+        let Some(dropped) = fit_projected(
+            self.turns.iter().map(ConversationTurn::bytes),
+            turn.bytes(),
+            self.limits.max_turns,
+            self.limits.max_bytes,
+        ) else {
+            return false;
+        };
+        self.turns.drain(..dropped);
         self.turns.push(turn);
-        self.trim();
         true
     }
 
@@ -524,20 +479,11 @@ impl History {
     }
 
     fn trim(&mut self) {
-        if self.turns.len() > self.limits.max_turns {
-            let excess = self.turns.len() - self.limits.max_turns;
-            self.turns.drain(..excess);
-        }
-
-        let mut bytes = self.bytes();
-        let mut dropped = 0;
-        for turn in &self.turns {
-            if bytes <= self.limits.max_bytes {
-                break;
-            }
-            bytes = bytes.saturating_sub(turn.bytes());
-            dropped += 1;
-        }
+        let dropped = eviction_count(
+            self.turns.iter().map(ConversationTurn::bytes),
+            self.limits.max_turns,
+            self.limits.max_bytes,
+        );
         self.turns.drain(..dropped);
     }
 }
@@ -545,6 +491,16 @@ impl History {
 #[cfg(test)]
 mod projection_tests {
     use super::{ConversationTurn, History, HistoryLimits};
+
+    #[test]
+    fn zero_turn_limit_records_nothing_without_panicking() {
+        let mut history = History::new(HistoryLimits {
+            max_turns: 0,
+            max_bytes: 10,
+        });
+        assert!(history.record_projected(ConversationTurn::unanswered("one")));
+        assert!(history.is_empty());
+    }
 
     #[test]
     fn fitting_drops_oldest_whole_turns_without_truncating_or_downgrading() {

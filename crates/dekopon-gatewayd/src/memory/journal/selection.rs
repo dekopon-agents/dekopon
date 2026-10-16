@@ -5,7 +5,7 @@ use crate::config::{
     MemoryWindow,
     memory::{ResolvedPolicy, RoutineKind, SelectionMode},
 };
-use dekopon_agent::prompt::{ConversationTurn, Exchange, History, Representation, Selection};
+use dekopon_agent::prompt::{ConversationTurn, History, Selection};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
 use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ExitCode, Streams,
@@ -121,71 +121,22 @@ pub(crate) fn decide<I: CapabilityInvoker>(
         .ok_or("invalid-response")
 }
 
-fn append_exchanges(
-    output: &mut String,
-    exchanges: &[Exchange],
-    mut selected: impl FnMut(&Representation) -> bool,
-) {
-    for exchange in exchanges {
-        output.push_str(&format!(
-            "\n[tool: {}, outcome: {}, exit: {:?}]",
-            exchange.tool, exchange.outcome, exchange.exit_status
-        ));
-        for (label, parts) in [("request", &exchange.request), ("result", &exchange.result)] {
-            let content: String = parts
-                .iter()
-                .filter(|rep| selected(rep))
-                .filter_map(|rep| rep.text.as_deref())
-                .collect();
-            if !content.is_empty() {
-                output.push_str(&format!("\n[{label}] {content}"));
-            }
-        }
-    }
-}
-
 pub(super) fn original_envelope_bytes(turn: &ConversationTurn) -> usize {
-    if turn.exchanges().is_empty() {
-        return turn.bytes();
-    }
-    let mut output = turn.user().to_owned();
-    if let Some(answer) = turn.answer() {
-        output.push('\n');
-        output.push_str(answer);
-    }
-    append_exchanges(&mut output, turn.exchanges(), |rep| rep.kind == "original");
-    output.len()
+    dekopon_context::original_envelope_bytes(turn.user(), turn.answer(), turn.exchanges())
 }
 
 fn envelope(line: &Line, id: &str, version: &str, is_original: bool) -> Option<String> {
-    let representations = line
-        .representations
-        .iter()
-        .filter(|rep| rep.routine_id == id && rep.version == version && rep.text.is_some());
-    let text = representations
-        .map(|rep| rep.text.as_deref().unwrap_or_default())
-        .collect::<String>();
-    if (is_original && line.user.is_none()) || (!is_original && text.is_empty()) {
-        return None;
-    }
-    let mut output = match (&line.user, &line.answer) {
-        (Some(user), Some(answer)) if is_original => format!("{user}\n{answer}"),
-        (Some(user), None) if is_original => user.clone(),
-        _ => text.clone(),
-    };
-    append_exchanges(&mut output, &line.exchanges, |rep| {
-        rep.routine_id == id && rep.version == version
-    });
-    if !is_original {
-        output = format!(
-            "[memory: routine={id}, omitted={} bytes]\n{output}",
-            line.representations
-                .iter()
-                .find(|rep| rep.routine_id == id)
-                .map_or(0, Representation::omitted_bytes)
-        );
-    }
-    Some(output)
+    dekopon_context::render_envelope(
+        dekopon_context::EnvelopeSource {
+            user: line.user.as_deref(),
+            answer: line.answer.as_deref(),
+            representations: &line.representations,
+            exchanges: &line.exchanges,
+        },
+        id,
+        version,
+        is_original,
+    )
 }
 
 fn representation<'a>(line: &'a Line, id: &str, policy: &'a ResolvedPolicy) -> Option<String> {

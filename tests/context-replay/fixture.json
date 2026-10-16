@@ -1,0 +1,196 @@
+{
+  "version": "v1",
+  "configId": "synthetic-v1",
+  "maxTurns": 3,
+  "maxBytes": 100,
+  "steps": [
+    {
+      "id": "9007199254740993",
+      "user": "Fact: amber kite",
+      "answer": "Remembered.",
+      "representations": [],
+      "exchanges": [],
+      "pin": null
+    },
+    {
+      "id": "9007199254740994",
+      "user": "distractor one",
+      "answer": "ok",
+      "representations": [],
+      "exchanges": [],
+      "pin": null
+    },
+    {
+      "id": "9007199254740995",
+      "user": "🌿 café and facts",
+      "answer": "done",
+      "representations": [
+        {
+          "routineId": "short",
+          "version": "v1",
+          "sourceRecordId": 0,
+          "kind": "prefix",
+          "capturedBytes": 20,
+          "text": "🌿 ca"
+        }
+      ],
+      "exchanges": [],
+      "pin": null
+    },
+    {
+      "id": "9007199254740996",
+      "user": "distractor two",
+      "answer": "ok",
+      "representations": [],
+      "exchanges": [],
+      "pin": null
+    },
+    {
+      "id": "9007199254740997",
+      "user": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "answer": null,
+      "representations": [],
+      "exchanges": [],
+      "pin": "original"
+    },
+    {
+      "id": "9007199254740998",
+      "user": "follow-up user",
+      "answer": "assistant reply",
+      "representations": [],
+      "exchanges": [],
+      "pin": null
+    }
+  ],
+  "cassette": [
+    {
+      "request": {
+        "version": "v1",
+        "configId": "synthetic-v1",
+        "ordinal": 0,
+        "input": {
+          "id": "9007199254740993",
+          "user": "Fact: amber kite",
+          "answer": "Remembered.",
+          "representations": [],
+          "exchanges": [],
+          "pin": null
+        }
+      },
+      "response": {
+        "id": "original",
+        "version": "v1",
+        "isOriginal": true
+      }
+    },
+    {
+      "request": {
+        "version": "v1",
+        "configId": "synthetic-v1",
+        "ordinal": 1,
+        "input": {
+          "id": "9007199254740994",
+          "user": "distractor one",
+          "answer": "ok",
+          "representations": [],
+          "exchanges": [],
+          "pin": null
+        }
+      },
+      "response": {
+        "id": "original",
+        "version": "v1",
+        "isOriginal": true
+      }
+    },
+    {
+      "request": {
+        "version": "v1",
+        "configId": "synthetic-v1",
+        "ordinal": 2,
+        "input": {
+          "id": "9007199254740995",
+          "user": "🌿 café and facts",
+          "answer": "done",
+          "representations": [
+            {
+              "routineId": "short",
+              "version": "v1",
+              "sourceRecordId": 0,
+              "kind": "prefix",
+              "capturedBytes": 20,
+              "text": "🌿 ca"
+            }
+          ],
+          "exchanges": [],
+          "pin": null
+        }
+      },
+      "response": {
+        "id": "short",
+        "version": "v1",
+        "isOriginal": false
+      }
+    },
+    {
+      "request": {
+        "version": "v1",
+        "configId": "synthetic-v1",
+        "ordinal": 3,
+        "input": {
+          "id": "9007199254740996",
+          "user": "distractor two",
+          "answer": "ok",
+          "representations": [],
+          "exchanges": [],
+          "pin": null
+        }
+      },
+      "response": {
+        "id": "original",
+        "version": "v1",
+        "isOriginal": true
+      }
+    },
+    {
+      "request": {
+        "version": "v1",
+        "configId": "synthetic-v1",
+        "ordinal": 4,
+        "input": {
+          "id": "9007199254740997",
+          "user": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+          "answer": null,
+          "representations": [],
+          "exchanges": [],
+          "pin": "original"
+        }
+      },
+      "response": {
+        "id": "original",
+        "version": "v1",
+        "isOriginal": true
+      }
+    },
+    {
+      "request": {
+        "version": "v1",
+        "configId": "synthetic-v1",
+        "ordinal": 5,
+        "input": {
+          "id": "9007199254740998",
+          "user": "follow-up user",
+          "answer": "assistant reply",
+          "representations": [],
+          "exchanges": [],
+          "pin": null
+        }
+      },
+      "response": {
+        "id": "original",
+        "version": "v1",
+        "isOriginal": true
+      }
+    }
+  ]
+}

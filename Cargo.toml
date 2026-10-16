@@ -7,6 +7,8 @@ members = [
     "crates/dekopon-brokerd",
     "crates/dekopon-capability",
     "crates/dekopon-config",
+    "crates/dekopon-context",
+    "crates/dekopon-context-wasm",
     "crates/dekopon-core",
     "crates/dekopon-model",
     "crates/dekopon-model-token-governor",
@@ -121,6 +123,7 @@ dekopon-broker-protocol = { version = "=0.47.0", path = "crates/dekopon-broker-p
 dekopon-brokerd = { version = "=0.47.0", path = "crates/dekopon-brokerd" }
 dekopon-capability = { version = "=0.47.0", path = "crates/dekopon-capability", default-features = false }
 dekopon-config = { version = "=0.47.0", path = "crates/dekopon-config" }
+dekopon-context = { version = "=0.47.0", path = "crates/dekopon-context" }
 dekopon-core = { version = "=0.47.0", path = "crates/dekopon-core", default-features = false }
 dekopon-http-host = { version = "=0.47.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "=0.47.0", path = "crates/dekopon-model" }

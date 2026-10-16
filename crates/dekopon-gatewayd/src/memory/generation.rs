@@ -7,6 +7,7 @@ use crate::{
     session::{SessionCancellation, SessionRunner},
 };
 use dekopon_agent::prompt::{ConversationTurn, Exchange, Representation};
+use dekopon_context::prefix_text as bounded;
 use dekopon_model::model::{ChatModel, CompletionOptions, ModelMessage};
 use sha2::{Digest, Sha256};
 use std::{ops::ControlFlow, sync::Arc, time::SystemTime};
@@ -28,10 +29,6 @@ pub(crate) fn version(routine: &Routine) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn bounded(text: &str, bytes: usize) -> String {
-    text[..text.floor_char_boundary(bytes.min(text.len()))].to_owned()
 }
 
 fn derived(
