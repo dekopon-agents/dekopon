@@ -986,3 +986,151 @@ pub enum ServerError {
     #[error("broker connections did not finish within the shutdown grace period")]
     ShutdownTimeout,
 }
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use crate::{
+        Mode,
+        tests::{ManagedBroker, POLICIES, write_owner_only},
+    };
+    use dekopon_broker::{AttestorGrant, AuthenticatedContext};
+    use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion, read_frame};
+    use dekopon_core::Actor;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    fn peer(principal: &str, attestor: Option<AttestorGrant>) -> MappedPeer {
+        let principal: dekopon_core::PrincipalId = principal.parse().unwrap();
+        MappedPeer {
+            context: AuthenticatedContext::new(principal.clone(), Actor::Service { principal })
+                .unwrap(),
+            attestor,
+        }
+    }
+
+    async fn exchange(
+        coordination: &Coordination,
+        mapped: MappedPeer,
+        other: MappedPeer,
+        request: BrokerRequest,
+    ) -> BrokerResponse {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let active = coordination.active();
+        let uid = client.peer_cred().unwrap().uid();
+        let identities = BTreeMap::from([(uid, mapped), (uid + 1, other)]);
+        let limits = FrameLimits::default();
+        let serve = handle(
+            server,
+            &active.ready.broker,
+            &identities,
+            limits,
+            Some(coordination),
+        );
+        let transact = async {
+            write_frame(
+                &mut client,
+                &RequestEnvelope {
+                    api_version: ProtocolVersion::V1Alpha3,
+                    request,
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+            read_frame::<_, ResponseEnvelope>(&mut client, limits)
+                .await
+                .unwrap()
+                .response
+        };
+        let (served, response) = tokio::join!(serve, transact);
+        served.unwrap();
+        response
+    }
+
+    fn unauthenticated(response: BrokerResponse) {
+        assert!(
+            matches!(response, BrokerResponse::Error { code, .. } if code == ERROR_UNAUTHENTICATED)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_gateway_attestor_peer_can_coordinate_generation_frames() {
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let coordination = Coordination::new(fixture.config(), active.unwrap());
+        let old = coordination.active().digest.clone();
+        write_owner_only(
+            &fixture.directory.path().join("policies.cedar"),
+            format!(
+                "{}\n@id(\"new\") permit(principal, action, resource);\n",
+                POLICIES.replace(
+                    "context.via == \"gateway\"",
+                    "context.via == \"dekopon-gatewayd\""
+                ),
+            )
+            .as_bytes(),
+        );
+        let (next, report) =
+            crate::load_candidate(&fixture.config(), Mode::Reload(&coordination.active())).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let next = next.unwrap().digest;
+        let owner = coordination.active().ready.identities[&crate::current_uid()].clone();
+        let strangers = [
+            peer("caller", None),
+            peer(
+                "dekopon-console",
+                Some(AttestorGrant {
+                    namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+                }),
+            ),
+        ];
+        let capture = dekopon_test_support::CaptureLayer::new();
+        async {
+            for stranger in &strangers {
+                for request in [
+                    BrokerRequest::PrepareGeneration { digest: old.clone() },
+                    BrokerRequest::CommitGeneration { digest: next.clone() },
+                    BrokerRequest::AbortGeneration { digest: next.clone() },
+                    BrokerRequest::ObserveGeneration,
+                ] {
+                    unauthenticated(exchange(&coordination, stranger.clone(), owner.clone(), request).await);
+                }
+                assert_eq!(coordination.active().digest, old);
+                assert!(matches!(exchange(&coordination, owner.clone(), stranger.clone(),
+                    BrokerRequest::CommitGeneration { digest: next.clone() }).await,
+                    BrokerResponse::Generation { outcome: GenerationOutcome::Refused, .. }));
+            }
+            assert!(matches!(exchange(&coordination, owner.clone(), strangers[0].clone(),
+                BrokerRequest::PrepareGeneration { digest: old.clone() }).await,
+                BrokerResponse::Generation { digest, outcome: GenerationOutcome::Prepared } if digest == next));
+            for stranger in &strangers {
+                unauthenticated(exchange(&coordination, stranger.clone(), owner.clone(),
+                    BrokerRequest::CommitGeneration { digest: next.clone() }).await);
+                unauthenticated(exchange(&coordination, stranger.clone(), owner.clone(),
+                    BrokerRequest::AbortGeneration { digest: next.clone() }).await);
+            }
+            assert_eq!(coordination.active().digest, old);
+            assert!(matches!(exchange(&coordination, owner.clone(), strangers[0].clone(),
+                BrokerRequest::CommitGeneration { digest: next.clone() }).await,
+                BrokerResponse::Generation { outcome: GenerationOutcome::Applied, .. }));
+            assert!(matches!(exchange(&coordination, owner.clone(), strangers[0].clone(),
+                BrokerRequest::ObserveGeneration).await,
+                BrokerResponse::Generation { digest, outcome: GenerationOutcome::Active } if digest == next));
+        }.with_subscriber(tracing_subscriber::registry().with(capture.clone())).await;
+        let refused = capture.events_where(
+            "dekopon_brokerd::server",
+            &[("event", "broker_generation_refused")],
+        );
+        assert_eq!(refused.len(), 12);
+        for record in refused {
+            assert_eq!(record.field("reason"), Some("not-reconciliation-owner"));
+            assert_eq!(
+                record.field("peer.uid"),
+                Some(crate::current_uid().to_string().as_str())
+            );
+        }
+    }
+}

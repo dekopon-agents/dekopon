@@ -18,6 +18,8 @@ A capability name in an agent spec permits the agent to propose that operation. 
 
 The local daemon-to-broker request carries only a proposal over an authenticated Unix connection, not identity claims or an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopon-gatewayd`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
 
+Generation coordination frames are accepted only from the peer mapped as `dekopon-gatewayd` with an attestor grant; other mapped peers are refused before any coordination state changes.
+
 Rust's private, non-cloneable `AuthorizedInvocation` fields and absent deserialization make accidental in-process fabrication or reuse harder. `AuthorizationGate::new` is public so a broker adapter can own the transition; constructing that handle authenticates no caller and evaluates no policy. This is defense in depth only. The real authority boundary depends on separate processes, authenticated requests, policy enforcement, authorization bound to execution, isolated credentials, provider sandboxing, and credential-safe audit linkage.
 
 ## Trust boundaries
