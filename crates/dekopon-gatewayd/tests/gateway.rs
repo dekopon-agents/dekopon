@@ -211,6 +211,7 @@ fn spawn_model(
     responses: Vec<Value>,
     first_answer_delay: Duration,
     first_answer_hold: Option<ModelHold>,
+    first_delta_hold: Option<ModelHold>,
 ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock model binds");
     let address = listener.local_addr().expect("mock model address");
@@ -234,7 +235,7 @@ fn spawn_model(
                     hold.wait();
                 }
             }
-            if let Err(error) = respond(stream, &response) {
+            if let Err(error) = respond(stream, &response, first_delta_hold.as_ref()) {
                 assert!(
                     index == 0
                         && first_answer_hold.is_some()
@@ -288,7 +289,11 @@ fn read_request(stream: &mut TcpStream) -> Option<Value> {
     serde_json::from_slice(&bytes[header_end..]).ok()
 }
 
-fn respond(mut stream: TcpStream, body: &Value) -> std::io::Result<()> {
+fn respond(
+    mut stream: TcpStream,
+    body: &Value,
+    mut first_delta_hold: Option<&ModelHold>,
+) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
@@ -296,6 +301,11 @@ fn respond(mut stream: TcpStream, body: &Value) -> std::io::Result<()> {
     for chunk in chunks(body) {
         write!(stream, "data: {chunk}\n\n")?;
         stream.flush()?;
+        if carries_text(&chunk)
+            && let Some(hold) = first_delta_hold.take()
+        {
+            hold.wait();
+        }
     }
     stream.write_all(b"data: [DONE]\n\n")?;
     stream.flush()
@@ -508,15 +518,17 @@ fn field<'a>(record: &'a str, name: &str) -> Option<&'a str> {
     Some(rest[..end].trim_matches('"'))
 }
 
+fn carries_text(chunk: &Value) -> bool {
+    chunk["choices"][0]["delta"]["content"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty())
+}
+
 fn scripted_deltas(responses: &[Value]) -> usize {
     responses
         .iter()
         .flat_map(chunks)
-        .filter(|chunk| {
-            chunk["choices"][0]["delta"]["content"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty())
-        })
+        .filter(carries_text)
         .count()
 }
 
@@ -613,6 +625,21 @@ async fn boot_held(responses: Vec<Value>, hold: &ModelHold) -> Fixture {
     .await
 }
 
+async fn boot_streaming(responses: Vec<Value>, first_delta: &ModelHold) -> Fixture {
+    boot_with(
+        temporary(),
+        responses,
+        None,
+        "plain",
+        true,
+        &Timing {
+            first_delta_hold: Some(first_delta.clone()),
+            ..Timing::default()
+        },
+    )
+    .await
+}
+
 async fn boot_rendering(responses: Vec<Value>, progress_detail: &str) -> Fixture {
     boot_in_with_scope(temporary(), responses, None, progress_detail, false).await
 }
@@ -671,6 +698,7 @@ struct Timing {
     keep_alive: Option<Value>,
     model_delay: Duration,
     model_hold: Option<ModelHold>,
+    first_delta_hold: Option<ModelHold>,
 }
 
 async fn boot_in_with_scope(
@@ -732,8 +760,12 @@ async fn boot_with(
         &directory.path().join("dekopon.yaml"),
         catalog_text().as_bytes(),
     );
-    let (endpoint, model_requests, model_prompts) =
-        spawn_model(responses, timing.model_delay, timing.model_hold.clone());
+    let (endpoint, model_requests, model_prompts) = spawn_model(
+        responses,
+        timing.model_delay,
+        timing.model_hold.clone(),
+        timing.first_delta_hold.clone(),
+    );
     let gateway_path = directory.path().join("dekopon-gatewayd.json");
     let mut config = gateway_config_with(
         directory.path(),
@@ -1146,6 +1178,24 @@ fn ask_lines(socket: &Path, subject: &str, text: &str) -> Vec<Value> {
     read_lines(stream, |value| value.get("reply").is_some())
 }
 
+fn ask_lines_releasing(
+    socket: &Path,
+    subject: &str,
+    text: &str,
+    first_delta: &ModelHold,
+) -> Vec<Value> {
+    let stream = UnixStream::connect(socket).expect("development socket accepts a caller");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("read timeout configures");
+    ask_lines_on(stream, subject, text, |value| {
+        if value.get("delta").is_some() {
+            first_delta.release();
+        }
+        value.get("reply").is_some()
+    })
+}
+
 fn ask_lines_on(
     stream: UnixStream,
     subject: &str,
@@ -1232,11 +1282,14 @@ const LADDER: [&str; 3] = ["reaction", "typing", "status"];
 #[tokio::test(flavor = "multi_thread")]
 async fn the_local_driver_streams_a_whole_run_and_finalizes_the_answer_in_place() {
     let _audit = Audit::exclusive().await;
-    let fixture = boot(tool_run()).await;
+    let first_delta = ModelHold::new();
+    let fixture = boot_streaming(tool_run(), &first_delta).await;
     let socket = fixture.socket();
-    let lines = tokio::task::spawn_blocking(move || ask_lines(&socket, MAPPED_SUBJECT, "say hi"))
-        .await
-        .expect("the request completes");
+    let lines = tokio::task::spawn_blocking(move || {
+        ask_lines_releasing(&socket, MAPPED_SUBJECT, "say hi", &first_delta)
+    })
+    .await
+    .expect("the request completes");
 
     let sequence = kinds(&lines);
     assert_eq!(
@@ -1689,12 +1742,14 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
         bash_tool_call("call-1", &script),
         final_answer("Upper-cased."),
     ];
-    let fixture = boot(responses.clone()).await;
+    let first_delta = ModelHold::new();
+    let fixture = boot_streaming(responses.clone(), &first_delta).await;
     let socket = fixture.socket();
-    let lines =
-        tokio::task::spawn_blocking(move || ask_lines(&socket, MAPPED_SUBJECT, PLANTED_PROMPT))
-            .await
-            .expect("the request completes");
+    let lines = tokio::task::spawn_blocking(move || {
+        ask_lines_releasing(&socket, MAPPED_SUBJECT, PLANTED_PROMPT, &first_delta)
+    })
+    .await
+    .expect("the request completes");
     assert_eq!(
         lines.last().and_then(|line| line["reply"].as_str()),
         Some("Upper-cased."),
