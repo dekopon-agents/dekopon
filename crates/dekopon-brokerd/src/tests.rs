@@ -2038,7 +2038,7 @@ async fn reaper_sweeps_with_the_committed_generation_retention() {
         Some(host),
         move || {
             if let Some(first) = first.lock().unwrap().take() {
-                let _ = first.send(());
+                first.send(()).expect("sweep sampler is still waiting");
             }
             reaper_owner
                 .active()

@@ -702,7 +702,7 @@ async fn private_inputs(
         None => Some((dekopon_broker::SecretCatalog::empty(), None)),
     };
     #[cfg(test)]
-    let _ = AFTER_PRIVATE_READ.try_with(|hook| hook());
+    drop(AFTER_PRIVATE_READ.try_with(|hook| hook()));
     if let (Some((_, credential_bytes)), Some((_, secret_map_bytes))) = (&credentials, &secrets)
         && let Err(error) = config
             .snapshot
