@@ -2003,26 +2003,9 @@ async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() 
     assert!(report.problems.is_empty(), "{report:?}");
     let digest = next.unwrap().digest;
     let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
     let old = owner.active();
-    let (release, waiting) = tokio::sync::oneshot::channel::<()>();
-    let old_leg = tokio::spawn(async move {
-        waiting.await.unwrap();
-        old
-    });
-    let old_digest = owner.active().digest.clone();
-    assert_eq!(
-        owner.prepare(&old_digest, current_uid()).await,
-        (digest.clone(), GenerationOutcome::Prepared)
-    );
-    assert_eq!(
-        owner.commit(&digest, current_uid()),
-        GenerationOutcome::Applied
-    );
-    release.send(()).unwrap();
-    let old = old_leg.await.unwrap();
-    let new = owner.active();
-    assert_eq!(old.ready.broker.policy_digest(), old_policy);
-    assert_ne!(new.ready.broker.policy_digest(), old_policy);
     let peer = AuthenticatedContext::new(
         "gateway".parse().unwrap(),
         Actor::Service {
@@ -2037,27 +2020,103 @@ async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() 
         "slack.t0123abc.u9xyz".parse().unwrap(),
         "chat-agent".parse().unwrap(),
     );
-    for (index, broker, expected) in [(0, &old.ready.broker, false), (1, &new.ready.broker, true)] {
-        let result = broker
-            .invoke(
-                &peer,
-                Some(&grant),
-                Some(&claim),
-                InvocationRequest {
-                    id: format!("leg-{index}").parse().unwrap(),
-                    capability: "cli-probe.upper".parse().unwrap(),
-                    trace_parent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
-                        .parse()
-                        .unwrap(),
-                    secret_use: None,
-                    input: json!({"text": "hello"}),
-                },
-                dekopon_broker_host::asset::AssetInputs::default(),
+    let request = |id: &str, piped| InvocationRequest {
+        id: id.parse().unwrap(),
+        capability: "cli-probe.upper".parse().unwrap(),
+        trace_parent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+            .parse()
+            .unwrap(),
+        secret_use: None,
+        input: json!({"text": "hello", "piped": piped}),
+    };
+    let (stdin, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (stdout, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let old_peer = peer.clone();
+    let old_grant = grant.clone();
+    let old_claim = claim.clone();
+    let old_request = request("leg-old", true);
+    let old_leg = tokio::spawn(
+        async move {
+            let result = old
+                .ready
+                .broker
+                .invoke(
+                    &old_peer,
+                    Some(&old_grant),
+                    Some(&old_claim),
+                    old_request,
+                    dekopon_broker_host::asset::AssetInputs {
+                        streams: Some(dekopon_broker_protocol::Streams {
+                            stdin: Some(stdin.into()),
+                            stdout: stdout.into(),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            (
+                old.ready.broker.policy_digest().to_owned(),
+                result.result.outcome,
             )
+        }
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone())),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while capture
+            .events_where(
+                "dekopon_broker::audit",
+                &[
+                    ("audit.event", "broker.decision"),
+                    ("invocation.id", "leg-old"),
+                    ("decision.allowed", "true"),
+                ],
+            )
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!old_leg.is_finished());
+    let old_digest = owner.active().digest.clone();
+    assert_eq!(
+        owner.prepare(&old_digest, current_uid()).await,
+        (digest.clone(), GenerationOutcome::Prepared)
+    );
+    assert_eq!(
+        owner.commit(&digest, current_uid()),
+        GenerationOutcome::Applied
+    );
+    let new = owner.active();
+    assert_ne!(new.ready.broker.policy_digest(), old_policy);
+    let denied = new
+        .ready
+        .broker
+        .invoke(
+            &peer,
+            Some(&grant),
+            Some(&claim),
+            request("leg-new", false),
+            dekopon_broker_host::asset::AssetInputs::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
+    std::io::Write::write_all(&mut feeder, b"hello").unwrap();
+    drop(feeder);
+    let (captured_policy, outcome) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), old_leg)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(result.result.outcome == InvocationOutcome::Denied, expected);
-    }
+    assert_eq!(captured_policy, old_policy);
+    assert_eq!(outcome, InvocationOutcome::Succeeded);
+    let mut output = Vec::new();
+    std::io::Read::read_to_end(&mut receiver, &mut output).unwrap();
+    assert_eq!(output, b"{\"text\":\"HELLOHELLO\"}\n");
 }
 
 #[tokio::test]
