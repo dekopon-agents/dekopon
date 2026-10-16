@@ -19,6 +19,7 @@ mod collection;
 mod config;
 mod conversation;
 mod follow;
+mod gateway;
 mod jobs;
 mod journal;
 mod meter_restore;
@@ -38,14 +39,13 @@ use std::{
     future::Future,
     path::Path,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
-use dekopon_broker_protocol::{BrokerClient, ConversationKind};
+use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinSet, time::timeout};
-use tracing::Instrument as _;
+use tokio::{sync::mpsc, task::JoinSet};
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
@@ -68,12 +68,11 @@ use crate::{
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{
-        CancelOutcome, ConfiguredModels, ModelCache, ModelCredentialError, SessionGate,
-        SessionRunner, model_bearer_token,
+        ConfiguredModels, ModelCache, ModelCredentialError, SessionGate, SessionRunner,
+        model_bearer_token,
     },
     transport::{
-        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, InboundMessage, MessageId,
-        ThreadOwnership, TransportEvent, TransportIdentity,
+        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, ThreadOwnership, TransportEvent,
         discord::{DiscordTransport, MessageContent},
         local::LocalTransport,
         slack::SlackTransport,
@@ -221,12 +220,14 @@ where
         terminal = supervise_transports(&mut readers, shutdown).await;
         readers.abort_all();
     };
-    let outcome = serve(
+    let outcome = gateway::Gateway::new(
         runner,
         routes,
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
         Arc::new(config.stop_words.clone()),
+    )
+    .serve(
         receiver,
         stopped,
         config.shutdown_grace,
@@ -588,199 +589,37 @@ enum ServeOutcome {
     TransportsLost,
 }
 
+#[cfg(test)]
+use transport::{InboundMessage, TransportIdentity};
+
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one serving loop owns the bounded wake, collection and follow deadlines"
+    reason = "preserves the existing serving test callers"
 )]
 async fn serve<F>(
     runner: Arc<SessionRunner>,
     routes: Arc<RoutingTable>,
-    mut identities: Arc<BTreeMap<String, TransportIdentity>>,
+    identities: Arc<BTreeMap<String, TransportIdentity>>,
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
     stop_words: Arc<Vec<String>>,
-    mut receiver: mpsc::Receiver<TransportEvent>,
+    receiver: mpsc::Receiver<TransportEvent>,
     shutdown: F,
     grace: Duration,
-    mut collector: collection::Collector,
+    collector: collection::Collector,
 ) -> ServeOutcome
 where
     F: Future<Output = ()> + Send,
 {
-    let mut sessions = JoinSet::new();
-    let mut follow_pending = follow::Debounce::default();
-    let mut ticks = JoinSet::new();
-    let mut wakes = runner.wakes.clone();
-    let mut notices = runner.jobs.take_notices();
-    tokio::pin!(shutdown);
-    let mut outcome = ServeOutcome::Shutdown;
-
-    loop {
-        while let Some(result) = sessions.try_join_next() {
-            observe_session(result);
-        }
-        let deadline = collector.deadline();
-        let follow_deadline = follow_pending.deadline();
-        let wake_deadline = wakes.as_ref().and_then(|store| store.next_at()).map(|at| {
-            tokio::time::Instant::now() + at.duration_since(SystemTime::now()).unwrap_or_default()
-        });
-        tokio::select! {
-            biased;
-            () = &mut shutdown => break,
-            () = async {
-                match wake_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let Some(store) = wakes.clone() else { continue };
-                let reading = Arc::clone(&store);
-                let due = tokio::task::spawn_blocking(move || reading.take_due(SystemTime::now())).await;
-                match due {
-                    Ok(Ok(due)) => {
-                        for fired in due.fired {
-                            start_wake(&runner, &routes, &drivers, &mut sessions, fired);
-                        }
-                        for tick in due.ticks {
-                            spawn_tick(&runner, &routes, &store, &mut ticks, tick);
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped");
-                        wakes = None;
-                    }
-                    Err(_) => {
-                        tracing::error!(event = "gateway_wake_store_failed", wakes = "stopped");
-                        wakes = None;
-                    }
-                }
-            },
-            Some(result) = ticks.join_next() => {
-                match result {
-                    Ok(Some(fired)) => start_wake(&runner, &routes, &drivers, &mut sessions, fired),
-                    Ok(None) => {}
-                    Err(_) => tracing::error!(event = "gateway_wake_task_failed"),
-                }
-            },
-            () = async {
-                match follow_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                for message in follow_pending.due(tokio::time::Instant::now()) {
-                    if let Some(route) = routes.route(&message)
-                        && let Some(table) = runner.follow.as_ref()
-                    {
-                        let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
-                        if matches!(table.ticket(&key, SystemTime::now()), follow::FollowTicket::Active { .. }) {
-                            start_session(&runner, &routes, &drivers, &mut sessions, message);
-                        }
-                    }
-                }
-            },
-            () = async {
-                match deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                for message in collector.take_due(tokio::time::Instant::now()) {
-                    start_session(&runner, &routes, &drivers, &mut sessions, message);
-                }
-            },
-            Some(message) = notices.recv() => {
-                let MessageId::Job { agent, .. } = &message.message_id else {
-                    continue;
-                };
-                let answering = routes.route(&message).is_some_and(|route| {
-                    route.job_timeout.is_some() && &route.agent == agent
-                });
-                if answering && drivers.contains_key(&message.transport) {
-                    start_session(&runner, &routes, &drivers, &mut sessions, message);
-                } else if let Some(notice) = jobs::Notice::of(&message) {
-                    notice.record("dropped");
-                }
-            },
-            event = receiver.recv() => {
-                let Some(event) = event else {
-                    outcome = ServeOutcome::TransportsLost;
-                    break;
-                };
-                match event {
-                    TransportEvent::Connected { name, identity } => {
-                        Arc::make_mut(&mut identities).insert(name, identity);
-                    }
-                    TransportEvent::Message(message) => {
-                        let received = message.receive_span.clone();
-                        received.in_scope(|| {
-                            dispatch(
-                                &runner,
-                                &routes,
-                                &identities,
-                                &drivers,
-                                &stop_words,
-                                &mut sessions,
-                                &mut collector,
-                                &mut follow_pending,
-                                *message,
-                            );
-                        });
-                    }
-                    TransportEvent::CancelRequested(request) => {
-                        if collector.cancel(&request) {
-                            tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via));
-                        }
-                        cancel_session(&runner, &request);
-                    },
-                }
-            }
-        }
-    }
-
-    drop(notices);
-    collector.shutdown();
-    drop(follow_pending);
-    runner.jobs.seal();
-
-    // A tick that fires here has already retired its row, so its wake must still start.
-    if timeout(grace, async {
-        while let Some(result) = ticks.join_next().await {
-            if let Ok(Some(fired)) = result {
-                start_wake(&runner, &routes, &drivers, &mut sessions, fired);
-            }
-        }
-        while let Some(result) = sessions.join_next().await {
-            observe_session(result);
-        }
-    })
-    .await
-    .is_err()
-    {
-        tracing::warn!(event = "gateway_sessions_abandoned");
-        // A blocking probe cannot be aborted; the runtime's shutdown timeout bounds it.
-        ticks.detach_all();
-        sessions.abort_all();
-        while sessions.join_next().await.is_some() {}
-    }
-    outcome
+    gateway::Gateway::new(runner, routes, identities, drivers, stop_words)
+        .serve(receiver, shutdown, grace, collector)
+        .await
 }
 
-fn observe_session(result: Result<(), tokio::task::JoinError>) {
-    if let Err(error) = result
-        && !error.is_cancelled()
-    {
-        tracing::error!(event = "gateway_session_task_failed");
-    }
-}
-
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "one dispatch entry owns stop handling, addressing, and bounded collection"
+    reason = "preserves the existing dispatch test callers"
 )]
 fn dispatch(
     runner: &Arc<SessionRunner>,
@@ -793,269 +632,21 @@ fn dispatch(
     follow_pending: &mut follow::Debounce,
     message: InboundMessage,
 ) {
-    // Checked before the route lookup and the addressed filter: a reload can unroute a conversation
-    // whose person still owns jobs, and a channel stop word like the bot mention plus stop would
-    // otherwise be dropped as unaddressed; only this sender's running or pending work may be stopped.
-    if transport::is_stop_word(
-        identities.get(&message.transport),
-        &message.text,
-        stop_words,
-    ) {
-        let mut banished = false;
-        if let Some(route) = routes.route(&message)
-            && route.follow
-            && let Some(table) = runner.follow.as_ref()
-        {
-            let key = follow::follow_key(
-                &route.transport,
-                route.agent.as_str(),
-                &route.conversation,
-                &message.conversation.key(),
-            );
-            follow_pending.remove(&key);
-            if matches!(
-                table.ticket(&key, SystemTime::now()),
-                follow::FollowTicket::Active { .. }
-            ) {
-                table.suspend(&key);
-                banished = true;
-                let table = Arc::clone(table);
-                let index = route.route_index;
-                sessions.spawn(async move {
-                    match tokio::task::spawn_blocking(move || table.leave(&key)).await {
-                        Ok(Ok(())) => tracing::info!(
-                            audit.event = "gateway.follow",
-                            operation = "banished",
-                            route = index
-                        ),
-                        _ => tracing::warn!(
-                            audit.event = "gateway.follow",
-                            operation = "refused",
-                            route = index,
-                            reason = "persistence"
-                        ),
-                    }
-                });
-            }
-        }
-        let request = CancelRequest {
-            transport: message.transport.clone(),
-            conversation_id: message.conversation.key(),
-            subject: message.subject.canonical(),
-            via: dekopon_agent::CancelVia::StopReply,
-        };
-        let stopped = runner.gate.cancel(&request);
-        let pending_cancelled = collector.cancel(&request) || stopped.dropped;
-        let active_outcome = stopped.running;
-        let jobs_stopped = runner.jobs.cancel_owner(&request);
-        if pending_cancelled {
-            if matches!(
-                active_outcome,
-                CancelOutcome::NoSession | CancelOutcome::OtherSubject | CancelOutcome::Completing
-            ) && let Some(driver) = drivers.get(&message.transport).cloned()
-                && let Some(reply) = runner.gate.refusal()
-            {
-                let receipt = message.receive_span.clone();
-                sessions.spawn(
-                    async move {
-                        let _reply = reply;
-                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
-                    }
-                    .instrument(receipt),
-                );
-            }
-            return;
-        }
-        match active_outcome {
-            CancelOutcome::Cancelled => {
-                tracing::info!(
-                    event = "gateway_session_stop_requested",
-                    transport = %request.transport,
-                    via = "stop-reply"
-                );
-                return;
-            }
-            outcome @ (CancelOutcome::AlreadyCancelled | CancelOutcome::Completing) => {
-                tracing::debug!(
-                    event = "gateway_session_stop_ignored",
-                    transport = %request.transport,
-                    reason = outcome.ignored_reason()
-                );
-                return;
-            }
-            CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
-        }
-        if jobs_stopped {
-            if let Some(driver) = drivers.get(&message.transport).cloned()
-                && let Some(reply) = runner.gate.refusal()
-            {
-                let receipt = message.receive_span.clone();
-                sessions.spawn(
-                    async move {
-                        let _reply = reply;
-                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
-                    }
-                    .instrument(receipt),
-                );
-            }
-            return;
-        }
-        if banished {
-            return;
-        }
-    }
-    let Some((route_id, _)) = routes.route_index(&message) else {
-        tracing::debug!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "unrouted",
-            conversation.kind = message.conversation.kind.as_str(),
-            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
-        );
-        return;
-    };
-    let addressed = message.addressed.unwrap_or_else(|| {
-        identities
-            .get(&message.transport)
-            .is_some_and(|identity| identity.is_addressed(&message.text))
-    });
-    let inherited_thread = message
-        .thread_continuation
-        .as_ref()
-        .is_some_and(|continuation| continuation.inherited);
-    if addressed
-        && let Some(route) = routes.route(&message)
-        && route.follow
-    {
-        let key = follow::follow_key(
-            &route.transport,
-            route.agent.as_str(),
-            &route.conversation,
-            &message.conversation.key(),
-        );
-        follow_pending.cancel(&key, &message.subject);
-    }
-    if message.conversation.kind != ConversationKind::DirectMessage
-        && !addressed
-        && !inherited_thread
-        && !collector.is_native_continuation(route_id, &message)
-    {
-        if let Some(route) = routes.route(&message)
-            && route.follow
-            && let Some(table) = runner.follow.as_ref()
-        {
-            let key = follow::follow_key(
-                &route.transport,
-                route.agent.as_str(),
-                &route.conversation,
-                &message.conversation.key(),
-            );
-            if matches!(
-                table.ticket(&key, SystemTime::now()),
-                follow::FollowTicket::Active { .. }
-            ) {
-                if !follow_pending.offer(key, message, tokio::time::Instant::now()) {
-                    tracing::info!(
-                        audit.event = "gateway.follow",
-                        operation = "refused",
-                        route = route_id,
-                        reason = "capacity"
-                    );
-                }
-                return;
-            }
-        }
-        tracing::debug!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "not-addressed"
-        );
-        return;
-    }
-    match collector.offer(route_id, message) {
-        collection::Offered::Pending => {}
-        collection::Offered::Immediate(message) => {
-            start_session(runner, routes, drivers, sessions, message)
-        }
-        collection::Offered::Refused(message, reason) => {
-            collection::disposition(&message.receive_span, reason);
-            if let Some(driver) = drivers.get(&message.transport).cloned()
-                && let Some(permit) = runner.gate.refusal()
-            {
-                let receipt = message.receive_span.clone();
-                sessions.spawn(async move {
-                    let _permit = permit;
-                    let reply = match reason {
-                        "collection-full" => "Busy collecting other requests. Please try again shortly.",
-                        "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
-                        "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
-                        _ => "Input refused: too many attachments or messages, or too much text. Please send a smaller request.",
-                    };
-                    session::answer(&driver, &message, reply).await;
-                }.instrument(receipt));
-            }
-        }
-    }
-}
-
-fn start_session(
-    runner: &Arc<SessionRunner>,
-    routes: &RoutingTable,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    sessions: &mut JoinSet<()>,
-    message: InboundMessage,
-) {
-    let Some(route) = routes.route(&message) else {
-        collection::disposition(&message.receive_span, "route-lost");
-        return;
-    };
-    let Some(driver) = drivers.get(&message.transport).cloned() else {
-        message
-            .receive_span
-            .in_scope(|| tracing::error!(event = "gateway_message_ignored", reason = "no-driver"));
-        collection::disposition(&message.receive_span, "no-driver");
-        return;
-    };
-    sessions.spawn(session::run_session(
+    gateway::Gateway::new(
         Arc::clone(runner),
-        route.clone(),
-        message,
-        driver,
-    ));
+        Arc::clone(routes),
+        Arc::new(identities.clone()),
+        Arc::new(drivers.clone()),
+        Arc::new(stop_words.to_vec()),
+    )
+    .dispatch(sessions, collector, follow_pending, message);
 }
 
-/// A wake whose route no longer answers as its agent is delivered as its note, so the person still
-/// hears what they asked to be reminded of.
-fn start_wake(
-    runner: &Arc<SessionRunner>,
-    routes: &RoutingTable,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    sessions: &mut JoinSet<()>,
-    fired: wake::Fired,
-) {
-    let agent = fired.agent().clone();
-    let id = fired.id();
-    let message = fired.into_inbound();
-    let answering = routes
-        .route(&message)
-        .is_some_and(|route| route.wakes && route.agent == agent);
-    let receipt = message.receive_span.clone();
-    receipt.in_scope(|| tracing::info!(event = "gateway_wake_fired", wake.id = %id));
-    if answering {
-        start_session(runner, routes, drivers, sessions, message);
-        return;
-    }
-    receipt.in_scope(|| tracing::warn!(event = "gateway_wake_orphaned", wake.id = %id));
-    if let Some(driver) = drivers.get(&message.transport).cloned()
-        && let MessageId::Wake { notice, .. } = &message.message_id
+fn observe_session(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && !error.is_cancelled()
     {
-        let notice = notice.clone();
-        sessions.spawn(
-            async move {
-                session::answer(&driver, &message, &notice).await;
-            }
-            .instrument(receipt),
-        );
+        tracing::error!(event = "gateway_session_task_failed");
     }
 }
 

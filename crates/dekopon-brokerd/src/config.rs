@@ -419,6 +419,26 @@ impl ConfigSnapshot {
         Ok(())
     }
 
+    pub(crate) fn record_authority_references(
+        &mut self,
+        credentials: Option<&serde_yaml::Value>,
+        secret_map: Option<&[u8]>,
+    ) -> Result<(), ConfigError> {
+        if let Some(value) = credentials {
+            self.0.insert(
+                "credentialReferences".to_owned(),
+                (Disposition::Swap, value.clone()),
+            );
+        }
+        if let Some(bytes) = secret_map {
+            let value =
+                serde_yaml::from_slice(bytes).map_err(|source| ConfigError::Decode { source })?;
+            self.0
+                .insert("secretMapReferences".to_owned(), (Disposition::Swap, value));
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_lock(&mut self, lock: Option<&LoadedLock>) {
         if let Some(lock) = lock {
             self.0.insert(
@@ -440,7 +460,11 @@ impl ConfigSnapshot {
             .filter(|(key, _)| key.as_str() != "providerSettings")
             .map(|(key, (_, value))| (key, value))
             .collect::<BTreeMap<_, _>>();
-        let encoded = serde_json::to_vec(&sources)?;
+        let canonical = sources
+            .into_iter()
+            .map(|(key, value)| Ok((key, canonical_value(value)?)))
+            .collect::<Result<BTreeMap<_, serde_json::Value>, serde_json::Error>>()?;
+        let encoded = serde_json::to_vec(&canonical)?;
         Ok(Sha256::digest(encoded)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -483,6 +507,39 @@ impl ConfigSnapshot {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+fn canonical_value(value: &serde_yaml::Value) -> Result<serde_json::Value, serde_json::Error> {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            let fields = mapping
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or(serde_json::to_string(key)?),
+                        canonical_value(value)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+            serde_json::to_value(fields)
+        }
+        serde_yaml::Value::Sequence(values) => {
+            let values = values
+                .iter()
+                .map(canonical_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            serde_json::to_value(values)
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            serde_json::to_value((tagged.tag.to_string(), canonical_value(&tagged.value)?))
+        }
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_) => serde_json::to_value(value),
     }
 }
 

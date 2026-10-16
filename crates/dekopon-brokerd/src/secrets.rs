@@ -1338,7 +1338,17 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
     }
 }
 
-pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
+#[cfg(test)]
+async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
+    load_with_bytes(path, expected_uid)
+        .await
+        .map(|(catalog, _)| catalog)
+}
+
+pub(crate) async fn load_with_bytes(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(SecretCatalog, Vec<u8>), SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
         .map_err(|source| SecretMapError::Read {
@@ -1350,7 +1360,8 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
             diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
         }
     })?;
-    validate_map(file, path, expected_uid).await
+    let catalog = validate_map(file, path, expected_uid).await?;
+    Ok((catalog, bytes))
 }
 
 #[expect(
@@ -1711,17 +1722,22 @@ fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
 )]
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || read_trusted_file(&owned, uid, FileTier::Private, maximum))
-        .await
-        .map_err(|join| classified(SourceError::Internal, &join))?
-        .map_err(|error| {
-            let mapped = match error {
-                FileHygieneError::Io { .. } => SourceError::Io,
-                FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
-                _ => SourceError::Insecure,
-            };
-            classified(mapped, &error)
-        })
+    tokio::task::spawn_blocking(move || {
+        let result = read_trusted_file(&owned, uid, FileTier::Private, maximum);
+        #[cfg(test)]
+        crate::private_read_witness::record(&owned, &result);
+        result
+    })
+    .await
+    .map_err(|join| classified(SourceError::Internal, &join))?
+    .map_err(|error| {
+        let mapped = match error {
+            FileHygieneError::Io { .. } => SourceError::Io,
+            FileHygieneError::TooLarge { .. } => SourceError::TooLarge,
+            _ => SourceError::Insecure,
+        };
+        classified(mapped, &error)
+    })
 }
 
 async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, SourceError> {

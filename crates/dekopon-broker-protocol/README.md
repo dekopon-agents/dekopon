@@ -113,8 +113,8 @@ the broker against the scope it resolves from the claim; a mismatch is a denied 
 Under the reserved `console-smoke` claim the broker substitutes its derived local transport and
 conversation before that check ([security model](../../docs/security-model.md#provider-storage-and-durable-on-demand-chat-memory)). It is a separate typed operation; `invoke` cannot reach hidden
 recording under any attestation. `ChatMemorySurface` is present only when the broker freshly
-authorizes the complete surface. `PROTOCOL_VERSION` is `dekopon.dev/broker/v1alpha2`; both envelopes
-are strict-decoded, so a broker and a client from different protocol versions refuse each other's
+authorizes the complete surface. `PROTOCOL_VERSION` remains `dekopon.dev/broker/v1alpha2` for ordinary requests; owner-only `v1alpha3` generation frames carry only a digest and outcome, and a v1alpha3 non-generation request is refused as `invalid-request`.
+Both envelopes are strict-decoded, so a broker and a client from different protocol versions refuse each other's
 first frame as `invalid-request` in either direction rather than misinterpreting it. Pre-execution
 storage setup failures carry the stable public codes `storage-quota`, `storage-busy`,
 `storage-timeout`, `storage-corrupt`, and `storage-io`; `outcome-unaudited` is reserved for a

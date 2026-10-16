@@ -21,6 +21,8 @@ mod config;
 mod credentials;
 mod github_app;
 mod lock_watch;
+#[cfg(test)]
+mod private_read_witness;
 mod provider_manager;
 mod reaper;
 mod secrets;
@@ -112,14 +114,11 @@ where
     let socket_path = candidate.socket_path.clone();
     let provider_lock = candidate.provider_lock.clone();
     let storage = candidate.storage.clone();
-    let broker = Arc::clone(&candidate.ready.broker);
-    let identities = candidate.ready.identities.clone();
     let coordination = Arc::new(Coordination::new(
         config_path.as_ref().to_path_buf(),
         candidate,
     ));
-    let server = BrokerServer::new(broker, identities, limits)?
-        .with_coordination(Arc::clone(&coordination))
+    let server = BrokerServer::for_generations(Arc::clone(&coordination), limits)?
         .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     tracing::info!(event = "broker_started");
@@ -475,9 +474,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     );
     let mut scratch = None;
     let runtime = match residents {
-        Residents::Open => boot_runtime(&config, uid, &mut report.problems).await,
+        Residents::Open => boot_runtime(&mut config, uid, &mut report.problems).await,
         Residents::Borrow(active) => {
-            reload_runtime(&config, uid, active, &mut scratch, &mut report.problems).await
+            reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Scratch => {
             keep(&mut report.problems, scratch_host(&config, &mut scratch)).map(|storage| Runtime {
@@ -563,7 +562,7 @@ impl CheckReport {
 }
 
 async fn boot_runtime(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     problems: &mut Vec<BrokerdError>,
 ) -> Option<Runtime> {
@@ -618,7 +617,7 @@ async fn boot_runtime(
 /// A changed `storage` or `assets` already refuses as restart-required, so the rest of the
 /// candidate is validated against a scratch host and no asset directory instead of opening either.
 async fn reload_runtime(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     active: &Candidate,
     scratch: &mut Option<tempfile::TempDir>,
@@ -643,8 +642,13 @@ async fn reload_runtime(
     })
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static AFTER_PRIVATE_READ: std::sync::Arc<dyn Fn() + Send + Sync>;
+}
+
 async fn private_inputs(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     problems: &mut Vec<BrokerdError>,
 ) -> (
@@ -682,20 +686,38 @@ async fn private_inputs(
     let credentials = match &config.credentials_path {
         Some(path) => keep(
             problems,
-            credentials::load(path, uid)
+            credentials::load_with_bytes(path, uid)
                 .await
+                .map(|(store, references)| (store, Some(references)))
                 .map_err(BrokerdError::from),
         ),
-        None => Some(CredentialStore::empty()),
+        None => Some((CredentialStore::empty(), None)),
     };
     let secrets = match &config.secret_map_path {
         Some(path) => keep(
             problems,
-            secrets::load(path, uid).await.map_err(BrokerdError::from),
+            secrets::load_with_bytes(path, uid)
+                .await
+                .map(|(catalog, bytes)| (catalog, Some(bytes)))
+                .map_err(BrokerdError::from),
         ),
-        None => Some(dekopon_broker::SecretCatalog::empty()),
+        None => Some((dekopon_broker::SecretCatalog::empty(), None)),
     };
-    (credentials, secrets)
+    #[cfg(test)]
+    let _hook_ran = AFTER_PRIVATE_READ.try_with(|hook| hook()).is_ok();
+    if let (Some((_, credential_references)), Some((_, secret_map_bytes))) =
+        (&credentials, &secrets)
+        && let Err(error) = config.snapshot.record_authority_references(
+            credential_references.as_ref(),
+            secret_map_bytes.as_deref(),
+        )
+    {
+        problems.push(error.into());
+    }
+    (
+        credentials.map(|(store, _)| store),
+        secrets.map(|(catalog, _)| catalog),
+    )
 }
 
 async fn resolve_provider_set(

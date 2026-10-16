@@ -19,7 +19,7 @@ use dekopon_broker_host::BoundCredential;
 use dekopon_core::{FileHygieneError, FileTier, Redacted, error_chain, read_trusted_file};
 use dekopon_http_host::ConfigurationError;
 use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshOutcome};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -48,13 +48,13 @@ pub(crate) const REAUTHORIZATION_CODES: [&str; 4] = [
     "refresh_token_expired",
 ];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 enum CredentialsApiVersion {
     #[serde(rename = "dekopon.dev/broker-credentials/v1alpha1")]
     V1Alpha1,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CredentialsFile {
     #[allow(
@@ -65,7 +65,7 @@ struct CredentialsFile {
     credentials: Vec<CredentialEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CredentialEntry {
     name: String,
@@ -91,7 +91,7 @@ struct CredentialEntry {
     permissions: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 enum CredentialKind {
     BearerToken,
@@ -109,22 +109,35 @@ impl CredentialKind {
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
+#[cfg(test)]
 pub(crate) async fn load(
     path: &Path,
     expected_uid: u32,
 ) -> Result<CredentialStore, CredentialsError> {
+    load_with_bytes(path, expected_uid)
+        .await
+        .map(|(store, _)| store)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
+pub(crate) async fn load_with_bytes(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(CredentialStore, serde_yaml::Value), CredentialsError> {
     let owned = path.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || {
-        read_trusted_file(
+        let result = read_trusted_file(
             &owned,
             expected_uid,
             FileTier::Private,
             HARD_MAX_CREDENTIALS_BYTES,
-        )
+        );
+        #[cfg(test)]
+        crate::private_read_witness::record(&owned, &result);
+        result
     })
     .await
     .map_err(|join| CredentialsError::Read {
@@ -142,15 +155,48 @@ pub(crate) async fn load(
             source: insecure,
         },
     })?;
-    let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes)
-        .map_err(|source| CredentialsError::Decode { source })?;
+    let parsed = serde_yaml::from_slice::<CredentialsFile>(&bytes).map_err(|source| {
+        let location = source
+            .location()
+            .map(|location| (location.line(), location.column()));
+        let message = source.to_string();
+        let description = if message.contains("unknown variant") {
+            "unknown variant"
+        } else if message.contains("unknown field") {
+            "unknown field"
+        } else if message.contains("missing field") {
+            "missing field"
+        } else if message.contains("invalid type") {
+            "invalid type"
+        } else {
+            "invalid document"
+        };
+        let diagnostic = location.map_or_else(
+            || description.to_owned(),
+            |(line, column)| format!("{description} at line {line}, column {column}"),
+        );
+        CredentialsError::Decode {
+            path: path.to_path_buf(),
+            diagnostic,
+        }
+    })?;
+    let references = serde_yaml::to_value(&parsed).map_err(|_source| CredentialsError::Decode {
+        path: path.to_path_buf(),
+        diagnostic: "invalid document".to_owned(),
+    })?;
     let resolved = tokio::task::spawn_blocking(move || resolve(parsed, expected_uid))
         .await
         .map_err(|join| CredentialsError::Read {
             path: path.to_path_buf(),
             source: std::io::Error::other(join),
         })??;
-    Ok(resolved)
+    Ok((resolved, references))
+}
+
+#[cfg(test)]
+pub(crate) fn references_from_bytes(bytes: &[u8]) -> serde_yaml::Value {
+    let parsed: CredentialsFile = serde_yaml::from_slice(bytes).expect("valid credential fixture");
+    serde_yaml::to_value(parsed).expect("typed reference serialization")
 }
 
 fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, CredentialsError> {
@@ -628,11 +674,8 @@ pub enum CredentialsError {
     },
     #[error("broker credentials are {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
-    #[error("broker credentials are not strict valid YAML/JSON")]
-    Decode {
-        #[source]
-        source: serde_yaml::Error,
-    },
+    #[error("broker credentials at {path} are not strict valid YAML/JSON ({diagnostic})")]
+    Decode { path: PathBuf, diagnostic: String },
     #[error("broker credentials name too many entries; maximum is {maximum}")]
     TooMany { maximum: usize },
     #[error("broker credentials are invalid: {}", problems.join("; "))]
@@ -765,6 +808,66 @@ credentials:
                 .expect_err("strict decoding must refuse");
             assert!(matches!(error, CredentialsError::Decode { .. }));
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_kind_diagnostic_keeps_path_but_never_echoes_file_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.yaml");
+        let sentinel = "fixture-sentinel-9f3c";
+        write_credentials(
+            directory.path(),
+            &VALID
+                .replace("kind: bearerToken", &format!("kind: {sentinel}"))
+                .replace("fixture-secret-value", sentinel),
+            0o600,
+        )
+        .await;
+        let error = load(&path, uid())
+            .await
+            .expect_err("invalid kind must refuse");
+        let chain = dekopon_core::error_chain(&error);
+        assert!(chain.contains(&path.display().to_string()), "{chain}");
+        assert!(
+            chain.contains("unknown variant at line 4, column 11"),
+            "{chain}"
+        );
+        assert!(!chain.contains(sentinel), "{chain}");
+        assert!(!format!("{error:?}").contains(sentinel));
+    }
+
+    #[tokio::test]
+    async fn tagged_secret_values_and_keys_never_affect_reference_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.yaml");
+        let mut digests = Vec::new();
+        for document in [
+            VALID.replace("fixture-secret-value", "!!bool fixture-secret-aaaa-0001"),
+            VALID.replace("fixture-secret-value", "fixture-secret-bbbb-0002"),
+            VALID.replace(
+                "secret: fixture-secret-value",
+                "!x secret: fixture-secret-aaaa-0001",
+            ),
+            VALID.replace("fixture-secret-value", "fixture-secret-bbbb-0002"),
+        ] {
+            write_credentials(directory.path(), &document, 0o600).await;
+            let (_, references) = super::load_with_bytes(&path, uid())
+                .await
+                .expect("typed file boots");
+            let mut snapshot = crate::config::ConfigSnapshot::default();
+            snapshot
+                .record_authority_references(Some(&references), None)
+                .unwrap();
+            digests.push(snapshot.digest().unwrap());
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "core scalar tags cannot change digest"
+        );
+        assert_eq!(
+            digests[2], digests[3],
+            "tagged secret keys cannot change digest"
+        );
     }
 
     #[tokio::test]
