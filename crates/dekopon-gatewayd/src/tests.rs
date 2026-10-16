@@ -1753,6 +1753,174 @@ async fn signed_github_request(
         .status()
 }
 
+async fn signed_reload_delivery(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    guid: &str,
+    event: &str,
+    repo: &str,
+) -> reqwest::StatusCode {
+    use crate::transport::webhook::hmac_sha256;
+    let claim = if event == "pull_request" {
+        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
+            "action":"opened","number":7,"pull_request":{"head":{"sha":"abc123"}}})
+    } else {
+        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
+            "action":"completed","workflow_run":{"id":5,"head_sha":"abc123","conclusion":"success"}})
+    };
+    let body = serde_json::to_vec(&claim).unwrap();
+    let signature: String = hmac_sha256(b"secret", &body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .header("x-github-delivery", guid)
+        .header("x-github-event", event)
+        .body(body)
+        .send()
+        .await
+        .expect("signed webhook delivery")
+        .status()
+}
+
+#[tokio::test]
+async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
+    use crate::{gateway::CurrentGeneration, transport::github::GithubTransport};
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    config["transports"][0] = json!({"kind":"githubWebhook", "name":"github",
+        "bind":address.to_string(), "secretEnv":"PATH"});
+    config["routes"][0]["transport"] = json!("github");
+    config["routes"][0]["memory"] = json!({"mode":"oneShot"});
+    config["routes"][0]["conversation"] = json!({"kind":["thread"],
+        "container":"owner", "ids":["owner.repo"]});
+    config["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let mut control = config["routes"][0].clone();
+    control["conversation"]["ids"] = json!(["owner.control"]);
+    config["routes"].as_array_mut().unwrap().push(control);
+    let path = write_config(root.path(), &config);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response()]);
+    let generation = CurrentGeneration::boot(
+        Arc::new(candidate.routes.clone()),
+        Arc::new(candidate.config.stop_words.clone()),
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::serving(
+        runner,
+        generation.clone(),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let mut transport =
+        GithubTransport::new("github".into(), address, "secret".into(), generation, None);
+    transport.connect().await.unwrap();
+    let client = reqwest::Client::new();
+    let send = |guid, event, repo| signed_reload_delivery(&client, address, guid, event, repo);
+    assert_eq!(
+        send("run-before", "workflow_run", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "initially unconfigured workflow event must not enter the queue"
+    );
+    assert_eq!(
+        send("control-before", "pull_request", "CONTROL").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(control_before) = transport.next().await.unwrap() else {
+        panic!("control before reload")
+    };
+    assert_eq!(control_before.subject.canonical(), "github.owner.control");
+    config["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        send("run-added", "workflow_run", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(added) =
+        tokio::time::timeout(Duration::from_secs(1), transport.next())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("new event admitted")
+    };
+    assert_eq!(added.subject.canonical(), "github.owner.repo");
+    assert_eq!(added.message_id.to_string(), "run-added");
+    assert_eq!(
+        send("pr-before-remove", "pull_request", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(before_remove) = transport.next().await.unwrap() else {
+        panic!("PR before removal")
+    };
+    assert_eq!(before_remove.message_id.to_string(), "pr-before-remove");
+    config["routes"][0]["githubEvents"] = json!(["workflow_run"]);
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        send("pr-removed", "pull_request", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "removed event must not enter the queue despite 200-on-ignore"
+    );
+    assert_eq!(
+        send("control-after", "pull_request", "CONTROL").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(control_after) =
+        tokio::time::timeout(Duration::from_secs(1), transport.next())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("control after reload")
+    };
+    assert_eq!(control_after.subject.canonical(), "github.owner.control");
+    assert_eq!(control_after.message_id.to_string(), "control-after");
+}
+
 async fn authorize_github_fixture(
     inbound: Box<crate::transport::InboundMessage>,
     route: &crate::routes::BoundRoute,
