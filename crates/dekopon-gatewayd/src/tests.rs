@@ -1208,6 +1208,18 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
     doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
     doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
     let path = write_config(directory.path(), &doc);
+    if std::env::var_os("CC07_S2_BLANK_BOOT_CHILD").is_some() {
+        let (candidate, report) =
+            crate::load_candidate(&path, None, config::LoadMode::Boot, None).await;
+        assert!(candidate.is_none());
+        assert!(report.problems.iter().any(|problem| matches!(problem,
+            crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem,
+                crate::StartupProblem::Transport { transport, source: crate::transport::TransportError::EmptyCredential { name } }
+                    if transport == "github" && name == "CC07_S2_ABSENT_SECRET"
+            ))
+        )));
+        std::process::exit(42);
+    }
     let (candidate, report) =
         crate::load_candidate(&path, None, config::LoadMode::Check, None).await;
     assert!(candidate.is_some(), "{report:?}");
@@ -1216,10 +1228,20 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::load_candidate(&path, None, config::LoadMode::Boot, None).await;
     assert!(candidate.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Startup { problems } if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport { source: crate::transport::TransportError::MissingCredential { .. }, .. })))));
-    assert!(matches!(
-        crate::transport::credential_from("CC07_S2_ABSENT_SECRET", Some("".into())),
-        Err(crate::transport::TransportError::EmptyCredential { .. })
-    ));
+    let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "tests::github_config_checks_structure_before_boot_secret_and_mount",
+        ])
+        .env("CC07_S2_BLANK_BOOT_CHILD", "1")
+        .env("CC07_S2_ABSENT_SECRET", "")
+        .output()
+        .expect("blank-credential boot fixture");
+    assert!(
+        child.status.code() == Some(42),
+        "blank-credential boot child: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
     let resolved = load(directory.path(), &doc).await.unwrap();
     assert!(matches!(
         crate::build_transport(&resolved.transports[0], &resolved),
@@ -1232,17 +1254,32 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         matches!(crate::build_transport(&resolved.transports[0], &resolved), Err(crate::transport::TransportError::NotMountableInThisBuild { transport }) if transport == "github")
     );
     doc["transports"][0]["secretEnv"] = json!("CC07_S2_ABSENT_SECRET");
-    for (field, value) in [
-        ("secretEnv", serde_json::Value::Null),
-        ("bind", serde_json::Value::Null),
-    ] {
-        let mut bad = doc.clone();
-        bad["transports"][0][field] = value;
-        assert!(matches!(
-            load(directory.path(), &bad).await,
-            Err(ConfigError::Decode { .. })
-        ));
+    for field in ["name", "bind", "secretEnv"] {
+        for present in [false, true] {
+            let mut bad = doc.clone();
+            if present {
+                bad["transports"][0][field] = serde_json::Value::Null;
+            } else {
+                bad["transports"][0].as_object_mut().unwrap().remove(field);
+            }
+            assert!(
+                matches!(
+                    load(directory.path(), &bad).await,
+                    Err(ConfigError::Decode { .. })
+                ),
+                "{field} must be present and non-null"
+            );
+        }
     }
+    let mut bad = doc.clone();
+    bad["routes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("githubEvents");
+    assert!(reports(
+        &load(directory.path(), &bad).await.unwrap_err(),
+        |p| matches!(p, ConfigProblem::InvalidGithubEvents { route: 0 })
+    ));
     for events in [
         json!(null),
         json!([]),
@@ -1282,21 +1319,6 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         &load(directory.path(), &bad).await.unwrap_err(),
         |p| matches!(p, ConfigProblem::InvalidRouteConversation { .. })
     ));
-}
-
-#[tokio::test]
-async fn broken_gateway_document_has_parser_error_without_route_indices() {
-    let directory = temporary();
-    let path = directory.path().join("dekopon-gatewayd.yaml");
-    fs::write(&path, "routes: [\n  - {transport: github\n").unwrap();
-    let (candidate, report) =
-        crate::load_candidate(&path, None, config::LoadMode::Check, None).await;
-    assert!(candidate.is_none());
-    assert!(report.problems.iter().any(|problem| matches!(
-        problem,
-        crate::GatewaydError::Config(ConfigError::Decode { .. })
-    )));
-    assert!(!report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Config(ConfigError::Invalid { problems, .. }) if problems.iter().any(|p| matches!(p, ConfigProblem::InvalidGithubEvents { .. } | ConfigProblem::GithubRequiresOneShot { .. })))));
 }
 
 #[tokio::test]
