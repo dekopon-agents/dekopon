@@ -335,7 +335,8 @@ impl Coordination {
             tracing::warn!(
                 event = "broker_reload_refused",
                 applied = false,
-                problems = report.problems.len()
+                problems = report.problems.len(),
+                error = %error_chain(&BrokerdError::from_problems(report.problems))
             );
             return (active.digest.clone(), GenerationOutcome::Refused);
         };

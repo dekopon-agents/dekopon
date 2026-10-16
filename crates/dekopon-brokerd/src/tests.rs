@@ -2098,6 +2098,56 @@ async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_
 }
 
 #[tokio::test]
+async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
+    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
+        let key = directory.join("github-app.pem");
+        write_owner_only(&key, KEY);
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
+            key.display()
+        )
+    })
+    .await;
+    let key = broker
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("github-app.pem");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let digest = owner.active().digest.clone();
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&digest, current_uid()).await,
+            (digest.clone(), GenerationOutcome::Refused)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(owner.active().digest, digest);
+    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    let error = refused[0].field("error").expect("refusal reason");
+    assert!(
+        error.contains(&format!(
+            "credential \"app\" privateKey {} is not trusted input (insecure-mode)",
+            key.display()
+        )),
+        "{error}"
+    );
+    assert!(error.contains("has mode 0644"), "{error}");
+    assert!(!error.contains("PRIVATE KEY"), "{error}");
+}
+
+#[tokio::test]
 async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_per_poll() {
     use dekopon_broker_protocol::GenerationOutcome;
     use tracing::instrument::WithSubscriber as _;
