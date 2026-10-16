@@ -807,7 +807,7 @@ fn read_window(
     {
         let mut line = item.map_err(|_malformed| JournalError::Corrupt)?;
         #[cfg(test)]
-        observe_live_decoded(1);
+        observe_live_decoded(1 + usize::from(last.is_some()));
         if line.version != 2
             || previous.is_some_and(|id| id != line.record_id)
             || line.next_record_id != line.record_id.saturating_add(1)
@@ -840,11 +840,32 @@ fn read_window(
 #[cfg(test)]
 thread_local! {
     static PEAK_LIVE_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HELD_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn observe_live_decoded(count: usize) {
-    PEAK_LIVE_DECODED.with(|peak| peak.set(peak.get().max(count)));
+    HELD_DECODED.with(|held| {
+        PEAK_LIVE_DECODED.with(|peak| peak.set(peak.get().max(count + held.get())));
+    });
+}
+
+#[cfg(test)]
+struct DecodedHold;
+
+#[cfg(test)]
+impl DecodedHold {
+    fn one() -> Self {
+        HELD_DECODED.with(|held| held.set(held.get() + 1));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecodedHold {
+    fn drop(&mut self) {
+        HELD_DECODED.with(|held| held.set(held.get() - 1));
+    }
 }
 
 fn read_lines(path: &Path) -> Result<Vec<Line>, JournalError> {
@@ -914,6 +935,7 @@ fn sweep_file(path: &Path, horizon: u64) -> Result<bool, JournalError> {
     if first.at_ms >= horizon {
         return Ok(false);
     }
+    drop(first);
     rewrite_eligible(path, horizon)?;
     if fs::metadata(path)?.len() == 0 {
         remove(path);
@@ -1099,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_recall_sweep_decodes_at_most_one_record_at_a_time() {
+    fn cold_recall_and_old_record_lookup_decode_at_most_two_records() {
         let dir = tempfile::tempdir().expect("tempdir");
         let stem = key().journal_stem();
         let now = SystemTime::now();
@@ -1130,6 +1152,14 @@ mod tests {
         PEAK_LIVE_DECODED.with(|peak| peak.set(0));
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(users(&recalled).last().copied(), Some("turn-99"));
+        PEAK_LIVE_DECODED.with(|peak| {
+            assert_eq!(
+                peak.get(),
+                2,
+                "recall including expiry must count both retained and incoming records"
+            )
+        });
+        PEAK_LIVE_DECODED.with(|peak| peak.set(0));
         use dekopon_agent::memory_tools::MemoryTools;
         let tools = JournalMemoryTools {
             journal: &journal,
@@ -1138,8 +1168,13 @@ mod tests {
             versions: [("original".into(), "v1".into())].into(),
         };
         assert!(tools.read(2, "original", None).starts_with("turn-0"));
-        PEAK_LIVE_DECODED
-            .with(|peak| assert!(peak.get() <= 1, "peak decoded records: {}", peak.get()));
+        PEAK_LIVE_DECODED.with(|peak| {
+            assert_eq!(
+                peak.get(),
+                2,
+                "lookup must count the retained match and current record"
+            )
+        });
     }
 
     fn append_versioned(journal: &Journal, stem: &str, now: SystemTime, user: &str) {
@@ -1218,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_tools_refuse_changed_grants_expiry_missing_versions_and_invalid_ranges() {
+    fn memory_tools_refuse_changed_grants_expiry_mismatched_version_and_invalid_ranges() {
         use dekopon_agent::memory_tools::MemoryTools;
         let dir = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
@@ -1240,10 +1275,13 @@ mod tests {
             read_lines(&journal.path(&stem)).expect("lines")[0].reads[0].outcome,
             "invalid-range"
         );
-        tools.versions.clear();
+        tools.versions.insert("original".into(), "v2".into());
+        let refusal = tools.read(1, "original", None);
+        assert!(refusal.starts_with("representation unavailable"));
+        assert!(!refusal.contains("canary"));
         assert!(
             tools
-                .read(1, "original", None)
+                .set_pin(1, "original")
                 .starts_with("representation unavailable")
         );
         tools.grant = "different".into();

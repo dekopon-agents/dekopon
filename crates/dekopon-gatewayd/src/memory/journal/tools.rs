@@ -84,6 +84,8 @@ impl JournalMemoryTools<'_> {
     fn lookup(&self, record_id: u64) -> Result<Option<Line>, JournalError> {
         let mut found = None;
         validated_lines(&self.journal.path(&self.stem), |line| {
+            #[cfg(test)]
+            super::observe_live_decoded(1 + usize::from(found.is_some()));
             if line.record_id == record_id {
                 found = Some(line);
             }
@@ -186,6 +188,8 @@ impl MemoryTools for JournalMemoryTools<'_> {
             .get(representation_id)
             .cloned()
             .unwrap_or_default();
+        #[cfg(test)]
+        let _held = line.as_ref().map(|_| super::DecodedHold::one());
         if line.as_ref().is_some_and(|line| self.eligible(line))
             && self
                 .mutate(|line| {
@@ -224,6 +228,8 @@ impl MemoryTools for JournalMemoryTools<'_> {
         let cost = self
             .representation(line, representation_id)
             .map_or(0, |text| text.len());
+        #[cfg(test)]
+        let _held = super::DecodedHold::one();
         match self.mutate(|line| {
             if line.record_id != record_id {
                 return false;
