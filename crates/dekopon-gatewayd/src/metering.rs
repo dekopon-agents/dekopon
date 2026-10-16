@@ -234,26 +234,32 @@ pub(crate) fn resolve(
     };
     let mut budgets = Vec::with_capacity(config.budgets.len());
     for (index, (agent, budget)) in config.budgets.into_iter().enumerate() {
-        let parsed = agent.parse::<AgentId>().ok();
-        let id = parsed.clone().filter(|_| agents.contains(&agent));
+        let id = agent
+            .parse::<AgentId>()
+            .ok()
+            .filter(|_| agents.contains(&agent));
         if id.is_none() {
             problems.push(MeteringProblem::UnknownAgent { entry: index + 1 });
         }
+        // Every validation branch uses the position for an unserved entry, never its raw key.
+        let label = id
+            .as_ref()
+            .map_or_else(|| format!("entry #{}", index + 1), |_| agent.clone());
         if budget.meters.is_empty() {
             problems.push(MeteringProblem::EmptyMeters {
-                agent: agent.clone(),
+                agent: label.clone(),
             });
         }
         if budget.models.as_ref().is_some_and(Vec::is_empty) {
             problems.push(MeteringProblem::EmptyModels {
-                agent: agent.clone(),
+                agent: label.clone(),
             });
         }
         for (model, name) in budget.models.iter().flatten().enumerate() {
             if !models.contains(name) {
                 problems.push(MeteringProblem::UnknownModel {
                     entry: index + 1,
-                    agent: parsed.clone(),
+                    agent: id.clone(),
                     model,
                 });
             }
@@ -262,7 +268,7 @@ pub(crate) fn resolve(
             .meters
             .iter()
             .enumerate()
-            .map(|(meter, config)| spec(&agent, meter, *config, problems))
+            .map(|(meter, config)| spec(&label, meter, *config, problems))
             .collect();
         if let Some(agent) = id {
             budgets.push(ResolvedBudget {

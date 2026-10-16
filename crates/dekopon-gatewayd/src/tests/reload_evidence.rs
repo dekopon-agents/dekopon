@@ -289,6 +289,44 @@ async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnost
         reason.contains("memory routine names an unknown model"),
         "{reason}"
     );
+
+    // Both a malformed key and a syntactically valid but unserved key must remain private
+    // across every validation branch, including empty lists and invalid meter specifications.
+    const VALID_UNSERVED: &str = "unserved-agent-sentinel";
+    config["metering"] = json!({"budgets": {}});
+    config["metering"]["budgets"][KEY] = json!({"models": [], "meters": []});
+    config["metering"]["budgets"][VALID_UNSERVED] = json!({"models": ["missing-model"], "meters": [
+        {"kind": "credit", "capacity": 10, "refill": 10, "per": "30s", "initial": 11}
+    ]});
+    config["routes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("memory");
+    write_config(root.path(), &config);
+    let report = crate::check(&path, None, None).await;
+    let boot = dekopon_core::error_chain(&crate::GatewaydError::from_problems(report.problems));
+    gateway.reconcile().await;
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 2);
+    let reason = refused[1].field("error").unwrap();
+    assert!(
+        reason.contains("entry #1 names an unknown model at models[0]"),
+        "{reason}"
+    );
+    assert!(reason.contains("entry #2\" lists no meters"), "{reason}");
+    assert!(reason.contains("entry #2\" lists no models"), "{reason}");
+    assert!(
+        reason.contains("meter 0 starts with more credit"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("period shorter than one minute"),
+        "{reason}"
+    );
+    for sentinel in [KEY, VALID_UNSERVED] {
+        assert!(!reason.contains(sentinel), "reload echoed {sentinel}");
+        assert!(!boot.contains(sentinel), "boot echoed {sentinel}");
+    }
 }
 
 #[tokio::test]
