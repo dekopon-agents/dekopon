@@ -9,7 +9,6 @@
     )
 )]
 pub mod asset;
-pub mod context;
 
 #[cfg(feature = "native")]
 pub mod base64;

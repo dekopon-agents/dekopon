@@ -1,6 +1,6 @@
 # Synthetic context replay
 
-This experimental replay takes already eligible, scripted records. Each cassette request must match the record, ordinal, version, and config identity exactly. The response names the representation to render. The standalone replay adapter calls `dekopon-core::context` to render that representation and fit whole visible turns; retained records remain visible separately in each snapshot. No inference request, network call, journal read, authority decision, or model request is produced.
+This experimental replay takes already eligible, scripted records. Each cassette request must match the record, ordinal, version, and config identity exactly. The response names the representation to render. The standalone replay adapter calls the portable source module owned by `dekopon-agent` to render that representation and fit whole visible turns; retained records remain visible separately in each snapshot. No inference request, network call, journal read, authority decision, or model request is produced.
 
 Build and run from the repository root with the pinned Rust toolchain and `wasm32-unknown-unknown` target:
 

@@ -12,8 +12,8 @@ use arc_swap::ArcSwap;
 use dekopon_model::model::{AssistantTurn, ModelMessage, assistant_message};
 use serde::{Deserialize, Serialize};
 
-pub use dekopon_core::context::{Exchange, Representation};
-use dekopon_core::context::{eviction_count, fit_projected};
+pub use super::context_portable::{Exchange, Representation};
+use super::context_portable::{eviction_count, fit_projected};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

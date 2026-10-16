@@ -1,4 +1,6 @@
-use dekopon_core::context::{
+#[path = "../../../crates/dekopon-agent/src/prompt/context_portable.rs"]
+mod context_portable;
+use context_portable::{
     EnvelopeSource, Exchange, Representation, fit_projected, original_envelope_bytes,
     render_envelope,
 };
