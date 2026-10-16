@@ -29,7 +29,7 @@ use tokio::{
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use crate::config::HARD_MAX_CONNECTIONS;
+use crate::{Coordination, config::HARD_MAX_CONNECTIONS};
 
 #[derive(Clone, Debug)]
 pub struct MappedPeer {
@@ -72,6 +72,7 @@ where
     identities: Arc<BTreeMap<u32, MappedPeer>>,
     limits: ServerLimits,
     deadline: ShutdownDeadline,
+    coordination: Option<Arc<Coordination>>,
 }
 
 impl<A> BrokerServer<A>
@@ -98,7 +99,13 @@ where
             identities: Arc::new(identities),
             limits,
             deadline: ShutdownDeadline::default(),
+            coordination: None,
         })
+    }
+
+    pub(crate) fn with_coordination(mut self, coordination: Arc<Coordination>) -> Self {
+        self.coordination = Some(coordination);
+        self
     }
 
     #[must_use]
@@ -191,13 +198,29 @@ where
             );
             return;
         };
-        let broker = Arc::clone(&self.broker);
-        let identities = Arc::clone(&self.identities);
         let frame = self.limits.frame;
-        tasks.spawn(async move {
-            let _permit = permit;
-            handle(stream, &broker, &identities, frame).await
-        });
+        if let Some(coordination) = &self.coordination {
+            let coordination = Arc::clone(coordination);
+            let generation = coordination.active();
+            tasks.spawn(async move {
+                let _permit = permit;
+                handle(
+                    stream,
+                    &generation.ready.broker,
+                    &generation.ready.identities,
+                    frame,
+                    Some(&coordination),
+                )
+                .await
+            });
+        } else {
+            let broker = Arc::clone(&self.broker);
+            let identities = Arc::clone(&self.identities);
+            tasks.spawn(async move {
+                let _permit = permit;
+                handle(stream, &broker, &identities, frame, None).await
+            });
+        }
     }
 
     // A peer whose connect completed before admission closed is already connected and may have
@@ -302,6 +325,7 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
         ProtocolError::DescriptorIndex => "descriptor-index",
         ProtocolError::DescriptorFlags { .. } => "descriptor-flags",
         ProtocolError::TooManyAssetRows => "too-many-asset-rows",
+        ProtocolError::InvalidGenerationDigest => "invalid-generation-digest",
     }
 }
 
@@ -393,6 +417,7 @@ async fn handle<A>(
     broker: &Broker<A>,
     identities: &BTreeMap<u32, MappedPeer>,
     limits: FrameLimits,
+    coordination: Option<&Coordination>,
 ) -> Result<(), ConnectionError>
 where
     A: AuditLog,
@@ -458,6 +483,16 @@ where
             return Err(ConnectionError::InvalidRequest);
         }
     };
+    let generation_request = matches!(
+        request.request,
+        BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration
+    );
+    if generation_request != (request.api_version == ProtocolVersion::V1Alpha3) {
+        return refuse_invalid_claim(&mut stream, limits).await;
+    }
     let context = &peer.context;
     let mut outputs = dekopon_broker_host::asset::AssetOutputs::default();
     let response = match request.request {
@@ -581,6 +616,52 @@ where
                     )
                 }
                 Err(error) => return write_broker_failure(&mut stream, limits, error).await,
+            }
+        }
+        BrokerRequest::PrepareGeneration { digest } => {
+            let (digest, outcome) = match coordination {
+                Some(owner) => owner.prepare(&digest, uid).await,
+                None => (digest, dekopon_broker_protocol::GenerationOutcome::Refused),
+            };
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
+            }
+        }
+        BrokerRequest::CommitGeneration { digest } => {
+            let outcome = coordination.map_or(
+                dekopon_broker_protocol::GenerationOutcome::Refused,
+                |owner| owner.commit(&digest, uid),
+            );
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
+            }
+        }
+        BrokerRequest::AbortGeneration { digest } => {
+            let outcome = coordination.map_or(
+                dekopon_broker_protocol::GenerationOutcome::Refused,
+                |owner| owner.abort(&digest, uid),
+            );
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
+            }
+        }
+        BrokerRequest::ObserveGeneration => {
+            let (digest, outcome) = match coordination {
+                Some(owner) => (
+                    owner.active().digest.clone(),
+                    dekopon_broker_protocol::GenerationOutcome::Active,
+                ),
+                None => (
+                    String::new(),
+                    dekopon_broker_protocol::GenerationOutcome::Refused,
+                ),
+            };
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
             }
         }
         BrokerRequest::UpcallResult { .. } => {
@@ -734,7 +815,11 @@ impl Upcaller<'_> {
             BrokerRequest::Capabilities { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
-            | BrokerRequest::RecordDeliveredTurn { .. } => Err(UpcallError::UnexpectedRequest),
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => Err(UpcallError::UnexpectedRequest),
         }
     }
 }

@@ -419,12 +419,42 @@ impl ConfigSnapshot {
         Ok(())
     }
 
+    pub(crate) fn record_lock(&mut self, lock: Option<&LoadedLock>) {
+        if let Some(lock) = lock {
+            self.0.insert(
+                "providerLockDigest".to_owned(),
+                (
+                    Disposition::Restart,
+                    serde_yaml::Value::String(lock.digest.clone()),
+                ),
+            );
+        }
+    }
+
+    pub(crate) fn digest(&self) -> Result<String, serde_json::Error> {
+        use sha2::{Digest as _, Sha256};
+        // Arbitrary provider settings can contain private values; their contents are not evidence.
+        let sources = self
+            .0
+            .iter()
+            .filter(|(key, _)| key.as_str() != "providerSettings")
+            .map(|(key, (_, value))| (key, value))
+            .collect::<BTreeMap<_, _>>();
+        let encoded = serde_json::to_vec(&sources)?;
+        Ok(Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
     pub(crate) fn keeps(&self, next: &Self, resident: Resident) -> bool {
         let category = match resident {
             Resident::Storage => "storage",
             Resident::Assets => "assets",
         };
-        self.0.get(category).map(|(_, value)| value) == next.0.get(category).map(|(_, value)| value)
+        let null = serde_yaml::Value::Null;
+        self.0.get(category).map_or(&null, |(_, value)| value)
+            == next.0.get(category).map_or(&null, |(_, value)| value)
     }
 
     pub(crate) fn restart_required(&self, next: &Self) -> Vec<String> {
@@ -556,6 +586,9 @@ pub async fn load_in(
             &resolved.host_options.extra_ca_bundles,
         )
         .await?;
+    resolved
+        .snapshot
+        .record_lock(resolved.provider_lock.as_ref());
     Ok((resolved, None))
 }
 
@@ -640,6 +673,9 @@ async fn load_directory(
             &resolved.host_options.extra_ca_bundles,
         )
         .await?;
+    resolved
+        .snapshot
+        .record_lock(resolved.provider_lock.as_ref());
     Ok((resolved, refusal))
 }
 
@@ -863,7 +899,15 @@ async fn resolve(
                     source,
                 })
             };
-            let lock_path = mode.runtime_path(resolve_path(managed.lock_path), canonical)?;
+            let lock_path = match mode {
+                LoadMode::Reload {
+                    provider_lock: Some(lock),
+                    ..
+                } => lock.path.clone(),
+                LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Check => {
+                    mode.runtime_path(resolve_path(managed.lock_path), canonical)?
+                }
+            };
             let store_path = mode.runtime_path(resolve_path(managed.store_path), canonical)?;
             Ok::<_, ConfigError>((lock_path, store_path))
         })
@@ -877,7 +921,11 @@ async fn resolve(
                 provider_lock,
             },
         ) => (
-            locked_providers.map(<[LockedProviderSource]>::to_vec),
+            if provider_lock.is_some() {
+                locked_providers.map(<[LockedProviderSource]>::to_vec)
+            } else {
+                None
+            },
             provider_lock.cloned(),
         ),
         (Some((lock_path, store_path)), LoadMode::Boot) => {

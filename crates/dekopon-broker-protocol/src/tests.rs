@@ -14,6 +14,52 @@ use super::{
     TraceParentError, Trigger, read_frame, write_frame,
 };
 
+#[tokio::test]
+async fn generation_frames_are_versioned_bounded_and_carry_no_authority() {
+    let digest = "a".repeat(64);
+    let frame = RequestEnvelope {
+        api_version: ProtocolVersion::V1Alpha3,
+        request: BrokerRequest::PrepareGeneration {
+            digest: digest.clone(),
+        },
+    };
+    let bytes = serde_json::to_vec(&frame).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "apiVersion": "dekopon.dev/broker/v1alpha3",
+            "request": {"operation": "prepareGeneration", "digest": digest}
+        })
+    );
+    for invalid in [
+        json!({"apiVersion": "dekopon.dev/broker/v1alpha3", "request": {"operation": "prepareGeneration"}}),
+        json!({"apiVersion": "dekopon.dev/broker/v1alpha3", "request": {"operation": "prepareGeneration", "digest": null}}),
+        json!({"apiVersion": "dekopon.dev/broker/v1alpha3", "request": {"operation": "activateGeneration", "digest": digest}}),
+        json!({"apiVersion": "dekopon.dev/broker/v1alpha3", "request": {"operation": "prepareGeneration", "digest": digest, "grant": "sentinel-authority"}}),
+    ] {
+        assert!(serde_json::from_value::<RequestEnvelope>(invalid).is_err());
+    }
+    let malformed: RequestEnvelope = serde_json::from_value(json!({
+        "apiVersion": "dekopon.dev/broker/v1alpha3",
+        "request": {"operation": "commitGeneration", "digest": "ABC"}
+    }))
+    .unwrap();
+    assert!(matches!(
+        malformed.request.validate(),
+        Err(ProtocolError::InvalidGenerationDigest)
+    ));
+    let (mut writer, _reader) = duplex(256);
+    let tiny = FrameLimits {
+        max_frame_bytes: 16,
+        ..FrameLimits::default()
+    };
+    assert!(matches!(
+        write_frame(&mut writer, &frame, tiny).await,
+        Err(ProtocolError::FrameTooLarge { .. })
+    ));
+}
+
 fn conversation(
     kind: ConversationKind,
     container: Option<&str>,
