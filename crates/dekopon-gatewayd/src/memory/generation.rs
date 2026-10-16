@@ -30,6 +30,15 @@ pub(crate) fn version(routine: &Routine) -> String {
         .collect()
 }
 
+pub(crate) fn captured_bytes(turn: &ConversationTurn, include_chat: bool) -> u64 {
+    let chat = if include_chat { turn.bytes() as u64 } else { 0 };
+    turn.exchanges()
+        .iter()
+        .flat_map(|exchange| exchange.request.iter().chain(&exchange.result))
+        .map(|rep| rep.captured_bytes)
+        .fold(chat, u64::saturating_add)
+}
+
 fn bounded(text: &str, bytes: usize) -> String {
     text[..text.floor_char_boundary(bytes.min(text.len()))].to_owned()
 }
@@ -163,6 +172,7 @@ pub(crate) fn prepare(
     let source_rep = Representation::original(&source, "");
     let mut metadata = source_rep.clone();
     metadata.text = None;
+    metadata.captured_bytes = captured_bytes(turn, include_chat);
     if let Some(routine) = retained_original {
         metadata.routine_id.clone_from(&routine.id);
         metadata.version = version(routine);

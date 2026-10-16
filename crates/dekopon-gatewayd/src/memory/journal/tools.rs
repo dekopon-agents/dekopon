@@ -4,7 +4,6 @@ use dekopon_agent::{
     prompt::{Pin, ReadRef},
 };
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -25,52 +24,8 @@ impl JournalMemoryTools<'_> {
                 >= millis(SystemTime::now())
                     .saturating_sub(duration_millis(self.journal.age_for(&self.stem)))
     }
-    fn representation<'a>(&self, line: &'a Line, id: &str) -> Option<Cow<'a, str>> {
-        if line.source_eligibility
-            && line.representations.iter().any(|rep| {
-                rep.kind == "original"
-                    && rep.routine_id == id
-                    && self.versions.get(id) == Some(&rep.version)
-            })
-            && (line.user.is_some() || !line.exchanges.is_empty())
-        {
-            let mut text = line.user.clone().unwrap_or_default();
-            if let Some(answer) = &line.answer {
-                text.push('\n');
-                text.push_str(answer);
-            }
-            for exchange in &line.exchanges {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&format!(
-                    "[tool: {}, outcome: {}, exit: {:?}]",
-                    exchange.tool, exchange.outcome, exchange.exit_status
-                ));
-                for (label, parts) in [("request", &exchange.request), ("result", &exchange.result)]
-                {
-                    if let Some(part) = parts.iter().find(|rep| {
-                        rep.kind == "original"
-                            && rep.routine_id == id
-                            && self.versions.get(id) == Some(&rep.version)
-                            && rep.text.is_some()
-                    }) {
-                        text.push_str(&format!("\n[{label}] "));
-                        text.push_str(part.text.as_deref().unwrap_or_default());
-                    }
-                }
-            }
-            return Some(Cow::Owned(text));
-        }
-        line.representations
-            .iter()
-            .chain(
-                line.exchanges
-                    .iter()
-                    .flat_map(|exchange| exchange.request.iter().chain(&exchange.result)),
-            )
-            .find(|rep| rep.routine_id == id && self.versions.get(id) == Some(&rep.version))
-            .and_then(|rep| rep.text.as_deref().map(Cow::Borrowed))
+    fn representation(&self, line: &Line, id: &str) -> Option<String> {
+        super::body(line, id, self.versions.get(id)?)
     }
     fn refusal(&self, line: Option<&Line>) -> String {
         line.map_or_else(
@@ -94,10 +49,7 @@ impl JournalMemoryTools<'_> {
         })?;
         Ok(found)
     }
-    pub(super) fn mutate(
-        &self,
-        mut update: impl FnMut(&mut Line) -> bool,
-    ) -> Result<bool, JournalError> {
+    fn mutate(&self, mut update: impl FnMut(&mut Line) -> bool) -> Result<bool, JournalError> {
         let path = self.journal.path(&self.stem);
         let temporary = path.with_extension("memory-update");
         let result = (|| {
@@ -161,7 +113,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
         let result = if let Some(line) = line.as_ref().filter(|line| self.eligible(line)) {
             if let Some(text) = self.representation(line, representation_id) {
                 let selected = match range {
-                    None if text.len() <= 16 * 1024 => Some(text.as_ref()),
+                    None if text.len() <= 16 * 1024 => Some(text.as_str()),
                     Some((start, end)) => usize::try_from(start)
                         .ok()
                         .zip(usize::try_from(end).ok())
