@@ -1375,6 +1375,35 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
 }
 
 #[tokio::test]
+async fn distinct_whatsapp_paths_on_one_bind_refuse_duplicate_github_mount() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    let whatsapp = json!({
+        "kind": "whatsappCloudApi", "name": "wa1", "bind": "127.0.0.1:9080",
+        "callbackPath": "/webhooks/whatsapp", "appSecretEnv": "PATH",
+        "verifyTokenEnv": "PATH", "accessTokenEnv": "PATH", "wabaId": "123",
+        "phoneNumberId": "456", "graphApiVersion": "v23.0"
+    });
+    let mut second = whatsapp.clone();
+    second["name"] = json!("wa2");
+    second["callbackPath"] = json!("/webhooks/whatsapp2");
+    doc["transports"] = json!([
+        doc["transports"][0], whatsapp, second,
+        {"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080",
+         "secretEnv": "PATH"}
+    ]);
+    let error = load(directory.path(), &doc)
+        .await
+        .expect_err("two listener-owning WhatsApp transports may not claim one bind");
+    assert!(reports(&error, |problem| matches!(problem,
+        ConfigProblem::SharedWhatsappBind { bind, transports }
+            if bind.port() == 9080 && transports == &["wa1", "wa2"])));
+    assert!(!reports(&error, |problem| matches!(problem,
+        ConfigProblem::GithubBindNotShared { name }
+        | ConfigProblem::ConflictingWebhookMount { name } if name == "github")));
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "one config fixture checks structure and boot credential outcomes"
