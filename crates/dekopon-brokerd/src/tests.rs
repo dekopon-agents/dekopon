@@ -1964,6 +1964,15 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
 
 async fn generation_with_private_credential()
 -> (ManagedBroker, std::path::PathBuf, super::Coordination) {
+    generation_with_credentials(|_| {
+        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n".to_owned()
+    })
+    .await
+}
+
+async fn generation_with_credentials(
+    credentials: impl FnOnce(&Path) -> String,
+) -> (ManagedBroker, std::path::PathBuf, super::Coordination) {
     let broker = ManagedBroker::gateway();
     broker.publish_lock('1');
     let credential = broker.directory.path().join("credentials.yaml");
@@ -1973,7 +1982,7 @@ async fn generation_with_private_credential()
     write_config(&broker.config(), &document);
     write_owner_only(
         &credential,
-        b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n",
+        credentials(&broker.directory.path().canonicalize().unwrap()).as_bytes(),
     );
     let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
@@ -2041,6 +2050,51 @@ async fn same_digest_credential_rotation_commits_once_and_next_poll_is_active() 
     let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].field("generation.digest"), Some(digest.as_str()));
+}
+
+#[tokio::test]
+async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_per_poll() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
+    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
+        let key = directory.join("github-app.pem");
+        write_owner_only(&key, KEY);
+        format!(
+            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
+            key.display()
+        )
+    })
+    .await;
+    let key = broker.directory.path().join("github-app.pem");
+    let reads = super::private_read_witness::TrackedRead::new(&key);
+    let digest = owner.active().digest.clone();
+    let uid = current_uid();
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Active)
+    );
+    assert_eq!(reads.count(), 1, "one key read per prepare");
+    write_owner_only(&key, &[b"\n".as_slice(), KEY].concat());
+    let capture = dekopon_test_support::CaptureLayer::new();
+    async {
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
+        );
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+    assert_eq!(reads.count(), 3, "one key read per prepare");
+    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
+    assert_eq!(applied.len(), 1);
 }
 
 #[tokio::test]

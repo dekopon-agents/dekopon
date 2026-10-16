@@ -735,7 +735,7 @@ async fn private_inputs(
         problems.push(error.into());
     }
     let fingerprint = PrivateFingerprint::of(
-        credentials.as_ref().map(|loaded| &loaded.file_digest),
+        credentials.as_ref().map(|loaded| &loaded.private_digest),
         secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
     );
     let (catalog, scheduled) = secrets.map_or_else(
