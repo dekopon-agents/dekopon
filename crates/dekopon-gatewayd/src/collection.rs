@@ -6,6 +6,8 @@ use tokio::time::Instant;
 use crate::{
     asset::MAX_ASSETS_PER_CONVERSATION,
     config::TransportConfig,
+    follow,
+    routes::BoundRoute,
     transport::{CancelRequest, InboundMessage, MAX_INBOUND_TEXT_BYTES, ReplyTarget},
 };
 
@@ -25,10 +27,46 @@ struct CollectionWindow {
 }
 
 struct Batch {
-    route: usize,
+    route: RouteIdentity,
     deadline: Instant,
     hard_deadline: Instant,
     members: Vec<InboundMessage>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum RouteIdentity {
+    Bound(String),
+    #[cfg(test)]
+    Index(usize),
+}
+
+pub(crate) trait CollectionRoute {
+    fn identity(&self, message: &InboundMessage) -> RouteIdentity;
+}
+
+impl CollectionRoute for &BoundRoute {
+    fn identity(&self, message: &InboundMessage) -> RouteIdentity {
+        RouteIdentity::Bound(follow::follow_key(
+            &self.transport,
+            self.agent.as_str(),
+            &self.conversation,
+            &message.conversation.key(),
+        ))
+    }
+}
+
+#[cfg(test)]
+impl CollectionRoute for RouteIdentity {
+    fn identity(&self, _message: &InboundMessage) -> RouteIdentity {
+        self.clone()
+    }
+}
+
+#[cfg(test)]
+impl CollectionRoute for usize {
+    fn identity(&self, _message: &InboundMessage) -> RouteIdentity {
+        RouteIdentity::Index(*self)
+    }
 }
 
 pub(crate) enum Offered {
@@ -71,7 +109,12 @@ impl Collector {
         self.pending.iter().map(|batch| batch.deadline).min()
     }
 
-    pub(crate) fn is_native_continuation(&self, route: usize, message: &InboundMessage) -> bool {
+    pub(crate) fn is_native_continuation(
+        &self,
+        route: impl CollectionRoute,
+        message: &InboundMessage,
+    ) -> bool {
+        let route = route.identity(message);
         message.transport_kind == ChatTransportKind::Telegram
             && message.native_group.is_some()
             && self.pending.iter().any(|batch| {
@@ -86,7 +129,12 @@ impl Collector {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    pub(crate) fn offer(&mut self, route: usize, message: InboundMessage) -> Offered {
+    pub(crate) fn offer(
+        &mut self,
+        route: impl CollectionRoute,
+        message: InboundMessage,
+    ) -> Offered {
+        let route = route.identity(&message);
         if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_CONVERSATION {
             message.receive_span.in_scope(|| record_received(&message));
             return Offered::Refused(message, "input-limit");
@@ -159,12 +207,21 @@ impl Collector {
         Offered::Pending
     }
 
+    #[cfg(test)]
     pub(crate) fn take_due(&mut self, now: Instant) -> Vec<InboundMessage> {
+        self.take_due_routed(now)
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    pub(crate) fn take_due_routed(&mut self, now: Instant) -> Vec<(RouteIdentity, InboundMessage)> {
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending.len() {
             if self.pending[index].deadline <= now {
-                ready.push(self.pending.remove(index).assemble());
+                let batch = self.pending.remove(index);
+                ready.push((batch.route.clone(), batch.assemble()));
             } else {
                 index += 1;
             }
@@ -343,6 +400,37 @@ mod tests {
             folded: Vec::new(),
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn collection_reorder_joins_the_same_agent_without_reassigning_another_agent() {
+        let mut collector = collector(30, 3);
+        let route = |agent: &str| {
+            RouteIdentity::Bound(follow::follow_key(
+                "wa",
+                agent,
+                &serde_yaml::from_str("kind: [directMessage]").unwrap(),
+                &message(1, "").conversation.key(),
+            ))
+        };
+        assert!(matches!(
+            collector.offer(route("first"), message(1, "one")),
+            Offered::Pending
+        ));
+        assert!(matches!(
+            collector.offer(route("second"), message(1, "other")),
+            Offered::Pending
+        ));
+        assert!(matches!(
+            collector.offer(route("first"), message(1, "two")),
+            Offered::Pending
+        ));
+        assert_eq!(collector.pending.len(), 2);
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let batches = collector.take_due(Instant::now());
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].assets.len(), 2);
+        assert_eq!(batches[1].assets.len(), 1);
+    }
+
     fn collector(millis: u64, capacity: usize) -> Collector {
         Collector {
             windows: BTreeMap::from([(

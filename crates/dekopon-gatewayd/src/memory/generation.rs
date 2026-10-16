@@ -333,6 +333,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     let journal = Arc::clone(journal);
     let policy = route.memory_policy.clone().unwrap_or_default();
     let models = Arc::clone(&runner.models);
+    let anchor = Arc::clone(&route.model);
     let metering = Arc::clone(&runner.metering);
     let agent = route.agent.clone();
     let runtime = tokio::runtime::Handle::current();
@@ -357,7 +358,7 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
                 |name| {
                     let config = generation_policy.models.get(name)?;
                     let client = models
-                        .client(config, runtime.clone(), cancel.clone())
+                        .client_anchored(&anchor, config, runtime.clone(), cancel.clone())
                         .ok()?;
                     Some(crate::metering::ChatProviderGovernor::wrap(
                         client, &metering, &agent, config,

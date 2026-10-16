@@ -6,14 +6,20 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dekopon_broker_protocol::{BrokerClient, ConversationKind, GenerationOutcome};
+use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
+use dekopon_core::ExternalSubject;
+use dekopon_model_proxy::{CurrentProxy, ModelProxy};
+use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tracing::Instrument as _;
 
 use crate::{
-    Candidate, ServeOutcome, cancel_session, collection, config, follow, jobs, observe_session,
+    Candidate, ServeOutcome, cancel_session,
+    collection::{self, CollectionRoute as _},
+    config::{self, GithubEvent},
+    follow, jobs, observe_session,
     routes::RoutingTable,
     session::{self, CancelOutcome, SessionRunner},
     spawn_tick,
@@ -35,9 +41,52 @@ pub(crate) struct Gateway {
 pub(crate) struct ServingGeneration {
     routes: Arc<RoutingTable>,
     stop_words: Arc<Vec<String>>,
+    proxy: Option<Arc<ModelProxy>>,
     _sources: Option<Arc<config::GatewaySources>>,
     _digest: String,
     _broker_digest: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct CurrentGeneration(Arc<ArcSwap<ServingGeneration>>);
+
+impl CurrentGeneration {
+    pub(crate) fn boot(routes: Arc<RoutingTable>, stop_words: Arc<Vec<String>>) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(ServingGeneration {
+            routes,
+            stop_words,
+            proxy: None,
+            _sources: None,
+            _digest: String::new(),
+            _broker_digest: String::new(),
+        })))
+    }
+
+    pub(crate) fn admits_github(
+        &self,
+        transport: &str,
+        conversation: &Conversation,
+        subject: &ExternalSubject,
+        event: GithubEvent,
+    ) -> bool {
+        self.0
+            .load()
+            .routes
+            .github_route(transport, conversation, subject, event)
+            .is_some()
+    }
+}
+
+impl CurrentProxy for CurrentGeneration {
+    fn current(&self) -> Option<Arc<ModelProxy>> {
+        self.0.load().proxy.clone()
+    }
+}
+
+pub(crate) struct ResidentModels {
+    pub(crate) credentials: Arc<session::ConfiguredModels>,
+    pub(crate) metering: Arc<Metering>,
+    pub(crate) proxy: Option<Arc<ModelProxy>>,
 }
 
 struct ReloadState {
@@ -47,6 +96,8 @@ struct ReloadState {
     sources: Arc<config::GatewaySources>,
     broker_digest: String,
     gateway_digest: String,
+    credentials: Arc<session::ConfiguredModels>,
+    metering: Arc<Metering>,
     pending: Option<(String, String)>,
 }
 
@@ -123,7 +174,15 @@ fn serving_digest(
         .collect())
 }
 
+#[cfg(test)]
+impl ServingGeneration {
+    pub(crate) fn routes_for_test(&self) -> &RoutingTable {
+        &self.routes
+    }
+}
+
 impl Gateway {
+    #[cfg(test)]
     pub(crate) fn new(
         runner: Arc<SessionRunner>,
         routes: Arc<RoutingTable>,
@@ -131,32 +190,64 @@ impl Gateway {
         drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
         stop_words: Arc<Vec<String>>,
     ) -> Self {
+        Self::serving(
+            runner,
+            CurrentGeneration::boot(routes, stop_words),
+            identities,
+            drivers,
+        )
+    }
+
+    pub(crate) fn serving(
+        runner: Arc<SessionRunner>,
+        generation: CurrentGeneration,
+        identities: Arc<BTreeMap<String, TransportIdentity>>,
+        drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+    ) -> Self {
         Self {
             runner,
-            active: Arc::new(ArcSwap::from_pointee(ServingGeneration {
-                routes,
-                stop_words,
-                _sources: None,
-                _digest: String::new(),
-                _broker_digest: String::new(),
-            })),
+            active: generation.0,
             reload: None,
             identities,
             drivers,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_reload(
-        mut self,
+        self,
         path: PathBuf,
         candidate: Candidate,
         broker_digest: String,
     ) -> Result<Self, config::ConfigError> {
+        self.with_reload_owners(
+            path,
+            candidate,
+            broker_digest,
+            ResidentModels {
+                credentials: Arc::new(session::ConfiguredModels::default()),
+                metering: Arc::new(Metering::new(Vec::new(), Metering::system_clock())),
+                proxy: None,
+            },
+        )
+    }
+
+    pub(crate) fn with_reload_owners(
+        mut self,
+        path: PathBuf,
+        candidate: Candidate,
+        broker_digest: String,
+        owners: ResidentModels,
+    ) -> Result<Self, config::ConfigError> {
         let gateway_digest = serving_digest(&candidate, &broker_digest)?;
+        owners
+            .credentials
+            .set_active_models(&candidate.config.models);
         let sources = Arc::new(candidate.sources);
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
             stop_words: Arc::new(candidate.config.stop_words.clone()),
+            proxy: owners.proxy,
             _sources: Some(Arc::clone(&sources)),
             _digest: gateway_digest.clone(),
             _broker_digest: broker_digest.clone(),
@@ -168,9 +259,15 @@ impl Gateway {
             sources,
             broker_digest,
             gateway_digest,
+            credentials: owners.credentials,
+            metering: owners.metering,
             pending: None,
         });
         Ok(self)
+    }
+
+    pub(crate) fn proxy_router(&self) -> axum::Router {
+        ModelProxy::router_current(CurrentGeneration(Arc::clone(&self.active)))
     }
 
     #[cfg(test)]
@@ -178,6 +275,11 @@ impl Gateway {
         if let Some(reload) = self.reload.as_mut() {
             reload.reconcile().await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runner_for_test(&self) -> &Arc<SessionRunner> {
+        &self.runner
     }
 
     #[cfg(test)]
@@ -323,8 +425,17 @@ impl Gateway {
                         None => std::future::pending().await,
                     }
                 } => {
-                    for message in collector.take_due(tokio::time::Instant::now()) {
-                        self.start_session(&mut sessions, &self.active.load(), message);
+                    for (identity, message) in collector.take_due_routed(tokio::time::Instant::now()) {
+                        let generation = self.active.load();
+                        let enqueued = generation.routes.route(&message)
+                            .is_some_and(|route| route.identity(&message) == identity);
+                        if enqueued {
+                            self.start_session(&mut sessions, &generation, message);
+                        } else {
+                            for receipt in &message.constituents {
+                                collection::disposition(receipt, "route-lost");
+                            }
+                        }
                     }
                 },
                 Some(message) = notices.recv() => {
@@ -526,7 +637,7 @@ impl Gateway {
                 return;
             }
         }
-        let Some((route_id, _)) = generation.routes.route_index(&message) else {
+        let Some((route_id, route)) = generation.routes.route_index(&message) else {
             tracing::debug!(
                 event = "gateway_message_ignored",
                 transport = %message.transport,
@@ -560,7 +671,7 @@ impl Gateway {
         if message.conversation.kind != ConversationKind::DirectMessage
             && !addressed
             && !inherited_thread
-            && !collector.is_native_continuation(route_id, &message)
+            && !collector.is_native_continuation(route, &message)
         {
             if let Some(route) = generation.routes.route(&message)
                 && route.follow
@@ -594,7 +705,7 @@ impl Gateway {
             );
             return;
         }
-        match collector.offer(route_id, message) {
+        match collector.offer(route, message) {
             collection::Offered::Pending => {}
             collection::Offered::Immediate(message) => {
                 self.start_session(sessions, &generation, message);
@@ -643,7 +754,13 @@ impl Gateway {
             route.clone(),
             message,
             driver,
-            move |message, _queued| active.load().routes.route(message).cloned(),
+            move |message, queued| {
+                let generation = active.load();
+                let route = generation.routes.route(message)?;
+                (message.constituents.is_empty()
+                    || route.identity(message) == queued.identity(message))
+                .then(|| route.clone())
+            },
         ));
     }
 
@@ -707,6 +824,32 @@ impl ReloadState {
             );
             return;
         };
+        let refreshed_proxy = if candidate.config.models != self.config.models {
+            match (
+                self.active.load().proxy.is_some(),
+                candidate.config.proxy.as_ref(),
+            ) {
+                (true, Some(proxy)) => match crate::proxy::build(
+                    proxy,
+                    &candidate.config.models,
+                    &self.credentials,
+                    &self.metering,
+                ) {
+                    Ok(proxy) => Some(proxy),
+                    Err(_) => {
+                        tracing::warn!(
+                            event = "gateway_reload_refused",
+                            applied = false,
+                            reason = "proxy-model"
+                        );
+                        return;
+                    }
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
         let broker = &candidate.config.broker;
         let Ok(client) = BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame)
         else {
@@ -729,7 +872,7 @@ impl ReloadState {
                 return;
             };
             if observed == pending_broker && digest == pending_gateway {
-                self.settle(candidate, observed, digest);
+                self.settle(candidate, observed, digest, refreshed_proxy);
                 return;
             }
             self.broker_digest = observed;
@@ -749,7 +892,7 @@ impl ReloadState {
         };
         match outcome {
             GenerationOutcome::Active if broker_digest == expected_broker => {
-                self.settle(candidate, broker_digest, digest);
+                self.settle(candidate, broker_digest, digest, refreshed_proxy);
                 return;
             }
             GenerationOutcome::Prepared => {}
@@ -786,27 +929,135 @@ impl ReloadState {
             );
             return;
         }
-        self.settle(candidate, broker_digest, digest);
+        self.settle(candidate, broker_digest, digest, refreshed_proxy);
     }
 
-    fn settle(&mut self, candidate: Candidate, broker_digest: String, digest: String) {
+    fn settle(
+        &mut self,
+        candidate: Candidate,
+        broker_digest: String,
+        digest: String,
+        refreshed_proxy: Option<Arc<ModelProxy>>,
+    ) {
         self.pending = None;
         if digest == self.gateway_digest {
             self.broker_digest = broker_digest;
             return;
         }
         let sources = Arc::new(candidate.sources);
+        let proxy = refreshed_proxy.or_else(|| self.active.load().proxy.clone());
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
             stop_words: Arc::new(candidate.config.stop_words.clone()),
+            proxy,
             _sources: Some(Arc::clone(&sources)),
             _digest: digest.clone(),
             _broker_digest: broker_digest.clone(),
         }));
+        self.credentials.set_active_models(&candidate.config.models);
         self.config = candidate.config;
         self.sources = sources;
         self.broker_digest = broker_digest;
         tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
         self.gateway_digest = digest;
+        self.credentials.retire();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use dekopon_core::Redacted;
+    use dekopon_model_proxy::{Grant, ProxyModel, Upstream};
+    use dekopon_model_token_governor::Tokens;
+    use dekopon_test_support::LoopbackServer;
+    use std::collections::{BTreeSet, HashMap};
+
+    #[tokio::test]
+    async fn one_published_snapshot_selects_the_proxy_for_each_request() {
+        let answer = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let first = LoopbackServer::once(answer);
+        let second = LoopbackServer::once(answer);
+        let meter = Arc::new(Metering::new(Vec::new(), Metering::system_clock()));
+        let build = |server: &LoopbackServer| {
+            Arc::new(
+                ModelProxy::new(
+                    vec![ProxyModel {
+                        name: "fixture".into(),
+                        wire_model: "upstream".into(),
+                        backend: "openrouter",
+                        reserve: Tokens(0),
+                        upstream: Upstream::OpenRouter {
+                            endpoint: server.url(),
+                            api_key: Redacted::new("synthetic-key".into()),
+                        },
+                    }],
+                    HashMap::from([(
+                        "vm".into(),
+                        Grant {
+                            agent: "reviewer".parse().unwrap(),
+                            models: BTreeSet::from(["fixture".into()]),
+                        },
+                    )]),
+                    Arc::clone(&meter),
+                )
+                .unwrap(),
+            )
+        };
+        let old_proxy = build(&first);
+        let active = Arc::new(ArcSwap::from_pointee(ServingGeneration {
+            routes: Arc::new(RoutingTable::default()),
+            stop_words: Arc::new(Vec::new()),
+            proxy: Some(Arc::clone(&old_proxy)),
+            _sources: None,
+            _digest: "old".into(),
+            _broker_digest: "old".into(),
+        }));
+        let previous = active.load_full();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let routed = Arc::clone(&active);
+        let serving = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                ModelProxy::router_current(CurrentGeneration(routed)),
+            )
+            .await
+            .unwrap()
+        });
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("http://{address}/v1/chat/completions"))
+                .header("x-dekopon-vm-subject", "vm")
+                .header("content-type", "application/json")
+                .body(r#"{"model":"fixture","messages":[],"stream":false}"#)
+        };
+        assert_eq!(send().send().await.unwrap().status(), 200);
+        assert!(Arc::ptr_eq(previous.proxy.as_ref().unwrap(), &old_proxy));
+        let next = build(&second);
+        active.store(Arc::new(ServingGeneration {
+            routes: Arc::clone(&previous.routes),
+            stop_words: Arc::clone(&previous.stop_words),
+            proxy: Some(Arc::clone(&next)),
+            _sources: None,
+            _digest: "new".into(),
+            _broker_digest: "new".into(),
+        }));
+        assert_eq!(active.load()._digest, "new");
+        assert!(Arc::ptr_eq(previous.proxy.as_ref().unwrap(), &old_proxy));
+        assert!(Arc::ptr_eq(active.load().proxy.as_ref().unwrap(), &next));
+        assert_eq!(send().send().await.unwrap().status(), 200);
+        assert!(
+            first
+                .request_text()
+                .starts_with("POST /v1/chat/completions HTTP/1.1")
+        );
+        assert!(
+            second
+                .request_text()
+                .starts_with("POST /v1/chat/completions HTTP/1.1")
+        );
+        serving.abort();
     }
 }

@@ -308,7 +308,7 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
     .await;
     let candidate = candidate.unwrap_or_else(|| panic!("active reload rejected: {report:?}"));
     assert!(
-        candidate.transports.is_empty(),
+        candidate.prepared.is_none(),
         "reload must not build transports"
     );
     assert!(
@@ -1568,7 +1568,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::routes::RoutingTable::default()
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
         ),
         Err(crate::transport::TransportError::MissingCredential { .. })
     ));
@@ -1579,7 +1579,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::routes::RoutingTable::default()
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
         )
         .is_ok()
     );
@@ -1753,6 +1753,174 @@ async fn signed_github_request(
         .status()
 }
 
+async fn signed_reload_delivery(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    guid: &str,
+    event: &str,
+    repo: &str,
+) -> reqwest::StatusCode {
+    use crate::transport::webhook::hmac_sha256;
+    let claim = if event == "pull_request" {
+        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
+            "action":"opened","number":7,"pull_request":{"head":{"sha":"abc123"}}})
+    } else {
+        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
+            "action":"completed","workflow_run":{"id":5,"head_sha":"abc123","conclusion":"success"}})
+    };
+    let body = serde_json::to_vec(&claim).unwrap();
+    let signature: String = hmac_sha256(b"secret", &body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    client
+        .post(format!("http://{address}/webhooks/github"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .header("x-github-delivery", guid)
+        .header("x-github-event", event)
+        .body(body)
+        .send()
+        .await
+        .expect("signed webhook delivery")
+        .status()
+}
+
+#[tokio::test]
+async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
+    use crate::{gateway::CurrentGeneration, transport::github::GithubTransport};
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    config["transports"][0] = json!({"kind":"githubWebhook", "name":"github",
+        "bind":address.to_string(), "secretEnv":"PATH"});
+    config["routes"][0]["transport"] = json!("github");
+    config["routes"][0]["memory"] = json!({"mode":"oneShot"});
+    config["routes"][0]["conversation"] = json!({"kind":["thread"],
+        "container":"owner", "ids":["owner.repo"]});
+    config["routes"][0]["githubEvents"] = json!(["pull_request"]);
+    let mut control = config["routes"][0].clone();
+    control["conversation"]["ids"] = json!(["owner.control"]);
+    config["routes"].as_array_mut().unwrap().push(control);
+    let path = write_config(root.path(), &config);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response()]);
+    let generation = CurrentGeneration::boot(
+        Arc::new(candidate.routes.clone()),
+        Arc::new(candidate.config.stop_words.clone()),
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::serving(
+        runner,
+        generation.clone(),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let mut transport =
+        GithubTransport::new("github".into(), address, "secret".into(), generation, None);
+    transport.connect().await.unwrap();
+    let client = reqwest::Client::new();
+    let send = |guid, event, repo| signed_reload_delivery(&client, address, guid, event, repo);
+    assert_eq!(
+        send("run-before", "workflow_run", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "initially unconfigured workflow event must not enter the queue"
+    );
+    assert_eq!(
+        send("control-before", "pull_request", "CONTROL").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(control_before) = transport.next().await.unwrap() else {
+        panic!("control before reload")
+    };
+    assert_eq!(control_before.subject.canonical(), "github.owner.control");
+    config["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        send("run-added", "workflow_run", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(added) =
+        tokio::time::timeout(Duration::from_secs(1), transport.next())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("new event admitted")
+    };
+    assert_eq!(added.subject.canonical(), "github.owner.repo");
+    assert_eq!(added.message_id.to_string(), "run-added");
+    assert_eq!(
+        send("pr-before-remove", "pull_request", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(before_remove) = transport.next().await.unwrap() else {
+        panic!("PR before removal")
+    };
+    assert_eq!(before_remove.message_id.to_string(), "pr-before-remove");
+    config["routes"][0]["githubEvents"] = json!(["workflow_run"]);
+    write_config(root.path(), &config);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_eq!(
+        send("pr-removed", "pull_request", "REPO").await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), transport.next())
+            .await
+            .is_err(),
+        "removed event must not enter the queue despite 200-on-ignore"
+    );
+    assert_eq!(
+        send("control-after", "pull_request", "CONTROL").await,
+        reqwest::StatusCode::OK
+    );
+    let TransportEvent::Message(control_after) =
+        tokio::time::timeout(Duration::from_secs(1), transport.next())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("control after reload")
+    };
+    assert_eq!(control_after.subject.canonical(), "github.owner.control");
+    assert_eq!(control_after.message_id.to_string(), "control-after");
+}
+
 async fn authorize_github_fixture(
     inbound: Box<crate::transport::InboundMessage>,
     route: &crate::routes::BoundRoute,
@@ -1846,7 +2014,7 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         "github".into(),
         address,
         "secret".into(),
-        std::sync::Arc::clone(&routes),
+        crate::gateway::CurrentGeneration::boot(std::sync::Arc::clone(&routes), Arc::default()),
         None,
     );
     transport.connect().await.unwrap();
@@ -2037,8 +2205,13 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
     assert_eq!(evicted.message_id.to_string(), "first");
     drop(transport);
     tokio::task::yield_now().await;
-    let mut restarted =
-        GithubTransport::new("github".into(), address, "secret".into(), routes, None);
+    let mut restarted = GithubTransport::new(
+        "github".into(),
+        address,
+        "secret".into(),
+        crate::gateway::CurrentGeneration::boot(routes, Arc::default()),
+        None,
+    );
     restarted.connect().await.unwrap();
     assert_eq!(
         signed_github_request(&client, address, &body, &signature, "first").await,
@@ -2078,7 +2251,7 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
         "github".into(),
         address,
         "gh-secret".into(),
-        std::sync::Arc::new(crate::routes::RoutingTable::default()),
+        crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
         Some(wa),
     );
     let mut drivers = BTreeMap::new();
@@ -19474,7 +19647,7 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
         let mut document = document(root.path());
         document["broker"]["serverUid"] = json!(crate::current_uid());
         let path = write_config(root.path(), &document);
-        let candidate = crate::boot_candidate(&path).await.unwrap();
+        let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
         let initial = candidate.routes.route(&message("before")).unwrap().steering;
         let next_broker = if same_broker_digest { "b" } else { "a" }.repeat(64);
         let response = |outcome| ResponseEnvelope {
@@ -19548,6 +19721,434 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
     }
 }
 
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one reload fixture carries two generations and all resident owners"
+)]
+async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    let other = catalog_text(true, Some("reasoning")).replace("name: reviewer", "name: other");
+    let catalog = root.path().join("catalog");
+    fs::create_dir(&catalog).unwrap();
+    fs::write(
+        catalog.join("reviewer.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    fs::write(catalog.join("other.yaml"), other).unwrap();
+    let mut document = document(root.path());
+    document["catalogPath"] = json!(catalog);
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["sessions"]["wakes"] = json!({"path":"wakes.jsonl", "minIntervalMs":300_000});
+    document["routes"][0]["wakes"] = json!(true);
+    let mut other_route = document["routes"][0].clone();
+    other_route["agent"] = json!("other");
+    other_route["conversation"]["ids"] = json!(["other"]);
+    document["routes"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, other_route);
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response()]);
+    let configured = Arc::new(crate::session::ConfiguredModels::default());
+    let mut runner = runner_with(
+        candidate.config.broker.clone(),
+        Arc::clone(&configured) as Arc<dyn ModelFactory>,
+        4,
+    );
+    Arc::get_mut(&mut runner).unwrap().wakes = Some(Arc::new(
+        crate::wake::WakeStore::open(candidate.config.wakes.as_ref().unwrap()).unwrap(),
+    ));
+    let private = private_conversation_key("dev", "dev", SUBJECT);
+    let shared = ConversationKey::shared(&"reviewer".parse().unwrap(), "dev", "dev");
+    let grant = granted(&["cli-probe.upper"]);
+    let now = Instant::now();
+    for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
+        commit(
+            &runner.conversations,
+            key,
+            &grant,
+            window(),
+            ConversationTurn::completed(text, "answer"),
+            now,
+        );
+    }
+    let mut gateway = crate::gateway::Gateway::new(
+        Arc::clone(&runner),
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let first = gateway.route_for_test(&message("first")).unwrap();
+    let job_capacity = runner.jobs.free_permits();
+    let owner = crate::jobs::JobOwner::of(&message("job"));
+    let anchor = crate::wake::Anchor::for_job(&message("job"), &first.agent).unwrap();
+    let (running_job, _signal) = runner
+        .jobs
+        .admit(owner.clone(), anchor, None, Arc::from("still running"))
+        .unwrap();
+    let asset_seed = runner
+        .conversations
+        .begin(&private, &grant, window(), None, now);
+    let access = asset_seed.assets.clone();
+    let arriving = runner.assets.assets_for_access(
+        &access,
+        vec![pending("kept.png", "image/png", 10)],
+        true,
+        now,
+    );
+    assert_eq!(arriving.arrived, [1]);
+    drop(asset_seed);
+    let old_generation = gateway.generation_for_test();
+    let other = old_generation.routes_for_test();
+    let old_model = Arc::clone(&first.model);
+    runner
+        .models
+        .client_bound(
+            &old_model,
+            tokio::runtime::Handle::current(),
+            tokio::sync::watch::channel(false).1,
+        )
+        .unwrap();
+    let old_client = configured.bound_client_for_test(&old_model).unwrap();
+    let (capture, _guard) = capture_spans();
+    for (index, version) in ["next", "newer"].into_iter().enumerate() {
+        document["models"][0]["model"] = json!(version);
+        write_config(root.path(), &document);
+        gateway.reconcile().await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        let selected = gateway.route_for_test(&message("after")).unwrap();
+        assert!(!Arc::ptr_eq(&selected.model, &old_model));
+        runner
+            .models
+            .client_bound(
+                &selected.model,
+                tokio::runtime::Handle::current(),
+                tokio::sync::watch::channel(false).1,
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &configured.bound_client_for_test(&selected.model).unwrap(),
+            &old_client
+        ));
+        let applied =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
+        assert_eq!(applied.len(), index + 1);
+        assert_eq!(applied[index].field("generation.digest").unwrap().len(), 64);
+        assert!(Arc::ptr_eq(gateway.runner_for_test(), &runner));
+        assert!(Arc::ptr_eq(
+            &gateway.runner_for_test().assets,
+            &runner.assets
+        ));
+        assert!(Arc::ptr_eq(&gateway.runner_for_test().jobs, &runner.jobs));
+        assert!(Arc::ptr_eq(
+            gateway.runner_for_test().wakes.as_ref().unwrap(),
+            runner.wakes.as_ref().unwrap()
+        ));
+        assert_eq!(gateway.runner_for_test().conversations.tracked(), 2);
+        assert_eq!(runner.jobs.list(&owner).len(), 1);
+        assert_eq!(
+            runner
+                .assets
+                .assets_for_access(&access, Vec::new(), true, now)
+                .inventory[0]
+                .name,
+            "kept.png"
+        );
+        for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
+            let history = runner
+                .conversations
+                .begin(key, &grant, window(), None, now)
+                .history;
+            assert_eq!(history.turns()[0].user(), text);
+        }
+        assert_eq!(other.len(), 2);
+        let mut other_message = message("unrelated");
+        other_message.conversation.id = "other".into();
+        assert_eq!(
+            gateway
+                .route_for_test(&other_message)
+                .unwrap()
+                .agent
+                .as_str(),
+            "other"
+        );
+    }
+    drop(running_job);
+    assert_eq!(runner.jobs.free_permits(), job_capacity);
+}
+
+#[tokio::test]
+async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_old_owner() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let first_path = root.path().join("first-auth.json");
+    let next_path = root.path().join("next-auth.json");
+    let fixture = serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"});
+    for path in [&first_path, &next_path] {
+        fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    }
+    let mut document = document(root.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["models"][0] = json!({"name":"codex","kind":"chatgptSubscription","model":"first","authFile":first_path,"timeoutMs":2000,"classes":["reasoning"]});
+    let path = write_config(root.path(), &document);
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+    let response = || ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha2,
+        response: BrokerResponse::Generation {
+            digest: "b".repeat(64),
+            outcome: GenerationOutcome::Active,
+        },
+    };
+    let mut broker = BrokerFixture::answering(root.path(), [response(), response(), response()]);
+    let configured = Arc::new(crate::session::ConfiguredModels::default());
+    let runner = runner_with(
+        candidate.config.broker.clone(),
+        Arc::clone(&configured) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload_owners(
+        path.clone(),
+        candidate,
+        "b".repeat(64),
+        crate::gateway::ResidentModels {
+            credentials: Arc::clone(&configured),
+            metering: Arc::new(dekopon_model_token_governor::Metering::new(
+                Vec::new(),
+                dekopon_model_token_governor::Metering::system_clock(),
+            )),
+            proxy: None,
+        },
+    )
+    .unwrap();
+    let first = configured
+        .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+        .unwrap();
+    let old = Arc::downgrade(&first);
+    document["models"][0]["model"] = json!("second");
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        &first,
+        &configured
+            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+            .unwrap()
+    ));
+    document["routes"][0]["steering"] = json!("boundary");
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert!(Arc::ptr_eq(
+        &first,
+        &configured
+            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
+            .unwrap()
+    ));
+    document["models"][0]["authFile"] = json!(next_path);
+    write_config(root.path(), &document);
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    let next = configured
+        .chatgpt_credential(Some(&next_path), Duration::from_secs(2))
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &next));
+    drop(first);
+    configured.retire();
+    assert!(old.upgrade().is_none());
+    assert_eq!(configured.credential_owners_for_test(), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn collected_media_never_crosses_a_removed_or_replaced_route() {
+    use dekopon_broker_protocol::{
+        BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
+    };
+    use dekopon_test_support::BrokerFixture;
+    for scenario in ["removed", "replaced", "reordered"] {
+        let root = temporary();
+        let catalog = root.path().join("catalog");
+        fs::create_dir(&catalog).unwrap();
+        fs::write(
+            catalog.join("reviewer.yaml"),
+            catalog_text(true, Some("reasoning")),
+        )
+        .unwrap();
+        fs::write(
+            catalog.join("other.yaml"),
+            catalog_text(true, Some("reasoning")).replace("name: reviewer", "name: other"),
+        )
+        .unwrap();
+        let mut document = document(root.path());
+        document["catalogPath"] = json!(catalog);
+        document["broker"]["serverUid"] = json!(crate::current_uid());
+        let path = write_config(root.path(), &document);
+        let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
+        let mut responses = vec![ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }];
+        if scenario == "reordered" {
+            responses.push(ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            ));
+        }
+        let mut broker = BrokerFixture::answering(root.path(), responses);
+        let model = ModelScript::forbidden();
+        let runner = runner(candidate.config.broker.clone(), Arc::clone(&model), 4);
+        let driver = Arc::new(RecordingDriver::default());
+        let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+        drivers.insert("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>);
+        let gateway = crate::gateway::Gateway::new(
+            runner,
+            Arc::new(candidate.routes.clone()),
+            Arc::new(BTreeMap::new()),
+            Arc::new(drivers),
+            Arc::new(Vec::new()),
+        )
+        .with_reload(path.clone(), candidate, "b".repeat(64))
+        .unwrap();
+        let (capture, _guard) = capture_spans();
+        let (tx, rx) = mpsc::channel(4);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(gateway.serve(
+            rx,
+            async move {
+                stopped.await.expect("shutdown sender stays alive");
+            },
+            Duration::from_secs(1),
+            crate::collection::Collector::new(&[], 4),
+        ));
+        for text in ["first", "second"] {
+            let mut inbound = message(text);
+            inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+            inbound.native_group = Some("group".into());
+            tx.send(TransportEvent::Message(Box::new(inbound)))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        let mut new_route = document["routes"][0].clone();
+        new_route["agent"] = json!("other");
+        match scenario {
+            "replaced" => document["routes"][0] = new_route,
+            "removed" => {
+                document["routes"].as_array_mut().unwrap().remove(0);
+                document["routes"].as_array_mut().unwrap().push(new_route);
+            }
+            "reordered" => {
+                new_route["conversation"]["ids"] = json!(["other"]);
+                document["routes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, new_route);
+            }
+            _ => unreachable!(),
+        }
+        write_config(root.path(), &document);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        for _ in 0..50 {
+            if !capture
+                .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            capture
+                .events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")])
+                .len(),
+            1
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        if scenario == "reordered" {
+            assert!(matches!(
+                broker.request().await.request,
+                BrokerRequest::Capabilities { .. }
+            ));
+        } else {
+            assert!(
+                broker.recorded().is_empty(),
+                "no broker session on the replacement route"
+            );
+            assert_eq!(model.requests(), 0);
+            assert!(driver.replies().is_empty());
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_gatewayd",
+                        &[
+                            ("event", "gateway_input_disposition"),
+                            ("outcome", "route-lost")
+                        ]
+                    )
+                    .len(),
+                2
+            );
+        }
+        stop.send(()).unwrap();
+        assert!(matches!(
+            serving.await.unwrap(),
+            crate::ServeOutcome::Shutdown
+        ));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
     let root = temporary();
@@ -19559,7 +20160,7 @@ async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let listener = UnixListener::bind(root.path().join("broker.sock")).unwrap();
     fs::set_permissions(
         root.path().join("broker.sock"),
@@ -19647,7 +20248,7 @@ async fn dispatched_message_starts_on_its_captured_generation_after_route_remova
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let mut broker = BrokerFixture::answering(
         root.path(),
         [ResponseEnvelope {
@@ -19712,7 +20313,7 @@ async fn refused_broker_digest_is_adopted_for_next_prepare_and_publication() {
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let old = "b".repeat(64);
     let current = "c".repeat(64);
     let response = |outcome| ResponseEnvelope {
@@ -19786,7 +20387,7 @@ async fn yaml_mapping_key_order_does_not_publish_a_new_gateway_generation() {
     let path = root.path().join("gateway.yaml");
     fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let broker_digest = "b".repeat(64);
     let mut broker = BrokerFixture::answering(
         root.path(),
@@ -19869,7 +20470,7 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
-    let candidate = crate::boot_candidate(&path).await.unwrap();
+    let (candidate, _prepared) = crate::boot_candidate(&path).await.unwrap();
     let mut sequence = 0;
     let mut broker = BrokerFixture::scripted(root.path(), move |_, _| {
         sequence += 1;

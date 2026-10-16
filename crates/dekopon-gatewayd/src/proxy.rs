@@ -170,20 +170,18 @@ pub enum ProxyStartError {
     Listen(#[from] dekopon_model_proxy::tls::ListenError),
 }
 
-/// Binds the listener and spawns it into `tasks`, whose owner aborts it at shutdown.
-pub(crate) async fn start(
+pub(crate) fn build(
     proxy: &ResolvedProxy,
     models: &[ModelConfig],
     credentials: &ConfiguredModels,
     metering: &Arc<Metering>,
-    tasks: &mut tokio::task::JoinSet<()>,
-) -> Result<std::net::SocketAddr, ProxyStartError> {
-    start_with(proxy, models, credentials, metering, tasks, |variable| {
+) -> Result<Arc<ModelProxy>, ProxyStartError> {
+    build_with(proxy, models, credentials, metering, |variable| {
         std::env::var_os(variable)
     })
-    .await
 }
 
+#[cfg(test)]
 pub(crate) async fn start_with(
     proxy: &ResolvedProxy,
     models: &[ModelConfig],
@@ -192,6 +190,17 @@ pub(crate) async fn start_with(
     tasks: &mut tokio::task::JoinSet<()>,
     resolve: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<std::net::SocketAddr, ProxyStartError> {
+    let router = build_with(proxy, models, credentials, metering, resolve)?.router();
+    listen(proxy, router, tasks).await
+}
+
+fn build_with(
+    proxy: &ResolvedProxy,
+    models: &[ModelConfig],
+    credentials: &ConfiguredModels,
+    metering: &Arc<Metering>,
+    resolve: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Arc<ModelProxy>, ProxyStartError> {
     let granted = proxy
         .guests
         .values()
@@ -255,7 +264,19 @@ pub(crate) async fn start_with(
             )
         })
         .collect::<HashMap<_, _>>();
-    let router = Arc::new(ModelProxy::new(upstreams, guests, Arc::clone(metering))?).router();
+    Ok(Arc::new(ModelProxy::new(
+        upstreams,
+        guests,
+        Arc::clone(metering),
+    )?))
+}
+
+/// Binds the listener and spawns it into `tasks`, whose owner aborts it at shutdown.
+pub(crate) async fn listen(
+    proxy: &ResolvedProxy,
+    router: axum::Router,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Result<std::net::SocketAddr, ProxyStartError> {
     let listener =
         Listener::bind(proxy.bind, proxy.files.clone(), proxy.jail_identity.clone()).await?;
     let address =

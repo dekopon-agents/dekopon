@@ -100,9 +100,16 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
-async fn boot_candidate(config_path: &Path) -> Result<Candidate, GatewaydError> {
+async fn boot_candidate(config_path: &Path) -> Result<(Candidate, Prepared), GatewaydError> {
     let (candidate, report) = load_candidate(config_path, None, config::LoadMode::Boot, None).await;
-    let candidate = candidate.ok_or_else(|| GatewaydError::from_problems(report.problems))?;
+    let Some((candidate, prepared)) = candidate.and_then(|mut candidate| {
+        candidate
+            .prepared
+            .take()
+            .map(|prepared| (candidate, prepared))
+    }) else {
+        return Err(GatewaydError::from_problems(report.problems));
+    };
     if !candidate
         .sources
         .still_current(config_path, &candidate.config.catalog_path, current_uid())
@@ -110,16 +117,24 @@ async fn boot_candidate(config_path: &Path) -> Result<Candidate, GatewaydError> 
     {
         return Err(config::ConfigError::ChangedDuringLoad.into());
     }
-    Ok(candidate)
+    Ok((candidate, prepared))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "gateway boot owns resident transports and reload owners until shutdown"
+)]
 pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
-    let mut candidate = boot_candidate(config_path.as_ref()).await?;
-    let built_transports = std::mem::take(&mut candidate.transports);
-    let routes = Arc::new(candidate.routes.clone());
+    let (
+        candidate,
+        Prepared {
+            transports: built_transports,
+            generation,
+        },
+    ) = boot_candidate(config_path.as_ref()).await?;
     let config = &candidate.config;
 
     let broker_client = BrokerClient::new(
@@ -207,12 +222,12 @@ where
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
     });
-    let mut owned_tasks = start_metering_tasks(config, &configured, &metering).await?;
+    let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
 
     tracing::info!(
         event = "gateway_started",
         transport.count = config.transports.len(),
-        route.count = routes.len()
+        route.count = candidate.routes.len()
     );
 
     let mut terminal = Ok(());
@@ -222,16 +237,31 @@ where
     };
     let shutdown_grace = config.shutdown_grace;
     let collector = collection::Collector::new(&config.transports, config.sessions.max_concurrent);
-    let outcome = gateway::Gateway::new(
+    let proxy_listener = config.proxy.clone();
+    let gateway = gateway::Gateway::serving(
         runner,
-        routes,
+        generation,
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
-        Arc::new(config.stop_words.clone()),
     )
-    .with_reload(config_path.as_ref().to_path_buf(), candidate, broker_digest)?
-    .serve(receiver, stopped, shutdown_grace, collector)
-    .await;
+    .with_reload_owners(
+        config_path.as_ref().to_path_buf(),
+        candidate,
+        broker_digest,
+        gateway::ResidentModels {
+            credentials: configured,
+            metering,
+            proxy: boot_proxy,
+        },
+    )?;
+    if let Some(resolved) = &proxy_listener {
+        proxy::listen(resolved, gateway.proxy_router(), &mut owned_tasks)
+            .await
+            .map_err(GatewaydError::Proxy)?;
+    }
+    let outcome = gateway
+        .serve(receiver, stopped, shutdown_grace, collector)
+        .await;
     readers.abort_all();
     owned_tasks.shutdown().await;
     while let Some(result) = readers.join_next().await {
@@ -332,25 +362,18 @@ async fn load_follow_table(
     Ok(Some(Arc::new(table)))
 }
 
-/// The restore task and the guest model proxy listener, owned by the gateway and aborted at
-/// shutdown.
-async fn start_metering_tasks(
+fn start_metering_tasks(
     config: &ResolvedConfig,
     configured: &ConfiguredModels,
     metering: &Arc<dekopon_model_token_governor::Metering>,
-) -> Result<JoinSet<()>, GatewaydError> {
+) -> Result<(JoinSet<()>, Option<Arc<dekopon_model_proxy::ModelProxy>>), GatewaydError> {
     let mut owned_tasks = JoinSet::new();
-    if let Some(resolved) = &config.proxy {
-        proxy::start(
-            resolved,
-            &config.models,
-            configured,
-            metering,
-            &mut owned_tasks,
-        )
-        .await
+    let boot_proxy = config
+        .proxy
+        .as_ref()
+        .map(|resolved| proxy::build(resolved, &config.models, configured, metering))
+        .transpose()
         .map_err(GatewaydError::Proxy)?;
-    }
     meter_restore::spawn(
         metering,
         config.metering.restore.clone(),
@@ -360,7 +383,7 @@ async fn start_metering_tasks(
             .and_then(|telemetry| telemetry.settings.ca_certificate().map(<[u8]>::to_vec)),
         &mut owned_tasks,
     );
-    Ok(owned_tasks)
+    Ok((owned_tasks, boot_proxy))
 }
 
 #[derive(Debug, Default)]
@@ -429,7 +452,7 @@ pub(crate) struct Candidate {
     pub(crate) sources: config::GatewaySources,
     pub(crate) config: ResolvedConfig,
     pub(crate) routes: RoutingTable,
-    pub(crate) transports: Vec<Box<dyn ChatTransport>>,
+    pub(crate) prepared: Option<Prepared>,
 }
 
 /// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
@@ -483,7 +506,7 @@ pub(crate) async fn load_candidate_against(
             None
         }
     };
-    let transports = match (&config, &routes) {
+    let prepared = match (&config, &routes) {
         (Some(config), Some(routes)) => {
             if mode == config::LoadMode::Check
                 && config.journal.is_none()
@@ -498,12 +521,12 @@ pub(crate) async fn load_candidate_against(
                 if !problems.is_empty() {
                     report.problems.push(GatewaydError::Startup { problems });
                 }
-                Vec::new()
+                None
             }
         }
         (None, _) | (_, None) => {
             report.skipped(Stage::Credentials);
-            Vec::new()
+            None
         }
     };
     let reload_scope = ProbeScope::Every;
@@ -549,7 +572,7 @@ pub(crate) async fn load_candidate_against(
                             sources,
                             config,
                             routes,
-                            transports,
+                            prepared,
                         }),
                         Err(error) => {
                             report.problems.push(error.into());
@@ -585,10 +608,10 @@ fn credentials(
     routes: &RoutingTable,
     mode: config::LoadMode,
     report: &mut CheckReport,
-) -> Vec<Box<dyn ChatTransport>> {
+) -> Option<Prepared> {
     match mode {
         config::LoadMode::Boot => match prepare(config, routes) {
-            Ok(Prepared { transports }) => return transports,
+            Ok(prepared) => return Some(prepared),
             Err(error) => report.problems.push(error),
         },
         config::LoadMode::Check => {
@@ -620,7 +643,7 @@ fn credentials(
             }
         }
     }
-    Vec::new()
+    None
 }
 
 fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
@@ -854,6 +877,10 @@ mod openrouter_startup_tests {
 
 fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, GatewaydError> {
     let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
+    let generation = gateway::CurrentGeneration::boot(
+        Arc::new(routes.clone()),
+        Arc::new(config.stop_words.clone()),
+    );
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
         if let TransportConfig::GithubWebhook { name, bind, secret_env } = spec
@@ -866,7 +893,7 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
             }
             continue;
         }
-        match build_transport(spec, config, routes) {
+        match build_transport(spec, config, &generation) {
             Ok(transport) => transports.push(transport),
             Err(source) => problems.push(StartupProblem::Transport {
                 transport: spec.name().to_owned(),
@@ -875,20 +902,24 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
         }
     }
     if problems.is_empty() {
-        Ok(Prepared { transports })
+        Ok(Prepared {
+            transports,
+            generation,
+        })
     } else {
         Err(GatewaydError::Startup { problems })
     }
 }
 
-struct Prepared {
+pub(crate) struct Prepared {
     transports: Vec<Box<dyn ChatTransport>>,
+    generation: gateway::CurrentGeneration,
 }
 
 fn build_transport(
     spec: &TransportConfig,
     config: &ResolvedConfig,
-    routes: &RoutingTable,
+    generation: &gateway::CurrentGeneration,
 ) -> Result<Box<dyn ChatTransport>, TransportError> {
     let surface = |liveness: &LivenessConfig| {
         let mut settings = liveness.settings();
@@ -912,7 +943,7 @@ fn build_transport(
             name.clone(),
             *bind,
             transport::read_credential(secret_env)?,
-            Arc::new(routes.clone()),
+            generation.clone(),
             None,
         )),
         TransportConfig::SlackSocketMode {
@@ -992,7 +1023,7 @@ fn build_transport(
                     name.clone(),
                     *bind,
                     transport::read_credential(secret_env)?,
-                    Arc::new(routes.clone()),
+                    generation.clone(),
                     Some(whatsapp),
                 ))
             } else {
