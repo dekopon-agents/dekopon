@@ -1,7 +1,7 @@
 use super::{Backward, Journal, JournalError, Line, body, duration_millis, millis, remove};
 use crate::config::{
     MemoryWindow,
-    memory::{ResolvedPolicy, RoutineKind, SelectionMode},
+    memory::{ResolvedPolicy, RoutineKind, Selection, SelectionMode},
 };
 use dekopon_agent::prompt::{ConversationTurn, History, Representation};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
@@ -9,6 +9,7 @@ use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ExitCode, Streams,
     TreeContext,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -16,14 +17,46 @@ use std::{
     time::SystemTime,
 };
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Evidence {
-    tool: String,
-    outcome: String,
-    exit: Option<i32>,
+    tool: EvidenceTool,
+    outcome: EvidenceOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_status: Option<u8>,
     age_ms: u64,
     bytes: u64,
     pinned: bool,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceTool {
+    Bash,
+    #[serde(rename = "none")]
+    Absent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceOutcome {
+    Success,
+    Failure,
+    #[serde(rename = "none")]
+    Absent,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChooseInput<'a> {
+    backend: &'a str,
+    model: &'a str,
+    evidence: &'a [Evidence],
+    labels: &'a [String],
+    require_probabilities: bool,
+}
+
+const MAX_EVIDENCE: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Projection<'a> {
@@ -76,29 +109,37 @@ impl<I: CapabilityInvoker> CapabilityInvoker for Decider<'_, I> {
 
 pub(crate) fn decide<I: CapabilityInvoker>(
     runtime: &ShellRuntime<I>,
-    capability: &str,
+    selection: &Selection,
     available: &[String],
     evidence: &[Evidence],
 ) -> Result<String, &'static str> {
+    let (Some(capability), Some(backend), Some(model), Some(require_probabilities)) = (
+        selection.decision_capability.as_deref(),
+        selection.backend.as_deref(),
+        selection.model.as_deref(),
+        selection.require_probabilities,
+    ) else {
+        return Err("not-configured");
+    };
     if !runtime.invoker.is_granted(capability) {
         return Err("not-granted");
     }
-    let evidence: Vec<_> = evidence
-        .iter()
-        .map(|item| {
-            json!({
-                "tool": item.tool, "outcome": item.outcome, "exitStatus": item.exit,
-                "ageMs": item.age_ms, "bytes": item.bytes, "pinned": item.pinned
-            })
-        })
-        .collect();
+    if available.len() < 2 {
+        return Err("single-label");
+    }
+    let input = serde_json::to_value(ChooseInput {
+        backend,
+        model,
+        evidence: &evidence[evidence.len().saturating_sub(MAX_EVIDENCE)..],
+        labels: available,
+        require_probabilities,
+    })
+    .map_err(|_unencodable| "invalid-request")?;
     let decider = ShellRuntime {
         invoker: Decider {
             inner: &runtime.invoker,
             capability,
-            input: json!({
-                "available": available, "evidence": evidence
-            }),
+            input,
         },
         limits: runtime.limits,
         calls: runtime.calls.clone(),
@@ -136,9 +177,15 @@ fn eligible_ids(line: &Line, policy: &ResolvedPolicy) -> Vec<String> {
 fn evidence_for(line: &Line, now: u64) -> Evidence {
     let exchange = line.exchanges.first();
     Evidence {
-        tool: exchange.map_or_else(|| "none".to_owned(), |exchange| exchange.tool.clone()),
-        outcome: exchange.map_or_else(|| "none".to_owned(), |exchange| exchange.outcome.clone()),
-        exit: exchange.and_then(|exchange| exchange.exit_status),
+        tool: exchange.map_or(EvidenceTool::Absent, |_script| EvidenceTool::Bash),
+        outcome: match exchange {
+            None => EvidenceOutcome::Absent,
+            Some(exchange) if exchange.outcome == "success" => EvidenceOutcome::Success,
+            Some(_) => EvidenceOutcome::Failure,
+        },
+        exit_status: exchange
+            .and_then(|exchange| exchange.exit_status)
+            .and_then(|status| u8::try_from(status).ok()),
         age_ms: now.saturating_sub(line.at_ms),
         bytes: line.original_bytes,
         pinned: line.pins.iter().any(|pin| pin.record_id == line.record_id),

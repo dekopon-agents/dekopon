@@ -1907,12 +1907,7 @@ async fn session(
                     },
                     &history,
                     |available, evidence| {
-                        let capability = policy
-                            .selection
-                            .decision_capability
-                            .as_deref()
-                            .unwrap_or("");
-                        journal::decide(&runtime, capability, available, evidence)
+                        journal::decide(&runtime, &policy.selection, available, evidence)
                     },
                 ) {
                     Ok(projected) => history = projected,
