@@ -16456,7 +16456,10 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            (
+                "user",
+                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nwhat broke?"
+            ),
             ("assistant", "Two things broke."),
             ("user", "and the second one?"),
         ]),
@@ -16513,7 +16516,8 @@ async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message(
         );
     }
     assert_eq!(prompt[1], ("user".to_owned(), prompt[1].1.clone()));
-    assert!(prompt[1].1.starts_with("four photos"));
+    assert!(prompt[1].1.starts_with("[memory: {\"recordId\":1,"));
+    assert!(prompt[1].1.contains("four photos"));
 }
 
 type Asked = (Option<String>, Option<String>, usize);
@@ -18559,10 +18563,18 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     let directory = temporary();
     let journal_dir = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
-    let models = ModelScript::new([script_call("printf result-sentinel"), answer("done")]);
+    let models = ModelScript::new([
+        script_call("printf result-sentinel"),
+        answer("done"),
+        answer("done again"),
+    ]);
     let runner = journaled_runner(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
     let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
     route.memory_policy = Some(crate::config::ResolvedPolicy::default());
+    crate::memory::generation::report_policy(
+        route.memory_policy.as_ref().unwrap(),
+        RecallSource::Platform,
+    );
     let inbound = message("do the work");
     let key = ConversationKey::private(
         &route.agent,
@@ -18575,7 +18587,7 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         Arc::clone(&runner),
         route.clone(),
         inbound,
-        driver as Arc<dyn ChatDriver>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
@@ -18587,17 +18599,9 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         Instant::now(),
     );
     let turn = remembered.history.turns().first().expect("committed turn");
-    let exchange = turn.exchanges().first().expect("script exchange captured");
-    assert_eq!(
-        exchange.request[0].text.as_deref(),
-        Some("printf result-sentinel")
-    );
     assert!(
-        exchange.result[0]
-            .text
-            .as_deref()
-            .unwrap_or_default()
-            .contains("result-sentinel")
+        turn.exchanges().is_empty(),
+        "the resident window excludes durable tool bytes"
     );
     assert_eq!(turn.user(), "do the work");
     assert_eq!(turn.answer(), Some("done"));
@@ -18633,10 +18637,27 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
     assert!(read.contains("outcome: success, exit: Some(0)"), "{read}");
     assert!(!read.contains("do the work"));
     assert!(!read.contains("done"));
+    let refused = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        line["recordId"].as_u64().unwrap(),
+        "missing",
+        None,
+    );
+    assert!(
+        refused.contains("eligible representation IDs: original"),
+        "{refused}"
+    );
     assert!(line["user"].is_null());
     assert!(line["answer"].is_null());
     assert!(!bytes.contains("do the work"));
     assert!(!bytes.contains("done"));
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message("follow-up"),
+        driver as Arc<dyn ChatDriver>,
+    )
+    .await;
     let policy = capture.events_where(
         "dekopon_gatewayd",
         &[("event", "gateway_memory_policy"), ("recall", "platform")],

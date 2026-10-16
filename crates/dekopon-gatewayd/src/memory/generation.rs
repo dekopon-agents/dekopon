@@ -292,6 +292,32 @@ pub(crate) struct PostReply<'a> {
     pub cancellation: &'a SessionCancellation,
 }
 
+pub(crate) fn report_policy(policy: &ResolvedPolicy, recall: crate::config::RecallSource) {
+    let mode = match policy.selection.mode {
+        crate::config::memory::SelectionMode::Fixed => "fixed",
+        crate::config::memory::SelectionMode::AgentPreference => "agentPreference",
+        crate::config::memory::SelectionMode::Decider => "decider",
+    };
+    let bound = |value| match value {
+        crate::config::memory::CaptureBound::Bytes(bytes) => bytes.get().to_string(),
+        crate::config::memory::CaptureBound::Word(_) => "uncapped".to_owned(),
+    };
+    tracing::info!(
+        event = "gateway_memory_policy",
+        mode,
+        recall = match recall {
+            crate::config::RecallSource::None => "none",
+            crate::config::RecallSource::Journal => "journal",
+            crate::config::RecallSource::Platform => "platform",
+        },
+        retained_routines = policy.retain.len(),
+        capture_user_bytes = %bound(policy.capture.user),
+        capture_assistant_bytes = %bound(policy.capture.assistant),
+        capture_tool_request_bytes = %bound(policy.capture.tool_request),
+        capture_tool_result_bytes = %bound(policy.capture.tool_result),
+    );
+}
+
 pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: ConversationTurn) {
     let PostReply {
         runner,
@@ -306,25 +332,6 @@ pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: 
     };
     let journal = Arc::clone(journal);
     let policy = route.memory_policy.clone().unwrap_or_default();
-    let mode = match policy.selection.mode {
-        crate::config::memory::SelectionMode::Fixed => "fixed",
-        crate::config::memory::SelectionMode::AgentPreference => "agentPreference",
-        crate::config::memory::SelectionMode::Decider => "decider",
-    };
-    tracing::info!(
-        event = "gateway_memory_policy",
-        mode,
-        recall = match window.recall {
-            crate::config::RecallSource::None => "none",
-            crate::config::RecallSource::Journal => "journal",
-            crate::config::RecallSource::Platform => "platform",
-        },
-        retained_routines = policy.retain.len(),
-        capture_user_bytes = ?policy.capture.user,
-        capture_assistant_bytes = ?policy.capture.assistant,
-        capture_tool_request_bytes = ?policy.capture.tool_request,
-        capture_tool_result_bytes = ?policy.capture.tool_result,
-    );
     let models = Arc::clone(&runner.models);
     let metering = Arc::clone(&runner.metering);
     let agent = route.agent.clone();

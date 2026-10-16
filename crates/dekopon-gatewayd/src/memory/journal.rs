@@ -1667,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_past_its_threshold_keeps_eligible_turns_and_the_snapshot() {
+    fn a_large_file_appends_without_rewriting_eligible_turns() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -1678,7 +1678,23 @@ mod tests {
             append_with(&journal, &stem, now, GRANT, &filler, &inventory);
         }
         let bytes = fs::metadata(journal.path(&stem)).expect("file").len();
-        assert!(bytes > compaction_threshold(window()), "{bytes} bytes");
+        assert!(bytes > 64 * 1024, "{bytes} bytes");
+        let before = fs::metadata(journal.path(&stem)).expect("file");
+        PEAK_LIVE_DECODED.with(|peak| peak.set(0));
+        append_with(&journal, &stem, now, GRANT, &filler, &inventory);
+        PEAK_LIVE_DECODED.with(|peak| {
+            assert!(
+                peak.get() <= 2,
+                "append must decode only its own tail and head"
+            )
+        });
+        let after = fs::metadata(journal.path(&stem)).expect("file");
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            after.ino(),
+            before.ino(),
+            "an eligible tail append must not rewrite the file"
+        );
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert_eq!(recalled.history.len(), 2, "two 400-byte turns fit 1 KiB");
         assert_eq!(recalled.assets.len(), 1);
@@ -1721,8 +1737,10 @@ mod tests {
         );
         fs::create_dir_all(journal.path(&stem).parent().unwrap()).unwrap();
         fs::write(journal.path(&stem), old).expect("old format");
-        let recalled = journal.recall(&stem, GRANT, window(), now).expect("reset");
-        assert!(recalled.history.is_empty());
+        assert!(matches!(
+            journal.recall(&stem, GRANT, window(), now),
+            Err(JournalError::Corrupt)
+        ));
         assert!(!journal.path(&stem).exists());
     }
 
@@ -1828,7 +1846,11 @@ mod tests {
                 .iter()
                 .all(|user| *user != "earlier")
         );
-        compact(&journal.path(&stem), age, now + age).unwrap();
+        rewrite_eligible(
+            &journal.path(&stem),
+            millis(now + age).saturating_sub(duration_millis(age)),
+        )
+        .unwrap();
         assert!(
             read_lines(&journal.path(&stem))
                 .unwrap()
@@ -2024,7 +2046,13 @@ mod tests {
                 .any(|part| part == b"source sentinel")
         );
         let record = read_lines(&path).unwrap().pop().unwrap();
-        assert_eq!(record.representations[0].text.as_deref(), Some("summary"));
+        assert_eq!(
+            record
+                .representations
+                .last()
+                .and_then(|rep| rep.text.as_deref()),
+            Some("summary")
+        );
         assert!(
             reopened
                 .recall(&stem, GRANT, window(), now)
@@ -2045,7 +2073,10 @@ mod tests {
         let before = fs::read(&path).unwrap();
         fs::create_dir(path.with_extension("compact")).unwrap();
         assert!(matches!(
-            compact(&path, RETENTION, now),
+            rewrite_eligible(
+                &path,
+                millis(now).saturating_sub(duration_millis(RETENTION))
+            ),
             Err(JournalError::Io { .. })
         ));
         assert_eq!(fs::read(path).unwrap(), before);

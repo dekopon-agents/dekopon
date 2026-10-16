@@ -42,10 +42,6 @@ pub(crate) struct BoundRoute {
     pub steering: Steering,
     pub progress_notes: bool,
     pub memory: MemoryPolicy,
-    #[allow(
-        dead_code,
-        reason = "resolved policy is consumed by later memory integration"
-    )]
     pub memory_policy: Option<ResolvedPolicy>,
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,

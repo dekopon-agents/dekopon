@@ -17,7 +17,6 @@ const CANARY: &str = "SOURCE_ONLY_CANARY_43";
 const LOG: &str = "check-log: build passed; lint passed; integration passed; coverage passed; SOURCE_ONLY_CANARY_43";
 const HEADER: &str = "\n[tool: check-log, outcome: succeeded, exit: Some(0)]";
 const LABEL: &str = "\n[result] ";
-const WRAPPER: &str = "[memory: routine=summary, omitted=0 bytes]\n";
 
 fn policy(mode: SelectionMode) -> ResolvedPolicy {
     let mut policy = ResolvedPolicy::default();
@@ -127,6 +126,11 @@ async fn selected_summary_with_limit(
                 ));
             }
             let metadata = invocation.input.to_string();
+            let evidence: Value = serde_json::from_str(&metadata).expect("bounded decision input");
+            assert_eq!(
+                evidence["evidence"][0]["bytes"],
+                "status".len() + "ok".len() + LOG.len()
+            );
             assert!(
                 !metadata.contains(CANARY),
                 "the broker must not see the check-log text"
@@ -138,7 +142,7 @@ async fn selected_summary_with_limit(
                 stdout,
                 "{}",
                 if choice == "refused" { json!({"refused":true,"backend":"fixture","model":"fixture"}) }
-                else { json!({"choice": if choice == "invalid" { "unknown" } else { choice }, "backend":"fixture", "model":"fixture"}) }
+                else { json!({"choice": if choice == "invalid" { "unknown" } else if choice == "missing" { "summary" } else { choice }, "backend":"fixture", "model":"fixture"}) }
             )
             .unwrap();
             return Some((
@@ -169,7 +173,14 @@ async fn selected_summary_with_limit(
     });
     if decider_mode {
         selection.selection.routine = None;
-        selection.selection.fallback = Some("summary".into());
+        selection.selection.fallback = Some(
+            if decider_choice == Some("missing") {
+                "original"
+            } else {
+                "summary"
+            }
+            .into(),
+        );
         selection.selection.decision_capability = Some("decider.choose".into());
     }
     if decider_choice == Some("preference") {
@@ -228,6 +239,29 @@ async fn selected_summary_with_limit(
     let journal = runner.journal.as_ref().unwrap();
     let stem = key.journal_stem();
     let grant = crate::journal::grant_digest(&granted(&granted_ids));
+    if decider_choice == Some("missing") {
+        journal
+            .append(
+                &stem,
+                &Entry {
+                    at: SystemTime::now(),
+                    grant: &grant,
+                    turn: &turn,
+                    inventory: &[],
+                    next_asset_id: 1,
+                    prepared: Some(&generation::Prepared {
+                        include_chat: true,
+                        representations: vec![meta.clone(), replacement.clone()],
+                        exchanges: turn.exchanges().to_vec(),
+                        original: true,
+                        availability: vec!["original".into(), "summary".into()],
+                        failed_routines: Vec::new(),
+                    }),
+                },
+                route.memory.window().unwrap(),
+            )
+            .unwrap();
+    }
     journal
         .append(
             &stem,
@@ -239,7 +273,11 @@ async fn selected_summary_with_limit(
                 next_asset_id: 1,
                 prepared: Some(&generation::Prepared {
                     include_chat: true,
-                    representations: vec![meta, replacement],
+                    representations: if decider_choice == Some("missing") {
+                        vec![meta]
+                    } else {
+                        vec![meta, replacement]
+                    },
                     exchanges: if summary_only {
                         vec![Exchange {
                             tool: "check-log".into(),
@@ -254,6 +292,8 @@ async fn selected_summary_with_limit(
                     original: !summary_only,
                     availability: if summary_only {
                         vec!["summary".into()]
+                    } else if decider_choice == Some("missing") {
+                        vec!["original".into()]
                     } else {
                         vec!["original".into(), "summary".into()]
                     },
@@ -295,6 +335,7 @@ async fn selected_summary_with_limit(
         };
         assert!(tools.set_pin(1, "summary").starts_with("pinned record 1"));
     }
+    let before = std::fs::read(journal_dir.path().join(format!("{stem}.jsonl"))).unwrap();
     run_session(
         Arc::clone(&runner),
         route,
@@ -302,9 +343,18 @@ async fn selected_summary_with_limit(
         Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
     )
     .await;
+    let after = std::fs::read(journal_dir.path().join(format!("{stem}.jsonl"))).unwrap();
+    assert!(
+        after.starts_with(&before),
+        "projection and append must not rewrite prior records"
+    );
     let disk = std::fs::read_to_string(journal_dir.path().join(format!("{stem}.jsonl"))).unwrap();
     let stored: serde_json::Value = serde_json::from_str(disk.lines().next().unwrap()).unwrap();
-    assert_eq!(stored["selections"][0]["reason"], reason);
+    assert_eq!(stored["recordId"], 1);
+    assert!(
+        stored.get("selections").is_none(),
+        "selection is telemetry-only"
+    );
     if summary_only {
         assert!(
             !disk.contains(CANARY),
@@ -321,32 +371,88 @@ async fn selected_summary_with_limit(
             "disposed source cannot reach the model"
         );
     }
-    let replacement = format!("{WRAPPER}{summary}{HEADER}");
+    let replacement = format!("{summary}{HEADER}");
     if actual == "omitted" {
         assert!(!model.prompt(0).iter().any(|(_, text)| text == expected));
     } else {
-        assert_eq!(model.prompt(0)[1], ("user".to_owned(), expected.to_owned()));
+        let eligible = if summary_only {
+            vec!["summary"]
+        } else if decider_choice == Some("missing") {
+            vec!["original"]
+        } else {
+            vec!["original", "summary"]
+        };
+        let label = record_label(
+            if decider_choice == Some("missing") {
+                2
+            } else {
+                1
+            },
+            actual,
+            &eligible,
+            0,
+        );
+        assert_eq!(
+            model.prompt(0)[if decider_choice == Some("missing") {
+                2
+            } else {
+                1
+            }],
+            ("user".to_owned(), format!("{label}{expected}"))
+        );
     }
     let events = capture.events_where("dekopon_gatewayd", &[("event", "gateway_memory_selection")]);
-    assert_eq!(events.len(), 1, "{events:?}");
-    let event = &events[0];
+    assert_eq!(
+        events.len(),
+        if decider_choice == Some("missing") {
+            2
+        } else {
+            1
+        },
+        "{events:?}"
+    );
+    let event = events
+        .iter()
+        .find(|event| {
+            event.field("record_id")
+                == Some(if decider_choice == Some("missing") {
+                    "2"
+                } else {
+                    "1"
+                })
+        })
+        .unwrap();
     assert_eq!(event.field("requested"), Some(requested));
     assert_eq!(event.field("actual"), Some(actual));
+    let record_id = if decider_choice == Some("missing") {
+        2
+    } else {
+        1
+    };
+    let eligible = if summary_only {
+        vec!["summary"]
+    } else if decider_choice == Some("missing") {
+        vec!["original"]
+    } else {
+        vec!["original", "summary"]
+    };
+    let original_bytes = if summary_only {
+        "status".len() + "ok".len() + LOG.len()
+    } else {
+        original.len() + record_label(record_id, "original", &eligible, 0).len()
+    };
+    let replacement_bytes = if requested == "original" || decider_choice == Some("missing") {
+        original.len() + record_label(record_id, "original", &eligible, 0).len()
+    } else {
+        replacement.len() + record_label(record_id, "summary", &eligible, 0).len()
+    };
     assert_eq!(
         event.field("original_bytes"),
-        Some(original.len().to_string().as_str())
+        Some(original_bytes.to_string().as_str())
     );
     assert_eq!(
         event.field("replacement_bytes"),
-        Some(
-            if requested == "original" {
-                original.len()
-            } else {
-                replacement.len()
-            }
-            .to_string()
-            .as_str()
-        )
+        Some(replacement_bytes.to_string().as_str())
     );
     assert_eq!(
         event.field("savings_bytes"),
@@ -367,7 +473,15 @@ async fn selected_summary_with_limit(
     );
     assert_eq!(
         event.field("pin_bytes"),
-        Some(if pin { replacement.len() } else { 0 }.to_string().as_str())
+        Some(
+            if pin {
+                replacement.len() + record_label(record_id, "summary", &eligible, 0).len()
+            } else {
+                0
+            }
+            .to_string()
+            .as_str()
+        )
     );
     assert_eq!(
         event.field("pinned"),
@@ -376,14 +490,35 @@ async fn selected_summary_with_limit(
     assert_eq!(broker.recorded().len(), if invoked { 2 } else { 1 });
 }
 
+fn record_label(
+    record_id: u64,
+    representation_id: &str,
+    eligible: &[&str],
+    omitted_bytes: u64,
+) -> String {
+    format!(
+        "[memory: {}]\n",
+        json!({"recordId":record_id,"representationId":representation_id,"eligibleRepresentationIds":eligible,"omittedBytes":omitted_bytes})
+    )
+}
+
 fn original() -> String {
     format!("status\nok{HEADER}{LABEL}{LOG}")
 }
 fn replacement(summary: &str) -> String {
-    format!("{WRAPPER}{summary}{HEADER}")
+    format!("{summary}{HEADER}")
+}
+fn envelope_savings(summary: &str) -> i64 {
+    (original().len() + record_label(1, "original", &["original", "summary"], 0).len()) as i64
+        - (replacement(summary).len()
+            + record_label(1, "summary", &["original", "summary"], 0).len()) as i64
 }
 fn equal_summary() -> String {
-    "x".repeat(original().len() - replacement("").len())
+    "x".repeat(
+        original().len() - replacement("").len()
+            + record_label(1, "original", &["original", "summary"], 0).len()
+            - record_label(1, "summary", &["original", "summary"], 0).len(),
+    )
 }
 
 #[tokio::test]
@@ -395,7 +530,7 @@ async fn smaller_check_log_summary_saves_envelope_bytes() {
         &replacement(summary),
         "summary",
         "summary",
-        original().len() as i64 - replacement(summary).len() as i64,
+        envelope_savings(summary),
         "selected",
         None,
     )
@@ -436,21 +571,124 @@ async fn larger_check_log_summary_keeps_original_and_reports_negative_savings() 
 
 #[tokio::test]
 async fn shorter_bare_check_log_summary_with_larger_envelope_keeps_original() {
-    let summary = "x".repeat(LOG.len() - 1);
-    assert!(summary.len() < LOG.len());
-    let savings = original().len() as i64 - replacement(&summary).len() as i64;
-    assert!(savings < 0);
-    selected_summary(
-        &summary,
-        false,
-        &original(),
-        "summary",
-        "original",
-        savings,
-        "kept-original: no-saving",
-        None,
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let mut broker = BrokerFixture::answering(
+        directory.path(),
+        [ResponseEnvelope::chat_capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            None,
+        )],
+    );
+    let client = ResolvedBroker {
+        socket_path: broker.socket().to_owned(),
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let model = ModelScript::new([answer("follow-up")]);
+    let runner = journaled_runner(client, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let window = recall_window(RecallSource::Journal);
+    let mut route = persistent_route(model_config(), window);
+    route.memory_policy = Some(policy(SelectionMode::Fixed));
+    let config = route.memory_policy.as_ref().unwrap();
+    let inbound = message("next question");
+    let key = ConversationKey::private(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation.key(),
+        &inbound.subject,
+    );
+    let original_text = "hi\nok";
+    let summary = "sum";
+    assert!(summary.len() < original_text.len());
+    let original_version = generation::version(&config.routines[0]);
+    let summary_version = generation::version(&config.routines[1]);
+    let mut metadata = Representation::original(original_text, &original_version);
+    metadata.text = None;
+    let replacement = Representation {
+        routine_id: "summary".into(),
+        version: summary_version,
+        source_record_id: 0,
+        part: None,
+        kind: "prefix".into(),
+        captured_bytes: 1_000_003,
+        text: Some(summary.into()),
+    };
+    let turn = ConversationTurn::completed("hi", "ok");
+    runner
+        .journal
+        .as_ref()
+        .unwrap()
+        .append(
+            &key.journal_stem(),
+            &Entry {
+                at: SystemTime::now(),
+                grant: &crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+                turn: &turn,
+                inventory: &[],
+                next_asset_id: 1,
+                prepared: Some(&generation::Prepared {
+                    include_chat: true,
+                    representations: vec![metadata, replacement],
+                    exchanges: Vec::new(),
+                    original: true,
+                    availability: vec!["original".into(), "summary".into()],
+                    failed_routines: Vec::new(),
+                }),
+            },
+            window,
+        )
+        .unwrap();
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
     )
     .await;
+    let original_label = record_label(1, "original", &["original", "summary"], 0);
+    let replacement_label = record_label(1, "summary", &["original", "summary"], 1_000_000);
+    let original_bytes = original_label.len() + "hi".len() + "ok".len();
+    let replacement_bytes = replacement_label.len() + summary.len();
+    assert!(
+        replacement_bytes > original_bytes,
+        "the longer model-facing label reverses bare-text savings"
+    );
+    assert_eq!(
+        model.prompt(0)[1..],
+        [
+            ("user".into(), format!("{original_label}hi")),
+            ("assistant".into(), "ok".into()),
+            ("user".into(), "next question".into()),
+        ]
+    );
+    let events = capture.events_where("dekopon_gatewayd", &[("event", "gateway_memory_selection")]);
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.field("requested"), Some("summary"));
+    assert_eq!(event.field("actual"), Some("original"));
+    assert_eq!(event.field("reason"), Some("kept-original: no-saving"));
+    assert_eq!(
+        event.field("original_bytes"),
+        Some(original_bytes.to_string().as_str())
+    );
+    assert_eq!(
+        event.field("replacement_bytes"),
+        Some(replacement_bytes.to_string().as_str())
+    );
+    assert_eq!(
+        event.field("savings_bytes"),
+        Some(
+            ((original_bytes as i64) - (replacement_bytes as i64))
+                .to_string()
+                .as_str()
+        )
+    );
+    assert_eq!(broker.recorded().len(), 1);
 }
 
 #[tokio::test]
@@ -649,7 +887,7 @@ async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
     assert_eq!(
         model.prompt(0)[1..],
         [
-            ("user".into(), "older".into()),
+            ("user".into(), "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nolder".into()),
             ("assistant".into(), "ok".into()),
             ("user".into(), "newer".into()),
             ("assistant".into(), "ok".into()),
@@ -669,6 +907,32 @@ async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
             )
             .len(),
         1
+    );
+    let prompt = &model.prompt(0)[1].1;
+    let (label, body) = prompt
+        .split_once("]\n")
+        .expect("addressable projected envelope");
+    let coordinate: Value =
+        serde_json::from_str(label.trim_start_matches("[memory: ").trim_end_matches(']')).unwrap();
+    assert_eq!(coordinate["recordId"], 1);
+    assert_eq!(coordinate["eligibleRepresentationIds"], json!(["original"]));
+    let tools = JournalMemoryTools {
+        journal: runner.journal.as_ref().unwrap(),
+        stem: key.journal_stem(),
+        grant,
+        versions: [(
+            "original".to_owned(),
+            generation::version(&ResolvedPolicy::default().routines[0]),
+        )]
+        .into(),
+    };
+    let id = coordinate["recordId"].as_u64().unwrap();
+    let representation = coordinate["representationId"].as_str().unwrap();
+    assert_eq!(tools.read(id, representation, None), format!("{body}\nok"));
+    assert!(
+        tools
+            .set_pin(id, representation)
+            .starts_with("pinned record 1")
     );
     assert_eq!(broker.recorded().len(), 1);
 }
@@ -753,7 +1017,7 @@ async fn journal_projection_fits_newest_whole_turns_without_downgrading() {
     let model = ModelScript::new([answer("follow-up")]);
     let runner = journaled_runner(client, Arc::new(Arc::clone(&model)), journal_dir.path());
     let mut window = recall_window(RecallSource::Journal);
-    window.limits.max_bytes = 14;
+    window.limits.max_bytes = 252;
     let mut route = persistent_route(model_config(), window);
     route.memory_policy = Some(ResolvedPolicy::default());
     let inbound = message("next question");
@@ -795,9 +1059,9 @@ async fn journal_projection_fits_newest_whole_turns_without_downgrading() {
     assert_eq!(
         model.prompt(0)[1..],
         [
-            ("user".into(), "middle".into()),
+            ("user".into(), "[memory: {\"recordId\":2,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nmiddle".into()),
             ("assistant".into(), "b".into()),
-            ("user".into(), "latest".into()),
+            ("user".into(), "[memory: {\"recordId\":3,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nlatest".into()),
             ("assistant".into(), "c".into()),
             ("user".into(), "next question".into())
         ]
@@ -828,7 +1092,9 @@ async fn disposed_original_with_expanding_summary_sends_replacement_and_signed_c
         &replacement(&summary),
         "summary",
         "summary",
-        -4,
+        ("status".len() + "ok".len() + LOG.len()) as i64
+            - (replacement(&summary).len() + record_label(1, "summary", &["summary"], 0).len())
+                as i64,
         "kept-replacement: original-unavailable",
         None,
         None,
@@ -872,6 +1138,21 @@ async fn a_decider_choice_cannot_silently_override_an_expanding_pin() {
 }
 
 #[tokio::test]
+async fn a_decider_choice_missing_on_a_record_uses_the_available_fallback() {
+    selected_summary(
+        "passed",
+        false,
+        &original(),
+        "summary",
+        "original",
+        0,
+        "fallback: choice-unavailable",
+        Some("missing"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn an_agent_preference_selects_its_retained_routine() {
     let summary = "passed";
     selected_summary(
@@ -880,7 +1161,7 @@ async fn an_agent_preference_selects_its_retained_routine() {
         &replacement(summary),
         "summary",
         "summary",
-        original().len() as i64 - replacement(summary).len() as i64,
+        envelope_savings(summary),
         "selected",
         Some("preference"),
     )
@@ -911,7 +1192,7 @@ async fn an_invalid_decider_choice_falls_back_once() {
         &replacement("passed"),
         "summary",
         "summary",
-        original().len() as i64 - replacement("passed").len() as i64,
+        envelope_savings("passed"),
         "invalid-choice",
         Some("invalid"),
     )
@@ -926,7 +1207,7 @@ async fn a_decider_refusal_falls_back_without_another_invocation() {
         &replacement("passed"),
         "summary",
         "summary",
-        original().len() as i64 - replacement("passed").len() as i64,
+        envelope_savings("passed"),
         "refused",
         Some("refused"),
     )
@@ -941,7 +1222,7 @@ async fn a_failed_decider_capability_falls_back_without_a_second_inference() {
         &replacement("passed"),
         "summary",
         "summary",
-        original().len() as i64 - replacement("passed").len() as i64,
+        envelope_savings("passed"),
         "invocation-failed",
         Some("failed"),
     )
@@ -956,7 +1237,7 @@ async fn a_spent_capability_budget_falls_back_without_invoking_a_broker() {
         &replacement("passed"),
         "summary",
         "summary",
-        original().len() as i64 - replacement("passed").len() as i64,
+        envelope_savings("passed"),
         "invocation-failed",
         Some("budget"),
     )
@@ -971,7 +1252,7 @@ async fn an_ungranted_decider_falls_back_without_invoking_a_broker() {
         &replacement("passed"),
         "summary",
         "summary",
-        original().len() as i64 - replacement("passed").len() as i64,
+        envelope_savings("passed"),
         "not-granted",
         Some("ungranted"),
     )

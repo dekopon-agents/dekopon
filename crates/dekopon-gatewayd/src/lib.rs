@@ -149,6 +149,15 @@ where
     }
 
     let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    if journal.is_some() {
+        for route in &config.routes {
+            if let (Some(window), Some(policy)) =
+                (route.memory.window(), route.memory_policy.as_ref())
+            {
+                memory::generation::report_policy(policy, window.recall);
+            }
+        }
+    }
     let wakes = match config.wakes.clone() {
         Some(wakes) => Some(Arc::new(
             tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))

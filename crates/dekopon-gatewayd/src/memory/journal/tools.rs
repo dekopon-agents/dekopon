@@ -33,7 +33,11 @@ impl JournalMemoryTools<'_> {
             |line| if !self.eligible(line) {
                 "record unavailable: expired or changed grant".into()
             } else {
-                format!("representation unavailable: missing, discarded or version mismatch; eligible representations: {}", line.availability.join(", "))
+                let mut eligible = self.versions.iter().filter_map(|(id, version)| {
+                    super::body(line, id, version).map(|_| id.as_str())
+                }).collect::<Vec<_>>();
+                eligible.sort_unstable();
+                format!("representation unavailable: missing, discarded or version mismatch; eligible representation IDs: {}", eligible.join(", "))
             },
         )
     }

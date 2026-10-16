@@ -699,10 +699,15 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
             .map(|(role, text)| ((*role).to_owned(), (*text).to_owned()))
             .collect::<Vec<_>>()
     };
+    let label = |id| {
+        format!(
+            "[memory: {{\"recordId\":{id},\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}}]\n"
+        )
+    };
     assert_eq!(
         window(2),
         turns(&[
-            ("user", "person said this"),
+            ("user", &format!("{}person said this", label(1))),
             ("assistant", "finished"),
             ("user", "what did I say?"),
         ])
@@ -710,9 +715,9 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     assert_eq!(
         window(3),
         turns(&[
-            ("user", "person said this"),
+            ("user", &format!("{}person said this", label(1))),
             ("assistant", "finished"),
-            ("user", "what did I say?"),
+            ("user", &format!("{}what did I say?", label(2))),
             ("assistant", "remembered"),
             ("user", "and before that?"),
         ])
