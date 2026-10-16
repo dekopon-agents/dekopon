@@ -65,15 +65,9 @@ where
             let inspected =
                 tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid, now)).await;
             let due = match inspected {
-                Err(_) => false,
-                Ok(result) => match result {
-                    Ok(Some(due)) => due <= now || seed_on_boot,
-                    Ok(None) => seed_on_boot,
-                    Err(error) => {
-                        tracing::warn!(event = "broker_credential_record_invalid", credential = %drn, category = error.category());
-                        false
-                    }
-                },
+                Ok(Ok(Some(due))) => due <= now || seed_on_boot,
+                Ok(Ok(None)) => seed_on_boot,
+                Ok(Err(_)) | Err(_) => false,
             };
             if !due {
                 continue;

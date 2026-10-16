@@ -1,14 +1,18 @@
 use super::*;
 
-fn scheduled_resolver(path: &Path, endpoint: &str, names: &[&str]) -> ScheduledCatalog {
+fn scheduled_entries(path: &Path, endpoint: &str, names: &[&str]) -> MapResolver {
     let mut entry = resolver(path, endpoint, names);
     for name in names {
         let mut source = source_value(path, endpoint);
         source["refresh"] = json!("scheduled");
         entry.entries.get_mut(&drn(name)).unwrap().source = serde_json::from_value(source).unwrap();
     }
+    entry
+}
+
+fn scheduled_resolver(path: &Path, endpoint: &str, names: &[&str]) -> ScheduledCatalog {
     ScheduledCatalog {
-        resolver: Some(Arc::new(entry)),
+        resolver: Some(Arc::new(scheduled_entries(path, endpoint, names))),
     }
 }
 
@@ -116,6 +120,65 @@ async fn shutdown_deadline_waits_for_a_started_rotation() {
     .unwrap();
     assert_eq!(access, NEW_ACCESS.as_bytes());
     assert_eq!(api.requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_malformed_scheduled_record_is_not_reported_on_each_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.json");
+    let live = dir.path().join("live.json");
+    fs::write(&bad, "{\"state\":").unwrap();
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o600)).unwrap();
+    write_record(&live, 100_000);
+    let api = TokenApi::serving(|_| ("503 Service Unavailable", "{}".to_owned()));
+    let mut entries = scheduled_entries(&bad, &api.endpoint, &["bad"]);
+    entries
+        .entries
+        .extend(scheduled_entries(&live, &api.endpoint, &["live"]).entries);
+    let scheduled = ScheduledCatalog {
+        resolver: Some(Arc::new(entries)),
+    };
+    let now = Arc::new(AtomicU64::new(22 * 3600));
+    let capture = CaptureLayer::new();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(
+        refresh_scheduler::serve_with_clock(
+            async {
+                stopped.await.expect("stop");
+                Ok(())
+            },
+            move || scheduled.clone(),
+            ShutdownDeadline::default(),
+            Arc::new({
+                let now = Arc::clone(&now);
+                move || now.load(Ordering::SeqCst)
+            }),
+        )
+        .with_subscriber(subscriber),
+    );
+    for tick in 1..=3 {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while api.requests().len() < tick {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live record attempted on this tick");
+        now.fetch_add(5 * 60, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(5 * 60)).await;
+    }
+    stop.send(()).expect("stop receiver");
+    task.await.unwrap().unwrap();
+    assert!(api.requests().len() >= 3);
+    assert!(
+        capture
+            .events_where(
+                "dekopon_brokerd",
+                &[("event", "broker_credential_record_invalid")]
+            )
+            .is_empty()
+    );
 }
 
 #[tokio::test]
