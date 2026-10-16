@@ -446,6 +446,10 @@ impl Journal {
             Err(JournalError::Io {
                 kind: io::ErrorKind::NotFound,
             }) => 1,
+            Err(JournalError::Corrupt) => {
+                remove(&path);
+                return Err(JournalError::Corrupt);
+            }
             Err(error) => return Err(error),
         };
         let default;
@@ -507,6 +511,16 @@ impl Journal {
                 representation.source_record_id = next_record_id;
             }
         }
+        let encoded = encode_line(&line)?;
+        let agent = stem.split_once('/').map(|(agent, _)| agent);
+        if agent.is_some_and(|agent| encoded.len() as u64 > self.agent_cap(agent)) {
+            tracing::warn!(
+                event = "gateway_memory_retention_failed",
+                reason = "agent-byte-cap",
+                encoded_bytes = encoded.len()
+            );
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             DirBuilder::new()
                 .recursive(true)
@@ -518,7 +532,6 @@ impl Journal {
             .append(true)
             .mode(0o600)
             .open(&path)?;
-        let encoded = encode_line(&line)?;
         file.write_all(&encoded)?;
         drop(file);
         let horizon = millis(entry.at).saturating_sub(duration_millis(self.age_for(stem)));
@@ -529,7 +542,7 @@ impl Journal {
             }
             result => result?,
         };
-        if let Some((agent, _)) = stem.split_once('/')
+        if let Some(agent) = agent
             && self.enforce_agent_cap(agent, Some(&path))?
         {
             tracing::warn!(
@@ -559,11 +572,7 @@ impl Journal {
         agent: &str,
         appended: Option<&Path>,
     ) -> Result<bool, JournalError> {
-        let limit = self
-            .agent_bytes
-            .get(agent)
-            .copied()
-            .unwrap_or(self.max_bytes_per_agent);
+        let limit = self.agent_cap(agent);
         let directory = self.dir.join(agent);
         if !directory.exists() {
             return Ok(false);
@@ -616,6 +625,13 @@ impl Journal {
                 .iter()
                 .any(|(path, size, cut, _)| path == appended && cut >= size)
         }))
+    }
+
+    fn agent_cap(&self, agent: &str) -> u64 {
+        self.agent_bytes
+            .get(agent)
+            .copied()
+            .unwrap_or(self.max_bytes_per_agent)
     }
 
     fn path(&self, stem: &str) -> PathBuf {
@@ -2393,5 +2409,243 @@ mod tests {
         assert!(journal.sealed(&stem, RETENTION).unwrap().is_none());
         journal.expire(SystemTime::now()).unwrap();
         assert!(!path.exists());
+    }
+
+    fn tear_last_line(path: &Path) {
+        let mut file = OpenOptions::new().append(true).open(path).expect("journal");
+        file.write_all(br#"{"version":2,"atMs":1"#)
+            .expect("torn line");
+    }
+
+    #[test]
+    fn a_torn_last_line_resets_the_file_at_append_so_the_next_append_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let now = SystemTime::now();
+        append(&journal, &stem, now, GRANT, "before");
+        tear_last_line(&journal.path(&stem));
+        let turn = ConversationTurn::completed("lost", "re: lost");
+        let entry = Entry {
+            prepared: None,
+            at: now,
+            grant: GRANT,
+            turn: &turn,
+            inventory: &[],
+            next_asset_id: 1,
+        };
+        assert!(matches!(
+            journal.append(&stem, &entry, window()),
+            Err(JournalError::Corrupt)
+        ));
+        assert!(!journal.path(&stem).exists());
+        append(&journal, &stem, now, GRANT, "after");
+        assert_eq!(
+            users(&journal.recall(&stem, GRANT, window(), now).expect("recall")),
+            ["after"]
+        );
+    }
+
+    #[test]
+    fn a_torn_last_line_resets_the_file_at_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let policy = ResolvedPolicy::default();
+        append(&journal, &stem, SystemTime::now(), GRANT, "before");
+        tear_last_line(&journal.path(&stem));
+        let projected = journal.project(
+            Projection {
+                stem: &stem,
+                grant: GRANT,
+                window: window(),
+                sealed_at: None,
+                policy: &policy,
+            },
+            &History::new(window().limits),
+            |_available, _evidence| Err("unused"),
+        );
+        assert!(matches!(projected, Err(JournalError::Corrupt)));
+        assert!(!journal.path(&stem).exists());
+    }
+
+    #[test]
+    fn a_turn_larger_than_the_agent_cap_is_refused_without_evicting_older_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let now = SystemTime::now();
+        let stem = key().journal_stem();
+        let other =
+            ConversationKey::shared(&"reviewer".parse().unwrap(), "slack", "other").journal_stem();
+        append(&journal, &stem, now - Duration::from_secs(2), GRANT, "kept");
+        append(
+            &journal,
+            &other,
+            now - Duration::from_secs(1),
+            GRANT,
+            "also kept",
+        );
+        let before = [
+            fs::read(journal.path(&stem)).unwrap(),
+            fs::read(journal.path(&other)).unwrap(),
+        ];
+        let cap = before.iter().map(|bytes| bytes.len() as u64).sum::<u64>() + 64;
+        journal.agent_bytes.insert("reviewer".into(), cap);
+        let (capture, _guard) = crate::tests::capture_spans();
+        append(&journal, &stem, now, GRANT, &"x".repeat(cap as usize));
+        let failures = capture.events_where(
+            "dekopon_gatewayd",
+            &[
+                ("event", "gateway_memory_retention_failed"),
+                ("reason", "agent-byte-cap"),
+            ],
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            [
+                fs::read(journal.path(&stem)).unwrap(),
+                fs::read(journal.path(&other)).unwrap()
+            ],
+            before
+        );
+    }
+
+    #[test]
+    fn memory_tools_offer_only_retained_routines_like_the_projection_label() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let mut policy = decider_policy();
+        append_represented(&journal, &stem, &policy, "first", &[(1, "summary text")]);
+        policy.retain.retain(|id| id != "summary");
+        let tools = JournalMemoryTools::new(&journal, stem, GRANT.into(), &policy);
+        assert_eq!(
+            tools.read(1, "summary", None),
+            "representation unavailable: missing, discarded or version mismatch; eligible representation IDs: original"
+        );
+    }
+
+    fn decider_policy() -> ResolvedPolicy {
+        use crate::config::memory::{Routine, RoutineKind, SelectionMode};
+        let mut policy = ResolvedPolicy::default();
+        for id in ["summary", "brief"] {
+            policy.routines.push(Routine {
+                id: id.into(),
+                kind: RoutineKind::Prefix,
+                max_bytes: std::num::NonZeroU64::new(1024),
+                model: None,
+                parts: None,
+            });
+            policy.retain.push(id.into());
+        }
+        policy.selection.mode = SelectionMode::Decider;
+        policy.selection.routine = None;
+        policy.selection.decision_capability = Some("decide.choose".into());
+        policy.selection.fallback = Some("summary".into());
+        policy
+    }
+
+    fn append_represented(
+        journal: &Journal,
+        stem: &str,
+        policy: &ResolvedPolicy,
+        user: &str,
+        replacements: &[(usize, &str)],
+    ) {
+        let turn = ConversationTurn::completed(user, "ok");
+        let version = |index: usize| crate::memory::generation::version(&policy.routines[index]);
+        let mut original = Representation::original(&format!("{user}\nok"), &version(0));
+        original.text = None;
+        let mut representations = vec![original];
+        let mut availability = vec!["original".to_owned()];
+        for (index, text) in replacements {
+            let id = policy.routines[*index].id.clone();
+            representations.push(Representation {
+                routine_id: id.clone(),
+                version: version(*index),
+                source_record_id: 0,
+                part: None,
+                kind: "prefix".into(),
+                captured_bytes: text.len() as u64,
+                text: Some((*text).to_owned()),
+            });
+            availability.push(id);
+        }
+        journal
+            .append(
+                stem,
+                &Entry {
+                    at: SystemTime::now(),
+                    grant: GRANT,
+                    turn: &turn,
+                    inventory: &[],
+                    next_asset_id: 1,
+                    prepared: Some(&crate::memory::generation::Prepared {
+                        include_chat: true,
+                        representations,
+                        exchanges: Vec::new(),
+                        original: true,
+                        availability,
+                        failed_routines: Vec::new(),
+                    }),
+                },
+                window(),
+            )
+            .expect("append");
+    }
+
+    #[test]
+    fn a_per_record_decider_fallback_is_sent_only_when_it_saves_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let stem = key().journal_stem();
+        let policy = decider_policy();
+        append_represented(&journal, &stem, &policy, "first", &[(1, "s"), (2, "b")]);
+        append_represented(&journal, &stem, &policy, "second", &[(1, &"x".repeat(200))]);
+        append_represented(&journal, &stem, &policy, &"third".repeat(40), &[(1, "s")]);
+        let (capture, _guard) = crate::tests::capture_spans();
+        let projected = journal
+            .project(
+                Projection {
+                    stem: &stem,
+                    grant: GRANT,
+                    window: window(),
+                    sealed_at: None,
+                    policy: &policy,
+                },
+                &History::new(window().limits),
+                |_available, _evidence| Ok("brief".to_owned()),
+            )
+            .expect("projection");
+        assert_eq!(projected.turns().len(), 3);
+        let selection = |record: &str| {
+            let events = capture.events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_memory_selection"), ("record_id", record)],
+            );
+            assert_eq!(events.len(), 1, "{events:?}");
+            (
+                events[0].field("requested").map(str::to_owned),
+                events[0].field("actual").map(str::to_owned),
+                events[0].field("reason").map(str::to_owned),
+            )
+        };
+        let expect = |requested: &str, actual: &str, reason: &str| {
+            (
+                Some(requested.to_owned()),
+                Some(actual.to_owned()),
+                Some(reason.to_owned()),
+            )
+        };
+        assert_eq!(selection("1"), expect("brief", "brief", "selected"));
+        assert_eq!(
+            selection("2"),
+            expect("brief", "original", "kept-original: no-saving")
+        );
+        assert_eq!(
+            selection("3"),
+            expect("brief", "summary", "fallback: choice-unavailable")
+        );
     }
 }

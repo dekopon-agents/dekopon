@@ -147,6 +147,9 @@ pub struct Selection {
     pub routine: Option<String>,
     pub decision_capability: Option<String>,
     pub fallback: Option<String>,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub require_probabilities: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -192,6 +195,9 @@ impl Default for ResolvedPolicy {
                 routine: Some("original".into()),
                 decision_capability: None,
                 fallback: None,
+                backend: None,
+                model: None,
+                require_probabilities: None,
             },
             preferred_routine: None,
         }
@@ -281,6 +287,16 @@ fn valid_id(id: &str) -> bool {
     !id.trim().is_empty() && id == id.trim()
 }
 
+// Routine IDs are the decision provider's labels, which it refuses outside this charset.
+fn valid_routine_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+const MAX_DECIDER_LABELS: usize = 32;
+
 pub fn resolve_policy(
     policy: Option<&PolicyConfig>,
     agent_routine: Option<&str>,
@@ -296,7 +312,7 @@ pub fn resolve_policy(
     };
     let mut ids = BTreeSet::new();
     for routine in &policy.routines {
-        if !valid_id(&routine.id) || !ids.insert(routine.id.as_str()) {
+        if !valid_routine_id(&routine.id) || !ids.insert(routine.id.as_str()) {
             return Err(PolicyProblem::Invalid("routine id"));
         }
         if routine
@@ -368,9 +384,13 @@ pub fn resolve_policy(
         return Err(PolicyProblem::Invalid("retain"));
     }
     let selected = &policy.selection;
+    let no_profile = selected.backend.is_none()
+        && selected.model.is_none()
+        && selected.require_probabilities.is_none();
     let preferred_routine = match selected.mode {
         SelectionMode::Fixed
-            if selected.decision_capability.is_none()
+            if no_profile
+                && selected.decision_capability.is_none()
                 && selected.fallback.is_none()
                 && selected
                     .routine
@@ -380,7 +400,8 @@ pub fn resolve_policy(
             None
         }
         SelectionMode::AgentPreference
-            if selected.decision_capability.is_none()
+            if no_profile
+                && selected.decision_capability.is_none()
                 && selected.fallback.is_none()
                 && selected
                     .routine
@@ -403,8 +424,14 @@ pub fn resolve_policy(
                 && selected
                     .fallback
                     .as_ref()
-                    .is_some_and(|name| retained.contains(name.as_str())) =>
+                    .is_some_and(|name| retained.contains(name.as_str()))
+                && selected.backend.as_deref().is_some_and(valid_id)
+                && selected.model.as_deref().is_some_and(valid_id)
+                && selected.require_probabilities.is_some() =>
         {
+            if retained.len() > MAX_DECIDER_LABELS {
+                return Err(PolicyProblem::Invalid("decider labels"));
+            }
             None
         }
         SelectionMode::Fixed | SelectionMode::AgentPreference | SelectionMode::Decider => {

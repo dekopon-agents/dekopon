@@ -58,7 +58,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `privateConversation`; explicit `sharedConversation` shares one exact agent/transport/conversation
   window. `memory: { mode: oneShot }` starts each session without prior history.
   `sessions.memory` resolves retention/arena bounds and per-agent representation policies;
-  journal-backed routes may override the agent policy with `routes[].memory.policy`.
+  journal-backed routes may override the agent policy with `routes[].memory.policy`. A `decider`
+  selection also names the decision provider's `backend`, `model` and `requireProbabilities`.
   Without a journal, persistent routes remain window-only and config-check warns once.
   Shared turns carry gateway-authored participant labels naming each sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;

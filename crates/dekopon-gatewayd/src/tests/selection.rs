@@ -15,8 +15,46 @@ use std::num::NonZeroU64;
 
 const CANARY: &str = "SOURCE_ONLY_CANARY_43";
 const LOG: &str = "check-log: build passed; lint passed; integration passed; coverage passed; SOURCE_ONLY_CANARY_43";
-const HEADER: &str = "\n[tool: check-log, outcome: succeeded, exit: Some(0)]";
+const HEADER: &str = "\n[tool: check-log, outcome: success, exit: Some(0)]";
 const LABEL: &str = "\n[result] ";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChooseInput {
+    backend: String,
+    model: String,
+    evidence: Vec<EvidenceRecord>,
+    labels: Vec<String>,
+    require_probabilities: bool,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvidenceRecord {
+    tool: EvidenceTool,
+    outcome: EvidenceOutcome,
+    exit_status: Option<u8>,
+    age_ms: u64,
+    bytes: u64,
+    pinned: bool,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceTool {
+    Bash,
+    #[serde(rename = "none")]
+    Absent,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceOutcome {
+    Success,
+    Failure,
+    #[serde(rename = "none")]
+    Absent,
+}
 
 fn policy(mode: SelectionMode) -> ResolvedPolicy {
     let mut policy = ResolvedPolicy::default();
@@ -84,7 +122,7 @@ async fn selected_summary_with_limit(
     let journal_dir = temporary();
     let decider_mode = decider_choice.is_some_and(|choice| choice != "preference");
     let decider_granted = decider_mode && decider_choice != Some("ungranted");
-    let invoked = decider_granted && decider_choice != Some("budget");
+    let invoked = decider_granted && !matches!(decider_choice, Some("budget" | "single"));
     let mut granted_ids = vec!["cli-probe.upper"];
     if decider_granted {
         granted_ids.push("decider.choose");
@@ -107,6 +145,7 @@ async fn selected_summary_with_limit(
         }
         if let Some(choice) = &choice
             && choice != "budget"
+            && choice != "single"
             && choice != "ungranted"
             && choice != "preference"
         {
@@ -126,10 +165,34 @@ async fn selected_summary_with_limit(
                 ));
             }
             let metadata = invocation.input.to_string();
-            let evidence: Value = serde_json::from_str(&metadata).expect("bounded decision input");
+            let input: ChooseInput =
+                serde_json::from_str(&metadata).expect("the provider's decide.choose input");
             assert_eq!(
-                evidence["evidence"][0]["bytes"],
-                "status".len() + "ok".len() + LOG.len()
+                (
+                    input.backend.as_str(),
+                    input.model.as_str(),
+                    input.require_probabilities
+                ),
+                ("openrouter-luna", "openai/gpt-6-luna-decisions", true)
+            );
+            assert_eq!(input.labels, ["original", "summary"]);
+            let record = input.evidence.last().expect("one record per row");
+            assert!(record.age_ms < 60_000);
+            assert_eq!(
+                (
+                    &record.tool,
+                    &record.outcome,
+                    record.exit_status,
+                    record.bytes,
+                    record.pinned
+                ),
+                (
+                    &EvidenceTool::Bash,
+                    &EvidenceOutcome::Success,
+                    Some(0),
+                    ("status".len() + "ok".len() + LOG.len()) as u64,
+                    pin
+                )
             );
             assert!(
                 !metadata.contains(CANARY),
@@ -182,6 +245,9 @@ async fn selected_summary_with_limit(
             .into(),
         );
         selection.selection.decision_capability = Some("decider.choose".into());
+        selection.selection.backend = Some("openrouter-luna".into());
+        selection.selection.model = Some("openai/gpt-6-luna-decisions".into());
+        selection.selection.require_probabilities = Some(true);
     }
     if decider_choice == Some("preference") {
         selection.selection.routine = Some("original".into());
@@ -221,7 +287,7 @@ async fn selected_summary_with_limit(
         tool: "check-log".into(),
         request: Vec::new(),
         result: vec![result],
-        outcome: "succeeded".into(),
+        outcome: "success".into(),
         exit_status: Some(0),
     }]);
     let turn = if summary_only {
@@ -283,7 +349,7 @@ async fn selected_summary_with_limit(
                             tool: "check-log".into(),
                             request: Vec::new(),
                             result: Vec::new(),
-                            outcome: "succeeded".into(),
+                            outcome: "success".into(),
                             exit_status: Some(0),
                         }]
                     } else {
@@ -464,6 +530,7 @@ async fn selected_summary_with_limit(
         Some("refused") => "refused",
         Some("budget" | "failed") => "invocation-failed",
         Some("ungranted") => "not-granted",
+        Some("single") => "single-label",
         _ => "none",
     };
     assert_eq!(event.field("fallback_reason"), Some(fallback));
@@ -1255,6 +1322,26 @@ async fn an_ungranted_decider_falls_back_without_invoking_a_broker() {
         envelope_savings("passed"),
         "not-granted",
         Some("ungranted"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_single_available_label_falls_back_without_invoking_the_decider() {
+    let summary = format!("{}plus", equal_summary());
+    selected_summary_with_limit(
+        &summary,
+        false,
+        &replacement(&summary),
+        "summary",
+        "summary",
+        ("status".len() + "ok".len() + LOG.len()) as i64
+            - (replacement(&summary).len() + record_label(1, "summary", &["summary"], 0).len())
+                as i64,
+        "kept-replacement: original-unavailable",
+        Some("single"),
+        None,
+        true,
     )
     .await;
 }

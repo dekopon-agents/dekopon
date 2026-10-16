@@ -824,7 +824,8 @@ async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_
     input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
         "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
         "routines": [{"id": "original", "kind": "original"}], "retain": ["original"],
-        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original"}
+        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original",
+            "backend": "openrouter-luna", "model": "openai/gpt-6-luna-decisions", "requireProbabilities": false}
     }});
     let error = load(directory.path(), &input)
         .await
@@ -938,6 +939,97 @@ async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
         load(directory.path(), &input).await,
         Err(ConfigError::Decode { .. })
     ));
+}
+
+#[tokio::test]
+async fn a_decider_selection_requires_its_provider_profile_and_label_safe_routine_ids() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"journal": {"path": "journal"}});
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
+        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
+        "routines": [{"id": "original", "kind": "original"}, {"id": "head_1.k-b", "kind": "prefix", "maxBytes": 512}],
+        "retain": ["original", "head_1.k-b"],
+        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original",
+            "backend": "openrouter-jev", "model": "typesafe/jev-1.13", "requireProbabilities": true}
+    }});
+    let config = load(directory.path(), &input)
+        .await
+        .expect("complete decider profile");
+    let selection = &config.routes[0]
+        .memory_policy
+        .as_ref()
+        .expect("policy")
+        .selection;
+    assert_eq!(selection.backend.as_deref(), Some("openrouter-jev"));
+    assert_eq!(selection.model.as_deref(), Some("typesafe/jev-1.13"));
+    assert_eq!(selection.require_probabilities, Some(true));
+    for key in ["backend", "model", "requireProbabilities"] {
+        let mut missing = input.clone();
+        missing["routes"][0]["memory"]["policy"]["selection"]
+            .as_object_mut()
+            .expect("selection")
+            .remove(key);
+        let error = load(directory.path(), &missing)
+            .await
+            .expect_err("incomplete decider profile");
+        assert!(reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::MemoryPolicy {
+                problem: crate::config::memory::PolicyProblem::Invalid("selection"),
+                ..
+            }
+        )));
+    }
+    let mut fixed = input.clone();
+    fixed["routes"][0]["memory"]["policy"]["selection"] = json!({"mode": "fixed", "routine": "original",
+        "backend": "openrouter-jev", "model": "typesafe/jev-1.13", "requireProbabilities": false});
+    let error = load(directory.path(), &fixed)
+        .await
+        .expect_err("decider profile outside decider mode");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Invalid("selection"),
+            ..
+        }
+    )));
+    for id in ["has space", "a/b", "é", &"x".repeat(129)] {
+        let mut unsafe_id = input.clone();
+        unsafe_id["routes"][0]["memory"]["policy"]["routines"][1]["id"] = json!(id);
+        unsafe_id["routes"][0]["memory"]["policy"]["retain"][1] = json!(id);
+        let error = load(directory.path(), &unsafe_id)
+            .await
+            .expect_err("routine ID outside the label charset");
+        assert!(reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::MemoryPolicy {
+                problem: crate::config::memory::PolicyProblem::Invalid("routine id"),
+                ..
+            }
+        )));
+    }
+    let mut crowded = input.clone();
+    let routines: Vec<Value> = (0..33)
+        .map(|index| json!({"id": format!("p{index}"), "kind": "prefix", "maxBytes": 64}))
+        .chain([json!({"id": "original", "kind": "original"})])
+        .collect();
+    let retain: Vec<Value> = routines
+        .iter()
+        .map(|routine| routine["id"].clone())
+        .collect();
+    crowded["routes"][0]["memory"]["policy"]["routines"] = Value::Array(routines);
+    crowded["routes"][0]["memory"]["policy"]["retain"] = Value::Array(retain);
+    let error = load(directory.path(), &crowded)
+        .await
+        .expect_err("more retained routines than decider labels");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Invalid("decider labels"),
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
