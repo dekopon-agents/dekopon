@@ -893,19 +893,45 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
         Arc::new(routes.clone()),
         Arc::new(config.stop_words.clone()),
     );
+    let whatsapp_binds = config
+        .transports
+        .iter()
+        .filter_map(|spec| match spec {
+            TransportConfig::WhatsappCloudApi { bind, .. } => Some(*bind),
+            TransportConfig::GithubWebhook { .. }
+            | TransportConfig::SlackSocketMode { .. }
+            | TransportConfig::DiscordGateway { .. }
+            | TransportConfig::TelegramLongPoll { .. }
+            | TransportConfig::Local { .. } => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut github_mounts = HashMap::new();
+    for spec in &config.transports {
+        if let TransportConfig::GithubWebhook {
+            name,
+            bind,
+            secret_env,
+        } = spec
+            && whatsapp_binds.contains(bind)
+        {
+            match transport::read_credential(secret_env) {
+                Ok(secret) => {
+                    github_mounts.insert(*bind, (name.clone(), secret));
+                }
+                Err(source) => problems.push(StartupProblem::Transport {
+                    transport: name.clone(),
+                    source,
+                }),
+            }
+        }
+    }
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
-        if let TransportConfig::GithubWebhook { name, bind, secret_env } = spec
-            && config.transports.iter().any(|other| {
-                matches!(other, TransportConfig::WhatsappCloudApi { bind: whatsapp_bind, .. } if whatsapp_bind == bind)
-            })
+        if matches!(spec, TransportConfig::GithubWebhook { bind, .. } if whatsapp_binds.contains(bind))
         {
-            if let Err(source) = transport::read_credential(secret_env) {
-                problems.push(StartupProblem::Transport { transport: name.clone(), source });
-            }
             continue;
         }
-        match build_transport(spec, config, &generation) {
+        match build_transport(spec, config, &generation, &mut github_mounts) {
             Ok(transport) => transports.push(transport),
             Err(source) => problems.push(StartupProblem::Transport {
                 transport: spec.name().to_owned(),
@@ -932,6 +958,7 @@ fn build_transport(
     spec: &TransportConfig,
     config: &ResolvedConfig,
     generation: &gateway::CurrentGeneration,
+    github_mounts: &mut HashMap<std::net::SocketAddr, (String, String)>,
 ) -> Result<Box<dyn ChatTransport>, TransportError> {
     let surface = |liveness: &LivenessConfig| {
         let mut settings = liveness.settings();
@@ -1022,24 +1049,15 @@ fn build_transport(
                 transport::read_credential(access_token_env)?,
                 surface(liveness),
             )?;
-            if let Some(TransportConfig::GithubWebhook {
-                name,
-                bind,
-                secret_env,
-            }) = config
-                .transports
-                .iter()
-                .find(|spec| matches!(spec, TransportConfig::GithubWebhook { bind: github_bind, .. } if github_bind == bind))
-            {
-                Box::new(GithubTransport::new(
-                    name.clone(),
+            match github_mounts.remove(bind) {
+                Some((name, secret)) => Box::new(GithubTransport::new(
+                    name,
                     *bind,
-                    transport::read_credential(secret_env)?,
+                    secret,
                     generation.clone(),
                     Some(whatsapp),
-                ))
-            } else {
-                Box::new(whatsapp)
+                )),
+                None => Box::new(whatsapp),
             }
         }
         TransportConfig::TelegramLongPoll {

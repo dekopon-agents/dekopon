@@ -1458,9 +1458,9 @@ async fn webhook_mounts_are_distinct_by_bind_and_path() {
         Ok(_) => panic!("missing GitHub secret must be attributed to GitHub"),
     };
     assert!(matches!(error, crate::GatewaydError::Startup { problems }
-        if problems.iter().any(|problem| matches!(problem, crate::StartupProblem::Transport {
+        if matches!(problems.as_slice(), [crate::StartupProblem::Transport {
             transport, source: crate::transport::TransportError::MissingCredential { name }
-        } if transport == "github" && name == "CC07_S2_ABSENT_SECRET"))));
+        }] if transport == "github" && name == "CC07_S2_ABSENT_SECRET")));
     doc["transports"][3]["secretEnv"] = json!("PATH");
 
     doc["transports"] = json!([doc["transports"][0], github(9082), whatsapp("wa1", 9080)]);
@@ -1568,7 +1568,8 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+            &mut HashMap::new()
         ),
         Err(crate::transport::TransportError::MissingCredential { .. })
     ));
@@ -1579,7 +1580,8 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         crate::build_transport(
             &resolved.transports[0],
             &resolved,
-            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default())
+            &crate::gateway::CurrentGeneration::boot(Arc::default(), Arc::default()),
+            &mut HashMap::new()
         )
         .is_ok()
     );
