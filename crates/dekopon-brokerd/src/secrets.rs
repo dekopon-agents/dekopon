@@ -1338,7 +1338,17 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
     }
 }
 
-pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
+#[cfg(test)]
+async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
+    load_with_bytes(path, expected_uid)
+        .await
+        .map(|(catalog, _)| catalog)
+}
+
+pub(crate) async fn load_with_bytes(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(SecretCatalog, Vec<u8>), SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
         .map_err(|source| SecretMapError::Read {
@@ -1350,7 +1360,8 @@ pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, Secre
             diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
         }
     })?;
-    validate_map(file, path, expected_uid).await
+    let catalog = validate_map(file, path, expected_uid).await?;
+    Ok((catalog, bytes))
 }
 
 #[expect(

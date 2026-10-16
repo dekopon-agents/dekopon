@@ -1970,36 +1970,37 @@ async fn authority_reference_edits_change_digest_but_secret_material_does_not() 
     let map = |destination: &str| {
         format!("secrets:\n  - drn: example\n    bindings:\n      - destination: {destination}\n")
     };
-    let uid = current_uid();
     write_owner_only(&credentials, credential("first", "one").as_bytes());
     write_owner_only(&bindings, map("first").as_bytes());
-    let snapshot = || async {
+    let snapshot = || {
         let mut snapshot = super::config::ConfigSnapshot::default();
         snapshot
-            .record_authority_references(Some(&credentials), Some(&bindings), uid)
-            .await
+            .record_authority_references(
+                Some(&std::fs::read(&credentials).unwrap()),
+                Some(&std::fs::read(&bindings).unwrap()),
+            )
             .unwrap();
         snapshot.digest().unwrap()
     };
-    let initial = snapshot().await;
+    let initial = snapshot();
     write_owner_only(&credentials, credential("second", "one").as_bytes());
-    let destination = snapshot().await;
+    let destination = snapshot();
     assert_ne!(initial, destination);
     write_owner_only(&bindings, map("second").as_bytes());
-    let binding = snapshot().await;
+    let binding = snapshot();
     assert_ne!(destination, binding);
     write_owner_only(&credentials, credential("second", "two").as_bytes());
-    assert_eq!(binding, snapshot().await);
+    assert_eq!(binding, snapshot());
     write_owner_only(
         &credentials,
         b"credentials:\n  - secret: two\n    destinations: [second]\n    name: key\n",
     );
-    assert_eq!(binding, snapshot().await);
+    assert_eq!(binding, snapshot());
     write_owner_only(
         &bindings,
         b"secrets:\n  - bindings:\n      - destination: second\n    drn: example\n",
     );
-    assert_eq!(binding, snapshot().await);
+    assert_eq!(binding, snapshot());
 }
 
 #[tokio::test(flavor = "multi_thread")]

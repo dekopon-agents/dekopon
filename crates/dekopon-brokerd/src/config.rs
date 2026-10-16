@@ -419,33 +419,15 @@ impl ConfigSnapshot {
         Ok(())
     }
 
-    pub(crate) async fn record_authority_references(
+    /// Takes the bytes the runtime was validated from, never a path: a second read could name a rotated file.
+    pub(crate) fn record_authority_references(
         &mut self,
-        credentials: Option<&Path>,
-        secret_map: Option<&Path>,
-        uid: u32,
+        credentials: Option<&[u8]>,
+        secret_map: Option<&[u8]>,
     ) -> Result<(), ConfigError> {
-        if let Some(path) = credentials {
-            let path = path.to_path_buf();
-            let bytes = tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || {
-                    read_trusted_file(
-                        &path,
-                        uid,
-                        FileTier::Private,
-                        crate::credentials::HARD_MAX_CREDENTIALS_BYTES,
-                    )
-                }
-            })
-            .await
-            .map_err(|source| ConfigError::Read {
-                path: path.clone(),
-                source: io::Error::other(source),
-            })?
-            .map_err(|source| trusted_read_error(&path, source))?;
+        if let Some(bytes) = credentials {
             let mut value: serde_yaml::Value =
-                serde_yaml::from_slice(&bytes).map_err(|source| ConfigError::Decode { source })?;
+                serde_yaml::from_slice(bytes).map_err(|source| ConfigError::Decode { source })?;
             if let Some(entries) = value
                 .get_mut("credentials")
                 .and_then(serde_yaml::Value::as_sequence_mut)
@@ -461,27 +443,9 @@ impl ConfigSnapshot {
                 (Disposition::Swap, value),
             );
         }
-        if let Some(path) = secret_map {
-            let path = path.to_path_buf();
-            let bytes = tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || {
-                    read_trusted_file(
-                        &path,
-                        uid,
-                        FileTier::Private,
-                        crate::secrets::HARD_MAX_SECRET_MAP_BYTES,
-                    )
-                }
-            })
-            .await
-            .map_err(|source| ConfigError::Read {
-                path: path.clone(),
-                source: io::Error::other(source),
-            })?
-            .map_err(|source| trusted_read_error(&path, source))?;
+        if let Some(bytes) = secret_map {
             let value =
-                serde_yaml::from_slice(&bytes).map_err(|source| ConfigError::Decode { source })?;
+                serde_yaml::from_slice(bytes).map_err(|source| ConfigError::Decode { source })?;
             self.0
                 .insert("secretMapReferences".to_owned(), (Disposition::Swap, value));
         }

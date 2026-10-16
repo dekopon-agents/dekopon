@@ -418,18 +418,6 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
         }
         return (None, report);
     };
-    if !matches!(mode, Mode::Check(_))
-        && let Err(error) = config
-            .snapshot
-            .record_authority_references(
-                config.credentials_path.as_deref(),
-                config.secret_map_path.as_deref(),
-                uid,
-            )
-            .await
-    {
-        report.problems.push(error.into());
-    }
     let (providers_resolved, residents) = match mode {
         Mode::Boot => (true, Residents::Open),
         Mode::Reload(active) => (true, Residents::Borrow(active)),
@@ -484,9 +472,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     );
     let mut scratch = None;
     let runtime = match residents {
-        Residents::Open => boot_runtime(&config, uid, &mut report.problems).await,
+        Residents::Open => boot_runtime(&mut config, uid, &mut report.problems).await,
         Residents::Borrow(active) => {
-            reload_runtime(&config, uid, active, &mut scratch, &mut report.problems).await
+            reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Scratch => {
             keep(&mut report.problems, scratch_host(&config, &mut scratch)).map(|storage| Runtime {
@@ -572,7 +560,7 @@ impl CheckReport {
 }
 
 async fn boot_runtime(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     problems: &mut Vec<BrokerdError>,
 ) -> Option<Runtime> {
@@ -627,7 +615,7 @@ async fn boot_runtime(
 /// A changed `storage` or `assets` already refuses as restart-required, so the rest of the
 /// candidate is validated against a scratch host and no asset directory instead of opening either.
 async fn reload_runtime(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     active: &Candidate,
     scratch: &mut Option<tempfile::TempDir>,
@@ -653,7 +641,7 @@ async fn reload_runtime(
 }
 
 async fn private_inputs(
-    config: &ResolvedConfig,
+    config: &mut ResolvedConfig,
     uid: u32,
     problems: &mut Vec<BrokerdError>,
 ) -> (
@@ -691,20 +679,34 @@ async fn private_inputs(
     let credentials = match &config.credentials_path {
         Some(path) => keep(
             problems,
-            credentials::load(path, uid)
+            credentials::load_with_bytes(path, uid)
                 .await
+                .map(|(store, bytes)| (store, Some(bytes)))
                 .map_err(BrokerdError::from),
         ),
-        None => Some(CredentialStore::empty()),
+        None => Some((CredentialStore::empty(), None)),
     };
     let secrets = match &config.secret_map_path {
         Some(path) => keep(
             problems,
-            secrets::load(path, uid).await.map_err(BrokerdError::from),
+            secrets::load_with_bytes(path, uid)
+                .await
+                .map(|(catalog, bytes)| (catalog, Some(bytes)))
+                .map_err(BrokerdError::from),
         ),
-        None => Some(dekopon_broker::SecretCatalog::empty()),
+        None => Some((dekopon_broker::SecretCatalog::empty(), None)),
     };
-    (credentials, secrets)
+    if let (Some((_, credential_bytes)), Some((_, secret_map_bytes))) = (&credentials, &secrets)
+        && let Err(error) = config
+            .snapshot
+            .record_authority_references(credential_bytes.as_deref(), secret_map_bytes.as_deref())
+    {
+        problems.push(error.into());
+    }
+    (
+        credentials.map(|(store, _)| store),
+        secrets.map(|(catalog, _)| catalog),
+    )
 }
 
 async fn resolve_provider_set(

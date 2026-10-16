@@ -109,14 +109,24 @@ impl CredentialKind {
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
+#[cfg(test)]
 pub(crate) async fn load(
     path: &Path,
     expected_uid: u32,
 ) -> Result<CredentialStore, CredentialsError> {
+    load_with_bytes(path, expected_uid)
+        .await
+        .map(|(store, _)| store)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
+pub(crate) async fn load_with_bytes(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(CredentialStore, Vec<u8>), CredentialsError> {
     let owned = path.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || {
         read_trusted_file(
@@ -150,7 +160,7 @@ pub(crate) async fn load(
             path: path.to_path_buf(),
             source: std::io::Error::other(join),
         })??;
-    Ok(resolved)
+    Ok((resolved, bytes))
 }
 
 fn resolve(file: CredentialsFile, expected_uid: u32) -> Result<CredentialStore, CredentialsError> {
