@@ -114,14 +114,53 @@ pub(crate) trait ModelFactory: Send + Sync {
     ) -> Result<SharedModel, SessionError> {
         self.build(model, runtime, cancel)
     }
+
+    fn build_anchored(
+        &self,
+        _anchor: &Arc<ModelConfig>,
+        model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        self.build(model, runtime, cancel)
+    }
+
+    fn retire(&self) {}
 }
 
 type BoundClients = HashMap<usize, (std::sync::Weak<ModelConfig>, Arc<ModelClient>)>;
+type AnchoredClients = HashMap<
+    usize,
+    (
+        std::sync::Weak<ModelConfig>,
+        Vec<(ModelConfig, Arc<ModelClient>)>,
+    ),
+>;
+
+fn blocking_model(
+    model: &ModelConfig,
+    client: Arc<ModelClient>,
+    runtime: tokio::runtime::Handle,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<SharedModel, SessionError> {
+    let timeout_ms = model
+        .timeout_ms()
+        .ok_or_else(|| SessionError::ProxyOnlyModel {
+            model: model.name().to_owned(),
+        })?;
+    Ok(Arc::new(BlockingModel::new(
+        client,
+        runtime,
+        cancel,
+        Duration::from_millis(timeout_ms),
+    )))
+}
 
 #[derive(Default)]
 pub(crate) struct ConfiguredModels {
     clients: Mutex<Vec<(ModelConfig, Arc<ModelClient>)>>,
     bound_clients: Mutex<BoundClients>,
+    anchored_clients: Mutex<AnchoredClients>,
     /// One credential instance per auth file path, shared across every model naming it, so a second
     /// instance cannot spend a refresh token the first already rotated and retired.
     chatgpt_credentials:
@@ -163,6 +202,15 @@ pub(crate) fn model_credential(
 }
 
 impl ConfiguredModels {
+    pub(crate) fn retire(&self) {
+        self.bound_clients
+            .lock()
+            .retain(|_, (owner, _)| owner.strong_count() > 0);
+        self.anchored_clients
+            .lock()
+            .retain(|_, (owner, _)| owner.strong_count() > 0);
+    }
+
     #[cfg(test)]
     pub(crate) fn bound_client_for_test(
         &self,
@@ -313,17 +361,53 @@ impl ModelFactory for ConfiguredModels {
                 )
             }
         };
-        let timeout = model
-            .timeout_ms()
-            .ok_or_else(|| SessionError::ProxyOnlyModel {
-                model: model.name().to_owned(),
-            })?;
-        Ok(Arc::new(BlockingModel::new(
-            client,
-            runtime,
-            cancel,
-            Duration::from_millis(timeout),
-        )))
+        blocking_model(model, client, runtime, cancel)
+    }
+
+    fn build_anchored(
+        &self,
+        anchor: &Arc<ModelConfig>,
+        model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        let key = Arc::as_ptr(anchor) as usize;
+        let live = |owner: &std::sync::Weak<ModelConfig>| {
+            owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, anchor))
+        };
+        let cached = self
+            .anchored_clients
+            .lock()
+            .get(&key)
+            .filter(|(owner, _)| live(owner))
+            .and_then(|(_, clients)| clients.iter().find(|(config, _)| config == model))
+            .map(|(_, client)| Arc::clone(client));
+        let client = match cached {
+            Some(client) => client,
+            None => {
+                let built = self.construct(model)?;
+                let mut anchored = self.anchored_clients.lock();
+                anchored.retain(|index, (owner, _)| {
+                    owner.strong_count() > 0 && (*index != key || live(owner))
+                });
+                let (_, clients) = anchored
+                    .entry(key)
+                    .or_insert_with(|| (Arc::downgrade(anchor), Vec::new()));
+                if let Some((_, client)) = clients.iter().find(|(config, _)| config == model) {
+                    Arc::clone(client)
+                } else {
+                    clients.push((model.clone(), Arc::clone(&built)));
+                    built
+                }
+            }
+        };
+        blocking_model(model, client, runtime, cancel)
+    }
+
+    fn retire(&self) {
+        ConfiguredModels::retire(self);
     }
 
     fn build(
@@ -351,17 +435,7 @@ impl ModelFactory for ConfiguredModels {
                 }
             }
         };
-        let timeout_ms = model
-            .timeout_ms()
-            .ok_or_else(|| SessionError::ProxyOnlyModel {
-                model: model.name().to_owned(),
-            })?;
-        Ok(Arc::new(BlockingModel::new(
-            client,
-            runtime,
-            cancel,
-            std::time::Duration::from_millis(timeout_ms),
-        )))
+        blocking_model(model, client, runtime, cancel)
     }
 }
 
@@ -381,13 +455,18 @@ impl ModelCache {
         self.factory.build_bound(model, runtime, cancel)
     }
 
-    pub(crate) fn client(
+    pub(crate) fn client_anchored(
         &self,
+        anchor: &Arc<ModelConfig>,
         model: &ModelConfig,
         runtime: tokio::runtime::Handle,
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
-        self.factory.build(model, runtime, cancel)
+        self.factory.build_anchored(anchor, model, runtime, cancel)
+    }
+
+    pub(crate) fn retire(&self) {
+        self.factory.retire();
     }
 }
 
@@ -1350,6 +1429,8 @@ pub(crate) fn run_session_resolving(
                 .await,
             );
         }
+        drop(route);
+        runner.models.retire();
     }
 }
 

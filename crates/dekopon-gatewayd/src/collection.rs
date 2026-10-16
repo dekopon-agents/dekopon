@@ -207,12 +207,21 @@ impl Collector {
         Offered::Pending
     }
 
+    #[cfg(test)]
     pub(crate) fn take_due(&mut self, now: Instant) -> Vec<InboundMessage> {
+        self.take_due_routed(now)
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    pub(crate) fn take_due_routed(&mut self, now: Instant) -> Vec<(RouteIdentity, InboundMessage)> {
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending.len() {
             if self.pending[index].deadline <= now {
-                ready.push(self.pending.remove(index).assemble());
+                let batch = self.pending.remove(index);
+                ready.push((batch.route.clone(), batch.assemble()));
             } else {
                 index += 1;
             }

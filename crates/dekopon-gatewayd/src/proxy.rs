@@ -1,4 +1,3 @@
-use arc_swap::ArcSwap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
@@ -171,24 +170,6 @@ pub enum ProxyStartError {
     Listen(#[from] dekopon_model_proxy::tls::ListenError),
 }
 
-/// Binds the listener and spawns it into `tasks`, whose owner aborts it at shutdown.
-pub(crate) async fn start(
-    proxy: &ResolvedProxy,
-    models: &[ModelConfig],
-    credentials: &ConfiguredModels,
-    metering: &Arc<Metering>,
-    tasks: &mut tokio::task::JoinSet<()>,
-) -> Result<Arc<ArcSwap<ModelProxy>>, ProxyStartError> {
-    let current = Arc::new(ArcSwap::from(build(proxy, models, credentials, metering)?));
-    let _address = listen(
-        proxy,
-        ModelProxy::router_current(Arc::clone(&current)),
-        tasks,
-    )
-    .await?;
-    Ok(current)
-}
-
 pub(crate) fn build(
     proxy: &ResolvedProxy,
     models: &[ModelConfig],
@@ -290,7 +271,8 @@ fn build_with(
     )?))
 }
 
-async fn listen(
+/// Binds the listener and spawns it into `tasks`, whose owner aborts it at shutdown.
+pub(crate) async fn listen(
     proxy: &ResolvedProxy,
     router: axum::Router,
     tasks: &mut tokio::task::JoinSet<()>,

@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, ConversationKind, GenerationOutcome};
-use dekopon_model_proxy::ModelProxy;
+use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -15,7 +15,9 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tracing::Instrument as _;
 
 use crate::{
-    Candidate, ServeOutcome, cancel_session, collection, config, follow, jobs, observe_session,
+    Candidate, ServeOutcome, cancel_session,
+    collection::{self, CollectionRoute as _},
+    config, follow, jobs, observe_session,
     routes::RoutingTable,
     session::{self, CancelOutcome, SessionRunner},
     spawn_tick,
@@ -37,15 +39,25 @@ pub(crate) struct Gateway {
 pub(crate) struct ServingGeneration {
     routes: Arc<RoutingTable>,
     stop_words: Arc<Vec<String>>,
+    proxy: Option<Arc<ModelProxy>>,
     _sources: Option<Arc<config::GatewaySources>>,
     _digest: String,
     _broker_digest: String,
 }
 
+#[derive(Clone)]
+struct CurrentGeneration(Arc<ArcSwap<ServingGeneration>>);
+
+impl CurrentProxy for CurrentGeneration {
+    fn current(&self) -> Option<Arc<ModelProxy>> {
+        self.0.load().proxy.clone()
+    }
+}
+
 pub(crate) struct ResidentModels {
     pub(crate) credentials: Arc<session::ConfiguredModels>,
     pub(crate) metering: Arc<Metering>,
-    pub(crate) proxy: Option<Arc<ArcSwap<ModelProxy>>>,
+    pub(crate) proxy: Option<Arc<ModelProxy>>,
 }
 
 struct ReloadState {
@@ -57,7 +69,6 @@ struct ReloadState {
     gateway_digest: String,
     credentials: Arc<session::ConfiguredModels>,
     metering: Arc<Metering>,
-    proxy: Option<Arc<ArcSwap<ModelProxy>>>,
     pending: Option<(String, String)>,
 }
 
@@ -154,6 +165,7 @@ impl Gateway {
             active: Arc::new(ArcSwap::from_pointee(ServingGeneration {
                 routes,
                 stop_words,
+                proxy: None,
                 _sources: None,
                 _digest: String::new(),
                 _broker_digest: String::new(),
@@ -195,6 +207,7 @@ impl Gateway {
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
             stop_words: Arc::new(candidate.config.stop_words.clone()),
+            proxy: owners.proxy,
             _sources: Some(Arc::clone(&sources)),
             _digest: gateway_digest.clone(),
             _broker_digest: broker_digest.clone(),
@@ -208,10 +221,13 @@ impl Gateway {
             gateway_digest,
             credentials: owners.credentials,
             metering: owners.metering,
-            proxy: owners.proxy,
             pending: None,
         });
         Ok(self)
+    }
+
+    pub(crate) fn proxy_router(&self) -> axum::Router {
+        ModelProxy::router_current(CurrentGeneration(Arc::clone(&self.active)))
     }
 
     #[cfg(test)]
@@ -369,8 +385,17 @@ impl Gateway {
                         None => std::future::pending().await,
                     }
                 } => {
-                    for message in collector.take_due(tokio::time::Instant::now()) {
-                        self.start_session(&mut sessions, &self.active.load(), message);
+                    for (identity, message) in collector.take_due_routed(tokio::time::Instant::now()) {
+                        let generation = self.active.load();
+                        let enqueued = generation.routes.route(&message)
+                            .is_some_and(|route| route.identity(&message) == identity);
+                        if enqueued {
+                            self.start_session(&mut sessions, &generation, message);
+                        } else {
+                            for receipt in &message.constituents {
+                                collection::disposition(receipt, "route-lost");
+                            }
+                        }
                     }
                 },
                 Some(message) = notices.recv() => {
@@ -689,7 +714,13 @@ impl Gateway {
             route.clone(),
             message,
             driver,
-            move |message, _queued| active.load().routes.route(message).cloned(),
+            move |message, queued| {
+                let generation = active.load();
+                let route = generation.routes.route(message)?;
+                (message.constituents.is_empty()
+                    || route.identity(message) == queued.identity(message))
+                .then(|| route.clone())
+            },
         ));
     }
 
@@ -754,8 +785,11 @@ impl ReloadState {
             return;
         };
         let refreshed_proxy = if candidate.config.models != self.config.models {
-            match (self.proxy.as_ref(), candidate.config.proxy.as_ref()) {
-                (Some(_), Some(proxy)) => match crate::proxy::build(
+            match (
+                self.active.load().proxy.is_some(),
+                candidate.config.proxy.as_ref(),
+            ) {
+                (true, Some(proxy)) => match crate::proxy::build(
                     proxy,
                     &candidate.config.models,
                     &self.credentials,
@@ -871,12 +905,11 @@ impl ReloadState {
             return;
         }
         let sources = Arc::new(candidate.sources);
-        if let (Some(current), Some(proxy)) = (&self.proxy, refreshed_proxy) {
-            current.store(proxy);
-        }
+        let proxy = refreshed_proxy.or_else(|| self.active.load().proxy.clone());
         self.active.store(Arc::new(ServingGeneration {
             routes: Arc::new(candidate.routes),
             stop_words: Arc::new(candidate.config.stop_words.clone()),
+            proxy,
             _sources: Some(Arc::clone(&sources)),
             _digest: digest.clone(),
             _broker_digest: broker_digest.clone(),
@@ -886,5 +919,6 @@ impl ReloadState {
         self.broker_digest = broker_digest;
         tracing::info!(event = "gateway_reload_applied", generation.digest = %digest);
         self.gateway_digest = digest;
+        self.credentials.retire();
     }
 }
