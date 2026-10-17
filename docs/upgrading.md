@@ -8,6 +8,18 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Request bodies in Cedar context (0.49.1)
+
+A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
+broker and gateway together. At the HTTP request point a JSON body with a `null` member or a short
+fraction now reaches Cedar as a record instead of being dropped, and every other body reaches it as
+the string `"opaque"`. A body fence written as an allowlist (`unless { context.request has body &&
+context.request.body has model && … }`) now admits a matching body that carries a `null` or a
+fraction, and still denies one it cannot read. Rewrite any fence written as a blocklist (`when { …
+context.request.body.model != "pinned" }`): a `null` or omitted member slips it. The allowlist form
+is in [the security model](security-model.md); a denial over an opaque body emits
+`policy.request.body_opaque` ([observability](observability.md)).
+
 ## ChatGPT auth-file diagnostics and fixed session tools (0.49.0)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the

@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.49.1] - 2026-10-17
+
+### Fixed
+
+- HTTP request policies see JSON bodies containing nulls or short fractions (decide's request), and a body policy cannot read is present as "opaque" so body-field forbids fail closed with a policy.request.body_opaque reason instead of silently seeing no body.
+
 ## [dekopon-chart-0.36.1] - 2026-10-17
 
 ### Fixed
