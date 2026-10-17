@@ -1,6 +1,6 @@
 # Dekopon Helm chart
 
-Chart `0.36.0` targets application `v0.49.0`.
+Chart `0.36.1` targets application `v0.49.0`.
 With empty `image.tag` and `image.digest`, the chart renders
 `ghcr.io/dekopon-agents/dekopon:v0.49.0`; the image helper selects `image.digest` first.
 With `broker.providerSet.enabled: true`, the chart runs `dekopon-brokerd provider precompile`
