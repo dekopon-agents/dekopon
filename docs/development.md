@@ -248,8 +248,8 @@ The overlay pins [C12 at `2c52d870`](https://github.com/dekopon-agents/wasmtime/
 based on Wasmtime 49.0.3. Wasmtime's workspace path dependencies keep its compiler
 and internal crates on that revision. The memory changes compact finalized machine-code buffers
 and release source locations after preserving the address map; they do not include the separate
-experimental unwind/linking changes. Treat this as an opt-in dogfood build, not an upstream fix
-or a claim of production validation.
+experimental unwind/linking changes. The RPi deploys this build on ARM64; it is a dogfood
+overlay, not an upstream fix.
 
 Return to the untouched checkout for stock builds and publication. If working in a dedicated
 optimized checkout, restore its tracked `Cargo.lock` and omit `--config` to return to stock.
@@ -257,12 +257,14 @@ optimized checkout, restore its tracked `Cargo.lock` and omit `--config` to retu
 The RPi runs the optimized ARM64 image, so CI runs it on native `ubuntu-24.04-arm` for every Rust
 pull request. Pushes to `main` that touch Rust inputs and manual dispatch run both lanes; a pull
 request that changes the overlay, its lock or that workflow also runs native `ubuntu-24.04`.
-Neither lane is a required check, so fork availability does not block the normal validation path.
-Only a main-branch ARM64 run saves the `wasmtime-optimization-v1` dependency cache that pull
-requests restore. Changing the pin requires regenerating `.cargo/wasmtime-optimization.lock` with
-Cargo in an isolated checkout and passing both lanes. Never copy the optimized lock into a
-release-publication checkout. The independent existing `tracing-core` patch still applies to
-workspace builds; this option does not remove that exception.
+x86-64 is a supported, tested architecture for this build; its lane runs beside ARM64, never
+behind it. Neither lane is a required check, so fork availability does not block the normal
+validation path. Main-branch runs save each architecture's `wasmtime-optimization-v1` dependency
+cache that pull requests restore, and a newer merge queues behind a running main-branch run
+instead of cancelling it, so both caches stay current. Changing the pin requires regenerating
+`.cargo/wasmtime-optimization.lock` with Cargo in an isolated checkout and passing both lanes.
+Never copy the optimized lock into a release-publication checkout. The independent existing
+`tracing-core` patch still applies to workspace builds; this option does not remove that exception.
 
 ## Runtime facts that are easy to miss
 

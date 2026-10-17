@@ -31,7 +31,7 @@ permissions:
 
 concurrency:
   group: wasmtime-optimization-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -59,7 +59,7 @@ jobs:
         with:
           shared-key: wasmtime-optimization-v1
           cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' && runner.arch == 'ARM64' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Verify the pinned Wasmtime source
         shell: bash
         run: |
