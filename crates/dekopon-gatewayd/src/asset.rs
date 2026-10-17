@@ -256,22 +256,15 @@ impl AssetStore {
         &self,
         conversation: &ConversationKey,
         arriving: Vec<PendingAsset>,
-        images_supported: bool,
         now: Instant,
     ) -> Registered {
-        self.assets_for_access(
-            &AssetAccess::one_shot(conversation.clone()),
-            arriving,
-            images_supported,
-            now,
-        )
+        self.assets_for_access(&AssetAccess::one_shot(conversation.clone()), arriving, now)
     }
 
     pub fn assets_for_access(
         &self,
         access: &AssetAccess,
         arriving: Vec<PendingAsset>,
-        images_supported: bool,
         now: Instant,
     ) -> Registered {
         access
@@ -318,14 +311,7 @@ impl AssetStore {
                     entry.touched = now;
                     entry.assets.clone()
                 });
-                let fetchable = inventory
-                    .iter()
-                    .any(|asset| asset.is_fetchable(images_supported));
-                Registered {
-                    inventory,
-                    arrived,
-                    fetchable,
-                }
+                Registered { inventory, arrived }
             })
             .unwrap_or_else(Registered::empty)
     }
@@ -570,7 +556,6 @@ fn kibibytes(size: u64) -> String {
 pub(crate) struct Registered {
     pub inventory: Vec<AssetRef>,
     pub arrived: Vec<u64>,
-    pub fetchable: bool,
 }
 
 impl Registered {
@@ -578,7 +563,6 @@ impl Registered {
         Self {
             inventory: Vec::new(),
             arrived: Vec::new(),
-            fetchable: false,
         }
     }
 }
@@ -595,21 +579,15 @@ pub(crate) struct SessionAssets {
     fetcher: Option<Arc<dyn AssetFetcher>>,
     runtime: Handle,
     images_supported: bool,
-    available: AtomicBool,
 }
 
 impl SessionAssets {
-    pub(crate) fn arrived(&self, fetchable: bool) {
-        self.available.fetch_or(fetchable, Ordering::Relaxed);
-    }
-
     pub fn new(
         store: Arc<AssetStore>,
         access: AssetAccess,
         fetcher: Option<Arc<dyn AssetFetcher>>,
         runtime: Handle,
         images_supported: bool,
-        available: bool,
     ) -> Self {
         Self {
             store,
@@ -617,23 +595,13 @@ impl SessionAssets {
             fetcher,
             runtime,
             images_supported,
-            available: AtomicBool::new(available),
         }
     }
 }
 
 impl AssetSource for SessionAssets {
-    fn is_empty(&self) -> bool {
-        if !self.access.is_active() {
-            return true;
-        }
-        if self.available.load(Ordering::Relaxed) && self.fetcher.is_some() {
-            return false;
-        }
-        !self.store.get_inventory(&self.access).iter().any(|asset| {
-            asset.is_fetchable(self.images_supported)
-                && matches!(asset.source, Some(AssetSourceRef::Generated { .. }))
-        })
+    fn offers_fetch(&self) -> bool {
+        self.access.is_active() && self.store.retains()
     }
 
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
@@ -950,11 +918,14 @@ impl Retention {
 
 impl AssetStore {
     fn get_inventory(&self, access: &AssetAccess) -> Vec<AssetRef> {
-        self.assets_for_access(access, Vec::new(), true, Instant::now())
+        self.assets_for_access(access, Vec::new(), Instant::now())
             .inventory
     }
     fn check_size(&self, id: u64, bytes: usize) -> Result<(), BlobError> {
         self.retention.lock().check_size(id, bytes)
+    }
+    fn retains(&self) -> bool {
+        self.retention.lock().budget > 0
     }
     fn pin(
         &self,
@@ -1273,7 +1244,6 @@ mod retention_tests {
                         file_id: "file".into(),
                     }),
                 }],
-                true,
                 Instant::now(),
             )
             .arrived[0]
@@ -1379,7 +1349,6 @@ mod retention_tests {
                             file_id: "ninth".into(),
                         }),
                     }],
-                    true,
                     Instant::now(),
                 )
                 .arrived[0];
@@ -1389,7 +1358,6 @@ mod retention_tests {
                 access,
                 Some(Arc::new(OneByteFetcher)),
                 Handle::current(),
-                true,
                 true,
             );
             tokio::task::spawn_blocking(move || {
@@ -1493,13 +1461,12 @@ mod retention_tests {
                         file_id: "note".into(),
                     }),
                 }],
-                true,
                 Instant::now(),
             )
             .arrived[0];
         assert_eq!(text_id, 9);
         drop(store.admit(&access, text_id, b"x").unwrap());
-        let session = SessionAssets::new(store, access, None, Handle::current(), true, true);
+        let session = SessionAssets::new(store, access, None, Handle::current(), true);
         tokio::task::spawn_blocking(move || {
             let capture = dekopon_test_support::CaptureLayer::workspace();
             let _guard = tracing_subscriber::registry()
@@ -1562,7 +1529,7 @@ mod retention_tests {
         for (id, value) in ids.iter().zip(1..=8) {
             drop(store.admit(&access, *id, &[value; 3]).unwrap());
         }
-        let session = SessionAssets::new(store, access, None, Handle::current(), true, true);
+        let session = SessionAssets::new(store, access, None, Handle::current(), true);
         tokio::task::spawn_blocking(move || {
             for (id, value) in ids.iter().zip(1..=8) {
                 assert_eq!(session.fetch(*id).unwrap().data.read().unwrap(), [value; 3]);
@@ -1841,7 +1808,6 @@ mod retention_tests {
                     }),
                 })
                 .collect(),
-            true,
             Instant::now(),
         );
         let note = reference_note(&registered, true).unwrap();
@@ -1854,7 +1820,6 @@ mod retention_tests {
             access.clone(),
             Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
             Handle::current(),
-            true,
             true,
         );
         assert_eq!(
@@ -1920,7 +1885,6 @@ mod retention_tests {
                             file_id: "file".into(),
                         }),
                     }],
-                    true,
                     Instant::now(),
                 )
                 .arrived[0];
@@ -1930,7 +1894,6 @@ mod retention_tests {
                 access,
                 Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
                 Handle::current(),
-                true,
                 true,
             );
             tokio::task::spawn_blocking(move || {
@@ -1973,7 +1936,6 @@ mod retention_tests {
             Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
             Handle::current(),
             true,
-            true,
         );
         tokio::task::spawn_blocking(move || {
             for _ in 0..2 {
@@ -2010,14 +1972,13 @@ mod retention_tests {
         let access = access("one");
         let pinned_id = register(&store, &access);
         let id = store
-            .assets_for_access(&access, message.assets, true, Instant::now())
+            .assets_for_access(&access, message.assets, Instant::now())
             .arrived[0];
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
             transport.asset_fetcher(),
             Handle::current(),
-            true,
             true,
         );
         tokio::task::spawn_blocking(move || {
@@ -2076,7 +2037,6 @@ mod retention_tests {
             access.clone(),
             Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
             Handle::current(),
-            true,
             true,
         );
         tokio::task::spawn_blocking(move || {
@@ -2144,7 +2104,6 @@ mod retention_tests {
             }) as Arc<dyn AssetFetcher>),
             Handle::current(),
             true,
-            true,
         );
         let fetch = tokio::task::spawn_blocking(move || stalled.fetch(id));
         entered.notified().await;
@@ -2174,7 +2133,6 @@ mod retention_tests {
             stalled_access,
             Some(Arc::new(fetcher) as Arc<dyn AssetFetcher>),
             Handle::current(),
-            true,
             true,
         );
         let stalled = tokio::task::spawn_blocking(move || {
@@ -2223,7 +2181,6 @@ mod retention_tests {
             None,
             Handle::current(),
             true,
-            false,
         ))
     }
     #[tokio::test]
@@ -2237,7 +2194,7 @@ mod retention_tests {
             .register(descriptor, &metadata, "image.edit", "invocation-2")
             .unwrap();
         assert_eq!(id, 1);
-        assert!(!session.is_empty());
+        assert!(session.offers_fetch());
         assert_eq!(
             session.fetch_for_capability(id).unwrap().1.read().unwrap(),
             png
@@ -2286,7 +2243,6 @@ mod retention_tests {
             None,
             Handle::current(),
             true,
-            false,
         );
         let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
         assert_eq!(

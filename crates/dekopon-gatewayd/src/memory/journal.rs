@@ -1224,7 +1224,7 @@ mod tests {
             })
             .collect();
         store
-            .assets_for_access(&access, pending, true, Instant::now())
+            .assets_for_access(&access, pending, Instant::now())
             .inventory
     }
 

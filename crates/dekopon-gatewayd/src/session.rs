@@ -1284,12 +1284,7 @@ fn platform_window(
 }
 
 impl Delta {
-    fn block(
-        self,
-        store: &AssetStore,
-        access: &AssetAccess,
-        images_supported: bool,
-    ) -> Option<String> {
+    fn block(self, store: &AssetStore, access: &AssetAccess) -> Option<String> {
         if self.messages.is_empty() {
             return None;
         }
@@ -1298,8 +1293,7 @@ impl Delta {
             .iter()
             .flat_map(|message| message.assets.iter().cloned())
             .collect();
-        let registered =
-            store.assets_for_access(access, arriving, images_supported, Instant::now());
+        let registered = store.assets_for_access(access, arriving, Instant::now());
         let mut ids = registered.arrived.into_iter();
         let mut block = String::new();
         for message in &self.messages {
@@ -1582,7 +1576,6 @@ struct SessionSteers {
     images_supported: bool,
     scope: Option<MemoryScope>,
     principal: Option<PrincipalId>,
-    assets: Arc<SessionAssets>,
     received_at: tokio::time::Instant,
     raw_texts: Mutex<Vec<String>>,
     taken: Mutex<Vec<String>>,
@@ -1607,13 +1600,9 @@ impl SteerSource for SessionSteers {
                     "[gateway: sent while you were working, +{seconds}s]\n{}",
                     steer.text
                 ));
-                let registered = self.store.assets_for_access(
-                    &self.access,
-                    steer.assets,
-                    self.images_supported,
-                    Instant::now(),
-                );
-                self.assets.arrived(registered.fetchable);
+                let registered =
+                    self.store
+                        .assets_for_access(&self.access, steer.assets, Instant::now());
                 let mut recorded =
                     bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
                 let mut prompt = match asset::reference_note(&registered, self.images_supported) {
@@ -1877,17 +1866,15 @@ async fn session(
     .join("\n\n");
     let images_supported = route.model.accepts_images();
     let delta = delta
-        .and_then(|delta| delta.block(&runner.assets, &asset_access, images_supported))
+        .and_then(|delta| delta.block(&runner.assets, &asset_access))
         .map(ConversationTurn::unanswered);
     if let Some(delta) = &delta {
         seeded.record(delta.clone());
     }
-    let registered = runner.assets.assets_for_access(
-        &asset_access,
-        message.assets.clone(),
-        images_supported,
-        Instant::now(),
-    );
+    let registered =
+        runner
+            .assets
+            .assets_for_access(&asset_access, message.assets.clone(), Instant::now());
     let text = match asset::reference_note(&registered, images_supported) {
         Some(note) if message.text.trim().is_empty() => note,
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
@@ -1933,7 +1920,6 @@ async fn session(
         runner.asset_fetchers.get(&message.transport).cloned(),
         tokio::runtime::Handle::current(),
         images_supported,
-        registered.fetchable,
     ));
     let steers = Arc::new(SessionSteers {
         gate: runner.gate.clone(),
@@ -1943,7 +1929,6 @@ async fn session(
         images_supported,
         scope: window.map(|window| window.scope),
         principal: principal.clone(),
-        assets: Arc::clone(&assets),
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),
         taken: Mutex::new(message.folded.clone()),

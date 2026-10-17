@@ -203,15 +203,11 @@ async fn a_photo_steer_is_acknowledged_and_offers_fetch_in_the_retried_turn() {
             .any(|(role, text)| role == "user" && text.contains("chat-asset:1"))
     );
     assert!(
-        !models
+        models
             .tool_names(0)
             .contains(&"fetch_chat_asset".to_owned())
     );
-    assert!(
-        models
-            .tool_names(1)
-            .contains(&"fetch_chat_asset".to_owned())
-    );
+    assert_eq!(models.tool_names(0), models.tool_names(1));
     assert_eq!(
         driver
             .calls()

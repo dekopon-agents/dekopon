@@ -1282,14 +1282,23 @@ mod tests {
     }
 
     fn scripted_turn(turn: u32, call_id: &str, script: &str) -> crate::model::AssistantTurn {
-        let arguments = json!({"script": script}).to_string();
+        tool_turn(turn, call_id, "bash", &json!({"script": script}))
+    }
+
+    fn tool_turn(
+        turn: u32,
+        call_id: &str,
+        name: &str,
+        arguments: &Value,
+    ) -> crate::model::AssistantTurn {
+        let arguments = arguments.to_string();
         crate::model::AssistantTurn::new(
             None,
             vec![crate::model::ModelToolCall {
                 id: call_id.into(),
                 kind: "function".to_owned(),
                 function: crate::model::ModelFunctionCall {
-                    name: "bash".to_owned(),
+                    name: name.to_owned(),
                     arguments: arguments.clone(),
                 },
             }],
@@ -1306,7 +1315,7 @@ mod tests {
                     "type": "function_call",
                     "id": format!("fc_{turn}"),
                     "call_id": call_id,
-                    "name": "bash",
+                    "name": name,
                     "arguments": arguments,
                 }),
             ],
@@ -1435,28 +1444,78 @@ mod tests {
                 .await
                 .expect("request body"),
         ];
-        for (turn, script) in [(1, "ls | wc -l"), (2, "ls -a | wc -l")] {
-            let call_id = format!("call_{turn}");
-            let assistant = scripted_turn(turn, &call_id, script);
-            messages.push(crate::model::assistant_message(&assistant));
-            messages.push(ModelMessage::tool(call_id.as_str(), "12\n"));
-            bodies.push(
-                request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
-                    .await
-                    .expect("request body"),
-            );
-        }
+        messages.push(crate::model::assistant_message(&scripted_turn(
+            1,
+            "call_1",
+            "ls | wc -l",
+        )));
+        messages.push(ModelMessage::tool("call_1", "12\n"));
+        bodies.push(
+            request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .await
+                .expect("request body"),
+        );
+        messages.push(crate::model::assistant_message(&tool_turn(
+            2,
+            "call_2",
+            "fetch_chat_asset",
+            &json!({"id": 3}),
+        )));
+        messages.push(ModelMessage::tool(
+            "call_2",
+            "chat-asset:3 follows in the next message.",
+        ));
+        messages.push(ModelMessage::user_with_parts(vec![
+            ContentPart::Text("chat-asset:3:".to_owned()),
+            ContentPart::Image {
+                mime: "image/png".to_owned(),
+                data: crate::asset::DiskBlob::from_bytes(b"PNG")
+                    .expect("spool")
+                    .into(),
+            },
+        ]));
+        bodies.push(
+            request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .await
+                .expect("request body"),
+        );
+        messages.push(crate::model::assistant_message(&scripted_turn(
+            3,
+            "call_3",
+            "ls -a | wc -l",
+        )));
+        messages.push(ModelMessage::tool("call_3", "12\n"));
+        bodies.push(
+            request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .await
+                .expect("request body"),
+        );
 
+        assert_eq!(
+            bodies[2]["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>(),
+            [
+                &json!({"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "chat-asset:3:"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,UE5H"},
+                ]}),
+                &json!({"type": "function_call_output", "call_id": "call_2",
+                        "output": "chat-asset:3 follows in the next message."}),
+            ]
+        );
         for pair in bodies.windows(2) {
             let (previous, next) = (&pair[0], &pair[1]);
             assert_eq!(
-                request_text(&previous["instructions"]),
-                request_text(&next["instructions"]),
+                previous["instructions"], next["instructions"],
                 "an appended turn rewrote the instructions that open every request"
             );
             assert_eq!(
-                request_text(&previous["tools"]),
-                request_text(&next["tools"]),
+                previous["tools"], next["tools"],
                 "an appended turn rewrote the tool definitions"
             );
             let previous_input = previous["input"].as_array().expect("input array");
@@ -1465,13 +1524,11 @@ mod tests {
                 next_input.len() > previous_input.len(),
                 "an appended turn must extend the input rather than replace it"
             );
-            for (index, item) in previous_input.iter().enumerate() {
-                assert_eq!(
-                    request_text(item),
-                    request_text(&next_input[index]),
-                    "input item {index} changed between turns; the cached prefix ends there"
-                );
-            }
+            assert_eq!(
+                previous_input.as_slice(),
+                &next_input[..previous_input.len()],
+                "an earlier input item changed between turns; the cached prefix ends there"
+            );
         }
     }
 
