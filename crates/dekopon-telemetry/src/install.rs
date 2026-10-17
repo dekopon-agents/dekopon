@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     io::{self, Write as _},
     sync::{
         Arc,
@@ -101,6 +102,11 @@ impl Console {
 
 type ConsoleOutput = Box<dyn io::Write + Send>;
 
+thread_local! {
+    static CONSOLE_WRITER_THREAD: Cell<bool> = const { Cell::new(false) };
+    static NOTICE_DROPPED: Cell<bool> = const { Cell::new(false) };
+}
+
 enum ConsoleState {
     Queued(SyncSender<Vec<u8>>),
     Direct(ConsoleOutput),
@@ -134,16 +140,20 @@ impl ConsoleSink {
         let handle = std::thread::Builder::new()
             .name("dekopon-console-stdout".into())
             .spawn(move || {
+                CONSOLE_WRITER_THREAD.set(true);
                 let mut reported = 0;
                 while let Ok(line) = receiver.recv() {
                     let total = dropped.load(Ordering::Relaxed);
                     if total != reported {
+                        NOTICE_DROPPED.set(false);
                         tracing::warn!(
                             audit.event = "telemetry.console.dropped",
                             console.dropped.lines = total,
                             "console log lines dropped"
                         );
-                        reported = total;
+                        if !NOTICE_DROPPED.get() {
+                            reported = total;
+                        }
                     }
                     if output.write_all(&line).is_err() {
                         dropped.fetch_add(1, Ordering::Relaxed);
@@ -156,8 +166,6 @@ impl ConsoleSink {
             })
             .map_err(|error| InstallError::ConsoleSpawn { kind: error.kind() })?;
         let worker = ConsoleWorker {
-            #[cfg(test)]
-            closed: None,
             state: Arc::clone(&sink.state),
             dropped: Arc::clone(&sink.dropped),
             completion,
@@ -202,7 +210,11 @@ impl io::Write for &ConsoleSink {
             }
             ConsoleState::Closed => {}
         }
-        self.dropped.fetch_add(1, Ordering::Relaxed);
+        if CONSOLE_WRITER_THREAD.get() {
+            NOTICE_DROPPED.set(true);
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(line.len())
     }
 
@@ -212,8 +224,6 @@ impl io::Write for &ConsoleSink {
 }
 
 struct ConsoleWorker {
-    #[cfg(test)]
-    closed: Option<SyncSender<()>>,
     state: Arc<Mutex<ConsoleState>>,
     dropped: Arc<AtomicU64>,
     completion: mpsc::Receiver<()>,
@@ -231,12 +241,6 @@ impl std::fmt::Debug for ConsoleWorker {
 impl ConsoleWorker {
     fn shutdown(self, timeout: Duration) -> Result<(), ShutdownError> {
         *self.state.lock() = ConsoleState::Closed;
-        #[cfg(test)]
-        if let Some(closed) = self.closed {
-            closed
-                .send(())
-                .map_err(|error| ShutdownError(error.to_string()))?;
-        }
         match self.completion.recv_timeout(timeout) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -638,6 +642,13 @@ mod tests {
             "telemetry.console.dropped"
         );
         assert_eq!(lines[queued + 1]["console.dropped.lines"], 7);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line["audit.event"] == "telemetry.console.dropped")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -654,9 +665,7 @@ mod tests {
             dispatch: None,
         }))
         .expect("console writer spawned");
-        let (closed, closing) = std::sync::mpsc::sync_channel(1);
-        let mut worker = worker;
-        worker.closed = Some(closed);
+        let state = Arc::clone(&sink.state);
         let subscriber = registry().with(
             tracing_subscriber::fmt::layer()
                 .json()
@@ -672,7 +681,7 @@ mod tests {
             }
             std::thread::scope(|scope| {
                 let releaser = scope.spawn(move || {
-                    closing.recv().expect("shutdown closed sink");
+                    wait_until_console_is_closed(&state);
                     release.send(()).expect("release writer");
                 });
                 guard.shutdown().expect("console drained");
@@ -703,9 +712,7 @@ mod tests {
             dispatch: Some(dispatch_receiver),
         }))
         .expect("console writer spawned");
-        let (closed, closing) = std::sync::mpsc::sync_channel(1);
-        let mut worker = worker;
-        worker.closed = Some(closed);
+        let state = Arc::clone(&sink.state);
         let dropped = Arc::clone(&sink.dropped);
         let dispatch = tracing::Dispatch::new(
             registry().with(
@@ -728,7 +735,7 @@ mod tests {
             assert_eq!(dropped.load(super::Ordering::Relaxed), 7);
             std::thread::scope(|scope| {
                 let releaser = scope.spawn(move || {
-                    closing.recv().expect("shutdown closed sink");
+                    wait_until_console_is_closed(&state);
                     release.send(()).expect("release writer");
                 });
                 guard.shutdown().expect("console drained");
@@ -744,8 +751,22 @@ mod tests {
             lines[queued + 1]["audit.event"],
             "telemetry.console.dropped"
         );
-        assert_eq!(lines[queued + 1]["console.dropped.lines"], queued + 7);
-        assert_eq!(dropped.load(super::Ordering::Relaxed), (queued + 7) as u64);
+        assert_eq!(lines[queued + 1]["console.dropped.lines"], 7);
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 7);
+    }
+
+    fn wait_until_console_is_closed(state: &Mutex<super::ConsoleState>) {
+        loop {
+            let closed = match &*state.lock() {
+                super::ConsoleState::Queued(_) => false,
+                super::ConsoleState::Closed => true,
+                super::ConsoleState::Direct(_) => panic!("writer released before shutdown"),
+            };
+            if closed {
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 
     #[test]
