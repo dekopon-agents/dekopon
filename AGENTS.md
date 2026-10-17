@@ -84,7 +84,7 @@ Audits and plans default to over-building, and the owner reels them back. Before
 
 ## Change and verify
 
-- An opt-in [memory-optimized Wasmtime build](docs/development.md#memory-optimized-wasmtime) is available; stock Wasmtime remains the default.
+- The RPi deploys the [memory-optimized Wasmtime build](docs/development.md#memory-optimized-wasmtime) on ARM64, and CI tests it on ARM64 and x86-64; stock Wasmtime remains the default everywhere else.
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
   Start follow-ups from current main, not an already-merged feature branch.
 - Follow the change map for companion tests, documentation and examples. Never edit `CHANGELOG.md` in a PR; write `Changelog: <Category>: <text>` lines in commit messages instead (`docs/development.md`).
