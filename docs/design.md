@@ -58,7 +58,7 @@ grounds is rejected on sight.
   field, constraint set, Cedar context, and audit record.
 - **Crash durability, reconcilable state, audit tamper-detection.** Audit is one structured log
   record per broker decision, `broker.decision` or `broker.execution`, emitted inside the trace:
-  stdout JSON always, OTLP logs when `telemetry` is configured. There is no on-disk audit sink;
+  best-effort stdout JSON, OTLP logs when `telemetry` is configured. There is no on-disk audit sink;
   losing the log exporter loses audit.
 - **Transformed reflection at the endpoint.** The host refuses a response that carries the raw
   secret; an endpoint that re-encodes what it legitimately received is outside the boundary.
