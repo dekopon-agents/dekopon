@@ -264,7 +264,7 @@ provider ran, and the terminal outcome — and each produces exactly one. The re
 the broker offers the decision to its `AuditLog` sink, so no sink can suppress it; `dekopon-brokerd`
 runs `TraceOnlyAuditLog`, which keeps nothing.
 
-Every record is a JSON line on the broker's stdout. When `broker.yaml` has a `telemetry` block it
+Every record is offered as a JSON line to the broker's best-effort stdout sink. When `broker.yaml` has a `telemetry` block it
 is also an OTLP log record, sent to the same endpoint, with the same `OTEL_EXPORTER_OTLP_HEADERS`
 and crate set, as the spans ([Broker export](#broker-export)). Without one, audit lasts as long as
 whatever keeps the process's stdout — `kubectl logs` for a pod — so a deployment that needs audit
@@ -342,6 +342,19 @@ network only, because headers and telemetry are unencrypted.
 
 ## Export failures
 
+Daemon stdout uses one native writer thread with a bounded queue of 1024 lines and 4 MiB of
+line bytes. Serving threads never wait for stdout: lines exceeding either limit, a full or
+disconnected queue, and failed writes are dropped and counted. Before writing the next received
+line, the writer reports accumulated losses through the same sink; that notice can itself be
+dropped under overload. Shutdown drains the queue within the configured timeout (one second by
+default). A finished writer returns to synchronous logging for records after shutdown; an
+unfinished writer leaves the sink closed and subsequent records are dropped and counted.
+Broker `provider` and `check` subcommands keep synchronous stderr logging.
+
+| Event | Level | Emitted by | Carries |
+|---|---|---|---|
+| `telemetry.console.dropped` | warn | `dekopon-telemetry` | `console.dropped.lines`: numeric count of console lines lost since the preceding notice |
+
 The OpenTelemetry SDK has no error handler to install; its `internal-logs` feature is the only
 runtime channel it reports export failures through, and the workspace enables that feature for the
 API, the SDK, and the OTLP exporter. Rejected tokens, a missing `organization` header, and a
@@ -356,7 +369,7 @@ Both daemons report the same two facts on the way out, in the same shape:
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
 | `gateway_exit` / `broker_exit` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: the failure and its whole source chain, rendered as one `a: b: c` line |
-| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: every flush and shutdown failure raised while stopping the exporters, each naming its signal and stage |
+| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: every flush and shutdown failure raised while stopping the exporters and console writer, each naming its signal and stage |
 
 ## Broker export
 

@@ -1,4 +1,15 @@
-use std::{io, time::Duration};
+use std::{
+    io::{self, Write as _},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
+    },
+    thread::JoinHandle,
+    time::Duration,
+};
+
+use parking_lot::Mutex;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -47,11 +58,7 @@ pub struct Console {
 }
 
 impl Console {
-    fn layer(self) -> Box<dyn Layer<Registry> + Send + Sync> {
-        let writer = match self.writer {
-            ConsoleWriter::Stdout => BoxMakeWriter::new(io::stdout),
-            ConsoleWriter::Stderr => BoxMakeWriter::new(io::stderr),
-        };
+    fn layer(self, writer: BoxMakeWriter) -> Box<dyn Layer<Registry> + Send + Sync> {
         let filter = match self.filter {
             ConsoleFilter::Environment(default) => {
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default))
@@ -89,6 +96,145 @@ impl Console {
                 }
             }
         }
+    }
+}
+
+type ConsoleOutput = Box<dyn io::Write + Send>;
+
+enum ConsoleState {
+    Queued(SyncSender<Vec<u8>>),
+    Direct(ConsoleOutput),
+    Closed,
+}
+
+#[derive(Clone)]
+struct ConsoleSink {
+    state: Arc<Mutex<ConsoleState>>,
+    bytes: Arc<AtomicUsize>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl ConsoleSink {
+    const MAX_LINES: usize = 1024;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+    fn new(mut output: ConsoleOutput) -> Result<(Self, ConsoleWorker), InstallError> {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(Self::MAX_LINES);
+        let (completed, completion) = mpsc::sync_channel(1);
+        let sink = Self {
+            state: Arc::new(Mutex::new(ConsoleState::Queued(sender))),
+            bytes: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let bytes = Arc::clone(&sink.bytes);
+        let dropped = Arc::clone(&sink.dropped);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: TelemetryGuard joins it at shutdown; bound: one writer thread per install, 1024 queued lines and 4 MiB"
+        )]
+        let handle = std::thread::Builder::new()
+            .name("dekopon-console-stdout".into())
+            .spawn(move || {
+                while let Ok(line) = receiver.recv() {
+                    let n = dropped.swap(0, Ordering::Relaxed);
+                    if n != 0 {
+                        tracing::warn!(
+                            audit.event = "telemetry.console.dropped",
+                            console.dropped.lines = n,
+                            "console log lines dropped"
+                        );
+                    }
+                    if output.write_all(&line).is_err() {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    bytes.fetch_sub(line.len(), Ordering::Relaxed);
+                }
+                match completed.send(()) {
+                    Ok(()) | Err(mpsc::SendError(())) => output,
+                }
+            })
+            .map_err(|error| InstallError::ConsoleSpawn { kind: error.kind() })?;
+        let worker = ConsoleWorker {
+            state: Arc::clone(&sink.state),
+            completion,
+            handle,
+        };
+        Ok((sink, worker))
+    }
+}
+
+impl<'a> fmt::MakeWriter<'a> for ConsoleSink {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl io::Write for ConsoleSink {
+    fn write(&mut self, line: &[u8]) -> io::Result<usize> {
+        match &mut *self.state.lock() {
+            ConsoleState::Queued(sender) => {
+                if self
+                    .bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+                        bytes
+                            .checked_add(line.len())
+                            .filter(|total| *total <= Self::MAX_BYTES)
+                    })
+                    .is_ok()
+                {
+                    match sender.try_send(line.to_vec()) {
+                        Ok(()) => return Ok(line.len()),
+                        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                            self.bytes.fetch_sub(line.len(), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            ConsoleState::Direct(output) => {
+                output.write_all(line)?;
+                return Ok(line.len());
+            }
+            ConsoleState::Closed => {}
+        }
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        Ok(line.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ConsoleWorker {
+    state: Arc<Mutex<ConsoleState>>,
+    completion: mpsc::Receiver<()>,
+    handle: JoinHandle<ConsoleOutput>,
+}
+
+impl std::fmt::Debug for ConsoleWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConsoleWorker")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConsoleWorker {
+    fn shutdown(self, timeout: Duration) -> Result<(), ShutdownError> {
+        *self.state.lock() = ConsoleState::Closed;
+        self.completion
+            .recv_timeout(timeout)
+            .map_err(|error| ShutdownError(format!("console writer shutdown: {error}")))?;
+        let output = self.handle.join().map_err(|payload| {
+            ShutdownError(format!(
+                "console writer shutdown: writer panicked: {}",
+                crate::exporter::panic_message(&*payload)
+            ))
+        })?;
+        *self.state.lock() = ConsoleState::Direct(output);
+        Ok(())
     }
 }
 
@@ -206,7 +352,14 @@ impl Install {
             shutdown_timeout,
         } = self;
 
-        let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![console.layer()];
+        let (writer, console_worker) = match console.writer {
+            ConsoleWriter::Stdout => {
+                let (sink, worker) = ConsoleSink::new(Box::new(io::stdout()))?;
+                (BoxMakeWriter::new(sink), Some(worker))
+            }
+            ConsoleWriter::Stderr => (BoxMakeWriter::new(io::stderr), None),
+        };
+        let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![console.layer(writer)];
         layers.extend(extra);
         let tracer_provider = traces.map(|traces| {
             let tracer = traces.provider.tracer(traces.tracer_name);
@@ -228,6 +381,7 @@ impl Install {
         });
 
         let guard = TelemetryGuard {
+            console_worker,
             tracer_provider,
             logger_provider,
             shutdown_timeout,
@@ -243,6 +397,7 @@ impl Install {
 #[derive(Debug)]
 #[must_use = "an exporter that is never flushed drops its last batch"]
 pub struct TelemetryGuard {
+    console_worker: Option<ConsoleWorker>,
     tracer_provider: Option<SdkTracerProvider>,
     logger_provider: Option<SdkLoggerProvider>,
     shutdown_timeout: Option<Duration>,
@@ -276,6 +431,12 @@ impl TelemetryGuard {
             }
         }
 
+        if let Some(worker) = self.console_worker
+            && let Err(error) =
+                worker.shutdown(self.shutdown_timeout.unwrap_or(Duration::from_secs(1)))
+        {
+            failures.push(error.to_string());
+        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -317,8 +478,12 @@ fn otlp_filter(directive: &str) -> EnvFilter {
 }
 
 #[derive(Debug, Error)]
-#[error(transparent)]
-pub struct InstallError(#[from] TryInitError);
+pub enum InstallError {
+    #[error(transparent)]
+    Subscriber(#[from] TryInitError),
+    #[error("could not spawn console writer: {kind}")]
+    ConsoleSpawn { kind: io::ErrorKind },
+}
 
 #[derive(Debug, Error)]
 #[error("{0}")]
@@ -343,6 +508,121 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct StalledOutput {
+        output: Output,
+        started: Option<std::sync::mpsc::SyncSender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        written: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl std::io::Write for StalledOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).expect("first write started");
+                self.release.recv().expect("reader released");
+            }
+            let size = self.output.write(bytes)?;
+            self.written.send(()).expect("write observed");
+            Ok(size)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn console_guard(worker: super::ConsoleWorker) -> TelemetryGuard {
+        TelemetryGuard {
+            console_worker: Some(worker),
+            tracer_provider: None,
+            logger_provider: None,
+            shutdown_timeout: None,
+        }
+    }
+
+    fn json_lines(output: &Output) -> Vec<serde_json::Value> {
+        let bytes = output.0.lock();
+        std::str::from_utf8(&bytes)
+            .expect("UTF-8 JSON")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON record"))
+            .collect()
+    }
+
+    #[test]
+    fn a_stalled_console_reader_drops_and_counts_instead_of_blocking() {
+        let output = Output::default();
+        let (started, start) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let (written, writes) = std::sync::mpsc::sync_channel(super::ConsoleSink::MAX_LINES + 2);
+        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
+            output: output.clone(),
+            started: Some(started),
+            release: released,
+            written,
+        }))
+        .expect("console writer spawned");
+        let subscriber = registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(sink)
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    metadata.target() == "stalled_console_test"
+                        || metadata.target() == module_path!().trim_end_matches("::tests")
+                })),
+        );
+        tracing::subscriber::set_global_default(subscriber).expect("sole global test subscriber");
+        let guard = console_guard(worker);
+        tracing::info!(target: "stalled_console_test", sequence = 0);
+        start.recv().expect("writer stalled");
+        let queued = super::ConsoleSink::MAX_LINES;
+        for sequence in 1..=queued + 7 {
+            tracing::info!(target: "stalled_console_test", sequence);
+        }
+        release.send(()).expect("release writer");
+        for _ in 0..queued + 2 {
+            writes.recv().expect("line written");
+        }
+        guard.shutdown().expect("console drained");
+        let lines = json_lines(&output);
+        assert_eq!(lines.len(), queued + 2);
+        for (sequence, line) in lines[..=queued].iter().enumerate() {
+            assert_eq!(line["sequence"], sequence);
+        }
+        assert_eq!(
+            lines[queued + 1]["audit.event"],
+            "telemetry.console.dropped"
+        );
+        assert_eq!(lines[queued + 1]["console.dropped.lines"], 7);
+    }
+
+    #[test]
+    fn shutdown_drains_queued_console_lines_and_then_writes_directly() {
+        let output = Output::default();
+        let (sink, worker) =
+            super::ConsoleSink::new(Box::new(output.clone())).expect("console writer spawned");
+        let subscriber = registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(sink),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let guard = console_guard(worker);
+            for sequence in 0..3 {
+                tracing::info!(sequence);
+            }
+            guard.shutdown().expect("console drained");
+            tracing::info!(sequence = 3);
+        });
+        let lines = json_lines(&output);
+        assert_eq!(lines.len(), 4);
+        for (sequence, line) in lines.iter().enumerate() {
+            assert_eq!(line["sequence"], sequence);
         }
     }
 
@@ -499,6 +779,7 @@ mod tests {
     #[test]
     fn a_guard_without_exporters_shuts_down_cleanly() {
         let guard = TelemetryGuard {
+            console_worker: None,
             tracer_provider: None,
             logger_provider: None,
             shutdown_timeout: None,

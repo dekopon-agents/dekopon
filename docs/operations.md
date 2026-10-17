@@ -9,7 +9,7 @@ question they arrived with, rather than by guessing that a crate README is the o
 ## Audit
 
 `dekopon-brokerd` records every decision as a metadata-only `broker.decision` or `broker.execution`
-log record inside the caller's trace: a JSON line on stdout always, and an OTLP log record when
+log record inside the caller's trace: a best-effort JSON line on stdout, and an OTLP log record when
 `broker.yaml` has a `telemetry` block. Without `telemetry`, audit lasts as long as whatever keeps
 the broker's stdout — `kubectl logs` for a pod — so a deployment that must keep audit past a pod
 restart configures `telemetry`. Losing the exporter loses audit.
