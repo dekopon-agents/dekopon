@@ -1,8 +1,11 @@
 use cedar_policy::{Context, RestrictedExpression};
 use serde::Deserialize;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde_json::{Value, json};
+use serde_json::{Value, error::Category, json};
 use std::{collections::BTreeMap, fmt};
+
+const MAX_BODY_BYTES: usize = 16 * 1024;
+const OPAQUE: &str = "opaque";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpRequestFacts {
@@ -11,12 +14,40 @@ pub struct HttpRequestFacts {
     pub path: String,
     pub query: String,
     pub headers: Vec<(String, Vec<u8>)>,
-    pub body: Option<Vec<u8>>,
+    pub body: RequestBody,
     pub content_type: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestBody {
+    Buffered(Vec<u8>),
+    Streamed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpaqueBody {
+    Streamed,
+    MediaType,
+    TooLarge,
+    Malformed,
+    Unrepresentable,
+}
+
+impl OpaqueBody {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Streamed => "streamed",
+            Self::MediaType => "media-type",
+            Self::TooLarge => "too-large",
+            Self::Malformed => "malformed",
+            Self::Unrepresentable => "unrepresentable",
+        }
+    }
+}
+
 impl HttpRequestFacts {
-    pub(super) fn context(self) -> Result<Context, super::RequestError> {
+    pub(super) fn context(self) -> Result<(Context, Option<OpaqueBody>), super::RequestError> {
         let mut url = vec![
             (
                 "host".to_owned(),
@@ -54,23 +85,62 @@ impl HttpRequestFacts {
         if valid {
             request.push(("headers".to_owned(), record(headers)?));
         }
-        if let (Some(body), Some(media)) = (self.body, self.content_type)
-            && body.len() <= 16 * 1024
-            && media
-                .split(';')
-                .next()
-                .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
-            && let Ok(Unique(value @ Value::Object(_))) = serde_json::from_slice::<Unique>(&body)
-            && let Ok(body) = Context::from_json_value(json!({"body": value}), None)
-        {
-            request.extend(body);
-        }
-        Context::from_pairs([("request".to_owned(), record(request)?)]).map_err(|source| {
-            super::RequestError::Context {
-                message: source.to_string(),
+        let body = match self.body {
+            RequestBody::Buffered(body) if body.is_empty() => None,
+            RequestBody::Buffered(body) => Some(json_record(&body, self.content_type.as_deref())),
+            RequestBody::Streamed => Some(Err(OpaqueBody::Streamed)),
+        };
+        let opaque = match body {
+            None => None,
+            Some(Ok(body)) => {
+                request.push(("body".to_owned(), body));
+                None
             }
-        })
+            // A body policy cannot read is present as a non-record, so any attribute test on it
+            // errors and denies instead of reading as absent.
+            Some(Err(kind)) => {
+                request.push((
+                    "body".to_owned(),
+                    RestrictedExpression::new_string(OPAQUE.to_owned()),
+                ));
+                Some(kind)
+            }
+        };
+        let context =
+            Context::from_pairs([("request".to_owned(), record(request)?)]).map_err(|source| {
+                super::RequestError::Context {
+                    message: source.to_string(),
+                }
+            })?;
+        Ok((context, opaque))
     }
+}
+
+fn json_record(body: &[u8], media: Option<&str>) -> Result<RestrictedExpression, OpaqueBody> {
+    if !media
+        .and_then(|media| media.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(OpaqueBody::MediaType);
+    }
+    if body.len() > MAX_BODY_BYTES {
+        return Err(OpaqueBody::TooLarge);
+    }
+    let value = match serde_json::from_slice::<Unique>(body) {
+        Ok(Unique(value @ Value::Object(_))) => value,
+        Ok(Unique(_)) => return Err(OpaqueBody::Unrepresentable),
+        Err(error) => {
+            return Err(match error.classify() {
+                Category::Data => OpaqueBody::Unrepresentable,
+                Category::Io | Category::Syntax | Category::Eof => OpaqueBody::Malformed,
+            });
+        }
+    };
+    Context::from_json_value(json!({ "body": value }), None)
+        .ok()
+        .and_then(|context| context.into_iter().next())
+        .map(|(_, body)| body)
+        .ok_or(OpaqueBody::Unrepresentable)
 }
 
 fn record(
@@ -108,15 +178,29 @@ impl<'de> Deserialize<'de> for Unique {
                     .map(|n| Unique(json!(n)))
                     .map_err(E::custom)
             }
-            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Unique, E> {
-                Err(E::custom("floating point"))
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Unique, E> {
+                let text = v.to_string();
+                let text = if text.contains('.') {
+                    text
+                } else {
+                    format!("{text}.0")
+                };
+                match text.split_once('.') {
+                    Some((_, fraction)) if fraction.len() <= 4 => {
+                        Ok(Unique(json!({"__extn": {"fn": "decimal", "arg": text}})))
+                    }
+                    Some(_) | None => Err(E::custom("fraction beyond decimal precision")),
+                }
             }
             fn visit_unit<E: de::Error>(self) -> Result<Unique, E> {
-                Err(E::custom("null"))
+                Ok(Unique(Value::Null))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Unique, A::Error> {
                 let mut values = Vec::new();
                 while let Some(Unique(value)) = seq.next_element()? {
+                    if value.is_null() {
+                        return Err(de::Error::custom("null set element"));
+                    }
                     values.push(value);
                 }
                 Ok(Unique(Value::Array(values)))
@@ -128,6 +212,7 @@ impl<'de> Deserialize<'de> for Unique {
                         return Err(de::Error::custom("duplicate or reserved key"));
                     }
                 }
+                fields.retain(|_, value| !value.is_null());
                 Ok(Unique(Value::Object(fields)))
             }
         }

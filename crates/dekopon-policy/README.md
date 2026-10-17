@@ -84,7 +84,7 @@ configuration:
 - `effect` / `risk` — the trusted classification the broker will execute under,
   matched byte for byte against the loaded manifest at startup.
 
-Invocation context excludes message content and arbitrary provider input; at the per-request Cedar point, `context.request` exposes bounded outgoing HTTP facts, including only representable buffered JSON record bodies of at most 16 KiB. A public DRN remains a separate strongly validated resource on a separate action, inert without an owner binding.
+Invocation context excludes message content and arbitrary provider input; at the per-request Cedar point, `context.request` exposes bounded outgoing HTTP facts, including a buffered JSON object body of at most 16 KiB as a record (`null` members omitted, fractions as Cedar `decimal`); any other body is the string `"opaque"`, so a forbid that reads its attributes errors and denies. A public DRN remains a separate strongly validated resource on a separate action, inert without an owner binding.
 
 ## Determinism and bounds
 

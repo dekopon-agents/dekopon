@@ -785,10 +785,22 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
             assert_eq!(events[0].field("policy.errors_present"), Some("true"));
         }
         if id == "form" || id == "multipart" {
-            assert_eq!(events[0].field("policy.ids"), Some("reply-only"), "{id}");
             assert_eq!(
                 events[0].field("policy.error_ids"),
-                Some("no-broadcast,thread-required"),
+                Some("no-broadcast,reply-only,thread-required"),
+                "{id}"
+            );
+            let opaque = capture.events_where(
+                "dekopon_broker::audit",
+                &[
+                    ("audit.event", "policy.request.body_opaque"),
+                    ("invocation.id", id),
+                ],
+            );
+            assert_eq!(opaque.len(), 1, "{id}");
+            assert_eq!(
+                opaque[0].field("request.body.reason"),
+                Some("media-type"),
                 "{id}"
             );
             assert_eq!(
@@ -902,6 +914,211 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
             .all(|line| !line.to_ascii_lowercase().starts_with("authorization:")),
         "guest sent no credential"
     );
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one server proves the three admitted bodies send exactly once and the three denied ones send nothing"
+)]
+async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_one_before_egress() {
+    use dekopon_test_support::CaptureLayer;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const DECIDE: &str = r#"{"model":"typesafe/jev-1.13","questions":{"decision":{"type":"choice","instructions":"Choose the best matching label for the supplied evidence.","criteria":{"original":"original","summary":"summary"}}},"state":{"records":[{"ageMs":17,"bytes":512,"exitStatus":null,"outcome":"none","pinned":false,"tool":"none"}]}}"#;
+    const CHAT: &str = r#"{"model":"typesafe/jev-1.13","messages":[{"role":"user","content":"SENTINEL-PROMPT"}],"temperature":0.7,"logprobs":true,"top_logprobs":5,"response_format":{"type":"json_object"}}"#;
+    const CANVAS: &str = r#"{"canvas_id":"F0C907QUHU7","changes":[{"operation":"replace","section_id":"temp:C:abc","document_content":{"type":"markdown","markdown":"SENTINEL-MARKDOWN"}}]}"#;
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider loads");
+    let server = LoopbackServer::serving(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        3,
+    );
+    let authority = server.authority().to_owned();
+    let mut constraints = loopback_constraints(&authority);
+    constraints
+        .http
+        .as_mut()
+        .expect("HTTP grant")
+        .allowed_methods = vec!["POST".to_owned()];
+    let policies = format!(
+        "{}\n{}",
+        http_policy("caller", "provider-test", "http-probe.fetch"),
+        r#"@id("decide-model-pin")
+            forbid(principal, action == Dekopon::Action::"http-probe.fetch", resource)
+            when { context has request }
+            when { context.request.url.path == "/api/alpha/decisions" }
+            unless { context.request has body
+                && context.request.body has model
+                && context.request.body.model == "typesafe/jev-1.13" };
+           @id("canvas-pin")
+            forbid(principal, action == Dekopon::Action::"http-probe.fetch", resource)
+            when { context has request }
+            when { context.request.url.path == "/api/canvases.edit" }
+            unless { context.request has body
+                && context.request.body has canvas_id
+                && context.request.body.canvas_id == "F0C907QUHU7" };"#
+    );
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        http_probe_engine(&policies),
+        catalog([("http-probe.fetch", set("http-probe", constraints))]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::new(InMemoryAuditLog::new(64).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("body fences load");
+    let capture = CaptureLayer::new();
+    for (id, path, body, admitted) in [
+        (
+            "decide-jev",
+            "/api/alpha/decisions",
+            DECIDE.to_owned(),
+            true,
+        ),
+        (
+            "decide-luna",
+            "/api/alpha/decisions",
+            DECIDE.replace("typesafe/jev-1.13", "openai/gpt-6-luna-decisions"),
+            false,
+        ),
+        ("chat-jev", "/api/alpha/decisions", CHAT.to_owned(), true),
+        (
+            "chat-opaque",
+            "/api/alpha/decisions",
+            CHAT.replace("0.7", "0.12345"),
+            false,
+        ),
+        (
+            "canvas-pinned",
+            "/api/canvases.edit",
+            CANVAS.to_owned(),
+            true,
+        ),
+        (
+            "canvas-other",
+            "/api/canvases.edit",
+            CANVAS.replace("F0C907QUHU7", "F0OTHER"),
+            false,
+        ),
+    ] {
+        let outcome = invoke_as(
+            &broker,
+            "caller",
+            "provider-test",
+            request(
+                id,
+                "http-probe.fetch",
+                json!({
+                    "uri": format!("http://{authority}{path}"), "method": "POST",
+                    "headers": [{"name": "content-type", "value": "application/json"}],
+                    "body": body
+                }),
+            ),
+        )
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await
+        .expect("invocation accounted");
+        assert_eq!(
+            outcome.result.outcome == dekopon_capability::InvocationOutcome::Succeeded,
+            admitted,
+            "{id}: {outcome:?}"
+        );
+        let decisions = capture.events_where(
+            "dekopon_broker::audit",
+            &[("decision.point", "http.request"), ("invocation.id", id)],
+        );
+        assert_eq!(decisions.len(), 1, "{id} reaches Cedar once");
+        let decision = &decisions[0];
+        let opaque = capture.events_where(
+            "dekopon_broker::audit",
+            &[
+                ("audit.event", "policy.request.body_opaque"),
+                ("invocation.id", id),
+            ],
+        );
+        match id {
+            "decide-luna" | "canvas-other" => {
+                assert_eq!(decision.field("decision.allowed"), Some("false"), "{id}");
+                assert_eq!(
+                    decision.field("policy.errors_present"),
+                    Some("false"),
+                    "{id}"
+                );
+                assert_eq!(
+                    decision.field("policy.ids"),
+                    Some(if id == "decide-luna" {
+                        "decide-model-pin"
+                    } else {
+                        "canvas-pin"
+                    })
+                );
+                assert!(opaque.is_empty(), "{id}");
+            }
+            "chat-opaque" => {
+                assert_eq!(decision.field("decision.allowed"), Some("false"));
+                assert_eq!(decision.field("decision.reason"), Some("policy-error"));
+                assert_eq!(decision.field("policy.error_ids"), Some("decide-model-pin"));
+                assert_eq!(opaque.len(), 1);
+                assert_eq!(
+                    opaque[0].field("request.body.reason"),
+                    Some("unrepresentable")
+                );
+                assert_eq!(
+                    opaque[0].field("decision.id"),
+                    decision.field("decision.id")
+                );
+            }
+            _ => {
+                assert_eq!(decision.field("decision.allowed"), Some("true"), "{id}");
+                assert!(opaque.is_empty(), "{id}");
+            }
+        }
+    }
+    let audit = capture.events_where("dekopon_broker::audit", &[]);
+    for sentinel in [
+        "SENTINEL-PROMPT",
+        "SENTINEL-MARKDOWN",
+        "0.12345",
+        "typesafe/jev",
+        "gpt-6-luna",
+        "F0OTHER",
+        "F0C907QUHU7",
+    ] {
+        assert!(
+            audit
+                .iter()
+                .all(|record| !format!("{record:?}").contains(sentinel)),
+            "audit leaked {sentinel}"
+        );
+    }
+    let sent = server
+        .recorded()
+        .into_iter()
+        .map(|bytes| String::from_utf8(bytes).expect("fixture request is UTF-8"))
+        .collect::<Vec<_>>();
+    let lines = sent
+        .iter()
+        .map(|wire| wire.lines().next().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        [
+            "POST /api/alpha/decisions HTTP/1.1",
+            "POST /api/alpha/decisions HTTP/1.1",
+            "POST /api/canvases.edit HTTP/1.1",
+        ],
+        "only the three admitted requests left the broker"
+    );
+    assert!(sent[0].ends_with(DECIDE) && sent[1].ends_with(CHAT) && sent[2].ends_with(CANVAS));
     server.join();
 }
 

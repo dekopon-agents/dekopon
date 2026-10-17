@@ -231,6 +231,7 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
 | `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
 | `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller sees plain `policy-denied` |
+| `policy.request.body_opaque` | `dekopon-broker` | `invocation.id`, `capability.id`, the HTTP `decision.id`, and a stable `request.body.reason` — `streamed`, `media-type`, `too-large`, `malformed`, or `unrepresentable` — when an HTTP request point denies a request whose body reached Cedar as `"opaque"`; never the body |
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never

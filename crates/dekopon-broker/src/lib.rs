@@ -3370,7 +3370,10 @@ where
                     path: facts.path,
                     query: facts.query,
                     headers: facts.headers,
-                    body: facts.body,
+                    body: facts.body.map_or(
+                        dekopon_policy::RequestBody::Streamed,
+                        dekopon_policy::RequestBody::Buffered,
+                    ),
                     content_type: facts.content_type,
                 };
                 // Cedar measures its recursion reserve against stacker's thread bounds, which a
@@ -3397,6 +3400,22 @@ where
                 };
                 let digest = decision_evidence_digest("policy-decision", &material);
                 let ordinal = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let decision_id = format!("http-{invocation}-{ordinal}");
+                if !result.allowed
+                    && let Some(opaque) = result.opaque_body
+                {
+                    tracing::warn!(
+                        target: "dekopon_broker::audit",
+                        {
+                            audit.event = "policy.request.body_opaque",
+                            invocation.id = %invocation,
+                            capability.id = %capability,
+                            decision.id = decision_id.as_str(),
+                            request.body.reason = opaque.label(),
+                        },
+                        "denied HTTP request carried a body policy could not read"
+                    );
+                }
                 let reason =
                     (!result.allowed).then(|| denial_reason(&result, "policy-denied").to_owned());
                 let decision_digest = match digest {
@@ -3424,7 +3443,7 @@ where
                     secret_sink: None,
                     provider: Some(provider.clone()),
                     authorized_by: Some(broker_principal.clone()),
-                    decision_id: format!("http-{invocation}-{ordinal}"),
+                    decision_id,
                     policy_ids: result.determining_policy_ids,
                     policy_error_ids: result.erroring_policy_ids,
                     policy_errors_present: Some(result.errors_present),
