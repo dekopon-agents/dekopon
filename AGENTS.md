@@ -35,17 +35,14 @@ The model proposes; a separate broker authorizes and executes provider effects.
   exclude secret bytes and daemon credentials. Bound attribute size, never span count.
 - Distinguish Current, Committed direction and Exploration; code/tests prove what exists.
   Stop for human decision if the requested change conflicts with design or security.
-- Publishing, releases, pushing/moving tags, adding credentials and protection changes require
-  explicit human authorization for that action; release authorization names one version.
-  Follow the [release procedure](README.md#maintainer-release-process), not memory.
-- Human intervention is not required when the plan is sufficiently scoped out and the changes
-  are expected. Scoped out: the owner approved a plan that names the change, its version and its
-  rollout. Expected: the diff does what the plan said and nothing else. Inside that, merge, tag,
-  release and deploy without waiting. A milestone the owner has funded in his campaign file is
-  explicit human authorization for that milestone's named version, its merges and its rollout.
-  The fresh adversarial review of the merged head is the review.
-- Stop for the owner when the work leaves the plan: a change it did not name, a result that
-  surprises its reviewer, a version it did not list, a new credential, a protection change.
+- Publishing, releases, pushing or moving tags, adding credentials and protection changes require
+  explicit human authorization. An execution contract the owner approved is that authorization for
+  what it lists: cut each release it allows and journal the version. Follow the
+  [release procedure](README.md#maintainer-release-process), not memory.
+- Inside an approved execution contract, merge, tag, release and deploy without waiting when the
+  diff does what the plan said. The fresh adversarial review of the merged head is the review.
+- Stop for the owner when the work leaves the plan: a change it did not name, a change to a contract
+  it froze, a result that surprises its reviewer, a new credential, a protection change.
 
 ## Committed direction
 
