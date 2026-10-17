@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.36.2] - 2026-10-17
+
+### Changed
+
+- Chart 0.36.2 targets core v0.49.1 and pins the verified v0.49.1 stock image index.
+
 ## [0.49.1] - 2026-10-17
 
 ### Fixed
