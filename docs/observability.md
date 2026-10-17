@@ -345,15 +345,17 @@ network only, because headers and telemetry are unencrypted.
 Daemon stdout uses one native writer thread with a bounded queue of 1024 lines and 4 MiB of
 line bytes. Serving threads never wait for stdout: lines exceeding either limit, a full or
 disconnected queue, and failed writes are dropped and counted. Before writing the next received
-line, the writer reports accumulated losses through the same sink; that notice can itself be
-dropped under overload. Shutdown drains the queue within the configured timeout (one second by
-default). A finished writer returns to synchronous logging for records after shutdown; an
-unfinished writer leaves the sink closed and subsequent records are dropped and counted.
+line, the writer reports the cumulative loss count since install through the same sink when it
+changes; that notice can itself be dropped under overload without resetting the count. After a
+successful drain, shutdown reports any pending count directly. Shutdown drains the queue within
+the configured timeout (one second by default). A finished writer returns to synchronous logging
+for records after shutdown; an unfinished writer leaves the sink closed and subsequent records
+are dropped and counted.
 Broker `provider` and `check` subcommands keep synchronous stderr logging.
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
-| `telemetry.console.dropped` | warn | `dekopon-telemetry` | `console.dropped.lines`: numeric count of console lines lost since the preceding notice |
+| `telemetry.console.dropped` | warn | `dekopon-telemetry` | `console.dropped.lines`: cumulative numeric count of console lines lost since install |
 
 The OpenTelemetry SDK has no error handler to install; its `internal-logs` feature is the only
 runtime channel it reports export failures through, and the workspace enables that feature for the
