@@ -706,10 +706,9 @@ They move for different reasons. A templating fix ships as a `dekopon-chart-*` t
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
 force an application release, and an application release must not republish an unchanged chart.
 
-The release-prep [Chart.yaml](../charts/dekopon/Chart.yaml) declares chart version `0.22.0` and
-`appVersion: "0.33.0"`. Until the published v0.33.0 image's index digest replaces the v0.32.0
-placeholder in a reviewed digest-only PR, this chart must not be tagged or deployed: the digest
-overrides the tag and would run v0.32.0 under a v0.33.0 version label. The application version is not decorative: `dekopon.labels` renders it as
+The release-prep [Chart.yaml](../charts/dekopon/Chart.yaml) declares the chart version and
+`appVersion` together with the workspace version, and `image.digest` defaults to empty, so the
+chart renders the `v<appVersion>` tag of the same commit. The application version is not decorative: `dekopon.labels` renders it as
 `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
 answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and
 every dashboard and alert built on that label reporting the same wrong number. It has to move in
@@ -723,7 +722,7 @@ therefore renders `v` + `appVersion`:
 ghcr.io/dekopon-agents/dekopon:v0.33.0
 ```
 
-There is no `latest`. Prefer `image.digest`; it pins across the
+There is no `latest`. `image.digest` is empty by default; set it to pin across the
 `linux/amd64` + `linux/arm64` index, and the index digest is what `gh attestation verify` attests.
 
 ## Publishing
