@@ -830,22 +830,25 @@ fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
     let credentials = serde_json::from_reader::<_, ChatGptCredentials>(file).map_err(|source| {
         ChatGptError::ParseAuth {
             path: path.to_path_buf(),
-            source,
+            category: source.classify(),
+            line: source.line(),
+            column: source.column(),
         }
     })?;
     if credentials.version != AUTH_VERSION {
         return Err(ChatGptError::Configuration(format!(
-            "unsupported ChatGPT credential version {}",
-            credentials.version
+            "ChatGPT credentials at {} have an unsupported `version`; expected {AUTH_VERSION}",
+            path.display()
         )));
     }
     if credentials.access.expose().is_empty()
         || credentials.refresh.expose().is_empty()
         || credentials.account_id.is_empty()
     {
-        return Err(ChatGptError::Configuration(
-            "ChatGPT credential file is incomplete".to_owned(),
-        ));
+        return Err(ChatGptError::Configuration(format!(
+            "ChatGPT credentials at {} are incomplete; `access`, `refresh` and `accountId` must be non-empty",
+            path.display()
+        )));
     }
     Ok(credentials)
 }
@@ -909,6 +912,18 @@ fn unix_time() -> Result<u64, ChatGptError> {
         .map_err(|_| ChatGptError::Configuration("system clock is before Unix epoch".to_owned()))
 }
 
+const fn parse_problem(category: serde_json::error::Category) -> &'static str {
+    match category {
+        serde_json::error::Category::Io => "the file could not be read",
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+            "the file is not valid JSON"
+        }
+        serde_json::error::Category::Data => {
+            "expected an object with integer `version` and `expiresAt` and string `access`, `refresh` and `accountId`"
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ChatGptError {
     #[error("invalid ChatGPT configuration: {0}")]
@@ -921,11 +936,14 @@ pub enum ChatGptError {
         #[source]
         source: io::Error,
     },
-    #[error("could not parse ChatGPT credentials at {}", path.display())]
+    // Serde's messages quote the mismatched value, which may be token bytes, so only its
+    // category and position are kept.
+    #[error("could not parse ChatGPT credentials at {}: {} at line {line}, column {column}", path.display(), parse_problem(*category))]
     ParseAuth {
         path: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        category: serde_json::error::Category,
+        line: usize,
+        column: usize,
     },
     #[error("could not serialize ChatGPT credentials at {}", path.display())]
     SerializeAuth {

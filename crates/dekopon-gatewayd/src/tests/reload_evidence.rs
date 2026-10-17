@@ -593,6 +593,85 @@ async fn a_refused_proxy_rebuild_names_the_model_and_variable_it_lacks() {
         error.contains("\"claude\" credential could not be opened"),
         "{error}"
     );
-    assert!(!format!("{refused:?}").contains(SENTINEL), "{error}");
+    assert!(!capture.text().contains(SENTINEL), "{}", capture.text());
     assert_eq!(gateway.digest_for_test(), old_digest);
+}
+
+#[tokio::test]
+async fn boot_never_echoes_auth_file_content() {
+    use crate::proxy::tests::{JAIL, pki};
+    const WORD: &str = "auth-file-boot-sentinel";
+    const NUMBER: u32 = 3_141_592_653;
+    let valid = json!({
+        "version": 1,
+        "access": "access-fixture",
+        "refresh": "refresh-fixture",
+        "expiresAt": 1,
+        "accountId": "account-fixture"
+    });
+    let planted = [
+        ("version", json!(NUMBER), NUMBER.to_string()),
+        ("version", json!(WORD), WORD.to_owned()),
+        ("access", json!(NUMBER), NUMBER.to_string()),
+        ("expiresAt", json!(WORD), WORD.to_owned()),
+    ];
+    let pki = pki();
+    let tls = pki.directory.path();
+    for (field, value, sentinel) in planted {
+        let root = temporary();
+        fs::write(
+            root.path().join("dekopon.yaml"),
+            catalog_text(true, Some("reasoning")),
+        )
+        .unwrap();
+        let auth = root.path().join("auth.json");
+        let mut credential = valid.clone();
+        credential[field] = value;
+        fs::write(&auth, credential.to_string()).unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut responses = listings(2, &[]);
+        responses[1] = ResponseEnvelope {
+            api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
+            response: dekopon_broker_protocol::BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: dekopon_broker_protocol::GenerationOutcome::Active,
+            },
+        };
+        let (broker, _observed) = stub_broker(root.path(), responses).await;
+        let mut config = document(root.path());
+        config["broker"]["serverUid"] = json!(broker.server_uid);
+        config["models"].as_array_mut().unwrap().push(json!({
+            "name": "codex",
+            "kind": "chatgptSubscription",
+            "model": "gpt",
+            "authFile": auth,
+            "timeoutMs": 2000
+        }));
+        config["proxy"] = json!({
+            "bind": "127.0.0.1:0",
+            "tls": {
+                "certFile": tls.join("tls.crt"),
+                "keyFile": tls.join("tls.key"),
+                "clientCaFile": tls.join("ca.crt")
+            },
+            "jailIdentity": JAIL,
+            "guests": {"dekopon:reviewer-vm": {"agent": "reviewer", "models": ["codex"]}}
+        });
+        let path = write_config(root.path(), &config);
+        let (capture, guard) = capture_spans();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::run(&path, std::future::pending()),
+        )
+        .await
+        .expect("boot is bounded")
+        .expect_err("an unusable auth file refuses boot");
+        drop(guard);
+        let rendered = dekopon_core::error_chain(&error);
+        assert!(!rendered.contains(&sentinel), "{field}: {rendered}");
+        let text = capture.text();
+        assert!(!text.contains(&sentinel), "{field}: {text}");
+        assert!(rendered.contains(auth.to_str().unwrap()), "{rendered}");
+        assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
+    }
 }

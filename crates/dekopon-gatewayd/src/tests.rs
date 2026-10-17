@@ -9262,10 +9262,12 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
         "dispatch must not wait on the writer's disk lock"
     );
     assert!(absent, "banish hides the resident ticket immediately");
+    // The disk lock is taken one statement before the writer check, so the banish can land on
+    // either side of it: NotFound before, PermissionDenied after the marker write.
     assert!(matches!(
         result,
         Err(crate::journal::JournalError::Io {
-            kind: std::io::ErrorKind::PermissionDenied
+            kind: std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
         })
     ));
     while let Some(done) = tokio::time::timeout(Duration::from_secs(3), sessions.join_next())

@@ -328,11 +328,10 @@ fn malformed_credential_diagnostics_never_reflect_values() {
                 }
                 assert!(diagnostic.contains("could not parse ChatGPT credentials"));
                 assert!(diagnostic.contains(path.to_str().expect("UTF-8 path")));
-                if verbosity.is_some() {
-                    assert!(diagnostic.contains("credential JSON Data at line 1 column "));
-                }
+                assert!(diagnostic.contains("expected an object with integer `version`"));
+                assert!(diagnostic.contains("at line 1, column "));
                 if verbosity == Some("-vv") {
-                    assert!(diagnostic.contains("debug: ChatGpt::ParseAuth"));
+                    assert!(diagnostic.contains("category: Data"), "{diagnostic}");
                 }
                 assert_eq!(std::fs::read(&path).expect("read fixture"), bytes);
             }
