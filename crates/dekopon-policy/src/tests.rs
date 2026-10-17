@@ -3,9 +3,9 @@ use dekopon_core::{RiskLevel, SecretSinkKind};
 use serde_json::json;
 
 use super::{
-    AGENT_PROMPT_ACTION, HttpRequestFacts, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext,
-    PolicyDecision, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION,
-    UnresolvedKind,
+    AGENT_PROMPT_ACTION, HttpRequestFacts, MAX_POLICY_BYTES, OpaqueBody, PolicyBuildError,
+    PolicyContext, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld,
+    RequestBody, SECRET_USE_ACTION, UnresolvedKind,
 };
 
 fn world() -> PolicyWorld {
@@ -84,7 +84,7 @@ fn facts(body: Option<&[u8]>) -> HttpRequestFacts {
         path: "/api/send".into(),
         query: String::new(),
         headers: vec![],
-        body: body.map(<[u8]>::to_vec),
+        body: RequestBody::Buffered(body.map(<[u8]>::to_vec).unwrap_or_default()),
         content_type: Some("application/json; charset=utf-8".into()),
     }
 }
@@ -110,10 +110,30 @@ fn request_json(facts: HttpRequestFacts) -> serde_json::Value {
     facts
         .context()
         .expect("valid request facts")
+        .0
         .to_json_value()
         .expect("representable request context")["request"]
         .clone()
 }
+
+fn opacity(facts: HttpRequestFacts) -> Option<OpaqueBody> {
+    let (context, opaque) = facts.context().expect("valid request facts");
+    let body = context
+        .to_json_value()
+        .expect("representable request context")["request"]
+        .get("body")
+        .cloned();
+    assert_eq!(
+        opaque.is_some(),
+        body.as_ref() == Some(&json!("opaque")),
+        "{body:?}"
+    );
+    opaque
+}
+
+const DECIDE_BODY: &str = r#"{"model":"typesafe/jev-1.13","questions":{"decision":{"type":"choice","instructions":"Choose the best matching label for the supplied evidence.","criteria":{"original":"original","summary":"summary"}}},"state":{"records":[{"ageMs":17,"bytes":512,"exitStatus":null,"outcome":"none","pinned":false,"tool":"none"}]}}"#;
+const CHAT_BODY: &str = r#"{"model":"typesafe/jev-1.13","messages":[{"role":"system","content":"label it"},{"role":"user","content":"evidence"}],"temperature":0.7,"logprobs":true,"top_logprobs":5,"response_format":{"type":"json_object"}}"#;
+const CANVAS_BODY: &str = r#"{"canvas_id":"F0C907QUHU7","changes":[{"operation":"replace","section_id":"temp:C:abc","document_content":{"type":"markdown","markdown":"new"}}]}"#;
 
 #[test]
 fn request_url_method_and_guest_headers_are_exact_or_absent() {
@@ -173,7 +193,7 @@ fn an_unread_expr_header_does_not_refuse_an_otherwise_permitted_request() {
 }
 
 #[test]
-fn only_entire_representable_json_records_enter_request_context() {
+fn representable_json_records_enter_request_context_and_any_other_body_is_opaque() {
     let body = br#"{"channel":"C0123","nested":{"ok":true,"count":-5,"values":["a",2]}}"#;
     let mut input = facts(Some(body));
     let exposed = request_json(input.clone());
@@ -183,44 +203,157 @@ fn only_entire_representable_json_records_enter_request_context() {
     let set = exposed["body"]["nested"]["values"].as_array().unwrap();
     assert_eq!(set.len(), 2);
     assert!(set.contains(&json!("a")) && set.contains(&json!(2)));
-    input.content_type = Some("application/problem+json".into());
+
+    input.body = RequestBody::Buffered(DECIDE_BODY.as_bytes().to_vec());
+    let decide = request_json(input.clone());
+    assert_eq!(decide["body"]["model"], "typesafe/jev-1.13");
+    let record = &decide["body"]["state"]["records"][0];
+    assert_eq!(record["tool"], "none");
+    assert!(record.get("exitStatus").is_none(), "{record}");
+    input.body = RequestBody::Buffered(CHAT_BODY.as_bytes().to_vec());
+    let chat = request_json(input.clone());
+    assert_eq!(
+        chat["body"]["temperature"],
+        json!({"__extn": {"fn": "decimal", "arg": "0.7"}})
+    );
+    assert_eq!(chat["body"]["top_logprobs"], 5);
+    assert_eq!(chat["body"]["response_format"]["type"], "json_object");
+    input.body = RequestBody::Buffered(CANVAS_BODY.as_bytes().to_vec());
+    assert_eq!(
+        request_json(input.clone())["body"]["canvas_id"],
+        "F0C907QUHU7"
+    );
+    input.body = RequestBody::Buffered(br#"{"whole":2.0}"#.to_vec());
+    assert_eq!(
+        request_json(input.clone())["body"]["whole"],
+        json!({"__extn": {"fn": "decimal", "arg": "2.0"}})
+    );
+
+    input.body = RequestBody::Buffered(Vec::new());
+    assert_eq!(opacity(input.clone()), None);
     assert!(request_json(input.clone()).get("body").is_none());
-    input.content_type = Some("application/json".into());
-    let at_limit = format!("{{\"x\":\"{}\"}}", "a".repeat(16 * 1024 - 8));
-    input.body = Some(at_limit.into_bytes());
-    assert!(request_json(input.clone()).get("body").is_some());
-    let over_limit = format!("{{\"x\":\"{}\"}}", "a".repeat(17 * 1024));
-    input.body = Some(over_limit.into_bytes());
-    assert!(request_json(input.clone()).get("body").is_none());
-    for bad in [
-        "",
-        "oops",
-        "[]",
-        "null",
-        "{\"x\":null}",
-        "{\"x\":1.5}",
-        "{\"x\":9223372036854775808}",
-        "{\"x\":1,\"x\":2}",
-        "{\"nested\":{\"x\":1,\"x\":2}}",
-        "{\"x\":{\"__entity\":\"A::\\\"b\\\"\"}}",
-        "{\"x\":[{\"__extn\":{}}]}",
+    input.body = RequestBody::Streamed;
+    assert_eq!(opacity(input.clone()), Some(OpaqueBody::Streamed));
+    input.body =
+        RequestBody::Buffered(format!("{{\"x\":\"{}\"}}", "a".repeat(17 * 1024)).into_bytes());
+    assert_eq!(opacity(input.clone()), Some(OpaqueBody::TooLarge));
+    for (bad, kind) in [
+        ("oops", OpaqueBody::Malformed),
+        ("{\"x\":", OpaqueBody::Malformed),
+        ("[]", OpaqueBody::Unrepresentable),
+        ("null", OpaqueBody::Unrepresentable),
+        ("\"x\"", OpaqueBody::Unrepresentable),
+        ("{\"x\":[1,null]}", OpaqueBody::Unrepresentable),
+        ("{\"x\":0.12345}", OpaqueBody::Unrepresentable),
+        ("{\"x\":1e300}", OpaqueBody::Unrepresentable),
+        ("{\"x\":9223372036854775808}", OpaqueBody::Unrepresentable),
+        ("{\"x\":1,\"x\":2}", OpaqueBody::Unrepresentable),
+        ("{\"x\":null,\"x\":2}", OpaqueBody::Unrepresentable),
+        (
+            "{\"nested\":{\"x\":1,\"x\":2}}",
+            OpaqueBody::Unrepresentable,
+        ),
+        (
+            "{\"x\":{\"__entity\":\"A::\\\"b\\\"\"}}",
+            OpaqueBody::Unrepresentable,
+        ),
+        ("{\"x\":[{\"__extn\":{}}]}", OpaqueBody::Unrepresentable),
     ] {
-        input.body = Some(bad.as_bytes().to_vec());
-        assert!(request_json(input.clone()).get("body").is_none(), "{bad}");
+        input.body = RequestBody::Buffered(bad.as_bytes().to_vec());
+        assert_eq!(opacity(input.clone()), Some(kind), "{bad}");
     }
-    input.body = Some(body.to_vec());
+    input.body = RequestBody::Buffered(body.to_vec());
     for media in [
-        "application/x-www-form-urlencoded",
-        "multipart/form-data",
-        "text/json",
+        Some("application/problem+json"),
+        Some("application/x-www-form-urlencoded"),
+        Some("multipart/form-data"),
+        Some("text/json"),
+        None,
     ] {
-        input.content_type = Some(media.into());
-        assert!(request_json(input.clone()).get("body").is_none());
+        input.content_type = media.map(str::to_owned);
+        assert_eq!(
+            opacity(input.clone()),
+            Some(OpaqueBody::MediaType),
+            "{media:?}"
+        );
     }
-    input.content_type = None;
-    assert!(request_json(input.clone()).get("body").is_none());
-    input.body = None;
-    assert!(request_json(input).get("body").is_none());
+}
+
+#[test]
+fn a_body_condition_admits_the_pinned_value_denies_others_and_denies_an_opaque_body() {
+    let engine = PolicyEngine::new(
+        r#"
+        @id("allow") permit(principal, action, resource);
+        @id("model-pin") forbid(principal, action, resource)
+        when { context has request }
+        unless { context.request has body
+                 && context.request.body has model
+                 && context.request.body.model == "typesafe/jev-1.13" };
+        @id("canvas-pin") forbid(principal, action, resource)
+        when { context has request }
+        when { context.request.url.path == "/api/canvases.edit" }
+        unless { context.request.body has canvas_id
+                 && context.request.body.canvas_id == "F0C907QUHU7" };
+    "#,
+        &world(),
+    )
+    .expect("guarded body fences load");
+    let decide = |path: &str, body: String| {
+        let mut input = facts(Some(body.as_bytes()));
+        input.path = path.to_owned();
+        engine.authorize_http(
+            capability_request("cpetersen", "cli-probe.upper", session()),
+            input,
+        )
+    };
+    for body in [DECIDE_BODY, CHAT_BODY] {
+        let allowed = decide("/api/alpha/decisions", body.to_owned());
+        assert!(allowed.allowed && !allowed.errors_present, "{allowed:?}");
+        assert_eq!(allowed.opaque_body, None);
+        let denied = decide(
+            "/api/alpha/decisions",
+            body.replace("typesafe/jev-1.13", "openai/gpt-6-luna-decisions"),
+        );
+        assert!(!denied.allowed && !denied.errors_present, "{denied:?}");
+        assert_eq!(denied.determining_policy_ids, ["model-pin"]);
+    }
+    let canvas = |canvas: &str| {
+        decide(
+            "/api/canvases.edit",
+            CANVAS_BODY.replace("F0C907QUHU7", canvas).replace(
+                "\"canvas_id\"",
+                "\"model\":\"typesafe/jev-1.13\",\"canvas_id\"",
+            ),
+        )
+    };
+    assert!(canvas("F0C907QUHU7").allowed);
+    let other = canvas("F0OTHER");
+    assert!(!other.allowed && !other.errors_present, "{other:?}");
+    assert_eq!(other.determining_policy_ids, ["canvas-pin"]);
+
+    let opaque = decide("/api/alpha/decisions", CHAT_BODY.replace("0.7", "0.12345"));
+    assert!(!opaque.allowed && opaque.errors_present, "{opaque:?}");
+    assert_eq!(opaque.opaque_body, Some(OpaqueBody::Unrepresentable));
+    assert_eq!(opaque.erroring_policy_ids, ["model-pin"]);
+
+    let mut form = facts(Some(b"channel=C0123"));
+    form.content_type = Some("application/x-www-form-urlencoded".to_owned());
+    let unread = PolicyEngine::new(
+        r#"
+        @id("allow") permit(principal, action, resource);
+        @id("post-only") forbid(principal, action, resource)
+        when { context has request }
+        unless { context.request.method == "POST" };
+    "#,
+        &world(),
+    )
+    .expect("guarded method fence loads")
+    .authorize_http(
+        capability_request("cpetersen", "cli-probe.upper", session()),
+        form,
+    );
+    assert!(unread.allowed && !unread.errors_present, "{unread:?}");
+    assert_eq!(unread.opaque_body, Some(OpaqueBody::MediaType));
 }
 
 #[test]

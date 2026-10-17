@@ -44,7 +44,7 @@ bytes = "1.12.1"
 http = "1.4.2"
 http-body = "1.1.0"
 humantime = "2.4.0"
-cedar-policy = { version = "4.12.0", default-features = false }
+cedar-policy = { version = "4.12.0", default-features = false, features = ["decimal"] }
 clap = { version = "4.6.4", features = ["derive", "env"] }
 flate2 = "1.1.10"
 form_urlencoded = "1.2.2"

@@ -114,7 +114,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 mod request;
-pub use request::HttpRequestFacts;
+pub use request::{HttpRequestFacts, OpaqueBody, RequestBody};
 
 pub const NAMESPACE: &str = "Dekopon";
 pub const AGENT_PROMPT_ACTION: &str = "agent.prompt";
@@ -457,6 +457,7 @@ pub struct PolicyDecision {
     /// channel for policy source or entity data on a per-request path.
     pub errors_present: bool,
     pub refusal: Option<String>,
+    pub opaque_body: Option<OpaqueBody>,
 }
 
 impl PolicyDecision {
@@ -467,6 +468,7 @@ impl PolicyDecision {
             erroring_policy_ids: Vec::new(),
             errors_present: true,
             refusal: Some(error.to_string()),
+            opaque_body: None,
         }
     }
 }
@@ -658,8 +660,8 @@ impl PolicyEngine {
         request: PolicyRequest,
         facts: Option<HttpRequestFacts>,
     ) -> PolicyDecision {
-        let cedar_request = match self.build_request(request, facts) {
-            Ok(cedar_request) => cedar_request,
+        let (cedar_request, opaque_body) = match self.build_request(request, facts) {
+            Ok(built) => built,
             Err(error) => return PolicyDecision::refused(&error),
         };
         let response =
@@ -690,6 +692,7 @@ impl PolicyEngine {
             erroring_policy_ids,
             errors_present,
             refusal: None,
+            opaque_body,
         }
     }
 
@@ -711,7 +714,7 @@ impl PolicyEngine {
         &self,
         request: PolicyRequest,
         request_facts: Option<HttpRequestFacts>,
-    ) -> Result<cedar_policy::Request, RequestError> {
+    ) -> Result<(cedar_policy::Request, Option<OpaqueBody>), RequestError> {
         let PolicyRequest {
             principal,
             target,
@@ -802,25 +805,27 @@ impl PolicyEngine {
         let context = Context::from_pairs(pairs).map_err(|source| RequestError::Context {
             message: source.to_string(),
         })?;
-        let context = if let Some(facts) = request_facts {
-            context
-                .merge(facts.context()?)
+        let (context, opaque_body) = if let Some(facts) = request_facts {
+            let (request, opaque_body) = facts.context()?;
+            let context = context
+                .merge(request)
                 .map_err(|source| RequestError::Context {
                     message: source.to_string(),
-                })?
+                })?;
+            (context, opaque_body)
         } else {
-            context
+            (context, None)
         };
         let schema = if has_request {
             None
         } else {
             Some(&self.schema)
         };
-        cedar_policy::Request::new(principal, action, resource, context, schema).map_err(|source| {
-            RequestError::Schema {
+        cedar_policy::Request::new(principal, action, resource, context, schema)
+            .map(|request| (request, opaque_body))
+            .map_err(|source| RequestError::Schema {
                 message: source.to_string(),
-            }
-        })
+            })
     }
 }
 
