@@ -886,7 +886,7 @@ verifying provenance for each downloaded component.
 ## Audit
 
 Audit is the `broker.decision` and `broker.execution` log events the broker emits inside the span
-that made each decision: structured JSON on stdout always, and OTLP log records when `telemetry`
+that made each decision: structured JSON on best-effort stdout, and OTLP log records when `telemetry`
 names a receiver, over the same endpoint and headers as the spans. Their fields and correlation are
 documented in [observability](../../docs/observability.md#the-broker-audit-record).
 
