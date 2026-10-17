@@ -8,6 +8,14 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## ChatGPT auth-file diagnostics and fixed session tools (0.49.0)
+
+A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
+broker and gateway together. Code that implements `dekopon_agent::AssetSource` replaces `is_empty`
+with `offers_fetch`, which a session asks once and keeps for every turn. Chart 0.36.0, the chart for
+this release, mounts gateway configuration, catalog and skills read-only and directly instead of
+copying them, so those edits apply on the next gateway reload; see the chart's changelog entry.
+
 ## Policy digests, gateway file ownership and journal v2 (0.48.0)
 
 Upgrade the broker and gateway together; no provider WIT or SDK re-pin is needed. Before
