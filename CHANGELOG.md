@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.36.1] - 2026-10-17
+
+### Fixed
+
+- The chart's init container no longer crash-loops with "Permission denied" when broker.privateFiles is set; files are copied before the private directory is handed to the broker UID.
+
 ## [dekopon-chart-0.36.0] - 2026-10-16
 
 ### Changed
