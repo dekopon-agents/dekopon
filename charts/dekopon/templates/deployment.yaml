@@ -129,9 +129,9 @@ spec:
               {{- end }}
 
 {{- if $private }}
-              mkdir -p "{{ $cfg }}/private"
-              chown "$uid:$gid" "{{ $cfg }}/private"
-              chmod 0700 "{{ $cfg }}/private"
+
+              # Copy before the handover: root without CAP_DAC_OVERRIDE cannot enter a 0700 directory it does not own.
+              mkdir -m 0700 "{{ $cfg }}/private"
 {{- range $private }}
               install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .source }}" "{{ $cfg }}/private/{{ .file }}"
               got=$(stat -c '%u:%g:%a:%h:%F' "{{ $cfg }}/private/{{ .file }}")
@@ -140,6 +140,12 @@ spec:
                 rc=1
               fi
 {{- end }}
+              chown "$uid:$gid" "{{ $cfg }}/private"
+              got=$(stat -c '%u:%a:%F' "{{ $cfg }}/private")
+              if [ "$got" != "$uid:700:directory" ]; then
+                echo "{{ $cfg }}/private: got $got, want $uid:700:directory" >&2
+                rc=1
+              fi
 {{- end }}
 
               # Assert what the daemons assert, so a wrong file is an init failure naming the file

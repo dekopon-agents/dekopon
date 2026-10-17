@@ -24,7 +24,8 @@ def test_private_copy_and_record_mount() -> None:
     )
     assert result.returncode == 0, result.stderr
     yaml = result.stdout
-    assert 'install -m 0600 -o "$uid" -g "$gid" "/dekopon-source/private-app-key.pem" "/etc/dekopon/private/app-key.pem"' in yaml
+    copy = yaml.index('install -m 0600 -o "$uid" -g "$gid" "/dekopon-source/private-app-key.pem" "/etc/dekopon/private/app-key.pem"')
+    assert yaml.index('mkdir -m 0700 "/etc/dekopon/private"') < copy < yaml.index('chown "$uid:$gid" "/etc/dekopon/private"')
     assert 'chmod 0700 "/etc/dekopon/private"' in yaml
     assert 'rm -rf "/etc/dekopon/private"' in yaml
     assert 'name: app-key' in yaml
