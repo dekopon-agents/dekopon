@@ -7,6 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.36.0] - 2026-10-16
+
+### Changed
+
+- Gateway configuration, catalog and skills updates become available without a chart-triggered pod restart: the gateway mounts its configuration (a read-only Secret projection, or the `gateway.configDirectory.configMap` directory) at `paths.gatewayConfigDir`, and its catalog and skills ConfigMaps, directly and read-only instead of init-container copies.
+- Chart 0.36.0 targets core v0.49.0 and pins the verified v0.49.0 stock image index.
+
 ## [0.49.0] - 2026-10-16
 
 ### Changed
