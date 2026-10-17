@@ -7,6 +7,21 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-10-16
+
+### Changed
+
+- A prompt session fixes its offered tools, including whether `fetch_chat_asset` is offered, when it starts, so Codex requests keep a stable prefix across image fetches and asset changes.
+- `dekopon_agent::AssetSource` implementors provide `offers_fetch`, asked once per session, instead of `is_empty`.
+
+### Fixed
+
+- A malformed or mistyped ChatGPT auth file no longer has its field values copied into the gateway's boot error, logs or the auth CLI; errors name the file, the field and the expected shape.
+- dekopon-brokerd names the problem in a version-mismatched or incomplete ChatGPT auth file instead of "credential status unavailable".
+- An unreadable ChatGPT auth file reports its I/O error instead of a parse error at line 0, column 0.
+- A gateway reload refused because the guest model proxy could not be rebuilt now names the model and credential variable it lacks.
+- The GitHub App credential refresh span records the token endpoint's HTTP status.
+
 ## [dekopon-chart-0.35.0] - 2026-10-16
 
 ### Added
