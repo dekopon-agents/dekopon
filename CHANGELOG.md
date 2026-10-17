@@ -1,5 +1,9 @@
 # Console changelog
 
+## 0.14.1
+
+- Changed: Target published Dekopon 0.49.1 with exact crates.io pins for all ten authored core dependencies, the pairing for chart 0.36.2; core 0.49.1 keeps request bodies with nulls and fractions in Cedar context.
+
 ## 0.14.0
 
 - Changed: Target published Dekopon 0.49.0 with exact crates.io pins for all ten authored core dependencies, the pairing for chart 0.36.0, which mounts skills and the catalog as live read-only projections.
