@@ -180,9 +180,46 @@ def test_retired_source_names_and_paths_are_not_reserved():
     render("-f", str(DIRECTORY), "--set", "providerStorage.enabled=true", "--set", "providerStorage.rootPath=/dekopon-gateway-d-source")
 
 
+def test_config_check_mounts_gateway_candidates_as_the_deployment_does():
+    item = {"key": "review-skill", "path": "pull-request-review/SKILL.md", "mode": 0o664}
+    docs, _, _, deployment_volumes, _, _, _ = render(
+        "-f", str(DIRECTORY),
+        "--set-json", "gateway.skills.items=" + json.dumps([item]),
+        "--set", "configCheck.enabled=true",
+        "--set", "configCheck.gateway.configMap=dekopon-check-gatewayd-d",
+        "--set", "configCheck.gateway.catalogConfigMap=dekopon-check-agents-d",
+        "--set", "configCheck.gateway.skillsConfigMap=dekopon-check-skills",
+        "--set", "configCheck.gateway.againstConfigMap=dekopon-gatewayd-d",
+    )
+    job = next(d for d in docs if d["kind"] == "Job" and d["metadata"]["name"].endswith("-config-check"))
+    spec = job["spec"]["template"]["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    check = next(c for c in spec["containers"] if c["name"] == "check-gateway")
+    init = next(c for c in spec["initContainers"] if c["name"] == "prepare-candidate")
+    assert check["args"][:4] == ["check", "/check/gatewayd.d", "--catalog=/check/agents.d", "--probe"]
+    expected = {
+        "gateway-source": "/check/gatewayd.d",
+        "catalog-source": "/check/agents.d",
+        "against-source": "/check/live.d",
+        "skills": "/etc/dekopon-skills",
+    }
+    for name, path in expected.items():
+        assert mounts(check)[name] == {"name": name, "mountPath": path, "readOnly": True}
+        assert name not in mounts(init)
+        assert "configMap" in volumes[name]
+    assert "check" not in mounts(check)
+    assert volumes["skills"]["configMap"] == {
+        **deployment_volumes["skills"]["configMap"], "name": "dekopon-check-skills",
+    }
+    assert volumes["skills"]["configMap"]["items"] == [item]
+    assert volumes["gateway-source"]["configMap"]["defaultMode"] == deployment_volumes["gateway-config"]["configMap"]["defaultMode"]
+    assert "/check/gatewayd.d" not in init["args"][0] and "/source/skills" not in init["args"][0]
+
+
 if __name__ == "__main__":
     test_live_gateway_directory_and_nested_skills()
     test_inline_gateway_source_changes_without_broker_roll()
     test_restart_notice_names_only_broker_secret_sources()
     test_existing_gateway_secret_and_broker_restart_sources()
     test_retired_source_names_and_paths_are_not_reserved()
+    test_config_check_mounts_gateway_candidates_as_the_deployment_does()

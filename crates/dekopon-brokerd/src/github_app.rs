@@ -252,6 +252,7 @@ impl GithubAppCredential {
             .await
             .map_err(|error| self.transport(&error))?;
         let status = response.status();
+        tracing::Span::current().record("http.response.status_code", status.as_u16());
         if status == StatusCode::UNAUTHORIZED {
             tracing::error!(
                 event = "broker_github_app_credential_reauth_required",
@@ -331,6 +332,7 @@ impl RefreshingCredential for GithubAppCredential {
             "broker.credential.refresh",
             credential = %self.name,
             outcome = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
         );
         let minted = match self.mint(now).instrument(span.clone()).await {
             Ok(minted) => minted,
@@ -352,7 +354,7 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use dekopon_broker::{CredentialRefreshError, RefreshingCredential as _};
-    use dekopon_test_support::{CaptureLayer, LoopbackServer};
+    use dekopon_test_support::{CaptureLayer, LoopbackServer, Record};
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -711,17 +713,27 @@ mod tests {
                     category: "token-endpoint-rejected"
                 }
             ));
-            let events = capture.events_where(
-                "dekopon_brokerd::github_app",
-                &[("event", "broker_github_app_credential_refresh_failed")],
-            );
+            let events = capture.events_where("dekopon_brokerd::github_app", &[]);
             assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].field("event"),
+                Some("broker_github_app_credential_refresh_failed")
+            );
             assert_eq!(events[0].field("category"), Some("token-endpoint-rejected"));
             assert_eq!(events[0].field("error"), None);
             assert_eq!(
                 events[0].field("message"),
                 Some("a GitHub App installation token could not be minted")
             );
+            let code = status.split(' ').next();
+            assert!(capture.records().iter().any(|record| matches!(
+                record,
+                Record::Span {
+                    name: "broker.credential.refresh",
+                    ..
+                }
+            )
+                && record.field("http.response.status_code") == code));
             server.join();
         }
     }

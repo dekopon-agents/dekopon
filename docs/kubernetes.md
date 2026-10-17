@@ -622,9 +622,11 @@ directory, `dekopon-check-*`), annotated as hooks of the same phase with a lower
 Job, so they exist before it starts. `againstConfigMap` names the live gateway ConfigMap: only a
 model absent from it or changed in it is probed, so an unchanged model costs no vendor call.
 
-A root init container copies each ConfigMap into a `0700` directory owned by the daemon that reads
-it, as `0600` regular files, because `check` refuses the symlinks a ConfigMap mount is made of. The
-broker check runs as `65532`, resolving `providerSetConfigMap`'s `providers.yaml` into
+A root init container copies the broker ConfigMaps into a `0700` directory owned by `65532`, as
+`0600` regular files, because `dekopon-brokerd check` refuses the symlinks a ConfigMap mount is made
+of. The gateway candidates are mounted read-only exactly as the Deployment mounts them, so a mode
+production would refuse (a group-writable skill, say) fails the hook too. The broker check runs as
+`65532`, resolving `providerSetConfigMap`'s `providers.yaml` into
 `<paths.stateDir>/config-check` on the state claim, so blobs persist between runs; that path needs
 `state.existingClaim` under the default Helm hook. The gateway check runs as `65533` with `env`,
 which should name each probed model's `apiKeyEnv` and nothing else; no ChatGPT login is mounted,

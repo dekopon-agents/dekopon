@@ -530,14 +530,14 @@ fn open_auth_file(
         format!(
             "credential {name:?} authFile {} is not a Dekopon ChatGPT credential: {}",
             auth_file.display(),
-            safe_chatgpt_diagnostic(&source)
+            error_chain(&source)
         )
     })?;
     let status = credential.status().map_err(|source| {
         format!(
             "credential {name:?} authFile {} could not be inspected: {}",
             auth_file.display(),
-            safe_chatgpt_diagnostic(&source)
+            error_chain(&source)
         )
     })?;
     tracing::info!(
@@ -549,15 +549,6 @@ fn open_auth_file(
         "loaded a ChatGPT subscription credential"
     );
     Ok(credential)
-}
-
-#[cfg(unix)]
-fn safe_chatgpt_diagnostic(error: &ChatGptError) -> String {
-    if let ChatGptError::ParseAuth { line, column, .. } = error {
-        format!("invalid JSON at line {line}, column {column}")
-    } else {
-        "credential status unavailable".to_owned()
-    }
 }
 
 fn parent_is_owner_writable(parent: &Path) -> bool {
@@ -1012,6 +1003,19 @@ credentials:
         tokio::fs::write(&unparseable, "not a credential document")
             .await
             .expect("overwrite with a non-credential document");
+        let mut document = serde_json::from_str::<serde_json::Value>(&chatgpt_document(u64::MAX))
+            .expect("fixture is JSON");
+        document["version"] = serde_json::json!(2);
+        let version_two = write_auth_file(directory.path(), "version-two", u64::MAX, 0o600).await;
+        tokio::fs::write(&version_two, document.to_string())
+            .await
+            .expect("overwrite with a version 2 document");
+        document["version"] = serde_json::json!(1);
+        document["refresh"] = serde_json::json!("");
+        let incomplete = write_auth_file(directory.path(), "incomplete", u64::MAX, 0o600).await;
+        tokio::fs::write(&incomplete, document.to_string())
+            .await
+            .expect("overwrite with an incomplete document");
         let read_only = write_auth_file(directory.path(), "read-only", u64::MAX, 0o600).await;
         tokio::fs::set_permissions(
             read_only.parent().expect("auth parent"),
@@ -1032,7 +1036,12 @@ credentials:
             (symlinked, "not trusted input"),
             (group_readable, "not trusted input"),
             (world_readable, "not trusted input"),
-            (unparseable, "not a Dekopon ChatGPT credential"),
+            (unparseable, "the file is not valid JSON"),
+            (version_two, "unsupported `version`; expected 1"),
+            (
+                incomplete,
+                "`access`, `refresh` and `accountId` must be non-empty",
+            ),
             (read_only, "cannot write"),
             (open_parent, "owner-only parent directory"),
             (
@@ -1051,6 +1060,8 @@ credentials:
                 "{} was refused as {rendered:?}, which does not name {expected:?}",
                 path.display()
             );
+            assert!(!rendered.contains("fixture-refresh-token"), "{rendered}");
+            assert!(!rendered.contains("header."), "{rendered}");
         }
 
         for subdir in ["read-only", "open-parent"] {

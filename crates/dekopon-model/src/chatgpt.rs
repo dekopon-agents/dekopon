@@ -2,8 +2,7 @@ use parking_lot::Mutex;
 use std::{
     env,
     ffi::OsString,
-    fmt,
-    fs::{self, File},
+    fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     thread,
@@ -815,7 +814,7 @@ fn credential_lock_path(auth_path: &Path) -> Option<PathBuf> {
 }
 
 fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
-    let file = File::open(path).map_err(|source| {
+    let bytes = fs::read(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             ChatGptError::NotLoggedIn {
                 path: path.to_path_buf(),
@@ -827,7 +826,7 @@ fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
             }
         }
     })?;
-    let credentials = serde_json::from_reader::<_, ChatGptCredentials>(file).map_err(|source| {
+    let credentials = serde_json::from_slice::<ChatGptCredentials>(&bytes).map_err(|source| {
         ChatGptError::ParseAuth {
             path: path.to_path_buf(),
             category: source.classify(),
@@ -914,10 +913,9 @@ fn unix_time() -> Result<u64, ChatGptError> {
 
 const fn parse_problem(category: serde_json::error::Category) -> &'static str {
     match category {
-        serde_json::error::Category::Io => "the file could not be read",
-        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-            "the file is not valid JSON"
-        }
+        serde_json::error::Category::Io
+        | serde_json::error::Category::Syntax
+        | serde_json::error::Category::Eof => "the file is not valid JSON",
         serde_json::error::Category::Data => {
             "expected an object with integer `version` and `expiresAt` and string `access`, `refresh` and `accountId`"
         }
@@ -995,7 +993,7 @@ pub enum ChatGptError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::{fs, io, path::Path, time::Duration};
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::{Value, json};
@@ -1130,6 +1128,16 @@ mod tests {
             message.contains("relative-config"),
             "the refusal must name the path an operator will go and look at: {message}"
         );
+    }
+
+    #[test]
+    fn an_auth_path_that_cannot_be_read_is_a_read_failure_with_its_io_kind() {
+        let temp = TempDir::new().expect("temporary directory");
+
+        let Err(ChatGptError::ReadAuth { source, .. }) = load_credentials(temp.path()) else {
+            panic!("an unreadable auth path is a read failure");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::IsADirectory);
     }
 
     fn fake_access(account: &str) -> String {
@@ -2617,13 +2625,18 @@ mod tests {
 
     #[test]
     fn a_rejected_refresh_grant_carries_the_oauth_code_as_a_field() {
+        let refresh = "refresh-old-sentinel-7c1e";
+        let access = fake_access("acct-old");
         let server = MockServer::start(vec![MockResponse::failure(
             400,
-            json!({"error": "invalid_grant", "error_description": "token expired or revoked"}),
+            json!({
+                "error": "invalid_grant",
+                "error_description": format!("token expired or revoked: {refresh} {access}"),
+            }),
         )]);
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
-        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+        save_credentials(&path, &credential_fixture("acct-old", refresh, 0))
             .expect("save credentials");
         let credential = CredentialFile::with_endpoints(
             &path,
@@ -2651,12 +2664,15 @@ mod tests {
             "the refusal must carry the OAuth code a caller classifies on, as a field"
         );
         assert!(detail.contains("token expired or revoked"), "{detail}");
+        assert!(!detail.contains(refresh), "{detail}");
+        assert!(!detail.contains(&access), "{detail}");
+        assert!(!refused.to_string().contains(refresh), "{refused}");
         assert_eq!(
             load_credentials(&path)
                 .expect("stored credentials")
                 .refresh
                 .expose(),
-            "refresh-old",
+            refresh,
             "a failed refresh must not rewrite the stored credential"
         );
     }

@@ -47,8 +47,10 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
-        # check refuses symlinks and files it does not own, and a ConfigMap mount is a root-owned
-        # symlink farm, so every candidate file is copied into a 0700 directory its daemon owns.
+        # dekopon-brokerd check refuses symlinks and files it does not own, and a ConfigMap mount is
+        # a root-owned symlink farm, so every broker candidate file is copied into a 0700 directory
+        # the broker owns. Gateway candidates are mounted directly: a copy would hide a mode the
+        # Deployment refuses.
         - name: prepare-candidate
           image: {{ include "dekopon.initImage" . }}
           imagePullPolicy: {{ .Values.initImage.pullPolicy }}
@@ -88,21 +90,6 @@ spec:
               chown {{ $uid }}:{{ $gid }} "{{ $storeDir }}"
               chmod 0700 "{{ $storeDir }}"
 {{- end }}
-{{- if $check.gateway.configMap }}
-              copy 65533 {{ $check.gateway.configMap }} /check/gatewayd.d /source/gatewayd.d/*.yaml
-              copy 65533 {{ $check.gateway.catalogConfigMap }} /check/agents.d /source/agents.d/*
-{{- if $check.gateway.againstConfigMap }}
-              copy 65533 {{ $check.gateway.againstConfigMap }} /check/live.d /source/live.d/*.yaml
-{{- end }}
-{{- end }}
-{{- if $skills }}
-              for entry in /source/skills/*; do
-                [ -e "$entry" ] || continue
-                cp -RL "$entry" {{ .Values.paths.skillsDir }}/
-              done
-              find {{ .Values.paths.skillsDir }} -type d -exec chmod 0755 {} +
-              find {{ .Values.paths.skillsDir }} -type f -exec chmod 0644 {} +
-{{- end }}
           resources:
             requests:
               cpu: 10m
@@ -126,26 +113,6 @@ spec:
               readOnly: true
             - name: state
               mountPath: {{ .Values.paths.stateDir }}
-{{- end }}
-{{- if $check.gateway.configMap }}
-            - name: gateway-source
-              mountPath: /source/gatewayd.d
-              readOnly: true
-            - name: catalog-source
-              mountPath: /source/agents.d
-              readOnly: true
-{{- if $check.gateway.againstConfigMap }}
-            - name: against-source
-              mountPath: /source/live.d
-              readOnly: true
-{{- end }}
-{{- end }}
-{{- if $skills }}
-            - name: skills-source
-              mountPath: /source/skills
-              readOnly: true
-            - name: skills
-              mountPath: {{ .Values.paths.skillsDir }}
 {{- end }}
       containers:
 {{- if $check.broker.configMap }}
@@ -200,9 +167,17 @@ spec:
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
           volumeMounts:
-            - name: check
-              mountPath: /check
+            - name: gateway-source
+              mountPath: /check/gatewayd.d
               readOnly: true
+            - name: catalog-source
+              mountPath: /check/agents.d
+              readOnly: true
+{{- if $check.gateway.againstConfigMap }}
+            - name: against-source
+              mountPath: /check/live.d
+              readOnly: true
+{{- end }}
             - name: tmp
               mountPath: /tmp
 {{- if .Values.gateway.proxy.enabled }}
@@ -248,6 +223,7 @@ spec:
         - name: gateway-source
           configMap:
             name: {{ $check.gateway.configMap }}
+            defaultMode: 292
         - name: catalog-source
           configMap:
             name: {{ $check.gateway.catalogConfigMap }}
@@ -258,16 +234,12 @@ spec:
 {{- end }}
 {{- end }}
 {{- if $skills }}
-        - name: skills-source
+        - name: skills
           configMap:
             name: {{ $check.gateway.skillsConfigMap }}
-            defaultMode: 0400
+            defaultMode: 292
             items:
               {{- toYaml .Values.gateway.skills.items | nindent 14 }}
-        - name: skills
-          emptyDir:
-            medium: Memory
-            sizeLimit: {{ .Values.volumeSizes.config }}
 {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
