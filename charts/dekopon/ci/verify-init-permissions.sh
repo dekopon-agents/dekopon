@@ -245,9 +245,10 @@ printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.ceda
 printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' > "$stamp/broker-credentials.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
 printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
+printf 'PRIVATE-APP-KEY\n' > "$stamp/private-app-key.pem"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml chatgpt-auth.json broker-chatgpt-auth.json; do
+for k in broker.yaml policies.cedar broker-credentials.yaml chatgpt-auth.json broker-chatgpt-auth.json private-app-key.pem; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
@@ -1004,9 +1005,32 @@ docker run --rm -i --platform "$platform" --user 65532:65532 --cap-drop=ALL \
   -v "${resource}-check":/check:ro \
   "$python_image" python3 - < "$work/config-check-set.py"
 
+# --------------------------------------------------------------------------------------------
+# Part 5: broker private files, copied into a broker-owned 0700 directory
+# --------------------------------------------------------------------------------------------
+echo
+echo "==> (r) broker.privateFiles: cold start, then an in-place restart over the handed-over directory"
+render_init "$work/init-private.sh" \
+  --set 'broker.privateFiles[0].file=app-key.pem' \
+  --set 'broker.privateFiles[0].existingSecret=app-key' \
+  --set 'broker.privateFiles[0].existingSecretKey=key'
+reset_mounts
+run_init "$work/init-private.sh"
+run_init "$work/init-private.sh"
+private_perms=$(docker run --rm --platform "$platform" -v "${resource}-etc":/etc/dekopon "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%F' /etc/dekopon/private; stat -c '%u:%g:%a:%h:%F' /etc/dekopon/private/app-key.pem")
+assert_eq "private directory and file permissions" "$private_perms" \
+  "$(printf '65532:65532:700:directory\n65532:65532:600:1:regular file')"
+private_source=$(docker run --rm --platform "$platform" -v "${resource}-src":/s "$busybox" \
+  sh -c 'sha256sum /s/private-app-key.pem | cut -d" " -f1' | tr -d '[:space:]')
+private_copy=$(docker run --rm --platform "$platform" --user 65532:65532 --cap-drop=ALL \
+  --security-opt=no-new-privileges -v "${resource}-etc":/etc/dekopon "$busybox" \
+  sh -c 'sha256sum /etc/dekopon/private/app-key.pem | cut -d" " -f1' | tr -d '[:space:]')
+assert_eq "UID 65532 reads the copied private file" "$private_copy" "$private_source"
+
 echo "==> render live gateway projections"
 python3 "$chart_dir/ci/test-live-sources.py"
 echo "PASS gateway source mounts are live, read-only and isolated"
 
 echo
-echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only; the managed provider set is broker-only, owned by 65532, and survives a restart."
+echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only; the managed provider set is broker-only, owned by 65532, and survives a restart; broker private files are copied into a 65532-owned 0700 directory."
