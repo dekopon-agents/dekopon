@@ -22,7 +22,8 @@ links them read the active trace without linking an exporter.
 stderr, filtered by `RUST_LOG` or by a fixed directive — then any process-specific layer, then the
 OTLP span layer, then the OTLP log bridge, in that order so an entered span has already activated
 a context the log SDK can correlate against. It returns a `TelemetryGuard` whose `shutdown` flushes
-and stops both providers, reporting every failure rather than the first. What a caller does with
+and stops both providers and drains the bounded stdout writer within the shutdown timeout (one
+second by default), reporting every failure rather than the first. What a caller does with
 that failure stays the caller's policy: the daemons log and carry on.
 
 ## Transports
