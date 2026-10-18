@@ -20,7 +20,8 @@ use dekopon_provider_sdk::{
     },
 };
 use dekopon_provider_sdk_testkit::{
-    BrokerHostLimits, Harness, HarnessError, HttpScript, Native, conformance,
+    BrokerHostLimits, ChatSlot, Harness, HarnessError, HttpScript, Native, RequestTemplate,
+    conformance,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -564,6 +565,72 @@ fn scripted_response_headers_match_native_and_typed_component() {
     assert_eq!(real_output["headerCount"], output["headerCount"]);
     assert_eq!(real.http_calls.len(), 1);
     assert_eq!(real.http_calls[0].authority, authority);
+}
+
+#[test]
+fn a_templated_read_sends_the_attested_slot_and_without_it_never_leaves_the_host() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/http-probe-provider.wasm");
+    let template: RequestTemplate = serde_json::from_value(json!({
+        "method": "GET",
+        "path": "/api/conversations.replies",
+        "query": {"pinned": {"channel": "conversation.id"}, "allowed": ["limit"]}
+    }))
+    .unwrap();
+    let script = HttpScript::new(
+        "fixture.example.test",
+        "GET",
+        Response {
+            status: 200,
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+        },
+    );
+    let run = Harness::<RawHttp>::get(&path)
+        .http(script.clone())
+        .template(template.clone())
+        .chat_slot(ChatSlot::ConversationId, "C0123ABC");
+    let origin = run.origin().unwrap().to_owned();
+    let output = run
+        .call(
+            "http-probe.fetch",
+            json!({"uri": format!("{origin}/api/conversations.replies?limit=3")}),
+        )
+        .unwrap();
+    assert_eq!(output.status, 0, "{}", output.stderr);
+    assert_eq!(output.http_calls.len(), 1);
+    let request = output
+        .http_request
+        .expect("templated request reached HTTPS");
+    assert_eq!(
+        request.uri,
+        format!("{origin}/api/conversations.replies?limit=3&channel=C0123ABC")
+    );
+    assert!(
+        request
+            .headers
+            .iter()
+            .all(|header| header.name != "authorization")
+    );
+
+    let run = Harness::<RawHttp>::get(&path)
+        .http(script)
+        .template(template);
+    let origin = run.origin().unwrap().to_owned();
+    let error = run
+        .call(
+            "http-probe.fetch",
+            json!({"uri": format!("{origin}/api/conversations.replies?limit=3")}),
+        )
+        .unwrap_err();
+    let HarnessError::Invocation(failure) = error else {
+        panic!("expected a typed host refusal, got {error:?}");
+    };
+    assert!(matches!(
+        *failure.error,
+        dekopon_broker_host::BrokerHostError::HostCallRejected { .. }
+    ));
+    assert!(failure.http_calls.is_empty());
 }
 
 #[test]

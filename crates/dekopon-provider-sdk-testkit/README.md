@@ -26,6 +26,12 @@ same native `Port::spawn` path and `Native::children` returns the captured
 runs. A scripted delay advances the native monotonic clock and runs on the
 real host for a component.
 
+`Run::template(RequestTemplate)` adds a request template enforced by the
+component Harness's real HTTP host. `Run::chat_slot(ChatSlot, value)` supplies an
+attested chat-scope value for that invocation; a missing required slot refuses
+the templated request before egress. `ChatSlot` and `RequestTemplate` are
+re-exported by the testkit.
+
 Storage and external components have no native typed provider; their fixture
 integration tests live in `dekopon-broker-host/tests/fixture_host.rs` and use
 exact authorized grants against the real storage host. Neither harness grants

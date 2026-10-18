@@ -8,7 +8,7 @@ mod typed;
 
 pub use conformance::{ConformanceError, conformance};
 pub use dekopon_broker_host::BrokerHostLimits;
-pub use dekopon_capability::AssetConstraints;
+pub use dekopon_capability::{AssetConstraints, ChatSlot, RequestTemplate};
 pub use typed::{
     ChildInput, ChildRun, ChildScript, ComponentOutput, Harness, HarnessError, HttpScript, Native,
     NativeOutput, Run,

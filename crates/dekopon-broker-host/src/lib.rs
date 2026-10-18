@@ -1765,21 +1765,12 @@ impl BrokerProviderRegistry {
     pub async fn invoke_with_test_imports(
         &self,
         authorized: AuthorizedInvocation,
-        credential: Option<BoundCredential>,
-        storage_grant: Option<StorageGrant>,
+        slots: ChatSlotValues,
         assets: asset::AssetInputs,
         test_imports: Option<&TestImports>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
-        self.invoke_authorized(
-            authorized,
-            credential,
-            storage_grant,
-            ChatSlotValues::default(),
-            None,
-            assets,
-            test_imports,
-        )
-        .await
+        self.invoke_authorized(authorized, None, None, slots, None, assets, test_imports)
+            .await
     }
 
     #[expect(
