@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Telemetry drops and testkit templates (0.50.0)
+
+A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
+broker and gateway together. A stalled stdout reader no longer blocks either daemon: console lines
+that do not fit the queue are dropped and counted in `telemetry.console.dropped`. The chart's
+`image.digest` now defaults to empty, so the default image is the `v0.50.0` tag; set it to pin.
+
 ## Request bodies in Cedar context (0.49.1)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
