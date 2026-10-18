@@ -159,6 +159,90 @@ async fn scheduled_and_authorized_use_share_the_record_lock() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_record_that_becomes_unreadable_mid_run_is_reported_once_and_never_refreshed() {
+    async fn tick(inspections: &AtomicU64, number: u64) {
+        if number > 1 {
+            tokio::time::advance(Duration::from_secs(5 * 60)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while inspections.load(Ordering::SeqCst) < number * 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first record inspected before the second clock read");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.json");
+    let witness = dir.path().join("witness.json");
+    write_record(&path, 100_000);
+    write_record(&witness, 100_000);
+    let api = TokenApi::serving(|_| ("500 Internal Server Error", "{}".to_owned()));
+    let mut entry = resolver(&path, &api.endpoint, &["one", "two"]);
+    for (name, record) in [("one", &path), ("two", &witness)] {
+        let mut source = source_value(record, &api.endpoint);
+        source["refresh"] = json!("scheduled");
+        entry.entries.get_mut(&drn(name)).unwrap().source = serde_json::from_value(source).unwrap();
+    }
+    let scheduled = ScheduledCatalog {
+        resolver: Some(Arc::new(entry)),
+    };
+    let inspections = Arc::new(AtomicU64::new(0));
+    let capture = CaptureLayer::new();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(
+        refresh_scheduler::serve_with_clock(
+            async {
+                stopped.await.expect("shutdown");
+                Ok(())
+            },
+            move || scheduled.clone(),
+            ShutdownDeadline::default(),
+            Arc::new({
+                let inspections = Arc::clone(&inspections);
+                move || {
+                    inspections.fetch_add(1, Ordering::SeqCst);
+                    1
+                }
+            }),
+        )
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone())),
+    );
+    tick(&inspections, 1).await;
+    assert!(api.requests().is_empty());
+    let sentinel = "sensitive-mid-run-record-sentinel";
+    let malformed = format!("{{\"state\":{sentinel}}}");
+    fs::write(&path, &malformed).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    for number in 2..=4 {
+        tick(&inspections, number).await;
+    }
+    let invalid = || {
+        capture.events_where(
+            "dekopon_brokerd::refresh_scheduler",
+            &[("event", "broker_credential_record_invalid")],
+        )
+    };
+    assert_eq!(invalid().len(), 1);
+    assert_eq!(invalid()[0].field("credential"), Some(drn("one").as_str()));
+    assert_eq!(
+        invalid()[0].field("instruction"),
+        Some("delete the record and provide a new seed")
+    );
+    write_record(&path, 100_000);
+    tick(&inspections, 5).await;
+    fs::write(&path, malformed).unwrap();
+    tick(&inspections, 6).await;
+    stop.send(()).expect("stop receiver");
+    task.await.unwrap().unwrap();
+    assert_eq!(invalid().len(), 2);
+    assert!(api.requests().is_empty());
+    assert!(!capture.text().contains(sentinel));
+    assert!(!capture.text().contains(path.to_str().unwrap()));
+}
+
+#[tokio::test(start_paused = true)]
 async fn transient_due_attempt_retries_after_five_minutes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
