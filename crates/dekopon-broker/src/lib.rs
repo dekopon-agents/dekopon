@@ -3401,8 +3401,7 @@ where
                 let digest = decision_evidence_digest("policy-decision", &material);
                 let ordinal = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let decision_id = format!("http-{invocation}-{ordinal}");
-                if !result.allowed
-                    && result.errors_present
+                if result.errors_present
                     && let Some(opaque) = result.opaque_body
                 {
                     tracing::warn!(

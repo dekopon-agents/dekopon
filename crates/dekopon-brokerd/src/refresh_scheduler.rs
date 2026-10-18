@@ -85,7 +85,7 @@ where
                 }
                 Err(_join) => {
                     if unreadable.insert(path.clone()) && !new_generation {
-                        tracing::error!(event = "broker_credential_record_invalid", credential = %drn, category = SourceError::Internal.category(), instruction = "delete the record and provide a new seed");
+                        tracing::error!(event = "broker_credential_record_inspection_failed");
                     }
                     false
                 }
