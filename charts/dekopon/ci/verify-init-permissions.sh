@@ -9,12 +9,14 @@
 # ..<timestamp>/, ..data -> ..<timestamp>, and key -> ..data/key.
 #
 # It asserts the filesystem tiers as each distinct UID and runs the rendered config-check
-# init and real broker check against a non-sticky tmpfs before accepting the hook.
+# init and the broker built from this checkout, on the image's runtime base, against a non-sticky
+# tmpfs before accepting the hook.
 #
-# Requires: helm, docker (with linux/arm64 emulation or an arm64 host), python3.
+# Requires: helm, docker (with linux/arm64 emulation or an arm64 host), python3, and BROKER_BINARY,
+# a dekopon-brokerd built for PLATFORM.
 #
-#   charts/dekopon/ci/verify-init-permissions.sh
-#   PLATFORM=linux/amd64 charts/dekopon/ci/verify-init-permissions.sh
+#   BROKER_BINARY=target/aarch64-unknown-linux-gnu/debug/dekopon-brokerd charts/dekopon/ci/verify-init-permissions.sh
+#   PLATFORM=linux/amd64 BROKER_BINARY=target/debug/dekopon-brokerd charts/dekopon/ci/verify-init-permissions.sh
 set -euo pipefail
 
 chart_dir=$(cd "$(dirname "$0")/.." && pwd)
@@ -49,6 +51,8 @@ docker() {
 }
 
 platform=${PLATFORM:-linux/arm64}
+broker_binary=$(realpath -e "${BROKER_BINARY:?set BROKER_BINARY to a dekopon-brokerd built for $platform}")
+runtime_base=$(sed -n 's/^FROM //p' "$chart_dir/../../Dockerfile")
 busybox=busybox@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
 python_image=python:3.13-alpine
 
@@ -947,12 +951,11 @@ assert broker["securityContext"]["capabilities"] == {"drop": ["ALL"]}
 assert broker["securityContext"]["readOnlyRootFilesystem"]
 assert not broker["securityContext"]["allowPrivilegeEscalation"]
 flag = next(a for a in broker["args"] if a.startswith("--provider-set="))
-sys.stdout.write(flag.split("=", 1)[1] + "\n" + broker["image"] + "\n" + init["args"][0])
+sys.stdout.write(flag.split("=", 1)[1] + "\n" + init["args"][0])
 CHECKEXTRACT
 python_yaml "$(cat "$work/config-check-extract.py")" "$work/config-check-render.yaml" > "$work/config-check-out"
 provider_set=$(head -n 1 "$work/config-check-out")
-broker_image=$(head -n 2 "$work/config-check-out" | tail -n 1)
-tail -n +3 "$work/config-check-out" > "$work/config-check-init.sh"
+tail -n +2 "$work/config-check-out" > "$work/config-check-init.sh"
 # /dev/shm is the Docker host's tmpfs. A unique bind mount keeps the same initially
 # non-sticky scratch directory across separate init and broker containers.
 docker run --rm --platform "$platform" -v /dev/shm:/host-shm "$busybox" \
@@ -974,7 +977,8 @@ docker run --rm --platform "$platform" \
   -v "${resource}-check":/check:ro \
   --mount "type=volume,source=${resource}-state,target=/var/lib/dekopon/config-check,volume-subpath=config-check" \
   --mount "type=bind,source=/dev/shm/$resource,target=/tmp" \
-  --entrypoint dekopon-brokerd "$broker_image" check /check/broker.d \
+  --mount "type=bind,source=$broker_binary,target=/usr/local/bin/dekopon-brokerd,readonly" \
+  --entrypoint dekopon-brokerd "$runtime_base" check /check/broker.d \
     --provider-set=/check/provider-set/providers.yaml --store=/var/lib/dekopon/config-check --output=json
 # provider_manager::read_secure_file: validate_file_parent, then the file itself, O_NOFOLLOW.
 cat > "$work/config-check-set.py" <<'CHECKSET'

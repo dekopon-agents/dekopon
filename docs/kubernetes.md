@@ -985,7 +985,8 @@ keeps the Service endpoint unavailable when the configuration and chart port dis
   real-daemon Linux `ipc_process.rs` suite proves mapped/unmapped cross-UID connections and
   server pin/live-peer refusals. `charts/dekopon/ci/verify-init-permissions.sh` executes actual rendered init
   commands, checks mounts/identities, and runs distinct-UID OS processes against that layout;
-  its Python socket fixture is not a real daemon. The image an empty `image.tag`
+  its Python socket fixture is not a real daemon, and its config-check step runs the
+  `dekopon-brokerd` the same CI run built, on the image's runtime base, not a published image. The image an empty `image.tag`
   resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every application
   release — but nothing here has watched one boot.
 - **The pull path is unproven.** No anonymous `helm pull` and no ArgoCD sync has run against the
