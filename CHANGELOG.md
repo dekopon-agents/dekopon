@@ -7,6 +7,29 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-10-18
+
+### Added
+
+- the provider testkit's component Harness applies request templates and attested chat slots, so a templated read runs offline through a built component.
+
+### Changed
+
+- The chart's `image.digest` defaults to empty, so the default image is the `v<appVersion>` tag; set `image.digest` to pin.
+
+### Fixed
+
+- a stalled stdout reader no longer blocks `dekopon-gatewayd` or `dekopon-brokerd`; console lines that do not fit a 1024-line, 4 MiB queue are dropped and reported as `telemetry.console.dropped`.
+- policy.request.body_opaque is logged only when a policy errored on the unreadable body, not on every denial that carried one.
+- the OAuth refresh scheduler logs broker_credential_record_invalid once when a record becomes unreadable mid-run, instead of skipping it silently on every tick.
+
+## [dekopon-chart-0.37.0] - 2026-10-18
+
+### Changed
+
+- The chart's `image.digest` defaults to empty, so the default image is the `v<appVersion>` tag; set `image.digest` to pin.
+- Chart 0.37.0 targets core v0.50.0 and renders the `v0.50.0` image tag.
+
 ## [dekopon-chart-0.36.2] - 2026-10-17
 
 ### Changed
