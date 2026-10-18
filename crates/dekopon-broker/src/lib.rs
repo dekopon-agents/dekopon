@@ -3402,6 +3402,7 @@ where
                 let ordinal = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let decision_id = format!("http-{invocation}-{ordinal}");
                 if !result.allowed
+                    && result.errors_present
                     && let Some(opaque) = result.opaque_body
                 {
                     tracing::warn!(

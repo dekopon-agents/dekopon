@@ -920,7 +920,7 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
 #[tokio::test(flavor = "multi_thread")]
 #[expect(
     clippy::too_many_lines,
-    reason = "one server proves the three admitted bodies send exactly once and the three denied ones send nothing"
+    reason = "one server proves the three admitted bodies send exactly once and the four denied ones send nothing"
 )]
 async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_one_before_egress() {
     use dekopon_test_support::CaptureLayer;
@@ -963,7 +963,11 @@ async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_on
             when { context.request.url.path == "/api/canvases.edit" }
             unless { context.request has body
                 && context.request.body has canvas_id
-                && context.request.body.canvas_id == "F0C907QUHU7" };"#
+                && context.request.body.canvas_id == "F0C907QUHU7" };
+           @id("path-block")
+            forbid(principal, action == Dekopon::Action::"http-probe.fetch", resource)
+            when { context has request }
+            when { context.request.url.path == "/api/blocked" };"#
     );
     let broker = Broker::new(
         registry,
@@ -991,6 +995,12 @@ async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_on
             false,
         ),
         ("chat-jev", "/api/alpha/decisions", CHAT.to_owned(), true),
+        (
+            "blocked-opaque",
+            "/api/blocked",
+            CHAT.replace("0.7", "0.12345"),
+            false,
+        ),
         (
             "chat-opaque",
             "/api/alpha/decisions",
@@ -1062,6 +1072,12 @@ async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_on
                     })
                 );
                 assert!(opaque.is_empty(), "{id}");
+            }
+            "blocked-opaque" => {
+                assert_eq!(decision.field("decision.allowed"), Some("false"));
+                assert_eq!(decision.field("policy.errors_present"), Some("false"));
+                assert_eq!(decision.field("policy.ids"), Some("path-block"));
+                assert!(opaque.is_empty());
             }
             "chat-opaque" => {
                 assert_eq!(decision.field("decision.allowed"), Some("false"));
