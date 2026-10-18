@@ -353,7 +353,7 @@ impl SlackTransport {
             return Ok(None);
         };
         let top_text = event["text"].as_str().unwrap_or_default();
-        if top_text.trim().is_empty() && pending_assets(&event["files"]).is_empty() {
+        if !has_request_content(event) {
             return Ok(None);
         }
         // Slack sets thread_ts equal to the message's own ts on a post threaded later; treating
@@ -1753,6 +1753,15 @@ fn forward_blocks(blocks: &Value) -> String {
     text
 }
 
+fn has_request_content(message: &Value) -> bool {
+    !message["text"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        || !pending_assets(&message["files"]).is_empty()
+}
+
 fn pending_assets(files: &Value) -> Vec<PendingAsset> {
     let Some(files) = files.as_array() else {
         return Vec::new();
@@ -1945,13 +1954,7 @@ fn past_message(message: &Value, team: &str, bot: &str) -> Option<PastMessage> {
     let user = message["user"].as_str()?;
     let ts = message["ts"].as_str()?;
     let at = slack_instant(ts)?;
-    if message["text"]
-        .as_str()
-        .unwrap_or_default()
-        .trim()
-        .is_empty()
-        && pending_assets(&message["files"]).is_empty()
-    {
+    if !has_request_content(message) {
         return None;
     }
     let projection = project_message(message);

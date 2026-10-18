@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{task::JoinSet, time::MissedTickBehavior};
 use tracing::instrument::WithSubscriber as _;
@@ -36,6 +42,7 @@ where
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut retry = BTreeMap::<PathBuf, u64>::new();
+    let mut unreadable = BTreeSet::<PathBuf>::new();
     let mut attempts = JoinSet::<Result<(), SourceError>>::new();
     let mut generation: Option<secrets::ScheduledCatalog> = None;
     loop {
@@ -50,10 +57,12 @@ where
             .is_none_or(|previous| !current.same_generation(previous));
         if new_generation {
             retry.clear();
+            unreadable.clear();
         }
         generation = Some(current.clone());
         let entries = current.entries();
         retry.retain(|record, _| entries.iter().any(|(_, path, _)| path == record));
+        unreadable.retain(|record| entries.iter().any(|(_, path, _)| path == record));
         for (drn, path, has_seed) in entries {
             let seed_on_boot = new_generation && has_seed;
             let now = now_seconds();
@@ -64,9 +73,22 @@ where
             let record = path.clone();
             let inspected = tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid)).await;
             let due = match inspected {
-                Ok(Ok(Some(due))) => due <= now || seed_on_boot,
-                Ok(Ok(None)) => seed_on_boot,
-                Ok(Err(_)) | Err(_) => false,
+                Ok(Ok(due)) => {
+                    unreadable.remove(&path);
+                    due.is_some_and(|due| due <= now) || seed_on_boot
+                }
+                Ok(Err(error)) => {
+                    if unreadable.insert(path.clone()) && !new_generation {
+                        tracing::error!(event = "broker_credential_record_invalid", credential = %drn, category = error.category(), instruction = "delete the record and provide a new seed");
+                    }
+                    false
+                }
+                Err(_join) => {
+                    if unreadable.insert(path.clone()) && !new_generation {
+                        tracing::error!(event = "broker_credential_record_inspection_failed");
+                    }
+                    false
+                }
             };
             if !due {
                 continue;
