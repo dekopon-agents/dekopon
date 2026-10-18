@@ -14,8 +14,8 @@ use dekopon_broker_host::{
     BrokerHostLimits, BrokerProviderRegistry, TestImports, UpcallExit, UpcallRequest, UpcallStdin,
 };
 use dekopon_capability::{
-    AssetConstraints, ExecutionConstraints, HttpConstraints, ProposedInvocation,
-    broker::AuthorizationGate,
+    AssetConstraints, ChatSlot, ChatSlotValues, ExecutionConstraints, HttpConstraints,
+    ProposedInvocation, RequestTemplate, broker::AuthorizationGate,
 };
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
 use dekopon_http_host::LoopbackHttpsPin;
@@ -67,6 +67,7 @@ pub struct HttpScript {
     pub hostname: String,
     pub method: String,
     pub response: Response,
+    pub templates: Vec<RequestTemplate>,
 }
 
 impl HttpScript {
@@ -76,7 +77,15 @@ impl HttpScript {
             hostname: hostname.into(),
             method: method.into(),
             response,
+            templates: Vec::new(),
         }
+    }
+
+    /// Applies an owner-authored request template through the component's real HTTP host.
+    #[must_use]
+    pub fn template(mut self, template: RequestTemplate) -> Self {
+        self.templates.push(template);
+        self
     }
 }
 
@@ -116,6 +125,7 @@ pub struct Run<P: Provider> {
     limits: BrokerHostLimits,
     clock: Option<SystemTime>,
     settings: Option<Value>,
+    slots: ChatSlotValues,
     http: Option<Result<ScriptServer, HarnessError>>,
     assets: Option<AssetConstraints>,
     input_assets: Vec<InputAsset>,
@@ -137,6 +147,7 @@ impl<P: Provider> Harness<P> {
             limits: BrokerHostLimits::default(),
             clock: None,
             settings: None,
+            slots: ChatSlotValues::default(),
             http: None,
             assets: None,
             input_assets: Vec::new(),
@@ -179,6 +190,13 @@ pub enum HarnessError {
 }
 
 impl<P: Provider> Run<P> {
+    /// Supplies an attested chat-scope value for this component invocation's request templates.
+    #[must_use]
+    pub fn chat_slot(mut self, slot: ChatSlot, value: impl Into<String>) -> Self {
+        self.slots.insert(slot, value.into());
+        self
+    }
+
     #[must_use]
     pub fn asset(
         mut self,
@@ -264,8 +282,7 @@ impl<P: Provider> Run<P> {
         reason = "only a guest exit is a captured result; every present and future host error remains a refusal"
     )]
     pub fn call(self, capability: &str, input: Value) -> Result<ComponentOutput, HarnessError> {
-        let component = self.component.canonicalize()?;
-        let registry = cached_registry::<P>(component, self.limits.clone())?;
+        let registry = cached_registry::<P>(self.component.canonicalize()?, self.limits.clone())?;
         let fixtures = Fixtures::new(self.assets.as_ref(), self.input_assets)?;
         let mut assets = fixtures
             .as_ref()
@@ -296,6 +313,7 @@ impl<P: Provider> Run<P> {
                 .map_err(|_error| HarnessError::Fixture("trace ID"))?,
             input,
         );
+        let timeout_ms = self.limits.max_timeout.as_millis();
         let authorized = AuthorizationGate::new().authorize(
             proposal,
             P::ID.parse()?,
@@ -304,12 +322,7 @@ impl<P: Provider> Run<P> {
             "a".repeat(64),
             ExecutionConstraints {
                 asset: self.assets,
-                timeout_ms: self
-                    .limits
-                    .max_timeout
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
+                timeout_ms: timeout_ms.try_into().unwrap_or(u64::MAX),
                 http,
                 storage: None,
                 secret_use: None,
@@ -362,8 +375,14 @@ impl<P: Provider> Run<P> {
             ready
                 .await
                 .map_err(|_closed| HarnessError::Fixture("stdout reader startup"))?;
-            let invoke =
-                registry.invoke_with_test_imports(authorized, None, None, assets, Some(&imports));
+            let invoke = registry.invoke_with_test_imports(
+                authorized,
+                None,
+                None,
+                self.slots,
+                assets,
+                Some(&imports),
+            );
             let feed = feeder.map(|f| tokio::task::spawn_blocking(f));
             let (result, captured, children) =
                 tokio::join!(invoke, capture, answer_children(answers, children));
@@ -489,6 +508,7 @@ struct ScriptServer {
     authority: String,
     origin: String,
     method: String,
+    templates: Vec<RequestTemplate>,
     pin: LoopbackHttpsPin,
     request: Arc<Mutex<Option<Request>>>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -517,7 +537,7 @@ impl ScriptServer {
             max_response_bytes: HTTP_BYTES as u64,
             allow_plaintext_loopback: false,
             propagate_trace: false,
-            request_templates: Vec::new(),
+            request_templates: self.templates.clone(),
         }
     }
 }
@@ -643,6 +663,7 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
         authority,
         origin,
         method,
+        templates: script.templates,
         pin,
         request,
         task,
