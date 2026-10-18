@@ -26,7 +26,7 @@ same native `Port::spawn` path and `Native::children` returns the captured
 runs. A scripted delay advances the native monotonic clock and runs on the
 real host for a component.
 
-`HttpScript::template(RequestTemplate)` adds a request template enforced by the
+`Run::template(RequestTemplate)` adds a request template enforced by the
 component Harness's real HTTP host. `Run::chat_slot(ChatSlot, value)` supplies an
 attested chat-scope value for that invocation; a missing required slot refuses
 the templated request before egress. `ChatSlot` and `RequestTemplate` are

@@ -67,7 +67,6 @@ pub struct HttpScript {
     pub hostname: String,
     pub method: String,
     pub response: Response,
-    pub templates: Vec<RequestTemplate>,
 }
 
 impl HttpScript {
@@ -77,15 +76,7 @@ impl HttpScript {
             hostname: hostname.into(),
             method: method.into(),
             response,
-            templates: Vec::new(),
         }
-    }
-
-    /// Applies an owner-authored request template through the component's real HTTP host.
-    #[must_use]
-    pub fn template(mut self, template: RequestTemplate) -> Self {
-        self.templates.push(template);
-        self
     }
 }
 
@@ -126,6 +117,7 @@ pub struct Run<P: Provider> {
     clock: Option<SystemTime>,
     settings: Option<Value>,
     slots: ChatSlotValues,
+    templates: Vec<RequestTemplate>,
     http: Option<Result<ScriptServer, HarnessError>>,
     assets: Option<AssetConstraints>,
     input_assets: Vec<InputAsset>,
@@ -148,6 +140,7 @@ impl<P: Provider> Harness<P> {
             clock: None,
             settings: None,
             slots: ChatSlotValues::default(),
+            templates: Vec::new(),
             http: None,
             assets: None,
             input_assets: Vec::new(),
@@ -190,6 +183,13 @@ pub enum HarnessError {
 }
 
 impl<P: Provider> Run<P> {
+    /// Applies an owner-authored request template through the component's real HTTP host.
+    #[must_use]
+    pub fn template(mut self, template: RequestTemplate) -> Self {
+        self.templates.push(template);
+        self
+    }
+
     /// Supplies an attested chat-scope value for this component invocation's request templates.
     #[must_use]
     pub fn chat_slot(mut self, slot: ChatSlot, value: impl Into<String>) -> Self {
@@ -282,7 +282,8 @@ impl<P: Provider> Run<P> {
         reason = "only a guest exit is a captured result; every present and future host error remains a refusal"
     )]
     pub fn call(self, capability: &str, input: Value) -> Result<ComponentOutput, HarnessError> {
-        let registry = cached_registry::<P>(self.component.canonicalize()?, self.limits.clone())?;
+        let component = self.component.canonicalize()?;
+        let registry = cached_registry::<P>(component, self.limits.clone())?;
         let fixtures = Fixtures::new(self.assets.as_ref(), self.input_assets)?;
         let mut assets = fixtures
             .as_ref()
@@ -300,7 +301,7 @@ impl<P: Provider> Run<P> {
         if let Some(script) = self.http {
             let started = script?;
             imports.loopback_https_pin = Some(started.pin.clone());
-            http = Some(started.constraints());
+            http = Some(started.constraints(self.templates));
             server = Some(started);
         }
         let proposal = ProposedInvocation::new(
@@ -313,7 +314,6 @@ impl<P: Provider> Run<P> {
                 .map_err(|_error| HarnessError::Fixture("trace ID"))?,
             input,
         );
-        let timeout_ms = self.limits.max_timeout.as_millis();
         let authorized = AuthorizationGate::new().authorize(
             proposal,
             P::ID.parse()?,
@@ -322,7 +322,12 @@ impl<P: Provider> Run<P> {
             "a".repeat(64),
             ExecutionConstraints {
                 asset: self.assets,
-                timeout_ms: timeout_ms.try_into().unwrap_or(u64::MAX),
+                timeout_ms: self
+                    .limits
+                    .max_timeout
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
                 http,
                 storage: None,
                 secret_use: None,
@@ -375,14 +380,8 @@ impl<P: Provider> Run<P> {
             ready
                 .await
                 .map_err(|_closed| HarnessError::Fixture("stdout reader startup"))?;
-            let invoke = registry.invoke_with_test_imports(
-                authorized,
-                None,
-                None,
-                self.slots,
-                assets,
-                Some(&imports),
-            );
+            let invoke =
+                registry.invoke_with_test_imports(authorized, self.slots, assets, Some(&imports));
             let feed = feeder.map(|f| tokio::task::spawn_blocking(f));
             let (result, captured, children) =
                 tokio::join!(invoke, capture, answer_children(answers, children));
@@ -508,7 +507,6 @@ struct ScriptServer {
     authority: String,
     origin: String,
     method: String,
-    templates: Vec<RequestTemplate>,
     pin: LoopbackHttpsPin,
     request: Arc<Mutex<Option<Request>>>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -528,7 +526,7 @@ impl ScriptServer {
         Ok(request)
     }
 
-    fn constraints(&self) -> HttpConstraints {
+    fn constraints(&self, templates: Vec<RequestTemplate>) -> HttpConstraints {
         HttpConstraints {
             allowed_hosts: vec![self.authority.clone()],
             allowed_methods: vec![self.method.clone()],
@@ -537,7 +535,7 @@ impl ScriptServer {
             max_response_bytes: HTTP_BYTES as u64,
             allow_plaintext_loopback: false,
             propagate_trace: false,
-            request_templates: self.templates.clone(),
+            request_templates: templates,
         }
     }
 }
@@ -663,7 +661,6 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
         authority,
         origin,
         method,
-        templates: script.templates,
         pin,
         request,
         task,

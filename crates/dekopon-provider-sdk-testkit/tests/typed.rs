@@ -585,10 +585,10 @@ fn a_templated_read_sends_the_attested_slot_and_without_it_never_leaves_the_host
             headers: Vec::new(),
             body: b"ok".to_vec(),
         },
-    )
-    .template(template);
+    );
     let run = Harness::<RawHttp>::get(&path)
         .http(script.clone())
+        .template(template.clone())
         .chat_slot(ChatSlot::ConversationId, "C0123ABC");
     let origin = run.origin().unwrap().to_owned();
     let output = run
@@ -613,7 +613,9 @@ fn a_templated_read_sends_the_attested_slot_and_without_it_never_leaves_the_host
             .all(|header| header.name != "authorization")
     );
 
-    let run = Harness::<RawHttp>::get(&path).http(script);
+    let run = Harness::<RawHttp>::get(&path)
+        .http(script)
+        .template(template);
     let origin = run.origin().unwrap().to_owned();
     let error = run
         .call(
