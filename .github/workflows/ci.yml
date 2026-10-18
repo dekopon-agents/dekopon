@@ -422,7 +422,7 @@ jobs:
   cli-smoke:
     name: CLI smoke tests
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    if: ${{ !cancelled() && (needs.changes.outputs.run_rust != 'false' || needs.changes.outputs.run_chart != 'false') }}
     runs-on: ubuntu-24.04
     env:
       SCCACHE_BASEDIRS: ${{ github.workspace }}
@@ -452,6 +452,13 @@ jobs:
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
         run: cargo build --locked -p dekopon-brokerd -p dekopon-gatewayd
+      - name: Upload the broker for the chart check
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dekopon-brokerd-linux-amd64
+          path: target/debug/dekopon-brokerd
+          if-no-files-found: error
+          retention-days: 1
       - name: Exercise generated help and example commands
         shell: bash
         run: |
@@ -505,7 +512,7 @@ jobs:
 
   chart:
     name: helm chart
-    needs: changes
+    needs: [changes, cli-smoke]
     if: ${{ !cancelled() && needs.changes.outputs.run_chart != 'false' }}
     runs-on: ubuntu-24.04
     steps:
@@ -741,10 +748,19 @@ jobs:
           tar -tzf "$tarball" > "$RUNNER_TEMP/chart-contents.txt"
           grep -Fxq 'dekopon/README.md' "$RUNNER_TEMP/chart-contents.txt"
           grep -Fxq 'dekopon/values-pr-summarizer-linter.yaml' "$RUNNER_TEMP/chart-contents.txt"
+      - name: Download the broker this run built
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dekopon-brokerd-linux-amd64
+          path: ${{ runner.temp }}/broker
       # A rendered manifest that looks right is not a file that survives O_NOFOLLOW plus an owner
       # and mode check. This runs the init container's real command in a real container and
       # asserts every permission tier dekopon-brokerd enforces, then seeds a ChatGPT credential,
       # rotates it the way save_credentials does, restarts twice, and asserts the rotated bytes
-      # survived — which is the only assertion that actually tests seed-once.
+      # survived — which is the only assertion that actually tests seed-once. The config-check
+      # hook runs this pull request's own broker, not a tagged image that exists only after release.
       - name: Prove the init container's output
-        run: PLATFORM=linux/amd64 charts/dekopon/ci/verify-init-permissions.sh
+        run: |
+          chmod 0755 "$RUNNER_TEMP/broker/dekopon-brokerd"
+          PLATFORM=linux/amd64 BROKER_BINARY="$RUNNER_TEMP/broker/dekopon-brokerd" \
+            charts/dekopon/ci/verify-init-permissions.sh
