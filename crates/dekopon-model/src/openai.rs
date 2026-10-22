@@ -403,6 +403,35 @@ impl<'a> WireMessage<'a> {
         Ok(())
     }
 
+    pub(crate) fn mark_last_text(&mut self, ttl: Option<crate::openrouter::settings::Ttl>) -> bool {
+        let marker = Some(CacheControl {
+            kind: "ephemeral",
+            ttl,
+        });
+        match &mut self.content {
+            Some(WireContent::Text(text)) if !text.is_empty() => {
+                self.content = Some(WireContent::Parts(vec![WirePart::Text {
+                    text: (*text).into(),
+                    cache_control: marker,
+                }]));
+                true
+            }
+            Some(WireContent::Parts(parts)) => parts
+                .iter_mut()
+                .rev()
+                .find_map(|part| match part {
+                    WirePart::Text {
+                        text,
+                        cache_control,
+                    } => (!text.is_empty()).then_some(cache_control),
+                    WirePart::ImageUrl { .. } | WirePart::File { .. } => None,
+                })
+                .map(|slot| *slot = marker)
+                .is_some(),
+            Some(WireContent::Text(_)) | None => false,
+        }
+    }
+
     pub(crate) async fn prepare(message: &'a ModelMessage) -> Result<Self, InferenceError> {
         let content = if let Some(parts) = message.parts() {
             let mut wire = Vec::with_capacity(parts.len());

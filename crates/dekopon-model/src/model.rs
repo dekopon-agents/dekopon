@@ -431,6 +431,7 @@ impl fmt::Debug for AssistantTurn {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionOptions {
     prompt_cache_key: Option<String>,
+    stable_prefix: Option<usize>,
 }
 
 impl CompletionOptions {
@@ -446,6 +447,17 @@ impl CompletionOptions {
     #[must_use]
     pub fn prompt_cache_key(&self) -> Option<&str> {
         self.prompt_cache_key.as_deref()
+    }
+
+    #[must_use]
+    pub const fn with_stable_prefix(mut self, messages: usize) -> Self {
+        self.stable_prefix = Some(messages);
+        self
+    }
+
+    #[must_use]
+    pub const fn stable_prefix(&self) -> Option<usize> {
+        self.stable_prefix
     }
 }
 
