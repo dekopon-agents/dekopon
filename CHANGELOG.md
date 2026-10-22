@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.1] - 2026-10-22
+
+### Changed
+
+- OpenRouter `cache: {style: explicitPrefix}` also marks the end of the replayed history and the newest user/tool message, so tool loops and follow-up messages read their prefix from the prompt cache.
+
+### Fixed
+
+- stock builds use wasmtime 49.0.4, rustls-webpki 0.103.16 and webpki-roots 1.0.10, which fix RUSTSEC-2026-0378, RUSTSEC-2026-0379, RUSTSEC-2026-0382 and RUSTSEC-2026-0381.
+
+## [dekopon-chart-0.37.1] - 2026-10-22
+
+### Changed
+
+- Chart 0.37.1 targets core v0.50.1 and renders the `v0.50.1` image tag.
+
 ## [0.50.0] - 2026-10-18
 
 ### Added

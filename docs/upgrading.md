@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Rolling OpenRouter prompt-cache breakpoints (0.50.1)
+
+A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
+broker and gateway together. An OpenRouter model with `cache: {style: explicitPrefix}` now also
+marks the end of the replayed history and the newest user or tool message, so tool loops and
+follow-up messages read their prefix from the prompt cache.
+
 ## Telemetry drops and testkit templates (0.50.0)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
