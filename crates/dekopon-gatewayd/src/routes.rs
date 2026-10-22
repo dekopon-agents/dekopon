@@ -7,7 +7,6 @@ use dekopon_core::{AgentId, ExternalSubject};
 use thiserror::Error;
 
 use crate::{
-    cache_key,
     config::{
         GithubEvent, MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, ResolvedPolicy,
         Steering, render_problems,
@@ -47,10 +46,6 @@ pub(crate) struct BoundRoute {
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
-    /// This cache lane is safe to share since its prefix is byte-identical and sender-agnostic
-    /// across the route's traffic, and grants nothing: every new session opens its own attested
-    /// broker leg.
-    pub cache_key: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -143,7 +138,6 @@ impl RoutingTable {
                 indicators: route.indicators.clone(),
                 wakes: route.wakes,
                 follow: route.follow,
-                cache_key: cache_key::for_route(),
             });
         }
         if problems.is_empty() {

@@ -48,7 +48,7 @@ pub(crate) fn dispatch(
 
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     fs,
     ops::ControlFlow,
@@ -78,7 +78,7 @@ use dekopon_broker_protocol::{
     ResponseEnvelope,
 };
 use dekopon_config::LocalCatalog;
-use dekopon_core::ExternalSubject;
+use dekopon_core::{AgentId, ExternalSubject};
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     TurnEvent,
@@ -98,7 +98,7 @@ use tokio::{net::UnixListener, sync::mpsc};
 
 use crate::{
     asset::{self, AssetAccess, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
-    cache_key,
+    cache_key::CacheKeySecret,
     config::{
         self, ConfigError, ConfigProblem, DEFAULT_FORGET_AFTER, DEFAULT_SCRIPT_TIMEOUT_MS,
         IndicatorSurface, LivenessConfig, LivenessMode, LivenessSettings, MemoryPolicy,
@@ -3385,15 +3385,20 @@ async fn every_bound_route_gets_its_own_prompt_cache_lane() {
         .route(&routed("dev", ConversationKind::Channel, "ops"))
         .expect("the channel route matches");
 
-    assert!(!direct.cache_key.trim().is_empty());
-    assert_ne!(direct.cache_key, channel.cache_key);
-    let rebound = RoutingTable::bind(&config, &catalog).expect("both routes bind again");
+    let store = ConversationStore::new(1);
+    assert!(!store.route_cache_key(direct).trim().is_empty());
     assert_ne!(
-        rebound
-            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
-            .expect("the direct-message route matches")
-            .cache_key,
-        direct.cache_key
+        store.route_cache_key(direct),
+        store.route_cache_key(channel)
+    );
+    let rebound = RoutingTable::bind(&config, &catalog).expect("both routes bind again");
+    assert_eq!(
+        store.route_cache_key(
+            rebound
+                .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+                .expect("the direct-message route matches")
+        ),
+        store.route_cache_key(direct)
     );
 }
 
@@ -4448,7 +4453,6 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         indicators: fixture_liveness(),
         wakes: false,
         follow: false,
-        cache_key: cache_key::for_route(),
     }
 }
 
@@ -8182,7 +8186,7 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     assert_eq!(resumed.history.len(), 2);
     assert_eq!(resumed.history.turns()[0].user(), "what broke?");
     assert_eq!(resumed.history.turns()[1].user(), "still there?");
-    assert_ne!(first_cache_key, second_cache_key);
+    assert_eq!(first_cache_key, second_cache_key);
     assert_eq!(resumed.cache_key, first_cache_key);
 }
 
@@ -8345,7 +8349,7 @@ fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
     assert_eq!(store.tracked(), 0);
     let cold = store.begin(&key, &allowed, window(), None, now + Duration::from_secs(3));
     assert!(cold.history.is_empty());
-    assert_ne!(cold.cache_key, stale_cache_key);
+    assert_eq!(cold.cache_key, stale_cache_key);
 }
 
 #[test]
@@ -8520,26 +8524,75 @@ fn routed(transport: &str, kind: ConversationKind, id: &str) -> InboundMessage {
     }
 }
 
-#[test]
-fn a_minted_cache_key_is_opaque_and_never_repeats() {
-    let first = cache_key::for_conversation();
-    let second = cache_key::for_conversation();
-    let route = cache_key::for_route();
-
-    for key in [&first, &second, &route] {
-        assert!(!key.trim().is_empty(), "an empty key is no key at all");
-    }
-    assert_ne!(
-        first, second,
-        "two conversations minted in one process must not collide"
-    );
-    assert_ne!(route, cache_key::for_route());
+fn secret(byte: u8) -> CacheKeySecret {
+    CacheKeySecret::from_bytes([byte; 32])
 }
 
 #[test]
-fn a_cache_key_carries_nothing_about_the_sender() {
-    // The cache key is minted, not derived from the sender, since a canonical subject can be a
-    // phone number that even a hash would expose to a model provider.
+fn a_cache_key_is_the_same_for_the_same_secret_and_conversation() {
+    let key = private_conversation_key("dev", "c0123abc", SUBJECT);
+    let first = secret(7).for_conversation(&key);
+    assert!(first.starts_with("gatewayd-conversation-"));
+    assert_eq!(first.len(), "gatewayd-conversation-".len() + 32);
+    assert!(
+        first["gatewayd-conversation-".len()..]
+            .chars()
+            .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase())
+    );
+    assert_eq!(
+        secret(7).for_conversation(&private_conversation_key("dev", "c0123abc", SUBJECT)),
+        first
+    );
+
+    let agent: AgentId = "reviewer".parse().expect("valid agent fixture");
+    let route = secret(7).for_route(&agent, "dev", 0);
+    assert!(route.starts_with("gatewayd-route-"));
+    assert_eq!(route.len(), "gatewayd-route-".len() + 32);
+    assert_eq!(secret(7).for_route(&agent, "dev", 0), route);
+}
+
+#[test]
+fn a_different_secret_conversation_agent_transport_or_audience_names_a_different_cache_key() {
+    let agent: AgentId = "reviewer".parse().expect("valid agent fixture");
+    let other_agent: AgentId = "helper".parse().expect("valid agent fixture");
+    let subject: ExternalSubject = SUBJECT.parse().expect("canonical subject fixture");
+    let base = ConversationKey::private(&agent, "dev", "c0123abc", &subject);
+    let mut keys = [
+        ConversationKey::private(&agent, "dev", "c0123abd", &subject),
+        ConversationKey::private(&other_agent, "dev", "c0123abc", &subject),
+        ConversationKey::private(&agent, "dev-other", "c0123abc", &subject),
+        ConversationKey::private(
+            &agent,
+            "dev",
+            "c0123abc",
+            &"tel.16035550100"
+                .parse()
+                .expect("canonical subject fixture"),
+        ),
+        ConversationKey::shared(&agent, "dev", "c0123abc"),
+    ]
+    .iter()
+    .map(|key| secret(7).for_conversation(key))
+    .collect::<BTreeSet<_>>();
+    keys.insert(secret(7).for_conversation(&base));
+    keys.insert(secret(8).for_conversation(&base));
+    assert_eq!(keys.len(), 7);
+
+    let routes = [
+        secret(7).for_route(&agent, "dev", 0),
+        secret(8).for_route(&agent, "dev", 0),
+        secret(7).for_route(&agent, "dev", 1),
+        secret(7).for_route(&other_agent, "dev", 0),
+        secret(7).for_route(&agent, "dev-other", 0),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(routes.len(), 5);
+    assert!(routes.is_disjoint(&keys));
+}
+
+#[test]
+fn a_cache_key_never_contains_the_raw_subject_or_conversation_id() {
     const DISTINCTIVE: &str = "tel.15558675309";
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "c0123abc", DISTINCTIVE);
@@ -8551,18 +8604,77 @@ fn a_cache_key_carries_nothing_about_the_sender() {
         Instant::now(),
     );
 
-    for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc"] {
+    for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc", "reviewer"] {
         assert!(
             !seed.cache_key.contains(fragment),
             "{fragment:?} reached the cache key: {}",
             seed.cache_key
         );
     }
-    assert!(!cache_key::for_route().contains("c0123abc"));
+    let route = secret(7).for_route(&"reviewer".parse().expect("valid agent fixture"), "dev", 0);
+    assert!(!route.contains("reviewer"));
 }
 
 #[test]
-fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
+fn the_cache_key_secret_is_created_owner_only_and_reused_by_the_next_boot() {
+    let directory = temporary();
+    let key = private_conversation_key("dev", "c0123abc", SUBJECT);
+    let first = CacheKeySecret::load_or_create(directory.path()).expect("first boot creates");
+    let path = directory.path().join("prompt-cache-key.secret");
+    let metadata = fs::metadata(&path).expect("secret file");
+    assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(metadata.len(), 32);
+    let written = fs::read(&path).expect("secret bytes");
+
+    let second = CacheKeySecret::load_or_create(directory.path()).expect("second boot reads");
+    assert_eq!(fs::read(&path).expect("secret bytes"), written);
+    assert_eq!(second.for_conversation(&key), first.for_conversation(&key));
+    assert_ne!(
+        CacheKeySecret::generate()
+            .expect("entropy")
+            .for_conversation(&key),
+        first.for_conversation(&key)
+    );
+}
+
+#[test]
+fn a_short_or_loose_cache_key_secret_is_rewritten_and_a_good_one_is_reused() {
+    let directory = temporary();
+    let key = private_conversation_key("dev", "c0123abc", SUBJECT);
+    let path = directory.path().join("prompt-cache-key.secret");
+    for (written, mode) in [(vec![1_u8; 31], 0o600), (vec![1_u8; 32], 0o644)] {
+        fs::write(&path, &written).expect("planted secret");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("mode");
+        let loaded = CacheKeySecret::load_or_create(directory.path()).expect("rewritten");
+        let metadata = fs::metadata(&path).expect("secret file");
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(metadata.len(), 32);
+        assert_ne!(fs::read(&path).expect("secret bytes"), written);
+        assert_ne!(
+            loaded.for_conversation(&key),
+            secret(1).for_conversation(&key),
+            "a rejected file's bytes never key a lane"
+        );
+    }
+
+    fs::write(&path, [2_u8; 32]).expect("good secret");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+    assert_eq!(
+        CacheKeySecret::load_or_create(directory.path())
+            .expect("reused")
+            .for_conversation(&key),
+        secret(2).for_conversation(&key)
+    );
+    assert!(
+        !directory
+            .path()
+            .join("prompt-cache-key.secret.tmp")
+            .exists()
+    );
+}
+
+#[test]
+fn an_evicted_conversation_comes_back_with_the_same_cache_key() {
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
@@ -8601,14 +8713,14 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
         cold.history.is_empty(),
         "the idle timeout dropped the entry"
     );
-    assert_ne!(
+    assert_eq!(
         cold.cache_key, first_cache_key,
-        "the same conversation identity must not keep naming a lane whose prefix is gone"
+        "the same conversation identity keeps the lane its leading prefix already warmed"
     );
 }
 
 #[test]
-fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
+fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
     let allowed = granted(&["cli-probe.upper"]);
     let wider = granted(&["cli-probe.upper", "gh.pr_view"]);
     let now = Instant::now();
@@ -8631,10 +8743,7 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         .begin(&grant_key, &allowed, window(), None, now)
         .cache_key
         .clone();
-    assert_ne!(
-        after_grant_change, before_grant_change,
-        "a changed grant starts a new cache lane"
-    );
+    assert_eq!(after_grant_change, before_grant_change);
 
     let removed_store = ConversationStore::new(8);
     let removed_key = private_conversation_key("dev", "removed", SUBJECT);
@@ -8655,10 +8764,7 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         .begin(&removed_key, &allowed, window(), None, now)
         .cache_key
         .clone();
-    assert_ne!(
-        after_removal, before_removal,
-        "an empty-grant removal retires its cache lane"
-    );
+    assert_eq!(after_removal, before_removal);
 
     let capacity_store = ConversationStore::new(1);
     let displaced = private_conversation_key("dev", "displaced", SUBJECT);
@@ -8693,10 +8799,7 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         )
         .cache_key
         .clone();
-    assert_ne!(
-        after_capacity, before_capacity,
-        "a capacity-evicted conversation cannot keep naming its old lane"
-    );
+    assert_eq!(after_capacity, before_capacity);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8764,13 +8867,14 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
         .await;
     }
 
-    assert_eq!(models.cache_key(0), route.cache_key);
+    let lane = runner.conversations.route_cache_key(&route);
+    assert_eq!(models.cache_key(0), lane);
     assert_eq!(
         models.cache_key(1),
-        route.cache_key,
+        lane,
         "a second sender on one route uses the same lane, because the prefix is the route's"
     );
-    assert_eq!(models.cache_key(2), route.cache_key);
+    assert_eq!(models.cache_key(2), lane);
     assert_eq!(
         runner.conversations.tracked(),
         0,

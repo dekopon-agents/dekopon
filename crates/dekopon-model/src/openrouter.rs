@@ -364,12 +364,50 @@ pub(crate) struct Replay {
 
 #[derive(Deserialize)]
 struct RouterChunk {
+    id: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     error: Option<ChunkError>,
     #[serde(default)]
     choices: Vec<RouterChoice>,
-    usage: Option<crate::wire::ChatUsage<u64>>,
+    usage: Option<RouterUsage>,
+}
+
+/// Cost is telemetry only, so a value of any shape is kept as JSON and recorded only when numeric.
+#[derive(Deserialize)]
+struct RouterUsage {
+    #[serde(flatten)]
+    tokens: crate::wire::ChatUsage<u64>,
+    #[serde(default)]
+    cost: Value,
+    #[serde(default)]
+    cost_details: Value,
+}
+
+impl RouterUsage {
+    fn record(&self) {
+        let span = tracing::Span::current();
+        let detail = |name| self.cost_details.get(name).and_then(Value::as_f64);
+        for (field, value) in [
+            ("usage.cost", self.cost.as_f64()),
+            (
+                "usage.upstream_inference_cost",
+                detail("upstream_inference_cost"),
+            ),
+            (
+                "usage.upstream_inference_prompt_cost",
+                detail("upstream_inference_prompt_cost"),
+            ),
+            (
+                "usage.upstream_inference_completions_cost",
+                detail("upstream_inference_completions_cost"),
+            ),
+        ] {
+            if let Some(value) = value {
+                span.record(field, value);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -392,6 +430,7 @@ struct Delta {
 struct RouterStream {
     content: String,
     replay: Replay,
+    response_id: Option<String>,
     model: Option<String>,
     provider: Option<String>,
     reasoning_positions: HashMap<u64, usize>,
@@ -439,6 +478,7 @@ impl RouterStream {
                 calls: Vec::new(),
                 reasoning: Vec::new(),
             },
+            response_id: None,
             model: None,
             provider: None,
             reasoning_positions: HashMap::new(),
@@ -460,6 +500,12 @@ impl RouterStream {
         if let Some(error) = chunk.error {
             return Err(stream_failure(error, secrets));
         }
+        if self.response_id.is_none()
+            && let Some(id) = chunk.id
+        {
+            tracing::Span::current().record("gen_ai.response.id", secrets.sanitize(&id));
+            self.response_id = Some(id);
+        }
         for (field, slot, value) in [
             ("model.returned", &mut self.model, chunk.model),
             ("model.upstream", &mut self.provider, chunk.provider),
@@ -472,7 +518,8 @@ impl RouterStream {
             }
         }
         if let Some(usage) = chunk.usage {
-            self.usage = Some(usage.into_openrouter());
+            usage.record();
+            self.usage = Some(usage.tokens.into_openrouter());
         }
         for choice in chunk.choices {
             self.choices_seen = true;

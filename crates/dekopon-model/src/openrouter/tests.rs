@@ -599,6 +599,43 @@ async fn unknown_fields_and_types_in_the_stream_are_tolerated() {
 }
 
 #[tokio::test]
+async fn an_odd_cost_is_skipped_and_never_fails_the_turn() {
+    for (cost, details, recorded) in [
+        (
+            json!("0.07"),
+            json!({"upstream_inference_cost": 0.05, "upstream_inference_prompt_cost": "x"}),
+            Some("0.05"),
+        ),
+        (Value::Null, json!("free"), None),
+        (json!({"usd": 1}), json!([1, 2]), None),
+    ] {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"gen-odd","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4,"cost":cost,"cost_details":details}}),
+        );
+        let server = MockServer::start(vec![MockResponse::sse(&body)]);
+        let capture = crate::trace_capture::TraceCapture::default();
+        let turn = generate(&client(&server, Settings::default()), &[])
+            .with_subscriber(capture.subscriber())
+            .await
+            .unwrap();
+        assert_eq!(turn.content.as_deref(), Some("ok"));
+        assert_eq!(turn.usage.and_then(|usage| usage.total_tokens), Some(4));
+        assert!(capture.field("usage.cost").is_none());
+        assert!(
+            capture
+                .field("usage.upstream_inference_prompt_cost")
+                .is_none()
+        );
+        assert_eq!(
+            capture.field("usage.upstream_inference_cost").as_deref(),
+            recorded
+        );
+    }
+}
+
+#[tokio::test]
 async fn refusals_have_typed_classes_and_never_retry() {
     for status in [401, 403, 429, 500] {
         let server = MockServer::start(vec![
@@ -957,9 +994,30 @@ async fn openrouter_trace_records_requested_controls_and_native_usage_without_pr
                     Some(value.to_string())
                 );
             }
+            assert_eq!(
+                capture.field("gen_ai.response.id").as_deref(),
+                Some("\"gen-1761100000-first\""),
+                "the first chunk's generation id names the exchange"
+            );
+            assert_eq!(capture.text().matches("gen_ai.response.id=").count(), 1);
+            for (field, value) in [
+                ("cost", "0.077595"),
+                ("upstream_inference_cost", "0.077595"),
+                ("upstream_inference_prompt_cost", "0.077275"),
+                ("upstream_inference_completions_cost", "0.00032"),
+            ] {
+                assert_eq!(
+                    capture.field(&format!("usage.{field}")).as_deref(),
+                    Some(value),
+                    "{field}"
+                );
+            }
+            assert!(!capture.text().contains("future_cost"));
+            assert!(!capture.text().contains("is_byok"));
         } else {
             assert!(!capture.text().contains("usage."));
             assert!(capture.field("model.upstream").is_none());
+            assert!(capture.field("gen_ai.response.id").is_none());
         }
         for secret in [
             "synthetic-key",

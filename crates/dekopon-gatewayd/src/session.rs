@@ -1816,7 +1816,7 @@ async fn session(
         }
         None => (
             History::default(),
-            route.cache_key.clone(),
+            runner.conversations.route_cache_key(route),
             None,
             AssetAccess::one_shot(key.clone()),
             None,
