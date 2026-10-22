@@ -1987,6 +1987,59 @@ mod tests {
     }
 
     #[test]
+    fn the_stable_prefix_ends_where_the_new_prompt_begins() {
+        struct PrefixModel {
+            scripted: ScriptedModel,
+            seen: Mutex<Vec<(Option<usize>, ModelMessage)>>,
+        }
+        impl ChatModel for PrefixModel {
+            fn complete(
+                &self,
+                messages: &[ModelMessage],
+                tools: &[ModelTool],
+                options: &CompletionOptions,
+                on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+            ) -> Result<AssistantTurn, InferenceError> {
+                if let Some(stable) = options.stable_prefix()
+                    && let Some(message) = messages.get(stable)
+                {
+                    self.seen.lock().push((Some(stable), message.clone()));
+                }
+                self.scripted.complete(messages, tools, options, on_event)
+            }
+        }
+        let model = PrefixModel {
+            scripted: ScriptedModel::new([answer("one"), answer("two")]),
+            seen: Mutex::new(Vec::new()),
+        };
+        let runtime = RecordingRuntime::new(0);
+        let mut history = History::default();
+        for prompt in ["msg1", "msg2"] {
+            run_prompt_session(
+                &model,
+                &runtime,
+                SessionInputs::new(prompt, limits(1, 1)).with_system(Some("rules")),
+                &mut history,
+            )
+            .expect("answered");
+        }
+        let seen = model.seen.lock();
+        assert_eq!(
+            seen.iter()
+                .map(|(stable, message)| (
+                    *stable,
+                    message.role().to_owned(),
+                    message.content().unwrap_or_default().to_owned()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some(1), "user".to_owned(), "msg1".to_owned()),
+                (Some(3), "user".to_owned(), "msg2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
     fn a_pre_cancelled_session_never_reaches_the_model_or_history() {
         let model = ScriptedModel::new([answer("too late")]);
         let runtime = RecordingRuntime::new(0);

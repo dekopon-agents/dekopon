@@ -147,7 +147,8 @@ Automatic cache mode sends no marker. `explicitPrefix` places up to three marker
 part of the last leading system message, before the first non-system message, carries the authored
 TTL. So does the last non-empty text part of the last user or tool message inside the replayed history,
 which is the prefix the next chat message repeats, since history replays the recorded prompt and drops
-tool exchanges. The newest user or tool message with non-empty text, walking back past assistant
+tool exchanges, until `maxTurns`, `maxBytes` or the journal horizon evicts the oldest turn and the next
+message writes the history afresh. The newest user or tool message with non-empty text, walking back past assistant
 messages, carries a marker without TTL (5m) for the calls of one tool loop; when it is the history
 marker, the authored TTL wins. A string becomes a text-part array:
 

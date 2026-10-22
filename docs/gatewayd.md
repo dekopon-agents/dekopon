@@ -255,7 +255,8 @@ Each optional block is strict, as is the model entry:
 
 Omitted members are absent on the wire, not sent as default values. No cache block means automatic
 mode (no marker); an omitted TTL is not invented. Explicit caching marks the last content part of
-the last leading system message, including optional-reply guidance; no leading system message is
+the last leading system message, including optional-reply guidance, plus the end of the replayed
+history and the newest user or tool text ([inference](inference.md)); no leading system message is
 an `InvalidRequest` before sending. Reasoning fragments remain private continuation state, never
 chat progress. The response-cache header `X-OpenRouter-Cache: false` is always sent; there is no
 `usage.include`, `stream_options` or `reasoning.exclude`. The prompt cache key is
