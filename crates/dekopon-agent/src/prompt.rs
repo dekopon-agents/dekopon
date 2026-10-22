@@ -450,6 +450,7 @@ where
         messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
     }
     history.replay_into(&mut messages);
+    let options = options.clone().with_stable_prefix(messages.len());
     messages.push(ModelMessage::user(prompt));
 
     let mut exchanges = Vec::new();
@@ -462,7 +463,7 @@ where
             exchanges: &mut exchanges,
             capture_exchanges,
             memory_tools,
-            options,
+            options: &options,
             assets,
             reply_assets,
             usage_observer,

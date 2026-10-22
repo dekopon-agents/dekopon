@@ -22,7 +22,7 @@ use settings::{CacheStyle, Settings};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     num::NonZeroU32,
-    ops::ControlFlow,
+    ops::{ControlFlow, Range},
     time::Duration,
 };
 
@@ -126,6 +126,12 @@ impl OpenRouterClient {
                     wire.mark_cache(cache.ttl)?;
                 }
                 messages.push(RouterMessage::Ordinary(wire));
+            }
+        }
+        if let Some(cache) = explicit {
+            mark_newest_text(request.messages, &mut messages, leading..usize::MAX, None);
+            if let Some(stable) = request.options.stable_prefix() {
+                mark_newest_text(request.messages, &mut messages, leading..stable, cache.ttl);
             }
         }
         let tools = request
@@ -395,6 +401,30 @@ struct RouterStream {
     terminal: bool,
     choices_seen: bool,
     unrecognized: BTreeSet<String>,
+}
+
+fn mark_newest_text(
+    messages: &[ModelMessage],
+    wire: &mut [RouterMessage<'_>],
+    range: Range<usize>,
+    ttl: Option<settings::Ttl>,
+) {
+    for (message, wire) in messages
+        .iter()
+        .zip(wire)
+        .take(range.end)
+        .skip(range.start)
+        .rev()
+    {
+        if let (
+            ModelMessage::User { .. } | ModelMessage::ToolResults { .. },
+            RouterMessage::Ordinary(wire),
+        ) = (message, wire)
+            && wire.mark_last_text(ttl)
+        {
+            return;
+        }
+    }
 }
 
 fn protocol(message: &str, secrets: DiagnosticSecrets<'_>) -> InferenceError {

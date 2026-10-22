@@ -143,15 +143,20 @@ or request-scoped overrides. The strict configuration and every accepted spellin
 and routing to snake-case members of `provider`. Forwarding a control does not prove that a remote
 provider honored it; telemetry labels these as requested settings.
 
-Automatic cache mode sends no marker. `explicitPrefix` marks the final content part of the last
-leading system message, before the first non-system message. A string becomes a text-part array:
+Automatic cache mode sends no marker. `explicitPrefix` places up to three markers. The final content
+part of the last leading system message, before the first non-system message, carries the authored
+TTL. So does the last non-empty text part of the last user or tool message inside the replayed history,
+which is the prefix the next chat message repeats, since history replays the recorded prompt and drops
+tool exchanges. The newest user or tool message with non-empty text, walking back past assistant
+messages, carries a marker without TTL (5m) for the calls of one tool loop; when it is the history
+marker, the authored TTL wins. A string becomes a text-part array:
 
 ```json
 {"type":"text","text":"stable instructions","cache_control":{"type":"ephemeral","ttl":"5m"}}
 ```
 
 TTL is absent unless authored (`5m` or `1h`). This handles instructions, the skills listing and
-optional-reply guidance without marking a user message. Zero leading system messages is a local
+optional-reply guidance. Zero leading system messages is a local
 `InvalidRequest` before send. The marker is a hint, not a cache lease or a promise of credited
 usage. `X-OpenRouter-Cache: false` disables response-cache reuse independently of prompt caching.
 

@@ -341,7 +341,8 @@ async fn omitted_controls_stay_absent_and_authored_controls_map_exactly() {
 }
 
 #[tokio::test]
-async fn explicit_cache_marks_only_the_last_of_one_two_or_three_leading_system_messages() {
+async fn explicit_cache_marks_only_the_last_of_one_two_or_three_leading_system_messages_and_the_newest_user_text()
+ {
     for (count, ttl, require_parameters) in [
         (1, None, None),
         (2, None, None),
@@ -395,9 +396,129 @@ async fn explicit_cache_marks_only_the_last_of_one_two_or_three_leading_system_m
                 );
             }
         }
+        assert_eq!(
+            body["messages"][count]["content"],
+            json!([{"type":"text","text":"go","cache_control":{"type":"ephemeral"}}])
+        );
         assert_eq!(body["messages"][count + 1]["content"], "not-leading");
         requests_have_only_the_authored_headers(&server);
     }
+}
+
+#[tokio::test]
+async fn explicit_cache_marks_the_replayed_history_end_with_the_configured_ttl_and_the_newest_text_without_one()
+ {
+    let server = MockServer::start(Vec::new());
+    let client = client(
+        &server,
+        Settings {
+            cache: Some(settings::Cache {
+                style: CacheStyle::ExplicitPrefix,
+                ttl: Some(settings::Ttl::OneHour),
+            }),
+            ..Default::default()
+        },
+    );
+    let answer = || assistant_message(&AssistantTurn::new(Some("answer".into()), vec![], None));
+    let messages = [
+        ModelMessage::system("rules"),
+        ModelMessage::user("earlier"),
+        answer(),
+        ModelMessage::user_with_parts(vec![
+            crate::model::ContentPart::Text("look".into()),
+            crate::model::ContentPart::Text(String::new()),
+        ]),
+        answer(),
+        ModelMessage::tool("call-1", "result"),
+        answer(),
+        ModelMessage::tool("call-2", ""),
+    ];
+    let stable = json!({"type":"ephemeral","ttl":"1h"});
+    let rolling = json!({"type":"ephemeral"});
+    let marked =
+        |text: &str, marker: &Value| json!([{"type":"text","text":text,"cache_control":marker}]);
+    let look = |marker: Option<&Value>| match marker {
+        Some(marker) => {
+            json!([{"type":"text","text":"look","cache_control":marker},{"type":"text","text":""}])
+        }
+        None => json!([{"type":"text","text":"look"},{"type":"text","text":""}]),
+    };
+    for (len, stable_prefix, expected) in [
+        (
+            8,
+            Some(3),
+            vec![
+                marked("rules", &stable),
+                marked("earlier", &stable),
+                json!("answer"),
+                look(None),
+                json!("answer"),
+                marked("result", &rolling),
+                json!("answer"),
+                json!(""),
+            ],
+        ),
+        (
+            8,
+            Some(1),
+            vec![
+                marked("rules", &stable),
+                json!("earlier"),
+                json!("answer"),
+                look(None),
+                json!("answer"),
+                marked("result", &rolling),
+                json!("answer"),
+                json!(""),
+            ],
+        ),
+        (
+            4,
+            Some(4),
+            vec![
+                marked("rules", &stable),
+                json!("earlier"),
+                json!("answer"),
+                look(Some(&stable)),
+            ],
+        ),
+        (
+            4,
+            None,
+            vec![
+                marked("rules", &stable),
+                json!("earlier"),
+                json!("answer"),
+                look(Some(&rolling)),
+            ],
+        ),
+    ] {
+        let options = CompletionOptions::default();
+        let options = match stable_prefix {
+            Some(stable) => options.with_stable_prefix(stable),
+            None => options,
+        };
+        let bytes = client
+            .prepare(GenerateRequest {
+                messages: &messages[..len],
+                tools: &[],
+                options: &options,
+            })
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let contents = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["content"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents, expected,
+            "len {len}, stable prefix {stable_prefix:?}"
+        );
+    }
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]

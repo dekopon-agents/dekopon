@@ -251,7 +251,7 @@ Each optional block is strict, as is the model entry:
 | `generation` | optional `maxOutputTokens` positive integer, finite `temperature` 0–2 inclusive, finite `topP` >0 and ≤1 | `max_tokens`, `temperature`, `top_p` |
 | `reasoning` | required `effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | `reasoning: {effort}` |
 | `routing` | optional `allowFallbacks`, `requireParameters` booleans; optional nonempty `only` list of nonblank strings | `provider: {allow_fallbacks, require_parameters, only}` |
-| `cache` | required `style`: `automatic` or `explicitPrefix`; optional `ttl`: `5m` or `1h`, only with `explicitPrefix` | explicit system-part `cache_control: {type: ephemeral, ttl?}` |
+| `cache` | required `style`: `automatic` or `explicitPrefix`; optional `ttl`: `5m` or `1h`, only with `explicitPrefix` | `cache_control: {type: ephemeral, ttl?}` on the last leading system part and the last replayed history user/tool text; `{type: ephemeral}` on the newest user/tool text |
 
 Omitted members are absent on the wire, not sent as default values. No cache block means automatic
 mode (no marker); an omitted TTL is not invented. Explicit caching marks the last content part of
