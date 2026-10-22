@@ -174,6 +174,13 @@ where
     }
 
     let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    let journal_dir = config.journal.as_ref().map(|journal| journal.dir.clone());
+    let cache_keys = tokio::task::spawn_blocking(move || match journal_dir {
+        Some(dir) => cache_key::CacheKeySecret::load_or_create(&dir),
+        None => cache_key::CacheKeySecret::generate(),
+    })
+    .await
+    .map_err(GatewaydError::TransportTask)??;
     if journal.is_some() {
         for route in &config.routes {
             if let (Some(window), Some(policy)) =
@@ -205,9 +212,10 @@ where
         )),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
-        conversations: ConversationStore::with_arena_limit(
+        conversations: ConversationStore::with_cache_keys(
             config.sessions.max_conversations,
             config.memory.arena.max_transient_bytes.get() as usize,
+            cache_keys,
         ),
         follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
         journal,
@@ -1110,6 +1118,8 @@ pub enum GatewaydError {
     TransportsLost,
     #[error("conversation journal directory is unusable: {kind}")]
     Journal { kind: std::io::ErrorKind },
+    #[error(transparent)]
+    CacheKeySecret(#[from] cache_key::CacheKeySecretError),
     #[error(transparent)]
     WakeStore(#[from] WakeStoreError),
     #[error("guest model proxy could not start")]

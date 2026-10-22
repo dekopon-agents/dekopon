@@ -117,7 +117,10 @@ Whatever the model provider reports for usage lands as `usage.input_tokens`,
 the `model.complete` and `prompt.model_turn` spans and the `accounting.model.turn` record.
 OpenRouter prompt tokens already include cached reads; `cache_write_tokens` is optional and is
 not added again to input. Reasoning is a subset of output, not additive. Unreported fields are
-absent, including cache writes on Codex and compatible responses.
+absent, including cache writes on Codex and compatible responses. OpenRouter's reported dollar cost and
+its `cost_details` land only on `model.complete`, as `usage.cost` and the
+`usage.upstream_inference_*` fields. They are best effort: a non-numeric value is skipped and never
+fails the turn, and unknown members beside them are ignored.
 
 `accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
 URL path or query, no headers, no bodies. It fires for every attempt, including one refused before
@@ -141,6 +144,7 @@ library uses `tracing` only and installs no subscriber.
 |---|---|
 | `model.name`, `model`, `model.backend`, `model.dialect` | configured name, requested model ID, adapter (`chatgpt-subscription`, `openai-compatible`, `openrouter`) and API dialect (`codex-responses` or `chat-completions`) |
 | `model.returned`, `model.upstream` | sanitized reported model and the last reported OpenRouter provider, only when present |
+| `gen_ai.response.id` | sanitized response `id` (OpenRouter's `gen-…` generation id): the first chunk's on OpenRouter, the reported one on OpenAI-compatible responses; absent when unreported |
 | `model.stream`, `cache.style` | local streamed/buffered mode and `automatic`/`explicitPrefix` encoding |
 | `generation.max_output_tokens`, `generation.temperature`, `generation.top_p`, `reasoning.effort` | authored OpenRouter requests, absent when omitted |
 | `routing.allow_fallbacks`, `routing.require_parameters`, `routing.only`, `cache.ttl` | authored routing/TTL hints; `routing.only` is a bounded comma-separated diagnostic |
@@ -150,6 +154,7 @@ library uses `tracing` only and installs no subscriber.
 | `stream.deltas` | number of visible text fragments; tool-only turns invent no first-text time |
 | `usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens` | normalized reported counters, never invented zeros |
 | `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.reasoning_output_tokens` | reported subsets/work, without adding them again to total |
+| `usage.cost`, `usage.upstream_inference_cost`, `usage.upstream_inference_prompt_cost`, `usage.upstream_inference_completions_cost` | OpenRouter's reported charge and its `cost_details`, as floats in OpenRouter credits (USD); absent when unreported, never computed locally |
 | `tool_call.count`, `response.bytes` | completed call count on success, bytes consumed by the response reader |
 | `finish.reason`, `output.partial` | reported chat finish reason; partial visible output on failure or successful `length` text |
 | `stream.events` | SSE events observed by the adapter, including `[DONE]`, recorded once when the exchange ends |
@@ -597,11 +602,13 @@ Additional reader failures discovered while joining aborted peers emit `gateway_
 (name and category) or `gateway_transport_task_failed` (task error).
 The exponential backoff jitter comes from the operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
 refused entropy, carrying the `getrandom` failure and nothing else; that attempt's delay falls back
-to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect. Two
-other records name the same refusal at their own sites: `session_trace_entropy_unavailable` (warn)
-when a non-exporting session's minted trace falls back to the hasher construction, and
-`gateway_cache_key_entropy_unavailable` (warn) when a prompt cache key is dropped rather than
-minted from something predictable.
+to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect.
+`session_trace_entropy_unavailable` (warn) names the same refusal when a non-exporting session's
+minted trace falls back to the hasher construction.
+
+`gateway_cache_key_secret_reset` (warn) records that boot wrote a fresh prompt cache key secret into
+the journal directory, with `reason` `missing`, `loose-mode` or `malformed`; it never carries the
+secret. Every conversation's cache key changes once after it.
 
 `gateway_indicators_effective` is emitted once per resolved route/conversation kind at
 configuration load: route index, transport name, kind, mode, status, typing, working, seen,
@@ -756,10 +763,15 @@ window trim rewrites the front of the request and costs a miss by construction, 
 on long conversations is `maxTurns` or `maxBytes` doing its job rather than a broken key.
 
 **The key rides its own log event.** It lands on `gateway.session.cache_key` and never enters
-`model.complete` fields. It carries nothing about the audience by construction, but within one process it joins
-one private or shared conversation's turns; it is emitted on its own event so that a key and a
-canonical subject never share a record, which keeps a reader who needs only one of them from seeing
-both.
+`model.complete` fields. It is an HMAC under a gateway-held secret, so it holds no recoverable
+subject or conversation id, but it joins every turn of one private or shared conversation across
+evictions, and across restarts when a journal holds the secret; it is emitted on its own event so that a key and a canonical subject never share a record, which keeps a reader who needs
+only one of them from seeing both.
+
+**`gen_ai.response.id` matches a turn to OpenRouter's own record.** It is the generation id
+OpenRouter's activity page and generation lookup are keyed by, so a miss on one `model.complete`
+can be read against OpenRouter's per-generation provider and cache data. `usage.cost` is the dollar
+figure OpenRouter charged; read it instead of multiplying token counts by price.
 
 ### Detached-job traces and records
 

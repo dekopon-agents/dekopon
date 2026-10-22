@@ -87,7 +87,8 @@ Per backend:
   `stream` field to set — one that could be written but not honored would be worse than none.
 - `openrouter` always streams at `https://openrouter.ai/api/v1/chat/completions`; there is no
   configurable endpoint or stream switch. It always sends `X-OpenRouter-Cache: false` and never
-  sends `stream_options` or `usage.include`; the prompt cache key travels as `session_id`.
+  sends `stream_options` or `usage.include`, which OpenRouter deprecated: usage, `cost` and
+  `cost_details` arrive in the final chunk regardless. The prompt cache key travels as `session_id`.
 - `openaiCompatible` streams by default and takes `stream: false` for an endpoint that gets it
   wrong: a proxy that buffers the whole event stream, or a server that drops `usage` when asked to
   stream. With streaming on, the request adds `stream: true` and
@@ -184,14 +185,16 @@ counts are a subset of output, not an extra charge added to it.
 A key is a routing hint, not a cache handle: `prompt_cache_key` on Codex and compatible requests,
 `session_id` on OpenRouter. Codex also sends the same key in the `session-id` header, including on
 credential-refresh resends; without a key, it sends neither field nor header. Dekopon cannot use it to read another response,
-enumerate cache contents, or delete provider state, and it is minted from entropy rather than from a
-subject, channel, phone number, or account ID. [`gatewayd.md`](gatewayd.md#the-prompt-cache-key) owns
-its scope, minting, and rotation.
+enumerate cache contents, or delete provider state. It is an HMAC of the agent, transport and
+conversation or route under a gateway-held secret, so it carries no subject, channel, phone number,
+or account ID in a form the provider can recover, and it survives evictions, and restarts when a
+journal holds the secret. [`gatewayd.md`](gatewayd.md#the-prompt-cache-key) owns
+its scope and derivation.
 
 Sharing a one-shot route's key does not share answers: two requests reuse only their identical
 prefix, and sender-specific text diverges where it differs. Once history is discarded the replacement
-prompt shares no prefix with the one it replaced, which is why the key rotates with the conversation
-it names.
+prompt still shares its instructions and tools prefix with the one it replaced, which is why the key
+stays with the conversation it names.
 
 ### Getting the reuse available today
 
@@ -507,7 +510,7 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 
 ## Related documents
 
-- [`gatewayd.md`](gatewayd.md) — routing, persistent-conversation bounds, cache-key scope and rotation, generated images, durable recording, and telemetry.
+- [`gatewayd.md`](gatewayd.md) — routing, persistent-conversation bounds, cache-key scope and derivation, generated images, durable recording, and telemetry.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) — retained text and prompt-injection dwell time.
 - [`cli.md`](cli.md) — isolated model-account login.
 - [`chatgpt-credential.md`](chatgpt-credential.md) — rotating subscription credential lifecycle.

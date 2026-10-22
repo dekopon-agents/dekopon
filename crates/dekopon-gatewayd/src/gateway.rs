@@ -819,6 +819,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
         | GatewaydError::TransportTask(_)
         | GatewaydError::TransportsLost
         | GatewaydError::Journal { .. }
+        | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::Problems { .. } => "preparation",
@@ -853,6 +854,7 @@ fn reload_problem(problem: &GatewaydError) -> String {
         | GatewaydError::TransportTask(_)
         | GatewaydError::TransportsLost
         | GatewaydError::Journal { .. }
+        | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::Problems { .. } => error_chain(problem),
@@ -878,6 +880,7 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
         | GatewaydError::TransportTask(_)
         | GatewaydError::TransportsLost
         | GatewaydError::Journal { .. }
+        | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::Probe(_)

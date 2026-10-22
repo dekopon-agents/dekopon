@@ -13,12 +13,13 @@ use dekopon_agent::prompt::{
     ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, History, PackedArena,
 };
 use dekopon_core::{AgentId, ExternalSubject};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, digest::Update};
 
 use crate::{
     asset::{AssetAccess, AssetFence},
-    cache_key,
+    cache_key::{self, CacheKeySecret},
     config::MemoryWindow,
+    routes::BoundRoute,
 };
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -61,22 +62,23 @@ impl ConversationKey {
         }
     }
 
-    /// A digest, so any subject or native conversation id encodes to a safe file name.
-    pub fn journal_stem(&self) -> String {
-        let mut digest = Sha256::new();
+    pub(crate) fn absorb(&self, digest: &mut impl Update) {
         for part in [self.agent.as_str(), &self.transport, &self.conversation] {
-            digest.update((part.len() as u64).to_be_bytes());
-            digest.update(part.as_bytes());
+            cache_key::absorb(digest, part.as_bytes());
         }
         match &self.audience {
             ConversationAudience::Private(subject) => {
-                let canonical = subject.canonical();
-                digest.update([1]);
-                digest.update((canonical.len() as u64).to_be_bytes());
-                digest.update(canonical.as_bytes());
+                digest.update(&[1]);
+                cache_key::absorb(digest, subject.canonical().as_bytes());
             }
-            ConversationAudience::Shared => digest.update([0]),
+            ConversationAudience::Shared => digest.update(&[0]),
         }
+    }
+
+    /// A digest, so any subject or native conversation id encodes to a safe file name.
+    pub fn journal_stem(&self) -> String {
+        let mut digest = Sha256::new();
+        self.absorb(&mut digest);
         let stem: String = digest
             .finalize()
             .iter()
@@ -91,8 +93,6 @@ struct Conversation {
     arena: Arc<PackedArena>,
     record_ids: Vec<u64>,
     next_record_id: u64,
-    /// The cache lane must be minted separately and never derived from the conversation key, since
-    /// that key may reveal who is asking.
     cache_key: String,
     touched: Instant,
     watermark: Option<Watermark>,
@@ -288,6 +288,7 @@ pub(crate) struct SealedConversation {
 
 pub(crate) struct ConversationStore {
     capacity: usize,
+    cache_keys: CacheKeySecret,
     headroom: Arc<ArenaHeadroom>,
     state: Mutex<StoreState>,
 }
@@ -350,9 +351,19 @@ impl ConversationStore {
         Self::with_arena_limit(capacity, 128 * 1024 * 1024)
     }
 
+    #[cfg(test)]
     pub fn with_arena_limit(capacity: usize, arena_limit: usize) -> Self {
+        Self::with_cache_keys(capacity, arena_limit, CacheKeySecret::from_bytes([7; 32]))
+    }
+
+    pub fn with_cache_keys(
+        capacity: usize,
+        arena_limit: usize,
+        cache_keys: CacheKeySecret,
+    ) -> Self {
         Self {
             capacity,
+            cache_keys,
             headroom: ArenaHeadroom::new(arena_limit),
             state: Mutex::new(StoreState {
                 next_generation: 1,
@@ -360,6 +371,11 @@ impl ConversationStore {
                 capacity_retired: HashMap::new(),
             }),
         }
+    }
+
+    pub(crate) fn route_cache_key(&self, route: &BoundRoute) -> String {
+        self.cache_keys
+            .for_route(&route.agent, &route.transport, route.route_index)
     }
 
     /// Whether `begin` would continue a window already in memory, making a recall pointless.
@@ -424,7 +440,7 @@ impl ConversationStore {
             state.capacity_retired.remove(key);
             let generation = allocate_generation(&mut state);
             let asset_fence = Arc::new(AssetFence::new());
-            let cache_key = cache_key::for_conversation();
+            let cache_key = self.cache_keys.for_conversation(key);
             let live = recalled
                 .map(|history| Conversation::new(history, &self.headroom, cache_key.clone(), now));
             let history = live.as_ref().map_or_else(
@@ -474,12 +490,17 @@ impl ConversationStore {
             slot.live = Some(Conversation::new(
                 history,
                 &self.headroom,
-                cache_key::for_conversation(),
+                self.cache_keys.for_conversation(key),
                 now,
             ));
         }
         let (history, cache_key) = slot.live.as_ref().map_or_else(
-            || (History::new(window.limits), cache_key::for_conversation()),
+            || {
+                (
+                    History::new(window.limits),
+                    self.cache_keys.for_conversation(key),
+                )
+            },
             |conversation| (conversation.history.clone(), conversation.cache_key.clone()),
         );
         ConversationSeed {

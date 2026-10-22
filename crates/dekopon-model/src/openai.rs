@@ -269,9 +269,11 @@ pub(crate) fn stream_failure(error: ChunkError, secrets: DiagnosticSecrets<'_>) 
     failure.into()
 }
 
-fn record_model(model: Option<&str>, secrets: DiagnosticSecrets<'_>) {
-    if let Some(model) = model {
-        tracing::Span::current().record("model.returned", secrets.sanitize(model));
+fn record_model(id: Option<&str>, model: Option<&str>, secrets: DiagnosticSecrets<'_>) {
+    for (field, value) in [("gen_ai.response.id", id), ("model.returned", model)] {
+        if let Some(value) = value {
+            tracing::Span::current().record(field, secrets.sanitize(value));
+        }
     }
 }
 
@@ -279,7 +281,7 @@ fn turn_from_response(
     secrets: crate::diagnostic::DiagnosticSecrets<'_>,
     response: ChatResponse,
 ) -> Result<AssistantTurn, InferenceError> {
-    record_model(response.model.as_deref(), secrets);
+    record_model(response.id.as_deref(), response.model.as_deref(), secrets);
     if let Some(error) = response.error {
         return Err(stream_failure(error, secrets));
     }
@@ -503,6 +505,8 @@ pub(crate) struct OpenAiTool<'a> {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     error: Option<ChunkError>,
@@ -630,6 +634,8 @@ pub(crate) fn replay_transcript(
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     choices: Vec<ChunkChoice>,
@@ -709,7 +715,7 @@ impl ChatStream {
         on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         secrets: crate::diagnostic::DiagnosticSecrets<'_>,
     ) -> Result<ControlFlow<()>, InferenceError> {
-        record_model(chunk.model.as_deref(), secrets);
+        record_model(chunk.id.as_deref(), chunk.model.as_deref(), secrets);
         if let Some(error) = chunk.error {
             return Err(stream_failure(error, secrets));
         }
@@ -985,7 +991,7 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         for stream in [true, false] {
             for reported_usage in [true, false] {
-                let mut body = json!({"model":"reported-model","choices":[{"message":{"content":"answer"},"delta":{"content":"answer"},"finish_reason":"stop"}]});
+                let mut body = json!({"id":"chatcmpl-trace","model":"reported-model","choices":[{"message":{"content":"answer"},"delta":{"content":"answer"},"finish_reason":"stop"}]});
                 if reported_usage {
                     body["usage"] = json!({"prompt_tokens":11,"completion_tokens":4,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":3,"cache_write_tokens":"ignored-compatible-extension"},"completion_tokens_details":{"reasoning_tokens":2}});
                 }
@@ -1023,6 +1029,10 @@ mod tests {
                 assert_eq!(
                     capture.field("model.returned").as_deref(),
                     Some("\"reported-model\"")
+                );
+                assert_eq!(
+                    capture.field("gen_ai.response.id").as_deref(),
+                    Some("\"chatcmpl-trace\"")
                 );
                 assert_eq!(capture.field("model.stream"), Some(stream.to_string()));
                 assert_eq!(capture.field("timing.first_event_ms").is_some(), stream);
@@ -1994,6 +2004,7 @@ mod tests {
             turn_from_response(
                 crate::diagnostic::DiagnosticSecrets::default(),
                 ChatResponse {
+                    id: None,
                     model: None,
                     error: None,
                     choices: Vec::new(),
