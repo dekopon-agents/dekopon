@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Keyed prompt-cache keys and fence-aware replies (0.50.2)
+
+A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the
+broker and gateway together. With `sessions.journal` set, the first boot creates
+`<journal dir>/prompt-cache-key.secret` (mode `0600`), and every prompt-cache key changes once at
+this upgrade.
+
 ## Rolling OpenRouter prompt-cache breakpoints (0.50.1)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the

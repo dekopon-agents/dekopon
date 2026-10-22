@@ -7,6 +7,27 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.2] - 2026-10-22
+
+### Added
+
+- `model.complete` records the response id as `gen_ai.response.id`, and OpenRouter's reported cost as `usage.cost`, `usage.upstream_inference_cost`, `usage.upstream_inference_prompt_cost` and `usage.upstream_inference_completions_cost`.
+
+### Changed
+
+- The gateway's prompt cache key (`session_id` on OpenRouter, `prompt_cache_key` elsewhere) is an HMAC-SHA256 of the agent, transport and conversation or route under a gateway-held secret instead of a random value, so it survives evictions, and restarts when `sessions.journal` holds the secret at `prompt-cache-key.secret`; deleting that file resets only routing hints.
+
+### Fixed
+
+- Long Discord, Telegram and WhatsApp replies no longer split inside a Markdown code block; a block that fits moves whole to the next message, and a longer one is closed and reopened with its language tag.
+- Long replies are never cut inside a code fence line and never send a whitespace-only message.
+
+## [dekopon-chart-0.37.2] - 2026-10-22
+
+### Changed
+
+- Chart 0.37.2 targets core v0.50.2 and renders the `v0.50.2` image tag.
+
 ## [0.50.1] - 2026-10-22
 
 ### Changed
