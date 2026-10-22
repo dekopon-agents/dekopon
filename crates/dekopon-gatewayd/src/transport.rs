@@ -4,6 +4,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
+    ops::Range,
     sync::Arc,
     time::Duration,
 };
@@ -776,38 +777,195 @@ impl TextUnit {
     }
 }
 
+/// max_units is counted in the given unit because chat services disagree on what they count, and a
+/// chunk measured in the wrong unit is rejected whole rather than trimmed.
 pub(crate) fn split_message(text: &str, max_units: usize, unit: TextUnit) -> Vec<String> {
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return vec!["[empty response]".to_owned()];
     }
+    let fences = Fence::scan(text, max_units, unit);
     let mut chunks = Vec::new();
     let mut start = 0;
-    while start < text.len() {
-        let rest = &text[start..];
-        let mut units = 0;
-        let mut end = text.len();
-        for (index, character) in rest.char_indices() {
-            let next = units + unit.weight(character);
-            if next > max_units {
-                end = start + index;
-                break;
+    let mut reopen: Option<&Fence> = None;
+    while !text[start..].trim().is_empty() {
+        let (end, open) = chunk_end(text, start, reopen, &fences, max_units, unit);
+        let mut chunk = String::new();
+        if let Some(fence) = reopen {
+            chunk.push_str(&text[fence.opener.clone()]);
+        }
+        chunk.push_str(&text[start..end]);
+        if let Some(fence) = open {
+            if !chunk.ends_with('\n') {
+                chunk.push('\n');
             }
-            units = next;
+            chunk.extend(std::iter::repeat_n(fence.marker, fence.width));
         }
-        if end < text.len()
-            && let Some(newline) = text[start..end].rfind('\n')
-            && newline > 0
-        {
-            end = start + newline + 1;
-        }
-        chunks.push(text[start..end].to_owned());
+        chunks.push(chunk);
+        reopen = open;
         start = end;
     }
     chunks
 }
 
-/// max_units is counted in the given unit because chat services disagree on what they count, and a
-/// chunk measured in the wrong unit is rejected whole rather than trimmed.
+struct Fence {
+    opener: Range<usize>,
+    closer: usize,
+    end: usize,
+    marker: char,
+    width: usize,
+}
+
+impl Fence {
+    fn scan(text: &str, max_units: usize, unit: TextUnit) -> Vec<Self> {
+        let mut fences = Vec::new();
+        let mut open: Option<(Range<usize>, char, usize)> = None;
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let range = offset..offset + line.len();
+            offset = range.end;
+            let Some(FenceRun {
+                marker,
+                width,
+                info,
+            }) = FenceRun::parse(line)
+            else {
+                continue;
+            };
+            match open.take() {
+                None => {
+                    open = (marker == '~' || !info.contains('`')).then_some((range, marker, width));
+                }
+                Some((opener, open_marker, open_width))
+                    if marker == open_marker
+                        && width >= open_width
+                        && info.trim_matches([' ', '\t']).is_empty() =>
+                {
+                    fences.push(Self {
+                        opener,
+                        closer: range.start,
+                        end: range.end,
+                        marker,
+                        width,
+                    });
+                }
+                Some(still_open) => open = Some(still_open),
+            }
+        }
+        if let Some((opener, marker, width)) = open {
+            fences.push(Self {
+                opener,
+                closer: text.len(),
+                end: text.len(),
+                marker,
+                width,
+            });
+        }
+        // A fence whose reopen and close would take over half a chunk is split as plain text, so
+        // every chunk inside it still carries content.
+        fences.retain(|fence| {
+            2 * (units(&text[fence.opener.clone()], unit) + 1 + fence.width) <= max_units
+        });
+        fences
+    }
+}
+
+struct FenceRun<'a> {
+    marker: char,
+    width: usize,
+    info: &'a str,
+}
+
+impl<'a> FenceRun<'a> {
+    fn parse(line: &'a str) -> Option<Self> {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let body = line.trim_start_matches(' ');
+        if line.len() - body.len() > 3 {
+            return None;
+        }
+        let marker = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+        let info = body.trim_start_matches(marker);
+        let width = body.len() - info.len();
+        (width >= 3).then_some(Self {
+            marker,
+            width,
+            info,
+        })
+    }
+}
+
+fn units(text: &str, unit: TextUnit) -> usize {
+    text.chars().map(|character| unit.weight(character)).sum()
+}
+
+fn open_fence_at<'f>(fences: &'f [Fence], text: &str, cut: usize) -> Option<&'f Fence> {
+    let index = fences.partition_point(|fence| fence.closer < cut);
+    fences
+        .get(index)
+        .filter(|fence| fence.opener.end <= cut && cut < text.len())
+}
+
+fn inside_delimiter(fences: &[Fence], cut: usize) -> bool {
+    let index = fences.partition_point(|fence| fence.end <= cut);
+    fences.get(index).is_some_and(|fence| {
+        (fence.opener.start < cut && cut <= fence.opener.end) || fence.closer <= cut
+    })
+}
+
+fn chunk_end<'f>(
+    text: &str,
+    start: usize,
+    reopen: Option<&Fence>,
+    fences: &'f [Fence],
+    max_units: usize,
+    unit: TextUnit,
+) -> (usize, Option<&'f Fence>) {
+    let mut used = reopen.map_or(0, |fence| units(&text[fence.opener.clone()], unit));
+    let mut line_cut = None;
+    let mut hard_cut = None;
+    let mut content = reopen.is_some();
+    let mut characters = text[start..].char_indices();
+    loop {
+        let (offset, next) = characters
+            .next()
+            .map_or((text.len() - start, None), |(offset, c)| (offset, Some(c)));
+        let cut = start + offset;
+        if cut > start && !inside_delimiter(fences, cut) {
+            let open = open_fence_at(fences, text, cut);
+            let after_newline = text[..cut].ends_with('\n');
+            let close = open.map_or(0, |fence| fence.width + usize::from(!after_newline));
+            if used + close <= max_units {
+                hard_cut = Some((cut, open));
+                let at_line = match open {
+                    None => after_newline && content,
+                    Some(fence) => after_newline && cut > fence.opener.end && cut < fence.closer,
+                };
+                if at_line || cut == text.len() {
+                    line_cut = Some((cut, open));
+                }
+            }
+        }
+        let Some(character) = next else { break };
+        used += unit.weight(character);
+        content |= !character.is_whitespace();
+        if used > max_units {
+            break;
+        }
+    }
+    let (end, open) = line_cut
+        .or(hard_cut)
+        .unwrap_or((ceil_boundary(text, start + 1), None));
+    if end < text.len()
+        && let Some(fence) = fences
+            .iter()
+            .find(|fence| start < fence.opener.start && fence.opener.start < end && end < fence.end)
+        && !text[start..fence.opener.start].trim().is_empty()
+        && units(&text[fence.opener.start..fence.end], unit) <= max_units
+    {
+        return (fence.opener.start, None);
+    }
+    (end, open)
+}
+
 pub(crate) fn reconnect_delay(failures: u32) -> Duration {
     let step = BASE_RECONNECT_DELAY.saturating_mul(1_u32 << failures.min(MAX_RECONNECT_DOUBLINGS));
     step.min(MAX_RECONNECT_DELAY)
@@ -1161,5 +1319,248 @@ mod tests {
                 "every service refuses an empty post, so every unit answers the same way"
             );
         }
+    }
+
+    fn fenced(opener: &str, closer: &str, lines: usize, width: usize) -> String {
+        let mut block = format!("{opener}\n");
+        for line in 0..lines {
+            block.push_str(&format!("{line:04} {}\n", "x".repeat(width)));
+        }
+        block.push_str(closer);
+        block.push('\n');
+        block
+    }
+
+    fn assert_fits(chunks: &[String], max_units: usize, unit: TextUnit) {
+        for chunk in chunks {
+            assert!(!chunk.is_empty(), "no service accepts an empty post");
+            let units: usize = chunk.chars().map(|c| unit.weight(c)).sum();
+            assert!(
+                units <= max_units,
+                "a chunk of {units} units exceeds {max_units}"
+            );
+        }
+    }
+
+    fn assert_balanced(chunks: &[String]) {
+        for chunk in chunks {
+            let delimiters = chunk
+                .lines()
+                .filter(|line| line.starts_with("```") || line.starts_with("~~~"))
+                .count();
+            assert_eq!(delimiters % 2, 0, "{chunk:?} leaves a fence open");
+        }
+    }
+
+    fn rejoined(chunks: &[String], close: &str, reopen: &str) -> String {
+        let last = chunks.len() - 1;
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                let chunk = if index > 0 {
+                    chunk
+                        .strip_prefix(reopen)
+                        .expect("a continuation reopens its fence")
+                } else {
+                    chunk
+                };
+                if index < last {
+                    chunk.strip_suffix(close).expect("a cut block is closed")
+                } else {
+                    chunk
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_block_straddling_the_discord_limit_moves_whole_to_the_next_message() {
+        let mut text = String::new();
+        for (index, lines) in [(0, 8), (1, 8), (2, 16), (3, 9)] {
+            text.push_str(&format!("Step {index} explains the next block.\n\n"));
+            text.push_str(&fenced(&format!("```rust{index}"), "```", lines, 60));
+            text.push('\n');
+        }
+        let third = text.find("```rust2").expect("third block");
+        let third_end = third + text[third..].find("\n```\n").expect("third closer") + 5;
+        assert!(
+            third < 2_000 && third_end > 2_000,
+            "the third block straddles the limit"
+        );
+
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks[1].starts_with("```rust2\n"),
+            "the block opens the next message"
+        );
+        assert!(chunks[0].ends_with("Step 2 explains the next block.\n\n"));
+        assert_eq!(
+            chunks.concat(),
+            text,
+            "a block that fits is moved, never rewritten"
+        );
+    }
+
+    #[test]
+    fn a_block_longer_than_a_chunk_is_closed_and_reopened_with_its_info_string() {
+        let text = format!("Here it is:\n{}Done.\n", fenced("```python", "```", 60, 50));
+        assert!(text.len() > 3_000);
+
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].starts_with("Here it is:\n```python\n"));
+        assert!(
+            chunks[0].ends_with("x\n```"),
+            "the cut is at a line inside the block"
+        );
+        assert!(chunks[1].starts_with("```python\n0"));
+        assert!(chunks[1].ends_with("x\n```\nDone.\n"));
+        assert_eq!(rejoined(&chunks, "```", "```python\n"), text);
+    }
+
+    #[test]
+    fn a_tilde_fence_is_closed_and_reopened_with_tildes() {
+        let text = fenced("~~~ sh", "~~~", 60, 50);
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert!(chunks[0].ends_with("\n~~~"));
+        assert!(chunks[1].starts_with("~~~ sh\n"));
+        assert_eq!(rejoined(&chunks, "~~~", "~~~ sh\n"), text);
+    }
+
+    #[test]
+    fn three_backticks_inside_a_four_backtick_fence_do_not_close_it() {
+        let mut inner = fenced("```rust", "```", 30, 50);
+        inner.push_str(&inner.clone());
+        let text = format!("````md\n{inner}````\n");
+
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks[0].ends_with("\n````"),
+            "the outer fence is the one closed"
+        );
+        assert!(chunks[1].starts_with("````md\n"));
+        assert_eq!(rejoined(&chunks, "````", "````md\n"), text);
+    }
+
+    #[test]
+    fn an_unterminated_fence_runs_to_the_end_of_the_text() {
+        let mut text = fenced("```", "```", 60, 50);
+        text.truncate(text.len() - "```\n".len());
+
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert!(chunks[0].ends_with("x\n```"));
+        assert!(chunks[1].starts_with("```\n"));
+        assert!(
+            chunks[1].ends_with("x\n"),
+            "the last chunk stays as unterminated as the answer"
+        );
+        assert_eq!(rejoined(&chunks, "```", "```\n"), text);
+
+        let short = format!(
+            "{}\n```\n{}",
+            "intro ".repeat(300),
+            "let x = 1;\n".repeat(30)
+        );
+        let chunks = split_message(&short, 2_000, TextUnit::Utf16);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks[1].starts_with("```\n"),
+            "an unterminated block that fits moves whole"
+        );
+    }
+
+    #[test]
+    fn crlf_lines_are_cut_after_the_line_feed_and_reopen_with_their_ending() {
+        let text = fenced("```rust", "```", 60, 50).replace('\n', "\r\n");
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert!(chunks[0].ends_with("x\r\n```"));
+        assert!(chunks[1].starts_with("```rust\r\n0"));
+        assert_eq!(rejoined(&chunks, "```", "```rust\r\n"), text);
+    }
+
+    #[test]
+    fn fence_aware_chunks_respect_the_telegram_and_whatsapp_limit_in_their_units() {
+        let text = format!(
+            "🦀 intro\n{}",
+            fenced("```diagram", "```", 160, 40).replace('x', "─")
+        );
+        for unit in [TextUnit::Utf16, TextUnit::Scalar] {
+            let chunks = split_message(&text, 4_096, unit);
+            assert_fits(&chunks, 4_096, unit);
+            assert_eq!(chunks.len(), 2);
+            assert!(chunks[1].starts_with("```diagram\n"));
+            assert_eq!(rejoined(&chunks, "```", "```diagram\n"), text);
+        }
+    }
+
+    #[test]
+    fn a_line_longer_than_a_chunk_is_hard_split_inside_its_fence() {
+        let text = format!("```\n{}\n```\n", "y".repeat(5_000));
+        let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+        assert_fits(&chunks, 2_000, TextUnit::Utf16);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[..2].iter().all(|chunk| chunk.ends_with("y\n```")));
+        assert_eq!(rejoined(&chunks, "\n```", "```\n"), text);
+
+        let mixed = format!(
+            "```js\n{}\n```\n🦀\n~~~~\n{}\n~~~~\n",
+            "🦀".repeat(70),
+            "z".repeat(90)
+        );
+        for max_units in 2..120 {
+            for unit in [TextUnit::Utf16, TextUnit::Scalar] {
+                let chunks = split_message(&mixed, max_units, unit);
+                assert_fits(&chunks, max_units, unit);
+                if max_units >= 20 {
+                    assert_balanced(&chunks);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_never_lands_inside_a_fence_delimiter_line() {
+        for body in [3_985, 3_986] {
+            let text = format!("```\n{}\n```\nAfter.\n", "y".repeat(body));
+            let chunks = split_message(&text, 2_000, TextUnit::Utf16);
+            assert_fits(&chunks, 2_000, TextUnit::Utf16);
+            assert_balanced(&chunks);
+            let last = chunks.last().expect("a chunk");
+            assert!(
+                last.starts_with("```\ny"),
+                "{last:?} reopens onto body text"
+            );
+            assert!(
+                last.ends_with("y\n```\nAfter.\n"),
+                "{last:?} keeps the real closer"
+            );
+            assert_eq!(rejoined(&chunks, "\n```", "```\n"), text);
+        }
+    }
+
+    #[test]
+    fn no_chunk_is_whitespace_only() {
+        let leading = format!("\n\n{}", "y".repeat(3_000));
+        let trailing = format!("{}\n \n", "y".repeat(2_000));
+        for text in [leading.as_str(), trailing.as_str(), " \n\t\n"] {
+            let chunks = split_message(text, 2_000, TextUnit::Utf16);
+            assert!(
+                chunks.iter().all(|chunk| !chunk.trim().is_empty()),
+                "Discord refuses a blank post: {chunks:?}"
+            );
+        }
+        assert_eq!(
+            split_message(&leading, 2_000, TextUnit::Utf16).concat(),
+            leading
+        );
     }
 }
