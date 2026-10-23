@@ -7,6 +7,25 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.3] - 2026-10-23
+
+### Fixed
+
+- Shell block and function redirects retain output inside discarded streams.
+- Assignment-only shell commands open and truncate redirected buffers.
+- Literal assignments preserve the last command substitution exit status.
+- Alternating shell expansions return syntax errors instead of overflowing the host stack.
+
+### Security
+
+- the memory-optimized Wasmtime overlay moves to 49.0.4 for RUSTSEC-2026-0378 and RUSTSEC-2026-0379.
+
+## [dekopon-chart-0.37.3] - 2026-10-23
+
+### Changed
+
+- Chart 0.37.3 targets core v0.50.3 and renders the `v0.50.3` image tag.
+
 ## [0.50.2] - 2026-10-22
 
 ### Added
