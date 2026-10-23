@@ -924,9 +924,7 @@ impl Waiter {
         let store = self.ticket.store.upgrade().ok_or(AssetFailure::Unknown)?;
         match store.pin(&self.ticket.access, self.ticket.id, Recency::Keep) {
             Ok(Some(data)) => Ok(data),
-            Ok(None) | Err(BlobError::Reclaimed) => {
-                Err(AssetFailure::Storage(BlobError::Reclaimed))
-            }
+            Ok(None) => Err(AssetFailure::Storage(BlobError::Reclaimed)),
             Err(error) => Err(AssetFailure::Storage(error)),
         }
     }
@@ -2451,7 +2449,7 @@ mod retention_tests {
         .unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_finished_download_holds_no_pin_once_its_waiter_returns() {
         let store = store(3);
         let access = access("one");
