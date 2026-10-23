@@ -965,10 +965,13 @@ impl AssetStore {
                 }
                 let attempt = self.downloads.attempts.fetch_add(1, Ordering::Relaxed);
                 let (sender, outcome) = watch::channel(None);
-                let task = Attempt(ticket(attempt));
+                let attempt_ticket = ticket(attempt);
                 let permits = Arc::clone(&self.downloads.permits);
                 let task = self.downloads.spawn(
                     async move {
+                        // Built on first poll: a runtime that drops the unpolled future inside
+                        // `spawn_on` while `entries` is locked must not run `Attempt::drop`.
+                        let task = Attempt(attempt_ticket);
                         let fetched = task.download(source, fetcher, permits).await;
                         // The entry leaves Downloading before waiters wake, so a retry never joins
                         // a finished attempt.
@@ -1652,9 +1655,9 @@ mod retention_tests {
         }
     }
 
-    struct FetchScript {
-        calls: std::sync::atomic::AtomicUsize,
-        last: Mutex<Vec<dekopon_model::model::ModelMessage>>,
+    pub(super) struct FetchScript {
+        pub(super) calls: std::sync::atomic::AtomicUsize,
+        pub(super) last: Mutex<Vec<dekopon_model::model::ModelMessage>>,
     }
 
     impl dekopon_model::model::ChatModel for FetchScript {
@@ -1693,7 +1696,7 @@ mod retention_tests {
         }
     }
 
-    struct NoScripts;
+    pub(super) struct NoScripts;
 
     impl dekopon_agent::prompt::ScriptRuntime for NoScripts {
         fn run_script(&self, _: &str) -> dekopon_shell::ScriptOutcome {

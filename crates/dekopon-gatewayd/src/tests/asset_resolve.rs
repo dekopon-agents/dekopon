@@ -342,28 +342,115 @@ async fn an_expired_conversation_releases_its_bytes_before_a_live_resident_is_ev
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_generated_base64_image_reference_spends_its_decoded_length() {
+async fn five_generated_base64_images_spend_their_decoded_length_against_the_model_budget() {
+    use super::retention_tests::{FetchScript, NoScripts};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let store = store(1024);
-    let access = access("decoded");
+    use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+    use tracing_subscriber::prelude::*;
+
+    let store = store(64 * 1024 * 1024);
     let session = Arc::new(SessionAssets::new(
         Arc::clone(&store),
-        access,
+        access("decoded"),
         None,
         Handle::current(),
         true,
     ));
-    let raw = b"\x89PNG\r\n\x1a\ngenerated pixels";
-    let (descriptor, metadata) = received(STANDARD.encode(raw).as_bytes(), AssetEncoding::Base64);
-    let id = session
-        .register(descriptor, &metadata, "image.edit", "invocation")
+    let raw = vec![0; dekopon_model::asset::MAX_ATTACHMENT_BYTES];
+    let encoded = STANDARD.encode(&raw);
+    for _ in 0..5 {
+        let (descriptor, metadata) = received(encoded.as_bytes(), AssetEncoding::Base64);
+        session
+            .register(descriptor, &metadata, "image.edit", "invocation")
+            .unwrap();
+    }
+    assert!(5 * raw.len() <= dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES);
+    assert!(4 * encoded.len() > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES);
+    tokio::task::spawn_blocking(move || {
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let model = FetchScript {
+            calls: AtomicUsize::new(0),
+            last: Mutex::new(vec![]),
+        };
+        run_prompt_session(
+            &model,
+            &NoScripts,
+            SessionInputs::new(
+                "show each image",
+                PromptLimits {
+                    max_steps: 11,
+                    max_capability_calls: 0,
+                },
+            )
+            .with_assets(session.as_ref()),
+            &mut History::default(),
+        )
         .unwrap();
-    let fetched = tokio::task::spawn_blocking(move || session.fetch(id))
-        .await
-        .unwrap()
+        let charged = raw.len().to_string();
+        for id in 1..=5_u64 {
+            let id = id.to_string();
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_agent::audit",
+                        &[
+                            ("audit.event", "agent.asset.fetched"),
+                            ("asset.id", &id),
+                            ("asset.bytes", &charged)
+                        ]
+                    )
+                    .len(),
+                1
+            );
+            assert!(
+                capture
+                    .events_where(
+                        "dekopon_agent::audit",
+                        &[("audit.event", "agent.asset.refused"), ("asset.id", &id)]
+                    )
+                    .is_empty()
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn a_download_spawned_after_runtime_shutdown_refuses_instead_of_deadlocking() {
+    use std::task::{Context, Poll, Waker};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .unwrap();
-    assert_eq!(fetched.data.len(), raw.len());
-    assert_eq!(fetched.data.read().unwrap(), raw);
+    let handle = runtime.handle().clone();
+    drop(runtime);
+    let store = store(1024);
+    let access = access("shutdown");
+    let id = register(&store, &access, None);
+    let session = SessionAssets::new(
+        Arc::clone(&store),
+        access,
+        Some(Gate::open(b"never") as Arc<dyn AssetFetcher>),
+        handle,
+        true,
+    );
+    let (done, finished) = std::sync::mpsc::channel();
+    let _detached = std::thread::spawn(move || {
+        let mut pending = session.resolve_input(id);
+        let polled = pending
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        done.send(matches!(polled, Poll::Ready(Err(_)))).unwrap();
+    });
+    assert!(
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resolve returns instead of deadlocking")
+    );
 }
 
 #[test]
