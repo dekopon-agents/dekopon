@@ -1188,13 +1188,7 @@ fn note_adapter() -> (
     let (text, _receiver) = tokio::sync::watch::channel(StreamedText::default());
     let counters = Arc::new(super::adapter::ProgressCounters::default());
     (
-        ProgressAdapter::new(
-            "local".to_owned(),
-            events,
-            text,
-            Arc::clone(&counters),
-            SessionCancellation::new(),
-        ),
+        ProgressAdapter::new("local".to_owned(), events, text, Arc::clone(&counters)),
         receiver,
         counters,
     )
@@ -2130,13 +2124,18 @@ async fn a_cancel_renders_the_stopped_line_before_the_session_unwinds() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_stop_after_the_loop_finished_leaves_the_answer_as_the_only_terminal_write() {
+async fn a_stop_after_the_loop_sealed_leaves_the_answer_as_the_only_terminal_write() {
     const ANSWER: &str = "The capability echoed hi.";
 
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
     harness.sink.emit(started());
     harness.sink.emit(answered_with_tool(1));
     settle().await;
+    assert_eq!(
+        crate::session::SessionGate::new(1)
+            .seal(&("local".to_owned(), "c".to_owned()), &harness.cancellation),
+        dekopon_agent::prompt::Seal::Sealed { leftover: 0 }
+    );
     harness.sink.emit(finished());
 
     assert!(

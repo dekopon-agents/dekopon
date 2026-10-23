@@ -17447,6 +17447,8 @@ mod github_invocation;
 mod jobs_e2e;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
+#[path = "tests/sealed_handoff.rs"]
+mod sealed_handoff;
 #[path = "tests/selection.rs"]
 mod selection;
 #[path = "tests/steering.rs"]
