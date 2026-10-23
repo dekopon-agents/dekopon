@@ -2279,8 +2279,12 @@ async fn session(
     let (outcome, turn, images) = match result.map_err(TaskFailure::from) {
         Ok(session) => session,
         Err(failure) => {
-            if steers.seal() == Seal::Stopped {
-                return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
+            match steers.seal() {
+                Seal::Stopped => {
+                    return stopped(runner, route, &key, message, &mut progress, &cancellation)
+                        .await;
+                }
+                Seal::Sealed { .. } => {}
             }
             progress.seal();
             tracing::error!(
@@ -2300,7 +2304,10 @@ async fn session(
     };
 
     if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
-        || steers.seal() == Seal::Stopped
+        || match steers.seal() {
+            Seal::Stopped => true,
+            Seal::Sealed { .. } => false,
+        }
     {
         return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
     }

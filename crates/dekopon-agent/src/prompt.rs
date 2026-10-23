@@ -933,8 +933,9 @@ where
             } else {
                 lease.seal()
             };
-            if seal == Seal::Stopped {
-                return Err(PromptError::Cancelled);
+            match seal {
+                Seal::Stopped => return Err(PromptError::Cancelled),
+                Seal::Sealed { .. } => {}
             }
             let answer = turn
                 .content
@@ -997,8 +998,9 @@ where
             }
             if capability_invocations == 0 {
                 check_cancelled(cancellation)?;
-                if lease.seal() == Seal::Stopped {
-                    return Err(PromptError::Cancelled);
+                match lease.seal() {
+                    Seal::Stopped => return Err(PromptError::Cancelled),
+                    Seal::Sealed { .. } => {}
                 }
                 tracing::info!(
                     target: "dekopon_agent::audit",
