@@ -202,8 +202,13 @@ impl LexError {
 /// ceiling, deeply nested expansions would abort the process instead of returning a lex error.
 const MAX_PARAMETER_NESTING: u32 = 32;
 
+#[cfg(test)]
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source, 0).run()
+    tokenize_at(source, 0)
+}
+
+pub(crate) fn tokenize_at(source: &str, depth: u32) -> Result<Vec<Token>, LexError> {
+    Lexer::new(source, depth).run()
 }
 
 fn tokenize_nested(source: &str, depth: u32, line: usize) -> Result<Vec<Token>, LexError> {

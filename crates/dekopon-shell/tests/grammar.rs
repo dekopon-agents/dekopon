@@ -460,6 +460,30 @@ fn binary_base64_passes_through_cat_but_not_text_boundaries() {
 }
 
 #[test]
+fn a_nested_block_buffer_overrides_inherited_discard() {
+    assert_eq!(
+        output("{ { printf kept; } > buf; } > /dev/null; cat buf"),
+        "kept"
+    );
+}
+
+#[test]
+fn a_function_buffer_overrides_inherited_discard() {
+    assert_eq!(
+        output("f() { printf kept; }; { f > buf; } > /dev/null; cat buf"),
+        "kept"
+    );
+}
+
+#[test]
+fn a_conditional_buffer_overrides_inherited_discard() {
+    assert_eq!(
+        output("{ if true; then printf kept; fi > buf; } > /dev/null; cat buf"),
+        "kept"
+    );
+}
+
+#[test]
 fn a_function_redirect_captures_its_body() {
     assert_eq!(output("f() { printf ab; }; f > buf; cat buf"), "ab");
     assert_eq!(output("f() { echo hi; }; f > buf; cat buf | wc -c"), "3");
@@ -1072,6 +1096,19 @@ fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
 }
 
 #[test]
+fn a_literal_assignment_preserves_the_last_substitution_status() {
+    assert_eq!(output("a=$(false) b=literal; echo $?"), "1");
+}
+
+#[test]
+fn an_assignment_condition_uses_the_last_substitution_status() {
+    assert_eq!(
+        output("if a=$(false) b=literal; then echo success; else echo failure; fi"),
+        "failure"
+    );
+}
+
+#[test]
 fn an_interpolated_substitution_still_reports_its_status() {
     assert_eq!(output("x=a$(false); echo $?"), "1");
     assert_eq!(output("x=$(false); echo $?"), "1");
@@ -1205,6 +1242,11 @@ fn pipelines_deliver_structured_values() {
         output("probe fetch | jq -r .bodyText | grep alpha | wc -l"),
         "2"
     );
+}
+
+#[test]
+fn an_assignment_only_redirect_truncates_its_buffer() {
+    assert_eq!(output("printf old > buf; x=value > buf; cat buf"), "");
 }
 
 #[test]
@@ -2492,6 +2534,15 @@ fn arithmetic_calls_deep(expression: &str, calls: u32) -> String {
 
 fn arithmetic_thirty_calls_deep(expression: &str) -> String {
     arithmetic_calls_deep(expression, 30)
+}
+
+#[test]
+fn alternating_expansions_share_parse_depth_on_a_two_mib_stack() {
+    let mut body = "echo hi".to_owned();
+    for _ in 0..63 {
+        body = format!("echo {}$({}){}", "${a:-".repeat(31), body, "}".repeat(31));
+    }
+    assert_eq!(on_a_two_mib_stack(&body).exit_code, ExitCode::SYNTAX);
 }
 
 #[test]

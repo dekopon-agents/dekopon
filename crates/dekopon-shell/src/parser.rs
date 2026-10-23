@@ -9,7 +9,8 @@ use crate::{
         Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
     lexer::{
-        LexError, RawIndex, RawModifier, RawParameter, RawPart, RawWord, Token, TokenKind, tokenize,
+        LexError, RawIndex, RawModifier, RawParameter, RawPart, RawWord, Token, TokenKind,
+        tokenize_at,
     },
 };
 
@@ -79,7 +80,7 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
 }
 
 fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
-    let tokens = tokenize(source)?;
+    let tokens = tokenize_at(source, depth)?;
     let mut parser = Parser::new(source, tokens, depth);
     let program = parser.parse_program(&[])?;
     if let Some(token) = parser.peek() {

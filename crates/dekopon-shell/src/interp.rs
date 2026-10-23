@@ -1856,8 +1856,10 @@ impl<'a> Evaluator<'a> {
             self.captures.push(Vec::new());
         }
         let previous_discard = self.discard_capture_depth;
-        if stdout == Sink::Discard {
-            self.discard_capture_depth = Some(self.captures.len());
+        match stdout {
+            Sink::Discard => self.discard_capture_depth = Some(self.captures.len()),
+            Sink::Buffer { .. } | Sink::Diagnostics => self.discard_capture_depth = None,
+            Sink::Value => {}
         }
         let previous_diagnostics = self.diagnostics_depth;
         if stdout == Sink::Diagnostics {
@@ -1964,6 +1966,7 @@ impl<'a> Evaluator<'a> {
         let transient = !argv.is_empty();
         let mut restore = Vec::new();
         let mut assignment_status = ExitCode::SUCCESS;
+        self.last_substitution_status = ExitCode::SUCCESS;
         for assignment in &command.assignments {
             let value = match self.assignment_value(&assignment.value) {
                 Ok(value) => value,
@@ -1981,15 +1984,6 @@ impl<'a> Evaluator<'a> {
                 self.restore_all(restore);
                 return Err(limit.into());
             }
-        }
-
-        if argv.is_empty() {
-            let status = if command.assignments.is_empty() {
-                ExitCode::SUCCESS
-            } else {
-                assignment_status
-            };
-            return Ok(Executed::Result(CommandResult::status(status)));
         }
 
         let mut here_doc_charges = Vec::new();
@@ -2026,6 +2020,15 @@ impl<'a> Evaluator<'a> {
         };
 
         self.open_buffers(&[&stdout, &stderr])?;
+        if argv.is_empty() {
+            let status = if command.assignments.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                assignment_status
+            };
+            return Ok(Executed::Result(CommandResult::status(status)));
+        }
+
         let capturing = stderr != Sink::Diagnostics;
         if capturing {
             self.stderr_capture.push(StderrCapture::new(&self.limits));
@@ -3222,8 +3225,10 @@ impl<'a> Evaluator<'a> {
         if *stdout_sink == Sink::Diagnostics {
             self.diagnostics_depth = Some(self.captures.len());
         }
-        if *stdout_sink == Sink::Discard {
-            self.discard_capture_depth = Some(self.captures.len());
+        match stdout_sink {
+            Sink::Discard => self.discard_capture_depth = Some(self.captures.len()),
+            Sink::Buffer { .. } | Sink::Diagnostics => self.discard_capture_depth = None,
+            Sink::Value => {}
         }
         let flow = self.execute_program(&body);
         if *stdout_sink != Sink::Value {
@@ -3342,7 +3347,6 @@ impl<'a> Evaluator<'a> {
     /// structured value instead of flattening it to text, a deliberate deviation from real shells
     /// that lets a script later index into what it captured.
     fn assignment_value(&mut self, word: &Word) -> Result<CommandResult, CommandFailure> {
-        self.last_substitution_status = ExitCode::SUCCESS;
         if let [WordPart::CommandSubstitution(program)] = word.parts.as_slice() {
             let mut result = self.run_substitution(program)?;
             if let Value::String(text) = &result.value {
