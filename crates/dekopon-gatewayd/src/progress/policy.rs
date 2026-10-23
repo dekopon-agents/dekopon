@@ -159,7 +159,6 @@ impl ProgressPolicy {
             events_tx,
             text_tx,
             Arc::clone(&counters),
-            cancellation.clone(),
         ));
         let surface = Pending {
             inputs,

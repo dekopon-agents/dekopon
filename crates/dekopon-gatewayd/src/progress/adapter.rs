@@ -7,7 +7,7 @@ use dekopon_agent::{ProgressEvent, ProgressSink};
 use dekopon_model::ModelText;
 use tokio::sync::{mpsc, watch};
 
-use crate::{session::SessionCancellation, transport::StreamedText};
+use crate::transport::StreamedText;
 
 pub(crate) const EVENT_QUEUE: usize = 64;
 
@@ -34,7 +34,6 @@ pub(crate) struct ProgressAdapter {
     turn: AtomicU32,
     notes: AtomicU32,
     counters: Arc<ProgressCounters>,
-    cancellation: SessionCancellation,
 }
 
 impl ProgressAdapter {
@@ -43,7 +42,6 @@ impl ProgressAdapter {
         events: mpsc::Sender<QueuedEvent>,
         text: watch::Sender<StreamedText>,
         counters: Arc<ProgressCounters>,
-        cancellation: SessionCancellation,
     ) -> Self {
         Self {
             transport,
@@ -52,7 +50,6 @@ impl ProgressAdapter {
             turn: AtomicU32::new(NO_TURN),
             notes: AtomicU32::new(0),
             counters,
-            cancellation,
         }
     }
 }
@@ -99,18 +96,6 @@ impl ProgressSink for ProgressAdapter {
                 cumulative.generation += 1;
             });
             self.turn.store(NO_TURN, Ordering::Relaxed);
-        }
-        // Claimed synchronously here, on the loop's own thread, so a stop word arriving while the
-        // session unwinds loses the race instead of overwriting the finished answer with the
-        // stopped reply.
-        if matches!(event, ProgressEvent::Finished { .. }) {
-            #[allow(
-                clippy::let_underscore_must_use,
-                reason = "the bool says whether this claim closed the race; losing it means a \
-                          stop already won, which the policy has already rendered and the \
-                          session already reports as cancelled"
-            )]
-            let _ = self.cancellation.claim_completion();
         }
         record(&event);
         if let Err(error) = self.events.try_send(QueuedEvent {

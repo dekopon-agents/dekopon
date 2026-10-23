@@ -17,8 +17,8 @@ use dekopon_agent::{
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
-        CancellationProbe, ConversationTurn, History, PromptError, ReplyDisposition, SessionInputs,
-        Steer, SteerSource, run_prompt_session,
+        CancellationProbe, ConversationTurn, Handoff, History, PromptError, ReplyDisposition, Seal,
+        SessionInputs, Steer, SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -457,7 +457,8 @@ impl ModelCache {
     }
 }
 
-pub(crate) const MAILBOX_CAPACITY: usize = 8;
+pub(crate) const MAILBOX_CAPACITY: usize = 100;
+pub(crate) const MAX_INTERRUPTS: u8 = 8;
 
 #[derive(Clone)]
 pub(crate) struct SessionGate {
@@ -507,6 +508,11 @@ pub(crate) enum Admit {
     Queued,
     Full(InboundMessage, Dispositions),
     Saturated(InboundMessage, Dispositions),
+}
+
+pub(crate) enum Taken {
+    Steers(Vec<InboundMessage>),
+    Sealed(Seal),
 }
 
 pub(crate) struct StopOutcome {
@@ -570,7 +576,7 @@ impl SessionGate {
                 running.steers.push_back(message);
                 if running.steering == Steering::Abort
                     && interrupts
-                    && usize::from(running.aborts) < MAILBOX_CAPACITY
+                    && running.aborts < MAX_INTERRUPTS
                 {
                     running.aborts += 1;
                     running.cancellation.interrupt_model();
@@ -628,6 +634,27 @@ impl SessionGate {
         running.steers.drain(..).collect()
     }
 
+    pub(crate) fn seal_or_take(
+        &self,
+        key: &AdmissionKey,
+        cancellation: &SessionCancellation,
+    ) -> Taken {
+        let mut entries = self.in_flight.lock();
+        if let Some(Holder::Session(running)) = entries.get_mut(key)
+            && Arc::ptr_eq(&running.cancellation.state, &cancellation.state)
+            && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
+            && !running.steers.is_empty()
+        {
+            running.cancellation.rearm_model();
+            return Taken::Steers(running.steers.drain(..).collect());
+        }
+        Taken::Sealed(seal_locked(&entries, key, cancellation))
+    }
+
+    pub(crate) fn seal(&self, key: &AdmissionKey, cancellation: &SessionCancellation) -> Seal {
+        seal_locked(&self.in_flight.lock(), key, cancellation)
+    }
+
     pub(crate) fn cancel(&self, request: &CancelRequest) -> StopOutcome {
         let key = (request.transport.clone(), request.conversation_id.clone());
         let mut entries = self.in_flight.lock();
@@ -674,6 +701,27 @@ impl SessionGate {
             dropped,
         }
     }
+}
+
+// Admission reads the running state under the same lock, so a steer is either in `steers` before
+// the seal or queued as a follow-up after it.
+fn seal_locked(
+    entries: &BTreeMap<AdmissionKey, Holder>,
+    key: &AdmissionKey,
+    cancellation: &SessionCancellation,
+) -> Seal {
+    if !cancellation.complete() {
+        return Seal::Stopped;
+    }
+    let leftover = match entries.get(key) {
+        Some(Holder::Session(running))
+            if Arc::ptr_eq(&running.cancellation.state, &cancellation.state) =>
+        {
+            running.steers.len()
+        }
+        Some(Holder::Session(_) | Holder::Probe) | None => 0,
+    };
+    Seal::Sealed { leftover }
 }
 
 impl SessionGate {
@@ -734,6 +782,7 @@ impl SessionAdmission {
                 return None;
             };
             // Fold before changing subject: leftover steers must never drain into another sender's run.
+            let mut leftovers = Vec::new();
             while let Some(mut message) = running.steers.pop_front() {
                 let folds = match message.message_id {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
@@ -741,38 +790,19 @@ impl SessionAdmission {
                 };
                 if folds {
                     let mut grouped = Vec::new();
-                    while running
-                        .steers
-                        .front()
-                        .is_some_and(|steer| match steer.message_id {
-                            MessageId::Native(_) => true,
-                            MessageId::Wake { .. }
-                            | MessageId::Job { .. }
-                            | MessageId::Follow(_) => false,
-                        })
-                    {
-                        if let Some(next) = running.steers.pop_front() {
-                            grouped.push(next);
-                        }
+                    while let Some(next) = running.steers.pop_front_if(|steer| folds_in(steer)) {
+                        grouped.push(next);
                     }
-                    message.text = bound_inbound(&crate::collection::combined_text(
-                        std::iter::once(&message).chain(grouped.iter()),
-                    ));
-                    for next in grouped {
-                        if let MessageId::Native(id) = next.message_id {
-                            message.folded.push(id);
-                        }
-                        message.folded.extend(next.folded);
-                        message.assets.extend(next.assets);
-                        message.constituents.extend(next.constituents);
-                        message.receive_span = next.receive_span;
-                    }
+                    fold(&mut message, grouped);
                 }
-                running.follow_ups.push_back(FollowUp {
+                leftovers.push(FollowUp {
                     route: (*self.route).clone(),
                     receipts: crate::collection::Dispositions(message.constituents.clone()),
                     message,
                 });
+            }
+            for leftover in leftovers.into_iter().rev() {
+                running.follow_ups.push_front(leftover);
             }
             let mut found = None;
             while let Some(mut next) = running.follow_ups.pop_front() {
@@ -780,6 +810,18 @@ impl SessionAdmission {
                     next.receipts.finish("route-lost");
                     continue;
                 };
+                if folds_in(&next.message) {
+                    let mut grouped = Vec::new();
+                    while let Some(mut same) = running.follow_ups.pop_front_if(|queued| {
+                        folds_in(&queued.message) && queued.message.subject == next.message.subject
+                    }) {
+                        next.receipts.0.append(&mut same.receipts.0);
+                        grouped.push(same.message);
+                    }
+                    if !grouped.is_empty() {
+                        fold(&mut next.message, grouped);
+                    }
+                }
                 next.route = route;
                 running.subject = next.message.subject.clone();
                 running.cancellation = SessionCancellation::new();
@@ -801,6 +843,28 @@ impl SessionAdmission {
             followup,
             evidence,
         })
+    }
+}
+
+fn folds_in(message: &InboundMessage) -> bool {
+    match message.message_id {
+        MessageId::Native(_) => true,
+        MessageId::Wake { .. } | MessageId::Job { .. } | MessageId::Follow(_) => false,
+    }
+}
+
+fn fold(lead: &mut InboundMessage, grouped: Vec<InboundMessage>) {
+    lead.text = bound_inbound(&crate::collection::combined_text(
+        std::iter::once(&*lead).chain(grouped.iter()),
+    ));
+    for next in grouped {
+        if let MessageId::Native(id) = next.message_id {
+            lead.folded.push(id);
+        }
+        lead.folded.extend(next.folded);
+        lead.assets.extend(next.assets);
+        lead.constituents.extend(next.constituents);
+        lead.receive_span = next.receive_span;
     }
 }
 
@@ -866,11 +930,8 @@ impl SessionCancellation {
         }
     }
 
-    /// Idempotent and claimed twice on the answering path, so a stop landing in the gap between the
-    /// loop finishing and the session resuming cannot write a stopped line under an answer already
-    /// being read.
     #[must_use]
-    pub(crate) fn claim_completion(&self) -> bool {
+    fn complete(&self) -> bool {
         match self.state.compare_exchange(
             SESSION_RUNNING,
             SESSION_COMPLETING,
@@ -1571,6 +1632,7 @@ async fn run_admitted(
 struct SessionSteers {
     gate: SessionGate,
     key: AdmissionKey,
+    cancellation: SessionCancellation,
     store: Arc<AssetStore>,
     access: AssetAccess,
     images_supported: bool,
@@ -1582,16 +1644,33 @@ struct SessionSteers {
 }
 
 impl SteerSource for SessionSteers {
-    fn drain(&self) -> Vec<Steer> {
-        self.gate
-            .take_steers(&self.key)
+    fn take(&self) -> Vec<Steer> {
+        self.stage(self.gate.take_steers(&self.key))
+    }
+
+    fn seal_or_take(&self) -> Handoff {
+        match self.gate.seal_or_take(&self.key, &self.cancellation) {
+            Taken::Steers(steers) => Handoff::Steers(self.stage(steers)),
+            Taken::Sealed(seal) => Handoff::Sealed(seal),
+        }
+    }
+
+    fn seal(&self) -> Seal {
+        self.gate.seal(&self.key, &self.cancellation)
+    }
+}
+
+impl SessionSteers {
+    fn stage(&self, steers: Vec<InboundMessage>) -> Vec<Steer> {
+        steers
             .into_iter()
-            .map(|steer| {
+            .map(|mut steer| {
                 match &steer.message_id {
                     MessageId::Job { .. } => return Steer::Notice(steer.text),
                     MessageId::Native(id) => self.taken.lock().push(id.clone()),
                     MessageId::Wake { .. } | MessageId::Follow(_) => {}
                 }
+                self.taken.lock().append(&mut steer.folded);
                 let seconds = steer
                     .received_at
                     .saturating_duration_since(self.received_at)
@@ -1618,9 +1697,7 @@ impl SteerSource for SessionSteers {
             })
             .collect()
     }
-}
 
-impl SessionSteers {
     fn user_text(&self, prompt: &str) -> String {
         let mut text = prompt.to_owned();
         for steer in self.raw_texts.lock().iter() {
@@ -1924,6 +2001,7 @@ async fn session(
     let steers = Arc::new(SessionSteers {
         gate: runner.gate.clone(),
         key: (message.transport.clone(), message.conversation.key()),
+        cancellation: cancellation.clone(),
         store: Arc::clone(&runner.assets),
         access: asset_access,
         images_supported,
@@ -2201,8 +2279,12 @@ async fn session(
     let (outcome, turn, images) = match result.map_err(TaskFailure::from) {
         Ok(session) => session,
         Err(failure) => {
-            if !cancellation.claim_completion() {
-                return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
+            match steers.seal() {
+                Seal::Stopped => {
+                    return stopped(runner, route, &key, message, &mut progress, &cancellation)
+                        .await;
+                }
+                Seal::Sealed { .. } => {}
             }
             progress.seal();
             tracing::error!(
@@ -2222,8 +2304,10 @@ async fn session(
     };
 
     if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
-        || cancellation.is_cancelled()
-        || !cancellation.claim_completion()
+        || match steers.seal() {
+            Seal::Stopped => true,
+            Seal::Sealed { .. } => false,
+        }
     {
         return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
     }

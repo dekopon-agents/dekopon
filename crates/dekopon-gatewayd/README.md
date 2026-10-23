@@ -28,7 +28,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   collection, using that run's asset access; downloads remain on demand.
 - **Steering** — same-sender input interrupts only the model (`steering: abort`, default) or waits
   for the step boundary (`boundary`). Other senders and wakes queue their own turns. The shared
-  mailbox holds eight items; busy replies mean a full mailbox or process-wide saturation, not an
+  mailbox holds 100 items; busy replies mean a full mailbox or process-wide saturation, not an
   ordinary follow-up. User stops drop only that sender's queued input.
 - **Asset handles** — exact proposal references carry read-only descriptors, never expanded bytes.
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized

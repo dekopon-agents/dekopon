@@ -52,8 +52,10 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   metadata such as a prompt cache key: they change how a provider routes the request, never
   what the model is asked, so the default is byte-identical to the call without them.
 - `prompt::SessionInputs` — the builder those entry points fill in and
-  `prompt::run_prompt_session` runs. `with_steering(&dyn prompt::SteerSource)` drains queued
+  `prompt::run_prompt_session` runs. `with_steering(&dyn prompt::SteerSource)` takes queued
   user text at step boundaries and retries model-only interruptions without spending a step.
+  Every exit seals the mailbox: a final answer with steps left takes or seals in one step, and
+  steers still unread at the seal are the embedder's leftovers to run next.
   `with_progress_notes()` appends the builtin's guidance to the bash tool description; without
   it that description is unchanged. Enable it alongside `BrokerLeg::with_progress_notes()`.
   `with_skills(&[Skill])` mounts operator-authored skills, and an empty slice adds no listing and
