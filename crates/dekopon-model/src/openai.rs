@@ -538,7 +538,7 @@ pub(crate) struct WireToolCall {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
-    function: Option<WireFunctionCall>,
+    function: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -568,6 +568,8 @@ impl WireToolCall {
         let function = call
             .function
             .ok_or_else(|| InferenceError::from(ProtocolFailure::IncompleteToolCall))?;
+        let function = WireFunctionCall::deserialize(function)
+            .map_err(|error| secrets.decode_failure(error))?;
         let arguments = match function.arguments {
             Value::String(arguments) => arguments,
             arguments @ Value::Object(_) => {
@@ -678,7 +680,7 @@ struct ChunkToolCall {
     #[serde(rename = "type", default)]
     kind: Option<String>,
     #[serde(default)]
-    function: Option<ChunkFunction>,
+    function: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -739,26 +741,50 @@ impl ChatStream {
                 }
             }
             for fragment in delta.tool_calls.unwrap_or_default() {
-                if let Some(index) = self.merge_call(fragment)
-                    && on_event(TurnEvent::ToolCallStarted { index }).is_break()
-                {
-                    return Ok(ControlFlow::Break(()));
-                }
+                self.merge_call(fragment, secrets)?;
             }
         }
         Ok(ControlFlow::Continue(()))
     }
 
-    fn merge_call(&mut self, fragment: ChunkToolCall) -> Option<u32> {
+    fn merge_call(
+        &mut self,
+        fragment: ChunkToolCall,
+        secrets: DiagnosticSecrets<'_>,
+    ) -> Result<(), InferenceError> {
         let index = fragment.index.unwrap_or(0);
-        let function = fragment.function.unwrap_or_default();
+        let existing = self.latest.get(&index).copied();
+        let held_kind = existing
+            .map(|position| self.calls[position].kind.as_str())
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("function");
+        let kind = fragment
+            .kind
+            .as_deref()
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or(held_kind);
+        let function = if kind == "function" {
+            fragment
+                .function
+                .map(ChunkFunction::deserialize)
+                .transpose()
+                .map_err(|error| secrets.decode_failure(error))?
+                .unwrap_or_default()
+        } else {
+            ChunkFunction::default()
+        };
         let name = function.name.filter(|name| !name.is_empty());
         let arguments = function.arguments.unwrap_or_default();
 
-        let slot = match self.latest.get(&index).copied() {
+        let slot = match existing {
             // Ollama reports every parallel call at index 0, so a fragment naming a function when
             // that index already has one starts a new call rather than continuing it.
-            Some(position) if name.is_some() && !self.calls[position].name.is_empty() => None,
+            Some(position)
+                if kind != held_kind
+                    || (name.is_some() && !self.calls[position].name.is_empty()) =>
+            {
+                None
+            }
             other => other,
         };
         let Some(position) = slot else {
@@ -769,7 +795,7 @@ impl ChatStream {
                 arguments,
             });
             self.latest.insert(index, self.calls.len() - 1);
-            return Some(u32::try_from(self.calls.len() - 1).unwrap_or(u32::MAX));
+            return Ok(());
         };
         let call = &mut self.calls[position];
         if let Some(id) = fragment.id.filter(|id| !id.is_empty()) {
@@ -784,7 +810,7 @@ impl ChatStream {
         // llama.cpp has answered with the whole argument document in one fragment and OpenAI sends
         // it a few characters at a time; appending is the same operation for both.
         call.arguments.push_str(&arguments);
-        None
+        Ok(())
     }
 
     fn into_turn(
@@ -805,10 +831,9 @@ impl ChatStream {
                     } else {
                         call.kind
                     },
-                    function: Some(WireFunctionCall {
-                        name: call.name,
-                        arguments: Value::String(call.arguments),
-                    }),
+                    function: Some(
+                        serde_json::json!({"name": call.name, "arguments": call.arguments}),
+                    ),
                 }
                 .into_model(secrets)
                 .transpose()
@@ -867,9 +892,10 @@ mod tests {
     use super::{
         AssistantTurn, ChatRequest, ChatResponse, ContentPart, ControlFlow, InferenceError,
         ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage, OpenAiClient,
-        OpenAiTool, StreamOptions, TurnEvent, WireFunctionCall, WireMessage, WireToolCall,
-        completion_url, replay_transcript, turn_from_response,
+        OpenAiTool, StreamOptions, TurnEvent, WireMessage, WireToolCall, completion_url,
+        replay_transcript, turn_from_response,
     };
+    use crate::diagnostic::DiagnosticSecrets;
     use crate::error::{AuthError, RateLimitError};
     use crate::mock::{MockResponse, MockServer};
     use crate::model::{ChatModel, ClientIdentity, CompletionOptions, assistant_message};
@@ -1515,7 +1541,6 @@ mod tests {
             .iter()
             .map(|event| match event {
                 TurnEvent::TextDelta(text) => format!("text:{}", text.as_str()),
-                TurnEvent::ToolCallStarted { index } => format!("call:{index}"),
             })
             .collect()
     }
@@ -1686,10 +1711,7 @@ mod tests {
         let call = WireToolCall {
             id: "call-1".to_owned(),
             kind: "function".to_owned(),
-            function: Some(WireFunctionCall {
-                name: "echo_echo".to_owned(),
-                arguments: json!({"message": "hi"}),
-            }),
+            function: Some(json!({"name": "echo_echo", "arguments": {"message": "hi"}})),
         }
         .into_model(crate::diagnostic::DiagnosticSecrets::default())
         .expect("object arguments normalize")
@@ -1910,6 +1932,52 @@ mod tests {
 
         assert_eq!(turn.content.as_deref(), Some("answer"));
         assert!(turn.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_functions_are_skipped_before_decoding_in_buffered_and_streamed_turns() {
+        let calls = json!([
+            {"index":0,"id":"search","type":"web_search","function":17},
+            {"index":1,"id":"call","type":"function","function":{"name":"bash","arguments":"{}"}}
+        ]);
+        let response: ChatResponse =
+            serde_json::from_value(json!({"choices":[{"finish_reason":"tool_calls",
+            "message":{"content":"answer","tool_calls":calls}}]}))
+            .unwrap();
+        let buffered = turn_from_response(DiagnosticSecrets::default(), response).unwrap();
+        let chunk = json!({"choices":[{"delta":{"content":"answer","tool_calls":calls},"finish_reason":"tool_calls"}]});
+        let streamed = replay_transcript(
+            DiagnosticSecrets::default(),
+            &format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            &mut |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        for turn in [buffered, streamed] {
+            assert_eq!(turn.content.as_deref(), Some("answer"));
+            assert_eq!(turn.tool_calls.len(), 1);
+            assert_eq!(turn.tool_calls[0].id.as_str(), "call");
+        }
+    }
+
+    #[test]
+    fn malformed_known_tool_functions_fail_buffered_and_streamed_turns() {
+        let calls = json!([{"id":"call","type":"function","function":17}]);
+        let response: ChatResponse = serde_json::from_value(json!({"choices":[{
+            "message":{"tool_calls":calls}}]}))
+        .unwrap();
+        assert!(matches!(
+            turn_from_response(DiagnosticSecrets::default(), response),
+            Err(InferenceError::Protocol(_))
+        ));
+        let chunk = json!({"choices":[{"delta":{"tool_calls":calls}}]});
+        assert!(matches!(
+            replay_transcript(
+                DiagnosticSecrets::default(),
+                &format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                &mut |_| ControlFlow::Continue(())
+            ),
+            Err(InferenceError::Protocol(_))
+        ));
     }
 
     async fn wire(message: &ModelMessage) -> Value {
@@ -2344,9 +2412,41 @@ mod tests {
         assert_eq!(turn.content.as_deref(), Some("Checking now."));
         assert_eq!(
             recorded(&events),
-            vec!["text:Checking", "text: now.", "call:0", "call:1"],
+            vec!["text:Checking", "text: now."],
             "an event carries a fragment of the answer or a counter, and nothing else"
         );
+    }
+
+    #[test]
+    fn a_different_tool_kind_at_a_reused_index_preserves_the_function_call() {
+        let stream = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"search","type":"web_search","function":17}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        let turn = replay_transcript(DiagnosticSecrets::default(), &stream, &mut ignored)
+            .expect("a streamed turn");
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id.as_str(), "call_1");
+        assert_eq!(turn.tool_calls[0].kind, "function");
+        assert_eq!(turn.tool_calls[0].function.name, "bash");
+        assert_eq!(turn.tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn an_empty_tool_kind_continues_the_held_unknown_call() {
+        let stream = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"search","type":"web_search"}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"","function":{"arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        let turn = replay_transcript(DiagnosticSecrets::default(), &stream, &mut ignored)
+            .expect("an unknown tool continuation is skipped");
+
+        assert!(turn.tool_calls.is_empty());
     }
 
     #[test]

@@ -814,6 +814,7 @@ mod unit_tests {
     fn streamed() -> StreamedText {
         let events = dekopon_model::events_from_transcript(
             dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+            dekopon_model::TranscriptDialect::ChatCompletions,
         )
         .expect("the recorded transcript parses");
         StreamedText {

@@ -57,19 +57,18 @@ pub(crate) fn read_skill_into(
     reads: &mut SkillReads,
     call: &ModelToolCall,
     model_turn: u32,
-    tool_call_index: usize,
 ) -> Result<(), PromptError> {
     let (name, resource) = match skill_arguments(&call.function.name, &call.function.arguments) {
         Ok(arguments) => arguments,
         Err(error) => {
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
+            reject_tool_call(model_turn, call.id.as_str(), error.telemetry_kind(), false);
             return Err(error);
         }
     };
     // Never copy the model-chosen skill name into telemetry, since it is untrusted text an operator
     // may read.
     let Some(skill) = skills.iter().find(|skill| skill.name().as_str() == name) else {
-        refuse(model_turn, tool_call_index, "unknown-skill");
+        refuse(model_turn, call.id.as_str(), "unknown-skill");
         let mounted = skills
             .iter()
             .map(|skill| skill.name().as_str())
@@ -89,7 +88,7 @@ pub(crate) fn read_skill_into(
                 Some(resource.path.clone()),
             ),
             None => {
-                refuse(model_turn, tool_call_index, "unknown-resource");
+                refuse(model_turn, call.id.as_str(), "unknown-resource");
                 messages.push(ModelMessage::tool(
                     call.id.clone(),
                     format!(
@@ -114,7 +113,7 @@ pub(crate) fn read_skill_into(
         {
             audit.event = "agent.skill.read",
             model.turn = model_turn,
-            tool_call.index = tool_call_index,
+            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
             skill.name = skill.name().as_str(),
             skill.resource = resource_path.as_deref().unwrap_or_default(),
             skill.bytes = result.len(),
@@ -126,13 +125,13 @@ pub(crate) fn read_skill_into(
     Ok(())
 }
 
-fn refuse(model_turn: u32, tool_call_index: usize, reason: &'static str) {
+fn refuse(model_turn: u32, call_id: &str, reason: &'static str) {
     tracing::info!(
         target: "dekopon_agent::audit",
         {
             audit.event = "agent.skill.refused",
             model.turn = model_turn,
-            tool_call.index = tool_call_index,
+            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
             reason = reason,
         },
         "skill read refused"

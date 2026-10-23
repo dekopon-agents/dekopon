@@ -177,6 +177,8 @@ empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a co
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
+`dekopon-model` also emits debug `unknown_content_part_skipped` and `unknown_tool_item_skipped`, each
+carrying only a sanitized, model-supplied `kind`; the item is skipped.
 
 ## Provider linear-memory sizing
 
@@ -220,18 +222,18 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (once per session, for an unknown tool or a malformed `bash` call) — never the model's own tool name or arguments |
+| `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (once per session, for an unknown tool or a malformed `bash` call) — never the model's own tool name or arguments |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
 | `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
-| `agent.skill.read` | `dekopon-agent` | model turn, tool-call index, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
-| `agent.skill.refused` | `dekopon-agent` | model turn, tool-call index, and a stable `reason` — `unknown-skill` or `unknown-resource`; the refusal that lists what *is* mounted goes to the model as a tool result, not here |
-| `agent.improvement.suggested` | `dekopon-agent` | model turn, tool-call index, `suggestion.index` (1 to 3), the enum tokens `suggestion.category` and `suggestion.confidence`, and the model-authored `suggestion.target`, `suggestion.summary`, `suggestion.evidence`, and `suggestion.proposal`, bounded to 128, 512, 2048, and 2048 bytes — see below |
-| `agent.improvement.refused` | `dekopon-agent` | model turn, tool-call index, and a stable `reason` — `invalid-category`, `invalid-confidence`, `empty-field`, `field-too-long`, or `session-limit`; none of the submitted text |
-| `agent.wake.refused` | `dekopon-agent` | model turn, tool-call index, and a stable `reason` — `note-too-long`, `horizon`, `interval`, `full`, `broken-probe`, `not-found`, `unavailable`, or `store`; the model reads the refusal as a tool result, and neither the note nor the probe script is copied here |
+| `agent.skill.read` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
+| `agent.skill.refused` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, and a stable `reason` — `unknown-skill` or `unknown-resource`; the refusal that lists what *is* mounted goes to the model as a tool result, not here |
+| `agent.improvement.suggested` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, `suggestion.index` (1 to 3), the enum tokens `suggestion.category` and `suggestion.confidence`, and the model-authored `suggestion.target`, `suggestion.summary`, `suggestion.evidence`, and `suggestion.proposal`, bounded to 128, 512, 2048, and 2048 bytes — see below |
+| `agent.improvement.refused` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, and a stable `reason` — `invalid-category`, `invalid-confidence`, `empty-field`, `field-too-long`, or `session-limit`; none of the submitted text |
+| `agent.wake.refused` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, and a stable `reason` — `note-too-long`, `horizon`, `interval`, `full`, `broken-probe`, `not-found`, `unavailable`, or `store`; the model reads the refusal as a tool result, and neither the note nor the probe script is copied here |
 | `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
 | `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
@@ -558,7 +560,7 @@ IO never holds a span guard across an await. WhatsApp's final media boundaries e
 alone is not delivery; only validated message acceptance completes the send. Cancelled futures can
 close these spans without a terminal outcome. Broker/provider W3C propagation is unchanged.
 
-The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
+The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and bounded provider-authored `gen_ai.tool.call.id` that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the
 metadata level: `declined` means an optional owned-thread continuation produced no chat delivery,
@@ -1222,7 +1224,7 @@ a public telemetry contract. Broker component spans and their bounds are describ
 
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so
 `prompt.script` is the span for a whole unit of model-requested work rather than for a single
-capability invocation. It carries `model.turn`, `tool_call.index`, `script.max_capability_calls`,
+capability invocation. It carries `model.turn`, `gen_ai.tool.call.id`, `script.max_capability_calls`,
 `script.bytes`, and `tool_call.ignored_arguments`: the comma-separated names, never the values, of
 arguments the `bash` call sent beside `command` (bounded to 256 bytes, absent when there were none).
 The call still runs; the field shows which shapes a model brings from other bash tools. Inside it, the interpreter opens one `shell.script` span per run, and inside

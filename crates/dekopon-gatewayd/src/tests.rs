@@ -15597,6 +15597,7 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
     .await;
     let first_delta = dekopon_model::events_from_transcript(
         dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+        dekopon_model::TranscriptDialect::ChatCompletions,
     )
     .expect("model fixture parses")
     .into_iter()
@@ -15695,6 +15696,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         let model = Arc::new(
             dekopon_test_support::ScriptedStreamModel::from_transcript(
                 dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+                dekopon_model::TranscriptDialect::ChatCompletions,
                 answer("Echoed hello."),
             )
             .expect("the recorded transcript parses"),

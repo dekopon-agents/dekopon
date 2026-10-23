@@ -152,17 +152,16 @@ pub(crate) fn suggest_improvement_into(
     suggestions: &mut Vec<ImprovementSuggestion>,
     call: &ModelToolCall,
     model_turn: u32,
-    tool_call_index: usize,
 ) -> Result<(), PromptError> {
     let raw = match raw_suggestion(&call.function.name, &call.function.arguments) {
         Ok(raw) => raw,
         Err(error) => {
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
+            reject_tool_call(model_turn, call.id.as_str(), error.telemetry_kind(), false);
             return Err(error);
         }
     };
     if suggestions.len() >= MAX_SUGGESTIONS_PER_SESSION {
-        refuse(model_turn, tool_call_index, "session-limit");
+        refuse(model_turn, call.id.as_str(), "session-limit");
         messages.push(ModelMessage::tool(
             call.id.clone(),
             format!(
@@ -175,7 +174,7 @@ pub(crate) fn suggest_improvement_into(
     let suggestion = match validate(raw) {
         Ok(suggestion) => suggestion,
         Err((reason, message)) => {
-            refuse(model_turn, tool_call_index, reason);
+            refuse(model_turn, call.id.as_str(), reason);
             messages.push(ModelMessage::tool(
                 call.id.clone(),
                 format!("Suggestion not recorded: {message} Fix it and call again, or continue."),
@@ -189,7 +188,7 @@ pub(crate) fn suggest_improvement_into(
         {
             audit.event = "agent.improvement.suggested",
             model.turn = model_turn,
-            tool_call.index = tool_call_index,
+            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
             suggestion.index = index,
             suggestion.category = suggestion.category.as_str(),
             suggestion.confidence = suggestion.confidence.as_str(),
@@ -211,13 +210,13 @@ pub(crate) fn suggest_improvement_into(
     Ok(())
 }
 
-fn refuse(model_turn: u32, tool_call_index: usize, reason: &'static str) {
+fn refuse(model_turn: u32, call_id: &str, reason: &'static str) {
     tracing::info!(
         target: "dekopon_agent::audit",
         {
             audit.event = "agent.improvement.refused",
             model.turn = model_turn,
-            tool_call.index = tool_call_index,
+            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
             reason = reason,
         },
         "agent improvement suggestion refused"

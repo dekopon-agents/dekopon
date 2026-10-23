@@ -57,9 +57,8 @@ The broker authorization leg is new for every Slack message. Neither remembered 
 The prompt loop stays synchronous: `ChatModel::complete` takes a callback,
 `&mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send)`. `BlockingModel` implements it over
 async `InferenceModel::generate`, using the caller-supplied tokio handle only on the blocking
-session task. Events arrive in wire order. It sees two things and can see no others: `TurnEvent::TextDelta`, carrying
-a fragment of the visible answer in a `ModelText`, and `TurnEvent::ToolCallStarted { index }`, a
-counter. Reasoning, tool-call arguments, tool output, and attachment bytes have no variant to
+session task. Events arrive in wire order. It sees one event: `TurnEvent::TextDelta`, carrying
+a fragment of the visible answer in a `ModelText`. Reasoning, tool-call arguments, tool output, and attachment bytes have no variant to
 travel in, and `ModelText` can be constructed from bytes only inside `dekopon-model`, so the rule
 that only answer text reaches a chat surface is enforced by the types rather than by review.
 

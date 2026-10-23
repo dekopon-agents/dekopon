@@ -150,7 +150,6 @@ pub(crate) fn wake_into(
     registrar: &dyn WakeRegistrar,
     call: &ModelToolCall,
     model_turn: u32,
-    tool_call_index: usize,
 ) -> Result<(), PromptError> {
     let request = match serde_json::from_str::<WakeCall>(&call.function.arguments) {
         Ok(request) => request,
@@ -159,7 +158,7 @@ pub(crate) fn wake_into(
                 tool: call.function.name.clone(),
                 source,
             };
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
+            reject_tool_call(model_turn, call.id.as_str(), error.telemetry_kind(), false);
             return Err(error);
         }
     };
@@ -206,7 +205,7 @@ pub(crate) fn wake_into(
                 {
                     audit.event = "agent.wake.refused",
                     model.turn = model_turn,
-                    tool_call.index = tool_call_index,
+                    gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                     reason = refusal.telemetry_kind(),
                 },
                 "wake refused"

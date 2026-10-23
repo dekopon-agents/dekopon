@@ -27,8 +27,8 @@ fn turn(text: &str) -> AssistantTurn {
     AssistantTurn::new(Some(text.to_owned()), Vec::new(), None)
 }
 
-fn scripted(body: &str) -> Vec<TurnEvent> {
-    dekopon_model::events_from_transcript(body).expect("the recorded transcript parses")
+fn scripted(body: &str, dialect: dekopon_model::TranscriptDialect) -> Vec<TurnEvent> {
+    dekopon_model::events_from_transcript(body, dialect).expect("the recorded transcript parses")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -51,7 +51,10 @@ async fn a_blocked_runtime_parks_inside_run_script_until_it_is_released() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scripted_stream_hands_out_one_event_per_release() {
-    let events = scripted(OPENAI_CHAT_COMPLETIONS_TWO_DELTAS);
+    let events = scripted(
+        OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+        dekopon_model::TranscriptDialect::ChatCompletions,
+    );
     assert_eq!(scripted_text(&events).as_str(), "Echoed hello.");
     let model = Arc::new(ScriptedStreamModel::scripted(events, turn("Echoed hello.")));
     let running = {
@@ -84,7 +87,10 @@ async fn a_scripted_stream_hands_out_one_event_per_release() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_the_caller_breaks_reports_the_interruption_rather_than_a_turn() {
     let model = Arc::new(ScriptedStreamModel::scripted(
-        scripted(OPENAI_CHAT_COMPLETIONS_TWO_DELTAS),
+        scripted(
+            OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+            dekopon_model::TranscriptDialect::ChatCompletions,
+        ),
         turn("never returned"),
     ));
     let running = {
@@ -275,19 +281,21 @@ fn failure_injection_is_per_object_and_per_call() {
 
 #[test]
 fn every_recorded_transcript_parses_to_the_events_its_backend_sends() {
-    for (name, body, text) in [
+    for (name, body, text, dialect) in [
         (
             "openai two deltas",
             OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
             "Echoed hello.",
+            dekopon_model::TranscriptDialect::ChatCompletions,
         ),
         (
             "codex two deltas",
             CODEX_RESPONSES_TWO_DELTAS,
             "Echoed hello.",
+            dekopon_model::TranscriptDialect::Responses,
         ),
     ] {
-        let events = scripted(body);
+        let events = scripted(body, dialect);
         assert_eq!(scripted_text(&events).as_str(), text, "{name}");
         assert!(
             events
@@ -296,17 +304,19 @@ fn every_recorded_transcript_parses_to_the_events_its_backend_sends() {
             "{name} carries visible text only: {events:?}"
         );
     }
-    for (name, body) in [
-        ("openai tool call", OPENAI_CHAT_COMPLETIONS_TOOL_CALL),
-        ("codex tool call", CODEX_RESPONSES_TOOL_CALL),
+    for (name, body, dialect) in [
+        (
+            "openai tool call",
+            OPENAI_CHAT_COMPLETIONS_TOOL_CALL,
+            dekopon_model::TranscriptDialect::ChatCompletions,
+        ),
+        (
+            "codex tool call",
+            CODEX_RESPONSES_TOOL_CALL,
+            dekopon_model::TranscriptDialect::Responses,
+        ),
     ] {
-        let events = scripted(body);
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, TurnEvent::ToolCallStarted { index: 0 })),
-            "{name} announces the call before its arguments: {events:?}"
-        );
+        let events = scripted(body, dialect);
         assert!(
             scripted_text(&events).is_empty(),
             "{name} shows the person nothing: a tool call is not an answer"
