@@ -400,7 +400,7 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_ninth_pending_message_gets_busy_with_the_mailbox_cause() {
+async fn the_pending_message_past_capacity_gets_busy_with_the_mailbox_cause() {
     let (capture, _subscriber) = capture_spans();
     let directory = temporary();
     let (broker, _observed) =
@@ -439,7 +439,11 @@ async fn the_ninth_pending_message_gets_busy_with_the_mailbox_cause() {
         })
         .expect("refusal audit");
     assert!(admission.0.contains("busy.cause=\"same-conversation\""));
-    assert!(admission.0.contains("queue.depth=8"));
+    assert!(
+        admission
+            .0
+            .contains(&format!("queue.depth={MAILBOX_CAPACITY}"))
+    );
     assert!(events.iter().any(
         |(fields, _)| fields.contains("event=\"gateway_steer_refused\"")
             && fields.contains("reason=\"mailbox-full\"")

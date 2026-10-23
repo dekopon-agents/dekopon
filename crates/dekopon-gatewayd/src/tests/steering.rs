@@ -3,7 +3,7 @@ use crate::routes::BoundRoute;
 use crate::{
     collection::Dispositions,
     config::Steering,
-    session::{Admit, MAILBOX_CAPACITY, SessionAdmission},
+    session::{Admit, MAILBOX_CAPACITY, MAX_INTERRUPTS, SessionAdmission},
 };
 use dekopon_agent::prompt::CancellationProbe;
 
@@ -62,12 +62,12 @@ fn drained_steers_exhaust_the_abort_budget_but_a_followup_gets_a_fresh_budget() 
     let model = cancellation.model_watch();
     let key = (message("").transport, message("").conversation.key());
 
-    for index in 0..MAILBOX_CAPACITY + 2 {
+    for index in 0..MAX_INTERRUPTS + 2 {
         assert!(matches!(
             admit(&gate, &route, message("steer")),
             Admit::Steered(_)
         ));
-        assert_eq!(*model.borrow(), index < MAILBOX_CAPACITY);
+        assert_eq!(*model.borrow(), index < MAX_INTERRUPTS);
         assert!(!cancellation.is_cancelled());
         assert_eq!(gate.take_steers(&key)[0].text, "steer");
         assert!(!*model.borrow());
@@ -89,7 +89,7 @@ fn drained_steers_exhaust_the_abort_budget_but_a_followup_gets_a_fresh_budget() 
 }
 
 #[test]
-fn the_ninth_item_is_full_counting_steers_and_followups_together() {
+fn the_item_past_capacity_is_full_counting_steers_and_followups_together() {
     let gate = SessionGate::new(1);
     let route = route(model_config());
     let _held = held(&gate, &route);
@@ -261,18 +261,15 @@ fn leftover_steers_never_become_another_subjects_input() {
         admit(&gate, &route, message_from("tel.999", "other")),
         Admit::Queued
     ));
-    let (admission, followup) = admission.next_or_release().expect("other sender first");
-    assert_eq!(followup.message.subject.canonical(), "tel.999");
-    let key = (
-        followup.message.transport.clone(),
-        followup.message.conversation.key(),
-    );
-    assert!(gate.take_steers(&key).is_empty());
     let (admission, followup) = admission
         .next_or_release()
         .expect("original sender's leftover");
     assert_eq!(followup.message.subject.canonical(), SUBJECT);
     assert!(followup.message.text.contains("leftover"));
+    assert!(!followup.message.text.contains("other"));
+    let (admission, followup) = admission.next_or_release().expect("other sender next");
+    assert_eq!(followup.message.subject.canonical(), "tel.999");
+    assert_eq!(followup.message.text, "other");
     assert!(admission.next_or_release().is_none());
 }
 

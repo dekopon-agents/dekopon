@@ -125,9 +125,119 @@ pub enum Steer {
     Notice(String),
 }
 
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Seal {
+    Sealed { leftover: usize },
+    Stopped,
+}
+
+#[derive(Debug)]
+pub enum Handoff {
+    Steers(Vec<Steer>),
+    Sealed(Seal),
+}
+
 pub trait SteerSource: Send + Sync {
     /// Moves every queued steer out, oldest first, as finished user text. Empty when none.
-    fn drain(&self) -> Vec<Steer>;
+    fn take(&self) -> Vec<Steer>;
+
+    /// Takes queued steers, or seals when none are queued; the check and the seal are one step, so
+    /// no steer can arrive between them unread.
+    fn seal_or_take(&self) -> Handoff;
+
+    /// Idempotent: a mailbox already sealed or stopped reports that outcome again.
+    fn seal(&self) -> Seal;
+}
+
+enum Mailbox<'a> {
+    Absent,
+    Open(&'a dyn SteerSource),
+    Closed(Seal),
+}
+
+struct MailboxLease<'a> {
+    mailbox: Mailbox<'a>,
+    staged: Vec<String>,
+}
+
+impl<'a> MailboxLease<'a> {
+    fn new(steering: Option<&'a dyn SteerSource>) -> Self {
+        Self {
+            mailbox: match steering {
+                Some(mailbox) => Mailbox::Open(mailbox),
+                None => Mailbox::Absent,
+            },
+            staged: Vec::new(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        match self.mailbox {
+            Mailbox::Open(_) => true,
+            Mailbox::Absent | Mailbox::Closed(_) => false,
+        }
+    }
+
+    fn take(&mut self, messages: &mut Vec<ModelMessage>) {
+        let steers = match self.mailbox {
+            Mailbox::Open(mailbox) => mailbox.take(),
+            Mailbox::Absent | Mailbox::Closed(_) => Vec::new(),
+        };
+        self.stage(steers, messages);
+    }
+
+    fn seal_or_take(&mut self, messages: &mut Vec<ModelMessage>) -> Option<Seal> {
+        match self.mailbox {
+            Mailbox::Open(mailbox) => match mailbox.seal_or_take() {
+                Handoff::Steers(steers) => {
+                    self.stage(steers, messages);
+                    None
+                }
+                Handoff::Sealed(seal) => {
+                    self.mailbox = Mailbox::Closed(seal);
+                    Some(seal)
+                }
+            },
+            Mailbox::Absent => Some(Seal::Sealed { leftover: 0 }),
+            Mailbox::Closed(seal) => Some(seal),
+        }
+    }
+
+    fn seal(&mut self) -> Seal {
+        match self.mailbox {
+            Mailbox::Open(mailbox) => {
+                let seal = mailbox.seal();
+                self.mailbox = Mailbox::Closed(seal);
+                seal
+            }
+            Mailbox::Absent => Seal::Sealed { leftover: 0 },
+            Mailbox::Closed(seal) => seal,
+        }
+    }
+
+    fn stage(&mut self, steers: Vec<Steer>, messages: &mut Vec<ModelMessage>) {
+        for steer in steers {
+            match steer {
+                Steer::Person { prompt, recorded } => {
+                    messages.push(ModelMessage::user(&prompt));
+                    self.staged.push(recorded);
+                }
+                Steer::Notice(text) => messages.push(ModelMessage::user(&text)),
+            }
+        }
+    }
+}
+
+impl Drop for MailboxLease<'_> {
+    fn drop(&mut self) {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "an unwinding turn loop has no answer for a stop to race; sealing here only \
+                      hands unread steers on as leftovers"
+        )]
+        let _ = self.seal();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,10 +616,10 @@ where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
-    let mut steers = Vec::new();
     let progress = extensions.progress;
     let cancellation = extensions.cancellation;
-    let result = run_turns(model, runtime, messages, limits, extensions, &mut steers);
+    let lease = MailboxLease::new(extensions.steering);
+    let (result, steers) = run_turns(model, runtime, messages, limits, extensions, lease);
     if let Err(error) = &result {
         report_end(progress, cancellation, error);
     }
@@ -543,36 +653,37 @@ fn emit(progress: Option<&dyn ProgressSink>, event: ProgressEvent) {
     }
 }
 
-fn drain_steers(
-    steering: Option<&dyn SteerSource>,
-    messages: &mut Vec<ModelMessage>,
-    consumed: &mut Vec<String>,
-) -> bool {
-    let steers = steering.map(SteerSource::drain).unwrap_or_default();
-    let any = !steers.is_empty();
-    for steer in steers {
-        match steer {
-            Steer::Person { prompt, recorded } => {
-                messages.push(ModelMessage::user(&prompt));
-                consumed.push(recorded);
-            }
-            Steer::Notice(text) => messages.push(ModelMessage::user(&text)),
-        }
-    }
-    any
+fn run_turns<M, R>(
+    model: &M,
+    runtime: &R,
+    messages: Vec<ModelMessage>,
+    limits: PromptLimits,
+    extensions: SessionExtensions<'_>,
+    mut lease: MailboxLease<'_>,
+) -> (Result<PromptOutcome, PromptError>, Vec<String>)
+where
+    M: ChatModel + ?Sized,
+    R: ScriptRuntime + ?Sized,
+{
+    let result = turns(model, runtime, messages, limits, extensions, &mut lease);
+    let result = match lease.seal() {
+        Seal::Stopped => Err(PromptError::Cancelled),
+        Seal::Sealed { .. } => result,
+    };
+    (result, std::mem::take(&mut lease.staged))
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn run_turns<M, R>(
+fn turns<M, R>(
     model: &M,
     runtime: &R,
     mut messages: Vec<ModelMessage>,
     limits: PromptLimits,
     extensions: SessionExtensions<'_>,
-    steers: &mut Vec<String>,
+    lease: &mut MailboxLease<'_>,
 ) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
@@ -587,7 +698,7 @@ where
         agent,
         agent_config,
         cancellation,
-        steering,
+        steering: _,
         progress,
         optional_reply,
         skills,
@@ -647,7 +758,7 @@ where
         }
         let model_turns = completed_turns + 1;
         check_cancelled(cancellation)?;
-        drain_steers(steering, &mut messages, steers);
+        lease.take(&mut messages);
         let model_span = tracing::info_span!(
             "prompt.model_turn",
             model.turn = model_turns,
@@ -693,8 +804,8 @@ where
         let turn = match completion {
             Ok(turn) => turn,
             Err(InferenceError::Cancelled) => {
-                let steered = steering.is_some()
-                    && !cancellation.is_some_and(CancellationProbe::is_cancelled);
+                let steered =
+                    lease.is_open() && !cancellation.is_some_and(CancellationProbe::is_cancelled);
                 tracing::info!(
                     target: "dekopon_agent::audit",
                     {
@@ -813,9 +924,17 @@ where
 
         if turn.tool_calls.is_empty() {
             check_cancelled(cancellation)?;
-            if model_turns < limits.max_steps && drain_steers(steering, &mut messages, steers) {
-                emit(progress, ProgressEvent::Steered { turn: model_turns });
-                continue;
+            let seal = if model_turns < limits.max_steps {
+                let Some(seal) = lease.seal_or_take(&mut messages) else {
+                    emit(progress, ProgressEvent::Steered { turn: model_turns });
+                    continue;
+                };
+                seal
+            } else {
+                lease.seal()
+            };
+            if seal == Seal::Stopped {
+                return Err(PromptError::Cancelled);
             }
             let answer = turn
                 .content
@@ -878,6 +997,9 @@ where
             }
             if capability_invocations == 0 {
                 check_cancelled(cancellation)?;
+                if lease.seal() == Seal::Stopped {
+                    return Err(PromptError::Cancelled);
+                }
                 tracing::info!(
                     target: "dekopon_agent::audit",
                     {
@@ -1815,12 +1937,12 @@ mod tests {
         AGENT_CONFIG_ALREADY_SHOWN, AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, AssetSource,
         BAD_SCRIPT_ARGUMENTS_FEEDBACK, CancellationProbe, ConversationTurn,
         DECLINE_AFTER_WORK_RESULT, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS,
-        FetchedAsset, History, HistoryLimits, IMPROVEMENT_TOOL_NAME, MAX_TEXTUAL_ASSET_BYTES,
-        MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError, PromptLimits, ReplyDisposition,
-        SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, SessionInputs,
-        Steer, SteerSource, agent_config_tool, asset_argument, format_script_outcome, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_tool,
+        FetchedAsset, Handoff, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
+        MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
+        PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
+        ScriptRuntime, Seal, SessionInputs, Steer, SteerSource, agent_config_tool, asset_argument,
+        format_script_outcome, run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_tool,
     };
 
     struct ScriptedModel {
@@ -2240,7 +2362,7 @@ mod tests {
     }
 
     impl SteerSource for QueuedSteers {
-        fn drain(&self) -> Vec<Steer> {
+        fn take(&self) -> Vec<Steer> {
             self.0
                 .lock()
                 .drain(..)
@@ -2249,6 +2371,21 @@ mod tests {
                     prompt: text,
                 })
                 .collect()
+        }
+
+        fn seal_or_take(&self) -> Handoff {
+            let taken = self.take();
+            if taken.is_empty() {
+                Handoff::Sealed(self.seal())
+            } else {
+                Handoff::Steers(taken)
+            }
+        }
+
+        fn seal(&self) -> Seal {
+            Seal::Sealed {
+                leftover: self.0.lock().len(),
+            }
         }
     }
 
@@ -2345,8 +2482,21 @@ mod tests {
     fn history_keeps_the_recorded_text_while_the_model_reads_the_noted_prompt() {
         struct OneSteer(Mutex<Option<Steer>>);
         impl SteerSource for OneSteer {
-            fn drain(&self) -> Vec<Steer> {
+            fn take(&self) -> Vec<Steer> {
                 self.0.lock().take().into_iter().collect()
+            }
+
+            fn seal_or_take(&self) -> Handoff {
+                match self.0.lock().take() {
+                    Some(steer) => Handoff::Steers(vec![steer]),
+                    None => Handoff::Sealed(Seal::Sealed { leftover: 0 }),
+                }
+            }
+
+            fn seal(&self) -> Seal {
+                Seal::Sealed {
+                    leftover: usize::from(self.0.lock().is_some()),
+                }
             }
         }
         let steer = OneSteer(Mutex::new(Some(Steer::Person {
@@ -2496,7 +2646,7 @@ mod tests {
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
         assert_eq!(
-            model.steers.drain(),
+            model.steers.take(),
             [Steer::Person {
                 prompt: "msg2".to_owned(),
                 recorded: "msg2".to_owned()
@@ -2521,7 +2671,7 @@ mod tests {
         .expect("the final step answers");
         assert_eq!(outcome.answer, "done");
         assert_eq!(
-            model.steers.drain(),
+            model.steers.take(),
             [Steer::Person {
                 prompt: "msg2".to_owned(),
                 recorded: "msg2".to_owned()
@@ -2601,7 +2751,7 @@ mod tests {
         .expect("decline does not drain a pending steer");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         assert_eq!(
-            model.steers.drain(),
+            model.steers.take(),
             [Steer::Person {
                 prompt: "msg2".to_owned(),
                 recorded: "msg2".to_owned()

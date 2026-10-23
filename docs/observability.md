@@ -566,9 +566,9 @@ metadata level: `declined` means an optional owned-thread continuation produced 
 session progress starts. Queued or steered input may already carry its admission 👀 acknowledgment;
 that does not mean it was authorized. `steered` joins the sender's running turn, and `queued` waits
 for a new turn.
-`busy` means the conversation's eight-item mailbox is full (`busy.cause = same-conversation`) or
+`busy` means the conversation's 100-item mailbox is full (`busy.cause = same-conversation`) or
 all process-wide permits are taken for a new conversation (`busy.cause = saturated`). `cancelled`
-means cancellation won before completion was claimed. `sealed` means a previous wall-clock stop
+means cancellation won before the turn sealed. `sealed` means a previous wall-clock stop
 sealed the thread, so `gateway_session_rejected` reports `reason="sealed"` before any broker or model
 call. `failed` names a category and the `error` that
 produced it through the `gateway_session_failed` log event. Model errors use the same labels as
