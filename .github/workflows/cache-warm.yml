@@ -160,7 +160,7 @@ jobs:
       # Keep this key, runner, toolchain and build flags aligned with CI's test job.
       # Default pruning saves dependency artifacts, not workspace crates or test executables.
       - name: Cache Rust test dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: workspace-tests-v1
           cache-bin: "false"
@@ -194,7 +194,7 @@ jobs:
       # Match release.yml's native runner, action, shared key, toolchain and build flags.
       # No sccache wrapper here: release artifact builds do not use one either.
       - name: Cache Linux release dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-release-v1-${{ matrix.target }}
           cache-workspace-crates: "false"
