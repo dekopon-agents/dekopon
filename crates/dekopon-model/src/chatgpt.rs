@@ -1050,7 +1050,6 @@ mod tests {
             .iter()
             .map(|event| match event {
                 TurnEvent::TextDelta(text) => format!("text:{}", text.as_str()),
-                TurnEvent::ToolCallStarted { index } => format!("call:{index}"),
             })
             .collect()
     }
@@ -1845,10 +1844,7 @@ mod tests {
             turn.tool_calls[0].function.arguments,
             r#"{"message":"hello"}"#
         );
-        assert_eq!(
-            recorded(&events),
-            vec!["text:Looking", "text: it up", "call:0"]
-        );
+        assert_eq!(recorded(&events), vec!["text:Looking", "text: it up"]);
     }
 
     #[test]

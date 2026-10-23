@@ -314,6 +314,8 @@ enum EventKind {
     ItemDone,
     #[serde(rename = "response.output_text.delta")]
     TextDelta,
+    #[serde(rename = "response.refusal.delta")]
+    RefusalDelta,
     #[serde(rename = "response.function_call_arguments.delta")]
     ArgumentsDelta,
     #[serde(rename = "response.function_call_arguments.done")]
@@ -397,13 +399,28 @@ struct WireItem<'a> {
     name: &'a str,
     #[serde(default)]
     arguments: &'a str,
-    #[serde(default, borrow)]
-    content: Option<Vec<WireText<'a>>>,
-}
-#[derive(Deserialize)]
-struct WireText<'a> {
     #[serde(default)]
-    text: &'a str,
+    content: Option<Vec<Value>>,
+}
+enum WirePart<'a> {
+    Reply(&'a str),
+    Unknown(&'a str),
+}
+
+impl<'a> WirePart<'a> {
+    fn parse(value: &'a Value) -> Result<Self, InferenceError> {
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let field = match kind {
+            "output_text" => "text",
+            "refusal" => "refusal",
+            kind => return Ok(Self::Unknown(kind)),
+        };
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .map(Self::Reply)
+            .ok_or_else(|| invalid_event("reply content part omitted text"))
+    }
 }
 
 #[derive(Default)]
@@ -420,17 +437,11 @@ struct PendingCall {
 }
 
 #[derive(Default)]
-enum TextSource {
-    #[default]
-    Items,
-    Deltas,
-}
-
-#[derive(Default)]
 pub(crate) struct CodexReducer<'a> {
     secrets: DiagnosticSecrets<'a>,
     text: String,
-    text_source: TextSource,
+    delta_messages: std::collections::HashSet<String>,
+    unattributed_deltas: bool,
     native_items: Vec<Value>,
     native_positions: HashMap<String, usize>,
     calls: BTreeMap<String, PendingCall>,
@@ -443,7 +454,6 @@ pub(crate) struct CodexReducer<'a> {
 impl CodexReducer<'_> {
     #[expect(
         clippy::too_many_lines,
-        clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
     pub(crate) fn apply(
@@ -456,10 +466,31 @@ impl CodexReducer<'_> {
         let kind = event
             .get("type")
             .and_then(|kind| EventKind::deserialize(kind).ok());
-        let failed = matches!(
-            kind,
-            Some(EventKind::Failed | EventKind::Incomplete | EventKind::Error)
-        ) || [event.get("error"), event.pointer("/response/error")]
+        let failed = match kind {
+            Some(EventKind::Failed | EventKind::Incomplete | EventKind::Error) => true,
+            Some(
+                EventKind::ItemAdded
+                | EventKind::ItemDone
+                | EventKind::TextDelta
+                | EventKind::RefusalDelta
+                | EventKind::ArgumentsDelta
+                | EventKind::ArgumentsDone
+                | EventKind::Completed
+                | EventKind::Created
+                | EventKind::InProgress
+                | EventKind::Queued
+                | EventKind::ContentAdded
+                | EventKind::ContentDone
+                | EventKind::TextDone
+                | EventKind::ReasoningPartAdded
+                | EventKind::ReasoningPartDone
+                | EventKind::ReasoningDelta
+                | EventKind::ReasoningDone
+                | EventKind::ReasoningTextDelta
+                | EventKind::ReasoningTextDone,
+            )
+            | None => false,
+        } || [event.get("error"), event.pointer("/response/error")]
             .into_iter()
             .flatten()
             .any(|error| !error.is_null());
@@ -512,35 +543,30 @@ impl CodexReducer<'_> {
                 let Some(item) = self.parse_item(&item)? else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                let index = self.call_order.len();
                 self.remember(&item)?;
-                if self.call_order.len() > index
-                    && observe(TurnEvent::ToolCallStarted {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                    })
-                    .is_break()
-                {
-                    return Err(InferenceError::Cancelled);
-                }
             }
             EventKind::ItemDone => self.finish_item(
                 event
                     .item
                     .ok_or_else(|| invalid_event("output item missing"))?,
             )?,
-            EventKind::TextDelta => {
+            EventKind::TextDelta | EventKind::RefusalDelta => {
                 let delta = event
                     .delta
                     .ok_or_else(|| invalid_event("text delta missing"))?;
                 if !delta.is_empty() {
-                    self.text_source = TextSource::Deltas;
+                    if let Some(id) = event.item_id {
+                        self.delta_messages.insert(id);
+                    } else {
+                        self.unattributed_deltas = true;
+                    }
                     self.text.push_str(&delta);
                     if observe(TurnEvent::TextDelta(ModelText::from_model(delta))).is_break() {
                         return Err(InferenceError::Cancelled);
                     }
                 }
             }
-            EventKind::ArgumentsDelta | EventKind::ArgumentsDone => {
+            EventKind::ArgumentsDelta => {
                 let item_id = event
                     .item_id
                     .as_deref()
@@ -550,27 +576,37 @@ impl CodexReducer<'_> {
                     .calls
                     .get_mut(item_id)
                     .ok_or_else(|| invalid_event("argument event for an unknown call"))?;
-                match kind {
-                    EventKind::ArgumentsDelta => call.arguments.push_str(
-                        event
-                            .delta
-                            .as_deref()
-                            .ok_or_else(|| invalid_event("argument delta missing"))?,
-                    ),
-                    EventKind::ArgumentsDone => {
-                        if let Some(arguments) = event.arguments.filter(|value| !value.is_empty()) {
-                            call.arguments = arguments;
-                        }
-                    }
-                    _ => {}
+                call.arguments.push_str(
+                    event
+                        .delta
+                        .as_deref()
+                        .ok_or_else(|| invalid_event("argument delta missing"))?,
+                );
+            }
+            EventKind::ArgumentsDone => {
+                let item_id = event
+                    .item_id
+                    .as_deref()
+                    .or_else(|| self.call_order.last().map(String::as_str))
+                    .ok_or_else(|| invalid_event("argument event without a call"))?;
+                let call = self
+                    .calls
+                    .get_mut(item_id)
+                    .ok_or_else(|| invalid_event("argument event for an unknown call"))?;
+                if let Some(arguments) = event.arguments.filter(|value| !value.is_empty()) {
+                    call.arguments = arguments;
                 }
             }
             EventKind::Completed => {
                 if let Some(response) = event.response {
-                    if response
-                        .status
-                        .is_some_and(|status| !matches!(status, ResponseStatus::Completed))
-                    {
+                    if response.status.is_some_and(|status| match status {
+                        ResponseStatus::Completed => false,
+                        ResponseStatus::Queued
+                        | ResponseStatus::InProgress
+                        | ResponseStatus::Incomplete
+                        | ResponseStatus::Failed
+                        | ResponseStatus::Cancelled => true,
+                    }) {
                         return Err(invalid_event("terminal response was not completed"));
                     }
                     self.usage = response.usage.map(ModelUsage::from);
@@ -613,8 +649,9 @@ impl CodexReducer<'_> {
     }
 
     fn remember(&mut self, item: &WireItem<'_>) -> Result<(), InferenceError> {
-        if !matches!(item.kind, ItemKind::FunctionCall) {
-            return Ok(());
+        match item.kind {
+            ItemKind::Message | ItemKind::Reasoning => return Ok(()),
+            ItemKind::FunctionCall => {}
         }
         if item.id.is_empty() {
             return Err(invalid_event("function call omitted item ID"));
@@ -658,24 +695,39 @@ impl CodexReducer<'_> {
             .and_then(Value::as_str)
             .and_then(|id| self.native_positions.get(id))
             .copied();
-        if matches!(item.kind, ItemKind::Message)
-            && matches!(self.text_source, TextSource::Items)
-            && position.is_none()
-        {
-            for part in item.content.iter().flatten() {
-                self.text.push_str(part.text);
+        match item.kind {
+            ItemKind::Message => {
+                let streamed = position.is_some()
+                    || self.delta_messages.contains(item.id)
+                    || self.unattributed_deltas;
+                if position.is_none() {
+                    self.unattributed_deltas = false;
+                }
+                for part in item.content.iter().flatten() {
+                    match WirePart::parse(part)? {
+                        WirePart::Reply(text) => {
+                            if !streamed {
+                                self.text.push_str(text);
+                            }
+                        }
+                        WirePart::Unknown(kind) => {
+                            tracing::debug!(event = "unknown_content_part_skipped", kind = %self.secrets.sanitize(kind));
+                        }
+                    }
+                }
             }
-        }
-        if matches!(item.kind, ItemKind::FunctionCall) {
-            let arguments = self
-                .calls
-                .get(item.id)
-                .ok_or_else(|| invalid_event("completed call missing"))?
-                .arguments
-                .clone();
-            if let Some(object) = value.as_object_mut() {
-                object.insert("arguments".to_owned(), Value::String(arguments));
+            ItemKind::FunctionCall => {
+                let arguments = self
+                    .calls
+                    .get(item.id)
+                    .ok_or_else(|| invalid_event("completed call missing"))?
+                    .arguments
+                    .clone();
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("arguments".to_owned(), Value::String(arguments));
+                }
             }
+            ItemKind::Reasoning => {}
         }
         if let Some(position) = position {
             let stored = self
@@ -700,11 +752,15 @@ impl CodexReducer<'_> {
         mut self,
         identity: &ClientIdentity,
     ) -> Result<AssistantTurn, InferenceError> {
-        if !matches!(self.terminal, Terminal::Completed) {
-            return Err(ProtocolFailure::MissingTerminal.into());
+        match self.terminal {
+            Terminal::Streaming => return Err(ProtocolFailure::MissingTerminal.into()),
+            Terminal::Completed => {}
         }
         let mut calls = Vec::with_capacity(self.call_order.len());
         for id in self.call_order {
+            if !self.native_positions.contains_key(&id) {
+                return Err(invalid_event("unfinished function call"));
+            }
             let call = self
                 .calls
                 .remove(&id)
@@ -1030,6 +1086,77 @@ mod tests {
     }
 
     #[test]
+    fn message_snapshots_only_supply_text_for_messages_without_deltas() {
+        for streamed in [false, true] {
+            let mut reducer = CodexReducer::default();
+            if streamed {
+                let _flow = reducer
+                    .apply(
+                        r#"{"type":"response.output_text.delta","item_id":"m1","delta":"first"}"#,
+                        &mut |_| ControlFlow::Continue(()),
+                    )
+                    .unwrap();
+            }
+            for (id, text) in [("m1", "first"), ("m2", "second")] {
+                reducer
+                    .finish_item(serde_json::json!({"type":"message","id":id,
+                    "content":[{"type":"output_text","text":text}]}))
+                    .unwrap();
+            }
+            let _flow = reducer
+                .apply(r#"{"type":"response.completed"}"#, &mut |_| {
+                    ControlFlow::Continue(())
+                })
+                .unwrap();
+            assert_eq!(
+                reducer
+                    .finish(&ClientIdentity::new())
+                    .unwrap()
+                    .content
+                    .as_deref(),
+                Some("firstsecond")
+            );
+        }
+    }
+
+    #[test]
+    fn an_added_call_must_complete_before_it_can_run() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"tool\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
+        );
+        assert!(matches!(
+            replay_transcript(body, &mut |_| ControlFlow::Continue(())),
+            Err(InferenceError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn known_text_parts_require_text_and_unknown_parts_are_skipped() {
+        let mut reducer = CodexReducer::default();
+        assert!(matches!(
+            reducer.finish_item(serde_json::json!({"type":"message",
+            "content":[{"type":"output_text","annotations":[]}]})),
+            Err(InferenceError::Protocol(_))
+        ));
+        reducer.finish_item(serde_json::json!({"type":"message","id":"m",
+            "content":[{"type":"refusal","refusal":"declined"},{"type":"future","text":17},{"text":"untyped"}]})).unwrap();
+        let _flow = reducer
+            .apply(r#"{"type":"response.completed"}"#, &mut |_| {
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(
+            reducer
+                .finish(&ClientIdentity::new())
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("declined")
+        );
+    }
+
+    #[test]
     fn a_large_native_item_stream_completes_without_duplicate_replay() {
         use std::fmt::Write as _;
         let count = 50_000;
@@ -1053,18 +1180,18 @@ mod tests {
     fn native_item_updates_preserve_first_seen_order_and_do_not_repeat_text() {
         let mut reducer = CodexReducer::default();
         for item in [
-            serde_json::json!({"type":"message","id":"z","content":[{"text":"first"}],"extra":true}),
+            serde_json::json!({"type":"message","id":"z","content":[{"type":"output_text","text":"first"}],"extra":true}),
             serde_json::json!({"type":"reasoning","id":"a","text":"initial"}),
-            serde_json::json!({"type":"message","content":[{"text":"unindexed"}]}),
+            serde_json::json!({"type":"message","content":[{"type":"output_text","text":"unindexed"}]}),
             serde_json::json!({"type":"reasoning","id":"a","text":"final"}),
-            serde_json::json!({"type":"message","id":"z","content":[{"text":"replacement"}]}),
+            serde_json::json!({"type":"message","id":"z","content":[{"type":"output_text","text":"replacement"}]}),
         ] {
             reducer.finish_item(item).unwrap();
         }
         let completed = serde_json::json!({"type":"response.completed","response":{"output":[
-            {"type":"message","id":"z","content":[{"text":"replacement"}]},
-            {"type":"message","content":[{"text":"unindexed"}]},
-            {"type":"message","content":[{"text":"again"}]},
+            {"type":"message","id":"z","content":[{"type":"output_text","text":"replacement"}]},
+            {"type":"message","content":[{"type":"output_text","text":"unindexed"}]},
+            {"type":"message","content":[{"type":"output_text","text":"again"}]},
         ]}});
         assert!(
             reducer
@@ -1695,7 +1822,7 @@ mod tests {
                 .unwrap()
                 .content
                 .as_deref(),
-            Some("answer")
+            Some("additiveanswer")
         );
         for event in [
             serde_json::json!({"type":"unknown.event","error":{"code":"quota","message":"refused"}}),
@@ -1808,7 +1935,7 @@ mod tests {
     fn completed_output_reconciles_calls_and_preserves_ordered_text() {
         let body = concat!(
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"tool\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"id\":\"one\",\"content\":[{\"text\":\"first\"}]},{\"type\":\"message\",\"id\":\"two\",\"content\":[{\"text\":\"second\"}]},{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"tool\",\"arguments\":\"{}\"}]}}\n\n"
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"id\":\"one\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]},{\"type\":\"message\",\"id\":\"two\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]},{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"tool\",\"arguments\":\"{}\"}]}}\n\n"
         );
         let turn = replay_transcript(body, &mut |_| ControlFlow::Continue(())).unwrap();
         assert_eq!(turn.content.as_deref(), Some("firstsecond"));

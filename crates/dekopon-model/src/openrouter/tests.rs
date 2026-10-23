@@ -123,11 +123,7 @@ async fn two_turns_merge_native_reasoning_and_replay_the_exact_second_request() 
     assert_eq!(usage.reasoning_output_tokens, Some(5));
     assert_eq!(usage.total_tokens, Some(112));
     assert_eq!(turn.tool_calls.len(), 1);
-    assert!(
-        events
-            .iter()
-            .all(|event| matches!(event, TurnEvent::ToolCallStarted { .. }))
-    );
+    assert!(events.is_empty());
     for hidden in [
         "cipher-tail",
         "think-more",
@@ -1113,6 +1109,40 @@ async fn done_without_a_finish_reason_completes_with_no_recorded_reason() {
     assert_eq!(trace.field("reasoning.items").as_deref(), Some("0"));
     assert_eq!(trace.field("tool_call.skipped").as_deref(), Some("0"));
     trace.assert_exchange("openrouter", "chat-completions");
+}
+
+#[tokio::test]
+async fn unknown_tool_functions_are_skipped_before_decoding_in_streamed_turns() {
+    let chunks = [
+        json!({"choices":[{"delta":{"content":"answer","tool_calls":[
+            {"index":0,"id":"search","type":"web_search","function":17},
+            {"index":1,"id":"call","type":"function","function":{"name":"bash","arguments":"{}"}}
+        ]}}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":17}]},"finish_reason":"tool_calls"}]}),
+    ];
+    let body: String = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect();
+    let server = MockServer::start(vec![MockResponse::sse(&body)]);
+    let turn = generate(&client(&server, Settings::default()), &[])
+        .await
+        .unwrap();
+    assert_eq!(turn.content.as_deref(), Some("answer"));
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].id.as_str(), "call");
+}
+
+#[tokio::test]
+async fn malformed_known_tool_functions_fail_streamed_turns() {
+    let chunk = json!({"choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"call","type":"function","function":17}
+    ]},"finish_reason":"tool_calls"}]});
+    let server = MockServer::start(vec![MockResponse::sse(&format!("data: {chunk}\n\n"))]);
+    assert!(matches!(
+        generate(&client(&server, Settings::default()), &[]).await,
+        Err(InferenceError::Protocol(_))
+    ));
 }
 
 #[tokio::test]

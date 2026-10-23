@@ -989,7 +989,7 @@ where
         if decline_requested {
             for (index, call) in turn.tool_calls.iter().enumerate() {
                 if call.id.as_str().trim().is_empty() {
-                    reject_tool_call(model_turns, index + 1, "empty-tool-call-id", false);
+                    reject_empty_tool_call(model_turns, index + 1);
                     return Err(PromptError::EmptyToolCallId);
                 }
                 if call.function.name == DECLINE_REPLY_TOOL_NAME {
@@ -1043,11 +1043,10 @@ where
             continue;
         }
 
-        for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
+        for (position, call) in turn.tool_calls.into_iter().enumerate() {
             check_cancelled(cancellation)?;
-            let tool_call_index = tool_call_index + 1;
             if call.id.as_str().trim().is_empty() {
-                reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id", false);
+                reject_empty_tool_call(model_turns, position + 1);
                 return Err(PromptError::EmptyToolCallId);
             }
             if call.function.name == AGENT_CONFIG_TOOL_NAME
@@ -1058,7 +1057,6 @@ where
                     config,
                     &call,
                     model_turns,
-                    tool_call_index,
                     &mut agent_config_shown,
                 )?;
                 continue;
@@ -1070,7 +1068,6 @@ where
                     &mut skill_reads,
                     &call,
                     model_turns,
-                    tool_call_index,
                 )?;
                 continue;
             }
@@ -1080,7 +1077,6 @@ where
                     &mut suggestions,
                     &call,
                     model_turns,
-                    tool_call_index,
                 )?;
                 continue;
             }
@@ -1092,26 +1088,13 @@ where
             if call.function.name == WAKE_TOOL_NAME
                 && let Some(registrar) = wakes
             {
-                wake::wake_into(
-                    &mut messages,
-                    registrar,
-                    &call,
-                    model_turns,
-                    tool_call_index,
-                )?;
+                wake::wake_into(&mut messages, registrar, &call, model_turns)?;
                 continue;
             }
             if call.function.name == ASSET_TOOL_NAME
                 && let Some(source) = assets
             {
-                fetch_asset_into(
-                    &mut messages,
-                    source,
-                    &call,
-                    model_turns,
-                    tool_call_index,
-                    &mut asset_bytes,
-                )?;
+                fetch_asset_into(&mut messages, source, &call, model_turns, &mut asset_bytes)?;
                 continue;
             }
             // The model-selected tool name is excluded from telemetry because it is untrusted model
@@ -1123,7 +1106,7 @@ where
                     &call,
                     unknown_tool_feedback(&model_tools),
                 );
-                reject_tool_call(model_turns, tool_call_index, "unknown-tool", answered);
+                reject_tool_call(model_turns, call.id.as_str(), "unknown-tool", answered);
                 if answered {
                     continue;
                 }
@@ -1140,7 +1123,7 @@ where
                     );
                     reject_tool_call(
                         model_turns,
-                        tool_call_index,
+                        call.id.as_str(),
                         error.telemetry_kind(),
                         answered,
                     );
@@ -1159,7 +1142,7 @@ where
             let span = tracing::info_span!(
                 "prompt.script",
                 model.turn = model_turns,
-                tool_call.index = tool_call_index,
+                gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                 tool_call.ignored_arguments = ignored_arguments,
                 script.max_capability_calls = remaining,
                 script.bytes = script.len()
@@ -1171,7 +1154,7 @@ where
                     {
                         audit.event = "agent.tool.script",
                         model.turn = model_turns,
-                        tool_call.index = tool_call_index,
+                        gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                         script = script.as_str(),
                     },
                     "agent tool script"
@@ -1183,7 +1166,7 @@ where
                     {
                         audit.event = "agent.tool.output",
                         model.turn = model_turns,
-                        tool_call.index = tool_call_index,
+                        gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                         output = outcome.output.as_str(),
                     },
                     "agent tool output"
@@ -1265,7 +1248,6 @@ impl<'a> TurnStream<'a> {
     fn observe(&mut self, event: TurnEvent) -> ControlFlow<()> {
         match event {
             TurnEvent::TextDelta(delta) => self.append(delta),
-            TurnEvent::ToolCallStarted { .. } => {}
         }
         if self
             .cancellation
@@ -1329,7 +1311,7 @@ pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
 
 pub(crate) fn reject_tool_call(
     model_turn: u32,
-    tool_call_index: usize,
+    call_id: &str,
     error_type: &'static str,
     fed_back: bool,
 ) {
@@ -1338,12 +1320,22 @@ pub(crate) fn reject_tool_call(
         {
             audit.event = "agent.tool.rejected",
             model.turn = model_turn,
-            tool_call.index = tool_call_index,
+            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
             error.type = error_type,
             rejection.fed_back = fed_back,
         },
         "model tool call rejected"
     );
+}
+
+fn reject_empty_tool_call(model_turn: u32, position: usize) {
+    tracing::error!(target: "dekopon_agent::audit", {
+        audit.event = "agent.tool.rejected",
+        model.turn = model_turn,
+        tool_call.position = position,
+        error.type = "empty-tool-call-id",
+        rejection.fed_back = false,
+    }, "model tool call rejected");
 }
 
 const BAD_SCRIPT_ARGUMENTS_FEEDBACK: &str = "dekopon: bash takes one string argument named \
@@ -1459,11 +1451,10 @@ fn inspect_agent_config_into(
     config: &AgentConfigView,
     call: &ModelToolCall,
     model_turn: u32,
-    tool_call_index: usize,
     already_shown: &mut bool,
 ) -> Result<(), PromptError> {
     if let Err(error) = agent_config_argument(&call.function.name, &call.function.arguments) {
-        reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
+        reject_tool_call(model_turn, call.id.as_str(), error.telemetry_kind(), false);
         return Err(error);
     }
     let result = if *already_shown {
@@ -1476,7 +1467,7 @@ fn inspect_agent_config_into(
         {
             audit.event = "agent.config.inspected",
             model.turn = model_turn,
-            tool_call.index = tool_call_index,
+            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
             config.bytes = result.len(),
             config.repeated = *already_shown,
         },
@@ -1562,20 +1553,19 @@ fn fetch_asset_into(
     source: &dyn AssetSource,
     call: &ModelToolCall,
     model_turn: u32,
-    tool_call_index: usize,
     asset_bytes: &mut usize,
 ) -> Result<(), PromptError> {
     let id = match asset_argument(&call.function.name, &call.function.arguments) {
         Ok(id) => id,
         Err(error) => {
-            reject_tool_call(model_turn, tool_call_index, error.telemetry_kind(), false);
+            reject_tool_call(model_turn, call.id.as_str(), error.telemetry_kind(), false);
             return Err(error);
         }
     };
     let span = tracing::info_span!(
         "prompt.asset_fetch",
         model.turn = model_turn,
-        tool_call.index = tool_call_index,
+        gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
         asset.id = id,
     );
     let _entered = span.enter();
@@ -2265,30 +2255,6 @@ mod tests {
         }
     }
 
-    struct EventingModel {
-        turns: Mutex<VecDeque<AssistantTurn>>,
-    }
-
-    impl ChatModel for EventingModel {
-        fn complete(
-            &self,
-            _messages: &[ModelMessage],
-            _tools: &[ModelTool],
-            _options: &CompletionOptions,
-            on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
-        ) -> Result<AssistantTurn, InferenceError> {
-            if on_event(TurnEvent::ToolCallStarted { index: 0 }).is_break() {
-                return Err(InferenceError::Cancelled);
-            }
-            self.turns
-                .lock()
-                .pop_front()
-                .ok_or(InferenceError::Protocol(
-                    dekopon_model::error::ProtocolFailure::NoChoices,
-                ))
-        }
-    }
-
     struct TranscriptModel {
         events: Mutex<VecDeque<TurnEvent>>,
         turn: Mutex<Option<AssistantTurn>>,
@@ -2296,8 +2262,11 @@ mod tests {
 
     impl TranscriptModel {
         fn new(body: &str, turn: AssistantTurn) -> Self {
-            let events = dekopon_model::events_from_transcript(body)
-                .expect("the recorded transcript parses");
+            let events = dekopon_model::events_from_transcript(
+                body,
+                dekopon_model::TranscriptDialect::ChatCompletions,
+            )
+            .expect("the recorded transcript parses");
             Self {
                 events: Mutex::new(events.into()),
                 turn: Mutex::new(Some(turn)),
@@ -2700,6 +2669,7 @@ mod tests {
                 if self.0.scripted.observed_messages.lock().is_empty() {
                     let events = dekopon_model::events_from_transcript(
                         dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+                        dekopon_model::TranscriptDialect::ChatCompletions,
                     )
                     .expect("streamed draft");
                     for event in events {
@@ -2816,9 +2786,7 @@ mod tests {
 
     #[test]
     fn an_interrupted_turn_stops_the_session_and_names_who_asked() {
-        let model = EventingModel {
-            turns: Mutex::new([answer("never delivered")].into_iter().collect()),
-        };
+        let model = TranscriptModel::new(&text_transcript(&["draft"]), answer("never delivered"));
         let runtime = RecordingRuntime::new(0);
         let (sink, progress) = recording_sink();
         let probe = StopsDuringTheTurn {
@@ -2843,8 +2811,12 @@ mod tests {
         assert_eq!(error.telemetry_kind(), "cancelled");
         assert_eq!(
             sink.labels(),
-            vec!["model-turn 1/2", "cancelled User { via: NativeStop }",],
-            "no answer was ever reported for the turn that was cut off"
+            vec![
+                "model-turn 1/2",
+                "text-delta 1 \"draft\" 5",
+                "cancelled User { via: NativeStop }",
+            ],
+            "no completed answer was reported for the turn that was cut off"
         );
     }
 
@@ -3751,6 +3723,54 @@ mod tests {
             scripts[0]
         );
         assert!(!scripts[1].contains("ignored_arguments"), "{}", scripts[1]);
+        let records = capture.records();
+        let script_records = records.iter().filter(|record| match record {
+            dekopon_test_support::Record::Span { name, .. } => *name == "prompt.script",
+            dekopon_test_support::Record::Event { .. } => false,
+        });
+        for (record, id) in script_records.zip(["call-1", "call-2"]) {
+            assert_eq!(record.field("gen_ai.tool.call.id"), Some(id));
+            assert_eq!(record.field(concat!("tool_call", ".index")), None);
+        }
+    }
+
+    #[test]
+    fn tool_rejections_record_the_call_id_or_the_position_of_an_empty_id() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        for id in ["rejected-call", ""] {
+            let capture = CaptureLayer::workspace();
+            let model = ScriptedModel::new([tool_call(id, "unknown", json!({})), answer("done")]);
+            let result = tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(capture.clone()),
+                || {
+                    run_prompt_session(
+                        &model,
+                        &RecordingRuntime::new(0),
+                        SessionInputs::new("go", limits(2, 4)),
+                        &mut History::default(),
+                    )
+                },
+            );
+            if id.is_empty() {
+                assert!(matches!(result, Err(PromptError::EmptyToolCallId)));
+            } else {
+                result.expect("unknown tool gets feedback");
+            }
+            let records = capture.records();
+            let rejection = records
+                .iter()
+                .find(|record| record.field("audit.event") == Some("agent.tool.rejected"))
+                .expect("rejection event");
+            assert_eq!(rejection.field(concat!("tool_call", ".index")), None);
+            if id.is_empty() {
+                assert_eq!(rejection.field("tool_call.position"), Some("1"));
+                assert_eq!(rejection.field("gen_ai.tool.call.id"), None);
+            } else {
+                assert_eq!(rejection.field("gen_ai.tool.call.id"), Some(id));
+            }
+        }
     }
 
     #[test]

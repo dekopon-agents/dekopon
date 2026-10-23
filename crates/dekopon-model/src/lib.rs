@@ -34,7 +34,7 @@ pub mod stream;
 mod trace_capture;
 pub mod wire;
 
-pub use stream::{ModelText, TurnEvent, events_from_transcript};
+pub use stream::{ModelText, TranscriptDialect, TurnEvent, events_from_transcript};
 
 /// Disables ureq's default ambient-proxy pickup and redirect-following, since an exported
 /// HTTPS_PROXY would otherwise route the ChatGPT bearer token and OAuth exchange through an

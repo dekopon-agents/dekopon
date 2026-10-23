@@ -488,8 +488,8 @@ impl ChatModel for ChatProviderGovernor {
             .admit(self.call.clone(), estimate)
             .map_err(InferenceError::OverBudget)?;
         let result = self.inner.complete(messages, tools, options, &mut |event| {
-            if let TurnEvent::TextDelta(text) = &event {
-                admission.observe_text(text.len());
+            match &event {
+                TurnEvent::TextDelta(text) => admission.observe_text(text.len()),
             }
             on_event(event)
         });
@@ -618,8 +618,12 @@ mod tests {
 
     fn streaming(usage: Option<ModelUsage>) -> Arc<ScriptedStreamModel> {
         let model = Arc::new(
-            ScriptedStreamModel::from_transcript(OPENAI_CHAT_COMPLETIONS_TWO_DELTAS, turn(usage))
-                .unwrap(),
+            ScriptedStreamModel::from_transcript(
+                OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+                dekopon_model::TranscriptDialect::ChatCompletions,
+                turn(usage),
+            )
+            .unwrap(),
         );
         for _ in 0..8 {
             model.release_next();

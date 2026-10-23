@@ -1,7 +1,5 @@
 use std::ops::ControlFlow;
 
-use serde_json::Value;
-
 use crate::error::InferenceError;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -45,45 +43,41 @@ impl ModelText {
 #[derive(Clone, Debug)]
 pub enum TurnEvent {
     TextDelta(ModelText),
-    /// Index is the call's position in the finished turn's tool_calls because that is the only
-    /// numbering both the chat-completions and Responses wire formats agree on.
-    ToolCallStarted {
-        index: u32,
-    },
 }
 
-pub fn events_from_transcript(body: &str) -> Result<Vec<TurnEvent>, InferenceError> {
+#[derive(Clone, Copy, Debug)]
+pub enum TranscriptDialect {
+    ChatCompletions,
+    Responses,
+}
+
+pub fn events_from_transcript(
+    body: &str,
+    dialect: TranscriptDialect,
+) -> Result<Vec<TurnEvent>, InferenceError> {
     let mut events = Vec::new();
     let mut collect = |event: TurnEvent| -> ControlFlow<()> {
         events.push(event);
         ControlFlow::Continue(())
     };
-    if is_responses_transcript(body) {
-        crate::codex::replay_transcript(body, &mut collect)?;
-    } else {
-        crate::openai::replay_transcript(
-            crate::diagnostic::DiagnosticSecrets::default(),
-            body,
-            &mut collect,
-        )?;
+    match dialect {
+        TranscriptDialect::Responses => {
+            crate::codex::replay_transcript(body, &mut collect)?;
+        }
+        TranscriptDialect::ChatCompletions => {
+            crate::openai::replay_transcript(
+                crate::diagnostic::DiagnosticSecrets::default(),
+                body,
+                &mut collect,
+            )?;
+        }
     }
     Ok(events)
 }
 
-fn is_responses_transcript(body: &str) -> bool {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim)
-        .find(|payload| !payload.is_empty() && *payload != "[DONE]")
-        .is_some_and(|payload| {
-            serde_json::from_str::<Value>(payload)
-                .is_ok_and(|event| event.get("type").is_some_and(Value::is_string))
-        })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ModelText, TurnEvent, events_from_transcript};
+    use super::{ModelText, TranscriptDialect, TurnEvent, events_from_transcript};
 
     #[test]
     fn cumulative_text_is_the_concatenation_of_its_deltas() {
@@ -104,7 +98,6 @@ mod tests {
             .iter()
             .map(|event| match event {
                 TurnEvent::TextDelta(text) => format!("text:{}", text.as_str()),
-                TurnEvent::ToolCallStarted { index } => format!("call:{index}"),
             })
             .collect()
     }
@@ -124,8 +117,11 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
         );
 
-        for (backend, transcript) in [("chat completions", chat), ("responses", responses)] {
-            let events = events_from_transcript(transcript)
+        for (backend, transcript, dialect) in [
+            ("chat completions", chat, TranscriptDialect::ChatCompletions),
+            ("responses", responses, TranscriptDialect::Responses),
+        ] {
+            let events = events_from_transcript(transcript, dialect)
                 .unwrap_or_else(|error| panic!("{backend}: {error}"));
 
             assert_eq!(
@@ -137,9 +133,23 @@ mod tests {
     }
 
     #[test]
+    fn responses_replay_accepts_a_multiline_first_data_field() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\n",
+            "data: \"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        );
+        let events = events_from_transcript(body, TranscriptDialect::Responses).unwrap();
+        assert_eq!(recorded(&events), ["text:hello"]);
+    }
+
+    #[test]
     fn a_transcript_that_is_not_a_stream_says_so_rather_than_replaying_nothing() {
-        let error = events_from_transcript("data: {\"choices\": [\n\n")
-            .expect_err("a truncated JSON payload is not a stream");
+        let error = events_from_transcript(
+            "data: {\"choices\": [\n\n",
+            TranscriptDialect::ChatCompletions,
+        )
+        .expect_err("a truncated JSON payload is not a stream");
 
         assert!(matches!(
             error,

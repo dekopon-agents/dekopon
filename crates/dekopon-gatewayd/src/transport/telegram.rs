@@ -1264,6 +1264,7 @@ mod tests {
     fn longer_than_one_message() -> ModelText {
         let events = dekopon_model::events_from_transcript(
             dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+            dekopon_model::TranscriptDialect::ChatCompletions,
         )
         .expect("the recorded transcript parses");
         let delta = dekopon_test_support::scripted_text(&events);

@@ -511,6 +511,7 @@ async fn advance(duration: Duration) {
 fn recorded_delta() -> ModelText {
     let events = dekopon_model::events_from_transcript(
         dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+        dekopon_model::TranscriptDialect::ChatCompletions,
     )
     .expect("the recorded transcript parses");
     dekopon_test_support::scripted_text(&events)

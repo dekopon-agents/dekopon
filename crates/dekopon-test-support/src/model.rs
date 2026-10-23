@@ -29,9 +29,13 @@ pub struct ScriptedStreamModel {
 }
 
 impl ScriptedStreamModel {
-    pub fn from_transcript(body: &str, turn: AssistantTurn) -> Result<Self, InferenceError> {
+    pub fn from_transcript(
+        body: &str,
+        dialect: dekopon_model::TranscriptDialect,
+        turn: AssistantTurn,
+    ) -> Result<Self, InferenceError> {
         Ok(Self::scripted(
-            dekopon_model::events_from_transcript(body)?,
+            dekopon_model::events_from_transcript(body, dialect)?,
             turn,
         ))
     }
@@ -119,8 +123,8 @@ impl ChatModel for ScriptedStreamModel {
 pub fn scripted_text(events: &[TurnEvent]) -> ModelText {
     let mut text = ModelText::default();
     for event in events {
-        if let TurnEvent::TextDelta(delta) = event {
-            text.push(delta);
+        match event {
+            TurnEvent::TextDelta(delta) => text.push(delta),
         }
     }
     text

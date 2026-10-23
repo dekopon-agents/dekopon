@@ -550,20 +550,12 @@ impl RouterStream {
                 )?;
             }
             for item in delta.tool_calls.unwrap_or_default() {
-                let started = merge_tool(
+                merge_tool(
                     &mut self.replay.calls,
                     &mut self.call_positions,
                     item,
                     secrets,
                 )?;
-                if started
-                    && observe(TurnEvent::ToolCallStarted {
-                        index: u32::try_from(self.replay.calls.len() - 1).unwrap_or(u32::MAX),
-                    })
-                    .is_break()
-                {
-                    return Err(InferenceError::Cancelled);
-                }
             }
         }
         Ok(())
@@ -691,7 +683,7 @@ fn merge_tool(
     positions: &mut HashMap<u64, usize>,
     incoming: Value,
     secrets: DiagnosticSecrets<'_>,
-) -> Result<bool, InferenceError> {
+) -> Result<(), InferenceError> {
     let Value::Object(mut object) = incoming else {
         return Err(protocol("tool fragment must be an object", secrets));
     };
@@ -700,12 +692,21 @@ fn merge_tool(
     let Some(&position) = positions.get(&index) else {
         positions.insert(index, items.len());
         items.push(Value::Object(object));
-        return Ok(true);
+        return Ok(());
     };
     let target = items
         .get_mut(position)
         .and_then(Value::as_object_mut)
         .ok_or_else(|| protocol("tool fragment must be an object", secrets))?;
+    let kind = object
+        .get("type")
+        .or_else(|| target.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+    if kind != "function" {
+        merge_fields(target, object, &[], secrets)?;
+        return Ok(());
+    }
     if let Some(function) = object.remove("function").filter(|value| !value.is_null()) {
         let Value::Object(function) = function else {
             return Err(protocol("function fragment must be an object", secrets));
@@ -722,7 +723,7 @@ fn merge_tool(
         merge_fields(existing, function, &["arguments"], secrets)?;
     }
     merge_fields(target, object, &[], secrets)?;
-    Ok(false)
+    Ok(())
 }
 
 #[cfg(test)]
