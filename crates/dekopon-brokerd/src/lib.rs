@@ -925,6 +925,10 @@ async fn resolve_provider_set(
     })
     .map_err(BrokerdError::ProviderSet)?;
     manager.sync().await.map_err(BrokerdError::ProviderSet)?;
+    manager
+        .precompile()
+        .await
+        .map_err(BrokerdError::ProviderSet)?;
     provider_manager::load_locked_sources(&lock_file, &store, uid)
         .await
         .map_err(BrokerdError::ProviderSet)

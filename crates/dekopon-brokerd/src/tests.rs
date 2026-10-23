@@ -3148,6 +3148,116 @@ async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
 }
 
 #[tokio::test]
+async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_object() {
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    let store = root.path().join("check-store");
+    let blobs = store.join("store/blobs/sha256");
+    for directory in [
+        store.clone(),
+        store.join("store"),
+        store.join("store/blobs"),
+        blobs.clone(),
+    ] {
+        fs::create_dir(&directory).expect("create store directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("private store directory");
+    }
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
+        .expect("checked cli-probe component");
+    let digest = Sha256::digest(&component)
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        });
+    write_owner_only(&blobs.join(format!("{digest}.wasm")), &component);
+    write_owner_only(
+        &store.join("providers.lock.yaml"),
+        format!(
+            "apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders:\n  - source: ghcr.io/example/cli-probe:1.0.0\n    resolvedVersion: 1.0.0\n    manifestDigest: sha256:{}\n    componentDigest: sha256:{digest}\n    componentBytes: {}\n    providerId: cli-probe\n",
+            "1".repeat(64), component.len()
+        ).as_bytes(),
+    );
+    let provider_set = root.path().join("providers.yaml");
+    write_owner_only(
+        &provider_set,
+        b"apiVersion: dekopon.dev/provider-set/v1alpha1\nproviders:\n  - source: ghcr.io/example/cli-probe:1.0.0\n",
+    );
+    let mut document = attested_document(current_uid());
+    document
+        .as_object_mut()
+        .expect("config object")
+        .remove("providers");
+    document["providerSet"] = json!({"lockPath": "providers.lock.yaml", "storePath": "store"});
+    let config = root.path().join("broker.yaml");
+    write_config(&config, &document);
+    write_owner_only(&root.path().join("policies.cedar"), POLICIES.as_bytes());
+    let check = || {
+        super::check(
+            &config,
+            Some(super::CheckProviders {
+                provider_set: provider_set.clone(),
+                store: store.clone(),
+            }),
+        )
+    };
+    let report = check().await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let cache = store.join("store/cwasm/v1");
+    let objects = cache.join("sha256");
+    let current_object = fs::read_dir(&objects)
+        .expect("compiled objects")
+        .next()
+        .expect("current object")
+        .expect("object entry")
+        .path();
+    let old_generation = cache.join("old-engine");
+    fs::create_dir(&old_generation).expect("old generation");
+    write_owner_only(&old_generation.join("stale.json"), b"stale");
+    let unreferenced = objects.join("unreferenced.cwasm");
+    write_owner_only(&unreferenced, b"unreferenced");
+    let report = check().await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(!old_generation.exists());
+    assert!(!unreferenced.exists());
+    assert!(current_object.is_file());
+}
+
+#[tokio::test]
+async fn non_strict_check_refuses_undeclared_capabilities_but_warns_for_unloaded_providers() {
+    use super::{BrokerdError, StartupWarning, capabilities::CapabilityProblem};
+
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
+        .expect("checked cli-probe component");
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    write_owner_only(&root.path().join("policies.cedar"), POLICIES.as_bytes());
+    let mut document = attested_document(current_uid());
+    document["strict"] = json!(false);
+    document["capabilities"]["cli-probe"]["capabilities"]["cli-probe.nonexistent"] = json!({});
+    document["capabilities"]["absent"] = json!({"capabilities": {}});
+    let config = root.path().join("broker.yaml");
+    write_config(&config, &document);
+    let report = super::check(&config, None).await;
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        BrokerdError::Capabilities { problems } if problems.iter().any(|problem| matches!(
+            problem, CapabilityProblem::UnknownCapability { provider, capability }
+                if provider.as_str() == "cli-probe" && capability.as_str() == "cli-probe.nonexistent"
+        ))
+    )), "{report:?}");
+    assert!(
+        report.warnings.iter().any(|warning| matches!(
+            warning,
+            StartupWarning::UnloadedCapability(CapabilityProblem::UnknownProvider { provider })
+                if provider.as_str() == "absent"
+        )),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
 async fn check_passes_the_conditional_write_example_in_place() {
     let report = super::check(example_path("examples/conditional-write/broker.yaml"), None).await;
     assert!(
