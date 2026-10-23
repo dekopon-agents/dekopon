@@ -28,7 +28,7 @@ updates:
       time: "09:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
-    rebase-strategy: auto
+    rebase-strategy: disabled
 
   - package-ecosystem: github-actions
     directory: /
