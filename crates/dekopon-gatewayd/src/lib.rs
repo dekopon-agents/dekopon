@@ -203,6 +203,11 @@ where
         &config.metering,
         dekopon_model_token_governor::Metering::system_clock(),
     ));
+    let assets = Arc::new(AssetStore::with_retention(
+        config.sessions.max_conversations,
+        ASSET_IDLE_TIMEOUT,
+        config.sessions.asset_retention_bytes,
+    ));
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -219,11 +224,7 @@ where
         ),
         follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
         journal,
-        assets: Arc::new(AssetStore::with_retention(
-            config.sessions.max_conversations,
-            ASSET_IDLE_TIMEOUT,
-            config.sessions.asset_retention_bytes,
-        )),
+        assets: Arc::clone(&assets),
         asset_fetchers,
         thread_ownership,
         wakes,
@@ -272,6 +273,7 @@ where
         .await;
     readers.abort_all();
     owned_tasks.shutdown().await;
+    assets.shutdown().await;
     while let Some(result) = readers.join_next().await {
         match result {
             Ok(Err(problem)) => tracing::warn!(

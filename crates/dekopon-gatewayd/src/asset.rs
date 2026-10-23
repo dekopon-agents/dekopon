@@ -17,13 +17,17 @@ use std::{
 
 use dekopon_agent::attachment::GeneratedImage;
 use dekopon_agent::{
-    attachment::{ChatAssetRefusal, ChatAssetSource},
+    attachment::{ChatAssetRefusal, ChatAssetSource, ResolveFuture, ResolvedInput},
     prompt::{AssetSource, FetchedAsset},
 };
 use dekopon_broker_protocol::{AssetEncoding, AssetRow, NewAsset};
 use dekopon_model::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Handle;
+use tokio::{
+    runtime::Handle,
+    sync::{Semaphore, watch},
+    task::{AbortHandle, JoinSet},
+};
 
 pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
 
@@ -41,7 +45,6 @@ pub(crate) struct AssetRef {
     pub size: Option<u64>,
     pub source: Option<AssetSourceRef>,
     pub arrived: SystemTime,
-    fetched: bool,
     encoding: AssetEncoding,
     sent: bool,
 }
@@ -221,14 +224,86 @@ pub(crate) struct AssetStore {
     idle_timeout: Duration,
     entries: Mutex<HashMap<AssetStateKey, ConversationAssets>>,
     retention: Mutex<Retention>,
+    downloads: Downloads,
     next_one_shot_id: AtomicU64,
 }
 
 struct ConversationAssets {
-    assets: Vec<AssetRef>,
+    assets: Vec<Row>,
     touched: Instant,
     fence: Option<Weak<AssetFence>>,
     delivery_failed: bool,
+}
+
+impl ConversationAssets {
+    fn new(fence: Option<Weak<AssetFence>>, now: Instant) -> Self {
+        Self {
+            assets: Vec::new(),
+            touched: now,
+            fence,
+            delivery_failed: false,
+        }
+    }
+}
+
+struct Row {
+    asset: AssetRef,
+    state: Attachment,
+}
+
+/// A row that leaves the table is Gone: its id survives only as a bounded release tombstone.
+enum Attachment {
+    Registered,
+    Downloading(Downloading),
+    Resident(Resident),
+    Evicted,
+}
+
+struct Downloading {
+    attempt: u64,
+    task: AbortHandle,
+    interests: usize,
+    outcome: watch::Receiver<Option<Fetched>>,
+}
+
+type Fetched = Result<DiskBlob, AssetFailure>;
+
+const MAX_CONCURRENT_DOWNLOADS: usize = 2;
+
+struct Downloads {
+    permits: Arc<Semaphore>,
+    tasks: Mutex<JoinSet<()>>,
+    attempts: AtomicU64,
+}
+
+impl Downloads {
+    fn spawn(
+        &self,
+        task: impl Future<Output = ()> + Send + 'static,
+        runtime: &Handle,
+    ) -> AbortHandle {
+        let mut tasks = self.tasks.lock();
+        while let Some(finished) = tasks.try_join_next() {
+            if let Err(error) = finished
+                && error.is_panic()
+            {
+                tracing::error!(event = "gateway_asset_download_failed", %error);
+            }
+        }
+        tasks.spawn_on(task, runtime)
+    }
+}
+
+fn row_mut<'a>(
+    entries: &'a mut HashMap<AssetStateKey, ConversationAssets>,
+    key: &AssetStateKey,
+    id: u64,
+) -> Option<&'a mut Row> {
+    entries
+        .get_mut(key)?
+        .assets
+        .iter_mut()
+        .find(|row| row.asset.id == id)
 }
 
 impl AssetStore {
@@ -247,8 +322,18 @@ impl AssetStore {
             idle_timeout,
             entries: Mutex::new(HashMap::new()),
             retention: Mutex::new(Retention::new(budget)),
+            downloads: Downloads {
+                permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
+                tasks: Mutex::new(JoinSet::new()),
+                attempts: AtomicU64::new(1),
+            },
             next_one_shot_id: AtomicU64::new(1),
         }
+    }
+
+    pub async fn shutdown(&self) {
+        let mut tasks = std::mem::take(&mut *self.downloads.tasks.lock());
+        tasks.shutdown().await;
     }
 
     #[cfg(test)]
@@ -270,18 +355,13 @@ impl AssetStore {
         access
             .with_active(|state_key| {
                 let mut entries = self.entries.lock();
-                Self::expire(&mut entries, self.idle_timeout, now);
+                let mut retention = self.retention.lock();
+                Self::expire(&mut entries, &mut retention, self.idle_timeout, now);
                 let mut arrived = Vec::with_capacity(arriving.len());
                 if !arriving.is_empty() {
-                    let entry =
-                        entries
-                            .entry(state_key.clone())
-                            .or_insert_with(|| ConversationAssets {
-                                assets: Vec::new(),
-                                touched: now,
-                                fence: access.weak_fence(),
-                                delivery_failed: false,
-                            });
+                    let entry = entries
+                        .entry(state_key.clone())
+                        .or_insert_with(|| ConversationAssets::new(access.weak_fence(), now));
                     entry.touched = now;
                     for pending in arriving {
                         let asset = AssetRef {
@@ -291,25 +371,22 @@ impl AssetStore {
                             size: pending.size,
                             source: pending.source,
                             arrived: SystemTime::now(),
-                            fetched: false,
                             encoding: AssetEncoding::Identity,
                             sent: false,
                         };
                         arrived.push(asset.id);
-                        entry.assets.push(asset);
+                        entry.assets.push(Row {
+                            asset,
+                            state: Attachment::Registered,
+                        });
                     }
-                    while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
-                        let evicted = entry.assets.remove(0);
-                        self.retention
-                            .lock()
-                            .evict(&(state_key.clone(), evicted.id));
-                    }
-                    Self::enforce_ceiling(&mut entries, self.conversations);
+                    Self::trim(entry, &mut retention, state_key);
+                    Self::enforce_ceiling(&mut entries, &mut retention, self.conversations);
                 }
 
                 let inventory = entries.get_mut(state_key).map_or_else(Vec::new, |entry| {
                     entry.touched = now;
-                    entry.assets.clone()
+                    entry.assets.iter().map(|row| row.asset.clone()).collect()
                 });
                 Registered { inventory, arrived }
             })
@@ -332,36 +409,30 @@ impl AssetStore {
         }
         access.with_active(|state_key| {
             let mut entries = self.entries.lock();
-            Self::expire(&mut entries, self.idle_timeout, now);
+            let mut retention = self.retention.lock();
+            Self::expire(&mut entries, &mut retention, self.idle_timeout, now);
             let entry = entries
                 .entry(state_key.clone())
-                .or_insert_with(|| ConversationAssets {
-                    assets: Vec::new(),
-                    touched: now,
-                    fence: access.weak_fence(),
-                    delivery_failed: false,
-                });
+                .or_insert_with(|| ConversationAssets::new(access.weak_fence(), now));
             entry.touched = now;
             entry
                 .assets
-                .extend(recalled.into_iter().map(|recalled| AssetRef {
-                    id: recalled.id,
-                    name: recalled.asset.name,
-                    mime: recalled.asset.mime,
-                    size: recalled.asset.size,
-                    source: recalled.asset.source,
-                    arrived: recalled.arrived,
-                    fetched: false,
-                    encoding: AssetEncoding::Identity,
-                    sent: false,
+                .extend(recalled.into_iter().map(|recalled| Row {
+                    asset: AssetRef {
+                        id: recalled.id,
+                        name: recalled.asset.name,
+                        mime: recalled.asset.mime,
+                        size: recalled.asset.size,
+                        source: recalled.asset.source,
+                        arrived: recalled.arrived,
+                        encoding: AssetEncoding::Identity,
+                        sent: false,
+                    },
+                    state: Attachment::Registered,
                 }));
-            entry.assets.sort_by_key(|asset| asset.id);
-            let excess = entry
-                .assets
-                .len()
-                .saturating_sub(MAX_ASSETS_PER_CONVERSATION);
-            entry.assets.drain(..excess);
-            Self::enforce_ceiling(&mut entries, self.conversations);
+            entry.assets.sort_by_key(|row| row.asset.id);
+            Self::trim(entry, &mut retention, state_key);
+            Self::enforce_ceiling(&mut entries, &mut retention, self.conversations);
         });
     }
 
@@ -378,29 +449,46 @@ impl AssetStore {
         access
             .with_active(|state_key| {
                 let mut entries = self.entries.lock();
-                Self::expire(&mut entries, self.idle_timeout, now);
+                Self::expire(
+                    &mut entries,
+                    &mut self.retention.lock(),
+                    self.idle_timeout,
+                    now,
+                );
                 let entry = entries.get_mut(state_key)?;
                 entry.touched = now;
-                entry.assets.iter().find(|asset| asset.id == id).cloned()
+                entry
+                    .assets
+                    .iter()
+                    .find(|row| row.asset.id == id)
+                    .map(|row| row.asset.clone())
             })
             .flatten()
     }
 
     fn expire(
         entries: &mut HashMap<AssetStateKey, ConversationAssets>,
+        retention: &mut Retention,
         idle_timeout: Duration,
         now: Instant,
     ) {
-        entries.retain(|_, entry| {
+        let expired = entries.extract_if(|_, entry| {
             let active = entry
                 .fence
                 .as_ref()
                 .is_none_or(|fence| fence.upgrade().is_some_and(|fence| fence.is_active()));
-            active && now.saturating_duration_since(entry.touched) < idle_timeout
+            !active || now.saturating_duration_since(entry.touched) >= idle_timeout
         });
+        for (key, entry) in expired {
+            retention.release_all(&key, entry.assets);
+        }
     }
 
-    fn enforce_ceiling(entries: &mut HashMap<AssetStateKey, ConversationAssets>, capacity: usize) {
+    fn enforce_ceiling(
+        entries: &mut HashMap<AssetStateKey, ConversationAssets>,
+        retention: &mut Retention,
+        capacity: usize,
+    ) {
         while entries.len() > capacity {
             let Some(oldest) = entries
                 .iter()
@@ -409,8 +497,18 @@ impl AssetStore {
             else {
                 break;
             };
-            entries.remove(&oldest);
+            if let Some(entry) = entries.remove(&oldest) {
+                retention.release_all(&oldest, entry.assets);
+            }
         }
+    }
+
+    fn trim(entry: &mut ConversationAssets, retention: &mut Retention, key: &AssetStateKey) {
+        let excess = entry
+            .assets
+            .len()
+            .saturating_sub(MAX_ASSETS_PER_CONVERSATION);
+        retention.release_all(key, entry.assets.drain(..excess));
     }
 }
 
@@ -539,6 +637,28 @@ impl AssetRef {
             "unavailable"
         }
     }
+
+    fn row(&self, bytes: Option<u64>) -> AssetRow {
+        AssetRow {
+            id: self.id,
+            content_type: self.mime.clone(),
+            encoding: self.encoding,
+            bytes,
+            origin: match &self.source {
+                Some(AssetSourceRef::Generated { capability, .. }) => {
+                    format!("provider:{capability}")
+                }
+                Some(
+                    AssetSourceRef::Slack { .. }
+                    | AssetSourceRef::Discord { .. }
+                    | AssetSourceRef::WhatsApp { .. }
+                    | AssetSourceRef::Telegram { .. },
+                )
+                | None => "chat".to_owned(),
+            },
+            sent: self.sent,
+        }
+    }
 }
 
 fn kibibytes(size: u64) -> String {
@@ -571,8 +691,6 @@ const MAX_ASSET_BYTES: u64 = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
 
 const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Fetch is synchronous because the prompt loop that calls it runs on a blocking task, so blocking
-/// here parks a blocking thread rather than a runtime worker.
 pub(crate) struct SessionAssets {
     store: Arc<AssetStore>,
     access: AssetAccess,
@@ -605,21 +723,27 @@ impl AssetSource for SessionAssets {
     }
 
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
-        let (asset, data) = self
-            .load(
-                id,
-                AssetConsumer::Model {
-                    images_supported: self.images_supported,
-                },
-            )
+        let asset = self.asset(id).map_err(|failure| failure.for_model(id))?;
+        if !asset.is_fetchable(self.images_supported) {
+            return Err(AssetFailure::Unreadable {
+                reason: asset.unreadable_reason(self.images_supported),
+            }
+            .for_model(id));
+        }
+        let data = self
+            .runtime
+            .block_on(self.resolve(&asset, Recency::Keep))
             .map_err(|failure| failure.for_model(id))?;
+        let decoded = GeneratedImage::new(data, asset.mime.clone(), asset.encoding)
+            .decoded_len()
+            .map_err(|error| AssetFailure::Storage(error).for_model(id))?;
         let reference = BlobReference::new(
             Arc::new(ScopedBlob {
                 store: Arc::downgrade(&self.store),
                 access: self.access.clone(),
                 id,
             }),
-            data.len(),
+            decoded,
             id,
         );
         Ok(FetchedAsset {
@@ -631,72 +755,60 @@ impl AssetSource for SessionAssets {
 }
 
 impl ChatAssetSource for SessionAssets {
-    fn fetch_for_capability(
-        &self,
-        id: u64,
-    ) -> Result<(String, dekopon_model::asset::DiskBlob), ChatAssetRefusal> {
-        let (asset, _resolution_pin) = self
-            .load(id, AssetConsumer::Capability)
-            .map_err(AssetFailure::for_capability)?;
-        // Capability resolution counts as actual use, not replay; the initial pin is kept until the
-        // recency update completes, and bytes are never substituted if that update fails.
-        let data = self
-            .store
-            .pin(&self.access, id, true)
-            .map_err(|error| AssetFailure::Storage(error).for_capability())?
-            .ok_or(ChatAssetRefusal::Reclaimed)?;
-        Ok((asset.mime, data))
+    fn resolve_input(&self, id: u64) -> ResolveFuture<'_> {
+        Box::pin(async move {
+            let asset = self.asset(id).map_err(AssetFailure::for_capability)?;
+            let blob = self
+                .resolve(&asset, Recency::Touch)
+                .await
+                .map_err(AssetFailure::for_capability)?;
+            Ok(ResolvedInput {
+                row: asset.row(Some(blob.len() as u64)),
+                blob,
+            })
+        })
     }
+
     fn rows(&self) -> Vec<AssetRow> {
         self.store
             .get_inventory(&self.access)
-            .into_iter()
-            .map(|asset| AssetRow {
-                id: asset.id,
-                content_type: asset.mime,
-                encoding: asset.encoding,
-                bytes: asset.size,
-                origin: match asset.source {
-                    Some(AssetSourceRef::Generated { capability, .. }) => {
-                        format!("provider:{capability}")
-                    }
-                    _ => "chat".to_owned(),
-                },
-                sent: asset.sent,
-            })
+            .iter()
+            .map(|asset| asset.row(asset.size))
             .collect()
     }
 }
 
+enum Located {
+    Resident(DiskBlob),
+    Remote {
+        source: AssetSourceRef,
+        fetcher: Arc<dyn AssetFetcher>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum Recency {
+    Keep,
+    Touch,
+}
+
 impl SessionAssets {
-    fn load(&self, id: u64, consumer: AssetConsumer) -> Result<(AssetRef, DiskBlob), AssetFailure> {
-        // There is no store-wide download lock because the session gate admits one session per
-        // conversation with sequential reads, so no attachment is ever fetched twice at once.
-        let Some(asset) = self.store.get_access(&self.access, id, Instant::now()) else {
-            return match self.store.pin(&self.access, id, false) {
-                Err(BlobError::Unknown) => Err(AssetFailure::Unknown),
-                Err(error) => Err(AssetFailure::Storage(error)),
-                Ok(_) => Err(AssetFailure::Unknown),
-            };
-        };
-        if let AssetConsumer::Model { images_supported } = consumer
-            && !asset.is_fetchable(images_supported)
-        {
-            return Err(AssetFailure::Unreadable {
-                reason: asset.unreadable_reason(images_supported),
-                refusal: if asset.source.is_none() {
-                    ChatAssetRefusal::Unavailable
-                } else {
-                    ChatAssetRefusal::UnsupportedMedia
-                },
-            });
-        }
+    fn asset(&self, id: u64) -> Result<AssetRef, AssetFailure> {
+        self.store
+            .get_access(&self.access, id, Instant::now())
+            .ok_or_else(|| match self.store.pin(&self.access, id, Recency::Keep) {
+                Err(BlobError::Unknown) | Ok(_) => AssetFailure::Unknown,
+                Err(error) => AssetFailure::Storage(error),
+            })
+    }
+
+    fn locate(&self, asset: &AssetRef, recency: Recency) -> Result<Located, AssetFailure> {
         if let Some(data) = self
             .store
-            .pin(&self.access, id, false)
+            .pin(&self.access, asset.id, recency)
             .map_err(AssetFailure::Storage)?
         {
-            return Ok((asset, data));
+            return Ok(Located::Resident(data));
         }
         if let Some(size) = asset.size
             && size > MAX_ASSET_BYTES
@@ -704,57 +816,256 @@ impl SessionAssets {
             return Err(AssetFailure::TooLarge { size });
         }
         self.store
-            .check_size(id, asset.size.unwrap_or_default() as usize)
+            .check_size(asset.id, asset.size.unwrap_or_default() as usize)
             .map_err(AssetFailure::Storage)?;
         let (Some(fetcher), Some(source)) = (self.fetcher.as_ref(), asset.source.as_ref()) else {
             return Err(AssetFailure::Unavailable);
         };
-        let data = self
-            .runtime
-            .block_on(tokio::time::timeout(
-                ASSET_FETCH_TIMEOUT,
-                fetcher.fetch(source, MAX_ASSET_BYTES),
-            ))
-            .map_err(|_elapsed| AssetFailure::Transport {
-                category: "fetch-timeout",
-            })?
-            .map_err(|error| AssetFailure::Transport {
-                // Only the transport's error category goes into the prompt, never its message,
-                // since a transport error can carry arbitrary service text.
-                category: error.category(),
-            })?;
-        // A generation can retire while a transport read is in flight; the read may not always be
-        // cancellable, but its bytes must never reach the model once retirement is visible.
-        if !self.access.is_active() {
-            return Err(AssetFailure::Unknown);
+        Ok(Located::Remote {
+            source: source.clone(),
+            fetcher: Arc::clone(fetcher),
+        })
+    }
+
+    async fn resolve(&self, asset: &AssetRef, recency: Recency) -> Fetched {
+        let (source, fetcher) = match self.locate(asset, recency)? {
+            Located::Resident(data) => return Ok(data),
+            Located::Remote { source, fetcher } => (source, fetcher),
+        };
+        match AssetStore::join(
+            &self.store,
+            &self.access,
+            asset.id,
+            source,
+            fetcher,
+            &self.runtime,
+        )? {
+            Download::Ready(data) => Ok(data),
+            Download::Pending(waiter) => waiter.wait().await,
         }
-        let data = self
-            .store
-            .admit(&self.access, id, &data)
-            .map_err(AssetFailure::Storage)?;
-        Ok((asset, data))
     }
 }
 
-enum AssetConsumer {
-    Model { images_supported: bool },
-    Capability,
+enum Download {
+    Ready(DiskBlob),
+    Pending(Waiter),
 }
 
+#[derive(Clone)]
+struct Ticket {
+    store: Weak<AssetStore>,
+    access: AssetAccess,
+    id: u64,
+    attempt: u64,
+}
+
+/// Dropping the task's attempt, by completion, abort or panic, is how the store observes that the
+/// download ended.
+struct Attempt(Ticket);
+
+impl Attempt {
+    async fn download(
+        &self,
+        source: AssetSourceRef,
+        fetcher: Arc<dyn AssetFetcher>,
+        permits: Arc<Semaphore>,
+    ) -> Fetched {
+        let _permit = permits
+            .acquire()
+            .await
+            .map_err(|_closed| AssetFailure::Unavailable)?;
+        let data =
+            tokio::time::timeout(ASSET_FETCH_TIMEOUT, fetcher.fetch(&source, MAX_ASSET_BYTES))
+                .await
+                .map_err(|_elapsed| AssetFailure::TimedOut)?
+                .map_err(|error| AssetFailure::Transport {
+                    // Only the transport's error category goes into the prompt, never its message,
+                    // since a transport error can carry arbitrary service text.
+                    category: error.category(),
+                })?;
+        let ticket = self.0.clone();
+        tokio::task::spawn_blocking(move || {
+            ticket
+                .store
+                .upgrade()
+                .ok_or(AssetFailure::Unknown)?
+                .complete(&ticket, &data)
+        })
+        .await
+        .map_err(|_join| AssetFailure::Unavailable)?
+    }
+
+    fn reset(&self) {
+        if let Some(store) = self.0.store.upgrade() {
+            store.reset(&self.0);
+        }
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
+struct Waiter {
+    ticket: Ticket,
+    outcome: watch::Receiver<Option<Fetched>>,
+}
+
+impl Waiter {
+    async fn wait(mut self) -> Fetched {
+        match self.outcome.wait_for(Option::is_some).await {
+            Ok(fetched) => fetched.clone().unwrap_or(Err(AssetFailure::Unavailable)),
+            Err(_closed) => Err(AssetFailure::Unavailable),
+        }
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        if let Some(store) = self.ticket.store.upgrade() {
+            store.release_interest(&self.ticket);
+        }
+    }
+}
+
+impl AssetStore {
+    fn join(
+        self: &Arc<Self>,
+        access: &AssetAccess,
+        id: u64,
+        source: AssetSourceRef,
+        fetcher: Arc<dyn AssetFetcher>,
+        runtime: &Handle,
+    ) -> Result<Download, AssetFailure> {
+        access
+            .with_active(|key| {
+                let mut entries = self.entries.lock();
+                let row = row_mut(&mut entries, key, id).ok_or(AssetFailure::Unknown)?;
+                let ticket = |attempt| Ticket {
+                    store: Arc::downgrade(self),
+                    access: access.clone(),
+                    id,
+                    attempt,
+                };
+                match &mut row.state {
+                    Attachment::Resident(resident) => {
+                        return Ok(Download::Ready(resident.data.clone()));
+                    }
+                    Attachment::Evicted => return Err(AssetFailure::Storage(BlobError::Reclaimed)),
+                    Attachment::Downloading(downloading) if downloading.interests > 0 => {
+                        downloading.interests += 1;
+                        return Ok(Download::Pending(Waiter {
+                            ticket: ticket(downloading.attempt),
+                            outcome: downloading.outcome.clone(),
+                        }));
+                    }
+                    Attachment::Downloading(_) | Attachment::Registered => (),
+                }
+                let attempt = self.downloads.attempts.fetch_add(1, Ordering::Relaxed);
+                let (sender, outcome) = watch::channel(None);
+                let attempt_ticket = ticket(attempt);
+                let permits = Arc::clone(&self.downloads.permits);
+                let task = self.downloads.spawn(
+                    async move {
+                        // Built on first poll: a runtime that drops the unpolled future inside
+                        // `spawn_on` while `entries` is locked must not run `Attempt::drop`.
+                        let task = Attempt(attempt_ticket);
+                        let fetched = task.download(source, fetcher, permits).await;
+                        // The entry leaves Downloading before waiters wake, so a retry never joins
+                        // a finished attempt.
+                        task.reset();
+                        sender.send_replace(Some(fetched));
+                    },
+                    runtime,
+                );
+                row.state = Attachment::Downloading(Downloading {
+                    attempt,
+                    task,
+                    interests: 1,
+                    outcome: outcome.clone(),
+                });
+                Ok(Download::Pending(Waiter {
+                    ticket: ticket(attempt),
+                    outcome,
+                }))
+            })
+            .unwrap_or(Err(AssetFailure::Storage(BlobError::Unauthorized)))
+    }
+
+    fn release_interest(&self, ticket: &Ticket) {
+        ticket.access.with_active(|key| {
+            let mut entries = self.entries.lock();
+            let Some(row) = row_mut(&mut entries, key, ticket.id) else {
+                return;
+            };
+            match &mut row.state {
+                Attachment::Downloading(downloading) => {
+                    if downloading.attempt == ticket.attempt {
+                        downloading.interests -= 1;
+                        if downloading.interests == 0 {
+                            downloading.task.abort();
+                        }
+                    }
+                }
+                Attachment::Registered | Attachment::Resident(_) | Attachment::Evicted => (),
+            }
+        });
+    }
+
+    fn reset(&self, ticket: &Ticket) {
+        ticket.access.with_active(|key| {
+            let mut entries = self.entries.lock();
+            if let Some(row) = row_mut(&mut entries, key, ticket.id)
+                && row.state.is_attempt(ticket.attempt)
+            {
+                row.state = Attachment::Registered;
+            }
+        });
+    }
+
+    fn complete(&self, ticket: &Ticket, bytes: &[u8]) -> Fetched {
+        ticket
+            .access
+            .with_active(|key| {
+                let mut entries = self.entries.lock();
+                let mut retention = self.retention.lock();
+                Self::expire(
+                    &mut entries,
+                    &mut retention,
+                    self.idle_timeout,
+                    Instant::now(),
+                );
+                let row = row_mut(&mut entries, key, ticket.id).ok_or(AssetFailure::Unknown)?;
+                if !row.state.is_attempt(ticket.attempt) {
+                    return Err(AssetFailure::Unavailable);
+                }
+                Self::admit_locked(&mut entries, &mut retention, key, ticket.id, bytes)
+                    .map_err(AssetFailure::Storage)
+            })
+            .unwrap_or(Err(AssetFailure::Unknown))
+    }
+}
+
+impl Attachment {
+    const fn is_attempt(&self, attempt: u64) -> bool {
+        match self {
+            Self::Downloading(downloading) => downloading.attempt == attempt,
+            Self::Registered | Self::Resident(_) | Self::Evicted => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum AssetFailure {
     Storage(dekopon_model::asset::BlobError),
     Unknown,
-    Unreadable {
-        reason: &'static str,
-        refusal: ChatAssetRefusal,
-    },
-    TooLarge {
-        size: u64,
-    },
+    Unreadable { reason: &'static str },
+    TooLarge { size: u64 },
     Unavailable,
-    Transport {
-        category: &'static str,
-    },
+    TimedOut,
+    Transport { category: &'static str },
 }
 
 impl AssetFailure {
@@ -766,7 +1077,7 @@ impl AssetFailure {
             Self::Unknown => format!(
                 "There is no chat-asset:{id} in this conversation. The reference lines in the messages above name the ones there are."
             ),
-            Self::Unreadable { reason, .. } => {
+            Self::Unreadable { reason } => {
                 format!("chat-asset:{id} cannot be opened: {reason}.")
             }
             Self::TooLarge { size } => format!(
@@ -775,6 +1086,7 @@ impl AssetFailure {
                 kibibytes(MAX_ASSET_BYTES)
             ),
             Self::Unavailable => format!("chat-asset:{id} cannot be opened."),
+            Self::TimedOut => format!("chat-asset:{id} could not be read (fetch-timeout)."),
             Self::Transport { category } => {
                 format!("chat-asset:{id} could not be read ({category}).")
             }
@@ -783,14 +1095,14 @@ impl AssetFailure {
 
     const fn for_capability(self) -> ChatAssetRefusal {
         match self {
-            Self::Unknown => ChatAssetRefusal::UnknownAsset,
-            Self::Unreadable { refusal, .. } => refusal,
-            Self::Storage(BlobError::Unknown) => ChatAssetRefusal::UnknownAsset,
+            Self::Unknown | Self::Storage(BlobError::Unknown) => ChatAssetRefusal::UnknownAsset,
+            Self::Unreadable { .. } => ChatAssetRefusal::UnsupportedMedia,
             Self::Storage(BlobError::Reclaimed) => ChatAssetRefusal::Reclaimed,
             Self::Storage(BlobError::Unauthorized) => ChatAssetRefusal::Unauthorized,
             Self::Storage(_)
             | Self::TooLarge { .. }
             | Self::Transport { .. }
+            | Self::TimedOut
             | Self::Unavailable => ChatAssetRefusal::Unavailable,
         }
     }
@@ -808,8 +1120,8 @@ struct Retention {
     budget: usize,
     bytes: usize,
     clock: u64,
-    resident: HashMap<RetentionKey, Resident>,
     released: VecDeque<RetentionKey>,
+    orphans: Vec<DiskBlob>,
 }
 impl Retention {
     fn new(budget: usize) -> Self {
@@ -817,8 +1129,8 @@ impl Retention {
             budget,
             bytes: 0,
             clock: 0,
-            resident: HashMap::new(),
             released: VecDeque::new(),
+            orphans: Vec::new(),
         }
     }
     fn miss(&self, id: u64, bytes: usize, reason: &'static str) {
@@ -837,82 +1149,66 @@ impl Retention {
         }
         Ok(())
     }
-    fn evict(&mut self, key: &RetentionKey) {
-        match self.remove(key) {
-            Ok(()) | Err(BlobError::Reclaimed | BlobError::Capacity) => (),
-            Err(error) => {
-                tracing::warn!(asset.id = key.1, %error, "could not reclaim evicted asset")
-            }
-        }
-    }
-    fn remove(&mut self, key: &RetentionKey) -> Result<(), BlobError> {
-        if let Some(entry) = self.resident.get(key) {
-            entry.data.reclaim()?;
-        }
-        if let Some(entry) = self.resident.remove(key) {
-            self.bytes -= entry.data.len().max(1);
-            drop(entry);
-            self.released.push_back(key.clone());
-            while self.released.len() > MAX_RELEASE_TOMBSTONES {
-                self.released.pop_front();
-            }
-        }
-        Ok(())
-    }
-    fn admit(&mut self, key: RetentionKey, bytes: &[u8]) -> Result<DiskBlob, BlobError> {
-        if bytes.len() > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
-            return Err(BlobError::TooLarge);
-        }
-        self.admit_with(key, bytes.len(), || DiskBlob::from_bytes(bytes))
-    }
-    fn admit_with(
-        &mut self,
-        key: RetentionKey,
-        len: usize,
-        create: impl FnOnce() -> Result<DiskBlob, BlobError>,
-    ) -> Result<DiskBlob, BlobError> {
-        // If two reads of the same attachment finish downloading back to back, the second keeps the
-        // first copy instead of charging the byte budget twice.
-        if let Some(entry) = self.resident.get_mut(&key) {
-            self.clock += 1;
-            entry.used = self.clock;
-            return Ok(entry.data.clone());
-        }
-        self.check_size(key.1, len)?;
-        let charge = len.max(1);
-        let needed = (self.bytes + charge).saturating_sub(self.budget);
-        let mut candidates: Vec<_> = self
-            .resident
-            .iter()
-            .filter(|(_, entry)| !entry.data.is_pinned())
-            .map(|(key, entry)| (key.clone(), entry.used, entry.data.len().max(1)))
-            .collect();
-        candidates.sort_by_key(|(_, used, _)| *used);
-        if candidates.iter().map(|(_, _, bytes)| *bytes).sum::<usize>() < needed {
-            self.miss(key.1, len, "all-pinned");
-            return Err(BlobError::Capacity);
-        }
-        for (old, _, _) in candidates {
-            if self.bytes + charge <= self.budget {
-                break;
-            }
-            self.remove(&old)?;
-        }
-        // Capacity is reserved under this mutex before the one file creation, so no staging file
-        // can escape the configured budget, and a failed construction never increments accounting.
-        let data = create().inspect_err(|_error| {
-            self.miss(key.1, len, "storage");
-        })?;
-        self.bytes += charge;
+    fn charge(&mut self, data: DiskBlob) -> Resident {
+        self.bytes += data.len().max(1);
         self.clock += 1;
-        self.resident.insert(
-            key,
-            Resident {
-                data: data.clone(),
-                used: self.clock,
-            },
-        );
-        Ok(data)
+        Resident {
+            data,
+            used: self.clock,
+        }
+    }
+    fn tombstone(&mut self, key: RetentionKey) {
+        self.released.push_back(key);
+        while self.released.len() > MAX_RELEASE_TOMBSTONES {
+            self.released.pop_front();
+        }
+    }
+    fn evict(&mut self, key: RetentionKey, row: &mut Row) -> Result<(), BlobError> {
+        match std::mem::replace(&mut row.state, Attachment::Evicted) {
+            Attachment::Resident(resident) => {
+                if let Err(error) = resident.data.reclaim() {
+                    row.state = Attachment::Resident(resident);
+                    return Err(error);
+                }
+                self.bytes -= resident.data.len().max(1);
+                self.tombstone(key);
+                Ok(())
+            }
+            other @ (Attachment::Registered | Attachment::Downloading(_) | Attachment::Evicted) => {
+                row.state = other;
+                Ok(())
+            }
+        }
+    }
+    fn release_all(&mut self, key: &AssetStateKey, rows: impl IntoIterator<Item = Row>) {
+        for row in rows {
+            match row.state {
+                Attachment::Resident(resident) => {
+                    self.tombstone((key.clone(), row.asset.id));
+                    self.retire(row.asset.id, resident.data);
+                }
+                Attachment::Downloading(downloading) => downloading.task.abort(),
+                Attachment::Registered | Attachment::Evicted => (),
+            }
+        }
+    }
+    fn retire(&mut self, id: u64, data: DiskBlob) {
+        match data.reclaim() {
+            Ok(()) => self.bytes -= data.len().max(1),
+            Err(BlobError::Capacity) => self.orphans.push(data),
+            Err(error) => {
+                tracing::warn!(asset.id = id, %error, "could not reclaim evicted asset");
+                self.orphans.push(data);
+            }
+        }
+    }
+    fn sweep(&mut self) {
+        for data in std::mem::take(&mut self.orphans) {
+            match data.reclaim() {
+                Ok(()) => self.bytes -= data.len().max(1),
+                Err(_) => self.orphans.push(data),
+            }
+        }
     }
 }
 
@@ -931,19 +1227,20 @@ impl AssetStore {
         &self,
         access: &AssetAccess,
         id: u64,
-        touch: bool,
+        recency: Recency,
     ) -> Result<Option<DiskBlob>, BlobError> {
         access
             .with_active(|key| {
                 let mut entries = self.entries.lock();
-                Self::expire(&mut entries, self.idle_timeout, Instant::now());
-                let asset = entries
-                    .get(key)
-                    .and_then(|entry| entry.assets.iter().find(|asset| asset.id == id));
                 let mut retention = self.retention.lock();
-                let cache_key = (key.clone(), id);
-                let Some(asset) = asset else {
-                    let reclaimed = retention.released.contains(&cache_key);
+                Self::expire(
+                    &mut entries,
+                    &mut retention,
+                    self.idle_timeout,
+                    Instant::now(),
+                );
+                let Some(row) = row_mut(&mut entries, key, id) else {
+                    let reclaimed = retention.released.contains(&(key.clone(), id));
                     retention.miss(id, 0, if reclaimed { "reclaimed" } else { "unknown" });
                     return Err(if reclaimed {
                         BlobError::Reclaimed
@@ -951,21 +1248,26 @@ impl AssetStore {
                         BlobError::Unknown
                     });
                 };
-                if touch {
-                    retention.clock += 1;
-                }
-                let clock = retention.clock;
-                if let Some(resident) = retention.resident.get_mut(&cache_key) {
-                    if touch {
-                        resident.used = clock;
+                match &mut row.state {
+                    Attachment::Resident(resident) => {
+                        match recency {
+                            Recency::Touch => {
+                                retention.clock += 1;
+                                resident.used = retention.clock;
+                            }
+                            Recency::Keep => (),
+                        }
+                        Ok(Some(resident.data.clone()))
                     }
-                    return Ok(Some(resident.data.clone()));
-                }
-                if asset.fetched {
-                    retention.miss(id, asset.size.unwrap_or_default() as usize, "reclaimed");
-                    Err(BlobError::Reclaimed)
-                } else {
-                    Ok(None)
+                    Attachment::Registered | Attachment::Downloading(_) => Ok(None),
+                    Attachment::Evicted => {
+                        retention.miss(
+                            id,
+                            row.asset.size.unwrap_or_default() as usize,
+                            "reclaimed",
+                        );
+                        Err(BlobError::Reclaimed)
+                    }
                 }
             })
             .unwrap_or_else(|| {
@@ -973,43 +1275,101 @@ impl AssetStore {
                 Err(BlobError::Unauthorized)
             })
     }
+    #[cfg(test)]
     fn admit(&self, access: &AssetAccess, id: u64, bytes: &[u8]) -> Result<DiskBlob, BlobError> {
         access
             .with_active(|key| {
                 let mut entries = self.entries.lock();
                 let mut retention = self.retention.lock();
-                // The completed download is recorded before any fallible size, cleanup, or
-                // admission check, since a successfully downloaded input must never silently be
-                // fetched twice.
-                let asset = entries
-                    .get_mut(key)
-                    .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
-                    .ok_or(BlobError::Unauthorized)?;
-                asset.fetched = true;
-                asset.size = Some(bytes.len() as u64);
-                retention.check_size(id, bytes.len())?;
-                Self::expire(&mut entries, self.idle_timeout, Instant::now());
-                let stale: Vec<_> = retention
-                    .resident
-                    .iter()
-                    .filter(|((key, id), resident)| {
-                        !resident.data.is_pinned()
-                            && !entries.get(key).is_some_and(|entry| {
-                                entry.assets.iter().any(|asset| asset.id == *id)
-                            })
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in stale {
-                    retention.remove(&key)?;
-                }
-                entries
-                    .get(key)
-                    .and_then(|entry| entry.assets.iter().find(|asset| asset.id == id))
-                    .ok_or(BlobError::Unauthorized)?;
-                retention.admit((key.clone(), id), bytes)
+                Self::expire(
+                    &mut entries,
+                    &mut retention,
+                    self.idle_timeout,
+                    Instant::now(),
+                );
+                Self::admit_locked(&mut entries, &mut retention, key, id, bytes)
             })
             .unwrap_or(Err(BlobError::Unauthorized))
+    }
+    fn admit_locked(
+        entries: &mut HashMap<AssetStateKey, ConversationAssets>,
+        retention: &mut Retention,
+        key: &AssetStateKey,
+        id: u64,
+        bytes: &[u8],
+    ) -> Result<DiskBlob, BlobError> {
+        let row = row_mut(entries, key, id).ok_or(BlobError::Unauthorized)?;
+        match &mut row.state {
+            Attachment::Resident(resident) => {
+                retention.clock += 1;
+                resident.used = retention.clock;
+                return Ok(resident.data.clone());
+            }
+            Attachment::Registered | Attachment::Downloading(_) | Attachment::Evicted => (),
+        }
+        // The completed download is recorded before any fallible size, cleanup, or admission
+        // check, since a successfully downloaded input must never silently be fetched twice.
+        row.asset.size = Some(bytes.len() as u64);
+        row.state = Attachment::Evicted;
+        if bytes.len() > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
+            return Err(BlobError::TooLarge);
+        }
+        Self::reserve(entries, retention, id, bytes.len())?;
+        // Capacity is reserved under this mutex before the one file creation, so no staging file
+        // can escape the configured budget, and a failed construction never increments accounting.
+        let data = DiskBlob::from_bytes(bytes).inspect_err(|_error| {
+            retention.miss(id, bytes.len(), "storage");
+        })?;
+        let resident = retention.charge(data.clone());
+        if let Some(row) = row_mut(entries, key, id) {
+            row.state = Attachment::Resident(resident);
+        }
+        Ok(data)
+    }
+    fn reserve(
+        entries: &mut HashMap<AssetStateKey, ConversationAssets>,
+        retention: &mut Retention,
+        id: u64,
+        len: usize,
+    ) -> Result<(), BlobError> {
+        retention.check_size(id, len)?;
+        retention.sweep();
+        let charge = len.max(1);
+        let needed = (retention.bytes + charge).saturating_sub(retention.budget);
+        if needed == 0 {
+            return Ok(());
+        }
+        let mut candidates: Vec<_> = entries
+            .iter()
+            .flat_map(|(key, entry)| {
+                entry.assets.iter().filter_map(move |row| match &row.state {
+                    Attachment::Resident(resident) => (!resident.data.is_pinned()).then(|| {
+                        (
+                            (key.clone(), row.asset.id),
+                            resident.used,
+                            resident.data.len().max(1),
+                        )
+                    }),
+                    Attachment::Registered | Attachment::Downloading(_) | Attachment::Evicted => {
+                        None
+                    }
+                })
+            })
+            .collect();
+        candidates.sort_by_key(|(_, used, _)| *used);
+        if candidates.iter().map(|(_, _, bytes)| *bytes).sum::<usize>() < needed {
+            retention.miss(id, len, "all-pinned");
+            return Err(BlobError::Capacity);
+        }
+        for (old, _, _) in candidates {
+            if retention.bytes + charge <= retention.budget {
+                break;
+            }
+            if let Some(row) = row_mut(entries, &old.0, old.1) {
+                retention.evict(old, row)?;
+            }
+        }
+        Ok(())
     }
 }
 struct ScopedBlob {
@@ -1020,7 +1380,7 @@ struct ScopedBlob {
 impl BlobSource for ScopedBlob {
     fn pin(&self) -> Result<DiskBlob, BlobError> {
         let store = self.store.upgrade().ok_or(BlobError::Reclaimed)?;
-        match store.pin(&self.access, self.id, true) {
+        match store.pin(&self.access, self.id, Recency::Touch) {
             Ok(Some(data)) => Ok(data),
             Ok(None) | Err(BlobError::Unknown) => Err(BlobError::Reclaimed),
             Err(error) => Err(error),
@@ -1063,21 +1423,20 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             let mut entries = self.store.entries.lock();
             let mut retention = self.store.retention.lock();
             let id = self.access.allocate_id(&self.store.next_one_shot_id);
-            let data = retention.admit_with((key.clone(), id), len, || Ok(data))?;
-            drop(data);
-            let entry = entries.entry(key.clone()).or_insert_with(|| ConversationAssets {
-                assets: Vec::new(), touched: Instant::now(), fence: self.access.weak_fence(), delivery_failed: false,
+            AssetStore::reserve(&mut entries, &mut retention, id, len)?;
+            let resident = retention.charge(data);
+            let now = Instant::now();
+            let entry = entries.entry(key.clone()).or_insert_with(|| ConversationAssets::new(self.access.weak_fence(), now));
+            entry.touched = now;
+            entry.assets.push(Row {
+                asset: AssetRef { id, name: format!("asset-{id}"), mime: metadata.content_type.clone(), size: Some(metadata.bytes),
+                    source: Some(AssetSourceRef::Generated { capability: capability.to_owned(), invocation: invocation.to_owned() }),
+                    arrived: SystemTime::now(), encoding: metadata.encoding, sent: false,
+                },
+                state: Attachment::Resident(resident),
             });
-            entry.touched = Instant::now();
-            entry.assets.push(AssetRef { id, name: format!("asset-{id}"), mime: metadata.content_type.clone(), size: Some(metadata.bytes),
-                source: Some(AssetSourceRef::Generated { capability: capability.to_owned(), invocation: invocation.to_owned() }),
-                arrived: SystemTime::now(), fetched: true, encoding: metadata.encoding, sent: false,
-            });
-            while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
-                let evicted = entry.assets.remove(0);
-                retention.evict(&(key.clone(), evicted.id));
-            }
-            AssetStore::enforce_ceiling(&mut entries, self.store.conversations);
+            AssetStore::trim(entry, &mut retention, key);
+            AssetStore::enforce_ceiling(&mut entries, &mut retention, self.store.conversations);
             if let Some(detected) = detected && detected != metadata.content_type {
                 let label: String = metadata.content_type.chars().filter(|c| !c.is_control()).take(128).collect();
                 tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.content_type_mismatch", asset.id = id, asset.content_type = label, asset.detected_type = detected, asset.bytes = metadata.bytes, asset.sha256 = metadata.sha256 }, "declared asset label differs from decoded prefix");
@@ -1093,13 +1452,14 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 let index = entry
                     .assets
                     .iter()
-                    .position(|asset| asset.id == id)
+                    .position(|row| row.asset.id == id)
                     .ok_or(BlobError::Unknown)?;
-                if entry.assets[index].sent {
+                if entry.assets[index].asset.sent {
                     return Err(BlobError::Unauthorized);
                 }
-                self.store.retention.lock().remove(&(key.clone(), id))?;
-                entry.assets.remove(index);
+                let mut retention = self.store.retention.lock();
+                retention.evict((key.clone(), id), &mut entry.assets[index])?;
+                retention.release_all(key, [entry.assets.remove(index)]);
                 Ok(())
             })
             .unwrap_or(Err(BlobError::Unauthorized))
@@ -1108,27 +1468,23 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
         self.access
             .with_active(|key| {
                 let mut entries = self.store.entries.lock();
-                let asset = entries
-                    .get_mut(key)
-                    .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
-                    .ok_or(BlobError::Unknown)?;
-                if asset.sent {
+                let row = row_mut(&mut entries, key, id).ok_or(BlobError::Unknown)?;
+                if row.asset.sent {
                     return Ok(None);
                 }
                 // Mark an asset sent once, even if its retained file becomes unavailable; never
                 // retry the send implicitly.
-                asset.sent = true;
-                let retention = self.store.retention.lock();
-                let data = retention
-                    .resident
-                    .get(&(key.clone(), id))
-                    .ok_or(BlobError::Reclaimed)?
-                    .data
-                    .clone();
+                row.asset.sent = true;
+                let data = match &row.state {
+                    Attachment::Resident(resident) => resident.data.clone(),
+                    Attachment::Registered | Attachment::Downloading(_) | Attachment::Evicted => {
+                        return Err(BlobError::Reclaimed);
+                    }
+                };
                 Ok(Some(GeneratedImage::new(
                     data,
-                    asset.mime.clone(),
-                    asset.encoding,
+                    row.asset.mime.clone(),
+                    row.asset.encoding,
                 )))
             })
             .unwrap_or(Err(BlobError::Unauthorized))
@@ -1205,6 +1561,10 @@ fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str
 }
 
 #[cfg(test)]
+#[path = "tests/asset_resolve.rs"]
+mod resolve_tests;
+
+#[cfg(test)]
 mod retention_tests {
     use super::*;
 
@@ -1248,6 +1608,32 @@ mod retention_tests {
             )
             .arrived[0]
     }
+    fn input(session: &SessionAssets, id: u64) -> Result<DiskBlob, ChatAssetRefusal> {
+        Handle::current()
+            .block_on(session.resolve_input(id))
+            .map(|resolved| resolved.blob)
+    }
+    fn residents(store: &AssetStore) -> usize {
+        let entries = store.entries.lock();
+        let resident = entries
+            .values()
+            .flat_map(|entry| &entry.assets)
+            .filter(|row| match row.state {
+                Attachment::Resident(_) => true,
+                Attachment::Registered | Attachment::Downloading(_) | Attachment::Evicted => false,
+            })
+            .count();
+        resident + store.retention.lock().orphans.len()
+    }
+    fn reclaim(store: &AssetStore, access: &AssetAccess, id: u64) {
+        let mut entries = store.entries.lock();
+        let row = row_mut(&mut entries, &access.key, id).unwrap();
+        store
+            .retention
+            .lock()
+            .evict((access.key.clone(), id), row)
+            .unwrap();
+    }
     fn store(budget: usize) -> Arc<AssetStore> {
         Arc::new(AssetStore::with_retention(
             8,
@@ -1269,9 +1655,9 @@ mod retention_tests {
         }
     }
 
-    struct FetchScript {
-        calls: std::sync::atomic::AtomicUsize,
-        last: Mutex<Vec<dekopon_model::model::ModelMessage>>,
+    pub(super) struct FetchScript {
+        pub(super) calls: std::sync::atomic::AtomicUsize,
+        pub(super) last: Mutex<Vec<dekopon_model::model::ModelMessage>>,
     }
 
     impl dekopon_model::model::ChatModel for FetchScript {
@@ -1310,7 +1696,7 @@ mod retention_tests {
         }
     }
 
-    struct NoScripts;
+    pub(super) struct NoScripts;
 
     impl dekopon_agent::prompt::ScriptRuntime for NoScripts {
         fn run_script(&self, _: &str) -> dekopon_shell::ScriptOutcome {
@@ -1551,13 +1937,16 @@ mod retention_tests {
         let b = register(&store, &access);
         drop(store.admit(&access, a, b"aaa").unwrap());
         drop(store.admit(&access, b, b"bbb").unwrap());
-        drop(store.pin(&access, a, true).unwrap());
+        drop(store.pin(&access, a, Recency::Touch).unwrap());
         assert_eq!(store.get_inventory(&access).len(), 2);
         let c = register(&store, &access);
         drop(store.admit(&access, c, b"ccc").unwrap());
-        assert!(store.pin(&access, a, false).unwrap().is_some());
-        assert_eq!(store.pin(&access, b, true), Err(BlobError::Reclaimed));
-        assert!(store.pin(&access, c, false).unwrap().is_some());
+        assert!(store.pin(&access, a, Recency::Keep).unwrap().is_some());
+        assert_eq!(
+            store.pin(&access, b, Recency::Touch),
+            Err(BlobError::Reclaimed)
+        );
+        assert!(store.pin(&access, c, Recency::Keep).unwrap().is_some());
         assert_eq!(store.retention.lock().bytes, 6);
     }
 
@@ -1588,9 +1977,8 @@ mod retention_tests {
                 MAX_ASSETS_PER_CONVERSATION
             );
             assert!(store.get_access(&access, first, Instant::now()).is_none());
-            let retained = store.retention.lock();
-            assert_eq!(retained.resident.len(), usize::from(pinned));
-            assert_eq!(retained.bytes, if pinned { 3 } else { 0 });
+            assert_eq!(residents(&store), usize::from(pinned));
+            assert_eq!(store.retention.lock().bytes, if pinned { 3 } else { 0 });
             if let Some(pin) = pin {
                 assert_eq!(pin.read().unwrap(), b"aaa");
             }
@@ -1613,14 +2001,11 @@ mod retention_tests {
                 if first.is_none() {
                     first = Some(id);
                     if pinned {
-                        pin = store.pin(&access, id, false).unwrap();
+                        pin = store.pin(&access, id, Recency::Keep).unwrap();
                     }
                 }
             }
-            assert_eq!(
-                store.retention.lock().resident.len(),
-                MAX_ASSETS_PER_CONVERSATION
-            );
+            assert_eq!(residents(&store), MAX_ASSETS_PER_CONVERSATION);
             let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
             session
                 .register(fd, &metadata, "asset.attach", "invocation")
@@ -1631,10 +2016,9 @@ mod retention_tests {
                     .get_access(&access, first.unwrap(), Instant::now())
                     .is_none()
             );
-            let retained = store.retention.lock();
             let expected = MAX_ASSETS_PER_CONVERSATION + usize::from(pinned);
-            assert_eq!(retained.resident.len(), expected);
-            assert_eq!(retained.bytes, 3 * expected);
+            assert_eq!(residents(&store), expected);
+            assert_eq!(store.retention.lock().bytes, 3 * expected);
             if let Some(pin) = pin {
                 assert_eq!(pin.read().unwrap(), b"abc");
             }
@@ -1689,7 +2073,10 @@ mod retention_tests {
         drop(pin);
         drop(store.admit(&second, b, b"bbb").unwrap());
         assert_eq!(store.retention.lock().bytes, 3);
-        assert_eq!(store.pin(&second, a + 10, true), Err(BlobError::Unknown));
+        assert_eq!(
+            store.pin(&second, a + 10, Recency::Touch),
+            Err(BlobError::Unknown)
+        );
     }
 
     #[test]
@@ -1700,10 +2087,10 @@ mod retention_tests {
             let id = register(&store, &access);
             drop(store.admit(&access, id, b"x").unwrap());
         }
+        assert_eq!(residents(&store), 1);
         let cache = store.retention.lock();
         assert_eq!(cache.released.len(), MAX_RELEASE_TOMBSTONES);
         assert_eq!(cache.bytes, 1);
-        assert_eq!(cache.resident.len(), 1);
     }
 
     #[test]
@@ -1730,9 +2117,8 @@ mod retention_tests {
             store.admit(&access, id, b"aaa"),
             Err(BlobError::Io(_))
         ));
-        let cache = store.retention.lock();
-        assert_eq!(cache.bytes, 0);
-        assert!(cache.resident.is_empty());
+        assert_eq!(store.retention.lock().bytes, 0);
+        assert_eq!(residents(&store), 0);
     }
 
     #[test]
@@ -1833,17 +2219,13 @@ mod retention_tests {
         assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
         tokio::task::spawn_blocking(move || {
             let id = registered.arrived[0];
-            let (_, blob) = session.fetch_for_capability(id).unwrap();
+            let blob = input(&session, id).unwrap();
             assert_eq!(blob.len(), 3);
             assert_eq!(session.rows()[0].bytes, Some(3));
             drop(blob);
-            store
-                .retention
-                .lock()
-                .remove(&(access.key.clone(), id))
-                .unwrap();
+            reclaim(&store, &access, id);
             assert_eq!(
-                session.fetch_for_capability(id).unwrap_err(),
+                input(&session, id).unwrap_err(),
                 ChatAssetRefusal::Reclaimed
             );
             assert_eq!(session.rows()[0].bytes, Some(3));
@@ -1853,13 +2235,9 @@ mod retention_tests {
             assert_eq!(empty.len(), 0);
             assert_eq!(session.rows()[1].bytes, Some(0));
             drop(empty);
-            store
-                .retention
-                .lock()
-                .remove(&(access.key.clone(), empty_id))
-                .unwrap();
+            reclaim(&store, &access, empty_id);
             assert_eq!(
-                session.fetch_for_capability(empty_id).unwrap_err(),
+                input(&session, empty_id).unwrap_err(),
                 ChatAssetRefusal::Reclaimed
             );
             assert_eq!(session.rows()[1].bytes, Some(0));
@@ -1910,14 +2288,13 @@ mod retention_tests {
                 );
                 assert!(second.contains("No automatic refetch"), "{second}");
                 assert_eq!(
-                    session.fetch_for_capability(id).unwrap_err(),
+                    input(&session, id).unwrap_err(),
                     ChatAssetRefusal::Reclaimed
                 );
                 assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
                 assert_eq!(session.rows()[0].bytes, Some(3));
-                let cache = store.retention.lock();
-                assert_eq!(cache.bytes, 0);
-                assert!(cache.resident.is_empty());
+                assert_eq!(store.retention.lock().bytes, 0);
+                assert_eq!(residents(&store), 0);
             })
             .await
             .unwrap();
@@ -1947,7 +2324,7 @@ mod retention_tests {
                 );
             }
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
-            assert!(store.pin(&access, id, false).unwrap().is_none());
+            assert!(store.pin(&access, id, Recency::Keep).unwrap().is_none());
         })
         .await
         .unwrap();
@@ -2042,28 +2419,22 @@ mod retention_tests {
         tokio::task::spawn_blocking(move || {
             let weak = session.fetch(a).unwrap();
             assert_eq!(weak.data.read().unwrap(), b"aaa");
-            assert_eq!(
-                session.fetch_for_capability(a).unwrap().1.read().unwrap(),
-                b"aaa"
-            );
+            assert_eq!(input(&session, a).unwrap().read().unwrap(), b"aaa");
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
             let b = register(&store, &access);
             drop(store.admit(&access, b, b"bbb").unwrap());
             assert_eq!(weak.data.read(), Err(BlobError::Reclaimed));
             assert!(session.fetch(a).unwrap_err().contains("released"));
-            assert_eq!(
-                session.fetch_for_capability(a).unwrap_err(),
-                ChatAssetRefusal::Reclaimed
-            );
+            assert_eq!(input(&session, a).unwrap_err(), ChatAssetRefusal::Reclaimed);
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
             let inputs = ChatAssetInputs::new(Arc::new(session));
-            let input = json!([format!("chat-asset:{b}"), format!("chat-asset:{a}")]);
-            let original = input.clone();
+            let proposal = json!([format!("chat-asset:{b}"), format!("chat-asset:{a}")]);
+            let original = proposal.clone();
             assert!(matches!(
-                inputs.prepare(&input, 4),
+                Handle::current().block_on(inputs.prepare(&proposal, 4)),
                 Err(ChatAssetRefusal::Reclaimed)
             ));
-            assert_eq!(input, original, "no partial edit reaches submission");
+            assert_eq!(proposal, original, "no partial edit reaches submission");
         })
         .await
         .unwrap();
@@ -2110,10 +2481,7 @@ mod retention_tests {
         tokio::time::advance(ASSET_FETCH_TIMEOUT).await;
         assert_eq!(
             fetch.await.unwrap().unwrap_err(),
-            AssetFailure::Transport {
-                category: "fetch-timeout"
-            }
-            .for_model(id)
+            AssetFailure::TimedOut.for_model(id)
         );
     }
 
@@ -2196,7 +2564,13 @@ mod retention_tests {
         assert_eq!(id, 1);
         assert!(session.offers_fetch());
         assert_eq!(
-            session.fetch_for_capability(id).unwrap().1.read().unwrap(),
+            session
+                .resolve_input(id)
+                .await
+                .unwrap()
+                .blob
+                .read()
+                .unwrap(),
             png
         );
         assert!(
@@ -2268,7 +2642,7 @@ mod retention_tests {
         }
         assert_eq!(store.retention.lock().bytes, 5 * encoded.len());
         let inputs = ChatAssetInputs::new(Arc::<SessionAssets>::clone(&session));
-        let (assets, pins) = inputs.prepare(&json!(references), 4).unwrap();
+        let (assets, pins) = inputs.prepare(&json!(references), 4).await.unwrap();
         assert_eq!(assets.descriptors.len(), 5);
         assert_eq!(
             pins.iter().map(DiskBlob::len).sum::<usize>(),
@@ -2328,7 +2702,7 @@ mod retention_tests {
                 assert_eq!(after - before, usize::from(label != "image/png"));
                 assert_eq!(
                     GeneratedImage::new(
-                        session.fetch_for_capability(id).unwrap().1,
+                        session.resolve_input(id).await.unwrap().blob,
                         label.to_owned(),
                         encoding
                     )

@@ -8,7 +8,7 @@ use dekopon_core::{
 use dekopon_model::asset::{BlobError, DiskBlob};
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::{fmt, io::Read, os::fd::OwnedFd, sync::Arc};
+use std::{fmt, future::Future, io::Read, os::fd::OwnedFd, pin::Pin, sync::Arc};
 use thiserror::Error;
 
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
@@ -315,10 +315,16 @@ impl ChatAssetRefusal {
         self.to_string()
     }
 }
+pub struct ResolvedInput {
+    pub row: AssetRow,
+    pub blob: DiskBlob,
+}
+pub type ResolveFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ResolvedInput, ChatAssetRefusal>> + Send + 'a>>;
 pub trait ChatAssetSource: Send + Sync {
-    /// Fetching a released (reclaimed) asset refuses permanently rather than trying to redownload
+    /// Resolving a released (reclaimed) asset refuses permanently rather than trying to redownload
     /// it, since the underlying bytes are gone.
-    fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal>;
+    fn resolve_input(&self, id: u64) -> ResolveFuture<'_>;
     fn rows(&self) -> Vec<AssetRow>;
 }
 pub struct ChatAssetInputs {
@@ -328,7 +334,7 @@ impl ChatAssetInputs {
     pub fn new(source: Arc<dyn ChatAssetSource>) -> Self {
         Self { source }
     }
-    pub fn prepare(
+    pub async fn prepare(
         &self,
         input: &Value,
         sends_remaining: u8,
@@ -336,27 +342,19 @@ impl ChatAssetInputs {
         let references = references(input)?;
         let mut pins = Vec::with_capacity(references.len());
         let mut descriptors = Vec::with_capacity(references.len());
-        for id in &references {
-            let (_, blob) = self.source.fetch_for_capability(*id)?;
-            descriptors.push(blob.descriptor().map_err(ChatAssetRefusal::Storage)?);
-            pins.push(blob);
-        }
-        // Fetch may populate the inventory's stored lengths; take the table after pinning.
-        let rows = self.source.rows();
         let mut total = 0usize;
-        for (id, blob) in references.iter().zip(&pins) {
-            let row = rows
-                .iter()
-                .find(|row| row.id == *id)
-                .ok_or(ChatAssetRefusal::UnknownAsset)?;
-            let decoded = GeneratedImage::new(blob.clone(), row.content_type.clone(), row.encoding)
+        for id in references {
+            let ResolvedInput { row, blob } = self.source.resolve_input(id).await?;
+            let decoded = GeneratedImage::new(blob.clone(), row.content_type, row.encoding)
                 .decoded_len()
                 .map_err(ChatAssetRefusal::Storage)?;
             total = input_total(total, decoded)?;
+            descriptors.push(blob.descriptor().map_err(ChatAssetRefusal::Storage)?);
+            pins.push(blob);
         }
         Ok((
             InvokeAssets {
-                rows,
+                rows: self.source.rows(),
                 descriptors,
                 sends_remaining,
                 streams: None,
@@ -433,31 +431,38 @@ mod tests {
     struct Source {
         blobs: Vec<DiskBlob>,
     }
+    fn row(id: u64, blob: &DiskBlob) -> AssetRow {
+        AssetRow {
+            id,
+            content_type: "application/octet-stream".to_owned(),
+            encoding: AssetEncoding::Identity,
+            bytes: Some(blob.len() as u64),
+            origin: "chat".to_owned(),
+            sent: false,
+        }
+    }
     impl ChatAssetSource for Source {
-        fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal> {
-            self.blobs
+        fn resolve_input(&self, id: u64) -> ResolveFuture<'_> {
+            let resolved = self
+                .blobs
                 .get(id as usize - 1)
-                .cloned()
-                .map(|blob| ("application/octet-stream".to_owned(), blob))
-                .ok_or(ChatAssetRefusal::UnknownAsset)
+                .map(|blob| ResolvedInput {
+                    row: row(id, blob),
+                    blob: blob.clone(),
+                })
+                .ok_or(ChatAssetRefusal::UnknownAsset);
+            Box::pin(async move { resolved })
         }
         fn rows(&self) -> Vec<AssetRow> {
             self.blobs
                 .iter()
-                .enumerate()
-                .map(|(index, blob)| AssetRow {
-                    id: index as u64 + 1,
-                    content_type: "application/octet-stream".to_owned(),
-                    encoding: AssetEncoding::Identity,
-                    bytes: Some(blob.len() as u64),
-                    origin: "chat".to_owned(),
-                    sent: false,
-                })
+                .zip(1..)
+                .map(|(blob, id)| row(id, blob))
                 .collect()
         }
     }
-    #[test]
-    fn references_are_distinct_in_first_occurrence_order_and_never_expanded() {
+    #[tokio::test]
+    async fn references_are_distinct_in_first_occurrence_order_and_never_expanded() {
         let proposal = json!(["chat-asset:2", {"image":"chat-asset:1"}, "chat-asset:2"]);
         assert_eq!(references(&proposal), Ok(vec![2, 1]));
         let a = DiskBlob::from_bytes(b"first").unwrap();
@@ -471,7 +476,7 @@ mod tests {
         .unwrap();
         let inputs = ChatAssetInputs::new(Arc::new(Source { blobs: vec![a, b] }));
         for _ in 0..2 {
-            let (assets, pins) = inputs.prepare(&proposal, 3).unwrap();
+            let (assets, pins) = inputs.prepare(&proposal, 3).await.unwrap();
             assert_eq!(assets.rows.len(), 2);
             assert_eq!(assets.sends_remaining, 3);
             assert_eq!(pins.len(), 2);
@@ -497,8 +502,8 @@ mod tests {
         }
         assert_eq!(proposal[0], "chat-asset:2");
     }
-    #[test]
-    fn five_eight_mib_inputs_fit_and_a_sixth_reference_is_refused_before_fetch() {
+    #[tokio::test]
+    async fn five_eight_mib_inputs_fit_and_a_sixth_reference_is_refused_before_fetch() {
         let inputs = ChatAssetInputs::new(Arc::new(Source {
             blobs: (0..5)
                 .map(|_| DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES]).unwrap())
@@ -511,7 +516,7 @@ mod tests {
             "chat-asset:4",
             "chat-asset:5"
         ]);
-        let (assets, pins) = inputs.prepare(&proposal, 4).unwrap();
+        let (assets, pins) = inputs.prepare(&proposal, 4).await.unwrap();
         assert_eq!(assets.descriptors.len(), 5);
         assert_eq!(
             pins.iter().map(DiskBlob::len).sum::<usize>(),

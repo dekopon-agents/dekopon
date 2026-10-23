@@ -171,8 +171,9 @@ A whole right-hand side keeps its value rather than collapsing to text — `copy
 `${issue[title]}` work. Glued to anything else it is text again.
 
 Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index re-enters the tokenizer on the native
-stack, so nesting has a fixed ceiling and deep `${a:-${a:- ... }}` is a lex error rather than a
-crashed host process — the same bound the parser applies to `$( $( ... ) )`.
+stack, so parameter expansions have a fixed ceiling of 32 levels, counting the parser depth
+already reached through enclosing `$( )` substitutions and the compound commands around them.
+Deep or alternating `${ }` and `$( )` nesting is a syntax error rather than a crashed host process.
 
 ## The two streams
 
@@ -216,7 +217,7 @@ The shell has no clock. Reading the wall time from here would be ambient authori
 
 This is a native tree-walking evaluator, so there is no engine fuel meter to fall back on. Every bound is hand-built and configurable: a step budget, one run-time nesting depth of 32 shared by function calls, `$( )` substitutions, `${ }` expansions and compound commands (each recurses on the native stack, so a recursive function multiplies whatever its body nests), independent output byte and line ceilings with head-and-tail truncation, a wall-clock deadline re-read on every step and around every capability call, a capability-invocation ceiling kept separate from the step budget, and a shared ceiling on retained value bytes, refunded when their owners drop or replace them — the one that bounds a script which is cheap in steps and expensive in memory, such as doubling a string in a loop.
 
-Parsing has its own fixed nesting ceiling of 64 levels, applied before any budget exists, because the parser and the arithmetic evaluator are recursive and run on the native stack: deeply nested `$( $( ... ) )`, or a `$(( ))` whose operators nest deeper than that (`!!!…1`, or a `1+1+…` chain), is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
+Parsing has a fixed nesting ceiling of 64 levels, applied before any budget exists, with parameter expansions enforcing their 32-level ceiling against that same depth, because the parser and the arithmetic evaluator are recursive and run on the native stack: deeply nested `$( $( ... ) )`, or a `$(( ))` whose operators nest deeper than that (`!!!…1`, or a `1+1+…` chain), is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
 
 The variable namespace is seeded only from the script's own assignments; the host process environment is never read. `jq --arg NAME VALUE` binds a string (last value wins for repeated names); `--argjson` is unsupported. Jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
 

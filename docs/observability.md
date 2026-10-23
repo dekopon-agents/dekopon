@@ -575,7 +575,8 @@ produced it through the `gateway_session_failed` log event. Model errors use the
 model HTTP telemetry: `authentication`, `rate-limited`, `provider`, `transport`, `protocol`,
 `attachment`, `invalid-request`, `cancelled`, `deadline-exceeded`, and `over-budget`; in particular,
 a model timeout is `deadline-exceeded`, not `model`. Empty answers, step exhaustion and lost tasks
-are `empty-answer`, `max-steps`, and `session-task`. An over-budget refusal remains
+are `empty-answer`, `max-steps`, and `session-task`; a lost task also carries `failure` (`panicked`
+or `cancelled`), and a panic's message rides `error`. An over-budget refusal remains
 `gateway_session_refused` with category `over-budget`. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose

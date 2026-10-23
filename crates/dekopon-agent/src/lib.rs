@@ -464,7 +464,7 @@ impl BrokerLeg {
         self.identifiers.trace()
     }
 
-    fn prepare_assets(
+    async fn prepare_assets(
         &self,
         input: &Value,
     ) -> Result<
@@ -476,7 +476,7 @@ impl BrokerLeg {
     > {
         let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
         let prepared = match &self.asset_inputs {
-            Some(inputs) => inputs.prepare(input, remaining),
+            Some(inputs) => inputs.prepare(input, remaining).await,
             None => attachment::references(input).and_then(|ids| {
                 if ids.is_empty() {
                     Ok((
@@ -821,35 +821,8 @@ impl BrokerLeg {
         if !self.capabilities.contains_key(capability) {
             return CapabilityCallResult::NotFound;
         }
-        let (mut assets, asset_pins) = match self.prepare_assets(&input) {
-            Ok(input) => input,
-            // This refusal is permanent, the interpreter's non-retryable Denied rather than a
-            // retryable Failed, and produces no broker audit record since no proposal was ever
-            // submitted.
-            Err(refusal) => {
-                return CapabilityCallResult::Denied {
-                    reason: format!(
-                        "the gateway refused this call before it reached the broker: {}",
-                        refusal.note()
-                    ),
-                };
-            }
-        };
-        assets.streams = Some(dekopon_broker_protocol::Streams {
-            stdin: streams.stdin,
-            stdout: streams.stdout,
-        });
-        let request = InvocationRequest {
-            id: self.identifiers.next_invocation(),
-            capability: parsed,
-            trace_parent: self.identifiers.trace_parent(),
-            secret_use,
-            input,
-        };
-
         // Safe only because this runs on a spawn_blocking thread; calling block_on here from an
         // ordinary runtime worker would deadlock the executor.
-        let invocation = request.id.to_string();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         // A child script runs on its own scoped thread, never inside this future: its broker calls
         // re-enter `Handle::block_on`, which panics on a thread already inside one. Cancel drops this
@@ -857,23 +830,47 @@ impl BrokerLeg {
         let submitted = std::thread::scope(|scope| {
             self.runtime.block_on(async {
                 tokio::select! {
-                    result = self.client.invoke(
-                        self.attestation.clone(),
-                        request,
-                        assets,
-                        async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
-                    ) => Some(result),
+                    result = async {
+                        let (mut assets, _pins) = self.prepare_assets(&input).await?;
+                        assets.streams = Some(dekopon_broker_protocol::Streams {
+                            stdin: streams.stdin,
+                            stdout: streams.stdout,
+                        });
+                        let request = InvocationRequest {
+                            id: self.identifiers.next_invocation(),
+                            capability: parsed,
+                            trace_parent: self.identifiers.trace_parent(),
+                            secret_use,
+                            input,
+                        };
+                        let invocation = request.id.to_string();
+                        let outcome = self.client.invoke(
+                            self.attestation.clone(),
+                            request,
+                            assets,
+                            async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
+                        ).await;
+                        Ok::<_, ChatAssetRefusal>((outcome, invocation))
+                    } => Some(result),
                     () = wait_for_cancel(self.effective_cancel().watch()) => None,
                     () = tokio::time::sleep(tree.remaining()) => None,
                 }
             })
         });
-        drop(asset_pins);
         match submitted {
             None => CapabilityCallResult::Denied {
                 reason: "script-cancelled".to_owned(),
             },
-            Some(Ok(outcome)) => {
+            // This refusal is permanent, the interpreter's non-retryable Denied rather than a
+            // retryable Failed, and produces no broker audit record since no proposal was ever
+            // submitted.
+            Some(Err(refusal)) => CapabilityCallResult::Denied {
+                reason: format!(
+                    "the gateway refused this call before it reached the broker: {}",
+                    refusal.note()
+                ),
+            },
+            Some(Ok((Ok(outcome), invocation))) => {
                 let result = outcome.result;
                 match result.outcome {
                     InvocationOutcome::Succeeded => {
@@ -933,21 +930,25 @@ impl BrokerLeg {
                     },
                 }
             }
-            Some(Err(ClientError::Remote { code, message })) if code == ERROR_UNAUTHENTICATED => {
+            Some(Ok((Err(ClientError::Remote { code, message }), _)))
+                if code == ERROR_UNAUTHENTICATED =>
+            {
                 CapabilityCallResult::Denied { reason: message }
             }
             // A client-side timeout cannot tell whether the call ran, so it is treated as the one
             // non-retryable Denied status with an explicit refusal to resubmit, rather than a
             // Failed a model would retry.
-            Some(Err(error)) if error.may_have_executed() => CapabilityCallResult::Denied {
-                reason: format!(
-                    "the broker did not record an outcome for this invocation and it may already \
+            Some(Ok((Err(error), _))) if error.may_have_executed() => {
+                CapabilityCallResult::Denied {
+                    reason: format!(
+                        "the broker did not record an outcome for this invocation and it may already \
                      have taken effect; do not resubmit it ({error})"
-                ),
-            },
+                    ),
+                }
+            }
             // Every ClientError renders without the socket path, since this is the one path that
             // could otherwise leak DEKOPON_BROKER_SOCKET back into a script.
-            Some(Err(error)) => CapabilityCallResult::Failed {
+            Some(Ok((Err(error), _))) => CapabilityCallResult::Failed {
                 error: error.to_string(),
                 detail: None,
             },

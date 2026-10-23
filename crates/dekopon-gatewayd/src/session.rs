@@ -2276,14 +2276,19 @@ async fn session(
     })
     .await;
 
-    let (outcome, turn, images) = match result {
+    let (outcome, turn, images) = match result.map_err(TaskFailure::from) {
         Ok(session) => session,
-        Err(_) => {
+        Err(failure) => {
             if steers.seal() == Seal::Stopped {
                 return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
             }
             progress.seal();
-            tracing::error!(event = "gateway_session_failed", category = "session-task");
+            tracing::error!(
+                event = "gateway_session_failed",
+                category = "session-task",
+                failure = failure.category(),
+                error = %failure
+            );
             let terminal = if is_follow {
                 Terminal::Silent
             } else {
@@ -3194,5 +3199,37 @@ mod model_factory_tests {
             2,
             "one credential per auth file, not per model"
         );
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TaskFailure {
+    #[error("the session task panicked: {cause}")]
+    Panicked { cause: String },
+    #[error("the session task was cancelled")]
+    Cancelled,
+}
+
+impl TaskFailure {
+    const fn category(&self) -> &'static str {
+        match self {
+            Self::Panicked { .. } => "panicked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl From<tokio::task::JoinError> for TaskFailure {
+    fn from(error: tokio::task::JoinError) -> Self {
+        match error.try_into_panic() {
+            Ok(payload) => Self::Panicked {
+                cause: payload
+                    .downcast_ref::<&str>()
+                    .map(|cause| (*cause).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default(),
+            },
+            Err(_cancelled) => Self::Cancelled,
+        }
     }
 }
