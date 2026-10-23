@@ -761,7 +761,7 @@ impl ChatStream {
         let kind = fragment
             .kind
             .as_deref()
-            .map(|kind| if kind.is_empty() { "function" } else { kind })
+            .filter(|kind| !kind.is_empty())
             .unwrap_or(held_kind);
         let function = if kind == "function" {
             fragment
@@ -2433,6 +2433,20 @@ mod tests {
         assert_eq!(turn.tool_calls[0].kind, "function");
         assert_eq!(turn.tool_calls[0].function.name, "bash");
         assert_eq!(turn.tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn an_empty_tool_kind_continues_the_held_unknown_call() {
+        let stream = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"search","type":"web_search"}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"","function":{"arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        let turn = replay_transcript(DiagnosticSecrets::default(), &stream, &mut ignored)
+            .expect("an unknown tool continuation is skipped");
+
+        assert!(turn.tool_calls.is_empty());
     }
 
     #[test]

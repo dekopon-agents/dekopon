@@ -177,7 +177,8 @@ empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a co
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
-`dekopon-model` also emits debug `unknown_content_part_skipped` and `unknown_tool_item_skipped`, each carrying only a sanitized, model-supplied `kind`; the item is skipped.
+`dekopon-model` also emits debug `unknown_content_part_skipped` and `unknown_tool_item_skipped`, each
+carrying only a sanitized, model-supplied `kind`; the item is skipped.
 
 ## Provider linear-memory sizing
 
