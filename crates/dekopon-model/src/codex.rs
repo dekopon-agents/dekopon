@@ -399,8 +399,6 @@ struct WireItem<'a> {
     name: &'a str,
     #[serde(default)]
     arguments: &'a str,
-    #[serde(default)]
-    content: Option<Vec<Value>>,
 }
 enum WirePart<'a> {
     Reply(&'a str),
@@ -567,15 +565,7 @@ impl CodexReducer<'_> {
                 }
             }
             EventKind::ArgumentsDelta => {
-                let item_id = event
-                    .item_id
-                    .as_deref()
-                    .or_else(|| self.call_order.last().map(String::as_str))
-                    .ok_or_else(|| invalid_event("argument event without a call"))?;
-                let call = self
-                    .calls
-                    .get_mut(item_id)
-                    .ok_or_else(|| invalid_event("argument event for an unknown call"))?;
+                let call = self.argument_call(event.item_id.as_deref())?;
                 call.arguments.push_str(
                     event
                         .delta
@@ -584,15 +574,7 @@ impl CodexReducer<'_> {
                 );
             }
             EventKind::ArgumentsDone => {
-                let item_id = event
-                    .item_id
-                    .as_deref()
-                    .or_else(|| self.call_order.last().map(String::as_str))
-                    .ok_or_else(|| invalid_event("argument event without a call"))?;
-                let call = self
-                    .calls
-                    .get_mut(item_id)
-                    .ok_or_else(|| invalid_event("argument event for an unknown call"))?;
+                let call = self.argument_call(event.item_id.as_deref())?;
                 if let Some(arguments) = event.arguments.filter(|value| !value.is_empty()) {
                     call.arguments = arguments;
                 }
@@ -646,6 +628,15 @@ impl CodexReducer<'_> {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    fn argument_call(&mut self, item_id: Option<&str>) -> Result<&mut PendingCall, InferenceError> {
+        let item_id = item_id
+            .or_else(|| self.call_order.last().map(String::as_str))
+            .ok_or_else(|| invalid_event("argument event without a call"))?;
+        self.calls
+            .get_mut(item_id)
+            .ok_or_else(|| invalid_event("argument event for an unknown call"))
     }
 
     fn remember(&mut self, item: &WireItem<'_>) -> Result<(), InferenceError> {
@@ -703,7 +694,14 @@ impl CodexReducer<'_> {
                 if position.is_none() {
                     self.unattributed_deltas = false;
                 }
-                for part in item.content.iter().flatten() {
+                let parts = match value.get("content") {
+                    None | Some(Value::Null) => &[][..],
+                    Some(content) => content
+                        .as_array()
+                        .ok_or_else(|| invalid_event("message content must be an array"))?
+                        .as_slice(),
+                };
+                for part in parts {
                     match WirePart::parse(part)? {
                         WirePart::Reply(text) => {
                             if !streamed {
@@ -1087,12 +1085,16 @@ mod tests {
 
     #[test]
     fn message_snapshots_only_supply_text_for_messages_without_deltas() {
-        for streamed in [false, true] {
+        for (delta, expected) in [
+            (None, "firstsecond"),
+            (Some(("m1", "first")), "firstsecond"),
+            (Some(("m2", "second")), "secondfirst"),
+        ] {
             let mut reducer = CodexReducer::default();
-            if streamed {
+            if let Some((id, text)) = delta {
                 let _flow = reducer
                     .apply(
-                        r#"{"type":"response.output_text.delta","item_id":"m1","delta":"first"}"#,
+                        &serde_json::json!({"type":"response.output_text.delta","item_id":id,"delta":text}).to_string(),
                         &mut |_| ControlFlow::Continue(()),
                     )
                     .unwrap();
@@ -1114,7 +1116,7 @@ mod tests {
                     .unwrap()
                     .content
                     .as_deref(),
-                Some("firstsecond")
+                Some(expected)
             );
         }
     }

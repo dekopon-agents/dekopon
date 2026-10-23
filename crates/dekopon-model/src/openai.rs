@@ -753,17 +753,16 @@ impl ChatStream {
         secrets: DiagnosticSecrets<'_>,
     ) -> Result<(), InferenceError> {
         let index = fragment.index.unwrap_or(0);
+        let existing = self.latest.get(&index).copied();
+        let held_kind = existing
+            .map(|position| self.calls[position].kind.as_str())
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("function");
         let kind = fragment
             .kind
             .as_deref()
-            .filter(|kind| !kind.is_empty())
-            .or_else(|| {
-                self.latest
-                    .get(&index)
-                    .map(|position| self.calls[*position].kind.as_str())
-            })
-            .filter(|kind| !kind.is_empty())
-            .unwrap_or("function");
+            .map(|kind| if kind.is_empty() { "function" } else { kind })
+            .unwrap_or(held_kind);
         let function = if kind == "function" {
             fragment
                 .function
@@ -777,10 +776,15 @@ impl ChatStream {
         let name = function.name.filter(|name| !name.is_empty());
         let arguments = function.arguments.unwrap_or_default();
 
-        let slot = match self.latest.get(&index).copied() {
+        let slot = match existing {
             // Ollama reports every parallel call at index 0, so a fragment naming a function when
             // that index already has one starts a new call rather than continuing it.
-            Some(position) if name.is_some() && !self.calls[position].name.is_empty() => None,
+            Some(position)
+                if kind != held_kind
+                    || (name.is_some() && !self.calls[position].name.is_empty()) =>
+            {
+                None
+            }
             other => other,
         };
         let Some(position) = slot else {
@@ -2411,6 +2415,24 @@ mod tests {
             vec!["text:Checking", "text: now."],
             "an event carries a fragment of the answer or a counter, and nothing else"
         );
+    }
+
+    #[test]
+    fn a_different_tool_kind_at_a_reused_index_preserves_the_function_call() {
+        let stream = frames(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"search","type":"web_search","function":17}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        let turn = replay_transcript(DiagnosticSecrets::default(), &stream, &mut ignored)
+            .expect("a streamed turn");
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id.as_str(), "call_1");
+        assert_eq!(turn.tool_calls[0].kind, "function");
+        assert_eq!(turn.tool_calls[0].function.name, "bash");
+        assert_eq!(turn.tool_calls[0].function.arguments, "{}");
     }
 
     #[test]

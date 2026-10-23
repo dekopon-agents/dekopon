@@ -177,6 +177,7 @@ empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a co
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
+`dekopon-model` also emits debug `unknown_content_part_skipped` and `unknown_tool_item_skipped`, each carrying only a sanitized, model-supplied `kind`; the item is skipped.
 
 ## Provider linear-memory sizing
 
@@ -220,7 +221,6 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `unknown_content_part_skipped` (debug `event`) | `dekopon-model` | sanitized `kind` of an unknown or untyped Responses message content part; the part is skipped |
 | `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (once per session, for an unknown tool or a malformed `bash` call) — never the model's own tool name or arguments |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |

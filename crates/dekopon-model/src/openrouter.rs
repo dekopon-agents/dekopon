@@ -700,6 +700,7 @@ fn merge_tool(
         .ok_or_else(|| protocol("tool fragment must be an object", secrets))?;
     let kind = object
         .get("type")
+        .filter(|value| !value.is_null())
         .or_else(|| target.get("type"))
         .and_then(Value::as_str)
         .unwrap_or("function");
