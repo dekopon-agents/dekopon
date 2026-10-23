@@ -794,9 +794,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-agent"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "async-trait",
  "dekopon-broker-host",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-host"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-broker-protocol"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-brokerd"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-capability"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-config"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-core",
  "dekopon-protocol",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-gatewayd"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-http-host"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model-proxy"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "arc-swap",
  "axum",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-model-token-governor"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-core",
  "dekopon-test-support",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-policy"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "cedar-policy",
  "dekopon-capability",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-process"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-protocol"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "clap",
  "dekopon-capability",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk-testkit"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "axum",
  "clap",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-shell"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-storage-host"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-capability",
  "dekopon-core",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-telemetry"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "async-trait",
  "opentelemetry",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-test-support"
-version = "0.50.3"
+version = "0.50.4"
 dependencies = [
  "dekopon-agent",
  "dekopon-broker-protocol",
@@ -1509,7 +1509,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2986,7 +2986,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3273,7 +3273,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3721,7 +3721,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3828,9 +3828,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -4723,7 +4723,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -7,6 +7,27 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.4] - 2026-10-23
+
+### Changed
+
+- The per-conversation mailbox holds 100 steers and follow-ups (was eight); model interrupts per run stay capped at eight.
+
+### Fixed
+
+- A steer that arrived as a turn finished, or during its last allowed step, is no longer stranded; leftover steers run before newer queued input (#657).
+- Messages folded into an in-flight steer are no longer replayed as fresh platform history on the next turn (#656).
+- A cold chat asset used as a provider input from a nested script no longer panics the session with "there is no reactor running".
+- An expired or dropped conversation row releases its retained file at once, so a later admission no longer evicts a live attachment in its place (#658).
+- A second completion for an already-retained attachment keeps the stored length and charges the retention budget once (#659).
+- A generated base64 image fetched by the model spends its decoded length, the same budget as an identity copy (#660).
+
+## [dekopon-chart-0.37.4] - 2026-10-23
+
+### Changed
+
+- Chart 0.37.4 targets core v0.50.4 and renders the `v0.50.4` image tag.
+
 ## [0.50.3] - 2026-10-23
 
 ### Fixed
