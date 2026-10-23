@@ -1,8 +1,8 @@
 # Dekopon Helm chart
 
-Chart `0.37.4` targets application `v0.50.4`.
+Chart `0.37.5` targets application `v0.50.5`.
 With empty `image.tag` and `image.digest`, the chart renders
-`ghcr.io/dekopon-agents/dekopon:v0.50.4`; a set `image.digest` wins over the tag.
+`ghcr.io/dekopon-agents/dekopon:v0.50.5`; a set `image.digest` wins over the tag.
 With `broker.providerSet.enabled: true`, the chart runs `dekopon-brokerd provider precompile`
 after file preparation and before broker startup, using the broker image, UID, provider-set
 subPath and resource limits. The image must be v0.32.0 or later; earlier images lack the command.
