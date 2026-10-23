@@ -6,10 +6,13 @@ published to `oci://ghcr.io/dekopon-agents/charts/dekopon` and consumed from Arg
 path, not by Git path; both GHCR packages are public. See
 [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
 
-**Nothing here has been applied to a cluster.** Every claim below about rendered YAML, file
-ownership, and file modes was verified against `helm template` and the CI render checks, never
-against a live Kubernetes API server. Treat the manifests as reviewed rather than field-proven:
-[What is not proven](#what-is-not-proven).
+The reference deployment is
+[rpi-homelab at `034c61cc`](https://github.com/xrl/rpi-homelab/blob/034c61cc27d0c22cededcbd4072eeb0a4b3fe5d7/apps/dekopon.yaml),
+which declares chart **0.37.4** and a digest-pinned **0.50.4 optimized-Wasmtime** image.
+Its [rollout PR](https://github.com/xrl/rpi-homelab/pull/291) records the previous 0.50.3 deployment
+as Synced/Healthy; its 0.50.4 post-sync checks are gates, not recorded results. Git configuration,
+rendered manifests and recorded rollout evidence are distinct from independently observed runtime
+state. See [verification limits](#what-is-not-proven).
 
 Read [the broker configuration reference](../crates/dekopon-brokerd/README.md) and
 [the gateway configuration reference](gatewayd.md) first. The chart places files and sets
@@ -46,12 +49,12 @@ and its chat/model credentials. The chart supplies file placement and permission
 references define their contents. [ChatGPT subscription credentials](#the-chatgpt-credential-is-seeded-once)
 and [managed provider sets](#the-managed-provider-set-comes-from-the-claim) have additional preparation steps.
 
-From the registry, using **chart version `0.21.1`**, not application version `0.32.0`:
+From the registry, using **chart version `0.37.4`**, not application version `0.50.4`:
 
 ```console
-helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.21.1
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.37.4
 helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
-  --version 0.21.1 -n dekopon --create-namespace -f my-values.yaml
+  --version 0.37.4 -n dekopon --create-namespace -f my-values.yaml
 ```
 
 `helm` itself takes the `oci://` prefix here — that is the Helm CLI's own registry syntax and it is
@@ -534,7 +537,8 @@ refuses any ancestor that is group- or world-writable without the sticky bit, an
 recursive: no other subdirectory of the claim is touched, the gateway's credential directory keeps
 its own `65533`, and the blobs the sync step wrote are already `65532`. Precompile mounts only the
 provider-set subPath, runs with the broker UID and resource limits, and uses the broker image; pin an
-image that includes `provider precompile` (v0.32.0 or later; the chart's default is v0.32.0).
+image that includes `provider precompile` (v0.32.0 or later; see `appVersion` in
+[Chart.yaml](../charts/dekopon/Chart.yaml) for the current default).
 
 Off by default. A release that leaves `broker.providerSet.enabled` false renders exactly what it
 rendered before, and a release that enables it must also stop naming `providers` in its
@@ -719,7 +723,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.33.0
+ghcr.io/dekopon-agents/dekopon:v0.50.4
 ```
 
 There is no `latest`. `image.digest` is empty by default; set it to pin across the
@@ -770,7 +774,8 @@ a private package fails confusingly — an anonymous pull of a private GHCR pack
 
 ## Consuming it from ArgoCD
 
-Verified against the target cluster, which runs **ArgoCD v3.3.6** on k3s v1.36.3:
+The chart source form below was documented against **ArgoCD v3.3.6** on k3s v1.36.3.
+The pinned homelab Application above uses this registry source alongside its Git configuration source:
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -783,7 +788,7 @@ spec:
   source:
     repoURL: ghcr.io/dekopon-agents/charts   # bare: no oci:// prefix on this source type
     chart: dekopon
-    targetRevision: 0.19.0                    # the CHART version, not appVersion
+    targetRevision: 0.37.4                    # the CHART version, not appVersion
     helm:
       valueFiles: []
       values: |
@@ -954,9 +959,14 @@ The chart's default `broker.config.inline` is the cli-probe example from the bro
 moved onto these paths: a real deny-by-default configuration that starts, loads the baked
 `cli-probe-provider.wasm`, and maps the pod's probe UID without granting an executable capability. It is
 there so you can install the chart and watch a broker become ready before you give it anything that
-matters. Replace it. Its `serverLimits` is all-or-nothing: when present every field is required.
-`brokerLimits` and `hostLimits` instead default each field independently. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
-model endpoint, and an agent catalog, and the chart can invent none of them.
+matters. Replace it. `serverLimits`, `brokerLimits` and `hostLimits` default each field independently;
+an omitted `serverLimits.maxFrameBytes` is derived from the configured payload bounds with a 2 MiB
+floor. The default inline example explicitly sets a 2 MiB ceiling; increase or omit that field when
+raising payload bounds. See the
+[broker configuration contract](../crates/dekopon-brokerd/README.md#configuration).
+`gateway.enabled` is `false` by default because a gateway needs transport configuration, a model
+endpoint, an agent catalog and any credentials those integrations require; the chart supplies none
+of those choices.
 
 Two annotation maps ship, and they are not interchangeable:
 
@@ -977,23 +987,26 @@ keeps the Service endpoint unavailable when the configuration and chart port dis
 
 ## What is not proven
 
-- No `kubectl apply` has happened. The chart has been linted, rendered, and schema-validated
+The reference deployment above establishes declared configuration and a dated rollout report, not
+a fresh verification of every feature or this release. The following local/CI checks are recorded
+by this guide; they were not rerun as part of the 2026-10-23 documentation review.
+
+- Local render evidence is not a cluster apply. The chart has been linted, rendered, and schema-validated
   with `kubeconform` against Kubernetes 1.29, 1.33 and 1.36, and the init container's rendered
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
   `securityContext` against a fixture built to match a projected volume's symlink layout.
-- The complete provider/model deployment has not been started from this configuration. The
+- Local fixtures do not prove the complete current provider/model deployment. The
   real-daemon Linux `ipc_process.rs` suite proves mapped/unmapped cross-UID connections and
   server pin/live-peer refusals. `charts/dekopon/ci/verify-init-permissions.sh` executes actual rendered init
   commands, checks mounts/identities, and runs distinct-UID OS processes against that layout;
   its Python socket fixture is not a real daemon, and its config-check step runs the
   `dekopon-brokerd` the same CI run built, on the image's runtime base, not a published image. The image an empty `image.tag`
   resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every application
-  release — but nothing here has watched one boot.
-- **The pull path is unproven.** No anonymous `helm pull` and no ArgoCD sync has run against the
-  registry path.
-- The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
-  against the running v3.3.6, but no `Application` has been created — the real one lands in a
-  separate rpi-homelab change.
+  release — but those local checks alone do not observe a pod boot.
+- The reference Application and its registry registration now exist in rpi-homelab. The recorded
+  previous Synced/Healthy rollout supersedes the original claim that no Application had been
+  created; this documentation review did not independently run an anonymous `helm pull`, inspect
+  ArgoCD or verify the current imageID.
 - The ChatGPT seed-once behaviour is proven against the rendered init container across a cold
   start, a simulated rotation, two restart shapes, and the gated re-seed — including a negative
   control confirming that removing the `[ -e ]` test does revert the credential — for both the
@@ -1003,12 +1016,13 @@ keeps the Service endpoint unavailable when the configuration and chart port dis
   token through it. What was exercised is the file-level contract (`0600`, one link, a `0700`
   writable directory, temp sibling plus rename) as each family's own daemon UID — `65533` for the
   gateway's, `65532` for the broker's — not a live refresh against OpenAI.
-- The provider-sync hook Job has not run in a cluster. Its rendered init and sync commands have run
-  in Docker under their rendered users and capabilities, against a fresh root-owned `0777` volume and
+- No current provider-sync hook completion was independently observed in this review. Its recorded
+  rendered init and sync checks ran in Docker under their rendered users and capabilities, against a fresh root-owned `0777` volume and
   a `65532`-owned `0700` claim root, mounted by `subPath` as the Job mounts it: the sync fetched every
   provider, and a second run fetched nothing.
-- The config-check hook Job has not run in a cluster. Both checks have run on the deployment's
-  real configuration outside one, and `--probe` against OpenRouter itself.
+- No current config-check hook completion was independently observed in this review. The guide
+  records checks on deployment configuration outside a cluster, including `--probe` against
+  OpenRouter; those historical checks do not prove current credentials or model availability.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
 
