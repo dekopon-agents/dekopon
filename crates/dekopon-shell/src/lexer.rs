@@ -202,8 +202,13 @@ impl LexError {
 /// ceiling, deeply nested expansions would abort the process instead of returning a lex error.
 const MAX_PARAMETER_NESTING: u32 = 32;
 
+#[cfg(test)]
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source, 0).run()
+    tokenize_at(source, 0)
+}
+
+pub(crate) fn tokenize_at(source: &str, depth: u32) -> Result<Vec<Token>, LexError> {
+    Lexer::new(source, depth).run()
 }
 
 fn tokenize_nested(source: &str, depth: u32, line: usize) -> Result<Vec<Token>, LexError> {
@@ -577,7 +582,7 @@ impl<'a> Lexer<'a> {
             // produce.
             body.pop();
             let parts = if specification.expand {
-                Self::interpolate_here_doc_body(&body, specification.line)?
+                Self::interpolate_here_doc_body(&body, specification.line, self.depth)?
             } else if body.is_empty() {
                 Vec::new()
             } else {
@@ -628,8 +633,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn interpolate_here_doc_body(body: &str, line: usize) -> Result<Vec<RawPart>, LexError> {
-        let mut lexer = Lexer::new(body, 0);
+    fn interpolate_here_doc_body(
+        body: &str,
+        line: usize,
+        depth: u32,
+    ) -> Result<Vec<RawPart>, LexError> {
+        let mut lexer = Lexer::new(body, depth);
         lexer.line = line + 1;
         lexer
             .read_interpolated(None, "unterminated here-document")
