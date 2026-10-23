@@ -582,7 +582,7 @@ impl PolicyEngine {
             PolicySet::new()
         } else {
             PolicySet::from_str(policy_text).map_err(|source| PolicyBuildError::Parse {
-                message: source.to_string(),
+                messages: source.iter().map(ToString::to_string).collect(),
             })?
         };
         if policies.num_of_templates() > 0 {
@@ -871,7 +871,7 @@ fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildErr
         renamed
             .add(policy.new_id(id))
             .map_err(|source| PolicyBuildError::Parse {
-                message: source.to_string(),
+                messages: vec![source.to_string()],
             })?;
     }
     Ok(renamed)
@@ -884,13 +884,13 @@ fn inspect_request_shapes(
     let mut invalid = Vec::new();
     for policy in policies.policies() {
         let est = policy.to_json().map_err(|source| PolicyBuildError::Parse {
-            message: source.to_string(),
+            messages: vec![source.to_string()],
         })?;
         if !references_request(&est) {
             ordinary
                 .add(policy.clone())
                 .map_err(|source| PolicyBuildError::Parse {
-                    message: source.to_string(),
+                    messages: vec![source.to_string()],
                 })?;
             continue;
         }
@@ -1247,8 +1247,8 @@ pub enum PolicyBuildError {
     PolicyTooLarge { length: usize, maximum: usize },
     #[error("policy set contains {count} policies; maximum is {maximum}")]
     TooManyPolicies { count: usize, maximum: usize },
-    #[error("policy source could not be parsed: {message}")]
-    Parse { message: String },
+    #[error("policy source could not be parsed: {}", messages.join("; "))]
+    Parse { messages: Vec<String> },
     #[error("policy templates are not supported; write static policies instead")]
     TemplateUnsupported,
     #[error("policy schema could not be generated: {message}")]

@@ -167,10 +167,10 @@ pub enum CapabilityProblem {
 impl CapabilityProblem {
     #[must_use]
     pub const fn is_unloaded_name(&self) -> bool {
-        matches!(
-            self,
-            Self::UnknownProvider { .. } | Self::UnknownCapability { .. }
-        )
+        match self {
+            Self::UnknownProvider { .. } => true,
+            Self::UnknownCapability { .. } | Self::MissingField { .. } => false,
+        }
     }
 }
 

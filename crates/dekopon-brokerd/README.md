@@ -53,8 +53,8 @@ warning naming what boot will require, and credential destination coverage and t
 not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
 (its lock and blobs, kept between checks), which fetches from the registry; a configuration naming
 provider paths loads them directly. `check` publishes validated managed components into its own
-`--store` cwasm cache through sync but loads without it, so each run compiles every provider. The
-peer-UID socket-parent check is runtime-only and skipped, and a configuration with no `identities`
+`--store` cwasm cache through sync, then prunes that cache to the current engine and the listed providers,
+but loads without it, so each run compiles every provider. The peer-UID socket-parent check is runtime-only and skipped, and a configuration with no `identities`
 (the chart renders them into `peers.yaml`) is a warning rather than a problem.
 
 ## Configuration
@@ -745,14 +745,14 @@ At decision time a capability with no constraint set is denied `unconstrained-ca
 Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
 
 `strict` (default `false`) decides whether startup *also* complains. Left alone, a policy naming a
-capability no loaded provider offers, and a constraint set naming one, are both warnings: the
-deployment starts, and each is logged as an `audit.event` so the mismatch is visible in traces. That
+capability no loaded provider offers, and a constraint block naming an unloaded provider, are both
+warnings: the deployment starts, and each is logged as an `audit.event` so the mismatch is visible in traces. That
 is what lets you ship policy for a provider you have not dropped in yet. Set `strict: true` for a
 deployment whose provider set is fixed, where a mismatch means someone made a mistake — then each of
 those warnings becomes a startup refusal.
 
-One thing is fatal in both modes: a policy naming a principal that no `identities` or
-`principals` entry declares. Principals come from this file rather than from a loaded
+A constraint block naming a capability its loaded provider does not declare is fatal in both modes, as is a policy naming
+a principal that no `identities` or `principals` entry declares. Principals come from this file rather than from a loaded
 component, so an undeclared one is always a typo.
 
 Bounds are startup-fixed: 1 MiB of source, 1024 policies, no templates, Cedar strict validation.
