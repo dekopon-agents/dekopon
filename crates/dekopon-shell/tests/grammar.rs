@@ -2543,6 +2543,16 @@ fn alternating_expansions_share_parse_depth_on_a_two_mib_stack() {
         body = format!("echo {}$({}){}", "${a:-".repeat(31), body, "}".repeat(31));
     }
     assert_eq!(on_a_two_mib_stack(&body).exit_code, ExitCode::SYNTAX);
+
+    let mut body = "echo hi".to_owned();
+    for level in 0..63 {
+        body = format!(
+            "echo $(cat <<E{level}\n{}$({body}){}\nE{level}\n)",
+            "${a:-".repeat(31),
+            "}".repeat(31)
+        );
+    }
+    assert_eq!(on_a_two_mib_stack(&body).exit_code, ExitCode::SYNTAX);
 }
 
 #[test]

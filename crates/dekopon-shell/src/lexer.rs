@@ -582,7 +582,7 @@ impl<'a> Lexer<'a> {
             // produce.
             body.pop();
             let parts = if specification.expand {
-                Self::interpolate_here_doc_body(&body, specification.line)?
+                Self::interpolate_here_doc_body(&body, specification.line, self.depth)?
             } else if body.is_empty() {
                 Vec::new()
             } else {
@@ -633,8 +633,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn interpolate_here_doc_body(body: &str, line: usize) -> Result<Vec<RawPart>, LexError> {
-        let mut lexer = Lexer::new(body, 0);
+    fn interpolate_here_doc_body(
+        body: &str,
+        line: usize,
+        depth: u32,
+    ) -> Result<Vec<RawPart>, LexError> {
+        let mut lexer = Lexer::new(body, depth);
         lexer.line = line + 1;
         lexer
             .read_interpolated(None, "unterminated here-document")

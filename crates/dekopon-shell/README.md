@@ -172,8 +172,8 @@ A whole right-hand side keeps its value rather than collapsing to text — `copy
 
 Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index re-enters the tokenizer on the native
 stack, so parameter expansions have a fixed ceiling of 32 levels, counting the parser depth
-already reached through `$( )` and compound commands. Deep or alternating `${ }` and `$( )`
-nesting is a syntax error rather than a crashed host process.
+already reached through enclosing `$( )` substitutions and the compound commands around them.
+Deep or alternating `${ }` and `$( )` nesting is a syntax error rather than a crashed host process.
 
 ## The two streams
 
