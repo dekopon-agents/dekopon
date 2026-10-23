@@ -263,10 +263,11 @@ struct Downloading {
     attempt: u64,
     task: AbortHandle,
     interests: usize,
-    outcome: watch::Receiver<Option<Fetched>>,
+    outcome: watch::Receiver<Option<Completion>>,
 }
 
 type Fetched = Result<DiskBlob, AssetFailure>;
+type Completion = Result<(), AssetFailure>;
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 
@@ -869,7 +870,7 @@ impl Attempt {
         source: AssetSourceRef,
         fetcher: Arc<dyn AssetFetcher>,
         permits: Arc<Semaphore>,
-    ) -> Fetched {
+    ) -> Completion {
         let _permit = permits
             .acquire()
             .await
@@ -910,14 +911,23 @@ impl Drop for Attempt {
 
 struct Waiter {
     ticket: Ticket,
-    outcome: watch::Receiver<Option<Fetched>>,
+    outcome: watch::Receiver<Option<Completion>>,
 }
 
 impl Waiter {
     async fn wait(mut self) -> Fetched {
-        match self.outcome.wait_for(Option::is_some).await {
-            Ok(fetched) => fetched.clone().unwrap_or(Err(AssetFailure::Unavailable)),
+        let completion = match self.outcome.wait_for(Option::is_some).await {
+            Ok(completion) => completion.unwrap_or(Err(AssetFailure::Unavailable)),
             Err(_closed) => Err(AssetFailure::Unavailable),
+        };
+        completion?;
+        let store = self.ticket.store.upgrade().ok_or(AssetFailure::Unknown)?;
+        match store.pin(&self.ticket.access, self.ticket.id, Recency::Keep) {
+            Ok(Some(data)) => Ok(data),
+            Ok(None) | Err(BlobError::Reclaimed) => {
+                Err(AssetFailure::Storage(BlobError::Reclaimed))
+            }
+            Err(error) => Err(AssetFailure::Storage(error)),
         }
     }
 }
@@ -972,11 +982,11 @@ impl AssetStore {
                         // Built on first poll: a runtime that drops the unpolled future inside
                         // `spawn_on` while `entries` is locked must not run `Attempt::drop`.
                         let task = Attempt(attempt_ticket);
-                        let fetched = task.download(source, fetcher, permits).await;
+                        let completion = task.download(source, fetcher, permits).await;
                         // The entry leaves Downloading before waiters wake, so a retry never joins
                         // a finished attempt.
                         task.reset();
-                        sender.send_replace(Some(fetched));
+                        sender.send_replace(Some(completion));
                     },
                     runtime,
                 );
@@ -1025,7 +1035,7 @@ impl AssetStore {
         });
     }
 
-    fn complete(&self, ticket: &Ticket, bytes: &[u8]) -> Fetched {
+    fn complete(&self, ticket: &Ticket, bytes: &[u8]) -> Completion {
         ticket
             .access
             .with_active(|key| {
@@ -1042,6 +1052,7 @@ impl AssetStore {
                     return Err(AssetFailure::Unavailable);
                 }
                 Self::admit_locked(&mut entries, &mut retention, key, ticket.id, bytes)
+                    .map(drop)
                     .map_err(AssetFailure::Storage)
             })
             .unwrap_or(Err(AssetFailure::Unknown))
@@ -2438,6 +2449,40 @@ mod retention_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_download_holds_no_pin_once_its_waiter_returns() {
+        let store = store(3);
+        let access = access("one");
+        let a = register(&store, &access);
+        let fetcher: Arc<dyn AssetFetcher> =
+            Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let source = AssetSourceRef::Telegram {
+            file_id: "file".into(),
+        };
+        let join = || match AssetStore::join(
+            &store,
+            &access,
+            a,
+            source.clone(),
+            Arc::clone(&fetcher),
+            &Handle::current(),
+        )
+        .unwrap()
+        {
+            Download::Pending(waiter) => waiter,
+            Download::Ready(_) => panic!("the download has not started"),
+        };
+        let first = join();
+        let second = join();
+        assert_eq!(first.wait().await.unwrap().read().unwrap(), b"aaa");
+        let b = register(&store, &access);
+        drop(store.admit(&access, b, b"bbb").unwrap());
+        assert!(matches!(
+            second.wait().await,
+            Err(AssetFailure::Storage(BlobError::Reclaimed))
+        ));
     }
 
     struct Stalled {
