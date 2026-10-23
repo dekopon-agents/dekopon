@@ -314,11 +314,14 @@ providerSettings:
 Provider settings do not authorize network access. An independent capability grant and its
 HTTP constraints still restrict destination, method, path, request count and credential use.
 
-Host, broker, and server limits have conservative defaults, including a 2 MiB frame ceiling, when
-their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a
-partial section keeps the absent-section value for everything it does not name — which is what lets
-a deployment set `maxTotalMemoryBytes` alone. `serverLimits` is all-or-nothing:
-when it is present every field is required. Unknown fields and unknown API versions are rejected.
+`hostLimits`, `brokerLimits`, and `serverLimits` default field by field: an omitted field keeps
+its default even when the section is present. For example, a deployment may set only
+`serverLimits.shutdownGraceMs` or `hostLimits.maxTotalMemoryBytes`.
+When `serverLimits.maxFrameBytes` is omitted, the loader derives it as the larger of the protocol's
+2 MiB floor and the largest configured host input, host output or chat-memory result bound plus
+response overhead. An explicit ceiling below the required response bound is rejected, not silently
+increased.
+Unknown fields and unknown API versions are rejected.
 
 Startup also requires aggregate provider metadata, every mapped peer's capability response, and the
 *widest* response any session could receive to fit the frame ceiling. That last bound is what

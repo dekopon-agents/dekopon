@@ -24,27 +24,27 @@ Homebrew 6 requires `brew trust` before loading a non-official tap. The
 [tap](https://github.com/dekopon-agents/homebrew-tap) is regenerated from each release's actual
 archives; it also supports Linux on ARM64 and x86-64.
 
-The 0.32.0 formula installs both executables and `BROKER.md` / `GATEWAY.md` under
+The formula installs both executables and `BROKER.md` / `GATEWAY.md` under
 `$(brew --prefix dekopon)/share/doc/dekopon/`. It installs no provider, starts neither daemon,
-generates no configuration, and defines no `brew services` service. The
-[local walkthrough](#run-a-read-only-local-session) below uses the *older 0.30.0 release* and its
-bundled provider; do not combine that component or configuration with 0.32.0.
+generates no configuration, and defines no `brew services` service. Check the installed version
+before choosing configuration and provider artifacts; Homebrew follows the tap rather than pinning
+the release used by the archive commands below.
 
 ### Prebuilt archives
 
-Each [GitHub release](https://github.com/dekopon-agents/dekopon/releases) carries three
-provenance-attested archives: macOS ARM64, Linux ARM64, and Linux x86-64. Each includes both
-daemons, licences, and broker/gateway reference documents in 0.32.0, with a
-`.sha256` sidecar beside each. This example selects 0.32.0 deliberately (run it only after publication):
+Release [0.50.4](https://github.com/dekopon-agents/dekopon/releases/tag/v0.50.4) provides standard
+archives for macOS ARM64, Linux ARM64, and Linux x86-64, plus separate optimized-Wasmtime Linux
+archives. Each standard archive includes both daemons, licences, and broker/gateway reference
+documents, with a `.sha256` sidecar. The Mac example selects the standard 0.50.4 archive:
 
 ```console
-gh release download v0.32.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.32.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.32.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.50.4 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.50.4-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.50.4-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.32.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.32.0-aarch64-apple-darwin.tar.gz
-export PATH="$PWD/dekopon-0.32.0-aarch64-apple-darwin:$PATH"
+  dekopon-0.50.4-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.50.4-aarch64-apple-darwin.tar.gz
+export PATH="$PWD/dekopon-0.50.4-aarch64-apple-darwin:$PATH"
 ```
 
 Use the configuration contracts and examples from the same tag as the binaries; a checkout of
@@ -73,189 +73,71 @@ also the MSRV (edition 2024):
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
+git checkout v0.50.4
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopon-gatewayd
 dekopon-brokerd --version
 dekopon-gatewayd --version
 ```
 
-That builds `main`. For a release build, check out its tag before the `cargo install` commands.
+That builds the selected release tag. Use `main` only when deliberately testing development code.
 The [development guide](development.md) owns source checks and provider-fixture builds.
 
-## Run a read-only local session
+## Prepare a local session
 
-This is a **same-user development setup**, with one explicitly granted public post-read capability.
-It does not isolate the gateway from the broker's files or process identity: another process under
-your UID can act as that peer. Do not add production credentials or external-write grants to this
-layout. Those require separate runtime UIDs and the
-[current local process boundary](security-model.md#current-local-process-boundary).
+Installing the executables is not a configured local deployment. Prepare these inputs using the
+contracts from the same release as the binaries:
 
-The configuration below uses the `capabilities` format supported by release **0.30.0**, not the
-retired `constraintSets` format. You need a running OpenAI-compatible model endpoint that supports
-tool calls, or the [ChatGPT subscription alternative](#use-a-chatgpt-subscription). The local
-endpoint in the example is not installed or started by Dekopon.
+- A compatible provider component or digest-pinned managed provider set, acquired separately.
+  Follow the [provider lifecycle](../crates/dekopon-brokerd/README.md#managed-provider-sets).
+  Neither the current formula nor the release archive supplies JSONPlaceholder. Do not copy a
+  provider from the old 0.30.0 bundle into a current installation or assume a test fixture is a
+  current starter component.
+- Broker configuration, an owner-authored Cedar policy and a principal mapping granting only the
+  intended read capability. The [broker reference](../crates/dekopon-brokerd/README.md#configuration)
+  owns file permissions, provider loading and limits.
+- An agent catalog and gateway configuration with a `local` transport, matching broker socket and
+  server UID, and a model endpoint supporting tool calls. The
+  [gateway reference](gatewayd.md#configuration) owns the schema; the
+  [local transport contract](gatewayd.md#local-development-transport) owns the JSON message format.
+  Dekopon does not install or start an inference server.
 
-### Prepare private files
+A same-user local experiment does not isolate the gateway from the broker's files or process
+identity. The local transport trusts its caller's declared subject; it does not authenticate a
+telephone identity. Keep this layout read-only and free of production provider credentials.
+External-write deployments require the [separate-UID process boundary](security-model.md#current-local-process-boundary).
+Relative file paths resolve against the configuration file's directory. Credential fields name
+references or environment variables, never values; see [secrets](secrets.md).
 
-Run these commands in one terminal. They create a dedicated directory outside the checkout. If it
-already contains a setup you want to keep, choose another directory before writing the files.
-
-```console
-umask 077
-mkdir -p "$HOME/.dekopon-demo/providers" "$HOME/.dekopon-demo/run"
-chmod 700 "$HOME/.dekopon-demo" "$HOME/.dekopon-demo/providers" "$HOME/.dekopon-demo/run"
-cd "$HOME/.dekopon-demo"
-DEMO_DIR=$(pwd -P)
-DEMO_UID=$(id -u)
-install -m 600 "$(brew --prefix dekopon)/share/dekopon/providers/jsonplaceholder-provider.wasm" \
-  "$DEMO_DIR/providers/jsonplaceholder-provider.wasm"
-```
-
-For an archive install, replace the `install` command's source with the extracted archive's
-`providers/jsonplaceholder-provider.wasm`. For a source build, fetch the exact fixture from that
-checkout with `ci/fetch-external-provider-components.sh examples/providers jsonplaceholder`, then
-copy it here. Copy the component rather than symlinking it: the broker requires a regular,
-single-link, broker-owned file and a broker-owned parent directory. `sudo` is not needed here.
-
-Create the broker configuration and Cedar policy:
-
-```console
-cat > broker.yaml <<EOF_BROKER
-apiVersion: dekopon.dev/brokerd/v1alpha1
-socketPath: "$DEMO_DIR/run/broker.sock"
-policiesPath: policies.cedar
-providers: [providers/jsonplaceholder-provider.wasm]
-identities:
-  - uid: $DEMO_UID
-    principal: dekopon-gatewayd
-    actor: {type: service, principal: dekopon-gatewayd}
-    attestor: {namespaces: [tel.16034700182]}
-principals:
-  local-user:
-    subjects: [tel.16034700182]
-capabilities:
-  jsonplaceholder:
-    capabilities:
-      jsonplaceholder.posts.get:
-        constraints:
-          timeoutMs: 10000
-          http:
-            allowedHosts: [jsonplaceholder.typicode.com]
-            allowedMethods: [GET]
-            maxRequests: 1
-            maxRequestBytes: 16384
-            maxResponseBytes: 262144
-EOF_BROKER
-# Provider output is bounded by hostLimits.maxOutputBytes in broker configuration.
-cat > policies.cedar <<'EOF_POLICY'
-@id("local-user-may-prompt-reader")
-permit(principal == Dekopon::Principal::"local-user",
-       action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"local-reader")
-when { context.via == "dekopon-gatewayd" };
-@id("local-reader-may-get-posts")
-permit(principal == Dekopon::Principal::"local-user",
-       action == Dekopon::Action::"jsonplaceholder.posts.get",
-       resource == Dekopon::Provider::"jsonplaceholder")
-when { context.via == "dekopon-gatewayd" && context.agent == "local-reader" };
-EOF_POLICY
-```
-
-The subject is a development fixture, not proof of a telephone identity. The owner-only local
-transport trusts the caller to declare it. The broker maps that exact subject and grants only
-`agent.prompt` and `jsonplaceholder.posts.get`; the provider's separate create capability is absent.
-
-Create an agent catalog and gateway configuration:
-
-```console
-cat > catalog.yaml <<'EOF_CATALOG'
-apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata: {name: local-reader}
-spec:
-  description: Read public JSONPlaceholder posts
-  enabled: true
-  instructions: Use placeholder posts get to answer questions about public posts.
-  modelClass: reasoning
-EOF_CATALOG
-cat > gateway.yaml <<EOF_GATEWAY
-apiVersion: dekopon.dev/gatewayd/v1alpha1
-catalogPath: catalog.yaml
-broker:
-  socketPath: "$DEMO_DIR/run/broker.sock"
-  serverUid: $DEMO_UID
-transports:
-  - name: dev
-    kind: local
-    socketPath: "$DEMO_DIR/run/chat.sock"
-models:
-  - name: local-model
-    kind: openaiCompatible
-    endpoint: http://127.0.0.1:11434/v1
-    model: replace-with-your-model
-    timeoutMs: 120000
-    classes: [reasoning]
-routes:
-  - transport: dev
-    conversation: {kind: [directMessage]}
-    agent: local-reader
-    limits: {maxSteps: 4, maxCapabilityCalls: 4}
-EOF_GATEWAY
-chmod 600 broker.yaml policies.cedar catalog.yaml gateway.yaml
-```
-
-Edit `gateway.yaml` to name the model your endpoint serves and its actual URL. No API key is needed
-when the local endpoint does not require one. If it does, set `apiKeyEnv` to the name of an
-environment variable available only to the gateway; never put the key in the YAML. Relative file
-paths resolve against the configuration file's directory. See the complete
-[broker configuration contract](../crates/dekopon-brokerd/README.md#configuration) and
-[gateway configuration contract](gatewayd.md#configuration) for other fields.
-
-### Check, start, and send a message
-
-Before starting either daemon:
+Once your configuration files exist, check them before serving:
 
 ```console
 dekopon-brokerd check "$HOME/.dekopon-demo/broker.yaml"
 dekopon-gatewayd check "$HOME/.dekopon-demo/gateway.yaml"
 ```
 
-These are preflight checks, not a connection test. They do not prove runtime socket permissions,
-model reachability, credentials, or a successful provider call. Start the broker in one terminal:
+These checks do not prove socket permissions, model reachability or successful provider calls.
+Start the broker first; after its startup completes, probe it before starting the gateway:
 
 ```console
 dekopon-brokerd --config "$HOME/.dekopon-demo/broker.yaml"
 ```
 
-In a second terminal, wait for its startup to finish, then probe it and start the gateway:
+In a second terminal:
 
 ```console
 dekopon-brokerd probe --socket "$HOME/.dekopon-demo/run/broker.sock"
 dekopon-gatewayd --config "$HOME/.dekopon-demo/gateway.yaml"
 ```
 
-A successful probe exits silently with status 0. It authenticates and lists capabilities; it
-invokes nothing. The gateway requires the broker to be serving before it starts.
+Use the socket path you configured in both files if it differs from the example. A successful
+probe authenticates and lists capabilities but invokes nothing. A real local message through the
+configured model and provider is a separate acceptance check. Stop the gateway before the broker;
+graceful shutdown does not roll back effects already sent to an endpoint.
 
-In a third terminal:
-
-```console
-nc -U "$HOME/.dekopon-demo/run/chat.sock"
-```
-
-Type one JSON line and press Return:
-
-```json
-{"subject":"tel.16034700182","text":"Use placeholder posts get --post-id 1 and summarize the post."}
-```
-
-The socket returns a JSON `reply` on the same connection. This request sends your prompt to the
-configured model, and the authorized provider read contacts `jsonplaceholder.typicode.com`.
-An unauthorized reply usually means the subject, agent, attestor, capability, or Cedar grant does
-not match; inspect both daemons' logs. For a provider failure, also check outbound HTTPS access.
-Stop the gateway with Ctrl-C before stopping the broker. Graceful shutdown drains rather than
-rolling back an effect. See [operations](operations.md) and the
-[local transport contract](gatewayd.md#local-development-transport).
+This page does not provide a verified end-to-end 0.50.4 Mac starter. The former 0.30.0 walkthrough
+relied on a bundled provider that current installs do not contain; replacing only its version
+numbers would not establish compatibility.
 
 ### Use a ChatGPT subscription
 
@@ -266,13 +148,13 @@ dekopon-gatewayd auth chatgpt login
 dekopon-gatewayd auth chatgpt status
 ```
 
-Replace the gateway's `models` list with:
+For a subscription-backed model, the gateway's `models` entry has this shape:
 
 ```yaml
 models:
   - name: subscription
     kind: chatgptSubscription
-    model: gpt-5-codex
+    model: replace-with-your-subscription-model
     timeoutMs: 120000
     classes: [reasoning]
 ```
@@ -290,8 +172,8 @@ rotation, and intentional export for a cluster.
   real authenticated subject and broker grant before replacing the local transport.
 - The [conditional writer](../examples/conditional-write/README.md) remains the credential-holding,
   conditional-write walkthrough. It requires a matching source checkout's `http-probe` fixture,
-  Slack setup, and your own API endpoint and token. The JSONPlaceholder component bundled with
-  the 0.30.0 Homebrew formula does not supply that example; formulas since 0.31.0 bundle no provider.
+  Slack setup, and your own API endpoint and token. It is not a credential-free Mac starter;
+  current formulas bundle no provider.
 - The [OpenObserve example](../examples/otel-traces/README.md) adds a receiver and a real-daemon smoke
   test. Telemetry is optional for local startup; without a receiver, audit lasts only as long as
   you retain stdout. Prompts and outputs can reach telemetry; secret bytes must not.
