@@ -695,9 +695,14 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   unpinned files are reclaimed before admission. Individually oversized assets are refused without
   evicting useful entries; insufficient unpinned space refuses clearly. Active provider requests and
   outbound delivery hold temporary pins charged to the same budget. Model messages hold weak
-  references, never residency ownership. Retired/expired inventories are pruned lazily; their files
-  are reclaimed on the next blocking admission, once active pins finish. Unlink failures retain
-  accounting rather than pretending disk space was freed.
+  references, never residency ownership. Retired/expired inventories are pruned lazily, at the next
+  store call; a dropped row reclaims its unpinned file in the same step, and a pinned one at the
+  first admission after its pins finish. Unlink failures retain accounting rather than pretending
+  disk space was freed.
+- **One download per attachment.** A cold attachment downloads in a store-owned task, at most two
+  at a time, under the 60-second fetch deadline. Model fetches and provider inputs that ask for the
+  same attachment share that download; when the last of them is cancelled, so is the download, and
+  the attachment can be requested again.
 - **Released is not unfetched.** A reclaimed asset is never silently downloaded again or substituted
   with an original input. Requested provider inputs are all resolved and pinned before submission;
   one missing input refuses the entire call. Historical model attachment parts become an explicit
