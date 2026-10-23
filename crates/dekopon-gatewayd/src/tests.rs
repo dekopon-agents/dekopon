@@ -12579,7 +12579,9 @@ async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlis
 
     let prepared = tokio::task::spawn_blocking(move || {
         let input = json!({"images": ["chat-asset:1"]});
-        let (assets, pins) = inputs.prepare(&input, 4).expect("one reference");
+        let (assets, pins) = tokio::runtime::Handle::current()
+            .block_on(inputs.prepare(&input, 4))
+            .expect("one reference");
         assert_eq!(assets.descriptors.len(), 1);
         assert_eq!(assets.rows[0].origin, "chat");
         assert_eq!(pins[0].read().unwrap(), b"\x89PNG\r\n\x1a\nshot");
@@ -16524,9 +16526,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
             tokio::runtime::Handle::current(),
             true,
         );
-        tokio::task::spawn_blocking(move || assert!(assets.fetch_for_capability(1).is_err()))
-            .await
-            .expect("scope check");
+        assert!(assets.resolve_input(1).await.is_err());
     }
     assert!(peer.requests.lock().is_empty());
     peer.finish().await;
