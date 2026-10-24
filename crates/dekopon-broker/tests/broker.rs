@@ -1853,12 +1853,20 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use dekopon_capability::InvocationOutcome::{Denied, Succeeded};
-    for (default_present, binding_present, grant_present, explicit, expected) in [
-        (false, true, true, false, Succeeded),
-        (true, true, true, false, Succeeded),
-        (true, true, false, false, Denied),
-        (true, false, true, false, Denied),
-        (true, true, true, true, Succeeded),
+    for (
+        default_present,
+        binding_present,
+        grant_present,
+        explicit,
+        capability_permitted,
+        expected,
+    ) in [
+        (false, true, true, false, true, Succeeded),
+        (true, true, true, false, true, Succeeded),
+        (true, true, false, false, true, Denied),
+        (true, false, true, false, true, Denied),
+        (true, true, true, true, true, Succeeded),
+        (true, true, true, false, false, Denied),
     ] {
         let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
         let authority = server.authority().to_owned();
@@ -1873,6 +1881,11 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
         )
         .await
         .unwrap();
+        let capability_policy = if capability_permitted {
+            http_policy("caller", "provider-test", "http-probe.fetch")
+        } else {
+            agent_prompt_policy("caller", "provider-test", GATEWAY)
+        };
         let mut set = set("http-probe", loopback_constraints(&authority));
         if default_present {
             set.default_secret_use = Some(DefaultSecretUse {
@@ -1887,10 +1900,7 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
         let broker = Broker::new(
             registry,
             principal("broker-test"),
-            http_probe_secret_engine(&format!(
-                "{}\n{secret_policy}",
-                http_policy("caller", "provider-test", "http-probe.fetch")
-            )),
+            http_probe_secret_engine(&format!("{capability_policy}\n{secret_policy}")),
             catalog([("http-probe.fetch", set)]),
             CredentialStore::empty(),
             callers(["caller"]),

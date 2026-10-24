@@ -2958,6 +2958,19 @@ where
                     .await
                     .map(ControlFlow::Break);
             }
+            // Before the decision: a denial still records the defaulted secret it refused.
+            if request.secret_use.is_none()
+                && let Some(default) = self
+                    .constraints
+                    .get(&request.capability)
+                    .and_then(|set| set.default_secret_use.as_ref())
+            {
+                request.secret_use = Some(match default.sink {
+                    DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
+                        secret: default.drn.clone(),
+                    },
+                });
+            }
             let AuthorizedInvocation {
                 mut set,
                 mut policy_ids,
@@ -2998,15 +3011,6 @@ where
                 }
             };
             authorize.record("policy.errors_present", errors_present);
-            if request.secret_use.is_none()
-                && let Some(default) = &set.default_secret_use
-            {
-                request.secret_use = Some(match default.sink {
-                    DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
-                        secret: default.drn.clone(),
-                    },
-                });
-            }
             if let Some(secret_use) = request.secret_use.as_ref() {
                 let Some(binding) = self
                     .secrets
@@ -4291,7 +4295,7 @@ struct PolicyEvaluation {
 
 pub struct AuthorizedInvocation {
     pub set: ConstraintSet,
-    pub policy_ids: Vec<String>,
+    policy_ids: Vec<String>,
     slots: ChatSlotValues,
     errors_present: bool,
 }

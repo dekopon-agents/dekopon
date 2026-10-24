@@ -4041,3 +4041,35 @@ async fn a_repeated_workflow_name_is_refused_rather_than_replacing_its_steps() {
         "{report:?}"
     );
 }
+
+#[tokio::test]
+async fn a_step_whose_capability_the_policy_does_not_permit_is_refused_as_grant() {
+    use super::workflows::{GrantRefusal, Refused};
+
+    let fixture = WorkflowFixture::new();
+    write_owner_only(
+        &fixture
+            .config
+            .parent()
+            .expect("fixture root")
+            .join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n    - {step: fetch, argv: [httpprobe, fetch, --uri, \"https://example.test/\"], capability: http-probe.fetch}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].step, "fetch");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Grant(GrantRefusal::Refused {
+                reason: "policy-denied",
+                ..
+            })
+        ),
+        "{refusals:?}"
+    );
+}
