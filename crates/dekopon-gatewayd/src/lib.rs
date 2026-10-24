@@ -747,16 +747,16 @@ fn spawn_tick(
     };
     let limits = routes
         .route_for_anchor(tick.anchor())
-        .map(|route| dekopon_shell::Limits {
+        .map(|route| dekopon_process::Limits {
             max_capability_calls: route.limits.max_capability_calls,
             timeout: route.script_timeout,
-            ..dekopon_shell::Limits::default()
+            ..dekopon_process::Limits::default()
         });
     let job_limits = routes.route_for_anchor(tick.anchor()).and_then(|route| {
-        route.job_timeout.map(|timeout| dekopon_shell::Limits {
+        route.job_timeout.map(|timeout| dekopon_process::Limits {
             max_capability_calls: route.limits.max_capability_calls,
             timeout,
-            ..dekopon_shell::Limits::default()
+            ..dekopon_process::Limits::default()
         })
     });
     let jobs = Arc::clone(&runner.jobs);

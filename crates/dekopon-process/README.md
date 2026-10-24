@@ -15,5 +15,8 @@ The agent's broker leg drives each command word's broker round trip in place.
 Stop or the script deadline drops a command word in flight, after which the script
 reads `session-cancelled`. A completed round trip is polled first and keeps its
 result. The same latch refuses capability calls proposed after Stop before any
-proposal exists. The broker remains the only authorizer; shell pipes, jobs, exit
-codes and limits remain in `dekopon-shell`.
+proposal exists. The broker remains the only authorizer.
+
+`dekopon-process` owns `TreeContext`, `CallBudget`, `RetainedBytes`, `Limits`,
+`LimitExceeded`, and the `DEFAULT_*` limit constants. Shell recursion budgets,
+output buffers, pipes, jobs and exit codes remain in `dekopon-shell`.

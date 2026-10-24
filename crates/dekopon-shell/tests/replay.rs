@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
 
+use dekopon_process::Limits;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter, Limits,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter,
 };
 use serde_json::{Value, json};
 
@@ -50,7 +51,7 @@ impl CapabilityInvoker for Replay {
         &self,
         proposal: CommandProposal,
         mut streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         if let Some(stdin) = streams.stdin.take() {
             let mut text = String::new();

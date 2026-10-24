@@ -17,9 +17,10 @@ use super::{CommandFailure, parse_flags};
 use crate::{
     CapabilityInvoker, ExitCode,
     jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
-    limits::{Budget, LimitExceeded},
+    limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
+use dekopon_process::LimitExceeded;
 
 /// env reads the host process environment and now reads the host wall clock; neither is reachable
 /// any other way in this crate, so both are excluded from the filter set.
@@ -44,7 +45,7 @@ pub(crate) struct Options {
 fn request_header(
     opts: &mut Options,
     budget: &Budget,
-) -> Result<(Vec<u8>, crate::RetainedBytes), CommandFailure> {
+) -> Result<(Vec<u8>, dekopon_process::RetainedBytes), CommandFailure> {
     let header = serde_json::to_vec(&(&opts.filter, opts.slurp, &opts.bindings))
         .map_err(|error| CommandFailure::failed(format!("jq: worker request: {error}")))?;
     let charge = budget.charge_value_bytes(header.len() as u64)?;
@@ -264,7 +265,7 @@ fn evaluate(
     std::thread::scope(|scope| {
         let mut input_budget = budget.fork();
         let writer = scope.spawn(
-            move || -> Result<Vec<crate::RetainedBytes>, CommandFailure> {
+            move || -> Result<Vec<dekopon_process::RetainedBytes>, CommandFailure> {
                 let mut stdin = io::BufWriter::new(stdin);
                 stdin.write_all(&header).map_err(input_error)?;
                 stdin.write_all(b"\n").map_err(input_error)?;
@@ -381,7 +382,7 @@ struct PipeSource<'a> {
     pending: Vec<u8>,
     offset: usize,
     failure: Option<LimitExceeded>,
-    charged: Option<crate::RetainedBytes>,
+    charged: Option<dekopon_process::RetainedBytes>,
 }
 
 impl<'a> PipeSource<'a> {
@@ -684,9 +685,9 @@ mod tests {
         let limit = expected.len() + 1;
         assert!(binding_bytes > 1);
         assert!(expected.len() + binding_bytes > limit);
-        let budget = Budget::start(crate::Limits {
+        let budget = Budget::start(dekopon_process::Limits {
             max_value_bytes: limit as u64,
-            ..crate::Limits::default()
+            ..dekopon_process::Limits::default()
         });
         let (header, charge) =
             request_header(&mut opts, &budget).expect("one retained header fits");
@@ -703,9 +704,9 @@ mod tests {
     #[test]
     fn slurp_refuses_an_oversized_document_before_finishing_its_parse() {
         let mut input = PipeReader::from_bytes(format!("\"{}\"", "x".repeat(100_000)).into_bytes());
-        let mut budget = Budget::start(crate::Limits {
+        let mut budget = Budget::start(dekopon_process::Limits {
             max_value_bytes: 64,
-            ..crate::Limits::default()
+            ..dekopon_process::Limits::default()
         });
         let invoker = crate::builtins::test_support::NoCapabilities;
         let mut source = PipeSource::new(&mut input, &mut budget, &invoker);
@@ -731,7 +732,7 @@ mod tests {
             .send(ReadOutput::Value(Value::from("retained")))
             .unwrap();
         sender.send(ReadOutput::Done).unwrap();
-        let mut budget = Budget::start(crate::Limits::default());
+        let mut budget = Budget::start(dekopon_process::Limits::default());
         let mut output = Vec::new();
         collect(
             &receiver,

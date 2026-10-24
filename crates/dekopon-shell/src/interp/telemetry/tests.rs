@@ -12,9 +12,8 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-use crate::{
-    CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits, ScriptOutcome,
-};
+use crate::{CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, ScriptOutcome};
+use dekopon_process::Limits;
 use serde_json::json;
 
 struct Fixture;
@@ -72,7 +71,7 @@ impl CapabilityInvoker for Fixture {
         &self,
         proposal: crate::CommandProposal,
         mut streams: crate::Streams,
-        _tree: &crate::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         let capability = proposal.capability;
         let input = proposal.input;

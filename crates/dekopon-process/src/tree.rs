@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::limits::{LimitExceeded, Limits};
+use crate::{LimitExceeded, Limits};
 
 #[derive(Clone, Debug)]
 pub struct CallBudget {
@@ -33,7 +33,7 @@ impl CallBudget {
         self.maximum
     }
 
-    pub(crate) fn charge(&self) -> Result<(), LimitExceeded> {
+    pub fn charge(&self) -> Result<(), LimitExceeded> {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 (used < self.maximum).then_some(used + 1)
@@ -64,17 +64,17 @@ pub struct RetainedBytes {
 }
 
 impl RetainedBytes {
-    pub(crate) fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
-    pub(crate) fn shrink(&mut self, bytes: u64) {
+    pub fn shrink(&mut self, bytes: u64) {
         debug_assert!(bytes <= self.bytes);
         self.bytes -= bytes;
         self.used.fetch_sub(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn grow(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
+    pub fn grow(&mut self, bytes: u64) -> Result<(), LimitExceeded> {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|next| *next <= self.maximum)
@@ -107,7 +107,7 @@ impl TreeContext {
         }
     }
 
-    pub(crate) fn charge_step(&self) -> Result<(), LimitExceeded> {
+    pub fn charge_step(&self) -> Result<(), LimitExceeded> {
         self.steps
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(1)
@@ -119,7 +119,7 @@ impl TreeContext {
             })
     }
 
-    pub(crate) fn retain(&self, bytes: u64) -> Result<RetainedBytes, LimitExceeded> {
+    pub fn retain(&self, bytes: u64) -> Result<RetainedBytes, LimitExceeded> {
         self.retained
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
@@ -135,19 +135,19 @@ impl TreeContext {
         })
     }
 
-    pub(crate) fn steps(&self) -> u64 {
+    pub fn steps(&self) -> u64 {
         self.steps.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn value_bytes(&self) -> u64 {
+    pub fn value_bytes(&self) -> u64 {
         self.retained.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn max_value_bytes(&self) -> u64 {
+    pub fn max_value_bytes(&self) -> u64 {
         self.limits.max_value_bytes
     }
 
-    pub(crate) fn check_deadline(&self) -> Result<(), LimitExceeded> {
+    pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
         if Instant::now() >= self.deadline {
             Err(LimitExceeded::Deadline {
                 timeout_ms: self.timeout.as_millis(),
@@ -173,7 +173,7 @@ impl TreeContext {
     }
 
     #[must_use]
-    pub(crate) fn calls(&self) -> &CallBudget {
+    pub fn calls(&self) -> &CallBudget {
         &self.calls
     }
 }

@@ -1230,7 +1230,7 @@ One generated OpenTelemetry trace links the command to spans such as:
 - `broker.invocation` and `broker.command_run`; and
 - `provider.compile`, `provider.describe`, `provider.run_command`, and `provider.invoke`.
 
-`dekopon-process` provides only the cancel latch and emits no spans. The agent drives
+`dekopon-process` owns the cancel latch and shared script-tree accounting and emits no spans. The agent drives
 each command word's broker round trip in place, retaining the calling script's W3C
 trace parent. Stop or the script deadline drops a command word in flight, after
 which the script reads `session-cancelled`. Broker component spans and their bounds are described in

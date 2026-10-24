@@ -31,7 +31,7 @@ Extensibility through Wasm providers:
 - Out-of-tree providers must be deployed independently against the current stdio provider contract; the image and CLI archives bundle no out-of-tree components. A SQLite-compatible [`turso-sql`](https://github.com/dekopon-agents/dekopon-provider-turso-sql) provider is available separately.
 - Strongly typed identifiers and an invocation typestate that separates a proposal from broker authorization.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose provider command words propose capability calls instead of spawning operating-system processes, with compound commands (`if`/`for`/`while`/`until`/`case`/`{ ...; }`) as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`, real parameter expansion, and two script-addressable streams. The shared agent layer hands it to a model as its `bash` tool, so a multi-step plan is one tool call rather than many round trips.
-- A cancel latch (`dekopon-process`) shared by frontends. Stop or the script deadline drops a command word in flight, after which the script reads `session-cancelled`.
+- A cancel latch and shared script-tree accounting (`dekopon-process`) shared by frontends. Stop or the script deadline drops a command word in flight, after which the script reads `session-cancelled`.
 
 The operator surface on top:
 

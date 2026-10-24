@@ -556,7 +556,7 @@ subsequent model turns and capability invocations, suppresses the stale answer/h
 queues `active`, and sends the `stopped` template (`Stopped.` by default). Wall-clock stops instead use the fixed time-limit line below. In-flight model HTTP sends and reads, including silent
 reasoning, select on the session watch and are cancelled locally. Remote inference or provider
 effects already accepted cannot be rolled back. The broker leg drives a provider command word's round trip in place using the
-`dekopon-process` cancel latch. Stop or the script deadline drops a command word in
+`dekopon-process` cancel latch and shared `TreeContext` accounting. Stop or the script deadline drops a command word in
 flight, after which the script reads `session-cancelled`. Unknown,
 duplicate, and other-user Stop events are ignored.
 

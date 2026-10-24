@@ -48,6 +48,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+dekopon-process.workspace = true
 dekopon-agent.workspace = true
 dekopon-shell.workspace = true
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }

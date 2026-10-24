@@ -10,7 +10,8 @@ use std::{
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
 use dekopon_core::{AgentId, ExternalSubject};
-use dekopon_shell::{CapabilityInvoker, Limits as ShellLimits};
+use dekopon_process::Limits as ShellLimits;
+use dekopon_shell::CapabilityInvoker;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

@@ -17767,14 +17767,14 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         crate::follow::FollowInvoker::new(leg, Some((Arc::clone(&table), key.clone(), 0)));
     let result = tokio::task::spawn_blocking(move || {
         let (stdout, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
-        let calls = dekopon_shell::CallBudget::new(2);
+        let calls = dekopon_process::CallBudget::new(2);
         invoker.invoke(
             dekopon_shell::CommandProposal::new("dekopon-provider-follow.stay", json!({}), None),
             dekopon_shell::Streams {
                 stdin: None,
                 stdout: std::os::fd::OwnedFd::from(stdout),
             },
-            &dekopon_shell::TreeContext::new(dekopon_shell::Limits::default(), calls),
+            &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), calls),
         )
     })
     .await
