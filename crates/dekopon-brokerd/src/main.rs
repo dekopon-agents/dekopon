@@ -67,6 +67,10 @@ struct CheckArgs {
     /// Private directory that keeps the resolved provider lock and blob store between checks.
     #[arg(long, value_name = "DIR", requires = "provider_set")]
     store: Option<PathBuf>,
+    /// Directory of essential workflows, every *.yaml file, run against the candidate providers
+    /// and policy.
+    #[arg(long, value_name = "DIR", requires = "provider_set")]
+    workflows: Option<PathBuf>,
     /// Render problems and warnings as a table or JSON.
     #[arg(long, value_enum, default_value_t)]
     output: OutputFormat,
@@ -493,7 +497,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
             provider_set,
             store,
         });
-    let report = dekopon_brokerd::check(&check.config, providers).await;
+    let report = dekopon_brokerd::check(&check.config, providers, check.workflows.as_deref()).await;
     let output = CheckOutput {
         ok: report.problems.is_empty(),
         problems: report
@@ -760,6 +764,36 @@ mod tests {
         let daemon = Cli::try_parse_from(["dekopon-brokerd", "--config=x", "check", "broker.d"])
             .expect("shape parses before validation");
         assert!(validate_cli(&daemon).is_err());
+    }
+
+    #[test]
+    fn check_workflows_requires_a_provider_set() {
+        let cli = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "check",
+            "broker.d",
+            "--provider-set=providers.yaml",
+            "--store=cache",
+            "--workflows=workflows.d",
+        ])
+        .expect("workflows beside a provider set parses");
+        let Some(Command::Check(check)) = cli.command else {
+            panic!("check command");
+        };
+        assert_eq!(check.workflows.as_deref(), Some(Path::new("workflows.d")));
+
+        let error = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "check",
+            "broker.d",
+            "--workflows=workflows.d",
+        ])
+        .expect_err("workflows without a provider set is a usage error");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

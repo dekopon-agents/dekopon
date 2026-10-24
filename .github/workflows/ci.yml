@@ -564,6 +564,7 @@ jobs:
             --set configCheck.enabled=true \
             --set configCheck.broker.configMap=dekopon-check-broker-d \
             --set configCheck.broker.providerSetConfigMap=dekopon-check-config \
+            --set configCheck.broker.workflowsConfigMap=dekopon-check-workflows-d \
             --set configCheck.gateway.configMap=dekopon-check-gatewayd-d \
             --set configCheck.gateway.catalogConfigMap=dekopon-check-agents-d \
             --set configCheck.gateway.againstConfigMap=dekopon-gatewayd-d \
@@ -579,7 +580,12 @@ jobs:
             --set console.enabled=true --set console.image.tag=v0.1.0 \
             --set console.subject=discord.1 > "$RUNNER_TEMP/console.yaml"
           helm template dekopon charts/dekopon \
-            -f charts/dekopon/ci/values-config-directory.yaml > "$RUNNER_TEMP/config-directory.yaml"
+            -f charts/dekopon/ci/values-config-directory.yaml \
+            --set configCheck.enabled=true \
+            --set configCheck.broker.configMap=dekopon-check-broker-d \
+            --set configCheck.broker.providerSetConfigMap=dekopon-check-config \
+            --set configCheck.broker.workflowsConfigMap=dekopon-check-workflows-d \
+            --set state.existingClaim=dekopon-state > "$RUNNER_TEMP/config-directory.yaml"
           grep -q -- '"--config", "/etc/dekopon/broker.d"' "$RUNNER_TEMP/config-directory.yaml"
           grep -q -- '"--config", "/etc/dekopon-gateway"' "$RUNNER_TEMP/config-directory.yaml"
           grep -q 'namespaces: \["discord.1"\]' "$RUNNER_TEMP/config-directory.yaml"

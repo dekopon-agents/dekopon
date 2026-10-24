@@ -29,6 +29,7 @@ mod refresh_scheduler;
 mod secrets;
 mod server;
 mod socket;
+mod workflows;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -219,10 +220,17 @@ pub struct CheckReport {
 pub async fn check(
     config_path: impl AsRef<Path>,
     providers: Option<CheckProviders>,
+    workflows: Option<&Path>,
 ) -> CheckReport {
-    load_candidate(config_path.as_ref(), Mode::Check(providers))
-        .await
-        .1
+    load_candidate(
+        config_path.as_ref(),
+        Mode::Check {
+            providers,
+            workflows,
+        },
+    )
+    .await
+    .1
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +239,7 @@ pub enum Stage {
     FrameLimits,
     Runtime,
     Providers,
+    Workflows,
 }
 
 impl std::fmt::Display for Stage {
@@ -240,6 +249,7 @@ impl std::fmt::Display for Stage {
             Self::FrameLimits => "frame limits",
             Self::Runtime => "runtime files",
             Self::Providers => "providers, policy and capabilities",
+            Self::Workflows => "essential workflows",
         })
     }
 }
@@ -247,7 +257,10 @@ impl std::fmt::Display for Stage {
 enum Mode<'a> {
     Boot,
     Reload(&'a Candidate),
-    Check(Option<CheckProviders>),
+    Check {
+        providers: Option<CheckProviders>,
+        workflows: Option<&'a Path>,
+    },
 }
 
 /// Only boot opens the storage host and asset directory: opening takes the root's writer lock and
@@ -461,8 +474,26 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
             locked_providers: active.locked_providers.as_deref(),
             provider_lock: active.provider_lock.as_ref(),
         },
-        Mode::Check(_) => LoadMode::Check,
+        Mode::Check { .. } => LoadMode::Check,
     };
+    let essential = match &mode {
+        Mode::Check {
+            workflows: Some(directory),
+            ..
+        } => match workflows::load(directory, uid).await {
+            Ok(files) => Some(files),
+            Err(error) => {
+                report.problems.push(error.into());
+                None
+            }
+        },
+        Mode::Boot
+        | Mode::Reload(_)
+        | Mode::Check {
+            workflows: None, ..
+        } => None,
+    };
+    let mut provider_lock_file = None;
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
         Ok((config, refusal)) => {
             report.problems.extend(refusal.map(BrokerdError::from));
@@ -491,31 +522,37 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
         ] {
             report.skipped(stage);
         }
+        if essential.is_some() {
+            report.skipped(Stage::Workflows);
+        }
         return (None, report);
     };
     let (providers_resolved, residents) = match mode {
         Mode::Boot => (true, Residents::Open),
         Mode::Reload(active) => (true, Residents::Borrow(active)),
-        Mode::Check(providers) => {
+        Mode::Check { providers, .. } => {
             if config.identities.is_empty() {
                 report.warnings.push(StartupWarning::IdentitiesRequired);
             }
             // A Check load leaves a providerSet's providers for this function to resolve.
             let resolved = match (config.providers.is_empty(), providers) {
-                (true, Some(providers)) => match resolve_provider_set(providers, uid).await {
-                    Ok(sources) => {
-                        config.providers = sources
-                            .iter()
-                            .map(|source| source.path().to_path_buf())
-                            .collect();
-                        config.locked_providers = Some(sources);
-                        true
+                (true, Some(providers)) => {
+                    provider_lock_file = Some(providers.store.join(PROVIDER_LOCK_FILE));
+                    match resolve_provider_set(providers, uid).await {
+                        Ok(sources) => {
+                            config.providers = sources
+                                .iter()
+                                .map(|source| source.path().to_path_buf())
+                                .collect();
+                            config.locked_providers = Some(sources);
+                            true
+                        }
+                        Err(error) => {
+                            report.problems.push(error);
+                            false
+                        }
                     }
-                    Err(error) => {
-                        report.problems.push(error);
-                        false
-                    }
-                },
+                }
                 (true, None) => {
                     report.problems.push(BrokerdError::ProviderSetRequired);
                     false
@@ -573,6 +610,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     let (Some(frame_limits), Some(mut runtime), true) = (frame_limits, runtime, providers_resolved)
     else {
         report.skipped(Stage::Providers);
+        if essential.is_some() {
+            report.skipped(Stage::Workflows);
+        }
         return (None, report);
     };
     let limits = ServerLimits {
@@ -601,6 +641,19 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     )
     .await;
     drop(scratch);
+    match (&prepared, &essential) {
+        (Ok(ready), Some(files)) => {
+            let versions = workflows::versions(provider_lock_file.as_deref(), uid).await;
+            report.problems.extend(
+                workflows::run(ready, files, &versions)
+                    .await
+                    .into_iter()
+                    .map(BrokerdError::Workflow),
+            );
+        }
+        (Err(_), Some(_)) => report.skipped(Stage::Workflows),
+        (Ok(_) | Err(_), None) => {}
+    }
     match prepared {
         Ok(ready) if report.problems.is_empty() => {
             let digest = match snapshot.digest() {
@@ -902,6 +955,8 @@ impl RawCandidate {
     }
 }
 
+const PROVIDER_LOCK_FILE: &str = "providers.lock.yaml";
+
 async fn resolve_provider_set(
     providers: CheckProviders,
     uid: u32,
@@ -918,7 +973,7 @@ async fn resolve_provider_set(
             });
         }
     }
-    let lock_file = providers.store.join("providers.lock.yaml");
+    let lock_file = providers.store.join(PROVIDER_LOCK_FILE);
     let store = providers.store.join("store");
     let manager = ProviderManager::new(ProviderManagerOptions {
         paths: ProviderManagerPaths {
@@ -1525,6 +1580,10 @@ pub enum BrokerdError {
     },
     #[error("check could not stand in for a configured credential")]
     UncheckedCredential(#[source] dekopon_http_host::ConfigurationError),
+    #[error("essential workflows could not be loaded")]
+    WorkflowFile(#[from] workflows::WorkflowFileError),
+    #[error("would break essential workflows")]
+    Workflow(#[source] workflows::StepRefusal),
 }
 
 impl BrokerdError {
