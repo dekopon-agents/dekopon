@@ -9,6 +9,7 @@ use wasmparser::{Encoding, Parser, Payload};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct SkillFile {
+    pub skill: SkillId,
     pub path: String,
     pub bytes: Vec<u8>,
 }
@@ -65,7 +66,7 @@ pub enum SkillReadError {
 
 pub fn read(provider: &ProviderId, component: &[u8]) -> Result<Vec<SkillFile>, SkillReadError> {
     let mut files = BTreeMap::new();
-    let mut skills = BTreeMap::<&str, (usize, usize)>::new();
+    let mut skills = BTreeMap::<SkillId, (usize, usize)>::new();
     for payload in Parser::new(0).parse_all(component) {
         let payload = payload?;
         if let Payload::Version {
@@ -84,7 +85,7 @@ pub fn read(provider: &ProviderId, component: &[u8]) -> Result<Vec<SkillFile>, S
         };
         let (skill, relative) = validate_path(provider, path)?;
         let bytes = section.data();
-        let totals = skills.entry(skill).or_default();
+        let totals = skills.entry(skill.clone()).or_default();
         if relative == SKILL_FILE_NAME {
             if bytes.len() > MAX_SKILL_FILE_BYTES {
                 return Err(SkillReadError::SkillFileTooLarge { path: path.into() });
@@ -97,12 +98,12 @@ pub fn read(provider: &ProviderId, component: &[u8]) -> Result<Vec<SkillFile>, S
             totals.1 += bytes.len();
             if totals.0 > MAX_SKILL_RESOURCES {
                 return Err(SkillReadError::TooManyResources {
-                    skill: skill.into(),
+                    skill: skill.to_string(),
                 });
             }
             if totals.1 > MAX_SKILL_TOTAL_BYTES {
                 return Err(SkillReadError::ResourcesTooLarge {
-                    skill: skill.into(),
+                    skill: skill.to_string(),
                 });
             }
         }
@@ -110,7 +111,7 @@ pub fn read(provider: &ProviderId, component: &[u8]) -> Result<Vec<SkillFile>, S
             path: path.into(),
             source,
         })?;
-        if files.insert(path, bytes).is_some() {
+        if files.insert(path, (skill, bytes)).is_some() {
             return Err(SkillReadError::DuplicatePath { path: path.into() });
         }
     }
@@ -126,13 +127,14 @@ pub fn read(provider: &ProviderId, component: &[u8]) -> Result<Vec<SkillFile>, S
     for skill in skills.keys() {
         if !files.contains_key(format!("{skill}/{SKILL_FILE_NAME}").as_str()) {
             return Err(SkillReadError::MissingSkillFile {
-                skill: (*skill).into(),
+                skill: skill.to_string(),
             });
         }
     }
     Ok(files
         .into_iter()
-        .map(|(path, bytes)| SkillFile {
+        .map(|(path, (skill, bytes))| SkillFile {
+            skill,
             path: path.into(),
             bytes: bytes.into(),
         })
@@ -142,7 +144,7 @@ pub fn read(provider: &ProviderId, component: &[u8]) -> Result<Vec<SkillFile>, S
 fn validate_path<'a>(
     provider: &ProviderId,
     path: &'a str,
-) -> Result<(&'a str, &'a str), SkillReadError> {
+) -> Result<(SkillId, &'a str), SkillReadError> {
     for segment in path.split('/') {
         let error = match segment {
             "" => Some(SkillReadError::EmptySegment { path: path.into() }),
@@ -163,19 +165,20 @@ fn validate_path<'a>(
     let (skill, relative) = path
         .split_once('/')
         .ok_or_else(|| SkillReadError::MissingFilePath { path: path.into() })?;
-    skill
+    let skill = skill
         .parse::<SkillId>()
         .map_err(|source| SkillReadError::InvalidSkill {
             skill: skill.into(),
             source,
         })?;
-    if skill != provider.as_str()
+    if skill.as_str() != provider.as_str()
         && !skill
+            .as_str()
             .strip_prefix(provider.as_str())
             .is_some_and(|suffix| suffix.starts_with('-'))
     {
         return Err(SkillReadError::ProviderMismatch {
-            skill: skill.into(),
+            skill: skill.to_string(),
         });
     }
     if relative.split('/').count() - 1 > MAX_SKILL_RESOURCE_DEPTH {
@@ -228,14 +231,17 @@ mod tests {
             read(&"gh".parse().unwrap(), &root.finish()).unwrap(),
             vec![
                 SkillFile {
+                    skill: "gh".parse().unwrap(),
                     path: "gh/SKILL.md".into(),
                     bytes: b"root".to_vec()
                 },
                 SkillFile {
+                    skill: "gh".parse().unwrap(),
                     path: "gh/nested.md".into(),
                     bytes: b"nested\n".to_vec()
                 },
                 SkillFile {
+                    skill: "gh".parse().unwrap(),
                     path: "gh/references/core.md".into(),
                     bytes: b"core\r\n".to_vec()
                 },

@@ -420,20 +420,21 @@ fn export_skills(
             ));
         }
     }
-    let mut skills =
-        BTreeMap::<String, (ProviderId, Vec<dekopon_broker_host::skills::SkillFile>)>::new();
+    let mut skills = BTreeMap::<
+        dekopon_core::SkillId,
+        (ProviderId, Vec<dekopon_broker_host::skills::SkillFile>),
+    >::new();
     for source in sources {
         let bytes = source.read().map_err(ProviderManagerError::Host)?;
         let files = dekopon_broker_host::skills::read(source.provider_id(), &bytes)
             .map_err(|source| ProviderManagerError::SkillRead { source })?;
         for file in files {
-            let skill = file.path.split_once('/').expect("reader validated path").0;
             let entry = skills
-                .entry(skill.into())
+                .entry(file.skill.clone())
                 .or_insert_with(|| (source.provider_id().clone(), Vec::new()));
             if &entry.0 != source.provider_id() {
                 return Err(ProviderManagerError::DuplicateSkill {
-                    skill: skill.into(),
+                    skill: file.skill.to_string(),
                 });
             }
             entry.1.push(file);
@@ -454,7 +455,7 @@ fn export_skills(
             }
             ProviderSkillStatus {
                 provider: provider.clone(),
-                skill: skill.parse().expect("reader validated skill"),
+                skill: skill.clone(),
                 files: files.len(),
                 bytes,
                 sha256: hex_digest(hash.finalize().as_slice()),
@@ -465,11 +466,12 @@ fn export_skills(
     for (_, files) in skills.values() {
         for file in files {
             let path = out.join(&file.path);
-            let relative_parent = Path::new(&file.path)
-                .parent()
-                .expect("reader validated path");
             let mut directory = out.to_path_buf();
-            for segment in relative_parent.components() {
+            for segment in Path::new(&file.path)
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+            {
                 directory.push(segment);
                 create_skill_directory(&directory)?;
             }
