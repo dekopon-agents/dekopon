@@ -353,6 +353,7 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
             Ok(record.access()?.expose().as_bytes().to_vec())
         }
         Err(error) => {
+            span.record("otel.status_code", "error");
             span.record(
                 "outcome",
                 match error {

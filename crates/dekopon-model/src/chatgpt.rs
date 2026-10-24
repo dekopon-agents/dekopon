@@ -188,6 +188,7 @@ impl CredentialFile {
             "chatgpt.refresh",
             forced = rejected.is_some(),
             outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
             credential.expires_at = tracing::field::Empty,
         );
@@ -230,6 +231,7 @@ impl CredentialFile {
             Ok(refreshed) => refreshed,
             Err(error) => {
                 span.record("outcome", "failed");
+                span.record("otel.status_code", "error");
                 span.record("duration_ms", elapsed_ms(started));
                 return Err(error);
             }

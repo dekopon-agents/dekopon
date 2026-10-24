@@ -3075,6 +3075,8 @@ where
             storage.namespace = tracing::field::Empty,
             storage.reset = tracing::field::Empty,
             outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
             error = tracing::field::Empty,
             error.code = tracing::field::Empty,
             error.message = tracing::field::Empty,
@@ -3231,6 +3233,7 @@ where
         );
         let execution = tracing::Span::current();
         execution.record("outcome", "failed");
+        execution.record("otel.status_description", reason);
         execution.record("error", reason);
         self.record_audit(event).await.map_err(|source| {
             execution.record("outcome", "authorized-failure-unaudited");
@@ -3832,15 +3835,17 @@ where
         };
 
         let execution = tracing::Span::current();
-        execution.record(
-            "outcome",
-            if matches!(result.outcome, InvocationOutcome::Succeeded) {
-                "succeeded"
-            } else {
-                "failed"
-            },
-        );
+        match result.outcome {
+            InvocationOutcome::Succeeded => {
+                execution.record("outcome", "succeeded");
+            }
+            InvocationOutcome::Denied | InvocationOutcome::Failed => {
+                execution.record("outcome", "failed");
+                execution.record("otel.status_code", "error");
+            }
+        }
         if let Some(error) = result.error.as_deref() {
+            execution.record("otel.status_description", error);
             execution.record("error", error);
         }
         if let Some(detail) = result.detail.as_ref() {

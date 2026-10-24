@@ -1441,6 +1441,7 @@ fn message_span(
         transport = %message.transport,
         agent = %route.agent,
         outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
         busy.cause = tracing::field::Empty,
         batch.members = receipts.0.len(),
     );
@@ -1624,7 +1625,11 @@ async fn run_admitted(
             conversation.carried_assets = tracing::field::Empty,
         ))
         .await;
-    tracing::Span::current().record("outcome", outcome);
+    let span = tracing::Span::current();
+    span.record("outcome", outcome);
+    if matches!(outcome, "failed" | "reply-failed") {
+        span.record("otel.status_code", "error");
+    }
     receipts.finish(outcome);
     admission
 }
@@ -1764,8 +1769,9 @@ async fn session(
                     .thread_continuation
                     .as_ref()
                     .is_some_and(|continuation| continuation.inherited)
+                && answer(driver, message, SEALED_THREAD_REPLY).await
             {
-                answer(driver, message, SEALED_THREAD_REPLY).await;
+                reply_delivered("sealed");
             }
             return "sealed";
         }
@@ -1784,8 +1790,8 @@ async fn session(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused"
             );
-            if !is_follow {
-                answer(driver, message, UNAUTHORIZED_REPLY).await;
+            if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
+                reply_delivered("unauthorized");
             }
             return "unauthorized";
         }
@@ -1795,8 +1801,8 @@ async fn session(
                 category = error.category(),
                 error = %error
             );
-            if !is_follow {
-                answer(driver, message, FAILURE_REPLY).await;
+            if !is_follow && answer(driver, message, FAILURE_REPLY).await {
+                reply_delivered("failed");
             }
             return "failed";
         }
@@ -1812,8 +1818,8 @@ async fn session(
             .conversations
             .remove(&key, EvictionReason::GrantChanged);
         tracing::info!(event = "gateway_session_rejected", reason = "unauthorized");
-        if !is_follow {
-            answer(driver, message, UNAUTHORIZED_REPLY).await;
+        if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
+            reply_delivered("unauthorized");
         }
         return "unauthorized";
     }
@@ -2299,6 +2305,9 @@ async fn session(
                 remember_stop(runner, &key, StopCause::SessionTask)
             };
             let replied = progress.terminal(terminal).await;
+            if replied {
+                reply_delivered("failed");
+            }
             return if replied { "failed" } else { "reply-failed" };
         }
     };
@@ -2451,6 +2460,9 @@ async fn session(
         }
     };
     let delivered = progress.terminal(terminal).await;
+    if delivered {
+        reply_delivered(completed_outcome);
+    }
     if let Some((turn, window)) = pending_journal.take() {
         crate::memory::generation::persist(post_reply(), window, turn).await;
     }
@@ -2644,8 +2656,18 @@ async fn stopped(
     } else {
         remember_stop(runner, key, StopCause::Cancelled(by))
     };
-    progress.terminal(terminal).await;
+    if progress.terminal(terminal).await {
+        reply_delivered("cancelled");
+    }
     "cancelled"
+}
+
+fn reply_delivered(outcome: &'static str) {
+    tracing::info!(
+        target: "dekopon_gatewayd::audit",
+        { audit.event = "reply.delivered", outcome },
+        "reply.delivered"
+    );
 }
 
 fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {

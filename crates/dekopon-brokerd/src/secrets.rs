@@ -408,6 +408,7 @@ impl ScheduledCatalog {
         };
         let span = tracing::info_span!(target: "credential", "broker.credential.refresh",
             credential = %drn, trigger = "scheduled", outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
             secret.source.kind = "oauth2-refresh", duration_ms = tracing::field::Empty,
             credential.expires_at_unix_ms = tracing::field::Empty);
         Ok(oauth2::refresh_task(
@@ -453,6 +454,7 @@ impl SecretResolver for MapResolver {
                 credential = %secret,
                 trigger = "use",
                 outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
                 secret.source.kind = "oauth2-refresh",
                 duration_ms = tracing::field::Empty,
                 credential.expires_at_unix_ms = tracing::field::Empty,

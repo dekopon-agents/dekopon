@@ -587,6 +587,7 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
             "broker.credential.refresh",
             credential = %self.name,
             outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
         );
         let credential = Arc::clone(&self.credential);
         let blocking_span = span.clone();
@@ -599,6 +600,7 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
             Ok(resolved) => resolved,
             Err(source) => {
                 span.record("outcome", "failed");
+                span.record("otel.status_code", "error");
                 tracing::warn!(
                     event = "broker_chatgpt_credential_refresh_failed",
                     credential = %self.name,
@@ -615,6 +617,7 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
             Ok(resolved) => resolved,
             Err(source) => {
                 span.record("outcome", "failed");
+                span.record("otel.status_code", "error");
                 return Err(self.classify(&source));
             }
         };

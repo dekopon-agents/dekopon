@@ -87,7 +87,7 @@ impl InferenceHttp {
         model: &str,
         provider: &str,
         dialect: &str,
-        operation: impl Future<Output = Result<AssistantTurn, InferenceError>> + Send,
+        operation: impl Future<Output = (Result<AssistantTurn, InferenceError>, Progress)> + Send,
     ) -> Result<AssistantTurn, InferenceError> {
         let span = tracing::info_span!(
             "model.complete",
@@ -95,8 +95,8 @@ impl InferenceHttp {
             model.name = name,
             model.backend = provider,
             model.dialect = dialect,
-            model.stream = true,
-            cache.style = "automatic",
+            model.stream = tracing::field::Empty,
+            cache.style = tracing::field::Empty,
             model.returned = tracing::field::Empty,
             model.upstream = tracing::field::Empty,
             gen_ai.response.id = tracing::field::Empty,
@@ -126,8 +126,11 @@ impl InferenceHttp {
             usage.reasoning_output_tokens = tracing::field::Empty,
             usage.total_tokens = tracing::field::Empty,
             outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
             error = tracing::field::Empty,
             error.kind = tracing::field::Empty,
+            error.type = tracing::field::Empty,
             error.phase = tracing::field::Empty,
             http.status = tracing::field::Empty,
             provider.code = tracing::field::Empty,
@@ -137,11 +140,12 @@ impl InferenceHttp {
             reasoning.items = tracing::field::Empty,
             tool_call.skipped = tracing::field::Empty,
             delta.unrecognized = tracing::field::Empty,
-            output.partial = false,
+            output.partial = tracing::field::Empty,
         );
         let started = Instant::now();
-        let result = operation.instrument(span.clone()).await;
+        let (result, progress) = operation.instrument(span.clone()).await;
         span.record("timing.total_ms", millis(started.elapsed()));
+        progress.finish(&span, &result);
         match &result {
             Ok(turn) => {
                 span.record("outcome", "success");
@@ -166,13 +170,23 @@ impl InferenceHttp {
             }
             Err(error) => {
                 let kind = error.kind().as_str();
+                // Upstream messages and parser sources may echo sensitive request data; only the
+                // local client's own transport chain is safe to describe.
                 let context = match error {
-                    InferenceError::Authentication(AuthError::Provider(context))
-                    | InferenceError::RateLimited(RateLimitError(context))
-                    | InferenceError::Provider(context)
-                    | InferenceError::Transport(TransportFailure::Http { context, .. }) => {
+                    InferenceError::Transport(TransportFailure::Http { context, .. }) => {
+                        span.record(
+                            "otel.status_description",
+                            dekopon_core::bounded_attribute(&context.diagnostic).as_ref(),
+                        );
                         Some(context)
                     }
+                    InferenceError::Authentication(AuthError::Provider(context))
+                    | InferenceError::RateLimited(RateLimitError(context))
+                    | InferenceError::Provider(context) => {
+                        span.record("otel.status_code", "error");
+                        Some(context)
+                    }
+                    InferenceError::Cancelled => None,
                     InferenceError::Authentication(AuthError::Credential(_))
                     | InferenceError::Transport(
                         TransportFailure::Blocking(_)
@@ -182,14 +196,16 @@ impl InferenceHttp {
                     | InferenceError::Protocol(_)
                     | InferenceError::Attachment(_)
                     | InferenceError::InvalidRequest(_)
-                    | InferenceError::Cancelled
                     | InferenceError::DeadlineExceeded
-                    | InferenceError::OverBudget(_) => None,
+                    | InferenceError::OverBudget(_) => {
+                        span.record("otel.status_code", "error");
+                        None
+                    }
                 };
                 span.record("outcome", "failed");
-                // Upstream messages and parser sources may echo sensitive request data.
                 span.record("error", kind);
                 span.record("error.kind", kind);
+                span.record("error.type", kind);
                 if matches!(
                     error,
                     InferenceError::InvalidRequest(_)
@@ -259,14 +275,17 @@ impl InferenceResponse {
         decode: impl FnOnce(&[u8]) -> Result<AssistantTurn, InferenceError> + Send,
     ) -> Result<AssistantTurn, InferenceError> {
         let mut bytes = Vec::new();
+        let record_bytes = |bytes: &[u8]| {
+            tracing::Span::current().record("response.bytes", bytes.len());
+        };
         loop {
-            let chunk = match control
-                .run(self.response.chunk())
-                .await
-                .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?
-            {
+            let chunk = match control.run(self.response.chunk()).await.inspect_err(|_| {
+                record_bytes(&bytes);
+                record_phase(FailurePhase::ReadingBody);
+            })? {
                 Ok(chunk) => chunk,
                 Err(source) => {
+                    record_bytes(&bytes);
                     return Err(response_context(
                         http_failure(FailurePhase::ReadingBody, self.context.status, source),
                         self.context,
@@ -277,12 +296,13 @@ impl InferenceResponse {
                 break;
             };
             if chunk.len() > MAX_BUFFERED_BYTES - bytes.len() {
+                record_bytes(&bytes);
                 record_phase(FailurePhase::ReadingBody);
                 return Err(ProtocolFailure::BufferedTooLarge.into());
             }
             bytes.extend_from_slice(&chunk);
-            tracing::Span::current().record("response.bytes", bytes.len());
         }
+        record_bytes(&bytes);
         control
             .check()
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
@@ -300,19 +320,22 @@ impl InferenceResponse {
             return Ok(self);
         }
         let mut bytes = Vec::new();
-        tracing::Span::current().record("response.bytes", 0);
+        let record_bytes = |bytes: &[u8]| {
+            tracing::Span::current().record("response.bytes", bytes.len());
+        };
         let limit = MAX_ERROR_BODY_BYTES as usize + 1;
         while bytes.len() < limit {
-            let chunk = control
-                .run(self.response.chunk())
-                .await
-                .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
+            let chunk = control.run(self.response.chunk()).await.inspect_err(|_| {
+                record_bytes(&bytes);
+                record_phase(FailurePhase::ReadingBody);
+            })?;
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(source) => {
+                    record_bytes(&bytes);
                     self.context.phase = FailurePhase::ReadingBody;
                     let source = source.without_url();
-                    self.context.diagnostic = secrets.sanitize(&source.to_string());
+                    self.context.diagnostic = secrets.sanitize(&dekopon_core::error_chain(&source));
                     return Err(TransportFailure::Http {
                         context: self.context,
                         source,
@@ -324,8 +347,8 @@ impl InferenceResponse {
                 break;
             };
             bytes.extend_from_slice(&chunk[..chunk.len().min(limit - bytes.len())]);
-            tracing::Span::current().record("response.bytes", bytes.len());
         }
+        record_bytes(&bytes);
         let truncated = bytes.len() == limit;
         self.context.phase = FailurePhase::ReadingBody;
         self.context.diagnostic = if truncated {
@@ -402,7 +425,8 @@ pub(crate) fn http_failure(
     source: reqwest::Error,
 ) -> InferenceError {
     let source = source.without_url();
-    let mut context = ProviderFailure::new(status.unwrap_or(0), &source.to_string());
+    let mut context =
+        ProviderFailure::new(status.unwrap_or(0), &dekopon_core::error_chain(&source));
     context.status = status;
     context.phase = phase;
     TransportFailure::Http { context, source }.into()
@@ -440,15 +464,19 @@ impl Progress {
                     .record("stream.first_delta_ms", millis(self.started.elapsed()));
             }
             self.deltas += 1;
-            tracing::Span::current().record("stream.deltas", self.deltas);
-            tracing::Span::current().record("output.partial", true);
         }
         observer(event)
     }
-}
-impl Drop for Progress {
-    fn drop(&mut self) {
-        tracing::Span::current().record("stream.events", self.events);
+    fn finish(self, span: &tracing::Span, result: &Result<AssistantTurn, InferenceError>) {
+        span.record("stream.events", self.events);
+        if self.deltas > 0 {
+            span.record("stream.deltas", self.deltas);
+        }
+        // A completed turn records its own `output.partial`, since only the adapter knows its
+        // finish reason.
+        if result.is_err() {
+            span.record("output.partial", self.deltas > 0);
+        }
     }
 }
 
@@ -473,17 +501,21 @@ mod tests {
         let capture = crate::trace_capture::TraceCapture::default();
         let result = http
             .generation("refusal", "fixture", "fixture", "fixture", async {
-                let response = http
-                    .send(
-                        http.post(&server.base_url()).body("{}"),
-                        &control,
-                        DiagnosticSecrets::default(),
-                    )
-                    .await?;
-                match response.check(&control, DiagnosticSecrets::default()).await {
-                    Err(error) => Err(error),
-                    Ok(_) => panic!("expected refusal"),
+                let result = async {
+                    let response = http
+                        .send(
+                            http.post(&server.base_url()).body("{}"),
+                            &control,
+                            DiagnosticSecrets::default(),
+                        )
+                        .await?;
+                    match response.check(&control, DiagnosticSecrets::default()).await {
+                        Err(error) => Err(error),
+                        Ok(_) => panic!("expected refusal"),
+                    }
                 }
+                .await;
+                (result, Progress::new())
             })
             .with_subscriber(capture.subscriber())
             .await;
@@ -494,6 +526,74 @@ mod tests {
         assert_eq!(capture.field("response.bytes"), Some(recorded.to_string()));
         assert_eq!(server.requests.lock().len(), 1);
         error
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_certificate_names_the_certificate_problem_in_the_error_and_span_status() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _refused = acceptor.accept(stream).await;
+        });
+        let http = InferenceHttp::new(Duration::from_secs(2)).unwrap();
+        let control =
+            TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2)).unwrap();
+        let (result, span) = crate::trace_capture::exported_model_span(http.generation(
+            "tls",
+            "fixture",
+            "fixture",
+            "fixture",
+            async {
+                let result = async {
+                    http.send(
+                        http.post(&format!("https://localhost:{port}/")).body("{}"),
+                        &control,
+                        DiagnosticSecrets::default(),
+                    )
+                    .await?;
+                    panic!("an untrusted certificate was accepted")
+                }
+                .await;
+                (result, Progress::new())
+            },
+        ))
+        .await;
+        server.await.unwrap();
+        let Err(InferenceError::Transport(TransportFailure::Http { context, .. })) = result else {
+            panic!("expected a transport failure");
+        };
+        assert!(
+            context
+                .diagnostic
+                .contains("invalid peer certificate: UnknownIssuer"),
+            "{}",
+            context.diagnostic
+        );
+        let opentelemetry::trace::Status::Error { description } = &span.status else {
+            panic!("span status {:?}", span.status);
+        };
+        assert_eq!(description.as_ref(), context.diagnostic);
+        assert!(
+            span.attributes
+                .iter()
+                .any(|attribute| attribute.key.as_str() == "error.type"
+                    && attribute.value.as_str() == "transport")
+        );
     }
 
     #[tokio::test]

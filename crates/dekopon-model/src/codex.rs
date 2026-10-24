@@ -164,8 +164,11 @@ impl CodexClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
+        progress: &mut Progress,
     ) -> Result<AssistantTurn, InferenceError> {
-        let mut progress = Progress::new();
+        let span = tracing::Span::current();
+        span.record("model.stream", true);
+        span.record("cache.style", "automatic");
         for message in request.messages {
             if let ModelMessage::Assistant { turn } = message
                 && !turn.accepts_client(&self.identity)
@@ -237,7 +240,7 @@ impl CodexClient {
         let response = response.check(control, secrets).await?;
         let mut reducer = CodexReducer {
             secrets,
-            reported_model: request
+            continued_model: request
                 .messages
                 .iter()
                 .rev()
@@ -284,7 +287,14 @@ impl InferenceModel for CodexClient {
                 &self.model,
                 "chatgpt-subscription",
                 "codex-responses",
-                self.exchange(request, observe, control),
+                async {
+                    let mut progress = Progress::new();
+                    (
+                        self.exchange(request, observe, control, &mut progress)
+                            .await,
+                        progress,
+                    )
+                },
             )
             .await
     }
@@ -446,6 +456,7 @@ pub(crate) struct CodexReducer<'a> {
     call_order: Vec<String>,
     terminal: Terminal,
     usage: Option<ModelUsage>,
+    continued_model: Option<String>,
     reported_model: Option<String>,
 }
 
@@ -506,12 +517,15 @@ impl CodexReducer<'_> {
             if self
                 .reported_model
                 .as_deref()
+                .or(self.continued_model.as_deref())
                 .is_some_and(|prior| prior != model)
             {
                 return Err(ProtocolFailure::ContinuationMismatch.into());
             }
-            self.reported_model = Some(model);
-            tracing::Span::current().record("model.returned", self.reported_model.as_deref());
+            if self.reported_model.is_none() {
+                tracing::Span::current().record("model.returned", model.as_str());
+                self.reported_model = Some(model);
+            }
         }
         if failed {
             let detail = event
@@ -788,7 +802,7 @@ impl CodexReducer<'_> {
             AssistantTurn::new(content, calls, self.usage).with_codex_continuation(
                 self.native_items,
                 identity.clone(),
-                self.reported_model,
+                self.reported_model.or(self.continued_model),
             ),
         )
     }

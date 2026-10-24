@@ -10,6 +10,7 @@ use dekopon_agent::prompt::{ConversationTurn, Exchange, Representation};
 use dekopon_model::model::{ChatModel, CompletionOptions, ModelMessage};
 use sha2::{Digest, Sha256};
 use std::{ops::ControlFlow, sync::Arc, time::SystemTime};
+use tracing::Instrument as _;
 
 use crate::config::memory::{ResolvedPolicy, Routine, RoutineKind};
 
@@ -319,6 +320,12 @@ pub(crate) fn report_policy(policy: &ResolvedPolicy, recall: crate::config::Reca
 }
 
 pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: ConversationTurn) {
+    persist_turn(context, window, turn)
+        .instrument(tracing::info_span!("memory.persist"))
+        .await;
+}
+
+async fn persist_turn(context: PostReply<'_>, window: MemoryWindow, turn: ConversationTurn) {
     let PostReply {
         runner,
         route,

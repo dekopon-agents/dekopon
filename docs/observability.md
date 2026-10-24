@@ -151,17 +151,18 @@ library uses `tracing` only and installs no subscriber.
 | `timing.total_ms` | complete exchange duration, including preparation and permitted refresh/resend |
 | `timing.headers_ms` | most recent send-to-headers duration; a Codex resend replaces the earlier value |
 | `timing.first_event_ms`, `stream.first_delta_ms` | time since adapter exchange starts (before preparation) to first SSE event / first visible text; absent when no such event/text exists |
-| `stream.deltas` | number of visible text fragments; tool-only turns invent no first-text time |
+| `stream.deltas` | number of visible text fragments, recorded once when the exchange ends; tool-only turns invent no first-text time |
 | `usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens` | normalized reported counters, never invented zeros |
 | `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.reasoning_output_tokens` | reported subsets/work, without adding them again to total |
 | `usage.cost`, `usage.upstream_inference_cost`, `usage.upstream_inference_prompt_cost`, `usage.upstream_inference_completions_cost` | OpenRouter's reported charge and its `cost_details`, as floats in OpenRouter credits (USD); absent when unreported, never computed locally |
-| `tool_call.count`, `response.bytes` | completed call count on success, bytes consumed by the response reader |
+| `tool_call.count`, `response.bytes` | completed call count on success, bytes consumed by the response reader, recorded once when the reader stops |
 | `finish.reason`, `output.partial` | reported chat finish reason; partial visible output on failure or successful `length` text |
 | `stream.events` | SSE events observed by the adapter, including `[DONE]`, recorded once when the exchange ends |
 | `reasoning.items` | merged reasoning item count when an OpenRouter turn is finalized; never reasoning text |
 | `tool_call.skipped` | OpenRouter tool items dropped during finalization because their type is unknown |
 | `delta.unrecognized` | first eight distinct ignored OpenRouter delta keys in sorted order, sanitized and comma-joined; absent when none, never their values |
-| `outcome`, `error`, `error.kind` | `success`/`failed`; failures have a stable category, not raw diagnostic text |
+| `outcome`, `error`, `error.kind`, `error.type` | `success`/`failed`; failures have a stable category, not raw diagnostic text |
+| span status | `Error` on every failure except `cancelled` (a steer or stop is not an error); only an HTTP transport failure gets a description, the transport's own source chain (for a TLS failure, the certificate problem), never upstream text |
 | `error.phase` | `before-send`, `awaiting-headers` or `reading-body`, when known |
 | `http.status`, `provider.code`, `provider.request_id` | safe known response metadata; status/request ID survive later protocol/cancellation failures |
 
@@ -172,6 +173,9 @@ previews are stripped of control characters, have in-scope credentials replaced 
 `[REDACTED]`, then are bounded at 16 KiB; a preview cut mid-credential drops the partial token.
 Parser sources are preserved when safe. Credentials, the prompt cache key and private reasoning
 never enter `model.complete` fields, and `traceparent` is not forwarded to the inference endpoint.
+Counts, byte totals, `output.partial`, `model.stream`, `cache.style` and the reported model are
+recorded once per exchange, not per delta or chunk, so a long stream cannot push `outcome` or
+`usage.*` past the span's attribute limit.
 `agent.model.prompt` includes `tools`: comma-joined names offered to that exact model turn,
 empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a complete tool list.
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
@@ -459,8 +463,17 @@ two further spans of its own:
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only); `failed` and `reply-failed` set the span status to `Error` |
 | `gateway.session` | `agent`, `generation.digest`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
+| `memory.persist` | no fields; a child of `gateway.session` opened after the terminal reply for every turn the journal records, including a declined turn and a reply that failed to deliver; it wraps the memory routines' summary `model.complete` calls and the journal append |
+
+`gateway.session` carries a `reply.delivered` event at the moment a reply it sends reaches the
+chat, with the message's `outcome`: `answered`, `failed`, `refused` and `cancelled` terminals, and
+the `sealed`, `unauthorized` and broker-failure (`failed`) notices. There is none for a declined or
+silent turn, a reply the transport refused, or a reply sent outside a session, such as the `busy`
+and stop notices. `gateway.message` still spans the
+memory work that follows, so its duration is not reply latency; the gap between `reply.delivered`
+and the end of `memory.persist` is where the rest went.
 
 `generation.digest` is the gateway generation activated for this session, including its broker activation reference; it is shared by distinct private conversations and says nothing about their history. Offline analysis may join a retained session span against an activated configuration reference; if the span or its reference is unavailable, the historical generation is **unknown**, not the latest configuration. It cannot reconstruct expired inputs, and there is no journal-generation link.
 
@@ -810,11 +823,11 @@ migration is implemented here.
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
+| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `console-smoke-claim-denied`, `console-real-scope-denied`, `chat-attestation-denied`, `chat-scope-required`, `probe-write`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`, `input` and `input.bytes`; `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
-| `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name and `outcome`; legacy ChatGPT uses `current`, `adopted`, `rotated`, `rotated-unsaved`, `failed` and nests `chatgpt.refresh` from `dekopon-model`. `oauth2Refresh` uses `refreshed`, `not-due`, `reauth-required`, `failed`, with `trigger = use` or `scheduled`, `secret.source.kind = oauth2-refresh`, `duration_ms`, and `credential.expires_at_unix_ms` (Unix seconds converted to milliseconds) for the returned token. A scheduled span is independent of provider traffic; emitted once per attempt; never a token, account identifier, response body, or file content. `githubApp` uses `renewed` and `failed`, records the token endpoint's `http.response.status_code` whenever one answered, and emits no span for a cached token. |
+| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; a `failed` outcome sets the span status to `Error`, described by `error`; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
+| `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name and `outcome`; legacy ChatGPT uses `current`, `adopted`, `rotated`, `rotated-unsaved`, `failed` and nests `chatgpt.refresh` from `dekopon-model`. A `failed` refresh (and an `oauth2Refresh` `reauth-required`) sets the span status to `Error`. `oauth2Refresh` uses `refreshed`, `not-due`, `reauth-required`, `failed`, with `trigger = use` or `scheduled`, `secret.source.kind = oauth2-refresh`, `duration_ms`, and `credential.expires_at_unix_ms` (Unix seconds converted to milliseconds) for the returned token. A scheduled span is independent of provider traffic; emitted once per attempt; never a token, account identifier, response body, or file content. `githubApp` uses `renewed` and `failed`, records the token endpoint's `http.response.status_code` whenever one answered, and emits no span for a cached token. |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider, `input` and `input.bytes`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure. An HTTP grant with `propagateTrace: true` propagates this span as the outbound `traceparent` when an OTel context exists; otherwise no trace header is sent. |
 

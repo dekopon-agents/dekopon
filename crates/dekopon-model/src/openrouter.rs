@@ -203,23 +203,24 @@ impl OpenRouterClient {
                 span.record("routing.only", secrets.sanitize(&only.join(",")));
             }
         }
-        if let Some(cache) = &self.settings.cache {
+        span.record("model.stream", true);
+        span.record(
+            "cache.style",
+            match self.settings.cache.as_ref().map(|cache| &cache.style) {
+                None | Some(CacheStyle::Automatic) => "automatic",
+                Some(CacheStyle::ExplicitPrefix) => "explicitPrefix",
+            },
+        );
+        if let Some(cache) = &self.settings.cache
+            && let Some(ttl) = cache.ttl
+        {
             span.record(
-                "cache.style",
-                match cache.style {
-                    CacheStyle::Automatic => "automatic",
-                    CacheStyle::ExplicitPrefix => "explicitPrefix",
+                "cache.ttl",
+                match ttl {
+                    settings::Ttl::FiveMinutes => "5m",
+                    settings::Ttl::OneHour => "1h",
                 },
             );
-            if let Some(ttl) = cache.ttl {
-                span.record(
-                    "cache.ttl",
-                    match ttl {
-                        settings::Ttl::FiveMinutes => "5m",
-                        settings::Ttl::OneHour => "1h",
-                    },
-                );
-            }
         }
     }
 
@@ -228,8 +229,8 @@ impl OpenRouterClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
+        progress: &mut Progress,
     ) -> Result<AssistantTurn, InferenceError> {
-        let mut progress = Progress::new();
         let secrets = DiagnosticSecrets::new(Some(&self.token));
         self.record_settings(secrets);
         let body = control
@@ -298,7 +299,14 @@ impl InferenceModel for OpenRouterClient {
                 &self.model,
                 "openrouter",
                 "chat-completions",
-                self.exchange(request, observe, control),
+                async {
+                    let mut progress = Progress::new();
+                    (
+                        self.exchange(request, observe, control, &mut progress)
+                            .await,
+                        progress,
+                    )
+                },
             )
             .await
     }
