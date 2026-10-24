@@ -149,7 +149,12 @@ pub(crate) fn assert_tool_options(
             let value = match &attribute.value {
                 opentelemetry::Value::String(value) => serde_json::Value::String(value.to_string()),
                 opentelemetry::Value::Bool(value) => serde_json::Value::Bool(*value),
-                value => panic!("tool option has wrong type: {value:?}"),
+                value @ (opentelemetry::Value::I64(_)
+                | opentelemetry::Value::F64(_)
+                | opentelemetry::Value::Array(_)) => {
+                    panic!("tool option has wrong type: {value:?}")
+                }
+                _ => panic!("tool option has an unknown type"),
             };
             (attribute.key.to_string(), value)
         })
