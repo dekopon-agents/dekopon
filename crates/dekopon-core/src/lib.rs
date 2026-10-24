@@ -38,7 +38,11 @@ pub use attribute::{BoundedDisplay, MAX_ATTRIBUTE_BYTES, bounded_attribute, boun
 pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
-pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
+pub use skill::{
+    MAX_SKILL_FILE_BYTES, MAX_SKILL_NAME_LENGTH, MAX_SKILL_RESOURCE_BYTES,
+    MAX_SKILL_RESOURCE_DEPTH, MAX_SKILL_RESOURCES, MAX_SKILL_TOTAL_BYTES, SKILL_FILE_NAME, SkillId,
+    SkillIdError,
+};
 pub use subject::{ExternalSubject, SubjectError, SubjectSegment, SubjectService};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]

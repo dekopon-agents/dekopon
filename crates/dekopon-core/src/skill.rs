@@ -1,6 +1,13 @@
 //! Narrower than AgentId on purpose, matching the external Agent Skills format exactly, so this is
 //! a separate type rather than one grammar with a mode.
 
+pub const SKILL_FILE_NAME: &str = "SKILL.md";
+pub const MAX_SKILL_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_SKILL_RESOURCE_BYTES: usize = 256 * 1024;
+pub const MAX_SKILL_RESOURCES: usize = 64;
+pub const MAX_SKILL_TOTAL_BYTES: usize = 1024 * 1024;
+pub const MAX_SKILL_RESOURCE_DEPTH: usize = 4;
+
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};

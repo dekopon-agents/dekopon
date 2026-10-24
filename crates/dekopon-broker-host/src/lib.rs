@@ -47,6 +47,7 @@ mod memory;
 mod metadata;
 mod random;
 mod settings;
+pub mod skills;
 mod spawn;
 mod stdio;
 mod storage;
@@ -226,6 +227,10 @@ impl LockedProviderSource {
             artifact_sha256,
             provider_id,
         })
+    }
+
+    pub fn read(&self) -> Result<Vec<u8>, BrokerHostError> {
+        read_source(&self.path, Some(self)).map(|(bytes, _)| bytes)
     }
 
     #[must_use]
@@ -663,7 +668,7 @@ fn prepare_component(
     source: ProviderSource,
 ) -> Result<CompiledComponent, BrokerHostError> {
     let started = Instant::now();
-    let (bytes, artifact) = read_source(&source)?;
+    let (bytes, artifact) = read_source(&source.path, source.expected.as_ref())?;
     let span = tracing::Span::current();
     span.record("artifact_bytes", artifact.bytes);
     span.record("artifact_sha256", &artifact.sha256);
@@ -729,39 +734,36 @@ fn prepare_component(
 }
 
 fn read_source(
-    source: &ProviderSource,
+    path: &Path,
+    expected: Option<&LockedProviderSource>,
 ) -> Result<(Vec<u8>, metadata::ArtifactIdentity), BrokerHostError> {
     // Reads once, capped one byte over the limit, since a second read can't prove it matches what
     // Cranelift consumed and concurrent growth could otherwise allocate unbounded memory.
-    let file =
-        std::fs::File::open(&source.path).map_err(|error| BrokerHostError::ArtifactMetadata {
-            path: source.path.clone(),
-            source: error,
-        })?;
+    let file = std::fs::File::open(path).map_err(|error| BrokerHostError::ArtifactMetadata {
+        path: path.to_path_buf(),
+        source: error,
+    })?;
     let metadata = file
         .metadata()
         .map_err(|error| BrokerHostError::ArtifactMetadata {
-            path: source.path.clone(),
+            path: path.to_path_buf(),
             source: error,
         })?;
-    let maximum = source
-        .expected
-        .as_ref()
-        .map_or(HARD_MAX_PROVIDER_COMPONENT_BYTES, |expected| {
-            expected.artifact_bytes
-        });
-    if let Some(expected) = &source.expected
+    let maximum = expected.map_or(HARD_MAX_PROVIDER_COMPONENT_BYTES, |expected| {
+        expected.artifact_bytes
+    });
+    if let Some(expected) = expected
         && metadata.len() != expected.artifact_bytes
     {
         return Err(BrokerHostError::ArtifactSizeMismatch {
-            path: source.path.clone(),
+            path: path.to_path_buf(),
             expected: expected.artifact_bytes,
             actual: metadata.len(),
         });
     }
     if metadata.len() > maximum {
         return Err(BrokerHostError::ArtifactTooLarge {
-            path: source.path.clone(),
+            path: path.to_path_buf(),
             actual: metadata.len(),
             maximum,
         });
@@ -770,36 +772,36 @@ fn read_source(
     file.take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| BrokerHostError::ArtifactMetadata {
-            path: source.path.clone(),
+            path: path.to_path_buf(),
             source: error,
         })?;
     let actual = bytes.len() as u64;
     if actual > maximum {
-        return match &source.expected {
+        return match expected {
             Some(expected) => Err(BrokerHostError::ArtifactSizeMismatch {
-                path: source.path.clone(),
+                path: path.to_path_buf(),
                 expected: expected.artifact_bytes,
                 actual,
             }),
             None => Err(BrokerHostError::ArtifactTooLarge {
-                path: source.path.clone(),
+                path: path.to_path_buf(),
                 actual,
                 maximum,
             }),
         };
     }
     let artifact = identify_bytes(&bytes);
-    if let Some(expected) = &source.expected {
+    if let Some(expected) = expected {
         if artifact.bytes != expected.artifact_bytes {
             return Err(BrokerHostError::ArtifactSizeMismatch {
-                path: source.path.clone(),
+                path: path.to_path_buf(),
                 expected: expected.artifact_bytes,
                 actual: artifact.bytes,
             });
         }
         if artifact.sha256 != expected.artifact_sha256 {
             return Err(BrokerHostError::ArtifactDigestMismatch {
-                path: source.path.clone(),
+                path: path.to_path_buf(),
                 expected: expected.artifact_sha256.clone(),
                 actual: artifact.sha256,
             });
@@ -1396,7 +1398,7 @@ fn precompile_sources(
     let span = tracing::Span::current();
     for locked in sources {
         let source = ProviderSource::from(locked.clone());
-        let (bytes, artifact) = read_source(&source)?;
+        let (bytes, artifact) = read_source(&source.path, source.expected.as_ref())?;
         let cache = cwasm::Cache::new(cwasm_dir.to_owned(), &engine);
         let publication = cache
             .precompile_component(&engine, &bytes, &artifact.sha256)

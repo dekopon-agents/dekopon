@@ -161,3 +161,16 @@ drop, without refunds for failed allocation. A refused growth emits `memory.refu
 sees -1, and an invocation that fails after refusal reports `host-memory-budget`. Invocation
 stores also report fuel where available. Describe and command-run stores emit `memory.store` too.
 See [operator sizing and limitations](../../docs/observability.md#provider-linear-memory-sizing).
+
+## Offline skill reader
+
+`dekopon_broker_host::skills::read(provider: &ProviderId, component: &[u8])` returns every
+`SkillFile` (full `<skill>/<path>` and exact bytes), sorted by path, or one typed `SkillReadError`.
+It parses `dekopon:skill/` custom sections at every component, nested component and core-module
+level without compiling or instantiating. No sections yields no skills. It checks declared payload
+lengths before copying, using core's shared skill bounds and filename. It refuses invalid names,
+provider naming mismatches, unsafe path segments, excessive directory depth, non-UTF-8 payloads,
+duplicate paths anywhere in the component, file/directory collisions and missing `SKILL.md`.
+Front matter is checked only by the gateway's directory loader. Its only production caller is
+the offline brokerd export command; the serving broker never reads skills. `LockedProviderSource::read`
+shares the host's one-read length and SHA-256 verification with that exporter.

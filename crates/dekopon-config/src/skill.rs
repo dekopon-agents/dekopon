@@ -8,19 +8,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dekopon_core::{SkillId, SkillIdError};
+use dekopon_core::{
+    MAX_SKILL_FILE_BYTES, MAX_SKILL_RESOURCE_BYTES, MAX_SKILL_RESOURCE_DEPTH, MAX_SKILL_RESOURCES,
+    MAX_SKILL_TOTAL_BYTES, SKILL_FILE_NAME, SkillId, SkillIdError,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{Projection, ProjectionError};
 
-pub const SKILL_FILE_NAME: &str = "SKILL.md";
-pub const MAX_SKILL_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 1024;
-pub const MAX_SKILL_RESOURCE_BYTES: usize = 256 * 1024;
-pub const MAX_SKILL_RESOURCES: usize = 64;
-pub const MAX_SKILL_TOTAL_BYTES: usize = 1024 * 1024;
-pub const MAX_SKILL_RESOURCE_DEPTH: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

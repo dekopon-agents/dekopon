@@ -955,6 +955,8 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "wasm-encoder 0.259.0",
+ "wasmparser 0.259.0",
  "wasmtime",
 ]
 

@@ -44,3 +44,14 @@ components, and `dekopon-provider-sdk-testkit` for native/component parity and
 conformance checks. Previously published guest binding crates continue to serve
 external providers until those providers migrate separately; they are not part
 of this workspace.
+
+## Embedded skills
+
+Call `dekopon_provider_sdk::skills!("gh/SKILL.md", "gh/references/review.md");` at crate scope.
+Paths are relative to `skills/` beside the calling crate's `Cargo.toml`. Each file's raw bytes
+become a `dekopon:skill/<path>` custom section on Wasm targets; native builds emit nothing.
+The macro uses no build script and performs no validation. The offline
+`dekopon-brokerd provider skills --out DIR` reader validates the `SkillId` grammar, provider ID
+or `<provider-id>-` naming, safe paths, required `SKILL.md`, UTF-8 and catalog bounds before
+export. The gateway checks front matter when it loads the exported directory. Skills are
+untrusted model text and grant no capability. See the [export contract](../dekopon-brokerd/README.md#managed-provider-sets).

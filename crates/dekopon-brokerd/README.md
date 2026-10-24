@@ -814,6 +814,33 @@ report contains `providers`, `compiled`, `repaired`, `removedFiles` and `removed
 components are included in `compiled`. An error exits non-zero without pruning. `verify` neither
 locks nor publishes compiled artifacts.
 
+`skills` reads only the lock and each locked local blob, under the same broker-UID ownership
+rules as `list` and `verify`. It verifies length and SHA-256 on the one buffer it parses, walks
+skill sections at every component/module nesting level, and compiles and instantiates nothing.
+It sends no registry request and writes nothing under the lock or store:
+
+```console
+dekopon-brokerd provider --lock-file=/store/providers.lock.yaml --store=/store/store skills --out /config/provider-skills
+```
+
+`--out DIR` is the skill subcommand's required destination flag, separate from global `--output`.
+The destination must be absent or an empty directory. Before writing, export refuses missing or
+mismatched blobs, invalid skill sections (including missing `SKILL.md`, paths, UTF-8 and shared
+catalog bounds), and a skill name exported by two providers. Refusals exit 1; usage errors exit 2.
+Validation refusals happen before the first write. Files contain the exact section bytes, with mode 0644 under
+0755 directories at `DIR/<skill>/<path>`. No manifest, index or report file is added. Export never
+deletes or prunes: the caller empties `DIR`. Commit this tree with the provider pin; CI can
+re-export to an empty directory and compare it. Mount the skill at `/etc/dekopon-skills/<skill>`
+using the existing catalog path. Front matter remains the gateway loader's responsibility.
+
+The report has one row per skill, sorted by skill name, with `provider`, `skill`, `files`, `bytes`
+and `sha256`, rendered as a table or a JSON array under `--output json`. `bytes` counts all file
+payloads including `SKILL.md`. `sha256` is lowercase hexadecimal SHA-256 of the concatenation,
+for files sorted by full section path, of: the path's UTF-8 byte length as a big-endian u64,
+the full `<skill>/<path>` bytes, the payload length as a big-endian u64, and the payload bytes.
+Thus any path or payload change changes the digest. The same lock and store produce identical
+files and report. Export emits no audit event.
+
 `--output json` gives deterministic machine-readable command results. A successful lock change
 reaches a running managed broker within seconds: it drains and exits so its supervisor restarts it
 on the new lock ([Configuration](#configuration)); there is no hot reload.
