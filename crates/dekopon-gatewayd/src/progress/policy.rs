@@ -412,6 +412,7 @@ struct Live {
     started: Instant,
     deadline: Deadline,
     message: Option<MessageRef>,
+    steers_at_post: u32,
     streaming: bool,
     silent_until_success: bool,
     latest_text: Option<StreamedText>,
@@ -453,6 +454,7 @@ impl Live {
             started: now,
             deadline: Deadline::new(now, inputs.max_duration),
             message: None,
+            steers_at_post: 0,
             streaming: false,
             silent_until_success: inputs.silent_until_success,
             latest_text: None,
@@ -772,6 +774,7 @@ impl Live {
         self.state.elapsed = now.saturating_duration_since(self.started);
         let text = self.line(line);
         let creating = status_text.is_none() && self.message.is_none();
+        let steers_at_post = self.counters.steers.load(Ordering::Relaxed);
         let outcome = if let Some(status_text) = status_text {
             if self.status_text == StatusTextState::Waiting {
                 self.status_text = StatusTextState::HandedOver;
@@ -807,6 +810,7 @@ impl Live {
             Ok(posted) => {
                 breaker.succeeded();
                 if let Some(message) = posted {
+                    self.steers_at_post = steers_at_post;
                     self.message = Some(message);
                 }
                 tracing::debug!(
@@ -905,12 +909,16 @@ impl Live {
         let chars = text.text.as_str().chars().count();
         let cancel = self.cancel_control();
         let creating = self.message.is_none();
+        let steers_at_post = self.counters.steers.load(Ordering::Relaxed);
         let outcome = bounded(stream.show(&target, self.message.as_ref(), &text, cancel)).await;
         self.stream.clear();
         self.stream.cooldown(limits.min_interval);
         match outcome {
             Ok(message) => {
                 self.breakers.stream.succeeded();
+                if creating {
+                    self.steers_at_post = steers_at_post;
+                }
                 self.message = Some(message);
                 self.streaming = true;
                 tracing::debug!(
@@ -994,7 +1002,7 @@ impl Live {
             Terminal::Silent => {
                 match streamed.filter(|partial| !partial.is_empty()) {
                     Some(partial) => {
-                        self.finalize(OutboundReply::text(partial), generation)
+                        self.finalize_in_place(OutboundReply::text(partial), generation)
                             .await;
                     }
                     None => self.discard().await,
@@ -1019,6 +1027,16 @@ impl Live {
     }
 
     async fn finalize(&mut self, reply: OutboundReply, generation: u64) -> bool {
+        if self.message.is_some()
+            && self.counters.steers.load(Ordering::Relaxed) > self.steers_at_post
+        {
+            self.discard().await;
+            return self.deliver(reply).await;
+        }
+        self.finalize_in_place(reply, generation).await
+    }
+
+    async fn finalize_in_place(&mut self, reply: OutboundReply, generation: u64) -> bool {
         if let Some(message) = self.message.clone() {
             let driver = Arc::clone(&self.driver);
             let finalized = if self.streaming {

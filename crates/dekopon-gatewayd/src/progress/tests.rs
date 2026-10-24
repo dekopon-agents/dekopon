@@ -48,6 +48,7 @@ enum Call {
     Finalize(String),
     Stream(String),
     StreamFinalize(String),
+    StreamDiscard,
     Reply(String),
 }
 
@@ -62,6 +63,7 @@ struct Recorder {
     stall_progress: AtomicU32,
     stall_finalize: AtomicU32,
     stall_status: AtomicU32,
+    slow_post: AtomicU32,
     post_attempts: AtomicU32,
     posts: AtomicU32,
 }
@@ -111,7 +113,12 @@ impl Recorder {
     fn writes(&self) -> Vec<Call> {
         self.calls()
             .into_iter()
-            .filter(|call| !matches!(call, Call::Reaction(_) | Call::Typing | Call::Status(_)))
+            .filter(|call| {
+                !matches!(
+                    call,
+                    Call::Reaction(_) | Call::Typing | Call::Status(_) | Call::StreamDiscard
+                )
+            })
             .collect()
     }
 }
@@ -229,6 +236,9 @@ impl ProgressMessage for Surfaces {
         text: &crate::progress::ProgressText,
         _cancel: bool,
     ) -> Result<MessageRef, TransportError> {
+        self.recorder
+            .stalled_for(&self.recorder.slow_post, Duration::from_millis(500))
+            .await;
         self.recorder.post_attempts.fetch_add(1, Ordering::Relaxed);
         self.recorder.stalled(&self.recorder.stall_progress).await;
         if self.recorder.counted(&self.recorder.refuse_progress) {
@@ -295,6 +305,9 @@ impl TextStream for Surfaces {
         text: &StreamedText,
         _cancel: bool,
     ) -> Result<MessageRef, TransportError> {
+        self.recorder
+            .stalled_for(&self.recorder.slow_post, Duration::from_millis(500))
+            .await;
         let mut rendered = text.text.as_str().to_owned();
         if text.truncated {
             rendered.push_str(TRUNCATION_MARKER);
@@ -307,6 +320,11 @@ impl TextStream for Surfaces {
                 id: format!("s{posts}"),
             }
         }))
+    }
+
+    async fn discard(&self, _message: &MessageRef) -> Result<(), TransportError> {
+        self.recorder.push(Call::StreamDiscard);
+        Ok(())
     }
 
     async fn finalize(
@@ -333,9 +351,10 @@ struct TestDriver {
 impl ChatDriver for TestDriver {
     async fn reply(
         &self,
-        _target: &ReplyTarget,
+        target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        assert!(matches!(target, ReplyTarget::Local { connection: 1 }));
         self.recorder.push(Call::Reply(reply.text));
         Ok(())
     }
@@ -1876,6 +1895,168 @@ async fn a_stream_past_the_surface_ceiling_is_cut_and_marked() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_steer_staged_after_the_progress_post_gets_its_answer_below_it() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    assert_eq!(harness.recorder.writes().len(), 1);
+    assert!(matches!(harness.recorder.writes()[0], Call::Post(_)));
+    for _ in 0..EVENT_QUEUE {
+        harness.sink.emit(answered_with_tool(1));
+    }
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    let writes = harness.recorder.writes();
+    assert_eq!(&writes[1..], [Call::Delete, Call::Reply("done".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_staged_while_the_progress_post_is_in_flight_gets_its_answer_below_it() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.recorder.slow_post.store(1, Ordering::Relaxed);
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    advance(Duration::from_millis(500)).await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    let writes = harness.recorder.writes();
+    assert!(matches!(writes[0], Call::Post(_)));
+    assert_eq!(&writes[1..], [Call::Delete, Call::Reply("done".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_staged_while_the_stream_post_is_in_flight_gets_its_answer_below_it() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            typing: false,
+            status: false,
+            reaction: false,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.recorder.slow_post.store(1, Ordering::Relaxed);
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    harness.sink.emit(ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
+    });
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    advance(Duration::from_millis(500)).await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    assert_eq!(
+        harness.recorder.calls(),
+        [
+            Call::Stream(text.as_str().to_owned()),
+            Call::StreamDiscard,
+            Call::Reply("done".to_owned())
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unsteered_turn_still_finalizes_in_place() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    let writes = harness.recorder.writes();
+    assert!(matches!(writes[0], Call::Post(_)));
+    assert_eq!(&writes[1..], [Call::Finalize("done".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_staged_before_the_progress_post_still_finalizes_in_place() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    let writes = harness.recorder.writes();
+    assert!(matches!(writes[0], Call::Post(_)));
+    assert_eq!(&writes[1..], [Call::Finalize("done".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_after_the_stream_began_discards_it_before_delivering_the_answer() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    let delta = || ProgressEvent::TextDelta {
+        turn: 1,
+        text: text.clone(),
+        cumulative_chars: text.as_str().chars().count(),
+    };
+    harness.sink.emit(delta());
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    harness.sink.emit(delta());
+    advance(Duration::from_secs(2)).await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    let calls: Vec<_> = harness
+        .recorder
+        .calls()
+        .into_iter()
+        .filter(|call| !matches!(call, Call::Reaction(_) | Call::Typing | Call::Status(_)))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            Call::Stream(text.as_str().to_owned()),
+            Call::Stream(text.as_str().to_owned()),
+            Call::StreamDiscard,
+            Call::Reply("done".to_owned())
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_refused_finalize_deletes_the_surface_and_replies() {
     let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
     harness.recorder.refuse_finalize.store(1, Ordering::Relaxed);
@@ -2511,19 +2692,15 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
                         .unwrap(),
                     png
                 );
-                if stream {
-                    assert!(deleted.is_none(), "append-only stream is preserved");
-                } else {
-                    let deleted = deleted.expect("progress removed before fallback");
-                    assert_eq!(lines[deleted]["progress"]["id"], id);
-                    assert!(
-                        deleted
-                            < lines
-                                .iter()
-                                .position(|line| line["reply"] == "done")
-                                .unwrap()
-                    );
-                }
+                let deleted = deleted.expect("surface removed before fallback");
+                assert_eq!(lines[deleted]["progress"]["id"], id);
+                assert!(
+                    deleted
+                        < lines
+                            .iter()
+                            .position(|line| line["reply"] == "done")
+                            .unwrap()
+                );
             } else {
                 assert_eq!(answer["id"], id);
                 assert!(answer.get("images").is_none());

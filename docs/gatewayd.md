@@ -913,10 +913,12 @@ For every route/kind, startup and reload emit a bounded `gateway_indicators_effe
 with route index, transport name, kind, enum settings and booleans only, not message text,
 identity, coordinates or credentials.
 
-**One message per session.** Whatever the policy posts, it posts once and then edits: a keep-alive
-is an edit, a streamed answer grows in place, and the answer finalizes the same message. There is
-never a second gateway message beside it, which is why `stream: true` means the stream *is* the
-surface and no separate progress line is posted.
+**One message per session.** The policy posts once and then edits: a keep-alive is an
+edit, and a streamed answer grows in place. The answer finalizes the same message unless a
+steer was staged after it was posted. In that case, the progress or stream message is deleted
+and the answer is posted fresh below the steer, to the same DM or thread. A steer staged before
+any progress message existed keeps finalization in place. With `stream: true`, the stream is
+the surface and no separate progress line is posted.
 
 **Opt-in by default.** An absent indicator block or `mode: off` disables all intermediate
 presentation. Both `reaction.working` and `reaction.seen` default to `off`. With

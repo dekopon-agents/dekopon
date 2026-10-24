@@ -626,6 +626,10 @@ impl TextStream for LocalDriver {
         })
     }
 
+    async fn discard(&self, message: &MessageRef) -> Result<(), TransportError> {
+        ProgressMessage::delete(self, message).await
+    }
+
     async fn finalize(
         &self,
         message: &MessageRef,
