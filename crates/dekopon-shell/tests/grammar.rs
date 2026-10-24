@@ -2602,7 +2602,7 @@ fn a_condition_chain_past_the_ceiling_is_refused() {
         (format!("{}true", "if ".repeat(2_000)), "an `if` statement"),
         (
             format!("{}true", "if true; then :; elif ".repeat(2_000)),
-            "a command block",
+            "an `if` statement",
         ),
         (format!("{}true", "while ".repeat(2_000)), "a `while` loop"),
         (format!("{}true", "until ".repeat(2_000)), "an `until` loop"),
@@ -2627,6 +2627,24 @@ fn a_condition_chain_past_the_ceiling_is_refused() {
         "; break; fi; done".repeat(5)
     );
     assert_eq!(on_a_two_mib_stack(&nested).output, "deep");
+}
+
+#[test]
+fn thirty_two_nested_if_and_while_bodies_still_run() {
+    for script in [
+        format!(
+            "{}echo ok{}",
+            "if true; then ".repeat(32),
+            "; fi".repeat(32)
+        ),
+        format!(
+            "{}echo ok{}",
+            "while true; do ".repeat(32),
+            "; break; done".repeat(32)
+        ),
+    ] {
+        assert_eq!(on_a_two_mib_stack(&script).output, "ok");
+    }
 }
 
 #[test]
