@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+import collections
+import csv
+import json
+import re
+import sys
+from pathlib import Path
+
+SLOT = re.compile(r"slot", re.I)
+DROPPED = re.compile(r"drop", re.I)
+
+
+def records(path):
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def event_name(row):
+    fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
+    return row.get("event") or fields.get("event") or row.get("audit.event")
+
+
+def percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))]
+
+
+def latency_line(label, values):
+    if not values:
+        return f"| {label} | 0 | – | – | – |"
+    return (f"| {label} | {len(values)} | {percentile(values, 0.5):.0f} | {percentile(values, 0.95):.0f} "
+            f"| {max(values):.0f} |")
+
+
+def spans(path):
+    services = collections.Counter()
+    names = collections.Counter()
+    for batch in records(path):
+        for resource in batch.get("resourceSpans", []):
+            service = next((a["value"].get("stringValue") for a in resource.get("resource", {})
+                            .get("attributes", []) if a.get("key") == "service.name"), "?")
+            for scope in resource.get("scopeSpans", []):
+                for span in scope.get("spans", []):
+                    services[service] += 1
+                    names[span.get("name")] += 1
+    return services, names
+
+
+def log_records(path):
+    services = collections.Counter()
+    for batch in records(path):
+        for resource in batch.get("resourceLogs", []):
+            service = next((a["value"].get("stringValue") for a in resource.get("resource", {})
+                            .get("attributes", []) if a.get("key") == "service.name"), "?")
+            for scope in resource.get("scopeLogs", []):
+                services[service] += len(scope.get("logRecords", []))
+    return services
+
+
+def tree_bytes(path):
+    if not path.exists():
+        return 0, 0
+    files = [item for item in path.rglob("*") if item.is_file()]
+    return sum(item.stat().st_size for item in files), len(files)
+
+
+def build(run):
+    meta = json.loads((run / "meta.json").read_text())
+    ref8 = meta["sha"][:8]
+    turns = list(csv.DictReader(open(run / "latency.csv", encoding="utf-8"))) if (run / "latency.csv").exists() else []
+    gateway = records(run / "gatewayd.stdout.log")
+    broker = records(run / "brokerd.stdout.log")
+    events = collections.Counter(event_name(row) for row in gateway if event_name(row))
+    calls = records(run / "model-calls.jsonl")
+    summaries = [c for c in calls if c.get("kind") == "summary"]
+    chats = [c for c in calls if c.get("kind") == "chat"]
+    lab_events = records(run / "events.jsonl")
+    out = [f"# {meta['scenario']} at {ref8}", ""]
+    out += [f"- ref: `{meta['ref']}` → `{meta['sha']}`", f"- profile: {meta['profile']} ({meta['build']} build)",
+            f"- uids: brokerd {meta['uids']['broker']}, gatewayd {meta['uids']['gateway']}"
+            f" ({meta['uids']['separation']})",
+            f"- started {meta['started_utc']}, finished {meta.get('finished_utc', '?')}",
+            f"- status: **{meta.get('status', 'unknown')}**", ""]
+    if meta.get("cost"):
+        out += [f"- real-profile cost: ${meta['cost']['spent_usd']} of ${meta['cost']['cap_usd']} "
+                f"({meta['cost']['prompt_tokens']} prompt, {meta['cost']['completion_tokens']} completion tokens)", ""]
+    replies = [t for t in turns if t["kind"] == "reply"]
+    kinds = collections.Counter(t["kind"] for t in turns)
+    slot_events = {name: count for name, count in events.items() if SLOT.search(name)}
+    dropped = {name: count for name, count in events.items() if DROPPED.search(name)}
+    resets = events.get("gateway_journal_reset", 0)
+    restarts = sum(1 for e in lab_events if e.get("event") == "daemon-ready" and e.get("daemon") == "gatewayd") - 1
+    out += ["## Counts", "",
+            f"- turns sent: {len(turns)}; replies: {len(replies)}; other outcomes: "
+            f"{dict((k, v) for k, v in kinds.items() if k != 'reply') or 'none'}",
+            "- summary slot transitions: " + (f"{sum(slot_events.values())} {slot_events}" if slot_events
+                                              else f"0 (no slot events at {ref8})"),
+            "- dropped jobs: " + (f"{sum(dropped.values())} {dropped}" if dropped
+                                  else f"0 (no drop events at {ref8})"),
+            f"- journal resets (`gateway_journal_reset`): {resets}",
+            f"- gatewayd restarts: {max(restarts, 0)}",
+            f"- model calls: {len(chats)} chat, {len(summaries)} summarizer "
+            f"{dict(collections.Counter(c.get('status') for c in summaries))}",
+            "- memory deviations: " + str(dict(collections.Counter(
+                (row.get("fields", row)).get("reason") for row in gateway
+                if event_name(row) == "gateway_memory_deviation")) or "none"),
+            f"- journal append failures: {events.get('gateway_journal_append_failed', 0)}; "
+            f"retention failures: {events.get('gateway_memory_retention_failed', 0)}",
+            f"- gatewayd errors/warnings: {sum(1 for r in gateway if r.get('level') == 'ERROR')}/"
+            f"{sum(1 for r in gateway if r.get('level') == 'WARN')}; "
+            f"brokerd: {sum(1 for r in broker if r.get('level') == 'ERROR')}/"
+            f"{sum(1 for r in broker if r.get('level') == 'WARN')}", ""]
+    wall = lambda rows: [float(t["wall_ms"]) for t in rows]  # noqa: E731
+    out += ["## Reply latency (ms, replies only)", "", "| set | n | p50 | p95 | max |", "|---|---|---|---|---|",
+            latency_line("all", wall(replies)),
+            latency_line("summary in flight", wall([t for t in replies if t["summary_in_flight"] == "yes"])),
+            latency_line("no summary in flight", wall([t for t in replies if t["summary_in_flight"] == "no"]))]
+    for key in sorted({(t["phase"], t["conversation"]) for t in replies}):
+        out.append(latency_line(f"{key[0]} / {key[1]}",
+                                wall([t for t in replies if (t["phase"], t["conversation"]) == key])))
+    out += [""]
+    out += ["## Resources", ""]
+    peaks = {}
+    if (run / "rss.csv").exists():
+        for row in csv.DictReader(open(run / "rss.csv", encoding="utf-8")):
+            peak = peaks.setdefault(row["daemon"], [0, 0, 0])
+            peak[0] = max(peak[0], int(row["rss_kib"]))
+            peak[1] = max(peak[1], int(row["hwm_kib"]))
+            peak[2] += 1
+    for daemon, (rss, hwm, samples) in sorted(peaks.items()):
+        out.append(f"- {daemon}: peak sampled RSS {rss / 1024:.1f} MiB, peak VmHWM {hwm / 1024:.1f} MiB "
+                   f"({samples} samples)")
+    journal_bytes, journal_files = tree_bytes(run / "journal")
+    out.append(f"- journal at end: {journal_bytes} bytes in {journal_files} files")
+    for label in ("journal-at-kill", "journal-before-corrupt", "journal-off"):
+        if (run / label).exists():
+            size, count = tree_bytes(run / label)
+            out.append(f"- {label}: {size} bytes in {count} files")
+    services, names = spans(run / "traces.jsonl")
+    out.append(f"- spans exported: {dict(services) or 'none'}; log records: {dict(log_records(run / 'logs.jsonl')) or 'none'}")
+    if names:
+        out.append("- top span names: " + ", ".join(f"{n} {c}" for n, c in names.most_common(8)))
+    out += [""]
+    out += verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8)
+    findings = meta.get("findings") or {}
+    if findings:
+        out += ["## Findings", ""] + [f"- {key}: {value}" for key, value in findings.items()] + [""]
+    return "\n".join(out)
+
+
+def verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8):
+    scenario = meta["scenario"]
+    timeout = meta["summarizer_timeout_ms"]
+    lines = ["## Verdict", ""]
+    lost = [t for t in turns if t["kind"] != "reply"]
+    if not turns:
+        return lines + ["- **no turns ran**; see status", ""]
+    lines.append(f"- every turn got a reply: {'yes' if not lost else 'NO, ' + str(len(lost)) + ' did not'}")
+    if scenario.startswith("summarizer-"):
+        waited = [t for t in replies if t["conversation"] == "summary" and float(t["wall_ms"]) >= timeout * 0.8]
+        lines.append(f"- summary-route replies that took ≥ 80% of the {timeout} ms summarizer timeout: "
+                     f"{len(waited)} of {sum(1 for t in replies if t['conversation'] == 'summary')}"
+                     + (" — **replies waited on a summary**" if waited else " — no reply waited on a summary"))
+        other = [t for t in replies if t["conversation"] != "summary" and float(t["wall_ms"]) >= timeout * 0.8]
+        lines.append(f"- other-route replies that slow: {len(other)}")
+    if scenario == "restart-mid-summary":
+        findings = meta.get("findings", {})
+        if not slot_events:
+            lines.append(f"- slot resume: **not applicable at {ref8}** (no summary slot events or files; "
+                         f"the summarizer was re-called {findings.get('summarizer re-called for killed turn after restart')} "
+                         "times for the killed turn)")
+        else:
+            resumed = findings.get("summarizer re-called for killed turn after restart", 0)
+            lines.append(f"- slot resume: {'pass' if resumed else 'FAIL'} (summarizer re-called {resumed} times)")
+    if scenario == "unloadable-journal":
+        lines.append(f"- exactly one reset record: {'pass' if resets == 1 else 'FAIL (' + str(resets) + ')'}")
+        after = [t for t in turns if t["phase"] == "after"]
+        lines.append(f"- clean start: {'pass' if after and all(t['kind'] == 'reply' for t in after) else 'FAIL'}"
+                     f" ({sum(1 for t in after if t['kind'] == 'reply')}/{len(after)} replies after boot)")
+    if scenario == "flood":
+        lines.append("- tool output size: see Findings (the shell caps a script's output)")
+    return lines + [""]
+
+
+def main():
+    run = Path(sys.argv[1])
+    text = build(run)
+    (run / "summary.md").write_text(text + "\n")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
