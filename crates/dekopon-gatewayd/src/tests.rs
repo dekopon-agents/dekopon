@@ -14660,6 +14660,147 @@ fn assert_trace_opens_at_receipt(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_queued_message_links_the_message_that_held_it() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("queued-link-test")))
+        .set_default();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+            ResponseEnvelope::capabilities(Vec::new(), Vec::new(), BTreeMap::new()),
+        ],
+    )
+    .await;
+    let model = BlockedModel::new("first turn");
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let driver = Arc::new(RecordingDriver::default());
+    let running = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message("first"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .with_current_subscriber(),
+    );
+    model.wait_until_entered().await;
+    run_session(
+        runner,
+        route(model_config()),
+        message_from("tel.999", "second"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    model.release();
+    running.await.expect("both turns finish");
+    provider.force_flush().unwrap();
+
+    let messages = exported
+        .0
+        .lock()
+        .iter()
+        .filter(|span| span.name == "gateway.message")
+        .map(|span| {
+            let outcome = span
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == "outcome")
+                .map(|attribute| attribute.value.to_string());
+            (span.span_context.clone(), outcome, span.links.links.clone())
+        })
+        .collect::<Vec<_>>();
+    let [
+        (queued, Some(queued_outcome), _),
+        (held, _, _),
+        (followed, _, links),
+    ] = messages.as_slice()
+    else {
+        panic!("three gateway.message spans: {messages:?}");
+    };
+    assert_eq!(queued_outcome, "queued");
+    assert_ne!(queued.trace_id(), held.trace_id());
+    assert_ne!(followed.trace_id(), held.trace_id());
+    assert!(
+        links
+            .iter()
+            .any(|link| link.span_context.span_id() == held.span_id()
+                && link.span_context.trace_id() == held.trace_id()),
+        "the dequeued message links the turn it waited behind: {links:?}"
+    );
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn a_stopped_turn_marks_its_stop_reply_delivered_as_cancelled() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let model = ModelScript::new([script_call("sleep 300")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&model), 4);
+    let running = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        message("stop me"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    while model.requests() == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        runner
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
+        CancelOutcome::Cancelled
+    );
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the stopped turn finishes")
+        .expect("session task finishes");
+    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    let delivered = capture.events_where(
+        "dekopon_gatewayd::audit",
+        &[("audit.event", "reply.delivered")],
+    );
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].field("outcome"), Some("cancelled"));
+    assert_eq!(delivered[0].parent(), Some("gateway.session"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     use opentelemetry::trace::{Status, TracerProvider as _};
     use opentelemetry_sdk::{

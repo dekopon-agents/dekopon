@@ -16,7 +16,7 @@ fn held(gate: &SessionGate, route: &BoundRoute) -> SessionAdmission {
     let Admit::Admitted(admission, _, receipts) = admit(gate, route, message("first")) else {
         panic!("first message must be admitted");
     };
-    receipts.finish("answered");
+    receipts.finish(crate::session::MessageOutcome::Answered);
     admission
 }
 

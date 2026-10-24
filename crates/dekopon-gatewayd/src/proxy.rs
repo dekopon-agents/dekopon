@@ -288,7 +288,8 @@ pub(crate) async fn listen(
     tasks.spawn(listener.serve(router, proxy.max_connections, std::future::pending()));
     tracing::info!(
         event = "gateway_proxy_listening",
-        proxy.port = address.port()
+        proxy.port = address.port(),
+        "gateway.proxy.listening"
     );
     Ok(address)
 }

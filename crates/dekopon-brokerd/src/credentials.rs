@@ -546,7 +546,7 @@ fn open_auth_file(
         path = %auth_file.display(),
         expires_at = status.expires_at,
         expired = status.expired,
-        "loaded a ChatGPT subscription credential"
+        "broker.chatgpt.credential.loaded"
     );
     Ok(credential)
 }
@@ -606,7 +606,7 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
                     credential = %self.name,
                     category = "refresh-task",
                     error = %source,
-                    "the credential refresh task did not complete"
+                    "broker.chatgpt.credential.refresh.failed"
                 );
                 return Err(CredentialRefreshError::Unavailable {
                     category: "refresh-task",
@@ -636,7 +636,7 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
                 credential = %self.name,
                 category = "invalid-material",
                 reason = %source,
-                "a renewed ChatGPT credential is not presentable"
+                "broker.chatgpt.credential.refresh.failed"
             );
             CredentialRefreshError::Unavailable {
                 category: "invalid-material",
@@ -675,8 +675,8 @@ impl ChatGptSubscriptionCredential {
                 path = %self.credential.path().display(),
                 category = category,
                 error = %error_chain(error),
-                "the ChatGPT subscription credential must be renewed with `dekopon-gatewayd auth chatgpt \
-                 login --auth-file`"
+                remedy = "dekopon-gatewayd auth chatgpt login --auth-file",
+                "broker.chatgpt.credential.reauth.required"
             );
             CredentialRefreshError::ReauthorizationRequired
         } else {
@@ -685,7 +685,7 @@ impl ChatGptSubscriptionCredential {
                 credential = %self.name,
                 category = category,
                 error = %error_chain(error),
-                "a ChatGPT subscription credential could not be renewed"
+                "broker.chatgpt.credential.refresh.failed"
             );
             CredentialRefreshError::Unavailable { category }
         }

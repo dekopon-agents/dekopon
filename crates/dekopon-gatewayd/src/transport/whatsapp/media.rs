@@ -43,7 +43,11 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
 
 /// Fixed local reason only, never service text, an expiring URL, or a credential.
 pub(super) fn failure(reason: &str) -> TransportError {
-    tracing::warn!(event = "gateway_whatsapp_media_refused", reason);
+    tracing::warn!(
+        event = "gateway_whatsapp_media_refused",
+        reason,
+        "gateway.whatsapp.media.refused"
+    );
     TransportError::Service {
         code: reason.to_owned(),
     }
@@ -59,7 +63,11 @@ fn request_failed(error: reqwest::Error) -> TransportError {
     } else {
         "request"
     };
-    tracing::warn!(event = "gateway_whatsapp_media_refused", reason = cause);
+    tracing::warn!(
+        event = "gateway_whatsapp_media_refused",
+        reason = cause,
+        "gateway.whatsapp.media.refused"
+    );
     TransportError::Request(Box::new(error.without_url()))
 }
 
@@ -94,7 +102,8 @@ async fn json_response(response: reqwest::Response) -> Result<Value, TransportEr
             event = "gateway_whatsapp_media_refused",
             reason = "json",
             line = source.line(),
-            column = source.column()
+            column = source.column(),
+            "gateway.whatsapp.media.refused"
         );
         TransportError::MalformedResponse(source)
     })
@@ -103,7 +112,7 @@ async fn json_response(response: reqwest::Response) -> Result<Value, TransportEr
 impl WhatsappDriver {
     fn download_url(&self, value: &str) -> Result<reqwest::Url, TransportError> {
         let url = reqwest::Url::parse(value).map_err(|source| {
-            tracing::warn!(event = "gateway_whatsapp_media_refused", reason = "url-parse", cause = %source);
+            tracing::warn!(event = "gateway_whatsapp_media_refused", reason = "url-parse", cause = %source, "gateway.whatsapp.media.refused");
             TransportError::Response
         })?;
         let trusted = url.scheme() == "https"
@@ -136,7 +145,7 @@ impl WhatsappDriver {
             return error;
         }
         tracing::warn!(event = "gateway_whatsapp_reply_partial", transport = %self.transport,
-            category = error.category(), delivered = accepted);
+            category = error.category(), delivered = accepted, "gateway.whatsapp.reply.partial");
         TransportError::PartialDelivery
     }
 

@@ -116,10 +116,7 @@ fn join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, TransportErro
         } else {
             "cancelled"
         };
-        tracing::error!(
-            reason,
-            "attachment hydration task failed; provider already executed"
-        );
+        tracing::error!(reason, "gateway.hydration.failed");
         TransportError::AttachmentTask { reason }
     })
 }

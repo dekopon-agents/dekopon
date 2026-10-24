@@ -26,7 +26,7 @@ struct StageRecord {
     elapsed: Duration,
     paused: bool,
     meter: Arc<StageMeter>,
-    last_span: Option<tracing::Span>,
+    last_span: Option<(tracing::Span, Duration)>,
     compound_span: Option<tracing::Span>,
 }
 
@@ -79,7 +79,11 @@ impl Drop for StageTrace {
     fn drop(&mut self) {
         STAGES.with_borrow_mut(|stages| {
             let Some(record) = stages.pop() else { return };
-            if let Some(span) = record.compound_span.as_ref().or(record.last_span.as_ref()) {
+            if let Some(span) = record
+                .compound_span
+                .as_ref()
+                .or(record.last_span.as_ref().map(|(span, _)| span))
+            {
                 record_on(
                     span,
                     &record,
@@ -135,9 +139,13 @@ pub(crate) fn record_compound_stage(span: &tracing::Span) {
 pub(crate) fn record_stage_command(span: &tracing::Span) {
     STAGES.with_borrow_mut(|stages| {
         if let Some(record) = stages.last_mut() {
-            record_on(span, record, record.elapsed + record.started.elapsed());
-            if record.compound_span.is_none() {
-                record.last_span = Some(span.clone());
+            let elapsed = record.elapsed + record.started.elapsed();
+            if record.compound_span.is_some() {
+                record_on(span, record, elapsed);
+            } else if let Some((previous, finished)) =
+                record.last_span.replace((span.clone(), elapsed))
+            {
+                record_on(&previous, record, finished);
             }
         }
     });

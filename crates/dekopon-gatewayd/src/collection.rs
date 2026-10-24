@@ -8,6 +8,7 @@ use crate::{
     config::TransportConfig,
     follow,
     routes::BoundRoute,
+    session::MessageOutcome,
     transport::{CancelRequest, InboundMessage, MAX_INBOUND_TEXT_BYTES, ReplyTarget},
 };
 
@@ -298,9 +299,9 @@ impl Batch {
 pub(crate) struct Dispositions(pub(crate) Vec<tracing::Span>);
 
 impl Dispositions {
-    pub(crate) fn finish(mut self, outcome: &'static str) {
+    pub(crate) fn finish(mut self, outcome: MessageOutcome) {
         for receipt in self.0.drain(..) {
-            disposition(&receipt, outcome);
+            disposition(&receipt, outcome.label());
         }
     }
 }
@@ -320,12 +321,18 @@ pub(crate) fn record_received(message: &InboundMessage) {
         subject = %message.subject,
         channel = message.conversation.id.as_str(),
         text = message.text.as_str(), },
-        "gateway message received"
+        "gateway.message.received"
     );
 }
 
 pub(crate) fn disposition(receipt: &tracing::Span, outcome: &'static str) {
-    receipt.in_scope(|| tracing::info!(event = "gateway_input_disposition", outcome));
+    receipt.in_scope(|| {
+        tracing::info!(
+            event = "gateway_input_disposition",
+            outcome,
+            "gateway.input.disposition"
+        )
+    });
 }
 
 #[cfg(test)]

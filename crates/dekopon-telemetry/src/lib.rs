@@ -59,7 +59,12 @@ pub struct TraceContextParts {
 
 #[must_use]
 pub fn current_trace_context() -> Option<TraceContextParts> {
-    let context = tracing::Span::current().context();
+    span_trace_context(&tracing::Span::current())
+}
+
+#[must_use]
+pub fn span_trace_context(span: &tracing::Span) -> Option<TraceContextParts> {
+    let context = span.context();
     let span = context.span();
     let span_context = span.span_context();
     if !span_context.is_valid() {

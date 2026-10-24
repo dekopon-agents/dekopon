@@ -13,7 +13,8 @@ fn read(
             tracing::info!(
                 event = "provider_random_read",
                 length,
-                status = "refused-phase"
+                status = "refused-phase",
+                "provider.random.read"
             );
             return Err(wasmtime::Error::msg("random bytes outside invoke"));
         }
@@ -24,7 +25,8 @@ fn read(
         tracing::info!(
             event = "provider_random_read",
             length,
-            status = "refused-size"
+            status = "refused-size",
+            "provider.random.read"
         );
         return Err(wasmtime::Error::msg("random request exceeds host limit"));
     }
@@ -38,7 +40,8 @@ fn read(
             event = "provider_random_read",
             length,
             status = "entropy-failed",
-            ?source
+            ?source,
+            "provider.random.read"
         );
         return Err(wasmtime::Error::msg("OS entropy unavailable"));
     }

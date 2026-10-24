@@ -147,7 +147,8 @@ impl TelegramTransport {
                         tracing::warn!(
                             event = "gateway_transport_ack_failed",
                             transport = %self.name,
-                            category = error.category()
+                            category = error.category(),
+                            "gateway.transport.ack.failed"
                         );
                     }
                     self.pending
@@ -264,7 +265,8 @@ impl TelegramTransport {
             tracing::debug!(
                 event = "gateway_transport_press_ignored",
                 transport = %self.name,
-                reason
+                reason,
+                "gateway.transport.press.ignored"
             );
             None
         };

@@ -155,6 +155,7 @@ where
                                 error.kind = kind,
                                 backoff_ms = accept_backoff_ms,
                                 error = %dekopon_core::error_chain(&source),
+                                "broker.accept.retried"
                             );
                             tokio::time::sleep(Duration::from_millis(accept_backoff_ms)).await;
                             accept_backoff_ms =
@@ -203,6 +204,7 @@ where
                 event = "broker_connection_rejected",
                 reason = "connection_limit",
                 refusal.written = refused,
+                "broker.connection.rejected"
             );
             return;
         };
@@ -307,16 +309,19 @@ fn observe_task(result: Result<Result<(), ConnectionError>, tokio::task::JoinErr
                     category = error.category(),
                     invocation.id = %invocation,
                     error = %cause,
+                    "broker.outcome.unaudited"
                 ),
                 None if error.is_capacity_exhausted() => tracing::error!(
                     event = "broker_capacity_exhausted",
                     category = error.category(),
                     error = %cause,
+                    "broker.capacity.exhausted"
                 ),
                 None => tracing::warn!(
                     event = "broker_connection_failed",
                     category = error.category(),
                     error = %cause,
+                    "broker.connection.failed"
                 ),
             }
         }
@@ -329,6 +334,7 @@ fn observe_task(result: Result<Result<(), ConnectionError>, tokio::task::JoinErr
             } else {
                 "task-cancelled"
             },
+            "broker.connection.failed"
         ),
     }
 }
@@ -365,7 +371,7 @@ fn report_command_run_failure(word: &str, error: &dekopon_broker_host::BrokerHos
             error.kind = "provider",
             error = %dekopon_core::error_chain(error),
         },
-        "command-word run failed"
+        "command.resolve.failed"
     );
 }
 
@@ -431,7 +437,11 @@ fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {
         span_id: parent.parent_id(),
         flags: parent.flags(),
     })) {
-        tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
+        tracing::debug!(
+            event = "broker_trace_parent_ignored",
+            error = %error,
+            "broker.trace.parent.ignored"
+        );
     }
 }
 
@@ -457,7 +467,11 @@ where
     let Some(peer) = identities.get(&uid) else {
         // The wire refusal is deliberately opaque; an unmapped UID is also the usual reason a
         // broker's readiness probe fails, since it connects as the broker's own UID.
-        tracing::warn!(event = "broker_peer_unmapped", peer.uid = uid);
+        tracing::warn!(
+            event = "broker_peer_unmapped",
+            peer.uid = uid,
+            "broker.peer.unmapped"
+        );
         stream
             .write_frame(
                 &ResponseEnvelope::error(
@@ -498,6 +512,7 @@ where
                 event = "broker_request_frame_invalid",
                 error.kind = protocol_error_kind(&error),
                 error = %error,
+                "broker.request.frame.invalid"
             );
             stream
                 .write_frame(
@@ -528,6 +543,7 @@ where
             event = "broker_generation_refused",
             peer.uid = uid,
             reason = "not-reconciliation-owner",
+            "broker.generation.refused"
         );
         return stream
             .write_frame(
@@ -718,6 +734,7 @@ where
             tracing::warn!(
                 event = "broker_request_frame_invalid",
                 error.kind = "unexpected-upcall-result",
+                "broker.request.frame.invalid"
             );
             stream
                 .write_frame(
@@ -800,6 +817,7 @@ impl Upcaller<'_> {
                     event = "broker_upcall_failed",
                     error.kind = error.kind(),
                     error = %dekopon_core::error_chain(error),
+                    "broker.upcall.failed"
                 );
             }
             if let Some(outcome) = outcome {

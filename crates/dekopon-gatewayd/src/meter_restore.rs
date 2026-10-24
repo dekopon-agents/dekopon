@@ -128,7 +128,7 @@ pub(crate) async fn restore_once(
                 event = "meter.restore",
                 rows = rows.len(),
                 lookback_ms = (window.until.0 - window.since.0).max(0),
-                "token windows restored"
+                "meter.restore"
             );
         }
         Err(error) => {
@@ -138,7 +138,7 @@ pub(crate) async fn restore_once(
                 event = "meter.restore",
                 error.kind = error.kind(),
                 error = %error,
-                "token windows start from live charges only"
+                "meter.restore"
             );
         }
     }
@@ -317,7 +317,7 @@ pub(crate) fn parse_openobserve(body: &[u8]) -> Result<Vec<HistoryRow>, RestoreE
         .filter_map(|row| {
             let tokens = tokens(row.input).saturating_add(tokens(row.output));
             let Ok(agent) = row.agent.parse() else {
-                tracing::debug!(target: "meter", "restore skipped a row naming no valid agent");
+                tracing::debug!(target: "meter", "meter.restore.skipped");
                 return None;
             };
             Some(
@@ -399,7 +399,7 @@ pub(crate) fn parse_quickwit(body: &[u8]) -> Result<Vec<HistoryRow>, RestoreErro
     let mut rows = Vec::new();
     for agent in agents.buckets {
         let Ok(id) = agent.key.parse() else {
-            tracing::debug!(target: "meter", "restore skipped a bucket naming no valid agent");
+            tracing::debug!(target: "meter", "meter.restore.skipped");
             continue;
         };
         for model in agent.model.buckets {

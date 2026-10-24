@@ -208,13 +208,17 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
     let code = match execute(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!(event = "gateway_exit", error = %error_chain(&error));
+            tracing::error!(event = "gateway_exit", error = %error_chain(&error), "gateway.exit");
             ExitCode::FAILURE
         }
     };
 
     if let Err(error) = telemetry.shutdown() {
-        tracing::error!(event = "gateway_telemetry_shutdown_failed", error = %error);
+        tracing::error!(
+            event = "gateway_telemetry_shutdown_failed",
+            error = %error,
+            "gateway.telemetry.shutdown.failed"
+        );
     }
     code
 }
@@ -226,7 +230,11 @@ async fn execute(config: std::path::PathBuf) -> Result<(), AppError> {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if result.is_err() {
-                    tracing::error!(event = "gateway_signal_failed", signal = "interrupt");
+                    tracing::error!(
+                        event = "gateway_signal_failed",
+                        signal = "interrupt",
+                        "gateway.signal.failed"
+                    );
                 }
             }
             _ = terminate.recv() => {}

@@ -651,13 +651,13 @@ fn compile_component(
         if let Ok(compiled) = &mut result {
             compiled.compile_ms = elapsed_ms;
         }
-        let outcome = if result.is_ok() { "ok" } else { "error" };
+        let outcome = if result.is_ok() { "succeeded" } else { "failed" };
         span.record("elapsed_us", elapsed_us);
         span.record("elapsed_ms", elapsed_ms);
         span.record("outcome", outcome);
         match &result {
-            Ok(_) => tracing::info!(elapsed_us, outcome, "provider component load finished"),
-            Err(error) => tracing::error!(elapsed_us, outcome, error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(error)), "provider component load failed"),
+            Ok(_) => tracing::info!(elapsed_us, outcome, "provider.load.finished"),
+            Err(error) => tracing::error!(elapsed_us, outcome, error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(error)), "provider.load.failed"),
         }
         result
     })
@@ -677,7 +677,7 @@ fn prepare_component(
     tracing::info!(
         source_verify_us,
         artifact_bytes = artifact.bytes,
-        "provider source verified"
+        "provider.source.verified"
     );
     let expected_provider_id = source.expected.map(|expected| expected.provider_id);
     let source = source.path;
@@ -884,7 +884,7 @@ impl BrokerWasmProvider {
             capabilities = manifest.capabilities.len(),
             command_words = manifest.command_words.len(),
             command_export = command_export_name(&command_export),
-            "loaded broker provider"
+            "provider.loaded"
         );
         let mut provider = Self {
             runtime,
@@ -1038,7 +1038,7 @@ impl BrokerWasmProvider {
                 tracing::warn!(
                     provider = %self.manifest.id,
                     error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(&error)),
-                    "provider --help render failed at load"
+                    "provider.help.failed"
                 );
                 return None;
             }
@@ -1049,7 +1049,7 @@ impl BrokerWasmProvider {
                 tracing::warn!(
                     provider = %self.manifest.id,
                     error = %error,
-                    "provider --help answer did not decode at load"
+                    "provider.help.failed"
                 );
                 return None;
             }
@@ -1063,7 +1063,7 @@ impl BrokerWasmProvider {
             _ => {
                 tracing::warn!(
                     provider = %self.manifest.id,
-                    "provider --help did not render successfully at load"
+                    "provider.help.failed"
                 );
                 None
             }
@@ -1547,10 +1547,14 @@ impl BrokerProviderRegistry {
         .instrument(span.clone())
         .await;
         let elapsed_us = cwasm::micros(started);
-        let outcome = if result.is_ok() { "ok" } else { "error" };
+        let outcome = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        };
         span.record("elapsed_us", elapsed_us);
         span.record("outcome", outcome);
-        span.in_scope(|| tracing::info!(elapsed_us, outcome, "provider registry load finished"));
+        span.in_scope(|| tracing::info!(elapsed_us, outcome, "provider.registry.loaded"));
         result
     }
 

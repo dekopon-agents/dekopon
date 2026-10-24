@@ -553,6 +553,7 @@ impl Journal {
                 authority,
                 fallback_reason = fallback_reason.unwrap_or("none"),
                 policy = mode,
+                "gateway.memory.selection"
             );
         }
         Ok(fitted.history)

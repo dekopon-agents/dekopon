@@ -390,14 +390,20 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
         {
             match table.stay(key, SystemTime::now()) {
                 Ok(()) => {
-                    tracing::info!(audit.event = "gateway.follow", operation = "invited", route)
+                    tracing::info!(
+                        audit.event = "gateway.follow",
+                        operation = "invited",
+                        route,
+                        "gateway.follow"
+                    )
                 }
                 Err(error) => {
                     tracing::warn!(
                         audit.event = "gateway.follow",
                         operation = "refused",
                         route,
-                        reason = error.label()
+                        reason = error.label(),
+                        "gateway.follow"
                     );
                     return CapabilityCallResult::Failed {
                         error: "follow marker was not persisted".to_owned(),

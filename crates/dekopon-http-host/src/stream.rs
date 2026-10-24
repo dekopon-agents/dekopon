@@ -208,7 +208,7 @@ fn record_asset(active: ActiveFile) {
     tracing::info!("asset.id" = active.part.id, "asset.content_type" = active.part.content_type,
         "asset.bytes" = active.cursor,
         "asset.sha256" = %active.digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-        "streamed asset consumed by HTTP body");
+        "http.asset.streamed");
 }
 
 fn read_chunk(mut active: ActiveFile) -> io::Result<Chunk> {
@@ -637,7 +637,7 @@ impl BufferedHttpClient {
                 "over-budget: broker asset disk capacity exhausted",
             ),
             AssetIoError::Io { kind } => {
-                tracing::error!(?kind, "streamed HTTP spool I/O failed");
+                tracing::error!(?kind, "http.spool.failed");
                 http_error(ErrorCode::Internal, "broker asset spool I/O failed")
             }
             AssetIoError::Worker => {

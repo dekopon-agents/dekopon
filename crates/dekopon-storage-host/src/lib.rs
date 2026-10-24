@@ -402,6 +402,7 @@ impl StorageHost {
             event = "storage_namespace_capacity",
             storage.namespace.count = namespace_count,
             storage.namespace.limit = limits.max_namespaces,
+            "storage.namespace.capacity"
         );
         let ledger = QuotaLedger::new(limits.clone(), usage);
         #[allow(
@@ -697,7 +698,7 @@ fn report_namespace_reset(reset: Reset, fresh: &Namespace) -> StorageHostError {
             .path
             .as_deref()
             .map(|path| tracing::field::display(path.display())),
-        "storage namespace was corrupt; it now opens a fresh generation and this invocation failed"
+        "storage.namespace.reset"
     );
     StorageHostError::Corrupt {
         scope: reset.check,
@@ -718,7 +719,7 @@ pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::
         decode.class = ?error.classify(),
         decode.line = error.line(),
         decode.column = error.column(),
-        "retained storage document did not decode"
+        "storage.document.decode.failed"
     );
 }
 

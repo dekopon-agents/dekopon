@@ -459,7 +459,8 @@ impl DiscordTransport {
                             tracing::debug!(
                                 event = "gateway_cancel_ack_failed",
                                 transport = %self.name,
-                                category = error.category()
+                                category = error.category(),
+                                "gateway.cancel.ack.failed"
                             );
                         }
                         Ok(PumpResult::Event(TransportEvent::CancelRequested(request)))
@@ -541,7 +542,7 @@ impl DiscordTransport {
                     transport,
                     subject,
                     channel, },
-                    "gateway message dropped"
+                    "gateway.message.dropped"
                 );
             }
             DropReason::MalformedEnvelope
@@ -555,7 +556,7 @@ impl DiscordTransport {
                     subject,
                     channel,
                     mention.roles = mention_roles, },
-                    "gateway message dropped"
+                    "gateway.message.dropped"
                 );
             }
         }
@@ -704,7 +705,12 @@ impl DiscordTransport {
     /// must not stall the reader that also sends heartbeats.
     async fn lookup(&self, path: &str, event: &'static str) -> Option<Value> {
         if self.driver.rest_cooldown().is_some() {
-            tracing::debug!(event = event, transport = %self.name, cause = "rest-cooldown");
+            tracing::debug!(
+                event = event,
+                transport = %self.name,
+                cause = "rest-cooldown",
+                "gateway.discord.lookup.failed"
+            );
             return None;
         }
         let response = timeout(
@@ -725,7 +731,8 @@ impl DiscordTransport {
                     event = event,
                     transport = %self.name,
                     cause = "status",
-                    status = response.status().as_u16()
+                    status = response.status().as_u16(),
+                    "gateway.discord.lookup.failed"
                 );
                 return None;
             }
@@ -734,12 +741,18 @@ impl DiscordTransport {
                     event = event,
                     transport = %self.name,
                     cause = "request",
-                    cause_type = %source
+                    cause_type = %source,
+                    "gateway.discord.lookup.failed"
                 );
                 return None;
             }
             Err(_elapsed) => {
-                tracing::debug!(event = event, transport = %self.name, cause = "timeout");
+                tracing::debug!(
+                    event = event,
+                    transport = %self.name,
+                    cause = "timeout",
+                    "gateway.discord.lookup.failed"
+                );
                 return None;
             }
         };
@@ -750,7 +763,8 @@ impl DiscordTransport {
                     event = event,
                     transport = %self.name,
                     cause = "body",
-                    cause_type = %source
+                    cause_type = %source,
+                    "gateway.discord.lookup.failed"
                 );
                 return None;
             }
@@ -762,7 +776,8 @@ impl DiscordTransport {
                     event = event,
                     transport = %self.name,
                     cause = "body",
-                    cause_type = %source
+                    cause_type = %source,
+                    "gateway.discord.lookup.failed"
                 );
                 None
             }
@@ -783,7 +798,8 @@ impl DiscordTransport {
             tracing::debug!(
                 event = "gateway_conversation_unresolved",
                 transport = %self.name,
-                cause = "channel-type"
+                cause = "channel-type",
+                "gateway.conversation.unresolved"
             );
             return None;
         };
@@ -817,7 +833,8 @@ impl DiscordTransport {
             tracing::debug!(
                 event = "gateway_role_unresolved",
                 transport = %self.name,
-                cause = "role-shape"
+                cause = "role-shape",
+                "gateway.role.unresolved"
             );
             return None;
         };

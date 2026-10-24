@@ -2983,6 +2983,7 @@ where
                         event = "broker_policy_evaluation_error",
                         invocation = %request.id,
                         policy.target = "capability",
+                        "broker.policy.evaluation.error"
                     );
                 }
                 if let Some(cause) = &decision.refusal {
@@ -2993,7 +2994,7 @@ where
                             capability.id = %request.capability,
                             error.reason = %cause,
                         },
-                        "policy request could not be constructed"
+                        "policy.request.refused"
                     );
                 }
                 return self
@@ -3038,6 +3039,7 @@ where
                             event = "broker_policy_evaluation_error",
                             invocation = %request.id,
                             policy.target = "secret",
+                            "broker.policy.evaluation.error"
                         );
                     }
                     return self
@@ -3416,7 +3418,7 @@ where
                             decision.id = decision_id.as_str(),
                             request.body.reason = opaque.label(),
                         },
-                        "denied HTTP request carried a body policy could not read"
+                        "policy.request.body_opaque"
                     );
                 }
                 let reason =
@@ -3429,6 +3431,7 @@ where
                             invocation = %invocation,
                             point = "http.request",
                             cause_type = std::any::type_name_of_val(&source),
+                            "broker.decision.evidence.failed"
                         );
                         return Box::pin(async { false })
                             as std::pin::Pin<Box<dyn Future<Output = bool> + Send>>;
@@ -3572,6 +3575,7 @@ where
                         event = "broker_secret_resolution_failed",
                         invocation = %invocation_id,
                         category = source.category,
+                        "broker.secret.resolution.failed"
                     );
                     return self
                         .fail_authorized_before_provider(
@@ -3623,6 +3627,7 @@ where
                         invocation = %invocation_id,
                         category = "invalid-material",
                         cause_type = std::any::type_name_of_val(&source),
+                        "broker.secret.credential.failed"
                     );
                     return self
                         .fail_authorized_before_provider(
@@ -3660,7 +3665,7 @@ where
                                 credential = legacy_credential_name.as_deref(),
                                 category = failure.category(),
                                 retryable = false,
-                                "a refreshing credential needs operator re-authorization"
+                                "broker.credential.refresh.failed"
                             );
                         } else {
                             tracing::warn!(
@@ -3669,7 +3674,7 @@ where
                                 credential = legacy_credential_name.as_deref(),
                                 category = failure.category(),
                                 retryable = true,
-                                "a refreshing credential could not be renewed"
+                                "broker.credential.refresh.failed"
                             );
                         }
                         return self
@@ -4345,6 +4350,7 @@ fn report_inspection_refusal(
         subject = %subject,
         agent = %agent,
         via = %peer.principal(),
+        "broker.capabilities.refused"
     );
 }
 
@@ -4401,7 +4407,7 @@ fn emit_audit_event(event: &AuditEvent) {
                     .map(StorageScopeCommitment::as_str),
                 storage.evidence = storage.as_ref().and_then(rendered),
             },
-            "broker decision"
+            "broker.decision"
         ),
         AuditEvent::Execution {
             invocation,
@@ -4462,7 +4468,7 @@ fn emit_audit_event(event: &AuditEvent) {
                     .map(StorageScopeCommitment::as_str),
                 storage.evidence = storage.as_ref().and_then(rendered),
             },
-            "broker execution"
+            "broker.execution"
         ),
     }
 }
@@ -4498,6 +4504,7 @@ fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: 
         category = source.category(),
         invocation = %invocation,
         error = %error_chain(source),
+        "broker.audit.append.failed"
     );
 }
 

@@ -150,6 +150,18 @@ pub enum ToolOutcome {
     Cancelled,
 }
 
+impl ToolOutcome {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Denied => "denied",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureClass {
     StepBudget,
@@ -158,6 +170,15 @@ pub enum FailureClass {
 }
 
 impl FailureClass {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::StepBudget => "step-budget",
+            Self::Model => "model",
+            Self::Internal => "internal",
+        }
+    }
+
     #[must_use]
     pub fn of(error: &PromptError) -> Option<Self> {
         match error {
@@ -189,6 +210,16 @@ impl FailureClass {
 pub enum SessionOutcome {
     Answered,
     Declined,
+}
+
+impl SessionOutcome {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Declined => "declined",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

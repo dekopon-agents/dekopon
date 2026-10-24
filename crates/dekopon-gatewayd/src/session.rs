@@ -520,16 +520,75 @@ pub(crate) struct StopOutcome {
     pub dropped: bool,
 }
 
-fn record_admission(message: &InboundMessage, outcome: &str, depth: usize, cause: Option<&str>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MessageOutcome {
+    Answered,
+    Declined,
+    Refused,
+    Failed,
+    ReplyFailed,
+    Cancelled,
+    Sealed,
+    Unauthorized,
+    FollowInactive,
+    Steered,
+    Queued,
+    Busy,
+    RouteLost,
+}
+
+impl MessageOutcome {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Declined => "declined",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+            Self::ReplyFailed => "reply-failed",
+            Self::Cancelled => "cancelled",
+            Self::Sealed => "sealed",
+            Self::Unauthorized => "unauthorized",
+            Self::FollowInactive => "follow-inactive",
+            Self::Steered => "steered",
+            Self::Queued => "queued",
+            Self::Busy => "busy",
+            Self::RouteLost => "route-lost",
+        }
+    }
+
+    const fn is_error(self) -> bool {
+        match self {
+            Self::Failed | Self::ReplyFailed => true,
+            Self::Answered
+            | Self::Declined
+            | Self::Refused
+            | Self::Cancelled
+            | Self::Sealed
+            | Self::Unauthorized
+            | Self::FollowInactive
+            | Self::Steered
+            | Self::Queued
+            | Self::Busy
+            | Self::RouteLost => false,
+        }
+    }
+}
+
+fn record_admission(
+    message: &InboundMessage,
+    outcome: MessageOutcome,
+    depth: usize,
+    cause: Option<&str>,
+) {
     if let Some(cause) = cause {
         tracing::Span::current().record("busy.cause", cause);
     }
     tracing::info!(
         target: "dekopon_gatewayd::audit",
-        { audit.event = "gateway.admission", outcome, busy.cause = cause,
+        { audit.event = "gateway.admission", outcome = outcome.label(), busy.cause = cause,
           transport = %message.transport, conversation.id = %message.conversation.key(),
           queue.depth = depth },
-        "gateway admission"
+        "gateway.admission"
     );
 }
 
@@ -552,13 +611,22 @@ impl SessionGate {
         let mut entries = self.in_flight.lock();
         if let Some(holder) = entries.get_mut(&key) {
             let Holder::Session(running) = holder else {
-                record_admission(&message, "busy", 0, Some("saturated"));
+                record_admission(&message, MessageOutcome::Busy, 0, Some("saturated"));
                 return Admit::Saturated(message, receipts);
             };
             let depth = running.steers.len() + running.follow_ups.len();
             if depth == MAILBOX_CAPACITY {
-                record_admission(&message, "busy", depth, Some("same-conversation"));
-                tracing::info!(event = "gateway_steer_refused", reason = "mailbox-full");
+                record_admission(
+                    &message,
+                    MessageOutcome::Busy,
+                    depth,
+                    Some("same-conversation"),
+                );
+                tracing::info!(
+                    event = "gateway_steer_refused",
+                    reason = "mailbox-full",
+                    "gateway.steer.refused"
+                );
                 return Admit::Full(message, receipts);
             }
             if message.subject == running.subject
@@ -572,7 +640,7 @@ impl SessionGate {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
                     MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
-                record_admission(&message, "steered", depth + 1, None);
+                record_admission(&message, MessageOutcome::Steered, depth + 1, None);
                 running.steers.push_back(message);
                 if running.steering == Steering::Abort
                     && interrupts
@@ -583,7 +651,7 @@ impl SessionGate {
                 }
                 return Admit::Steered(receipts);
             }
-            record_admission(&message, "queued", depth + 1, None);
+            record_admission(&message, MessageOutcome::Queued, depth + 1, None);
             running.follow_ups.push_back(FollowUp {
                 route: route.clone(),
                 message,
@@ -592,7 +660,7 @@ impl SessionGate {
             return Admit::Queued;
         }
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-            record_admission(&message, "busy", 0, Some("saturated"));
+            record_admission(&message, MessageOutcome::Busy, 0, Some("saturated"));
             return Admit::Saturated(message, receipts);
         };
         let running = Running::new(route, &message);
@@ -730,7 +798,8 @@ impl SessionGate {
         if permit.is_none() {
             tracing::info!(
                 event = "gateway_refusal_reply_skipped",
-                reason = "refusals-full"
+                reason = "refusals-full",
+                "gateway.refusal.reply.skipped"
             );
         }
         permit
@@ -807,7 +876,7 @@ impl SessionAdmission {
             let mut found = None;
             while let Some(mut next) = running.follow_ups.pop_front() {
                 let Some((route, evidence)) = resolve(&next.message, &next.route) else {
-                    next.receipts.finish("route-lost");
+                    next.receipts.finish(MessageOutcome::RouteLost);
                     continue;
                 };
                 if folds_in(&next.message) {
@@ -1121,7 +1190,8 @@ impl Recall<'_> {
                             event = "gateway_recalled",
                             source = "journal",
                             messages = recalled.history.len(),
-                            delta = 0
+                            delta = 0,
+                            "gateway.recalled"
                         );
                         Some(RecalledWindow {
                             history: recalled.history,
@@ -1134,7 +1204,8 @@ impl Recall<'_> {
                         tracing::warn!(
                             event = "gateway_recall_failed",
                             source = "journal",
-                            reason = error.label()
+                            reason = error.label(),
+                            "gateway.recall.failed"
                         );
                         None
                     }
@@ -1142,7 +1213,8 @@ impl Recall<'_> {
                         tracing::warn!(
                             event = "gateway_recall_failed",
                             source = "journal",
-                            reason = "task"
+                            reason = "task",
+                            "gateway.recall.failed"
                         );
                         None
                     }
@@ -1164,7 +1236,8 @@ impl Recall<'_> {
                     event = "gateway_recalled",
                     source = "platform",
                     messages = messages.len(),
-                    delta = 0
+                    delta = 0,
+                    "gateway.recalled"
                 );
                 Some(platform_window(messages, &names, window))
             }
@@ -1204,7 +1277,8 @@ impl Recall<'_> {
             event = "gateway_recalled",
             source = "platform",
             messages = messages.len(),
-            delta = messages.len()
+            delta = messages.len(),
+            "gateway.recalled"
         );
         Some(Delta { messages, names })
     }
@@ -1240,7 +1314,12 @@ impl Recall<'_> {
             Ok(Err(error)) => error.category(),
             Err(_) => "timeout",
         };
-        tracing::warn!(event = "gateway_recall_failed", source = "platform", reason);
+        tracing::warn!(
+            event = "gateway_recall_failed",
+            source = "platform",
+            reason,
+            "gateway.recall.failed"
+        );
         None
     }
 
@@ -1479,6 +1558,7 @@ pub(crate) fn run_session_resolving(
     let receipts = Dispositions(message.constituents.clone());
     async move {
         let span = message_span(&route, &message, &receipts);
+        let mut held_by = dekopon_telemetry::span_trace_context(&span);
         let mut admission = execute(&runner, &route, message, &driver, receipts, &digest)
             .instrument(span)
             .await;
@@ -1491,6 +1571,10 @@ pub(crate) fn run_session_resolving(
                 evidence: digest,
             } = resolved;
             let span = message_span(&followup.route, &followup.message, &followup.receipts);
+            if let Some(parts) = held_by {
+                dekopon_telemetry::link_remote(&span, parts);
+            }
+            held_by = dekopon_telemetry::span_trace_context(&span);
             admission = Some(
                 run_admitted(
                     &runner,
@@ -1548,8 +1632,8 @@ async fn execute(
             if let Some(notice) = &notice {
                 notice.record("steered");
             }
-            tracing::Span::current().record("outcome", "steered");
-            receipts.finish("steered");
+            tracing::Span::current().record("outcome", MessageOutcome::Steered.label());
+            receipts.finish(MessageOutcome::Steered);
             acknowledge_steer(driver.as_ref(), liveness.as_ref(), route, message_kind).await;
             None
         }
@@ -1557,7 +1641,7 @@ async fn execute(
             if let Some(notice) = &notice {
                 notice.record("queued");
             }
-            tracing::Span::current().record("outcome", "queued");
+            tracing::Span::current().record("outcome", MessageOutcome::Queued.label());
             if !is_unattended {
                 acknowledge_steer(driver.as_ref(), liveness.as_ref(), route, message_kind).await;
             }
@@ -1567,7 +1651,11 @@ async fn execute(
             if let Some(notice) = &notice {
                 notice.record("dropped");
             }
-            tracing::info!(event = "gateway_session_rejected", reason = "busy");
+            tracing::info!(
+                event = "gateway_session_rejected",
+                reason = "busy",
+                "gateway.session.rejected"
+            );
             if !matches!(message.message_id, MessageId::Follow(_))
                 && notice.is_none()
                 && (runner.reply_on_busy || !message.constituents.is_empty())
@@ -1575,8 +1663,8 @@ async fn execute(
             {
                 answer(driver, &message, BUSY_REPLY).await;
             }
-            tracing::Span::current().record("outcome", "busy");
-            receipts.finish("busy");
+            tracing::Span::current().record("outcome", MessageOutcome::Busy.label());
+            receipts.finish(MessageOutcome::Busy);
             None
         }
     }
@@ -1594,7 +1682,7 @@ async fn acknowledge_steer(
     }) && let (Some(ack), Some(target)) = (driver.steer_ack(), target)
         && let Err(error) = crate::progress::bounded(ack.seen(target)).await
     {
-        tracing::debug!(event = "gateway_steer_ack_failed", transport = %route.transport, error = %error);
+        tracing::debug!(event = "gateway_steer_ack_failed", transport = %route.transport, error = %error, "gateway.steer.ack.failed");
     }
 }
 
@@ -1606,7 +1694,8 @@ async fn run_admitted(
     receipts: Dispositions,
     (admission, digest): (SessionAdmission, &str),
 ) -> SessionAdmission {
-    let outcome = session(runner, route, &message, driver, admission.cancellation())
+    let cancellation = admission.cancellation();
+    let Ended { outcome, journal } = session(runner, route, &message, driver, cancellation.clone())
         .instrument(tracing::info_span!(
             "gateway.session",
             generation.digest = digest,
@@ -1626,12 +1715,29 @@ async fn run_admitted(
         ))
         .await;
     let span = tracing::Span::current();
-    span.record("outcome", outcome);
-    if matches!(outcome, "failed" | "reply-failed") {
+    span.record("outcome", outcome.label());
+    if outcome.is_error() {
         span.record("otel.status_code", "error");
     }
     receipts.finish(outcome);
+    if let Some(journal) = journal {
+        crate::memory::generation::persist(runner, route, &cancellation, journal).await;
+    }
     admission
+}
+
+struct Ended {
+    outcome: MessageOutcome,
+    journal: Option<crate::memory::generation::PostReply>,
+}
+
+impl From<MessageOutcome> for Ended {
+    fn from(outcome: MessageOutcome) -> Self {
+        Self {
+            outcome,
+            journal: None,
+        }
+    }
 }
 
 struct SessionSteers {
@@ -1724,7 +1830,7 @@ async fn session(
     message: &InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
-) -> &'static str {
+) -> Ended {
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
     let key = conversation_key(route, message);
@@ -1744,9 +1850,10 @@ async fn session(
                 audit.event = "gateway.follow",
                 operation = "refused",
                 route = route.route_index,
-                reason = "inactive"
+                reason = "inactive",
+                "gateway.follow"
             );
-            return "follow-inactive";
+            return MessageOutcome::FollowInactive.into();
         }
     }
     let sealed = sealed_conversation(
@@ -1763,7 +1870,11 @@ async fn session(
     match message.conversation.kind {
         ConversationKind::Thread if sealed.is_some() => {
             revoke_thread_ownership(runner, message);
-            tracing::info!(event = "gateway_session_rejected", reason = "sealed");
+            tracing::info!(
+                event = "gateway_session_rejected",
+                reason = "sealed",
+                "gateway.session.rejected"
+            );
             if !is_follow
                 && !message
                     .thread_continuation
@@ -1771,9 +1882,9 @@ async fn session(
                     .is_some_and(|continuation| continuation.inherited)
                 && answer(driver, message, SEALED_THREAD_REPLY).await
             {
-                reply_delivered("sealed");
+                reply_delivered(MessageOutcome::Sealed);
             }
-            return "sealed";
+            return MessageOutcome::Sealed.into();
         }
         ConversationKind::Thread
         | ConversationKind::DirectMessage
@@ -1788,23 +1899,25 @@ async fn session(
             revoke_thread_ownership(runner, message);
             tracing::info!(
                 event = "gateway_session_rejected",
-                reason = "attestation-refused"
+                reason = "attestation-refused",
+                "gateway.session.rejected"
             );
             if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
-                reply_delivered("unauthorized");
+                reply_delivered(MessageOutcome::Unauthorized);
             }
-            return "unauthorized";
+            return MessageOutcome::Unauthorized.into();
         }
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category(),
-                error = %error
+                error = %error,
+                "gateway.session.failed"
             );
             if !is_follow && answer(driver, message, FAILURE_REPLY).await {
-                reply_delivered("failed");
+                reply_delivered(MessageOutcome::Failed);
             }
-            return "failed";
+            return MessageOutcome::Failed.into();
         }
     };
     // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
@@ -1817,11 +1930,15 @@ async fn session(
         runner
             .conversations
             .remove(&key, EvictionReason::GrantChanged);
-        tracing::info!(event = "gateway_session_rejected", reason = "unauthorized");
+        tracing::info!(
+            event = "gateway_session_rejected",
+            reason = "unauthorized",
+            "gateway.session.rejected"
+        );
         if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
-            reply_delivered("unauthorized");
+            reply_delivered(MessageOutcome::Unauthorized);
         }
-        return "unauthorized";
+        return MessageOutcome::Unauthorized.into();
     }
     // A chat thread becomes a continuation surface only after this exact sender's fresh broker
     // grant succeeds; merely mentioning the bot or putting coordinates in model text cannot claim
@@ -1922,7 +2039,7 @@ async fn session(
             prompt.cache_key = cache_key.as_str(),
             conversation.persistent = window.is_some(),
         },
-        "gateway session prompt cache key"
+        "gateway.session.cache_key"
     );
 
     let memory_surface = leg.chat_memory_surface().cloned();
@@ -2218,7 +2335,8 @@ async fn session(
                     Err(error) => tracing::warn!(
                         event = "gateway_recall_failed",
                         source = "journal",
-                        reason = error.label()
+                        reason = error.label(),
+                        "gateway.recall.failed"
                     ),
                 }
             }
@@ -2288,7 +2406,8 @@ async fn session(
             match steers.seal() {
                 Seal::Stopped => {
                     return stopped(runner, route, &key, message, &mut progress, &cancellation)
-                        .await;
+                        .await
+                        .into();
                 }
                 Seal::Sealed { .. } => {}
             }
@@ -2297,7 +2416,8 @@ async fn session(
                 event = "gateway_session_failed",
                 category = "session-task",
                 failure = failure.category(),
-                error = %failure
+                error = %failure,
+                "gateway.session.failed"
             );
             let terminal = if is_follow {
                 Terminal::Silent
@@ -2306,9 +2426,10 @@ async fn session(
             };
             let replied = progress.terminal(terminal).await;
             if replied {
-                reply_delivered("failed");
+                reply_delivered(MessageOutcome::Failed);
+                return MessageOutcome::Failed.into();
             }
-            return if replied { "failed" } else { "reply-failed" };
+            return MessageOutcome::ReplyFailed.into();
         }
     };
 
@@ -2318,7 +2439,9 @@ async fn session(
             Seal::Sealed { .. } => false,
         }
     {
-        return stopped(runner, route, &key, message, &mut progress, &cancellation).await;
+        return stopped(runner, route, &key, message, &mut progress, &cancellation)
+            .await
+            .into();
     }
 
     progress.seal();
@@ -2341,27 +2464,25 @@ async fn session(
             Instant::now(),
         ) && runner.journal.is_some()
         {
-            pending_journal = Some((turn, window));
+            pending_journal = Some(crate::memory::generation::PostReply {
+                key: key.clone(),
+                granted,
+                access: journal_access,
+                window,
+                turn,
+            });
         }
     }
 
-    let post_reply = || crate::memory::generation::PostReply {
-        runner,
-        route,
-        key: &key,
-        granted: &granted,
-        access: &journal_access,
-        cancellation: &cancellation,
-    };
     if matches!(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
         progress.terminal(Terminal::Silent).await;
-        if let Some((turn, window)) = pending_journal.take() {
-            crate::memory::generation::persist(post_reply(), window, turn).await;
-        }
-        return "declined";
+        return Ended {
+            outcome: MessageOutcome::Declined,
+            journal: pending_journal,
+        };
     }
 
     let (terminal, completed_outcome, delivered_answer) = match &outcome {
@@ -2376,20 +2497,29 @@ async fn session(
             } else {
                 OutboundReply::with_images(text.clone(), images)
             };
-            (Terminal::Answered(reply), "answered", Some(text))
+            (
+                Terminal::Answered(reply),
+                MessageOutcome::Answered,
+                Some(text),
+            )
         }
         Err(SessionError::Prompt(PromptError::Model(InferenceError::OverBudget(refusal)))) => {
-            tracing::info!(event = "gateway_session_refused", category = "over-budget");
+            tracing::info!(
+                event = "gateway_session_refused",
+                category = "over-budget",
+                "gateway.session.refused"
+            );
             (
                 Terminal::Failed(bound_outbound(&refusal.to_string())),
-                "refused",
+                MessageOutcome::Refused,
                 None,
             )
         }
         Err(SessionError::Prompt(PromptError::UnreportedCapabilityWork)) => {
             tracing::error!(
                 event = "gateway_session_failed",
-                category = "unreported-capability-work"
+                category = "unreported-capability-work",
+                "gateway.session.failed"
             );
             (
                 if is_follow {
@@ -2397,7 +2527,7 @@ async fn session(
                 } else {
                     Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned())
                 },
-                "failed",
+                MessageOutcome::Failed,
                 None,
             )
         }
@@ -2405,7 +2535,8 @@ async fn session(
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category(),
-                error = %error
+                error = %error,
+                "gateway.session.failed"
             );
             let terminal = match error {
                 SessionError::Model(InferenceError::OverBudget(_)) => {
@@ -2456,15 +2587,12 @@ async fn session(
                     | PromptError::UnreportedCapabilityWork,
                 ) => Terminal::Failed(bound_outbound(liveness.templates.failed())),
             };
-            (terminal, "failed", None)
+            (terminal, MessageOutcome::Failed, None)
         }
     };
     let delivered = progress.terminal(terminal).await;
     if delivered {
         reply_delivered(completed_outcome);
-    }
-    if let Some((turn, window)) = pending_journal.take() {
-        crate::memory::generation::persist(post_reply(), window, turn).await;
     }
     attachments.finish(match (&outcome, delivered) {
         (Ok(_), true) => AssetDeliveryDisposition::Delivered,
@@ -2472,7 +2600,7 @@ async fn session(
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
     if delivered {
-        if completed_outcome == "answered"
+        if completed_outcome == MessageOutcome::Answered
             && leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
@@ -2488,18 +2616,20 @@ async fn session(
                 Ok(Ok(())) => tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "self-left",
-                    route = index
+                    route = index,
+                    "gateway.follow"
                 ),
                 _ => tracing::warn!(
                     audit.event = "gateway.follow",
                     operation = "refused",
                     route = index,
-                    reason = "persistence"
+                    reason = "persistence",
+                    "gateway.follow"
                 ),
             }
         }
         if is_follow
-            && completed_outcome == "answered"
+            && completed_outcome == MessageOutcome::Answered
             && !leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
@@ -2517,13 +2647,15 @@ async fn session(
                 Ok(Ok(())) => tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "refreshed",
-                    route = index
+                    route = index,
+                    "gateway.follow"
                 ),
                 _ => tracing::warn!(
                     audit.event = "gateway.follow",
                     operation = "refused",
                     route = index,
-                    reason = "persistence"
+                    reason = "persistence",
+                    "gateway.follow"
                 ),
             }
         }
@@ -2540,9 +2672,15 @@ async fn session(
             )
             .await;
         }
-        completed_outcome
+        Ended {
+            outcome: completed_outcome,
+            journal: pending_journal,
+        }
     } else {
-        "reply-failed"
+        Ended {
+            outcome: MessageOutcome::ReplyFailed,
+            journal: pending_journal,
+        }
     }
 }
 
@@ -2562,7 +2700,12 @@ async fn sealed_conversation(
         Ok(Err(error)) => error.label(),
         Err(_) => "task",
     };
-    tracing::warn!(event = "gateway_recall_failed", source = "seal", reason);
+    tracing::warn!(
+        event = "gateway_recall_failed",
+        source = "seal",
+        reason,
+        "gateway.recall.failed"
+    );
     None
 }
 
@@ -2587,19 +2730,22 @@ pub(crate) async fn seal_conversation(
             Ok(Ok(())) => tracing::info!(
                 audit.event = "gateway.follow",
                 operation = "sealed",
-                route = route.route_index
+                route = route.route_index,
+                "gateway.follow"
             ),
             Ok(Err(error)) => tracing::warn!(
                 audit.event = "gateway.follow",
                 operation = "refused",
                 route = route.route_index,
-                reason = error.label()
+                reason = error.label(),
+                "gateway.follow"
             ),
             Err(_) => tracing::warn!(
                 audit.event = "gateway.follow",
                 operation = "refused",
                 route = route.route_index,
-                reason = "task"
+                reason = "task",
+                "gateway.follow"
             ),
         }
     }
@@ -2618,7 +2764,11 @@ pub(crate) async fn seal_conversation(
         Ok(Err(error)) => error.label(),
         Err(_) => "task",
     };
-    tracing::warn!(event = "gateway_journal_seal_failed", reason);
+    tracing::warn!(
+        event = "gateway_journal_seal_failed",
+        reason,
+        "gateway.journal.seal.failed"
+    );
     false
 }
 
@@ -2637,8 +2787,11 @@ async fn stopped(
     message: &InboundMessage,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
-) -> &'static str {
-    tracing::info!(event = "gateway_session_cancelled");
+) -> MessageOutcome {
+    tracing::info!(
+        event = "gateway_session_cancelled",
+        "gateway.session.cancelled"
+    );
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
     let sealed = match by {
         CancelSource::Budget {
@@ -2657,15 +2810,15 @@ async fn stopped(
         remember_stop(runner, key, StopCause::Cancelled(by))
     };
     if progress.terminal(terminal).await {
-        reply_delivered("cancelled");
+        reply_delivered(MessageOutcome::Cancelled);
     }
-    "cancelled"
+    MessageOutcome::Cancelled
 }
 
-fn reply_delivered(outcome: &'static str) {
+pub(crate) fn reply_delivered(outcome: MessageOutcome) {
     tracing::info!(
         target: "dekopon_gatewayd::audit",
-        { audit.event = "reply.delivered", outcome },
+        { audit.event = "reply.delivered", outcome = outcome.label() },
         "reply.delivered"
     );
 }
@@ -2792,13 +2945,18 @@ async fn record_delivered_turn(
     assistant: DeliveredAnswer,
 ) {
     let MessageId::Native(message_id) = &message.message_id else {
-        tracing::debug!(event = "gateway_memory_record_skipped", reason = "wake");
+        tracing::debug!(
+            event = "gateway_memory_record_skipped",
+            reason = "wake",
+            "gateway.memory.record.skipped"
+        );
         return;
     };
     let Some(delivery) = delivery_identity(message, message_id, &claim) else {
         tracing::warn!(
             event = "gateway_memory_record_failed",
             category = "delivery-identity",
+            "gateway.memory.record.failed"
         );
         return;
     };
@@ -2830,6 +2988,7 @@ async fn record_delivered_turn(
         tracing::warn!(
             event = "gateway_memory_record_failed",
             category = memory_record_category(&error),
+            "gateway.memory.record.failed"
         );
     }
 }
@@ -2953,7 +3112,11 @@ pub(crate) async fn answer(
     {
         Ok(()) => true,
         Err(error) => {
-            tracing::error!(event = "gateway_reply_failed", category = error.category());
+            tracing::error!(
+                event = "gateway_reply_failed",
+                category = error.category(),
+                "gateway.reply.failed"
+            );
             false
         }
     }

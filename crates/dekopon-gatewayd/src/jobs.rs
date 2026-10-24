@@ -278,6 +278,7 @@ impl Jobs {
                 job.exit_code = ended.exit.get(),
                 job.waited = waited,
                 job.output.bytes = ended.output.len(),
+                "gateway.job.finished"
             );
             let noticed = match outcome {
                 JobOutcome::Succeeded | JobOutcome::Failed | JobOutcome::Deadline => !waited,
@@ -592,7 +593,11 @@ impl JobContext {
             .broker
             .leg_client()
             .inspect_err(|error| {
-                tracing::warn!(event = "gateway_job_leg_unavailable", error = %error);
+                tracing::warn!(
+                    event = "gateway_job_leg_unavailable",
+                    error = %error,
+                    "gateway.job.leg.unavailable"
+                );
             })
             .ok()?;
         let leg = self
@@ -602,7 +607,11 @@ impl JobContext {
                 Some(self.anchor.claim(self.trigger())),
             ))
             .inspect_err(|error| {
-                tracing::warn!(event = "gateway_job_leg_unavailable", error = %error);
+                tracing::warn!(
+                    event = "gateway_job_leg_unavailable",
+                    error = %error,
+                    "gateway.job.leg.unavailable"
+                );
             })
             .ok()?;
         let nested = Self {

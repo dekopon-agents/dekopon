@@ -149,7 +149,7 @@ impl ConsoleSink {
                         tracing::warn!(
                             audit.event = "telemetry.console.dropped",
                             console.dropped.lines = total,
-                            "console log lines dropped"
+                            "telemetry.console.dropped"
                         );
                         if !NOTICE_DROPPED.get() {
                             reported = total;
@@ -261,7 +261,7 @@ impl ConsoleWorker {
             tracing::warn!(
                 audit.event = "telemetry.console.dropped",
                 console.dropped.lines = total,
-                "console log lines dropped"
+                "telemetry.console.dropped"
             );
         }
         Ok(())
@@ -396,6 +396,7 @@ impl Install {
             layers.push(
                 tracing_opentelemetry::layer()
                     .with_tracer(tracer)
+                    .with_error_events_to_status(false)
                     .with_filter(otlp_filter(&traces.filter))
                     .boxed(),
             );

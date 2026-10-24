@@ -128,8 +128,6 @@ impl InferenceHttp {
             outcome = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
             otel.status_description = tracing::field::Empty,
-            error = tracing::field::Empty,
-            error.kind = tracing::field::Empty,
             error.type = tracing::field::Empty,
             error.phase = tracing::field::Empty,
             http.status = tracing::field::Empty,
@@ -148,7 +146,7 @@ impl InferenceHttp {
         progress.finish(&span, &result);
         match &result {
             Ok(turn) => {
-                span.record("outcome", "success");
+                span.record("outcome", "succeeded");
                 span.record("tool_call.count", turn.tool_calls.len());
                 if let Some(usage) = turn.usage {
                     for (key, value) in [
@@ -203,8 +201,6 @@ impl InferenceHttp {
                     }
                 };
                 span.record("outcome", "failed");
-                span.record("error", kind);
-                span.record("error.kind", kind);
                 span.record("error.type", kind);
                 if matches!(
                     error,

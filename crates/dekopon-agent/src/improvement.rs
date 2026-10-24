@@ -197,7 +197,7 @@ pub(crate) fn suggest_improvement_into(
             suggestion.evidence = suggestion.evidence.as_str(),
             suggestion.proposal = suggestion.proposal.as_str(),
         },
-        "agent improvement suggested"
+        "agent.improvement.suggested"
     );
     suggestions.push(suggestion);
     messages.push(ModelMessage::tool(
@@ -219,7 +219,7 @@ fn refuse(model_turn: u32, call_id: &str, reason: &'static str) {
             gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
             reason = reason,
         },
-        "agent improvement suggestion refused"
+        "agent.improvement.refused"
     );
 }
 

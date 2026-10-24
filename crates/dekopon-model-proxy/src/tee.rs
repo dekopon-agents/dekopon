@@ -143,7 +143,7 @@ where
                         return Some(Ok(chunk));
                     }
                     Some(Err(error)) => {
-                        tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = "stream", error = %error);
+                        tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = "stream", error = %error, "proxy.upstream_failed");
                         self.settle(Outcome::Failed);
                         return Some(Err(std::io::Error::other("upstream stream failed")));
                     }
@@ -156,7 +156,7 @@ where
                 () = tokio::time::sleep_until(wake) => {
                     let now = Instant::now();
                     if now >= idle_at {
-                        tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = "idle");
+                        tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = "idle", "proxy.upstream_failed");
                         self.settle(Outcome::Failed);
                         return Some(Err(std::io::Error::other("upstream went idle")));
                     }
@@ -228,7 +228,7 @@ where
                 self.flush();
             }
             Err(error) => {
-                tracing::debug!(target: "model", error = %error, "proxied event was not JSON");
+                tracing::debug!(target: "model", error = %error, "proxy.event.unparsed");
             }
         }
     }
@@ -240,7 +240,7 @@ where
             match serde_json::from_slice::<Value>(&self.json) {
                 Ok(body) => self.dialect.observe_body(&body, &mut self.observed),
                 Err(error) => {
-                    tracing::debug!(target: "model", error = %error, "proxied answer was not JSON");
+                    tracing::debug!(target: "model", error = %error, "proxy.answer.unparsed");
                 }
             }
         }

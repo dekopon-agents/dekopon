@@ -425,7 +425,7 @@ impl Directory {
             tracing::warn!(
                 storage.file = %self.diagnostic_child(name).display(),
                 storage.check = error.category(),
-                "refusing a private storage file that failed its hygiene check"
+                "storage.file.refused"
             );
             return Err(self.corrupt(name, "private-file"));
         }
@@ -763,8 +763,7 @@ pub(crate) fn scan_root_usage(
                         storage.path = %namespaces.diagnostic_child(&base).display(),
                         storage.check = check,
                         error = %dekopon_core::error_chain(&error),
-                        "a namespace did not scan at startup; it is not charged and its next \
-                         grant fails on it"
+                        "storage.root.entry.ignored"
                     );
                 }
             }

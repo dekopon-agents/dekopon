@@ -159,13 +159,21 @@ impl Anchor {
         let client = broker
             .leg_client()
             .inspect_err(|error| {
-                tracing::warn!(event = "gateway_wake_probe_unavailable", error = %error);
+                tracing::warn!(
+                    event = "gateway_wake_probe_unavailable",
+                    error = %error,
+                    "gateway.wake.probe.unavailable"
+                );
             })
             .ok()?;
         runtime
             .block_on(BrokerLeg::connect(client, Some(self.claim(Trigger::Probe))))
             .inspect_err(|error| {
-                tracing::warn!(event = "gateway_wake_probe_unavailable", error = %error);
+                tracing::warn!(
+                    event = "gateway_wake_probe_unavailable",
+                    error = %error,
+                    "gateway.wake.probe.unavailable"
+                );
             })
             .ok()
     }
@@ -355,7 +363,7 @@ impl WakeRegistrar for SessionWakes {
                 wake.watch = summary.watch.is_some(),
                 subject = %self.anchor.subject,
             },
-            "wake scheduled"
+            "gateway.wake.scheduled"
         );
         Ok(summary)
     }
@@ -366,7 +374,7 @@ impl WakeRegistrar for SessionWakes {
 
     fn cancel(&self, id: WakeId) -> Result<(), WakeRefusal> {
         self.store.cancel(&self.anchor.subject, id)?;
-        tracing::info!(event = "gateway_wake_cancelled", wake.id = %id);
+        tracing::info!(event = "gateway_wake_cancelled", wake.id = %id, "gateway.wake.cancelled");
         Ok(())
     }
 }
@@ -409,12 +417,20 @@ pub(crate) fn run_tick(
         Ok(Resolved::Rearmed | Resolved::Gone) => None,
         Ok(Resolved::Fired(fired)) => {
             if failed {
-                tracing::warn!(event = "gateway_wake_tick_failed", wake.id = %fired.id());
+                tracing::warn!(
+                    event = "gateway_wake_tick_failed",
+                    wake.id = %fired.id(),
+                    "gateway.wake.tick.failed"
+                );
             }
             Some(*fired)
         }
         Err(error) => {
-            tracing::error!(event = "gateway_wake_store_failed", error = %error);
+            tracing::error!(
+                event = "gateway_wake_store_failed",
+                error = %error,
+                "gateway.wake.store.failed"
+            );
             None
         }
     }

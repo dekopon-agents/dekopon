@@ -79,13 +79,16 @@ where
                 }
                 Ok(Err(error)) => {
                     if unreadable.insert(path.clone()) && !new_generation {
-                        tracing::error!(event = "broker_credential_record_invalid", credential = %drn, category = error.category(), instruction = "delete the record and provide a new seed");
+                        tracing::error!(event = "broker_credential_record_invalid", credential = %drn, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid");
                     }
                     false
                 }
                 Err(_join) => {
                     if unreadable.insert(path.clone()) && !new_generation {
-                        tracing::error!(event = "broker_credential_record_inspection_failed");
+                        tracing::error!(
+                            event = "broker_credential_record_inspection_failed",
+                            "broker.credential.record.inspection.failed"
+                        );
                     }
                     false
                 }
@@ -117,7 +120,7 @@ where
                     match joined.unwrap_or(Err(SourceError::Internal)) {
                         Ok(()) => { retry.remove(&path); }
                         Err(error) => {
-                            tracing::warn!(event = "broker_credential_scheduled_failed", credential = %drn, category = error.category());
+                            tracing::warn!(event = "broker_credential_scheduled_failed", credential = %drn, category = error.category(), "broker.credential.scheduled.failed");
                             retry.insert(path, now.saturating_add(oauth2::retry_seconds()));
                         }
                     }

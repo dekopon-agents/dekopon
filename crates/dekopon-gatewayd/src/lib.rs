@@ -156,7 +156,8 @@ where
     }
     tracing::info!(
         event = "gateway_broker_ready",
-        capability.count = capabilities.len()
+        capability.count = capabilities.len(),
+        "gateway.broker.ready"
     );
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
@@ -236,7 +237,8 @@ where
     tracing::info!(
         event = "gateway_started",
         transport.count = config.transports.len(),
-        route.count = candidate.routes.len()
+        route.count = candidate.routes.len(),
+        "gateway.started"
     );
 
     let mut terminal = Ok(());
@@ -280,28 +282,42 @@ where
                 event = "gateway_transport_stopped",
                 transport = %problem.transport,
                 category = problem.source.category(),
+                "gateway.transport.stopped"
             ),
             Err(error) if !error.is_cancelled() => tracing::error!(
                 event = "gateway_transport_task_failed", error = %error,
+                "gateway.transport.task.failed"
             ),
             Ok(Ok(())) | Err(_) => {}
         }
     }
     drop(sender);
     if let Err(error) = terminal {
-        tracing::error!(event = "gateway_stopped", reason = "transport-failed");
+        tracing::error!(
+            event = "gateway_stopped",
+            reason = "transport-failed",
+            "gateway.stopped"
+        );
         return Err(error);
     }
     match outcome {
         ServeOutcome::Shutdown => {
-            tracing::info!(event = "gateway_stopped", reason = "shutdown");
+            tracing::info!(
+                event = "gateway_stopped",
+                reason = "shutdown",
+                "gateway.stopped"
+            );
             Ok(())
         }
         // Exiting successfully here would let a gateway that lost every workspace to a revoked
         // token look like a clean run to whatever supervises it, so this is reported as a failure
         // instead.
         ServeOutcome::TransportsLost => {
-            tracing::error!(event = "gateway_stopped", reason = "transports-lost");
+            tracing::error!(
+                event = "gateway_stopped",
+                reason = "transports-lost",
+                "gateway.stopped"
+            );
             Err(GatewaydError::TransportsLost)
         }
     }
@@ -701,7 +717,10 @@ fn observe_session(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result
         && !error.is_cancelled()
     {
-        tracing::error!(event = "gateway_session_task_failed");
+        tracing::error!(
+            event = "gateway_session_task_failed",
+            "gateway.session.task.failed"
+        );
     }
 }
 
@@ -718,7 +737,12 @@ fn spawn_tick(
         .gate
         .admit_probe(("wake".to_owned(), tick.id().to_string()))
     else {
-        tracing::info!(event = "gateway_wake_tick_skipped", wake.id = %tick.id(), reason = "busy");
+        tracing::info!(
+            event = "gateway_wake_tick_skipped",
+            wake.id = %tick.id(),
+            reason = "busy",
+            "gateway.wake.tick.skipped"
+        );
         return;
     };
     let limits = routes
@@ -757,14 +781,16 @@ fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
         None => tracing::info!(
             event = "gateway_session_stop_requested",
             transport = %request.transport,
-            via = via_label(request.via)
+            via = via_label(request.via),
+            "gateway.session.stop.requested"
         ),
         // Ignored here since only the subject that started a session may stop it, and a session
         // that already ended has nothing left to stop.
         Some(reason) => tracing::debug!(
             event = "gateway_session_stop_ignored",
             transport = %request.transport,
-            reason
+            reason,
+            "gateway.session.stop.ignored"
         ),
     }
 }

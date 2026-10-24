@@ -284,13 +284,12 @@ pub(crate) fn prepare(
     }
 }
 
-pub(crate) struct PostReply<'a> {
-    pub runner: &'a SessionRunner,
-    pub route: &'a BoundRoute,
-    pub key: &'a ConversationKey,
-    pub granted: &'a [String],
-    pub access: &'a AssetAccess,
-    pub cancellation: &'a SessionCancellation,
+pub(crate) struct PostReply {
+    pub key: ConversationKey,
+    pub granted: Vec<String>,
+    pub access: AssetAccess,
+    pub window: MemoryWindow,
+    pub turn: ConversationTurn,
 }
 
 pub(crate) fn report_policy(policy: &ResolvedPolicy, recall: crate::config::RecallSource) {
@@ -316,24 +315,34 @@ pub(crate) fn report_policy(policy: &ResolvedPolicy, recall: crate::config::Reca
         capture_assistant_bytes = %bound(policy.capture.assistant),
         capture_tool_request_bytes = %bound(policy.capture.tool_request),
         capture_tool_result_bytes = %bound(policy.capture.tool_result),
+        "gateway.memory.policy"
     );
 }
 
-pub(crate) async fn persist(context: PostReply<'_>, window: MemoryWindow, turn: ConversationTurn) {
-    persist_turn(context, window, turn)
+pub(crate) async fn persist(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    cancellation: &SessionCancellation,
+    reply: PostReply,
+) {
+    persist_turn(runner, route, cancellation, reply)
         .instrument(tracing::info_span!("memory.persist"))
         .await;
 }
 
-async fn persist_turn(context: PostReply<'_>, window: MemoryWindow, turn: ConversationTurn) {
+async fn persist_turn(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    cancellation: &SessionCancellation,
+    reply: PostReply,
+) {
     let PostReply {
-        runner,
-        route,
         key,
         granted,
         access,
-        cancellation,
-    } = context;
+        window,
+        turn,
+    } = reply;
     let Some(journal) = runner.journal.as_ref() else {
         return;
     };
@@ -346,8 +355,8 @@ async fn persist_turn(context: PostReply<'_>, window: MemoryWindow, turn: Conver
     let runtime = tokio::runtime::Handle::current();
     let cancel = cancellation.model_watch();
     let stem = key.journal_stem();
-    let grant = journal::grant_digest(granted);
-    let inventory = runner.assets.inventory(access);
+    let grant = journal::grant_digest(&granted);
+    let inventory = runner.assets.inventory(&access);
     let next_asset_id = access.next_asset_id();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
@@ -381,7 +390,8 @@ async fn persist_turn(context: PostReply<'_>, window: MemoryWindow, turn: Conver
         Err(_) => {
             tracing::warn!(
                 event = "gateway_memory_deviation",
-                reason = "generation-task"
+                reason = "generation-task",
+                "gateway.memory.deviation"
             );
             Some(prepare(&turn, &policy, |_| None, include_chat))
         }
@@ -391,18 +401,20 @@ async fn persist_turn(context: PostReply<'_>, window: MemoryWindow, turn: Conver
             tracing::warn!(
                 event = "gateway_memory_deviation",
                 reason = "generation-failed",
-                routine = %failed.chars().take(64).collect::<String>()
+                routine = %failed.chars().take(64).collect::<String>(),
+                "gateway.memory.deviation"
             );
         }
     }
     if !access.generation().is_some_and(|generation| {
         runner
             .conversations
-            .publication_eligible(key, granted, generation)
+            .publication_eligible(&key, &granted, generation)
     }) {
         tracing::warn!(
             event = "gateway_memory_retention_failed",
-            reason = "stale-generation"
+            reason = "stale-generation",
+            "gateway.memory.retention.failed"
         );
         return;
     }
@@ -429,5 +441,9 @@ async fn persist_turn(context: PostReply<'_>, window: MemoryWindow, turn: Conver
         Ok(Err(error)) => error.label(),
         Err(_) => "task",
     };
-    tracing::warn!(event = "gateway_journal_append_failed", reason);
+    tracing::warn!(
+        event = "gateway_journal_append_failed",
+        reason,
+        "gateway.journal.append.failed"
+    );
 }

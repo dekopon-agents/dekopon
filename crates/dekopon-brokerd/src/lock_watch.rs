@@ -32,7 +32,7 @@ pub(crate) async fn watch(lock: &LoadedLock, uid: u32, period: Duration) -> Lock
                     event = "broker_provider_lock_changed",
                     lock.loaded = %lock.digest,
                     lock.current = %current,
-                    "provider lock changed; draining for a restart"
+                    "broker.provider.lock.changed"
                 );
                 return LockStop::Changed;
             }
@@ -43,7 +43,7 @@ pub(crate) async fn watch(lock: &LoadedLock, uid: u32, period: Duration) -> Lock
                     polls = WINDOW,
                     cause = if error.is_some() { "unreadable" } else { "unstable" },
                     error = error.as_ref().map(|error| dekopon_core::error_chain(error)),
-                    "provider lock did not settle; draining for a restart"
+                    "broker.provider.lock.unsettled"
                 );
                 return LockStop::Unsettled;
             }

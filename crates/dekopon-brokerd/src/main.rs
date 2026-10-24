@@ -303,7 +303,7 @@ async fn observed(
     let code = match work.await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!(event = "broker_exit", error = %error_chain(&error));
+            tracing::error!(event = "broker_exit", error = %error_chain(&error), "broker.exit");
             ExitCode::FAILURE
         }
     };
@@ -330,7 +330,11 @@ async fn observed(
         }
     };
     if let Err(error) = flushed {
-        tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
+        tracing::error!(
+            event = "broker_telemetry_shutdown_failed",
+            error = %error,
+            "broker.telemetry.shutdown.failed"
+        );
     }
     code
 }
@@ -361,7 +365,11 @@ async fn execute_server(
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if result.is_err() {
-                    tracing::error!(event = "broker_signal_failed", signal = "interrupt");
+                    tracing::error!(
+                        event = "broker_signal_failed",
+                        signal = "interrupt",
+                        "broker.signal.failed"
+                    );
                 }
             }
             _ = terminate.recv() => {}

@@ -239,7 +239,8 @@ impl Breaker {
             transport = %transport,
             primitive,
             outcome = "error",
-            category
+            category,
+            "gateway.progress.rendered"
         );
         self.failures = self.failures.saturating_add(1);
         if self.failures >= ceiling && !self.tripped {
@@ -248,7 +249,8 @@ impl Breaker {
                 event = "gateway_progress_degraded",
                 transport = %transport,
                 primitive,
-                category
+                category,
+                "gateway.progress.degraded"
             );
         }
     }
@@ -382,7 +384,11 @@ impl Pending {
             Some(reply) => match self.inputs.driver.reply(&self.inputs.reply, reply).await {
                 Ok(()) => true,
                 Err(error) => {
-                    tracing::error!(event = "gateway_reply_failed", category = error.category());
+                    tracing::error!(
+                        event = "gateway_reply_failed",
+                        category = error.category(),
+                        "gateway.reply.failed"
+                    );
                     false
                 }
             },
@@ -764,7 +770,8 @@ impl Live {
                 tracing::debug!(
                     event = "gateway_progress_budget_exhausted",
                     transport = %self.transport,
-                    edits = self.edits
+                    edits = self.edits,
+                    "gateway.progress.budget.exhausted"
                 );
             }
             self.edit.clear();
@@ -817,7 +824,8 @@ impl Live {
                     event = "gateway_progress_rendered",
                     transport = %self.transport,
                     primitive,
-                    outcome = "ok"
+                    outcome = "ok",
+                    "gateway.progress.rendered"
                 );
             }
             Err(category) if creating && category == DEADLINE_MISSED => {
@@ -926,7 +934,8 @@ impl Live {
                     transport = %self.transport,
                     primitive = "stream",
                     outcome = "ok",
-                    chars
+                    chars,
+                    "gateway.progress.rendered"
                 );
             }
             Err(category) if creating && category == DEADLINE_MISSED => {
@@ -1059,7 +1068,8 @@ impl Live {
                         event = "gateway_progress_rendered",
                         transport = %self.transport,
                         primitive = "finalize",
-                        outcome = "ok"
+                        outcome = "ok",
+                        "gateway.progress.rendered"
                     );
                     return true;
                 }
@@ -1069,7 +1079,8 @@ impl Live {
                         transport = %self.transport,
                         primitive = "finalize",
                         outcome = "error",
-                        category
+                        category,
+                        "gateway.progress.rendered"
                     );
                     if category == DEADLINE_MISSED {
                         self.message = None;
@@ -1107,7 +1118,11 @@ impl Live {
         match driver.reply(&self.reply, reply).await {
             Ok(()) => true,
             Err(error) => {
-                tracing::error!(event = "gateway_reply_failed", category = error.category());
+                tracing::error!(
+                    event = "gateway_reply_failed",
+                    category = error.category(),
+                    "gateway.reply.failed"
+                );
                 false
             }
         }
@@ -1155,7 +1170,8 @@ impl Live {
                     event = "gateway_progress_rendered",
                     transport = %self.transport,
                     primitive,
-                    outcome = "ok"
+                    outcome = "ok",
+                    "gateway.progress.rendered"
                 );
             }
             Err(category) => breaker.failed(&self.transport, primitive, category),
@@ -1196,7 +1212,7 @@ fn record_terminal(terminal: &Terminal, counters: &ProgressCounters, edits: u32,
             progress.dropped = counters.dropped.load(Ordering::Relaxed),
             progress.notes_dropped = counters.notes_dropped.load(Ordering::Relaxed),
         },
-        "gateway progress"
+        "gateway.progress"
     );
 }
 
@@ -1229,7 +1245,10 @@ async fn run(
             }
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
-                pending.terminal(Terminal::Stopped(StopCause::Cancelled(by))).await;
+                let delivered = pending.terminal(Terminal::Stopped(StopCause::Cancelled(by))).await;
+                if delivered.accepted {
+                    crate::session::reply_delivered(crate::session::MessageOutcome::Cancelled);
+                }
                 return;
             }
             () = coordination.finished() => return,
@@ -1272,13 +1291,16 @@ async fn run(
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
                 let latest = text.borrow_and_update().clone();
-                surface.terminal(Terminal::Stopped(StopCause::Cancelled(by)), latest).await;
+                let delivered = surface.terminal(Terminal::Stopped(StopCause::Cancelled(by)), latest).await;
+                if delivered.accepted {
+                    crate::session::reply_delivered(crate::session::MessageOutcome::Cancelled);
+                }
                 return;
             }
             () = coordination.finished() => break,
             () = surface.deadline.fired() => {
                 if cancellation.cancel(CancelSource::Budget { limit: BudgetLimit::WallClock }) {
-                    tracing::info!(event = "gateway_session_stop_requested", transport = %surface.transport, via = "wall-clock");
+                    tracing::info!(event = "gateway_session_stop_requested", transport = %surface.transport, via = "wall-clock", "gateway.session.stop.requested");
                 }
             }
             event = events.recv(), if events_open => match event {
@@ -1311,6 +1333,9 @@ async fn run(
 
 fn acknowledge(done: oneshot::Sender<bool>, delivered: Delivered) {
     if done.send(delivered.accepted).is_err() {
-        tracing::debug!(event = "gateway_progress_terminal_unobserved");
+        tracing::debug!(
+            event = "gateway_progress_terminal_unobserved",
+            "gateway.progress.terminal.unobserved"
+        );
     }
 }

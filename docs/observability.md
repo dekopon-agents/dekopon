@@ -161,7 +161,7 @@ library uses `tracing` only and installs no subscriber.
 | `reasoning.items` | merged reasoning item count when an OpenRouter turn is finalized; never reasoning text |
 | `tool_call.skipped` | OpenRouter tool items dropped during finalization because their type is unknown |
 | `delta.unrecognized` | first eight distinct ignored OpenRouter delta keys in sorted order, sanitized and comma-joined; absent when none, never their values |
-| `outcome`, `error`, `error.kind`, `error.type` | `success`/`failed`; failures have a stable category, not raw diagnostic text |
+| `outcome`, `error.type` | `succeeded`/`failed`; a failure's `error.type` is its stable kind, not raw diagnostic text |
 | span status | `Error` on every failure except `cancelled` (a steer or stop is not an error); only an HTTP transport failure gets a description, the transport's own source chain (for a TLS failure, the certificate problem), never upstream text |
 | `error.phase` | `before-send`, `awaiting-headers` or `reading-body`, when known |
 | `http.status`, `provider.code`, `provider.request_id` | safe known response metadata; status/request ID survive later protocol/cancellation failures |
@@ -254,6 +254,15 @@ the model wrote into those fields.
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
 this file does not mention, so a rename lands here in the same change.
+
+Every event's OpenTelemetry name is a stable dotted name, never prose or a source location: an
+audit record is named by its `audit.event`, and an operational event by its `event` with each `_`
+read as `.` (`gateway_memory_deviation` is named `gateway.memory.deviation`), or by its own dotted
+name such as `provider.load.finished`. Both fields stay on the record for log queries.
+
+A span's status is only what its own code sets through `otel.status_code`: an `error` field on an
+event inside the span never becomes the status or its description, and an error-level event marks
+the span `Error` without a description.
 
 ## The broker audit record
 
@@ -463,17 +472,16 @@ two further spans of its own:
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only); `failed` and `reply-failed` set the span status to `Error` |
-| `gateway.session` | `agent`, `generation.digest`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
-| `memory.persist` | no fields; a child of `gateway.session` opened after the terminal reply for every turn the journal records, including a declined turn and a reply that failed to deliver; it wraps the memory routines' summary `model.complete` calls and the journal append |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `follow-inactive`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only); `failed` and `reply-failed` set the span status to `Error`. A message that waited behind the conversation's running turn links that turn's `gateway.message` |
+| `gateway.session` | `agent`, `generation.digest`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg, the model session and the terminal reply, and ends once that reply's delivery is recorded |
+| `memory.persist` | no fields; a child of `gateway.message` opened after `gateway.session` ends, for every turn the journal records, including a declined turn and a reply that failed to deliver; it wraps the memory routines' summary `model.complete` calls and the journal append |
 
 `gateway.session` carries a `reply.delivered` event at the moment a reply it sends reaches the
 chat, with the message's `outcome`: `answered`, `failed`, `refused` and `cancelled` terminals, and
 the `sealed`, `unauthorized` and broker-failure (`failed`) notices. There is none for a declined or
 silent turn, a reply the transport refused, or a reply sent outside a session, such as the `busy`
-and stop notices. `gateway.message` still spans the
-memory work that follows, so its duration is not reply latency; the gap between `reply.delivered`
-and the end of `memory.persist` is where the rest went.
+and stop notices. `gateway.session`'s duration is the time to the reply; `gateway.message` also
+covers the `memory.persist` work that follows it, so the message's duration is not reply latency.
 
 `generation.digest` is the gateway generation activated for this session, including its broker activation reference; it is shared by distinct private conversations and says nothing about their history. Offline analysis may join a retained session span against an activated configuration reference; if the span or its reference is unavailable, the historical generation is **unknown**, not the latest configuration. It cannot reconstruct expired inputs, and there is no journal-generation link.
 
@@ -563,7 +571,7 @@ body length, while its request grant bounds literal parts only. An `asset.send` 
 the ordinary `broker.decision` and `broker.execution` records, not a separate authorization path.
 
 Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
-`duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
+`duration_ms`, `outcome=succeeded|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
 changed length, or OS IO category). It emits one bounded warning on a failed operation, with no
 path, payload, URL or base64. Reads and cleanup parent to whatever span is active when they run,
 or start a root span outside one. A retained asset never holds the span that created it, so
@@ -637,7 +645,10 @@ In-flight presentation is metadata-minimal apart from opted-in progress notes. E
 `turn`, `turns`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`,
 `calls_max`, `index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`,
 `class`, `by`, `edits`, `keep_alives`, `stream.deltas`, `progress.dropped`, and
-`progress.notes_dropped` that kind has.
+`progress.notes_dropped` that kind has. `outcome` is `answered` or `declined` on `finished` and
+`succeeded`, `denied`, `failed` or `cancelled` on `tool_finished`; `class` is `step-budget`, `model`
+or `internal`; `by` is the stop's origin (`user:native-stop`, `user:button`, `user:stop-reply`,
+`operator`, `budget:wall-clock`).
 `turn` is the turn a `model_turn`, `answered` or `steered` record is about; `turns` counts completed
 model calls on `kind = finished`. The model-text exception is `kind = note`, carrying `note`
 and optional `note.eta_s` (whole seconds) on a route with `progressNotes: true`; its bounds are
@@ -819,7 +830,7 @@ migration is implemented here.
 | Span | Crate | Fields |
 |---|---|---|
 | `provider.precompile` | `dekopon-brokerd` | `providers`, `compiled`, `repaired`, `removed_files`, `removed_bytes`, and `error` on failure; one offline command span, including lock acquisition, source checks, compilation and pruning, emitted only where a subscriber collects it |
-| `provider.registry_load` | `dekopon-broker-host` | `providers`, `mmap`, `elapsed_us`, `outcome` (`ok`/`error`); one root for complete registry startup, including engine creation and descriptions |
+| `provider.registry_load` | `dekopon-broker-host` | `providers`, `mmap`, `elapsed_us`, `outcome` (`succeeded`/`failed`); one root for complete registry startup, including engine creation and descriptions |
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
@@ -1252,7 +1263,7 @@ and log filters. Each command span carries:
 | `shell.command.output.bytes` | The uncut length of that recorded result |
 | `shell.command.pipeline_id`, `shell.command.stage_index` | Shared pipeline id and zero-based position in it |
 | `shell.command.input.bytes`, `shell.command.stdout.bytes` | Bytes read from the stream and accepted by the next stage or terminal output |
-| `shell.command.duration_ns`, `shell.command.close_reason` | Stage elapsed nanoseconds and `end` or `reader_gone` |
+| `shell.command.duration_ns`, `shell.command.close_reason` | Stage elapsed nanoseconds and `end` or `reader_gone`, recorded once when the stage ends |
 | `shell.command.exit_code` | The status the command reported |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, `cancelled`, or `rejected` |
 

@@ -179,7 +179,7 @@ impl NamespacePlan {
 
         let expected = identity(request);
         let resource_identity = serde_json::to_vec(&expected).map_err(|error| {
-            tracing::error!(error = %error, "could not encode storage identity");
+            tracing::error!(error = %error, "storage.identity.unencodable");
             StorageHostError::Arithmetic
         })?;
         if resource_identity.len() > 4_096 {

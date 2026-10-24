@@ -106,7 +106,7 @@ struct StateData {
 fn refuse(state: &StateData, reason: Refusal, status: StatusCode) -> Response {
     if let Some(suppressed) = state.refusals.lock().admit(reason) {
         tracing::warn!(event = "gateway_github_webhook_refused", transport = %state.name,
-            reason = reason.reason(), status = status.as_u16(), suppressed);
+            reason = reason.reason(), status = status.as_u16(), suppressed, "gateway.github.webhook.refused");
     }
     webhook::content_free(status)
 }
@@ -181,11 +181,11 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         .generation
         .admits_github(&state.name, &conversation, &subject, event_kind)
     {
-        tracing::debug!(event = "gateway_github_ignored");
+        tracing::debug!(event = "gateway_github_ignored", "gateway.github.ignored");
         return webhook::content_free(StatusCode::OK);
     }
     let Some(text) = text else {
-        tracing::debug!(event = "gateway_github_ignored");
+        tracing::debug!(event = "gateway_github_ignored", "gateway.github.ignored");
         return webhook::content_free(StatusCode::OK);
     };
     let receipt = received.in_scope(|| receive_span(ChatTransportKind::Github));
@@ -221,7 +221,10 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     }) {
         Ok(true) => {}
         Ok(false) => {
-            tracing::debug!(event = "gateway_github_duplicate");
+            tracing::debug!(
+                event = "gateway_github_duplicate",
+                "gateway.github.duplicate"
+            );
             return webhook::content_free(StatusCode::OK);
         }
         Err(()) => return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE),

@@ -333,7 +333,10 @@ impl ScheduledCatalog {
                 .await
                 .is_err()
                 {
-                    tracing::error!(event = "broker_credential_record_inspection_failed");
+                    tracing::error!(
+                        event = "broker_credential_record_inspection_failed",
+                        "broker.credential.record.inspection.failed"
+                    );
                 }
             }
         }
@@ -480,6 +483,7 @@ impl SecretResolver for MapResolver {
                     event = "secret_source_resolution_failed",
                     source_kind = entry.source.kind(),
                     category = error.category(),
+                    "secret.source.resolution.failed"
                 );
                 SecretResolutionError {
                     category: error.category(),
@@ -492,6 +496,7 @@ impl SecretResolver for MapResolver {
                     event = "secret_projection_failed",
                     source_kind = entry.source.kind(),
                     category = error.category(),
+                    "secret.projection.failed"
                 );
                 SecretResolutionError {
                     category: error.category(),
@@ -1800,6 +1805,7 @@ fn validate_endpoint(endpoint: &str, allow_loopback_http: bool) -> Result<(), &'
             event = "secret_source_configuration_cause",
             category = "invalid-endpoint",
             reason = %source,
+            "secret.source.configuration.cause"
         );
         "endpoint is not an absolute URL"
     })?;
@@ -1983,6 +1989,7 @@ async fn bounded_json(
             category = "rejected",
             cause_type = "http-status",
             http.response.status_code = response.status().as_u16(),
+            "secret.source.cause.classified"
         );
         return Err(if response.status() == reqwest::StatusCode::NOT_FOUND {
             SourceError::Missing
@@ -2387,6 +2394,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             cause_type = "io",
             error.kind = ?source.kind(),
             error.errno = source.raw_os_error(),
+            "secret.source.cause.classified"
         );
     } else if let Some(source) = any.downcast_ref::<reqwest::Error>() {
         tracing::debug!(
@@ -2396,6 +2404,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             error.timeout = source.is_timeout(),
             error.connect = source.is_connect(),
             http.response.status_code = source.status().map(|status| status.as_u16()),
+            "secret.source.cause.classified"
         );
     } else if let Some(source) = any.downcast_ref::<FileHygieneError>() {
         // EACCES on a private secret file is a FileHygieneError::Io, not an io::Error, so it skips
@@ -2408,6 +2417,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             error.check = source.category(),
             error.kind = ?cause.map(std::io::Error::kind),
             error.errno = cause.and_then(std::io::Error::raw_os_error),
+            "secret.source.cause.classified"
         );
     } else if let Some(source) = any.downcast_ref::<serde_json::Error>() {
         tracing::debug!(
@@ -2417,6 +2427,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             error.class = ?source.classify(),
             error.line = source.line(),
             error.column = source.column(),
+            "secret.source.cause.classified"
         );
     } else {
         // Unrecognized dependency error types are logged only by type name and category, since
@@ -2425,6 +2436,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             event = "secret_source_cause_classified",
             category = error.category(),
             cause_type = std::any::type_name::<E>(),
+            "secret.source.cause.classified"
         );
     }
     error

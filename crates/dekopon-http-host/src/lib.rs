@@ -894,7 +894,7 @@ impl BufferedHttpClient {
                     "error.message" = failure.map(|error| error.message.as_str()),
                     outcome = outcome,
                 },
-                "external HTTP request accounted"
+                "accounting.http.request"
             );
         });
 
@@ -1588,7 +1588,7 @@ async fn resolve_destination(host: &str, port: u16) -> Result<Vec<SocketAddr>, H
     let addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| {
-            tracing::debug!(error = %error, "destination resolution failed");
+            tracing::debug!(error = %error, "http.destination.unresolved");
             http_error(ErrorCode::Dns, "destination could not be resolved")
         })?;
     bounded_addresses(addresses)

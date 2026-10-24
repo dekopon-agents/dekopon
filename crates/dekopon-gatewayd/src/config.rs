@@ -2209,7 +2209,7 @@ pub(crate) fn resolve(
                     typing = ?resolved.settings.typing, working = ?resolved.settings.working,
                     seen = ?resolved.settings.seen, progress = ?resolved.settings.progress,
                     stream = resolved.settings.stream, status_text = resolved.settings.status_text,
-                    cancel_button = resolved.settings.cancel_button);
+                    cancel_button = resolved.settings.cancel_button, "gateway.indicators.effective");
                 indicators.insert(kind, Arc::new(resolved));
             }
         }
