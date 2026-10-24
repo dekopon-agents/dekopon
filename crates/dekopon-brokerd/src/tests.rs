@@ -4022,3 +4022,22 @@ async fn a_workflow_file_with_an_unknown_key_is_refused() {
         "{report:?}"
     );
 }
+
+#[tokio::test]
+async fn a_repeated_workflow_name_is_refused_rather_than_replacing_its_steps() {
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: bogus, argv: [probe, bogus], capability: cli-probe.upper}\n  approve:\n    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n",
+    );
+    let report = super::check(&fixture.config, None, Some(&fixture.workflows)).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::WorkflowFile(
+                super::workflows::WorkflowFileError::Decode { .. }
+            )]
+        ),
+        "{report:?}"
+    );
+}

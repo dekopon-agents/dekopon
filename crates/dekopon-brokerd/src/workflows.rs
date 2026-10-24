@@ -248,12 +248,13 @@ pub(crate) async fn load(
         let bytes = config::read_owner_only(&path, uid, config::HARD_MAX_CONFIG_BYTES)
             .await
             .map_err(read)?;
-        let file = serde_yaml::from_slice::<EssentialWorkflows>(&bytes).map_err(|source| {
-            WorkflowFileError::Decode {
+        // Through a Value, whose mappings refuse a duplicate key; a typed map keeps the last.
+        let file = serde_yaml::from_slice::<serde_yaml::Value>(&bytes)
+            .and_then(serde_yaml::from_value::<EssentialWorkflows>)
+            .map_err(|source| WorkflowFileError::Decode {
                 path: path.clone(),
                 source,
-            }
-        })?;
+            })?;
         if file.workflows.is_empty() || file.workflows.values().any(Vec::is_empty) {
             return Err(WorkflowFileError::Incomplete { path });
         }
@@ -429,8 +430,8 @@ fn provider(
         })
 }
 
-// Canonical for the kind and subject, so a policy on the transport or conversation kind sees what it
-// sees live; a policy pinned to one conversation id is not modelled.
+// Canonical for the kind and subject; a Slack DM carries the thread an Agent DM has, so a template
+// that needs it is a miss on an unthreaded DM rather than a false red on an Agent DM.
 fn conversation(
     transport: ChatTransportKind,
     kind: ConversationKind,
@@ -440,7 +441,7 @@ fn conversation(
     let team = || part(subject.tenant().unwrap_or("t0"));
     let (container, id, thread) = match (transport, kind) {
         (ChatTransportKind::Slack, ConversationKind::DirectMessage) => {
-            (team(), "d0".to_owned(), None)
+            (team(), "d0".to_owned(), part(SLACK_THREAD))
         }
         (ChatTransportKind::Slack, ConversationKind::GroupDirectMessage) => {
             (team(), "g0".to_owned(), part(SLACK_THREAD))
