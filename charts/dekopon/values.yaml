@@ -522,6 +522,9 @@ configCheck:
     # a providerSet. The resolved store is kept under <paths.stateDir>/config-check between runs, so
     # the default Helm hook then requires state.existingClaim.
     providerSetConfigMap: ""
+    # Candidate essential workflows: every *.yaml key, passed as --workflows. Requires
+    # providerSetConfigMap.
+    workflowsConfigMap: ""
   gateway:
     # Candidate gatewayd.d: every *.yaml key.
     configMap: ""

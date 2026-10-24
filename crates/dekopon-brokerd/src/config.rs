@@ -769,7 +769,7 @@ async fn load_directory(
     Ok((resolved, refusal))
 }
 
-async fn read_owner_only(
+pub(crate) async fn read_owner_only(
     path: &Path,
     expected_uid: u32,
     maximum: usize,

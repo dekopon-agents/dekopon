@@ -1744,7 +1744,7 @@ async fn broker_projection_does_not_relax_owner_only_source_rules() {
     std::os::unix::fs::symlink("..2026", root.path().join("..data")).unwrap();
     std::os::unix::fs::symlink("..data/broker.yaml", &path).unwrap();
     for report in [
-        super::check(&path, None).await,
+        super::check(&path, None, None).await,
         super::load_candidate(&path, Mode::Boot).await.1,
     ] {
         assert!(
@@ -3056,7 +3056,7 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     document["credentialsPath"] = json!("bad-credentials.yaml");
     document["secretMapPath"] = json!("bad-secrets.yaml");
     write_config(&path, &document);
-    let checked = super::check(&path, None).await;
+    let checked = super::check(&path, None, None).await;
     assert!(checked.problems.is_empty(), "{checked:?}");
     for report in [
         super::load_candidate(&path, Mode::Boot).await.1,
@@ -3095,7 +3095,7 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     });
     document["agents"] = json!({"chat-agent": {"credentials": {"present": "absent"}}});
     write_config(&path, &document);
-    let checked = super::check(&path, None).await;
+    let checked = super::check(&path, None, None).await;
     assert!(checked.problems.is_empty(), "{checked:?}");
     let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
@@ -3131,7 +3131,7 @@ async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
         document["strict"] = json!(strict);
         write_config(&config_path, &document);
         for report in [
-            super::check(&config_path, None).await,
+            super::check(&config_path, None, None).await,
             super::load_candidate(&config_path, Mode::Boot).await.1,
         ] {
             assert!(
@@ -3200,6 +3200,7 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
                 provider_set: provider_set.clone(),
                 store: store.clone(),
             }),
+            None,
         )
     };
     let report = check().await;
@@ -3239,7 +3240,7 @@ async fn non_strict_check_refuses_undeclared_capabilities_but_warns_for_unloaded
     document["capabilities"]["absent"] = json!({"capabilities": {}});
     let config = root.path().join("broker.yaml");
     write_config(&config, &document);
-    let report = super::check(&config, None).await;
+    let report = super::check(&config, None, None).await;
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
         BrokerdError::Capabilities { problems } if problems.iter().any(|problem| matches!(
@@ -3259,7 +3260,12 @@ async fn non_strict_check_refuses_undeclared_capabilities_but_warns_for_unloaded
 
 #[tokio::test]
 async fn check_passes_the_conditional_write_example_in_place() {
-    let report = super::check(example_path("examples/conditional-write/broker.yaml"), None).await;
+    let report = super::check(
+        example_path("examples/conditional-write/broker.yaml"),
+        None,
+        None,
+    )
+    .await;
     assert!(
         report.problems.is_empty(),
         "{:?}",
@@ -3317,7 +3323,7 @@ async fn check_reports_a_fragment_collision_an_unknown_group_and_a_missing_field
         .as_bytes(),
     );
 
-    let report = super::check(&directory, None).await;
+    let report = super::check(&directory, None, None).await;
 
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -3361,7 +3367,7 @@ async fn check_keeps_going_past_a_collision_and_names_the_stage_it_could_not_run
         &json!({"apiVersion": config::CONFIG_API_VERSION, "socketPath": "/elsewhere.sock"}),
     );
 
-    let report = super::check(&directory, None).await;
+    let report = super::check(&directory, None, None).await;
 
     assert!(
         matches!(
@@ -3410,7 +3416,7 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
         &fs::read(example.join("policies.cedar")).expect("example policies"),
     );
 
-    let report = super::check(&path, None).await;
+    let report = super::check(&path, None, None).await;
 
     assert!(report.problems.is_empty(), "{:?}", report.problems);
     assert!(report.warnings.iter().any(|warning| matches!(
@@ -3838,4 +3844,232 @@ async fn each_distinct_lock_change_drains_once_an_identical_rewrite_never_and_a_
         stopped_within(task).await,
         Err(super::BrokerdError::ProviderLockUnsettled)
     ));
+}
+
+const WORKFLOW_POLICIES: &str = r#"
+@id("fetch-for-chat-agent")
+permit(principal == Dekopon::Principal::"cpetersen",
+       action == Dekopon::Action::"http-probe.fetch",
+       resource == Dekopon::Provider::"http-probe")
+when { context.via == "gateway" && context.agent == "chat-agent" };
+"#;
+
+struct WorkflowFixture {
+    _root: tempfile::TempDir,
+    config: std::path::PathBuf,
+    workflows: std::path::PathBuf,
+}
+
+impl WorkflowFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create workflow fixture");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture directory");
+        for provider in ["cli-probe", "http-probe"] {
+            let component = fs::read(example_path(&format!(
+                "examples/providers/{provider}-provider.wasm"
+            )))
+            .expect("checked provider component");
+            write_owner_only(&root.path().join(format!("{provider}.wasm")), &component);
+        }
+        write_owner_only(
+            &root.path().join("policies.cedar"),
+            format!("{POLICIES}{WORKFLOW_POLICIES}").as_bytes(),
+        );
+        let mut document = attested_document(current_uid());
+        document["providers"] = json!(["cli-probe.wasm", "http-probe.wasm"]);
+        document["capabilities"]["http-probe"] = json!({
+            "constraints": {
+                "timeoutMs": 30_000,
+                "http": {
+                    "allowedHosts": ["example.test"], "allowedMethods": ["GET"],
+                    "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+                }
+            },
+            "capabilities": {"http-probe.fetch": {}}
+        });
+        let config = root.path().join("broker.yaml");
+        write_config(&config, &document);
+        let workflows = root.path().join("workflows.d");
+        fs::create_dir(&workflows).expect("create workflows directory");
+        fs::set_permissions(&workflows, fs::Permissions::from_mode(0o700))
+            .expect("private workflows directory");
+        Self {
+            _root: root,
+            config,
+            workflows,
+        }
+    }
+
+    fn write(&self, subject: &str, steps: &str) {
+        let file = format!(
+            "apiVersion: dekopon.dev/workflow/v1alpha1\nkind: EssentialWorkflows\nagent: chat-agent\nsubject: {subject}\nvia: gateway\nscope: {{transport: nestedset, transportKind: slack, conversation: directMessage}}\nworkflows:\n  approve:\n{steps}"
+        );
+        write_owner_only(&self.workflows.join("chat-agent.yaml"), file.as_bytes());
+    }
+
+    async fn refusals(&self) -> Vec<super::workflows::StepRefusal> {
+        let report = super::check(&self.config, None, Some(&self.workflows)).await;
+        report
+            .problems
+            .into_iter()
+            .map(|problem| {
+                if let super::BrokerdError::Workflow(refusal) = problem {
+                    refusal
+                } else {
+                    panic!(
+                        "unexpected problem: {}",
+                        dekopon_core::error_chain(&problem)
+                    )
+                }
+            })
+            .collect()
+    }
+}
+
+const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
+
+#[tokio::test]
+async fn a_step_whose_argv_renders_a_usage_error_is_refused_as_parse() {
+    use super::workflows::{ParseFailure, ParseRefusal, Refused};
+
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n    - {step: bogus, argv: [probe, bogus], capability: cli-probe.upper}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].workflow, "approve");
+    assert_eq!(refusals[0].step, "bogus");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Parse(parse) if matches!(
+                &**parse,
+                ParseRefusal {
+                    failure: ParseFailure::Rendered { status: 2, .. },
+                    provider: Some(_),
+                    ..
+                }
+            )
+        ),
+        "{refusals:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_for_an_unmapped_subject_is_refused_as_grant() {
+    use super::workflows::{GrantRefusal, Refused};
+
+    let fixture = WorkflowFixture::new();
+    let step =
+        "    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n";
+    fixture.write(MAPPED_SUBJECT, step);
+    assert!(fixture.refusals().await.is_empty());
+
+    fixture.write("slack.t0123abc.u0other", step);
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Grant(GrantRefusal::Refused {
+                reason: "unmapped-subject",
+                ..
+            })
+        ),
+        "{refusals:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_declaring_more_requests_than_its_capability_allows_is_refused_as_budget() {
+    use super::workflows::Refused;
+
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: one, argv: [httpprobe, fetch, --uri, \"https://example.test/\"], capability: http-probe.fetch, requests: 1}\n    - {step: two, argv: [httpprobe, fetch, --uri, \"https://example.test/\"], capability: http-probe.fetch, requests: 2}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].step, "two");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Budget { declared, maximum: 1 } if declared.get() == 2
+        ),
+        "{refusals:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_file_with_an_unknown_key_is_refused() {
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper, expectedHeadSha: abc}\n",
+    );
+    let report = super::check(&fixture.config, None, Some(&fixture.workflows)).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::WorkflowFile(
+                super::workflows::WorkflowFileError::Decode { .. }
+            )]
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_workflow_name_is_refused_rather_than_replacing_its_steps() {
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: bogus, argv: [probe, bogus], capability: cli-probe.upper}\n  approve:\n    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n",
+    );
+    let report = super::check(&fixture.config, None, Some(&fixture.workflows)).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::WorkflowFile(
+                super::workflows::WorkflowFileError::Decode { .. }
+            )]
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_step_whose_capability_the_policy_does_not_permit_is_refused_as_grant() {
+    use super::workflows::{GrantRefusal, Refused};
+
+    let fixture = WorkflowFixture::new();
+    write_owner_only(
+        &fixture
+            .config
+            .parent()
+            .expect("fixture root")
+            .join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n    - {step: fetch, argv: [httpprobe, fetch, --uri, \"https://example.test/\"], capability: http-probe.fetch}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].step, "fetch");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Grant(GrantRefusal::Refused {
+                reason: "policy-denied",
+                ..
+            })
+        ),
+        "{refusals:?}"
+    );
 }

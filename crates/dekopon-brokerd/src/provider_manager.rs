@@ -752,7 +752,10 @@ async fn load_optional_lock(
     }
 }
 
-async fn load_lock(path: &Path, expected_uid: u32) -> Result<ProviderLock, ProviderManagerError> {
+pub(crate) async fn load_lock(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<ProviderLock, ProviderManagerError> {
     let bytes = read_secure_file(path, expected_uid, HARD_MAX_PROVIDER_STATE_BYTES).await?;
     decode_lock(&bytes)
 }
