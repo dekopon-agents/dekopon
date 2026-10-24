@@ -341,7 +341,7 @@ fn io_error(error_value: AssetIoError) -> wit::Error {
         } => error(wit::ErrorCode::InvalidEncoding, "invalid base64 asset"),
         AssetIoError::Io { kind } => {
             tracing::warn!(?kind, "asset.io.failed");
-            error(wit::ErrorCode::Io, "asset.io.failed")
+            error(wit::ErrorCode::Io, "asset I/O failed")
         }
         AssetIoError::Worker => error(wit::ErrorCode::Internal, "asset worker failed"),
     }

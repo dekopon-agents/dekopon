@@ -2600,7 +2600,22 @@ async fn session(
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
     if delivered {
-        if completed_outcome == MessageOutcome::Answered
+        let answered = match completed_outcome {
+            MessageOutcome::Answered => true,
+            MessageOutcome::Declined
+            | MessageOutcome::Refused
+            | MessageOutcome::Failed
+            | MessageOutcome::ReplyFailed
+            | MessageOutcome::Cancelled
+            | MessageOutcome::Sealed
+            | MessageOutcome::Unauthorized
+            | MessageOutcome::FollowInactive
+            | MessageOutcome::Steered
+            | MessageOutcome::Queued
+            | MessageOutcome::Busy
+            | MessageOutcome::RouteLost => false,
+        };
+        if answered
             && leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
@@ -2629,7 +2644,7 @@ async fn session(
             }
         }
         if is_follow
-            && completed_outcome == MessageOutcome::Answered
+            && answered
             && !leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {

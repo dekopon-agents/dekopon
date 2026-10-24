@@ -144,6 +144,7 @@ pub(crate) struct ProgressInputs {
 pub(crate) struct ProgressPolicy {
     coordination: Arc<Coordination>,
     terminal: Option<oneshot::Sender<TerminalRequest>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProgressPolicy {
@@ -167,20 +168,19 @@ impl ProgressPolicy {
         };
         #[expect(
             clippy::disallowed_methods,
-            reason = "detached on purpose: cleanup now finishes before the terminal \
-                      acknowledgment that frees the session's admission permit, but cancellation \
-                      and coordination-end exits still run this after their caller stops \
-                      watching; bounded by EVENT_QUEUE and each driver call's timeout, and it \
-                      ends once the terminal request and event queue are done"
+            reason = "owner: ProgressPolicy, which joins it in terminal(); bound: EVENT_QUEUE and \
+                      each driver call's timeout, and it ends once the terminal request, a \
+                      cancellation or the end of coordination is handled"
         )]
-        drop(tokio::spawn(tracing::Instrument::instrument(
+        let worker = tokio::spawn(tracing::Instrument::instrument(
             run(surface, events_rx, text_rx, terminal_rx, cancellation),
             tracing::Span::current(),
-        )));
+        ));
         (
             Self {
                 coordination,
                 terminal: Some(terminal_tx),
+                worker: Some(worker),
             },
             adapter,
         )
@@ -195,10 +195,21 @@ impl ProgressPolicy {
             return false;
         };
         let (done, wait) = oneshot::channel();
-        if sender.send(TerminalRequest { terminal, done }).is_err() {
-            return false;
+        let delivered = if sender.send(TerminalRequest { terminal, done }).is_ok() {
+            wait.await.unwrap_or(false)
+        } else {
+            false
+        };
+        // The worker holds the session span; joining it lets that span end at the reply.
+        if let Some(worker) = self.worker.take()
+            && worker.await.is_err()
+        {
+            tracing::debug!(
+                event = "gateway_progress_worker_failed",
+                "gateway.progress.worker.failed"
+            );
         }
-        wait.await.unwrap_or(false)
+        delivered
     }
 }
 
