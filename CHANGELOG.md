@@ -7,6 +7,30 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-10-24
+
+### Added
+
+- dekopon-brokerd provider commands and check --provider-set trust the PEM roots in the file named by DEKOPON_REGISTRY_CA_BUNDLE, beside the public roots, when that variable is set.
+- Providers can ship Agent Skills inside their component with dekopon_provider_sdk::skills!, and dekopon-brokerd provider skills --out DIR exports a locked provider set's skills as skill directories an agent can mount.
+
+### Removed
+
+- dekopon-process now provides only CancelHandle and CancelSignal, whose cancelled() wait is public; ProcessRun, Process, process_fn and the DEBUG process.run and process.node spans are gone.
+
+### Fixed
+
+- A deeply nested `if`, `elif`, `while` or `until` condition is a syntax error instead of a stack overflow that aborts the gateway.
+- `$(( ... ))` refuses text between its closing parentheses instead of silently dropping it.
+- Shell scripts: a case pattern, comment or here-document inside $( ) no longer ends the substitution early.
+- Shell scripts: ${NAME:-word} and its relatives keep a quoted }, ( or /, the word's whitespace and a leading # as bash does.
+
+## [dekopon-chart-0.38.0] - 2026-10-24
+
+### Changed
+
+- Chart 0.38.0 targets core v0.51.0 and renders the `v0.51.0` image tag.
+
 ## [0.50.6] - 2026-10-24
 
 ### Fixed
