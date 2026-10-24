@@ -6,8 +6,8 @@ dekopon-storage-host
 dekopon-model-token-governor
 dekopon-model
 dekopon-model-proxy
-dekopon-shell
 dekopon-process
+dekopon-shell
 dekopon-http-host
 dekopon-protocol
 dekopon-provider-sdk
