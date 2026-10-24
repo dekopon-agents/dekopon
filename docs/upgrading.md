@@ -8,6 +8,10 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Process spans removed (0.51.0)
+
+A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. `dekopon-gatewayd` no longer emits the `DEBUG` `process.run` and `process.node` spans its trace filter exported, so a saved query, dashboard or alert on them sees no spans after 0.51.0.
+
 ## Undeclared capabilities refuse and tool-call ids (0.50.5)
 
 A capability block naming a capability its loaded provider does not declare now refuses
