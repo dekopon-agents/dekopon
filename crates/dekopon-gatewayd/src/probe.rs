@@ -6,7 +6,7 @@ use dekopon_model::{
     control::TurnControl,
     error::InferenceError,
     inference::{GenerateRequest, InferenceModel as _},
-    model::{CompletionOptions, ModelMessage},
+    model::{CompletionOptions, ContentPart, ModelMessage, ModelTool},
     openrouter::{
         OpenRouterClient,
         settings::{Generation, Settings},
@@ -87,6 +87,10 @@ pub enum ProbeError {
     // The vendor's text is already in this display; chaining its sources repeats it.
     #[error("{0}")]
     Vendor(InferenceError),
+    #[error("vendor canary returned an invalid tool call (HTTP 200)")]
+    InvalidToolCall,
+    #[error("vendor canary returned a malformed response (HTTP 200): {0}")]
+    MalformedResponse(dekopon_model::error::ProtocolFailure),
 }
 
 impl From<InferenceError> for ProbeError {
@@ -103,22 +107,27 @@ fn render_routes(routes: &[String]) -> String {
     }
 }
 
+pub(crate) struct Baseline<'a> {
+    pub active: Option<(&'a ResolvedConfig, &'a RoutingTable)>,
+    pub catalog: Option<&'a dekopon_config::LocalCatalog>,
+}
+
 pub(crate) async fn probe(
     config: &ResolvedConfig,
     routes: Option<&RoutingTable>,
     scope: &ProbeScope,
-    active_models: Option<&[ModelConfig]>,
+    against: Baseline<'_>,
     vendor: &Vendor,
     report: &mut CheckReport,
 ) {
-    let baseline = if let Some(models) = active_models {
-        Some(Cow::Borrowed(models))
+    let loaded_baseline = if against.active.is_some() {
+        None
     } else {
         match scope {
             ProbeScope::Every => None,
             ProbeScope::ChangedFrom(path) => {
                 match config::load_in(path, crate::current_uid(), config::LoadMode::Check).await {
-                    Ok((against, _)) => Some(Cow::Owned(against.models)),
+                    Ok((against, _)) => Some(against),
                     Err(source) => {
                         report.warnings.push(CheckWarning::Baseline {
                             path: path.clone(),
@@ -130,10 +139,41 @@ pub(crate) async fn probe(
             }
         }
     };
+    let baseline = against
+        .active
+        .map(|(config, _)| config)
+        .or(loaded_baseline.as_ref());
+    let baseline_routes = if let Some((_, routes)) = against.active {
+        Some(Cow::Borrowed(routes))
+    } else {
+        baseline.as_ref().and_then(|old| {
+            let catalog = against.catalog.map(Cow::Borrowed).map_or_else(
+                || dekopon_config::LocalCatalog::load(&old.catalog_path).map(Cow::Owned),
+                Ok,
+            );
+            match catalog
+                .map_err(GatewaydError::Catalog)
+                .and_then(|catalog| RoutingTable::bind(old, &catalog).map_err(GatewaydError::from))
+            {
+                Ok(routes) => Some(Cow::Owned(routes)),
+                Err(source) => {
+                    report.warnings.push(CheckWarning::BaselineRoutes {
+                        source: Box::new(source),
+                    });
+                    None
+                }
+            }
+        })
+    };
     for model in &config.models {
         if baseline
             .as_ref()
-            .is_some_and(|models| models.iter().any(|old| old == model))
+            .is_some_and(|old| old.models.iter().any(|old| old == model))
+            && routes.is_none_or(|routes| {
+                baseline_routes
+                    .as_ref()
+                    .is_some_and(|old| !routes.new_binding(model.name(), old))
+            })
         {
             continue;
         }
@@ -216,19 +256,59 @@ async fn probe_openrouter(
     }
     let control = TurnControl::new(tokio::sync::watch::channel(false).1, timeout)?;
     let messages = [
-        ModelMessage::system("Reply with one word."),
-        ModelMessage::user("ping"),
+        ModelMessage::system(
+            "Call the canary tool exactly once with no arguments after viewing the attached image.",
+        ),
+        ModelMessage::user_with_parts(vec![ContentPart::Image {
+            mime: "image/png".to_owned(),
+            data: dekopon_model::asset::DiskBlob::from_bytes(&[
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100,
+                248, 15, 0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+                130,
+            ])
+            .map_err(InferenceError::from)?
+            .into(),
+        }]),
     ];
-    client
+    let tools = [ModelTool {
+        name: "canary".to_owned(),
+        description: "Confirm the image can be received.".to_owned(),
+        parameters: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    }];
+    let turn = client
         .generate(
             GenerateRequest {
                 messages: &messages,
-                tools: &[],
+                tools: &tools,
                 options: &CompletionOptions::default(),
             },
             &mut |_| ControlFlow::Continue(()),
             &control,
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            InferenceError::Protocol(source) => ProbeError::MalformedResponse(source),
+            other @ (InferenceError::InvalidRequest(_)
+            | InferenceError::Provider(_)
+            | InferenceError::Transport(_)
+            | InferenceError::Attachment(_)
+            | InferenceError::Authentication(_)
+            | InferenceError::RateLimited(_)
+            | InferenceError::DeadlineExceeded
+            | InferenceError::Cancelled
+            | InferenceError::OverBudget(_)) => ProbeError::Vendor(other),
+        })?;
+    let [call] = turn.tool_calls.as_slice() else {
+        return Err(ProbeError::InvalidToolCall);
+    };
+    if call.id.as_str().is_empty()
+        || call.kind != "function"
+        || call.function.name != tools[0].name
+        || serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok()
+            != Some(serde_json::json!({}))
+    {
+        return Err(ProbeError::InvalidToolCall);
+    }
     Ok(())
 }

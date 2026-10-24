@@ -241,6 +241,7 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
     .unwrap();
     let path = write_config(root.path(), &document(root.path()));
     let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
     let old_sources = gateway_sources(&active).await;
     let mut edited = document(root.path());
     edited["broker"]["serverUid"] = json!(502);
@@ -251,7 +252,7 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &old_sources)),
+        Some((&active, &old_sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_none());
@@ -272,7 +273,7 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &old_sources)),
+        Some((&active, &old_sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_some(), "{report:?}");
@@ -297,13 +298,14 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
     }]);
     let path = write_config(root.path(), &config);
     let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
     let sources = gateway_sources(&active).await;
     let (candidate, report) = crate::load_candidate_against(
         &path,
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     let candidate = candidate.unwrap_or_else(|| panic!("active reload rejected: {report:?}"));
@@ -325,7 +327,7 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_none());
@@ -19640,6 +19642,7 @@ fn models_fragment(models: Value) -> Value {
 struct FakeVendor {
     endpoint: String,
     asked: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Value>>>,
 }
 
 #[allow(
@@ -19656,24 +19659,35 @@ fn spawn_fake_vendor() -> FakeVendor {
     let listener = tokio::net::TcpListener::from_std(listener).expect("fake vendor adopts");
     let asked = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&asked);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
             let recorded = Arc::clone(&recorded);
+            let recorded_requests = Arc::clone(&recorded_requests);
             tokio::spawn(async move {
-                let Some((_, headers, body)) = read_http_request_parts(&mut stream).await else {
+                let Some((uri, headers, body)) = read_http_request_parts(&mut stream).await else {
                     return;
                 };
+                assert_eq!(uri, "/api/v1/chat/completions");
                 let model =
                     serde_json::from_str::<Value>(&body).expect("probe body is JSON")["model"]
                         .as_str()
                         .expect("probe names its model")
                         .to_owned();
+                let request: Value = serde_json::from_str(&body).unwrap();
+                assert_canary_request(&request);
+                recorded_requests.lock().push(request);
                 recorded.lock().push(model.clone());
+                if model == "vendor/deadline" {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
                 let (status, content_type, response) = if model == "vendor/refused"
                     || model == "vendor/outage"
+                    || model == "vendor/image-refused"
                 {
                     let authorization = headers
                         .lines()
@@ -19690,7 +19704,10 @@ fn spawn_fake_vendor() -> FakeVendor {
                     (
                         "200 OK",
                         "text/event-stream",
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(),
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id": if model == "vendor/incomplete" { "" } else { "call_canary" },"type":"function","function":{"name":"canary","arguments": if model == "vendor/malformed" { "{broken" } else if model == "vendor/wrong-arguments" { "{\"unexpected\":true}" } else { "{}" }}}]},"finish_reason":"tool_calls"}]})
+                        ),
                     )
                 };
                 let head = format!(
@@ -19707,7 +19724,29 @@ fn spawn_fake_vendor() -> FakeVendor {
     FakeVendor {
         endpoint: format!("http://{address}/api/v1/chat/completions"),
         asked,
+        requests,
     }
+}
+
+fn assert_canary_request(request: &Value) {
+    assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(request["tools"][0]["function"]["name"], "canary");
+    let images = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .collect::<Vec<_>>();
+    assert_eq!(images.len(), 1);
+    assert!(
+        images[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+    assert_eq!(request["max_tokens"], 16);
 }
 
 async fn probed(
@@ -20941,6 +20980,10 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
     ));
 }
 
+fn active_routes(config: &crate::ResolvedConfig) -> RoutingTable {
+    RoutingTable::bind(config, &LocalCatalog::load(&config.catalog_path).unwrap()).unwrap()
+}
+
 async fn gateway_sources(config: &crate::ResolvedConfig) -> config::GatewaySources {
     let catalog = LocalCatalog::load(&config.catalog_path).unwrap();
     config::GatewaySources {
@@ -20977,6 +21020,7 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
         .push(openrouter_model("router", "vendor/kept", 5_000));
     let path = write_config(root.path(), &document);
     let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
     let sources = gateway_sources(&active).await;
     document["models"][1]["model"] = json!("vendor/refused");
     write_config(root.path(), &document);
@@ -20985,7 +21029,7 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
         None,
         config::LoadMode::Boot,
         Some((&crate::ProbeScope::Every, &environment)),
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_none());
@@ -21012,6 +21056,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
     let active = config::load(&live_path, crate::current_uid())
         .await
         .unwrap();
+    let active_routes = active_routes(&active);
     let sources = gateway_sources(&active).await;
     let mut candidate = document(root.path());
     for (model, status) in [("vendor/refused", 400), ("vendor/outage", 503)] {
@@ -21025,7 +21070,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
             None,
             config::LoadMode::Boot,
             Some((&crate::ProbeScope::Every, &environment)),
-            Some((&active, &sources)),
+            Some((&active, &sources, &active_routes)),
         )
         .await;
         assert!(prepared.is_none());
@@ -21049,7 +21094,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
         None,
         config::LoadMode::Boot,
         Some((&crate::ProbeScope::Every, &environment)),
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     let prepared = prepared.expect("repair prepares a full candidate");
@@ -22001,4 +22046,183 @@ async fn a_cold_platform_recall_skips_messages_before_the_seal() {
     assert!(!recalled.contains("before the seal"));
     assert!(recalled.contains("at the seal"));
     assert!(recalled.contains("after the seal"));
+}
+
+#[tokio::test]
+async fn an_image_refusal_names_the_model_routes_and_vendor_status() {
+    canary_result("vendor/image-refused", false).await;
+}
+
+#[tokio::test]
+async fn a_malformed_canary_tool_call_refuses_the_model() {
+    canary_result("vendor/malformed", false).await;
+}
+
+#[tokio::test]
+async fn a_well_formed_canary_tool_call_passes() {
+    canary_result("vendor/accepted", true).await;
+}
+
+async fn canary_result(model: &str, passes: bool) {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([openrouter_model("router", model, 5_000)]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::Every, &vendor).await;
+    if passes {
+        assert!(report.problems.is_empty(), "{report:?}");
+    } else {
+        let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+            panic!("{report:?}")
+        };
+        assert_eq!(problem.model, "router");
+        assert_eq!(problem.routes, ["dev:reviewer"]);
+        let diagnostic = crate::gateway::reload_problem(&report.problems[0]);
+        assert!(diagnostic.contains("router"), "{diagnostic}");
+        assert!(diagnostic.contains("dev:reviewer"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(if model == "vendor/image-refused" {
+                "400"
+            } else {
+                "200"
+            }),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains(PROBE_KEY), "{diagnostic}");
+        match model {
+            "vendor/image-refused" => assert!(matches!(&problem.source,
+                crate::ProbeError::Vendor(InferenceError::Provider(failure)) if failure.status == Some(400))),
+            "vendor/malformed" | "vendor/incomplete" => assert!(matches!(
+                &problem.source,
+                crate::ProbeError::MalformedResponse(_)
+            )),
+            "vendor/wrong-arguments" => assert!(matches!(
+                &problem.source,
+                crate::ProbeError::InvalidToolCall
+            )),
+
+            _ => panic!("unexpected test model"),
+        }
+    }
+    assert_eq!(vendor.asked.lock().as_slice(), [model]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0]);
+}
+
+#[tokio::test]
+async fn rebinding_an_unchanged_model_is_probed_but_unchanged_bindings_are_not() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([
+        openrouter_model("first", "vendor/first", 5_000),
+        openrouter_model("second", "vendor/second", 5_000)
+    ]);
+    document["routes"][0]["model"] = json!("first");
+    let path = write_config(root.path(), &document);
+    let live = root.path().join("live.json");
+    fs::copy(&path, &live).unwrap();
+    let scope = crate::ProbeScope::ChangedFrom(live);
+    let report = probed(&path, &scope, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(vendor.requests.lock().is_empty());
+    document["routes"][0]["model"] = json!("second");
+    write_config(root.path(), &document);
+    let report = probed(&path, &scope, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/second"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0]);
+}
+
+#[tokio::test]
+async fn an_incomplete_canary_tool_call_preserves_the_protocol_cause() {
+    canary_result("vendor/incomplete", false).await;
+}
+
+#[tokio::test]
+async fn catalog_rebinding_uses_the_active_routes_and_refuses_the_reload() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: |variable| (variable == "PATH").then(|| PROBE_KEY.into()),
+    };
+    let root = temporary();
+    let catalog = root.path().join("dekopon.yaml");
+    fs::write(&catalog, catalog_text(true, Some("reasoning"))).unwrap();
+    let mut document = document(root.path());
+    let mut first = openrouter_model("first", "vendor/first", 5_000);
+    first["apiKeyEnv"] = json!("PATH");
+    first["classes"] = json!(["reasoning"]);
+    let mut second = openrouter_model("second", "vendor/image-refused", 5_000);
+    second["apiKeyEnv"] = json!("PATH");
+    second["classes"] = json!(["vision"]);
+    document["models"] = json!([first, second]);
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
+    let sources = gateway_sources(&active).await;
+    fs::write(&catalog, catalog_text(true, Some("vision"))).unwrap();
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources, &active_routes)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(problem.model, "second");
+    assert_eq!(problem.routes, ["dev:reviewer"]);
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/image-refused"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0]);
+    assert_eq!(active_routes.serving("first"), ["dev:reviewer"]);
+}
+
+#[tokio::test]
+async fn a_canary_deadline_names_the_model_and_routes() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([openrouter_model("router", "vendor/deadline", 100)]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::Every, &vendor).await;
+    let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(problem.model, "router");
+    assert_eq!(problem.routes, ["dev:reviewer"]);
+    assert!(matches!(
+        problem.source,
+        crate::ProbeError::Vendor(InferenceError::DeadlineExceeded)
+    ));
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0]);
+}
+
+#[tokio::test]
+async fn canary_arguments_must_match_the_declared_tool() {
+    canary_result("vendor/wrong-arguments", false).await;
 }

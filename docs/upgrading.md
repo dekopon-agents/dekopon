@@ -8,6 +8,21 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Image-and-tool model canary
+
+`dekopon-gatewayd check --probe [--against <live config>]` and the reload gate now send one
+capped request containing a built-in one-pixel PNG and one fixed tool to each changed `openrouter`
+model. Exactly one well-formed call to that tool is required; no second request is made. A route
+newly binding an otherwise unchanged model also selects it for probing. An unchanged route and
+model do not select it under `--against` or reload.
+
+A vendor refusal, malformed tool call or deadline refuses the candidate; reload keeps the running
+configuration serving. The existing 16-output-token cap and 30-second bound (or shorter model
+`timeoutMs`) remain. Subscription, `anthropic` and `openaiCompatible` models retain their not-probed
+warnings, and plain `check` still reads no credential. No configuration migration is needed.
+Boot does not run the vendor canary; run `check --probe --against <live config>` in deployment CI
+before restarting with a candidate.
+
 ## Process spans removed (0.51.0)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. `dekopon-gatewayd` no longer emits the `DEBUG` `process.run` and `process.node` spans its trace filter exported, so a saved query, dashboard or alert on them sees no spans after 0.51.0.

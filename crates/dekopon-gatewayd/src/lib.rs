@@ -421,6 +421,11 @@ pub struct CheckReport {
 
 #[derive(Debug, Error)]
 pub enum CheckWarning {
+    #[error("baseline routes did not bind, so every model is probed")]
+    BaselineRoutes {
+        #[source]
+        source: Box<GatewaydError>,
+    },
     #[error("transport {transport} reads {variable} from the environment at boot")]
     TransportCredential { transport: String, variable: String },
     #[error("model {model} reads {variable} from the environment at boot")]
@@ -498,8 +503,9 @@ pub(crate) async fn load_candidate_against(
     catalog_path: Option<&Path>,
     mode: config::LoadMode,
     probe: Option<(&ProbeScope, &probe::Vendor)>,
-    active: Option<(&ResolvedConfig, &config::GatewaySources)>,
+    active: Option<(&ResolvedConfig, &config::GatewaySources, &RoutingTable)>,
 ) -> (Option<Candidate>, CheckReport) {
+    let baseline_catalog_override = catalog_path.is_some();
     let mut report = CheckReport::default();
     let before_config = config::source_snapshot(config_path, None, current_uid()).await;
     let (config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
@@ -575,7 +581,10 @@ pub(crate) async fn load_candidate_against(
                 config,
                 routes.as_ref(),
                 scope,
-                active.map(|(config, _)| config.models.as_slice()),
+                probe::Baseline {
+                    active: active.map(|(config, _, routes)| (config, routes)),
+                    catalog: catalog.as_ref().filter(|_| baseline_catalog_override),
+                },
                 vendor,
                 &mut report,
             )
@@ -595,7 +604,7 @@ pub(crate) async fn load_candidate_against(
                         config: after,
                         catalog: catalog_after,
                     };
-                    let changes = active.map(|(_, old)| old.changes(&sources)).transpose();
+                    let changes = active.map(|(_, old, _)| old.changes(&sources)).transpose();
                     match changes {
                         Ok(Some(changes)) if !changes.restart_required.is_empty() => {
                             report.problems.push(

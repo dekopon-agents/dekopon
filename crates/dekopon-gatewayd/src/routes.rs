@@ -156,6 +156,21 @@ impl RoutingTable {
             .collect()
     }
 
+    pub(crate) fn new_binding(&self, model: &str, baseline: &Self) -> bool {
+        self.routes
+            .iter()
+            .filter(|route| route.model.name() == model)
+            .any(|route| {
+                !baseline.routes.iter().any(|old| {
+                    old.transport == route.transport
+                        && old.conversation == route.conversation
+                        && old.subjects == route.subjects
+                        && old.agent == route.agent
+                        && old.model.name() == model
+                })
+            })
+    }
+
     pub(crate) fn serving(&self, model: &str) -> Vec<String> {
         self.routes
             .iter()

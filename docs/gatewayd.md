@@ -44,17 +44,26 @@ opened and no journal directory is created. Transport clients are not built, so 
 in their constructors run only at boot.
 
 `--probe` adds the one online stage, and with it the one credential read: for each changed
-`openrouter` model it reads the model's `apiKeyEnv` and sends a single completion capped at 16
-output tokens, through the same client and routing settings the gateway uses, with a 30-second
-bound (or the model's `timeoutMs`, if shorter). A refusal is a problem naming the model, its
-vendor model id, the file that defines it, the routes it serves and the vendor's status and body;
+`openrouter` model it reads the model's `apiKeyEnv` and sends a single image-and-tool canary
+request capped at 16 output tokens, through the same client and routing settings the gateway uses,
+with a 30-second bound (or the model's `timeoutMs`, if shorter). The request carries a built-in
+one-pixel PNG and declares one fixed `canary` tool with empty object arguments. It must return exactly one well-formed call to that tool; no tool result or
+second request is sent. A refusal, malformed call or deadline is a problem naming the model, its
+vendor model id, the file that defines it and the routes it serves. Vendor failures retain
+status and a redacted diagnostic when available; a deadline reports that the turn expired;
 the key never appears, because the client redacts it from the body. A model is changed when its
-name is absent from the `--against` configuration or its parsed settings differ there (defaults
-filled in, so formatting alone is no change); without `--against` every model is probed, and an
-`--against` that does not load is a warning and probes every model. `chatgptSubscription` models
+name is absent from the `--against` configuration, its parsed settings differ there (defaults
+filled in, so formatting alone is no change), or a route newly binds it. Route bindings compare
+transport, conversation selector, subjects, agent and selected model. Without `--against` every
+model is probed, and an `--against` that does not load is a warning and probes every model. `chatgptSubscription` models
 are never probed, since reading the login can refresh and rotate it under the running gateway;
 each changed one is a `not probed: subscription auth` warning, as is each changed `anthropic`
 (`proxy-only model`) and `openaiCompatible` model.
+
+Reload uses the same canary against the active configuration and refuses a failed candidate while
+the running configuration keeps serving. Boot behaviour is unchanged: it does not run this vendor
+canary. Run `check --probe --against <live config>` before deploying a candidate that will restart
+the gateway.
 
 ## Configuration
 
