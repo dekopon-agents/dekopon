@@ -79,7 +79,8 @@ workflows:
       requests: 2
 ```
 
-`via` names the attesting peer's principal among the candidate `identities`; `subject`, `agent`
+`via` names the attesting peer's principal, which exactly one candidate identity must have, or
+every step is refused as `grant`; `subject`, `agent`
 and `scope` form the attestation it would send, with trigger `message` and conversation
 coordinates the check fills in as canonical for the transport kind and subject. Only some of them
 are real values: the Slack container (the subject's team), a Telegram or WhatsApp direct-message id

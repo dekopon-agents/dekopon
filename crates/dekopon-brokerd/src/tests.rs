@@ -4073,3 +4073,58 @@ async fn a_step_whose_capability_the_policy_does_not_permit_is_refused_as_grant(
         "{refusals:?}"
     );
 }
+
+#[tokio::test]
+async fn a_via_principal_that_two_identities_share_is_refused_as_grant() {
+    use super::workflows::{GrantRefusal, Refused};
+
+    let fixture = WorkflowFixture::new();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.config).expect("read fixture config"))
+            .expect("fixture config is JSON");
+    document["identities"]
+        .as_array_mut()
+        .expect("identities list")
+        .push(json!({
+            "uid": current_uid() + 3,
+            "principal": "gateway",
+            "actor": {"type": "service", "principal": "gateway"},
+            "attestor": {"namespaces": ["slack.t0other"]}
+        }));
+    write_config(&fixture.config, &document);
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: upper, argv: [probe, upper, --text, hi], capability: cli-probe.upper}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Grant(GrantRefusal::AmbiguousVia { via, identities: 2 })
+                if via.as_str() == "gateway"
+        ),
+        "{refusals:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_workflow_file_is_refused_as_a_workflow_file() {
+    let fixture = WorkflowFixture::new();
+    write_owner_only(
+        &fixture.workflows.join("chat-agent.yaml"),
+        &vec![b'#'; config::HARD_MAX_CONFIG_BYTES + 1],
+    );
+    let report = super::check(&fixture.config, None, Some(&fixture.workflows)).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::WorkflowFile(
+                super::workflows::WorkflowFileError::Read(
+                    dekopon_core::FileHygieneError::TooLarge { .. }
+                )
+            )]
+        ),
+        "{report:?}"
+    );
+}

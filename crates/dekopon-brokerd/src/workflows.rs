@@ -12,8 +12,9 @@ use dekopon_broker_protocol::{
     ConversationKind, Trigger,
 };
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, TransportId, error_chain,
-    fragments,
+    AgentId, CapabilityId, ExternalSubject, FileHygieneError, PrincipalId, ProviderId, TransportId,
+    error_chain,
+    fragments::{self, FragmentError},
 };
 use semver::Version;
 use serde::Deserialize;
@@ -90,8 +91,10 @@ impl TryFrom<Vec<String>> for Argv {
 
 #[derive(Debug, Error)]
 pub enum WorkflowFileError {
-    #[error("could not read essential workflows")]
-    Read(#[source] config::ConfigError),
+    #[error("could not read the essential workflows directory")]
+    Directory(#[source] FragmentError),
+    #[error("could not read an essential workflows file")]
+    Read(#[source] FileHygieneError),
     #[error("essential workflows directory {path} holds no *.yaml file")]
     Empty { path: PathBuf },
     #[error("essential workflows file {path} does not decode")]
@@ -156,6 +159,10 @@ pub enum GrantRefusal {
     UnknownVia {
         via: PrincipalId,
     },
+    AmbiguousVia {
+        via: PrincipalId,
+        identities: usize,
+    },
     Refused {
         reason: &'static str,
         policy_ids: Vec<String>,
@@ -207,6 +214,12 @@ impl fmt::Display for Refused {
             Self::Grant(GrantRefusal::UnknownVia { via }) => {
                 write!(formatter, "no candidate identity has principal {via}")
             }
+            Self::Grant(GrantRefusal::AmbiguousVia { via, identities }) => {
+                write!(
+                    formatter,
+                    "{identities} candidate identities have principal {via}"
+                )
+            }
             Self::Grant(GrantRefusal::Refused { reason, policy_ids }) if policy_ids.is_empty() => {
                 formatter.write_str(reason)
             }
@@ -235,9 +248,8 @@ pub(crate) async fn load(
     directory: &Path,
     uid: u32,
 ) -> Result<Vec<EssentialWorkflows>, WorkflowFileError> {
-    let read = |error: config::ConfigError| WorkflowFileError::Read(error);
     let paths =
-        fragments::scan_directory(directory, uid, "yaml").map_err(|error| read(error.into()))?;
+        fragments::scan_directory(directory, uid, "yaml").map_err(WorkflowFileError::Directory)?;
     if paths.is_empty() {
         return Err(WorkflowFileError::Empty {
             path: directory.to_path_buf(),
@@ -245,9 +257,9 @@ pub(crate) async fn load(
     }
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
-        let bytes = config::read_owner_only(&path, uid, config::HARD_MAX_CONFIG_BYTES)
+        let bytes = config::read_not_world_writable(&path, uid, config::HARD_MAX_CONFIG_BYTES)
             .await
-            .map_err(read)?;
+            .map_err(WorkflowFileError::Read)?;
         // Through a Value, whose mappings refuse a duplicate key; a typed map keeps the last.
         let file = serde_yaml::from_slice::<serde_yaml::Value>(&bytes)
             .and_then(serde_yaml::from_value::<EssentialWorkflows>)
@@ -289,10 +301,6 @@ pub(crate) async fn run(
 ) -> Vec<StepRefusal> {
     let mut refusals = Vec::new();
     for file in files {
-        let peer = ready
-            .identities
-            .values()
-            .find(|peer| peer.context.principal() == &file.via);
         let claim = Attestation {
             subject: file.subject.clone(),
             agent: file.agent.clone(),
@@ -310,8 +318,7 @@ pub(crate) async fn run(
         };
         for (workflow, steps) in &file.workflows {
             for step in steps {
-                if let Err(refused) = run_step(ready, peer, &claim, step, versions, &file.via).await
-                {
+                if let Err(refused) = run_step(ready, &claim, step, versions, &file.via).await {
                     refusals.push(StepRefusal {
                         workflow: workflow.clone(),
                         step: step.step.clone(),
@@ -326,17 +333,12 @@ pub(crate) async fn run(
 
 async fn run_step(
     ready: &Ready,
-    peer: Option<&MappedPeer>,
     claim: &Attestation,
     step: &Step,
     versions: &BTreeMap<ProviderId, Version>,
     via: &PrincipalId,
 ) -> Result<(), Refused> {
-    let Some(peer) = peer else {
-        return Err(Refused::Grant(GrantRefusal::UnknownVia {
-            via: via.clone(),
-        }));
-    };
+    let peer = attesting_peer(ready, via).map_err(Refused::Grant)?;
     let broker = &ready.broker;
     let (context, refusal) = broker.resolve_context(&peer.context, peer.attestor.as_ref(), claim);
     if let Some(refusal) = refusal {
@@ -391,6 +393,24 @@ async fn run_step(
             Ok(())
         }
         None => Ok(()),
+    }
+}
+
+fn attesting_peer<'ready>(
+    ready: &'ready Ready,
+    via: &PrincipalId,
+) -> Result<&'ready MappedPeer, GrantRefusal> {
+    let mut peers = ready
+        .identities
+        .values()
+        .filter(|peer| peer.context.principal() == via);
+    match (peers.next(), peers.count()) {
+        (Some(peer), 0) => Ok(peer),
+        (Some(_), others) => Err(GrantRefusal::AmbiguousVia {
+            via: via.clone(),
+            identities: others + 1,
+        }),
+        (None, _) => Err(GrantRefusal::UnknownVia { via: via.clone() }),
     }
 }
 
