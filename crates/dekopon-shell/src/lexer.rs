@@ -127,6 +127,12 @@ impl LexError {
 // Counts `${ }` nesting plus the parser depth at each enclosing `$( )`, not compound commands in the same command list.
 const MAX_PARAMETER_NESTING: u32 = 32;
 
+#[derive(Clone, Copy)]
+enum Enclosure {
+    Bare,
+    DoubleQuoted,
+}
+
 #[cfg(test)]
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(source, 0).run()
@@ -209,7 +215,7 @@ impl<'a> Lexer<'a> {
                 '\\' => self.read_escape()?,
                 '\'' => self.read_single_quoted()?,
                 '"' => self.read_double_quoted()?,
-                '$' => self.read_dollar(index)?,
+                '$' => self.read_dollar(index, Enclosure::Bare)?,
                 // Backticks are rejected by name rather than falling through as literal text, since
                 // silently treating them as text would make a script look like its command had run.
                 '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
@@ -397,7 +403,7 @@ impl<'a> Lexer<'a> {
                     }
                 },
                 '$' => {
-                    let part = self.read_dollar_part(index)?;
+                    let part = self.read_dollar_part(index, Enclosure::DoubleQuoted)?;
                     match part {
                         Some(part) => {
                             if !literal.is_empty() {
@@ -596,15 +602,19 @@ impl<'a> Lexer<'a> {
             .map_err(|error| LexError::new(error.line, error.message))
     }
 
-    fn read_dollar(&mut self, index: usize) -> Result<(), LexError> {
-        match self.read_dollar_part(index)? {
+    fn read_dollar(&mut self, index: usize, enclosure: Enclosure) -> Result<(), LexError> {
+        match self.read_dollar_part(index, enclosure)? {
             Some(part) => self.push_part(part),
             None => self.push_literal('$'),
         }
         Ok(())
     }
 
-    fn read_dollar_part(&mut self, dollar_index: usize) -> Result<Option<WordPart>, LexError> {
+    fn read_dollar_part(
+        &mut self,
+        dollar_index: usize,
+        enclosure: Enclosure,
+    ) -> Result<Option<WordPart>, LexError> {
         let Some((_, next)) = self.chars.peek().copied() else {
             return Ok(None);
         };
@@ -641,7 +651,7 @@ impl<'a> Lexer<'a> {
             }
             '{' => {
                 self.chars.next();
-                self.read_braced_parameter().map(Some)
+                self.read_braced_parameter(enclosure).map(Some)
             }
             '?' => {
                 self.chars.next();
@@ -699,7 +709,7 @@ impl<'a> Lexer<'a> {
         name
     }
 
-    fn read_braced_parameter(&mut self) -> Result<WordPart, LexError> {
+    fn read_braced_parameter(&mut self, enclosure: Enclosure) -> Result<WordPart, LexError> {
         let line = self.line;
         match self.chars.peek().map(|(_, character)| *character) {
             Some('?') => {
@@ -723,7 +733,7 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     return Ok(WordPart::Parameter(Parameter::PositionalCount));
                 }
-                return self.read_named_parameter(line, true);
+                return self.read_named_parameter(line, true, enclosure);
             }
             Some(digit) if digit.is_ascii_digit() => {
                 let mut digits = String::new();
@@ -752,10 +762,15 @@ impl<'a> Lexer<'a> {
             _ => {}
         }
 
-        self.read_named_parameter(line, false)
+        self.read_named_parameter(line, false, enclosure)
     }
 
-    fn read_named_parameter(&mut self, line: usize, length: bool) -> Result<WordPart, LexError> {
+    fn read_named_parameter(
+        &mut self,
+        line: usize,
+        length: bool,
+        enclosure: Enclosure,
+    ) -> Result<WordPart, LexError> {
         let name = self.read_name();
         if name.is_empty() {
             return Err(LexError::new(line, "empty ${} parameter reference"));
@@ -775,7 +790,7 @@ impl<'a> Lexer<'a> {
             indices.push(self.read_index(line)?);
         }
 
-        let modifier = self.read_modifier(line, &name, length)?;
+        let modifier = self.read_modifier(line, &name, length, enclosure)?;
         Ok(WordPart::Parameter(Parameter::Named {
             name,
             indices,
@@ -789,6 +804,7 @@ impl<'a> Lexer<'a> {
         line: usize,
         name: &str,
         length: bool,
+        enclosure: Enclosure,
     ) -> Result<Modifier, LexError> {
         let first = match self.chars.peek().map(|(_, character)| *character) {
             Some('}') => {
@@ -818,17 +834,18 @@ impl<'a> Lexer<'a> {
             first
         };
 
+        // bash removes quotes from a `?` message and from patterns even inside double quotes.
         let modifier = match operator {
             '-' => Modifier::Default {
                 colon,
-                word: self.read_modifier_word(line, &['}'])?.0,
+                word: self.read_modifier_word(line, &['}'], enclosure)?.0,
             },
             '=' => Modifier::Assign {
                 colon,
-                word: self.read_modifier_word(line, &['}'])?.0,
+                word: self.read_modifier_word(line, &['}'], enclosure)?.0,
             },
             '?' => {
-                let word = self.read_modifier_word(line, &['}'])?.0;
+                let word = self.read_modifier_word(line, &['}'], Enclosure::Bare)?.0;
                 Modifier::Require {
                     colon,
                     word: (!word.parts.is_empty()).then_some(word),
@@ -836,7 +853,7 @@ impl<'a> Lexer<'a> {
             }
             '+' => Modifier::Alternate {
                 colon,
-                word: self.read_modifier_word(line, &['}'])?.0,
+                word: self.read_modifier_word(line, &['}'], enclosure)?.0,
             },
             '#' | '%' | '/' if colon => {
                 return Err(LexError::new(
@@ -851,7 +868,7 @@ impl<'a> Lexer<'a> {
                 if doubled {
                     self.chars.next();
                 }
-                let pattern = self.read_modifier_word(line, &['}'])?.0;
+                let pattern = self.read_modifier_word(line, &['}'], Enclosure::Bare)?.0;
                 if operator == '#' {
                     Modifier::StripPrefix(
                         parser::parameter_pattern(pattern, line).map_err(lex_error)?,
@@ -867,9 +884,10 @@ impl<'a> Lexer<'a> {
                 if all {
                     self.chars.next();
                 }
-                let (pattern, terminator) = self.read_modifier_word(line, &['/', '}'])?;
+                let (pattern, terminator) =
+                    self.read_modifier_word(line, &['/', '}'], Enclosure::Bare)?;
                 let replacement = if terminator == '/' {
-                    self.read_modifier_word(line, &['}'])?.0
+                    self.read_modifier_word(line, &['}'], Enclosure::Bare)?.0
                 } else {
                     Word { parts: Vec::new() }
                 };
@@ -898,6 +916,7 @@ impl<'a> Lexer<'a> {
         &mut self,
         line: usize,
         terminators: &[char],
+        enclosure: Enclosure,
     ) -> Result<(Word, char), LexError> {
         if let Some((_, character)) = self.chars.peek().copied()
             && terminators.contains(&character)
@@ -908,7 +927,7 @@ impl<'a> Lexer<'a> {
         let mut lexer = self.parameter_lexer(self.source, line)?;
         lexer.chars = self.chars.clone();
         lexer.line = self.line;
-        let result = lexer.read_parameter_word(line, terminators);
+        let result = lexer.read_parameter_word(line, terminators, enclosure);
         self.chars = lexer.chars;
         self.line = lexer.line;
         result
@@ -930,6 +949,7 @@ impl<'a> Lexer<'a> {
         &mut self,
         line: usize,
         terminators: &[char],
+        enclosure: Enclosure,
     ) -> Result<(Word, char), LexError> {
         let mut braces = 0_usize;
         loop {
@@ -946,10 +966,16 @@ impl<'a> Lexer<'a> {
                 ));
             }
             match character {
-                '\'' => self.read_single_quoted()?,
+                '\'' => match enclosure {
+                    Enclosure::Bare => self.read_single_quoted()?,
+                    Enclosure::DoubleQuoted => self.read_double_quoted_parameter_quote()?,
+                },
                 '"' => self.read_double_quoted()?,
-                '\\' => self.read_escape()?,
-                '$' => self.read_dollar(index)?,
+                '\\' => match enclosure {
+                    Enclosure::Bare => self.read_escape()?,
+                    Enclosure::DoubleQuoted => self.read_double_quoted_parameter_escape()?,
+                },
+                '$' => self.read_dollar(index, enclosure)?,
                 '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
                 '|' | '&' | ';' | '<' | '>' | '(' | ')' => {
                     self.read_operator(character)?;
@@ -973,6 +999,55 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+    }
+
+    // bash keeps these quotes as text and expands between them, yet a `}` between them does not
+    // close the expansion.
+    fn read_double_quoted_parameter_quote(&mut self) -> Result<(), LexError> {
+        let opened = self.line;
+        self.push_literal('\'');
+        loop {
+            let Some((index, character)) = self.chars.next() else {
+                return Err(LexError::new(opened, "unterminated single-quoted string"));
+            };
+            match character {
+                '\'' => {
+                    self.push_literal('\'');
+                    return Ok(());
+                }
+                '\\' if self.chars.peek().map(|(_, next)| *next) == Some('\'') => {
+                    self.push_literal('\\');
+                }
+                '\\' => self.read_double_quoted_parameter_escape()?,
+                '"' => self.read_double_quoted()?,
+                '$' => self.read_dollar(index, Enclosure::DoubleQuoted)?,
+                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
+                other => {
+                    if other == '\n' {
+                        self.line += 1;
+                    }
+                    self.push_literal(other);
+                }
+            }
+        }
+    }
+
+    fn read_double_quoted_parameter_escape(&mut self) -> Result<(), LexError> {
+        match self.chars.next() {
+            Some((_, '\n')) => self.line += 1,
+            Some((_, escaped @ ('"' | '\\' | '$' | '`' | '}'))) => self.push_literal(escaped),
+            Some((_, other)) => {
+                self.push_literal('\\');
+                self.push_literal(other);
+            }
+            None => {
+                return Err(LexError::new(
+                    self.line,
+                    "script ends with a trailing backslash",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn expect_brace_close(&mut self, line: usize) -> Result<(), LexError> {
