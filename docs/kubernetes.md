@@ -49,12 +49,12 @@ and its chat/model credentials. The chart supplies file placement and permission
 references define their contents. [ChatGPT subscription credentials](#the-chatgpt-credential-is-seeded-once)
 and [managed provider sets](#the-managed-provider-set-comes-from-the-claim) have additional preparation steps.
 
-From the registry, using **chart version `0.37.6`**, not application version `0.50.6`:
+From the registry, using **chart version `0.38.0`**, not application version `0.51.0`:
 
 ```console
-helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.37.6
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.38.0
 helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
-  --version 0.37.6 -n dekopon --create-namespace -f my-values.yaml
+  --version 0.38.0 -n dekopon --create-namespace -f my-values.yaml
 ```
 
 `helm` itself takes the `oci://` prefix here — that is the Helm CLI's own registry syntax and it is
@@ -742,7 +742,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.50.6
+ghcr.io/dekopon-agents/dekopon:v0.51.0
 ```
 
 There is no `latest`. `image.digest` is empty by default; set it to pin across the
@@ -807,7 +807,7 @@ spec:
   source:
     repoURL: ghcr.io/dekopon-agents/charts   # bare: no oci:// prefix on this source type
     chart: dekopon
-    targetRevision: 0.37.6                    # the CHART version, not appVersion
+    targetRevision: 0.38.0                    # the CHART version, not appVersion
     helm:
       valueFiles: []
       values: |
