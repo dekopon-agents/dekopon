@@ -29,9 +29,8 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
-use dekopon_process::ProcessOutcome;
 #[cfg(unix)]
-use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
+use dekopon_process::CancelSignal;
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
@@ -318,18 +317,6 @@ impl Drop for ScriptCancellation {
     }
 }
 
-#[cfg(unix)]
-async fn wait_for_cancel(mut signal: tokio::sync::watch::Receiver<bool>) {
-    loop {
-        if *signal.borrow_and_update() {
-            return;
-        }
-        if signal.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
 /// A client of brokerd's authorization path, never a participant: it only submits proposals and
 /// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
@@ -581,11 +568,11 @@ impl CapabilityInvoker for BrokerLeg {
     )]
     fn script_started(&self, timeout: Duration) {
         let (handle, signal) = CancelSignal::pair();
-        let parent = self.cancel.watch();
+        let parent = self.cancel.clone();
         let timer = self.runtime.spawn(async move {
             tokio::select! {
                 () = tokio::time::sleep(timeout) => {},
-                () = wait_for_cancel(parent) => {},
+                () = parent.cancelled() => {},
             }
             handle.cancel();
         });
@@ -642,34 +629,24 @@ impl CapabilityInvoker for BrokerLeg {
             calls_used: self.calls.used(),
             calls_max: self.calls.maximum(),
         });
-        // The round-trip task must be joined before returning, or the leg could answer while an
-        // aborted call is still in flight.
-        let client = self.client.clone();
-        let attestation = self.attestation.clone();
-        let (owned_word, argv) = (word.to_owned(), argv.to_vec());
-        let trace_parent = self.identifiers.trace_parent();
-        let operation = process_fn(
-            ProcessMetadata::cancellable("broker-command", self.effective_cancel()),
-            move || async move {
-                client
-                    .run_command(attestation, owned_word, argv, stdin_piped, trace_parent)
-                    .await
-                    .map(command_run_from_outcome)
-            },
-        );
-        let outcome = self.runtime.block_on(ProcessRun::execute(operation));
-        let mut run = match outcome {
-            ProcessOutcome::Completed(Ok(run)) => run,
-            ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
-                message: dekopon_core::error_chain(&error),
-            },
-            ProcessOutcome::TaskFailed(error) if error.is_cancelled() => CommandRun::Denied {
-                reason: "session-cancelled".to_owned(),
-            },
-            ProcessOutcome::TaskFailed(error) => CommandRun::Errored {
-                message: error.to_string(),
-            },
-        };
+        let cancel = self.effective_cancel();
+        let mut run = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                result = self.client.run_command(
+                    self.attestation.clone(), word.to_owned(), argv.to_vec(),
+                    stdin_piped, self.identifiers.trace_parent(),
+                ) => match result {
+                    Ok(outcome) => command_run_from_outcome(outcome),
+                    Err(error) => CommandRun::Errored {
+                        message: dekopon_core::error_chain(&error),
+                    },
+                },
+                () = cancel.cancelled() => CommandRun::Denied {
+                    reason: "session-cancelled".to_owned(),
+                },
+            }
+        });
         let outcome = match &mut run {
             CommandRun::Proposed { report, .. } => {
                 let sink = self.progress.clone();
@@ -827,6 +804,7 @@ impl BrokerLeg {
         // A child script runs on its own scoped thread, never inside this future: its broker calls
         // re-enter `Handle::block_on`, which panics on a thread already inside one. Cancel drops this
         // future and its connection first; the scope then joins a child that sees the same cancel.
+        let cancel = self.effective_cancel();
         let submitted = std::thread::scope(|scope| {
             self.runtime.block_on(async {
                 tokio::select! {
@@ -852,7 +830,7 @@ impl BrokerLeg {
                         ).await;
                         Ok::<_, ChatAssetRefusal>((outcome, invocation))
                     } => Some(result),
-                    () = wait_for_cancel(self.effective_cancel().watch()) => None,
+                    () = cancel.cancelled() => None,
                     () = tokio::time::sleep(tree.remaining()) => None,
                 }
             })

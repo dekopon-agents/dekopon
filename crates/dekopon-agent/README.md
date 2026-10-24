@@ -73,11 +73,11 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   proposes on behalf of a transport-authenticated external subject, which the broker
   honors only under an owner-configured attestor grant. Its fresh capability
   snapshot also supplies trusted effect and risk metadata for self-inspection,
-  never policy source, identity, constraints, or credentials. Each provider command word
-  it runs is one cancellable `broker-command` process node around the `runCommand` round
-  trip, which carries the calling script span's W3C trace parent exactly as an invocation does;
-  `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
-  gateway's Stop), and without it they are cancellable in contract only. A transport
+  never policy source, identity, constraints, or credentials. Each provider command word's
+  `runCommand` round trip runs in place and carries the calling script span's W3C trace parent
+  exactly as an invocation does. The `dekopon-process` cancel latch ties it to the embedder's
+  Stop through `BrokerLeg::with_cancel_signal`, or the script deadline while a script runs.
+  Either drops a command word in flight, after which the script reads `session-cancelled`. A transport
   failure reaches the script as `CommandRun::Errored` naming its cause, and a cancelled run
   as `CommandRun::Denied { "session-cancelled" }`. The same signal read synchronously refuses a
   capability call the script starts *after* the Stop, with the same reason and before any proposal

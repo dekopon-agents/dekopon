@@ -555,9 +555,9 @@ and lets the initiating subject win one atomic race against the normal answer. A
 subsequent model turns and capability invocations, suppresses the stale answer/history commit,
 queues `active`, and sends the `stopped` template (`Stopped.` by default). Wall-clock stops instead use the fixed time-limit line below. In-flight model HTTP sends and reads, including silent
 reasoning, select on the session watch and are cancelled locally. Remote inference or provider
-effects already accepted cannot be rolled back. A provider command word the script is waiting on is the exception: its broker round
-trip runs as one cancellable process node tied to the session's Stop, so the run is aborted and
-joined and the script reads `session-cancelled` instead of waiting the broker out. Unknown,
+effects already accepted cannot be rolled back. The broker leg drives a provider command word's round trip in place using the
+`dekopon-process` cancel latch. Stop or the script deadline drops a command word in
+flight, after which the script reads `session-cancelled`. Unknown,
 duplicate, and other-user Stop events are ignored.
 
 The Agent manifest also subscribes to `message.channels` and `message.groups`, requiring
