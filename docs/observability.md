@@ -465,10 +465,13 @@ two further spans of its own:
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only); `failed` and `reply-failed` set the span status to `Error` |
 | `gateway.session` | `agent`, `generation.digest`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
-| `memory.persist` | no fields; a child of `gateway.session` opened after the reply is delivered, wrapping the memory routines' summary `model.complete` calls and the journal append |
+| `memory.persist` | no fields; a child of `gateway.session` opened after the terminal reply for every turn the journal records, including a declined turn and a reply that failed to deliver; it wraps the memory routines' summary `model.complete` calls and the journal append |
 
-`gateway.session` carries a `reply.delivered` event, with `outcome` (`answered`, `failed` or
-`refused`), at the moment the terminal reply reaches the chat. `gateway.message` still spans the
+`gateway.session` carries a `reply.delivered` event at the moment a reply it sends reaches the
+chat, with the message's `outcome`: `answered`, `failed`, `refused` and `cancelled` terminals, and
+the `sealed`, `unauthorized` and broker-failure (`failed`) notices. There is none for a declined or
+silent turn, a reply the transport refused, or a reply sent outside a session, such as the `busy`
+and stop notices. `gateway.message` still spans the
 memory work that follows, so its duration is not reply latency; the gap between `reply.delivered`
 and the end of `memory.persist` is where the rest went.
 

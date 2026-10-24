@@ -2,7 +2,7 @@ use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
     error::{InferenceError, ProtocolFailure, ProviderFailure, RequestError, TransportFailure},
-    http::{InferenceHttp, ModelExchange, Progress, record_phase},
+    http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{
         AssistantTurn, ContentPart, DataUrl, JSON_CONTENT_TYPE, ModelFunctionCall, ModelMessage,
@@ -78,7 +78,7 @@ impl OpenAiClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
-        progress: &Progress,
+        progress: &mut Progress,
     ) -> Result<AssistantTurn, InferenceError> {
         let span = tracing::Span::current();
         span.record("model.stream", self.stream);
@@ -198,17 +198,20 @@ impl InferenceModel for OpenAiClient {
         observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
     ) -> Result<AssistantTurn, InferenceError> {
-        let progress = Progress::new();
         self.http
             .generation(
-                ModelExchange {
-                    name: &self.name,
-                    model: &self.model,
-                    backend: "openai-compatible",
-                    dialect: "chat-completions",
+                &self.name,
+                &self.model,
+                "openai-compatible",
+                "chat-completions",
+                async {
+                    let mut progress = Progress::new();
+                    (
+                        self.exchange(request, observe, control, &mut progress)
+                            .await,
+                        progress,
+                    )
                 },
-                &progress,
-                self.exchange(request, observe, control, &progress),
             )
             .await
     }

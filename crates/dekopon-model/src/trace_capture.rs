@@ -111,8 +111,11 @@ pub(crate) async fn exported_model_span<F: std::future::Future>(
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(exported.clone())
         .build();
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("model-test")));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_error_events_to_status(false)
+            .with_tracer(provider.tracer("model-test")),
+    );
     let output = operation.with_subscriber(subscriber).await;
     provider.force_flush().unwrap();
     let mut spans = exported.0.lock();

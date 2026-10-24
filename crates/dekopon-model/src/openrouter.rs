@@ -5,7 +5,7 @@ use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
     error::{FailurePhase, InferenceError, ProtocolFailure, RequestError, TransportFailure},
-    http::{InferenceHttp, ModelExchange, Progress, record_phase},
+    http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{AssistantTurn, ClientIdentity, ModelMessage, ModelToolCall, compact_json_body},
     openai::{
@@ -229,7 +229,7 @@ impl OpenRouterClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
-        progress: &Progress,
+        progress: &mut Progress,
     ) -> Result<AssistantTurn, InferenceError> {
         let secrets = DiagnosticSecrets::new(Some(&self.token));
         self.record_settings(secrets);
@@ -293,17 +293,20 @@ impl InferenceModel for OpenRouterClient {
         observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
     ) -> Result<AssistantTurn, InferenceError> {
-        let progress = Progress::new();
         self.http
             .generation(
-                ModelExchange {
-                    name: &self.name,
-                    model: &self.model,
-                    backend: "openrouter",
-                    dialect: "chat-completions",
+                &self.name,
+                &self.model,
+                "openrouter",
+                "chat-completions",
+                async {
+                    let mut progress = Progress::new();
+                    (
+                        self.exchange(request, observe, control, &mut progress)
+                            .await,
+                        progress,
+                    )
                 },
-                &progress,
-                self.exchange(request, observe, control, &progress),
             )
             .await
     }

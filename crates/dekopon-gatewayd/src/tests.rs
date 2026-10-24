@@ -14708,14 +14708,27 @@ async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     provider.force_flush().unwrap();
 
-    let statuses = exported
-        .0
-        .lock()
+    let spans = exported.0.lock().clone();
+    let statuses = spans
         .iter()
         .filter(|span| span.name == "gateway.message")
         .map(|span| span.status.clone())
         .collect::<Vec<_>>();
     assert_eq!(statuses, [Status::Unset, Status::error("")]);
+    let delivered = spans
+        .iter()
+        .filter(|span| span.name == "gateway.session")
+        .map(|span| {
+            span.events
+                .iter()
+                .filter(|event| event.name == "reply.delivered")
+                .flat_map(|event| &event.attributes)
+                .filter(|attribute| attribute.key.as_str() == "outcome")
+                .map(|attribute| attribute.value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(delivered, [["answered"], ["failed"]]);
     provider.shutdown().unwrap();
 }
 

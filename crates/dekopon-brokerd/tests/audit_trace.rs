@@ -246,9 +246,14 @@ fn install() -> Probe {
                 .with_span_processor(probe.clone())
                 .build();
             tracing_subscriber::registry()
-                .with(tracing_opentelemetry::layer().with_tracer(
-                    opentelemetry::trace::TracerProvider::tracer(&provider, "audit-trace-test"),
-                ))
+                .with(
+                    tracing_opentelemetry::layer()
+                        .with_error_events_to_status(false)
+                        .with_tracer(opentelemetry::trace::TracerProvider::tracer(
+                            &provider,
+                            "audit-trace-test",
+                        )),
+                )
                 .with(probe.clone())
                 .init();
             (probe, provider)
