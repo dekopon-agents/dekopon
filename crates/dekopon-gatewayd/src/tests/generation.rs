@@ -3,6 +3,7 @@ use crate::{
     config::memory::{PolicyConfig, ResolvedPolicy},
     memory::generation::prepare,
 };
+use dekopon_test_support::Record;
 
 fn policy(kind: &str, retain: &[&str]) -> ResolvedPolicy {
     let config: PolicyConfig = serde_json::from_value(json!({
@@ -195,6 +196,56 @@ async fn a_failed_summary_replies_and_persists_only_metadata() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].field("routine"), Some("summary"));
     assert!(!format!("{:?}", events[0]).contains("PRIVATE_SOURCE_SENTINEL"));
+}
+
+#[tokio::test]
+async fn a_delivered_reply_is_marked_before_memory_persists_under_its_own_span() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("reply delivered")]);
+    let runner = journaled_runner(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        journal.path(),
+    );
+    let mut route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    route.memory_policy = Some(policy("progressiveOneShot", &["summary"]));
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        message("persist after delivery"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["reply delivered"]);
+    let records = capture.records();
+    let delivered = records
+        .iter()
+        .position(|record| record.field("audit.event") == Some("reply.delivered"))
+        .expect("reply.delivered recorded");
+    assert_eq!(records[delivered].parent(), Some("gateway.session"));
+    assert_eq!(records[delivered].field("outcome"), Some("answered"));
+    let persist = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record,
+                Record::Span {
+                    name: "memory.persist",
+                    ..
+                }
+            )
+        })
+        .expect("memory.persist opened");
+    assert!(delivered < persist);
+    assert_eq!(records[persist].parent(), Some("gateway.session"));
+    let deviation =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_memory_deviation")]);
+    assert_eq!(deviation.len(), 1);
+    assert_eq!(deviation[0].parent(), Some("memory.persist"));
 }
 
 #[tokio::test]
