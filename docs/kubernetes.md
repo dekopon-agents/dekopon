@@ -608,6 +608,7 @@ configCheck:
   broker:
     configMap: dekopon-check-broker-d
     providerSetConfigMap: dekopon-check-config
+    workflowsConfigMap: dekopon-check-workflows-d
   gateway:
     configMap: dekopon-check-gatewayd-d
     catalogConfigMap: dekopon-check-agents-d
@@ -628,7 +629,11 @@ model absent from it or changed in it is probed, so an unchanged model costs no 
 
 A root init container copies the broker ConfigMaps into a `0700` directory owned by `65532`, as
 `0600` regular files, because `dekopon-brokerd check` refuses the symlinks a ConfigMap mount is made
-of. The gateway candidates are mounted read-only exactly as the Deployment mounts them, so a mode
+of. Wherever the pod gets the chart-rendered `peers.yaml` (`broker.configDirectory.configMap` with
+`broker.configDirectory.peers`), the hook copies that same rendered file beside the candidates, from
+a `<fullname>-check-peers` hook ConfigMap, and refuses a candidate `peers.yaml` key as the
+Deployment does, so the check sees the attestor grants the pod will run with. The gateway
+candidates are mounted read-only exactly as the Deployment mounts them, so a mode
 production would refuse (a group-writable skill, say) fails the hook too. The broker check runs as
 `65532`, resolving `providerSetConfigMap`'s `providers.yaml` into
 `<paths.stateDir>/config-check` on the state claim, so blobs persist between runs; that path needs
@@ -637,11 +642,25 @@ which should name each probed model's `apiKeyEnv` and nothing else; no ChatGPT l
 since `check` never probes a subscription model. `backoffLimit: 0`, since a refusal is
 deterministic and a retry pays for every probe twice; `activeDeadlineSeconds: 600`.
 
-Two costs. The broker check loads providers without the cwasm cache, so every run compiles every
-provider in the set; on the RPi that run time is not yet measured. And the hook sees only the
-candidate ConfigMaps: the `peers.yaml` the chart renders into the pod's `broker.d`
-(`broker.configDirectory.peers`) is not among them, so a problem there surfaces at boot, not in the
-hook.
+One cost: the broker check loads providers without the cwasm cache, so every run compiles every
+provider in the set; on the RPi that run time is not yet measured.
+
+`configCheck.broker.workflowsConfigMap` (requires `providerSetConfigMap`) names a ConfigMap of
+essential workflows, every `*.yaml` key, passed to the broker check as `--workflows`; the file
+format is in the brokerd README. After the candidate providers and policy load, each step's argv
+runs through its provider's `run-command` and the serving broker's attestation and Cedar
+decisions, offline: no model, no HTTP request, no credential. A step is refused as `parse` when the
+argv does not propose the step's capability, as `grant` when the attestation or the capability is
+denied, and as `budget` when it declares more `requests` than the capability's
+`constraints.http.maxRequests`. Each refused step is one problem,
+`would break essential workflows: <workflow>: <step>: <check>: <detail>`, and fails the hook.
+Empty, the default, runs no workflow check.
+
+A refusing hook blocks every later sync, a fix's included. The override is unsetting
+`workflowsConfigMap` (or setting it to `""`) in the commit that carries the fix: the hook renders
+from the target revision, so that sync runs the base check without the workflow phase. Never
+override with a sync that skips hooks, such as a selective sync or `--strategy apply`: it skips
+the base check and the provider-sync hook too.
 
 `configCheck.annotations` replaces the hook annotations entirely. Empty means
 `helm.sh/hook: pre-install,pre-upgrade` with `before-hook-creation`, which Argo CD runs as
@@ -874,7 +893,7 @@ path (`credentialsPath: /etc/dekopon/broker-credentials.yaml`).
 own identities: `65532` as `dekopon-probe`, `65533` as `dekopon-gatewayd` with `attestor: {}` when
 the gateway is enabled, and `65535` as `dekopon-console` with `attestor.namespaces:
 [<console.subject>]` when the console is enabled with a subject. A ConfigMap key named
-`peers.yaml` fails the init container while this is on.
+`peers.yaml` fails the init container, and the config-check hook, while this is on.
 
 `gateway.configDirectory.configMap` mounts the ConfigMap directly at `paths.gatewayConfigDir`;
 `--config` points to that directory, and `gateway.config` must be empty. A projected key is

@@ -1,0 +1,17 @@
+{{- if and .Values.configCheck.enabled (include "dekopon.configCheckPeers" .) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dekopon.fullname" . }}-check-peers
+  labels:
+    {{- include "dekopon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config-check
+  {{- $hook := .Values.configCheck.annotations | default (dict "helm.sh/hook" "pre-install,pre-upgrade" "helm.sh/hook-delete-policy" "before-hook-creation") }}
+  annotations:
+    {{- $weight := sub (get $hook "helm.sh/hook-weight" | default "0" | int) 1 }}
+    {{- $wave := sub (get $hook "argocd.argoproj.io/sync-wave" | default "0" | int) 1 }}
+    {{- toYaml (mergeOverwrite (deepCopy $hook) (dict "helm.sh/hook-weight" (toString $weight) "argocd.argoproj.io/sync-wave" (toString $wave))) | nindent 4 }}
+data:
+  peers.yaml: |
+    {{- include "dekopon.peersFragment" . | nindent 4 }}
+{{- end }}

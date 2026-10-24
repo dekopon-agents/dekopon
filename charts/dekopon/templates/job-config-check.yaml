@@ -10,6 +10,11 @@
 {{- if and $store (not $check.annotations) (not .Values.state.existingClaim) }}
 {{- fail "configCheck.broker.providerSetConfigMap with Helm's default pre-install hook requires state.existingClaim; the chart-created claim does not exist yet when the hook runs" }}
 {{- end }}
+{{- $workflows := and $store $check.broker.workflowsConfigMap -}}
+{{- if and $check.broker.workflowsConfigMap (not $store) }}
+{{- fail "configCheck.broker.workflowsConfigMap requires configCheck.broker.providerSetConfigMap; the workflow check runs against the resolved provider set" }}
+{{- end }}
+{{- $peers := include "dekopon.configCheckPeers" . -}}
 {{- $skills := and $check.gateway.configMap $check.gateway.skillsConfigMap -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 {{- $gid := .Values.podSecurityContext.runAsGroup | int -}}
@@ -79,8 +84,17 @@ spec:
               }
               chmod 0755 /check
               chmod 1777 /tmp
-{{- if $check.broker.configMap }}
+{{- if $peers }}
+              if [ -f /source/broker.d/peers.yaml ]; then
+                echo "{{ $check.broker.configMap }}: key peers.yaml collides with the chart-rendered peers.yaml; rename it or set broker.configDirectory.peers=false" >&2
+                exit 1
+              fi
+              copy {{ $uid }} {{ $check.broker.configMap }} /check/broker.d /source/broker.d/*.yaml /source/broker.d/*.cedar /source/peers/peers.yaml
+{{- else if $check.broker.configMap }}
               copy {{ $uid }} {{ $check.broker.configMap }} /check/broker.d /source/broker.d/*.yaml /source/broker.d/*.cedar
+{{- end }}
+{{- if $workflows }}
+              copy {{ $uid }} {{ $check.broker.workflowsConfigMap }} /check/workflows.d /source/workflows.d/*.yaml
 {{- end }}
 {{- if $store }}
               copy {{ $uid }} {{ $check.broker.providerSetConfigMap }} /check/provider-set /source/provider-set/providers.yaml
@@ -114,6 +128,16 @@ spec:
             - name: state
               mountPath: {{ .Values.paths.stateDir }}
 {{- end }}
+{{- if $workflows }}
+            - name: workflows-source
+              mountPath: /source/workflows.d
+              readOnly: true
+{{- end }}
+{{- if $peers }}
+            - name: peers-source
+              mountPath: /source/peers
+              readOnly: true
+{{- end }}
       containers:
 {{- if $check.broker.configMap }}
         - name: check-broker
@@ -126,6 +150,9 @@ spec:
 {{- if $store }}
             - --provider-set=/check/provider-set/providers.yaml
             - --store={{ $storeDir }}
+{{- if $workflows }}
+            - --workflows=/check/workflows.d
+{{- end }}
 {{- end }}
             - --output=json
           securityContext:
@@ -218,6 +245,16 @@ spec:
         - name: state
           persistentVolumeClaim:
             claimName: {{ include "dekopon.stateClaimName" . }}
+{{- end }}
+{{- if $workflows }}
+        - name: workflows-source
+          configMap:
+            name: {{ $check.broker.workflowsConfigMap }}
+{{- end }}
+{{- if $peers }}
+        - name: peers-source
+          configMap:
+            name: {{ include "dekopon.fullname" . }}-check-peers
 {{- end }}
 {{- if $check.gateway.configMap }}
         - name: gateway-source

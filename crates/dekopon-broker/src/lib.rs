@@ -1983,6 +1983,46 @@ where
             .is_some_and(|set| set.constraints.storage.is_some() || set.route.is_chat_memory())
     }
 
+    /// The serving decision before any secret use is bound; `dekopon-brokerd check --workflows`
+    /// relies on it being the decision `invoke` makes.
+    pub fn authorize_invocation(
+        &self,
+        context: &AuthenticatedContext,
+        capability: &CapabilityId,
+    ) -> Result<AuthorizedInvocation, Refusal> {
+        // This check is the actual enforcement under Leniency::Tolerant, not just defense in
+        // depth; never weaken it into an assertion or fold it into the policy decision, or an
+        // unrouted but policy-anticipated capability would stop being denied.
+        let Some(set) = self.constraints.get(capability).cloned() else {
+            return Err(unevaluated_refusal("unconstrained-capability"));
+        };
+        if !probe_permits(context, set.effect) {
+            return Err(unevaluated_refusal("probe-write"));
+        }
+        if set.constraints.storage.is_some() && context.chat_scope().is_none() {
+            return Err(unevaluated_refusal("chat-scope-required"));
+        }
+        let slots = render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
+            .map_err(unevaluated_refusal)?;
+        let decision = self.authorize_capability(context, capability, &set, None);
+        if !decision.allowed {
+            let reason = denial_reason(&decision, "policy-denied");
+            return Err(Refusal {
+                evaluation: Some(PolicyEvaluation {
+                    errors_present: decision.errors_present,
+                    cause: decision.refusal,
+                }),
+                ..determined_refusal(reason, decision.determining_policy_ids)
+            });
+        }
+        Ok(AuthorizedInvocation {
+            set,
+            policy_ids: decision.determining_policy_ids,
+            slots,
+            errors_present: decision.errors_present,
+        })
+    }
+
     fn authorize_capability(
         &self,
         context: &AuthenticatedContext,
@@ -2465,7 +2505,7 @@ where
         .await
     }
 
-    fn resolve_context(
+    pub fn resolve_context(
         &self,
         peer: &AuthenticatedContext,
         grant: Option<&AttestorGrant>,
@@ -2918,22 +2958,12 @@ where
                     .await
                     .map(ControlFlow::Break);
             }
-            // This check is the actual enforcement under Leniency::Tolerant, not just defense in
-            // depth; never weaken it into an assertion or fold it into the policy decision, or an
-            // unrouted but policy-anticipated capability would stop being denied.
-            let Some(mut set) = self.constraints.get(&request.capability).cloned() else {
-                authorize.record("outcome", "unconstrained-capability");
-                return self
-                    .deny(
-                        context,
-                        &request,
-                        unevaluated_refusal("unconstrained-capability"),
-                    )
-                    .await
-                    .map(ControlFlow::Break);
-            };
+            // Before the decision: a denial still records the defaulted secret it refused.
             if request.secret_use.is_none()
-                && let Some(default) = &set.default_secret_use
+                && let Some(default) = self
+                    .constraints
+                    .get(&request.capability)
+                    .and_then(|set| set.default_secret_use.as_ref())
             {
                 request.secret_use = Some(match default.sink {
                     DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
@@ -2941,71 +2971,46 @@ where
                     },
                 });
             }
-            if !probe_permits(context, set.effect) {
-                authorize.record("outcome", "probe-write");
-                return self
-                    .deny(context, &request, unevaluated_refusal("probe-write"))
-                    .await
-                    .map(ControlFlow::Break);
-            }
-            if set.constraints.storage.is_some() && context.chat_scope().is_none() {
-                authorize.record("outcome", "chat-scope-required");
-                return self
-                    .deny(
-                        context,
-                        &request,
-                        unevaluated_refusal("chat-scope-required"),
-                    )
-                    .await
-                    .map(ControlFlow::Break);
-            }
-            let slots = match render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
-            {
-                Ok(slots) => slots,
-                Err(reason) => {
-                    authorize.record("outcome", reason);
+            let AuthorizedInvocation {
+                mut set,
+                mut policy_ids,
+                slots,
+                errors_present,
+            } = match self.authorize_invocation(context, &request.capability) {
+                Ok(authorized) => authorized,
+                Err(refusal) => {
+                    // A policy error denies exactly like a non-match; this is recorded as a flag
+                    // rather than the error text so denial explanations can't become a
+                    // per-request channel leaking policy source or entity data.
+                    if let Some(evaluation) = &refusal.evaluation {
+                        authorize.record("policy.errors_present", evaluation.errors_present);
+                        if evaluation.errors_present {
+                            tracing::warn!(
+                                event = "broker_policy_evaluation_error",
+                                invocation = %request.id,
+                                policy.target = "capability",
+                            );
+                        }
+                        if let Some(cause) = &evaluation.cause {
+                            tracing::warn!(
+                                target: "dekopon_broker::audit",
+                                {
+                                    audit.event = "policy.request.refused",
+                                    capability.id = %request.capability,
+                                    error.reason = %cause,
+                                },
+                                "policy request could not be constructed"
+                            );
+                        }
+                    }
+                    authorize.record("outcome", refusal.reason);
                     return self
-                        .deny(context, &request, unevaluated_refusal(reason))
+                        .deny(context, &request, refusal)
                         .await
                         .map(ControlFlow::Break);
                 }
             };
-            let decision = self.authorize_capability(context, &request.capability, &set, None);
-            // A policy error denies exactly like a non-match; this is recorded as a flag rather
-            // than the error text so denial explanations can't become a per-request channel leaking
-            // policy source or entity data.
-            authorize.record("policy.errors_present", decision.errors_present);
-            if !decision.allowed {
-                let reason = denial_reason(&decision, "policy-denied");
-                authorize.record("outcome", reason);
-                if decision.errors_present {
-                    tracing::warn!(
-                        event = "broker_policy_evaluation_error",
-                        invocation = %request.id,
-                        policy.target = "capability",
-                    );
-                }
-                if let Some(cause) = &decision.refusal {
-                    tracing::warn!(
-                        target: "dekopon_broker::audit",
-                        {
-                            audit.event = "policy.request.refused",
-                            capability.id = %request.capability,
-                            error.reason = %cause,
-                        },
-                        "policy request could not be constructed"
-                    );
-                }
-                return self
-                    .deny(
-                        context,
-                        &request,
-                        determined_refusal(reason, decision.determining_policy_ids),
-                    )
-                    .await
-                    .map(ControlFlow::Break);
-            }
-            let mut policy_ids = decision.determining_policy_ids;
+            authorize.record("policy.errors_present", errors_present);
             if let Some(secret_use) = request.secret_use.as_ref() {
                 let Some(binding) = self
                     .secrets
@@ -3026,7 +3031,7 @@ where
                     self.authorize_secret_use(context, &request.capability, &set, secret_use);
                 authorize.record(
                     "policy.errors_present",
-                    decision.errors_present || secret_decision.errors_present,
+                    errors_present || secret_decision.errors_present,
                 );
                 policy_ids.extend(secret_decision.determining_policy_ids.clone());
                 policy_ids.sort();
@@ -3099,6 +3104,7 @@ where
             reason,
             wire,
             policy_ids,
+            ..
         } = refusal;
         let decision_id = format!("deny-{}", request.id);
         let decision = self.decision_reference(&decision_id);
@@ -4280,10 +4286,23 @@ fn console_smoke_delivery(
     }
 }
 
-struct Refusal {
-    reason: &'static str,
+pub struct Refusal {
+    pub reason: &'static str,
     wire: &'static str,
+    pub policy_ids: Vec<String>,
+    evaluation: Option<PolicyEvaluation>,
+}
+
+struct PolicyEvaluation {
+    errors_present: bool,
+    cause: Option<String>,
+}
+
+pub struct AuthorizedInvocation {
+    pub set: ConstraintSet,
     policy_ids: Vec<String>,
+    slots: ChatSlotValues,
+    errors_present: bool,
 }
 
 impl Refusal {
@@ -4298,6 +4317,7 @@ const fn console_real_scope_refusal() -> Refusal {
         reason: CONSOLE_REAL_SCOPE_REASON,
         wire: CONSOLE_REAL_SCOPE_REFUSAL,
         policy_ids: Vec::new(),
+        evaluation: None,
     }
 }
 
@@ -4306,6 +4326,7 @@ const fn unevaluated_refusal(reason: &'static str) -> Refusal {
         reason,
         wire: reason,
         policy_ids: Vec::new(),
+        evaluation: None,
     }
 }
 
@@ -4314,6 +4335,7 @@ fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal 
         reason,
         wire: reason,
         policy_ids,
+        evaluation: None,
     }
 }
 

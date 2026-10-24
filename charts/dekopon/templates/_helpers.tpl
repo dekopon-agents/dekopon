@@ -274,6 +274,10 @@ cannot drift apart.
 {{- end }}
 {{- end -}}
 
+{{- define "dekopon.configCheckPeers" -}}
+{{- if and .Values.configCheck.broker.configMap .Values.broker.configDirectory.configMap .Values.broker.configDirectory.peers -}}true{{- end -}}
+{{- end -}}
+
 {{- define "dekopon.peersFragment" -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 apiVersion: dekopon.dev/brokerd/v1alpha1
