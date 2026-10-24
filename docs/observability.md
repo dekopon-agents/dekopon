@@ -162,7 +162,7 @@ library uses `tracing` only and installs no subscriber.
 | `tool_call.skipped` | OpenRouter tool items dropped during finalization because their type is unknown |
 | `delta.unrecognized` | first eight distinct ignored OpenRouter delta keys in sorted order, sanitized and comma-joined; absent when none, never their values |
 | `outcome`, `error`, `error.kind`, `error.type` | `success`/`failed`; failures have a stable category, not raw diagnostic text |
-| span status | `Error` on every failure; its description is the transport's own source chain (for a TLS failure, the certificate problem) on an HTTP transport failure, and the failure kind otherwise, never upstream text |
+| span status | `Error` on every failure except `cancelled` (a steer or stop is not an error); only an HTTP transport failure gets a description, the transport's own source chain (for a TLS failure, the certificate problem), never upstream text |
 | `error.phase` | `before-send`, `awaiting-headers` or `reading-body`, when known |
 | `http.status`, `provider.code`, `provider.request_id` | safe known response metadata; status/request ID survive later protocol/cancellation failures |
 
@@ -173,8 +173,9 @@ previews are stripped of control characters, have in-scope credentials replaced 
 `[REDACTED]`, then are bounded at 16 KiB; a preview cut mid-credential drops the partial token.
 Parser sources are preserved when safe. Credentials, the prompt cache key and private reasoning
 never enter `model.complete` fields, and `traceparent` is not forwarded to the inference endpoint.
-Counts, byte totals and the reported model are recorded once per exchange, not per delta or
-chunk, so a long stream cannot push `outcome` or `usage.*` past the span's attribute limit.
+Counts, byte totals, `output.partial`, `model.stream`, `cache.style` and the reported model are
+recorded once per exchange, not per delta or chunk, so a long stream cannot push `outcome` or
+`usage.*` past the span's attribute limit.
 `agent.model.prompt` includes `tools`: comma-joined names offered to that exact model turn,
 empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a complete tool list.
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
@@ -462,7 +463,7 @@ two further spans of its own:
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only); `failed` and `reply-failed` set the span status to `Error` |
 | `gateway.session` | `agent`, `generation.digest`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 | `memory.persist` | no fields; a child of `gateway.session` opened after the reply is delivered, wrapping the memory routines' summary `model.complete` calls and the journal append |
 
@@ -819,7 +820,7 @@ migration is implemented here.
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
+| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `console-smoke-claim-denied`, `console-real-scope-denied`, `chat-attestation-denied`, `chat-scope-required`, `probe-write`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`, `input` and `input.bytes`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; a `failed` outcome sets the span status to `Error`, described by `error`; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |

@@ -76,6 +76,7 @@ struct Entered {
 struct Ended {
     name: String,
     parent_span_id: String,
+    status: opentelemetry::trace::Status,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,6 +98,15 @@ impl Probe {
             .iter()
             .filter(|ended| ended.name == name)
             .map(|ended| ended.parent_span_id.clone())
+            .collect()
+    }
+
+    fn statuses_ended(&self, name: &str) -> Vec<opentelemetry::trace::Status> {
+        self.ended
+            .lock()
+            .iter()
+            .filter(|ended| ended.name == name)
+            .map(|ended| ended.status.clone())
             .collect()
     }
 
@@ -214,6 +224,7 @@ impl opentelemetry_sdk::trace::SpanProcessor for Probe {
         self.ended.lock().push(Ended {
             name: span.name.into_owned(),
             parent_span_id: span.parent_span_id.to_string(),
+            status: span.status,
         });
     }
 
@@ -609,5 +620,15 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
             r#""error""#
         ],
         "each run records its outcome under its exact name, in order"
+    );
+    assert_eq!(
+        probe.statuses_ended("broker.command_run"),
+        [
+            opentelemetry::trace::Status::Unset,
+            opentelemetry::trace::Status::Unset,
+            opentelemetry::trace::Status::Unset,
+            opentelemetry::trace::Status::error(""),
+        ],
+        "only a run the broker could not complete is an error; a guest's own decline is an answer"
     );
 }

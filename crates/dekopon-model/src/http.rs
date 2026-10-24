@@ -10,9 +10,9 @@ use crate::{
     stream::TurnEvent,
 };
 use std::{
-    borrow::Cow,
     future::Future,
     ops::ControlFlow,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tracing::Instrument as _;
@@ -21,6 +21,13 @@ pub(crate) const MAX_BUFFERED_BYTES: usize = 10 * 1024 * 1024;
 
 pub(crate) fn record_phase(phase: FailurePhase) {
     tracing::Span::current().record("error.phase", phase.as_str());
+}
+
+pub(crate) struct ModelExchange<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) backend: &'static str,
+    pub(crate) dialect: &'static str,
 }
 
 pub(crate) struct InferenceHttp {
@@ -84,20 +91,18 @@ impl InferenceHttp {
 
     pub(crate) async fn generation(
         &self,
-        name: &str,
-        model: &str,
-        provider: &str,
-        dialect: &str,
+        exchange: ModelExchange<'_>,
+        progress: &Progress,
         operation: impl Future<Output = Result<AssistantTurn, InferenceError>> + Send,
     ) -> Result<AssistantTurn, InferenceError> {
         let span = tracing::info_span!(
             "model.complete",
-            model = model,
-            model.name = name,
-            model.backend = provider,
-            model.dialect = dialect,
-            model.stream = true,
-            cache.style = "automatic",
+            model = exchange.model,
+            model.name = exchange.name,
+            model.backend = exchange.backend,
+            model.dialect = exchange.dialect,
+            model.stream = tracing::field::Empty,
+            cache.style = tracing::field::Empty,
             model.returned = tracing::field::Empty,
             model.upstream = tracing::field::Empty,
             gen_ai.response.id = tracing::field::Empty,
@@ -127,6 +132,7 @@ impl InferenceHttp {
             usage.reasoning_output_tokens = tracing::field::Empty,
             usage.total_tokens = tracing::field::Empty,
             outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
             otel.status_description = tracing::field::Empty,
             error = tracing::field::Empty,
             error.kind = tracing::field::Empty,
@@ -140,11 +146,12 @@ impl InferenceHttp {
             reasoning.items = tracing::field::Empty,
             tool_call.skipped = tracing::field::Empty,
             delta.unrecognized = tracing::field::Empty,
-            output.partial = false,
+            output.partial = tracing::field::Empty,
         );
         let started = Instant::now();
         let result = operation.instrument(span.clone()).await;
         span.record("timing.total_ms", millis(started.elapsed()));
+        progress.finish(&span, &result);
         match &result {
             Ok(turn) => {
                 span.record("outcome", "success");
@@ -171,14 +178,21 @@ impl InferenceHttp {
                 let kind = error.kind().as_str();
                 // Upstream messages and parser sources may echo sensitive request data; only the
                 // local client's own transport chain is safe to describe.
-                let (context, description) = match error {
-                    InferenceError::Transport(TransportFailure::Http { context, .. }) => (
-                        Some(context),
-                        dekopon_core::bounded_attribute(&context.diagnostic),
-                    ),
+                let context = match error {
+                    InferenceError::Transport(TransportFailure::Http { context, .. }) => {
+                        span.record(
+                            "otel.status_description",
+                            dekopon_core::bounded_attribute(&context.diagnostic).as_ref(),
+                        );
+                        Some(context)
+                    }
                     InferenceError::Authentication(AuthError::Provider(context))
                     | InferenceError::RateLimited(RateLimitError(context))
-                    | InferenceError::Provider(context) => (Some(context), Cow::Borrowed(kind)),
+                    | InferenceError::Provider(context) => {
+                        span.record("otel.status_code", "error");
+                        Some(context)
+                    }
+                    InferenceError::Cancelled => None,
                     InferenceError::Authentication(AuthError::Credential(_))
                     | InferenceError::Transport(
                         TransportFailure::Blocking(_)
@@ -188,12 +202,13 @@ impl InferenceHttp {
                     | InferenceError::Protocol(_)
                     | InferenceError::Attachment(_)
                     | InferenceError::InvalidRequest(_)
-                    | InferenceError::Cancelled
                     | InferenceError::DeadlineExceeded
-                    | InferenceError::OverBudget(_) => (None, Cow::Borrowed(kind)),
+                    | InferenceError::OverBudget(_) => {
+                        span.record("otel.status_code", "error");
+                        None
+                    }
                 };
                 span.record("outcome", "failed");
-                span.record("otel.status_description", description.as_ref());
                 span.record("error", kind);
                 span.record("error.kind", kind);
                 span.record("error.type", kind);
@@ -425,47 +440,47 @@ pub(crate) fn http_failure(
 
 pub(crate) struct Progress {
     started: Instant,
-    events: u64,
-    deltas: u64,
+    events: AtomicU64,
+    deltas: AtomicU64,
 }
 
 impl Progress {
     pub(crate) fn new() -> Self {
         Self {
             started: Instant::now(),
-            events: 0,
-            deltas: 0,
+            events: AtomicU64::new(0),
+            deltas: AtomicU64::new(0),
         }
     }
-    pub(crate) fn event(&mut self) {
-        if self.events == 0 {
+    pub(crate) fn event(&self) {
+        if self.events.fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::Span::current()
                 .record("timing.first_event_ms", millis(self.started.elapsed()));
         }
-        self.events += 1;
     }
     pub(crate) fn observe(
-        &mut self,
+        &self,
         event: TurnEvent,
         observer: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
     ) -> ControlFlow<()> {
-        if matches!(event, TurnEvent::TextDelta(_)) {
-            if self.deltas == 0 {
-                let span = tracing::Span::current();
-                span.record("stream.first_delta_ms", millis(self.started.elapsed()));
-                span.record("output.partial", true);
-            }
-            self.deltas += 1;
+        if matches!(event, TurnEvent::TextDelta(_))
+            && self.deltas.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            tracing::Span::current()
+                .record("stream.first_delta_ms", millis(self.started.elapsed()));
         }
         observer(event)
     }
-}
-impl Drop for Progress {
-    fn drop(&mut self) {
-        let span = tracing::Span::current();
-        span.record("stream.events", self.events);
-        if self.deltas > 0 {
-            span.record("stream.deltas", self.deltas);
+    fn finish(&self, span: &tracing::Span, result: &Result<AssistantTurn, InferenceError>) {
+        let deltas = self.deltas.load(Ordering::Relaxed);
+        span.record("stream.events", self.events.load(Ordering::Relaxed));
+        if deltas > 0 {
+            span.record("stream.deltas", deltas);
+        }
+        // A completed turn records its own `output.partial`, since only the adapter knows its
+        // finish reason.
+        if result.is_err() {
+            span.record("output.partial", deltas > 0);
         }
     }
 }
@@ -479,6 +494,15 @@ mod tests {
     use super::*;
     use crate::mock::{MockResponse, MockServer};
 
+    fn fixture_exchange() -> ModelExchange<'static> {
+        ModelExchange {
+            name: "fixture",
+            model: "fixture",
+            backend: "fixture",
+            dialect: "fixture",
+        }
+    }
+
     async fn refusal_with_body(bytes: usize) -> ProviderFailure {
         let server = MockServer::start(vec![MockResponse::failure(
             500,
@@ -490,7 +514,7 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         let capture = crate::trace_capture::TraceCapture::default();
         let result = http
-            .generation("refusal", "fixture", "fixture", "fixture", async {
+            .generation(fixture_exchange(), &Progress::new(), async {
                 let response = http
                     .send(
                         http.post(&server.base_url()).body("{}"),
@@ -540,10 +564,8 @@ mod tests {
         let control =
             TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2)).unwrap();
         let (result, span) = crate::trace_capture::exported_model_span(http.generation(
-            "tls",
-            "fixture",
-            "fixture",
-            "fixture",
+            fixture_exchange(),
+            &Progress::new(),
             async {
                 http.send(
                     http.post(&format!("https://localhost:{port}/")).body("{}"),

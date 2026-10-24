@@ -14659,6 +14659,66 @@ fn assert_trace_opens_at_receipt(
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
+    use opentelemetry::trace::{Status, TracerProvider as _};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("message-status-test")))
+        .set_default();
+
+    answer_once(message("answer this")).await;
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, ModelScript::new([]), 4),
+        route(model_config()),
+        message("fail this"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
+    provider.force_flush().unwrap();
+
+    let statuses = exported
+        .0
+        .lock()
+        .iter()
+        .filter(|span| span.name == "gateway.message")
+        .map(|span| span.status.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, [Status::Unset, Status::error("")]);
+    provider.shutdown().unwrap();
+}
+
 #[tokio::test]
 async fn gateway_session_exports_the_configured_agent_invocation_under_the_message() {
     use opentelemetry::trace::TracerProvider as _;

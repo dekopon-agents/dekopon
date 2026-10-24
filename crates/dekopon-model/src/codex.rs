@@ -6,7 +6,7 @@ use crate::{
         AuthError, FailurePhase, InferenceError, ProtocolFailure, ProviderFailure, RequestError,
         TransportFailure,
     },
-    http::{InferenceHttp, Progress, record_phase},
+    http::{InferenceHttp, ModelExchange, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{
         AssistantTurn, ClientIdentity, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
@@ -164,8 +164,11 @@ impl CodexClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
+        progress: &Progress,
     ) -> Result<AssistantTurn, InferenceError> {
-        let mut progress = Progress::new();
+        let span = tracing::Span::current();
+        span.record("model.stream", true);
+        span.record("cache.style", "automatic");
         for message in request.messages {
             if let ModelMessage::Assistant { turn } = message
                 && !turn.accepts_client(&self.identity)
@@ -278,13 +281,17 @@ impl InferenceModel for CodexClient {
         observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
     ) -> Result<AssistantTurn, InferenceError> {
+        let progress = Progress::new();
         self.http
             .generation(
-                &self.name,
-                &self.model,
-                "chatgpt-subscription",
-                "codex-responses",
-                self.exchange(request, observe, control),
+                ModelExchange {
+                    name: &self.name,
+                    model: &self.model,
+                    backend: "chatgpt-subscription",
+                    dialect: "codex-responses",
+                },
+                &progress,
+                self.exchange(request, observe, control, &progress),
             )
             .await
     }

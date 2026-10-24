@@ -589,6 +589,7 @@ where
                 "broker.command_run",
                 word = %word,
                 outcome = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
             );
             adopt_trace_parent(&span, trace_parent);
             match broker
@@ -609,6 +610,7 @@ where
                 }
                 Err(error) => {
                     span.record("outcome", "error");
+                    span.record("otel.status_code", "error");
                     span.in_scope(|| report_command_run_failure(&word, &error));
                     ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
                 }

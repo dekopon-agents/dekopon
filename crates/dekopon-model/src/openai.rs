@@ -2,7 +2,7 @@ use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
     error::{InferenceError, ProtocolFailure, ProviderFailure, RequestError, TransportFailure},
-    http::{InferenceHttp, Progress, record_phase},
+    http::{InferenceHttp, ModelExchange, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{
         AssistantTurn, ContentPart, DataUrl, JSON_CONTENT_TYPE, ModelFunctionCall, ModelMessage,
@@ -78,9 +78,11 @@ impl OpenAiClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
+        progress: &Progress,
     ) -> Result<AssistantTurn, InferenceError> {
-        tracing::Span::current().record("model.stream", self.stream);
-        let mut progress = Progress::new();
+        let span = tracing::Span::current();
+        span.record("model.stream", self.stream);
+        span.record("cache.style", "automatic");
         let secrets = DiagnosticSecrets::new(self.bearer_token.as_ref());
         let encoded = control
             .run(async {
@@ -196,13 +198,17 @@ impl InferenceModel for OpenAiClient {
         observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
     ) -> Result<AssistantTurn, InferenceError> {
+        let progress = Progress::new();
         self.http
             .generation(
-                &self.name,
-                &self.model,
-                "openai-compatible",
-                "chat-completions",
-                self.exchange(request, observe, control),
+                ModelExchange {
+                    name: &self.name,
+                    model: &self.model,
+                    backend: "openai-compatible",
+                    dialect: "chat-completions",
+                },
+                &progress,
+                self.exchange(request, observe, control, &progress),
             )
             .await
     }
@@ -1460,12 +1466,82 @@ mod tests {
             assert_eq!(attribute(key).as_deref(), Some(value), "{key}");
         }
         assert_eq!(span.dropped_attributes_count, 0);
+        assert_eq!(attribute("output.partial").as_deref(), Some("false"));
+        let mut keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        let recorded = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), recorded, "a field was exported more than once");
         assert!(
             span.attributes.len()
                 < opentelemetry_sdk::trace::SpanLimits::default().max_attributes_per_span as usize,
             "{}",
             span.attributes.len()
         );
+    }
+
+    fn exported(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Vec<String> {
+        span.attributes
+            .iter()
+            .filter(|attribute| attribute.key.as_str() == key)
+            .map(|attribute| attribute.value.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_stream_exports_partial_output_once_without_an_error_status() {
+        let body = frames(&[
+            r#"{"choices":[{"delta":{"content":"first"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"second"}}]}"#,
+        ]);
+        let server = MockServer::start(vec![MockResponse::sse(&body)]);
+        let client =
+            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let mut observe = |_| ControlFlow::Break(());
+        let (result, span) = crate::trace_capture::exported_model_span(generate(
+            &client,
+            &[],
+            &[],
+            &CompletionOptions::default(),
+            &mut observe,
+        ))
+        .await;
+        assert!(matches!(result, Err(InferenceError::Cancelled)));
+        assert_eq!(span.status, opentelemetry::trace::Status::Unset);
+        assert_eq!(exported(&span, "outcome"), ["failed"]);
+        assert_eq!(exported(&span, "output.partial"), ["true"]);
+        assert_eq!(exported(&span, "model.stream"), ["true"]);
+    }
+
+    #[tokio::test]
+    async fn a_deadline_exceeded_call_exports_an_error_status_without_a_description() {
+        let (reply, _ready, release) = MockResponse::sse("data: [DONE]\n\n").stalled();
+        let server = MockServer::start(vec![reply]);
+        let client =
+            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let control = TurnControl::new(
+            tokio::sync::watch::channel(false).1,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let (result, span) = crate::trace_capture::exported_model_span(client.generate(
+            GenerateRequest {
+                messages: &[],
+                tools: &[],
+                options: &CompletionOptions::default(),
+            },
+            &mut ignored,
+            &control,
+        ))
+        .await;
+        drop(release);
+        assert!(matches!(result, Err(InferenceError::DeadlineExceeded)));
+        assert_eq!(span.status, opentelemetry::trace::Status::error(""));
+        assert_eq!(exported(&span, "error.type"), ["deadline-exceeded"]);
     }
 
     #[tokio::test]

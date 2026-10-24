@@ -1441,6 +1441,7 @@ fn message_span(
         transport = %message.transport,
         agent = %route.agent,
         outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
         busy.cause = tracing::field::Empty,
         batch.members = receipts.0.len(),
     );
@@ -1624,7 +1625,11 @@ async fn run_admitted(
             conversation.carried_assets = tracing::field::Empty,
         ))
         .await;
-    tracing::Span::current().record("outcome", outcome);
+    let span = tracing::Span::current();
+    span.record("outcome", outcome);
+    if matches!(outcome, "failed" | "reply-failed") {
+        span.record("otel.status_code", "error");
+    }
     receipts.finish(outcome);
     admission
 }

@@ -5,7 +5,7 @@ use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
     error::{FailurePhase, InferenceError, ProtocolFailure, RequestError, TransportFailure},
-    http::{InferenceHttp, Progress, record_phase},
+    http::{InferenceHttp, ModelExchange, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{AssistantTurn, ClientIdentity, ModelMessage, ModelToolCall, compact_json_body},
     openai::{
@@ -203,23 +203,24 @@ impl OpenRouterClient {
                 span.record("routing.only", secrets.sanitize(&only.join(",")));
             }
         }
-        if let Some(cache) = &self.settings.cache {
+        span.record("model.stream", true);
+        span.record(
+            "cache.style",
+            match self.settings.cache.as_ref().map(|cache| &cache.style) {
+                None | Some(CacheStyle::Automatic) => "automatic",
+                Some(CacheStyle::ExplicitPrefix) => "explicitPrefix",
+            },
+        );
+        if let Some(cache) = &self.settings.cache
+            && let Some(ttl) = cache.ttl
+        {
             span.record(
-                "cache.style",
-                match cache.style {
-                    CacheStyle::Automatic => "automatic",
-                    CacheStyle::ExplicitPrefix => "explicitPrefix",
+                "cache.ttl",
+                match ttl {
+                    settings::Ttl::FiveMinutes => "5m",
+                    settings::Ttl::OneHour => "1h",
                 },
             );
-            if let Some(ttl) = cache.ttl {
-                span.record(
-                    "cache.ttl",
-                    match ttl {
-                        settings::Ttl::FiveMinutes => "5m",
-                        settings::Ttl::OneHour => "1h",
-                    },
-                );
-            }
         }
     }
 
@@ -228,8 +229,8 @@ impl OpenRouterClient {
         request: GenerateRequest<'_>,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
+        progress: &Progress,
     ) -> Result<AssistantTurn, InferenceError> {
-        let mut progress = Progress::new();
         let secrets = DiagnosticSecrets::new(Some(&self.token));
         self.record_settings(secrets);
         let body = control
@@ -292,13 +293,17 @@ impl InferenceModel for OpenRouterClient {
         observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
     ) -> Result<AssistantTurn, InferenceError> {
+        let progress = Progress::new();
         self.http
             .generation(
-                &self.name,
-                &self.model,
-                "openrouter",
-                "chat-completions",
-                self.exchange(request, observe, control),
+                ModelExchange {
+                    name: &self.name,
+                    model: &self.model,
+                    backend: "openrouter",
+                    dialect: "chat-completions",
+                },
+                &progress,
+                self.exchange(request, observe, control, &progress),
             )
             .await
     }
