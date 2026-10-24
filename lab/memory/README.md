@@ -104,6 +104,26 @@ N reached`. The summarizer stays on the fake, so its scripted behaviours still a
 (`act=fail|hang|refuse`) do not exist on this profile. The gateway is given the caller's proxy
 variables.
 
+## Lab overlay: extra CA
+
+Dekopon's model clients trust only the webpki roots and ignore proxy variables. In a container
+whose direct HTTPS is intercepted by an egress gateway, every real model call then fails with
+`model transport failed: HTTP: error sending request`. Setting `LAB_EXTRA_CA=<pem bundle>` builds
+the ref with `overlay/extra-ca.patch` applied to a separate worktree and target directory
+(`.work/src/<sha>-extra-ca-<patch12>-<ca12>`, `.work/target-extra-ca`), with the bundle compiled
+in as `crates/dekopon-model/lab-extra-ca.pem`:
+
+- the reqwest client in `InferenceHttp::new` adds every certificate in the bundle beside its
+  webpki roots;
+- the ureq agent in `agent_from` uses exactly the bundle's certificates, because ureq cannot add
+  roots to its compiled-in webpki set, so pass a full bundle (public roots plus the egress CA,
+  like `/root/.ccr/ca-bundle.crt`), not the egress CA alone.
+
+A run built this way says `lab overlay: extra CA` with the patch and bundle SHA-256s in
+`summary.md` and `meta.json`; a stock run says `none (stock code)`. The patch is never applied to
+a dekopon branch. `LAB_FAKE_TLS_CERT` and `LAB_FAKE_TLS_KEY` serve the fake model over HTTPS,
+which is how the overlay is checked without a real endpoint.
+
 `traces.jsonl` is the collector's unmodified OTLP JSON: each span keeps `traceId`, `spanId`,
 `parentSpanId`, `name`, `kind`, start and end times, attributes, events and status.
 `summary.md` reports roots and spans whose parent was never exported (expected only around a

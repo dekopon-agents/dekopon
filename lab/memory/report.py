@@ -94,6 +94,9 @@ def build(run):
     out += [f"- ref: `{meta['ref']}` → `{meta['sha']}`", f"- profile: {meta['profile']} ({meta['build']} build)",
             f"- uids: brokerd {meta['uids']['broker']}, gatewayd {meta['uids']['gateway']}"
             f" ({meta['uids']['separation']})",
+            "- lab overlay: " + (f"**{meta['overlay']['name']}** (patch sha256 `{meta['overlay']['patch_sha256']}`, "
+                                 f"CA sha256 `{meta['overlay']['ca_sha256']}`) — not stock code"
+                                 if meta.get("overlay") else "none (stock code)"),
             f"- started {meta['started_utc']}, finished {meta.get('finished_utc', '?')}",
             f"- status: **{meta.get('status', 'unknown')}**", ""]
     if meta.get("cost"):

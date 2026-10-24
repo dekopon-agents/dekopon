@@ -70,7 +70,7 @@ class Budget:
 
 
 class FakeModel:
-    def __init__(self, calls_path, real=None):
+    def __init__(self, calls_path, real=None, tls=None):
         self.calls_path = calls_path
         self.real = real
         self.lock = threading.Lock()
@@ -80,6 +80,12 @@ class FakeModel:
         self.stopping = threading.Event()
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
+        self.scheme = "http"
+        if tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(*tls)
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+            self.scheme = "https"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     @property

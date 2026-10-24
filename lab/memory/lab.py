@@ -60,7 +60,9 @@ class Lab:
         if args.profile == "real":
             self.budget = fakemodel.Budget(args.cost_cap, args.price_in, args.price_out)
             real = {"model": args.real_model, "budget": self.budget}
-        self.model = fakemodel.FakeModel(self.run / "model-calls.jsonl", real).start()
+        tls = (os.environ["LAB_FAKE_TLS_CERT"], os.environ["LAB_FAKE_TLS_KEY"]) \
+            if os.environ.get("LAB_FAKE_TLS_CERT") else None
+        self.model = fakemodel.FakeModel(self.run / "model-calls.jsonl", real, tls).start()
         self.summaries_on = True
         self.codex_auth = self.dirs["gateway"] / "codex" / "auth.json"
         self.codex_original = None
@@ -122,7 +124,7 @@ class Lab:
         return path
 
     def write_gateway_config(self):
-        endpoint = f"http://127.0.0.1:{self.model.port}/v1"
+        endpoint = f"{self.model.scheme}://127.0.0.1:{self.model.port}/v1"
         model = lambda name, model_id, classes, timeout: {  # noqa: E731
             "name": name, "kind": "openaiCompatible", "model": model_id, "endpoint": endpoint,
             "apiKeyEnv": "LAB_MODEL_KEY", "timeoutMs": timeout, "classes": classes, "stream": False}

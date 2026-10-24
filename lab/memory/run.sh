@@ -47,12 +47,27 @@ if ! sha="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")"; then
   sha="$(git -C "$repo" rev-parse --verify "FETCH_HEAD^{commit}")"
 fi
 src="$work/src/$sha"
+target="$work/target"
+overlay=None
+if [ -n "${LAB_EXTRA_CA:-}" ]; then
+  grep -q "BEGIN CERTIFICATE" "$LAB_EXTRA_CA" || { echo "LAB_EXTRA_CA holds no PEM certificate" >&2; exit 2; }
+  patch="$lab/overlay/extra-ca.patch"
+  patch_sha="$(sha256sum "$patch" | cut -d' ' -f1)"
+  ca_sha="$(sha256sum "$LAB_EXTRA_CA" | cut -d' ' -f1)"
+  src="$work/src/$sha-extra-ca-${patch_sha:0:12}-${ca_sha:0:12}"
+  target="$work/target-extra-ca"
+  overlay="{\"name\": \"extra CA\", \"patch_sha256\": \"$patch_sha\", \"ca_sha256\": \"$ca_sha\"}"
+fi
 if [ ! -d "$src" ]; then
   mkdir -p "$work/src"
   git -C "$repo" worktree add --quiet --detach "$src" "$sha"
+  if [ "$overlay" != None ]; then
+    git -C "$src" apply "$patch" || { git -C "$repo" worktree remove --force "$src"; echo "the extra-CA overlay does not apply at $sha" >&2; exit 1; }
+    install -m 0644 "$LAB_EXTRA_CA" "$src/crates/dekopon-model/lab-extra-ca.pem"
+  fi
 fi
 
-cargo_flags=(--locked -p dekopon-brokerd -p dekopon-gatewayd --target-dir "$work/target")
+cargo_flags=(--locked -p dekopon-brokerd -p dekopon-gatewayd --target-dir "$target")
 [ "$build" = release ] && cargo_flags+=(--release)
 (cd "$src" && cargo build "${cargo_flags[@]}")
 
@@ -62,7 +77,7 @@ state="${LAB_STATE_ROOT:-/var/tmp/dekopon-lab}/$run_id"
 mkdir -p "$run" "$state/bin"
 chmod 0755 "$state" "$state/bin"
 for binary in dekopon-brokerd dekopon-gatewayd; do
-  install -m 0755 "$work/target/$build/$binary" "$state/bin/$binary"
+  install -m 0755 "$target/$build/$binary" "$state/bin/$binary"
 done
 install -m 0644 "$src/examples/providers/cli-probe-provider.wasm" "$state/bin/cli-probe-provider.wasm"
 (cd "$state/bin" && sha256sum dekopon-brokerd dekopon-gatewayd cli-probe-provider.wasm) >"$run/artifacts.sha256"
@@ -117,7 +132,7 @@ curl --silent --fail --output /dev/null --max-time 2 -X POST -H 'Content-Type: a
 python3 - "$run/meta.json" <<PYMETA
 import json, sys
 json.dump({"ref": "$ref", "sha": "$sha", "scenario": "$scenario", "profile": "$profile", "build": "$build",
-           "started_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "collector_image": "$collector_image",
+           "overlay": $overlay, "started_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "collector_image": "$collector_image",
            "uids": {"broker": $broker_uid, "gateway": $gateway_uid, "ipc_gid": $ipc_gid,
                     "separation": "$separation"}}, open(sys.argv[1], "w"), indent=1)
 PYMETA
