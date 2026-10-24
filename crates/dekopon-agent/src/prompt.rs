@@ -179,19 +179,29 @@ impl<'a> MailboxLease<'a> {
         }
     }
 
-    fn take(&mut self, messages: &mut Vec<ModelMessage>) {
+    fn take(
+        &mut self,
+        messages: &mut Vec<ModelMessage>,
+        progress: Option<&dyn ProgressSink>,
+        model_turns: u32,
+    ) {
         let steers = match self.mailbox {
             Mailbox::Open(mailbox) => mailbox.take(),
             Mailbox::Absent | Mailbox::Closed(_) => Vec::new(),
         };
-        self.stage(steers, messages);
+        self.stage(steers, messages, progress, model_turns);
     }
 
-    fn seal_or_take(&mut self, messages: &mut Vec<ModelMessage>) -> Option<Seal> {
+    fn seal_or_take(
+        &mut self,
+        messages: &mut Vec<ModelMessage>,
+        progress: Option<&dyn ProgressSink>,
+        model_turns: u32,
+    ) -> Option<Seal> {
         match self.mailbox {
             Mailbox::Open(mailbox) => match mailbox.seal_or_take() {
                 Handoff::Steers(steers) => {
-                    self.stage(steers, messages);
+                    self.stage(steers, messages, progress, model_turns);
                     None
                 }
                 Handoff::Sealed(seal) => {
@@ -216,7 +226,16 @@ impl<'a> MailboxLease<'a> {
         }
     }
 
-    fn stage(&mut self, steers: Vec<Steer>, messages: &mut Vec<ModelMessage>) {
+    fn stage(
+        &mut self,
+        steers: Vec<Steer>,
+        messages: &mut Vec<ModelMessage>,
+        progress: Option<&dyn ProgressSink>,
+        model_turns: u32,
+    ) {
+        if !steers.is_empty() {
+            emit(progress, ProgressEvent::Steered { turn: model_turns });
+        }
         for steer in steers {
             match steer {
                 Steer::Person { prompt, recorded } => {
@@ -758,7 +777,7 @@ where
         }
         let model_turns = completed_turns + 1;
         check_cancelled(cancellation)?;
-        lease.take(&mut messages);
+        lease.take(&mut messages, progress, model_turns);
         let model_span = tracing::info_span!(
             "prompt.model_turn",
             model.turn = model_turns,
@@ -831,7 +850,6 @@ where
                 );
                 drop(model_entered);
                 if steered {
-                    emit(progress, ProgressEvent::Steered { turn: model_turns });
                     continue;
                 }
                 return Err(PromptError::Cancelled);
@@ -925,8 +943,7 @@ where
         if turn.tool_calls.is_empty() {
             check_cancelled(cancellation)?;
             let seal = if model_turns < limits.max_steps {
-                let Some(seal) = lease.seal_or_take(&mut messages) else {
-                    emit(progress, ProgressEvent::Steered { turn: model_turns });
+                let Some(seal) = lease.seal_or_take(&mut messages, progress, model_turns) else {
                     continue;
                 };
                 seal
@@ -2411,6 +2428,31 @@ mod tests {
             }
             turn
         }
+    }
+
+    #[test]
+    fn a_steer_taken_before_a_model_call_emits_exactly_one_steered() {
+        let steers = QueuedSteers::default();
+        steers.push("msg2");
+        let (sink, progress) = recording_sink();
+        run_prompt_session(
+            &ScriptedModel::new([answer("done")]),
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg1", limits(1, 4))
+                .with_steering(&steers)
+                .with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("session answers");
+        let labels = sink.labels();
+        assert_eq!(labels[0], "steered 1");
+        assert_eq!(
+            labels
+                .into_iter()
+                .filter(|label| label.starts_with("steered "))
+                .collect::<Vec<_>>(),
+            ["steered 1"]
+        );
     }
 
     #[test]

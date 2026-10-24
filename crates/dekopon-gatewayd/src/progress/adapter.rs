@@ -16,6 +16,7 @@ const MAX_NOTES_PER_SESSION: u32 = 24;
 
 #[derive(Debug, Default)]
 pub(crate) struct ProgressCounters {
+    pub steers: AtomicU32,
     pub dropped: AtomicU32,
     pub notes_dropped: AtomicU32,
     pub deltas: AtomicU32,
@@ -91,6 +92,7 @@ impl ProgressSink for ProgressAdapter {
             self.counters.note_generation.load(Ordering::Acquire)
         };
         if matches!(event, ProgressEvent::Steered { .. }) {
+            self.counters.steers.fetch_add(1, Ordering::Relaxed);
             self.text.send_modify(|cumulative| {
                 cumulative.text = ModelText::default();
                 cumulative.generation += 1;

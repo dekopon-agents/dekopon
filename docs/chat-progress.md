@@ -226,9 +226,9 @@ Terminal handling has exactly **one** writer, the policy task:
 
 | Outcome | What the person is left with |
 |---|---|
-| Answered | the surface finalized in place as the answer; attachments follow on the reply path |
-| Stopped | with streamed partial text, the cause-specific line is appended in place; without streamed text, the progress message is removed and the line is posted as a fresh reply. Person/operator stops use `stopped`, other model failures use `failed` |
-| Failed | a progress message deleted and the fixed failure line as the reply; a streamed surface closed in place, with the partial answer above that line |
+| Answered | the surface finalized in place as the answer, unless a steer was staged after the surface was posted: then the surface is deleted and the answer is posted fresh below the steer in the same reply target; attachments follow on the reply path |
+| Stopped | with streamed partial text, the cause-specific line is appended and finalized in place, unless a steer staged after the surface was posted requires deleting it and delivering the result fresh; without streamed text, the progress message is removed and the line is posted as a fresh reply. Person/operator stops use `stopped`, other model failures use `failed` |
+| Failed | a progress message deleted and the fixed failure line as the reply; a streamed surface closed with the partial answer above that line, in place unless a steer staged after the surface was posted requires deleting it and delivering the result fresh |
 | Declined | a progress message removed and no reply at all; a streamed surface closed on exactly the text already on screen |
 
 Two tasks writing the same conversation on cancel is the one race worth naming: the session's

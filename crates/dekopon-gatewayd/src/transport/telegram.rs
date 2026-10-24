@@ -622,6 +622,10 @@ impl TextStream for TelegramDriver {
         Ok(message.clone())
     }
 
+    async fn discard(&self, message: &MessageRef) -> Result<(), TransportError> {
+        ProgressMessage::delete(self, message).await
+    }
+
     async fn finalize(
         &self,
         message: &MessageRef,
