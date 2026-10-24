@@ -363,7 +363,7 @@ async fn every_id_of_a_taken_folded_steer_is_consumed_and_never_replayed() {
             prompt[prompt.len() - 2..],
             transcript(&[
                 ("user", "[gateway: chat history, from U2]\nunaddressed"),
-                ("user", "next"),
+                ("user", "[gateway: authenticated participant: xavier]\nnext"),
             ]),
             "{steering:?}"
         );

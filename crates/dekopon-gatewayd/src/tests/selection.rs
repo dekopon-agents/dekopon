@@ -730,7 +730,10 @@ async fn shorter_bare_check_log_summary_with_larger_envelope_keeps_original() {
         [
             ("user".into(), format!("{original_label}hi")),
             ("assistant".into(), "ok".into()),
-            ("user".into(), "next question".into()),
+            (
+                "user".into(),
+                "[gateway: unmapped participant]\nnext question".into()
+            ),
         ]
     );
     let events = capture.events_where("dekopon_gatewayd", &[("event", "gateway_memory_selection")]);
@@ -850,7 +853,10 @@ async fn a_selected_omission_never_replays_its_resident_original() {
     .await;
     assert_eq!(
         model.prompt(0)[1..],
-        [("user".into(), "next question".into())]
+        [(
+            "user".into(),
+            "[gateway: unmapped participant]\nnext question".into()
+        )]
     );
     let omitted = capture.events_where(
         "dekopon_gatewayd",
@@ -958,7 +964,7 @@ async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
             ("assistant".into(), "ok".into()),
             ("user".into(), "newer".into()),
             ("assistant".into(), "ok".into()),
-            ("user".into(), "next question".into())
+            ("user".into(), "[gateway: unmapped participant]\nnext question".into())
         ]
     );
     assert_eq!(
@@ -1130,7 +1136,7 @@ async fn journal_projection_fits_newest_whole_turns_without_downgrading() {
             ("assistant".into(), "b".into()),
             ("user".into(), "[memory: {\"recordId\":3,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nlatest".into()),
             ("assistant".into(), "c".into()),
-            ("user".into(), "next question".into())
+            ("user".into(), "[gateway: unmapped participant]\nnext question".into())
         ]
     );
     assert_eq!(broker.recorded().len(), 1);

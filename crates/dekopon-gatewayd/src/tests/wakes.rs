@@ -594,7 +594,10 @@ async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
 
     assert_eq!(driver.replies(), ["it merged"]);
     let (_, prompt) = models.prompt(0).pop().expect("a user prompt");
-    assert!(prompt.starts_with("[gateway: wake 1 fired."), "{prompt}");
+    assert!(
+        prompt.starts_with("[gateway: unmapped participant]\n[gateway: wake 1 fired."),
+        "{prompt}"
+    );
     assert!(prompt.contains("check the PR"), "{prompt}");
     assert_eq!(triggers(&mut observed), [Trigger::Wake]);
 }
