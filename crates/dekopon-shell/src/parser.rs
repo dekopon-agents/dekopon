@@ -1540,6 +1540,42 @@ mod tests {
     }
 
     #[test]
+    fn pending_substitution_close_keeps_the_here_doc_refusal() {
+        let source = "echo \"$(cat <<EOF)\"\nhi\nEOF\n";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\""
+        );
+    }
+
+    #[test]
+    fn completed_here_doc_keeps_a_later_backtick_refusal() {
+        let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\n`x`\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 4: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+    }
+
+    #[test]
+    fn completed_here_doc_keeps_a_later_quote_refusal() {
+        let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\necho \"oops\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 4: unterminated double-quoted string"
+        );
+    }
+
+    #[test]
+    fn completed_empty_quoted_here_doc_keeps_a_later_backtick_refusal() {
+        let source = "echo $(cat <<'EOF'; case a in a) true;; esac\nEOF\n`x`\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 3: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+    }
+
+    #[test]
     fn substitution_keeps_the_whole_case_program() {
         let command = simple_command_of(r#"echo "$(case ready in ready) echo yes;; esac)""#);
         assert_eq!(

@@ -538,6 +538,7 @@ impl<'a> Lexer<'a> {
             };
             self.tokens[specification.token].kind = TokenKind::HereDoc(Word { parts });
         }
+        self.pending_here_doc_close = None;
         Ok(())
     }
 
@@ -1242,6 +1243,60 @@ mod tests {
             TokenKind::Word(word) => word.parts,
             other => panic!("expected a word, found {other}"),
         }
+    }
+
+    #[test]
+    fn a_pending_here_doc_records_a_case_pattern_close() {
+        let source = "cat <<EOF; case a in a) `x`";
+        let mut lexer = super::Lexer::new(source, 0);
+        let error = loop {
+            match lexer.next_token() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("must be rejected"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.to_string(),
+            "line 1: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+        assert_eq!(lexer.pending_here_doc_close(), source.find(')'));
+    }
+
+    #[test]
+    fn a_pending_here_doc_records_a_function_close() {
+        let source = "cat <<EOF; f() `x`";
+        let mut lexer = super::Lexer::new(source, 0);
+        let error = loop {
+            match lexer.next_token() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("must be rejected"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.to_string(),
+            "line 1: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+        assert_eq!(lexer.pending_here_doc_close(), source.find(')'));
+    }
+
+    #[test]
+    fn completed_here_docs_clear_a_pending_function_close() {
+        let source = "cat <<EOF; cat <<'END'; f() { true; }\nhi\nEOF\nEND\n`x`";
+        let mut lexer = super::Lexer::new(source, 0);
+        let error = loop {
+            match lexer.next_token() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("must be rejected"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.to_string(),
+            "line 5: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+        assert_eq!(lexer.pending_here_doc_close(), None);
     }
 
     #[test]
