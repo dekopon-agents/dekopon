@@ -3668,6 +3668,7 @@ fn substitution_and_parameter_words_match_bash() {
     let refusals = [
         "echo $(cat <<EOF)\nhi\nEOF\n",
         "x=$(cat <<EOF)\nprobe upper --text hi\nEOF\n",
+        "echo \"$(cat <<EOF)\"\nhi\nEOF\n",
     ];
     let actual = refusals.map(|script| {
         let outcome = run(script);

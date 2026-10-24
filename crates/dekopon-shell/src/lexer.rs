@@ -144,6 +144,7 @@ pub(crate) struct Lexer<'a> {
     word_offset: usize,
     token_offset: usize,
     pending_here_docs: Vec<PendingHereDoc>,
+    pending_here_doc_close: Option<usize>,
     depth: u32,
     block_depth: u32,
 }
@@ -162,6 +163,7 @@ impl<'a> Lexer<'a> {
             word_offset: 0,
             token_offset: 0,
             pending_here_docs: Vec::new(),
+            pending_here_doc_close: None,
             depth,
             block_depth: 0,
         }
@@ -177,6 +179,10 @@ impl<'a> Lexer<'a> {
 
     pub(crate) fn set_parser_depth(&mut self, depth: u32) {
         self.block_depth = depth.saturating_sub(self.depth);
+    }
+
+    pub(crate) fn pending_here_doc_close(&self) -> Option<usize> {
+        self.pending_here_doc_close
     }
 
     pub(crate) fn offset(&mut self) -> usize {
@@ -1202,7 +1208,12 @@ impl<'a> Lexer<'a> {
             }
             ('<', _) => TokenKind::Less,
             ('(', _) => TokenKind::LeftParen,
-            (')', _) => TokenKind::RightParen,
+            (')', _) => {
+                if !self.pending_here_docs.is_empty() && self.pending_here_doc_close.is_none() {
+                    self.pending_here_doc_close = Some(self.token_offset);
+                }
+                TokenKind::RightParen
+            }
             _ => unreachable!("read_operator is only called for operator characters"),
         };
         self.push(kind);

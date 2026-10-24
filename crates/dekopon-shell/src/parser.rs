@@ -103,6 +103,9 @@ pub(crate) fn parse_substitution(
     parser.substitution = true;
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
+        if let Some(close) = parser.lexer.pending_here_doc_close() {
+            parse_nested(&source[..close + 1], depth + 1)?;
+        }
         return Err(error.into());
     }
     let program = result?;
