@@ -8,6 +8,15 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Undeclared capabilities refuse and tool-call ids (0.50.5)
+
+A capability block naming a capability its loaded provider does not declare now refuses
+configuration in both `strict` modes, at `dekopon-brokerd check` and at boot. Before starting
+the new broker, run the new `dekopon-brokerd check` over the deployment's config.
+
+Tool-call telemetry renames `tool_call.index` to `gen_ai.tool.call.id` (`tool_call.position`
+for an empty id). Saved queries and dashboards that filter on the old name need the new one.
+
 ## Keyed prompt-cache keys and fence-aware replies (0.50.2)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. Upgrade the

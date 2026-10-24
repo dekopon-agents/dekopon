@@ -7,6 +7,34 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.5] - 2026-10-24
+
+### Changed
+
+- Tool-call telemetry uses gen_ai.tool.call.id instead of tool_call.index, with tool_call.position for empty ids.
+- Remove TurnEvent::ToolCallStarted; streamed events carry reply text only.
+- events_from_transcript requires an explicit TranscriptDialect.
+- A capability block naming a capability its loaded provider does not declare now refuses configuration in both strict modes.
+
+### Fixed
+
+- Skip unknown model tool kinds before decoding their function payloads. (#648)
+- Preserve snapshot-only Codex messages beside streamed messages. (#650)
+- Refuse unfinished Codex calls before tools execute. (#651)
+- Deliver Codex refusals as reply text and reject textless output_text parts. (#653)
+- Provider-set configuration checks prune stale compiled provider cache entries.
+- Policy configuration failures report every Cedar parse error.
+
+### Security
+
+- tokio moves to 1.53.3 (RUSTSEC-2026-0386) and ctutils to 0.4.4 (RUSTSEC-2026-0385), in both the stock and memory-optimized builds.
+
+## [dekopon-chart-0.37.5] - 2026-10-24
+
+### Changed
+
+- Chart 0.37.5 targets core v0.50.5 and renders the `v0.50.5` image tag.
+
 ## [0.50.4] - 2026-10-23
 
 ### Changed
