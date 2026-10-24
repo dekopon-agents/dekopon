@@ -3664,4 +3664,17 @@ fn substitution_and_parameter_words_match_bash() {
         .map(|(_, expected)| *expected)
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+
+    let refusals = [
+        "echo $(cat <<EOF)\nhi\nEOF\n",
+        "x=$(cat <<EOF)\nprobe upper --text hi\nEOF\n",
+    ];
+    let actual = refusals.map(|script| {
+        let outcome = run(script);
+        (outcome.exit_code, outcome.output)
+    });
+    let expected = refusals.map(|_| {
+        (ExitCode::SYNTAX, "dekopon-shell: syntax error: line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\"".to_owned())
+    });
+    assert_eq!(actual, expected);
 }

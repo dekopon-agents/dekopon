@@ -179,7 +179,7 @@ impl<'a> Lexer<'a> {
         self.block_depth = depth.saturating_sub(self.depth);
     }
 
-    fn offset(&mut self) -> usize {
+    pub(crate) fn offset(&mut self) -> usize {
         self.chars
             .peek()
             .map_or(self.source.len(), |(index, _)| *index)

@@ -106,11 +106,40 @@ pub(crate) fn parse_substitution(
         return Err(error.into());
     }
     let program = result?;
-    match parser.peek_kind() {
-        Some(TokenKind::RightParen) => {
-            Ok((program, parser.peek().map_or(0, |token| token.offset) + 1))
+    let Some(token) = parser.peek() else {
+        return Err(ParseError::syntax(line, "unterminated $( ... )"));
+    };
+    let token_line = token.line;
+    let end = token.offset + 1;
+    match &token.kind {
+        TokenKind::RightParen => {
+            if parser.lexer.offset() != end {
+                // Reparse the bounded prefix to preserve the here-document's delimiter-specific refusal.
+                return parse_nested(&source[..end], depth + 1).and(Err(ParseError::syntax(
+                    token_line,
+                    "unterminated here-document",
+                )));
+            }
+            Ok((program, end))
         }
-        _ => Err(ParseError::syntax(line, "unterminated $( ... )")),
+        kind @ (TokenKind::Word(_)
+        | TokenKind::Pipe
+        | TokenKind::Semicolon
+        | TokenKind::DoubleSemicolon
+        | TokenKind::Newline
+        | TokenKind::AndAnd
+        | TokenKind::OrOr
+        | TokenKind::Ampersand
+        | TokenKind::LeftParen
+        | TokenKind::LeftBrace
+        | TokenKind::RightBrace
+        | TokenKind::Redirect { .. }
+        | TokenKind::Duplicate { .. }
+        | TokenKind::Less
+        | TokenKind::HereDoc(_)
+        | TokenKind::LessParen) => {
+            Err(ParseError::syntax(token_line, format!("unexpected {kind}")))
+        }
     }
 }
 
@@ -981,7 +1010,6 @@ impl<'a> Parser<'a> {
                     return Err(ParseError::syntax(line, "unexpected `)`"));
                 }
                 Some(TokenKind::HereDoc(word)) => {
-                    let word = word.clone();
                     let line = self.line();
                     self.position += 1;
                     if here_doc.is_some() {
@@ -1495,6 +1523,17 @@ mod tests {
             ParseError::Syntax { message, .. } => message,
             ParseError::Lex(error) => error.message,
         }
+    }
+
+    #[test]
+    fn substitution_reports_unexpected_tokens_at_their_body_lines() {
+        let cases = [
+            ("$(echo })", "line 1: unexpected }"),
+            ("$(echo a ;; )", "line 1: unexpected ;;"),
+        ];
+        let actual = cases.map(|(source, _)| parse(source).expect_err(source).to_string());
+        let expected = cases.map(|(_, expected)| expected.to_owned());
+        assert_eq!(actual, expected);
     }
 
     #[test]
