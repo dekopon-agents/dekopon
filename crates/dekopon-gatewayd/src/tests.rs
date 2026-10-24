@@ -14510,7 +14510,7 @@ fn spool_spans_never_record_payload_or_paths() {
     assert!(
         text.contains("bytes=21")
             && text.contains("duration_ms=")
-            && text.contains("outcome=\"ok\""),
+            && text.contains("outcome=\"succeeded\""),
         "{text}"
     );
     assert!(

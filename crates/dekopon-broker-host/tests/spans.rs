@@ -226,7 +226,7 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
         &capture,
         "provider.registry_load",
         "outcome",
-        "ok"
+        "succeeded"
     ));
     drop(cold);
 
@@ -295,13 +295,13 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
         &capture,
         "provider.load_stage",
         "outcome",
-        "error"
+        "failed"
     ));
     assert!(recorded_value(
         &capture,
         "provider.registry_load",
         "outcome",
-        "error"
+        "failed"
     ));
     assert!(!recorded_value(
         &capture,

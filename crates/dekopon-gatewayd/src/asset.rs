@@ -2727,7 +2727,7 @@ mod retention_tests {
             for label in ["image/png", "image/jpeg"] {
                 let before = capture
                     .text()
-                    .matches("gateway.asset.content_type_mismatch")
+                    .matches("audit.event=\"gateway.asset.content_type_mismatch\"")
                     .count();
                 let (fd, metadata) = received(&bytes, label, encoding);
                 let id = session
@@ -2744,7 +2744,7 @@ mod retention_tests {
                 );
                 let after = capture
                     .text()
-                    .matches("gateway.asset.content_type_mismatch")
+                    .matches("audit.event=\"gateway.asset.content_type_mismatch\"")
                     .count();
                 assert_eq!(after - before, usize::from(label != "image/png"));
                 assert_eq!(
@@ -2868,7 +2868,13 @@ mod retention_tests {
             slot.finish(disposition);
             slot.finish(disposition);
             drop(slot);
-            assert_eq!(capture.text().matches("agent.asset.send").count(), 1);
+            assert_eq!(
+                capture
+                    .text()
+                    .matches("audit.event=\"agent.asset.send\"")
+                    .count(),
+                1
+            );
             let dispatched = disposition != AssetDeliveryDisposition::Abandoned;
             assert!(capture.text().contains(&format!("dispatched={dispatched}")));
             match disposition {

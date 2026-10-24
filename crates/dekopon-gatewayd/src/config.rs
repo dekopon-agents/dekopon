@@ -3346,13 +3346,16 @@ routes:
         assert_eq!(record.field("route"), Some("0"));
         assert_eq!(record.field("seen"), Some("Off"));
         assert_eq!(record.field("working"), Some("Off"));
+        assert_eq!(
+            record.field("message"),
+            Some("gateway.indicators.effective")
+        );
         for forbidden in [
             "agent",
             "subject",
             "principal",
             "conversation",
             "conversation_id",
-            "message",
             "payload",
             "token",
             "coordinate",
