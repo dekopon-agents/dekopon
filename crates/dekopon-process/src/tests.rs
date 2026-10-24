@@ -1,371 +1,46 @@
-use parking_lot::Mutex;
-use std::{
-    collections::HashMap,
-    io,
-    sync::{Arc, OnceLock},
-};
-
-use tokio::sync::oneshot;
-use tracing::{Subscriber, field::Visit};
-use tracing_subscriber::{Layer, layer::Context, prelude::*};
-
 use super::*;
 
 #[tokio::test]
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-async fn typed_success_and_operation_error_are_preserved() {
-    let success = process_fn(
-        ProcessMetadata::non_interruptible("success-test"),
-        || async { Ok::<_, io::Error>(42_u8) },
-    );
-    assert!(matches!(
-        ProcessRun::execute(success).await,
-        ProcessOutcome::Completed(Ok(42))
-    ));
-
-    let failure = process_fn(ProcessMetadata::non_interruptible("error-test"), || async {
-        Err::<(), _>(io::Error::other("typed operation cause"))
-    });
-    match ProcessRun::execute(failure).await {
-        ProcessOutcome::Completed(Err(error)) => {
-            assert_eq!(error.kind(), io::ErrorKind::Other);
-            assert_eq!(error.to_string(), "typed operation cause");
-        }
-        _ => panic!("unexpected operation outcome"),
-    }
-}
-
-#[tokio::test]
-#[expect(
-    clippy::match_wildcard_for_single_variants,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-async fn panic_preserves_the_tokio_task_failure() {
-    let process = process_fn(ProcessMetadata::non_interruptible("panic-test"), || async {
-        panic!("deliberate process panic");
-        #[allow(unreachable_code)]
-        Ok::<_, io::Error>(())
-    });
-
-    let error = match ProcessRun::execute(process).await {
-        ProcessOutcome::TaskFailed(error) => error,
-        _ => panic!("unexpected panic outcome"),
-    };
-    assert!(error.is_panic());
-    let payload = error.into_panic();
-    assert_eq!(
-        payload.downcast_ref::<&'static str>(),
-        Some(&"deliberate process panic")
-    );
-}
-
-#[derive(Default)]
-struct CaptureState {
-    records: Mutex<Vec<String>>,
-    kinds: Mutex<HashMap<tracing::span::Id, String>>,
-    terminal_waiters: Mutex<HashMap<String, oneshot::Sender<()>>>,
-}
-
-#[derive(Clone, Default)]
-struct CaptureLayer(Arc<CaptureState>);
-
-impl CaptureLayer {
-    fn global() -> Self {
-        static CAPTURE: OnceLock<CaptureLayer> = OnceLock::new();
-        CAPTURE
-            .get_or_init(|| {
-                let capture = Self::default();
-                let subscriber = tracing_subscriber::registry().with(capture.clone());
-                tracing::subscriber::set_global_default(subscriber)
-                    .expect("test subscriber installs once");
-                capture
-            })
-            .clone()
-    }
-
-    fn terminal(&self, kind: &str) -> oneshot::Receiver<()> {
-        let (sender, receiver) = oneshot::channel();
-        let previous = self
-            .0
-            .terminal_waiters
-            .lock()
-            .insert(kind.to_owned(), sender);
-        assert!(previous.is_none(), "one terminal waiter per process kind");
-        receiver
-    }
-}
-
-#[derive(Default)]
-struct FieldCapture {
-    rendered: String,
-    process_kind: Option<String>,
-}
-
-impl Visit for FieldCapture {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.rendered.push_str(field.name());
-        self.rendered.push('=');
-        self.rendered.push_str(&format!("{value:?};"));
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "process.kind" {
-            self.process_kind = Some(value.to_owned());
-        }
-        self.record_debug(field, &value);
-    }
-}
-
-impl<Registry> Layer<Registry> for CaptureLayer
-where
-    Registry: Subscriber,
-{
-    fn on_new_span(
-        &self,
-        attributes: &tracing::span::Attributes<'_>,
-        id: &tracing::span::Id,
-        _context: Context<'_, Registry>,
-    ) {
-        let mut fields = FieldCapture::default();
-        attributes.record(&mut fields);
-        if let Some(kind) = fields.process_kind {
-            self.0.kinds.lock().insert(id.clone(), kind);
-        }
-        self.0.records.lock().push(format!(
-            "{};{}",
-            attributes.metadata().name(),
-            fields.rendered
-        ));
-    }
-
-    fn on_record(
-        &self,
-        span: &tracing::span::Id,
-        values: &tracing::span::Record<'_>,
-        _context: Context<'_, Registry>,
-    ) {
-        let mut fields = FieldCapture::default();
-        values.record(&mut fields);
-        let terminal = fields.rendered.contains("process.outcome=");
-        let kind = self.0.kinds.lock().get(span).cloned();
-        let rendered = match &kind {
-            Some(kind) => format!("process.kind={kind:?};{}", fields.rendered),
-            None => fields.rendered,
-        };
-        self.0.records.lock().push(rendered);
-        if !terminal {
-            return;
-        }
-        if let Some(sender) = kind.and_then(|kind| self.0.terminal_waiters.lock().remove(&kind)) {
-            assert!(sender.send(()).is_ok(), "terminal waiter remains");
-        }
-    }
-
-    fn on_close(&self, id: tracing::span::Id, _context: Context<'_, Registry>) {
-        self.0.kinds.lock().remove(&id);
-    }
-}
-
-#[tokio::test]
-async fn trace_fields_are_fixed_and_payload_free() {
-    let capture = CaptureLayer::global();
-
-    let payload = "VERY_SECRET_PROCESS_PAYLOAD".to_owned();
-    let process = process_fn(
-        ProcessMetadata::non_interruptible("trace-test"),
-        move || async move {
-            assert_eq!(payload.len(), 27);
-            Ok::<_, io::Error>(())
-        },
-    );
-    assert!(matches!(
-        ProcessRun::execute(process).await,
-        ProcessOutcome::Completed(Ok(()))
-    ));
-
-    let trace = capture.0.records.lock().join("\n");
-    assert!(trace.contains("process.run"), "{trace}");
-    assert!(trace.contains("process.node"), "{trace}");
-    assert!(trace.contains("run.id="), "{trace}");
-    assert!(trace.contains("node.id="), "{trace}");
-    assert!(trace.contains("parent.id=\"root\""), "{trace}");
-    assert!(trace.contains("process.kind=\"trace-test\""), "{trace}");
-    assert!(
-        trace.contains("process.interruptibility=\"non-interruptible\""),
-        "{trace}"
-    );
-    assert!(
-        trace.contains("process.kind=\"trace-test\";process.outcome=\"succeeded\";"),
-        "{trace}"
-    );
-    assert!(!trace.contains("VERY_SECRET_PROCESS_PAYLOAD"), "{trace}");
-
-    let payload = "VERY_SECRET_CANCELLABLE_PAYLOAD".to_owned();
+async fn a_request_completes_current_and_future_waits() {
     let (handle, signal) = CancelSignal::pair();
-    let cancellable = process_fn(
-        ProcessMetadata::cancellable("trace-cancellable-test", signal),
-        move || async move {
-            assert_eq!(payload.len(), 31);
-            Ok::<_, io::Error>(())
-        },
+    let waiting = signal.cancelled();
+    tokio::pin!(waiting);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+            .await
+            .is_pending()
     );
-    assert!(matches!(
-        ProcessRun::execute(cancellable).await,
-        ProcessOutcome::Completed(Ok(()))
-    ));
+    handle.cancel();
+    waiting.await;
     drop(handle);
-
-    let trace = capture.0.records.lock().join("\n");
-    assert!(
-        trace.contains(
-            "process.kind=\"trace-cancellable-test\";process.interruptibility=\"cancellable\";"
-        ),
-        "{trace}"
-    );
-    assert!(
-        trace.contains("process.kind=\"trace-cancellable-test\";process.outcome=\"succeeded\";"),
-        "{trace}"
-    );
-    assert!(
-        !trace.contains("VERY_SECRET_CANCELLABLE_PAYLOAD"),
-        "{trace}"
-    );
-}
-
-fn joined_trace(capture: &CaptureLayer) -> String {
-    capture.0.records.lock().join("\n")
+    signal.cancelled().await;
 }
 
 #[tokio::test]
-async fn a_cancel_signal_aborts_a_cancellable_process_and_records_cancelled() {
-    let capture = CaptureLayer::global();
-    let terminal = capture.terminal("cancel-test");
-    let (started_sender, started_receiver) = oneshot::channel();
-    let (_park_sender, park_receiver) = oneshot::channel::<()>();
+async fn dropping_every_handle_leaves_the_wait_pending() {
     let (handle, signal) = CancelSignal::pair();
-    let process = process_fn(
-        ProcessMetadata::cancellable("cancel-test", signal),
-        move || async move {
-            started_sender.send(()).expect("start observer remains");
-            park_receiver
-                .await
-                .expect("the park sender outlives the process");
-            Ok::<_, io::Error>(())
-        },
-    );
-    let execute = tokio::spawn(ProcessRun::execute(process));
-
-    started_receiver.await.expect("process starts");
-    handle.cancel();
-    handle.cancel();
-
-    let error = match execute.await.expect("outer execute task joins") {
-        ProcessOutcome::TaskFailed(error) => error,
-        ProcessOutcome::Completed(_) => panic!("a parked process cannot complete"),
-    };
-    assert!(error.is_cancelled());
-    assert!(!error.is_panic());
-    terminal.await.expect("execute records terminal outcome");
-
-    let trace = joined_trace(&capture);
-    assert!(
-        trace.contains("process.kind=\"cancel-test\";process.interruptibility=\"cancellable\";"),
-        "{trace}"
-    );
-    assert!(
-        trace.contains("process.kind=\"cancel-test\";process.outcome=\"cancelled\";"),
-        "{trace}"
-    );
-}
-
-#[tokio::test]
-async fn a_completed_process_wins_over_a_late_signal() {
-    let capture = CaptureLayer::global();
-    let terminal = capture.terminal("late-signal-test");
-    let (handle, signal) = CancelSignal::pair();
-    let process = process_fn(
-        ProcessMetadata::cancellable("late-signal-test", signal),
-        || async { Ok::<_, io::Error>(7_u8) },
-    );
-
-    let outcome = ProcessRun::execute(process).await;
-    handle.cancel();
-
-    assert!(matches!(outcome, ProcessOutcome::Completed(Ok(7))));
-    terminal.await.expect("execute records terminal outcome");
-    let trace = joined_trace(&capture);
-    assert!(
-        trace.contains("process.kind=\"late-signal-test\";process.outcome=\"succeeded\";"),
-        "{trace}"
-    );
-}
-
-#[tokio::test]
-async fn a_never_signal_leaves_a_cancellable_process_joined() {
-    let capture = CaptureLayer::global();
-    let terminal = capture.terminal("never-signal-test");
-    let process = process_fn(
-        ProcessMetadata::cancellable("never-signal-test", CancelSignal::never()),
-        || async {
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-            Ok::<_, io::Error>("joined")
-        },
-    );
-
-    assert!(matches!(
-        ProcessRun::execute(process).await,
-        ProcessOutcome::Completed(Ok("joined"))
-    ));
-    terminal.await.expect("execute records terminal outcome");
-    let trace = joined_trace(&capture);
-    assert!(
-        trace.contains(
-            "process.kind=\"never-signal-test\";process.interruptibility=\"cancellable\";"
-        ),
-        "{trace}"
-    );
-    assert!(
-        trace.contains("process.kind=\"never-signal-test\";process.outcome=\"succeeded\";"),
-        "{trace}"
-    );
-}
-
-#[tokio::test]
-async fn dropping_every_cancel_handle_does_not_cancel() {
-    let (started_sender, started_receiver) = oneshot::channel();
-    let (release_sender, release_receiver) = oneshot::channel();
-    let (handle, signal) = CancelSignal::pair();
-    let second_handle = handle.clone();
-    let process = process_fn(
-        ProcessMetadata::cancellable("dropped-handle-test", signal),
-        move || async move {
-            started_sender.send(()).expect("start observer remains");
-            release_receiver.await.expect("release sender remains");
-            Ok::<_, io::Error>(())
-        },
-    );
-    let execute = tokio::spawn(ProcessRun::execute(process));
-
-    started_receiver.await.expect("process starts");
+    let second = handle.clone();
     drop(handle);
-    drop(second_handle);
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    assert!(!execute.is_finished(), "a closed signal must not cancel");
-    release_sender
-        .send(())
-        .expect("process still awaits release");
+    drop(second);
+    let waiting = signal.cancelled();
+    tokio::pin!(waiting);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+}
 
-    assert!(matches!(
-        execute.await.expect("outer execute task joins"),
-        ProcessOutcome::Completed(Ok(()))
-    ));
+#[tokio::test]
+async fn a_never_signal_leaves_the_wait_pending() {
+    let signal = CancelSignal::never();
+    let waiting = signal.cancelled();
+    tokio::pin!(waiting);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
 }
 
 #[test]

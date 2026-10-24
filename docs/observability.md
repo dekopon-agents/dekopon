@@ -1198,7 +1198,6 @@ the one fact a redacted field has no reason to carry.
 One generated OpenTelemetry trace links the command to spans such as:
 
 - `transport.receive`, `gateway.message`, `gateway.session`, and `prompt.session`;
-- `process.run` and `process.node` at `DEBUG` for process-lifecycle work;
 - `prompt.model_turn` and `model.complete`, with `chatgpt.refresh` nested inside the latter whenever
   a ChatGPT subscription credential is rotated or adopted — it carries `forced`, `outcome`
   (`adopted`, `rotated`, `rotated-unsaved`, or `failed`), `duration_ms`, and the new
@@ -1207,19 +1206,10 @@ One generated OpenTelemetry trace links the command to spans such as:
 - `broker.invocation` and `broker.command_run`; and
 - `provider.compile`, `provider.describe`, `provider.run_command`, and `provider.invoke`.
 
-`process.run` carries only its private stable `run.id`. `process.node` carries that `run.id`, a
-private stable `node.id`, root parent, fixed `process.kind`, the `process.interruptibility` contract
-(`non-interruptible` or `cancellable`), and terminal `process.outcome` (`succeeded`,
-`operation-error`, `panicked`, `cancelled` for a requested cancellation of a cancellable node, or
-`task-cancelled` for a runtime-driven abort). Tokio task IDs, scripts, argv, values, diagnostics,
-provider payloads, and raw operation errors are absent. These spans are `DEBUG` so INFO volume does
-not grow with frontend process nodes or with the command words a script runs; a diagnostic filter
-may enable them. The `broker-command` kind is one cancellable node per command word the broker leg
-runs, and `dekopon-gatewayd` ties it to session Stop, which aborts and joins the round trip before the
-script reads `session-cancelled`; external embedders may supply no signal. Nodes report `parent.id`
-`root`; real parent threading remains future. The gateway's trace filter includes `dekopon_process`;
-`Span::or_current` retains the current parent when a sink disables these DEBUG spans, which are not
-a public telemetry contract. Broker component spans and their bounds are described in
+`dekopon-process` provides only the cancel latch and emits no spans. The agent drives
+each command word's broker round trip in place, retaining the calling script's W3C
+trace parent. Stop or the script deadline drops a command word in flight, after
+which the script reads `session-cancelled`. Broker component spans and their bounds are described in
 [Broker execution spans](#broker-execution-spans).
 
 One model turn drives at most a handful of scripts, and one script drives many capability calls, so
