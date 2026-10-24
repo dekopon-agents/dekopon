@@ -38,7 +38,14 @@ impl GeneratedImage {
         &self.content_type
     }
     pub fn filename(&self, index: usize) -> String {
-        let extension = match self.content_type.as_str() {
+        let content_type = self
+            .content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let extension = match content_type.as_str() {
             "image/png" => "png",
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
@@ -46,6 +53,17 @@ impl GeneratedImage {
             "video/mp4" => "mp4",
             "text/plain" => "txt",
             "application/pdf" => "pdf",
+            "text/markdown" => "md",
+            "text/csv" => "csv",
+            "application/json" => "json",
+            "text/html" => "html",
+            "text/xml" | "application/xml" => "xml",
+            "application/msword" => "doc",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+            "application/rtf" => "rtf",
+            other if other.starts_with("text/") => "txt",
             _ => "bin",
         };
         format!("asset-{}.{extension}", index + 1)
@@ -657,6 +675,48 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn outbound_names_follow_the_content_type() {
+        for (content_type, extension) in [
+            ("text/markdown", "md"),
+            ("text/x-unknown", "txt"),
+            ("application/octet-stream", "bin"),
+            ("text/markdown; charset=utf-8", "md"),
+            ("Text/Markdown", "md"),
+            (" text/markdown ; charset=utf-8; ignored=true", "md"),
+            ("text/csv", "csv"),
+            ("application/json", "json"),
+            ("text/html", "html"),
+            ("text/xml", "xml"),
+            ("application/xml", "xml"),
+            ("application/msword", "doc"),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "docx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "pptx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "xlsx",
+            ),
+            ("application/rtf", "rtf"),
+        ] {
+            let image = GeneratedImage::new(
+                DiskBlob::from_bytes(b"attachment").unwrap(),
+                content_type.to_owned(),
+                AssetEncoding::Identity,
+            );
+            assert_eq!(
+                image.filename(0),
+                format!("asset-1.{extension}"),
+                "{content_type}"
+            );
+        }
     }
 
     #[test]
