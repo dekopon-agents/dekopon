@@ -527,6 +527,19 @@ fn conclude(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ExpansionOutput {
+    Legacy,
+    Unsplit,
+    Fields,
+    Value,
+}
+
+struct FieldExpansion<'a> {
+    fields: &'a mut Vec<String>,
+    separated: &'a mut bool,
+}
+
 struct Evaluator<'a> {
     invoker: &'a dyn CapabilityInvoker,
     budget: Budget,
@@ -934,7 +947,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn execute_case(&mut self, statement: &CaseStatement) -> Result<Flow, FatalError> {
-        let subject = match self.expand_word(&statement.subject) {
+        let subject = match self.expand_quoted_fields(&statement.subject.parts) {
             Ok(expanded) => expanded.join(" "),
             Err(failure) => {
                 let status = self.absorb(failure)?;
@@ -948,7 +961,7 @@ impl<'a> Evaluator<'a> {
                 self.budget.charge_step_with(self.invoker)?;
                 let matched = match pattern {
                     CasePattern::Any => true,
-                    CasePattern::Literal(word) => match self.expand_word(word) {
+                    CasePattern::Literal(word) => match self.expand_quoted_fields(&word.parts) {
                         Ok(expanded) => expanded.join(" ") == subject,
                         Err(failure) => {
                             let status = self.absorb(failure)?;
@@ -957,7 +970,7 @@ impl<'a> Evaluator<'a> {
                         }
                     },
                     CasePattern::Expanded(word) => {
-                        let expanded = match self.expand_word(word) {
+                        let expanded = match self.expand_quoted_fields(&word.parts) {
                             Ok(expanded) => expanded.join(" "),
                             Err(failure) => {
                                 let status = self.absorb(failure)?;
@@ -1945,9 +1958,24 @@ impl<'a> Evaluator<'a> {
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step_with(self.invoker)?;
 
+        let local_assignment = matches!(
+            command.words.first(),
+            Some(Word { parts }) if matches!(parts.as_slice(), [WordPart::Literal(name)] if name == "local")
+        );
         let mut argv = Vec::new();
-        for word in &command.words {
-            match self.expand_word(word) {
+        for (index, word) in command.words.iter().enumerate() {
+            let assignment = local_assignment
+                && index > 0
+                && matches!(
+                    word.parts.first(),
+                    Some(WordPart::Literal(text)) if text.split_once('=').is_some_and(|(name, _)| is_variable_name(name))
+                );
+            let expanded = if assignment {
+                self.expand_word_with(word, ExpansionOutput::Unsplit)
+            } else {
+                self.expand_word(word)
+            };
+            match expanded {
                 Ok(expanded) => argv.extend(expanded),
                 Err(failure) => {
                     let status = self.absorb(failure)?;
@@ -3363,7 +3391,7 @@ impl<'a> Evaluator<'a> {
         let start = self.expansion_charges.len();
         let value = match word.parts.as_slice() {
             [WordPart::Parameter(parameter)] => self.parameter_value(parameter)?,
-            _ => Value::String(self.expand_word(word)?.join(" ")),
+            _ => Value::String(self.expand_quoted(&word.parts)?),
         };
         let mut result = CommandResult::value(value);
         result.retained = self.expansion_charges.split_off(start);
@@ -3371,65 +3399,278 @@ impl<'a> Evaluator<'a> {
     }
 
     fn expansion_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
-        let result = self.assignment_value(word)?;
-        self.expansion_charges.extend(result.retained);
-        Ok(result.value)
+        match word.parts.as_slice() {
+            [WordPart::Parameter(_)] | [WordPart::CommandSubstitution(_)] => {
+                let result = self.assignment_value(word)?;
+                self.expansion_charges.extend(result.retained);
+                Ok(result.value)
+            }
+            _ => Ok(Value::String(
+                self.expand_word_with(word, ExpansionOutput::Legacy)?
+                    .join(" "),
+            )),
+        }
     }
 
     fn expand_word(&mut self, word: &Word) -> Result<Vec<String>, CommandFailure> {
-        let mut fields = vec![String::new()];
-        let mut produced = false;
+        self.expand_word_with(word, ExpansionOutput::Fields)
+    }
 
+    fn expand_word_with(
+        &mut self,
+        word: &Word,
+        output: ExpansionOutput,
+    ) -> Result<Vec<String>, CommandFailure> {
+        let mut fields = Vec::new();
+        let mut separated = true;
         for part in &word.parts {
-            match part {
-                WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
-                    append(&mut fields, text);
-                    produced = true;
-                }
-                WordPart::DoubleQuoted(parts) => {
-                    let expanded = self.expand_quoted_fields(parts)?;
-                    let mut expanded = expanded.into_iter();
-                    if let Some(first) = expanded.next() {
-                        append(&mut fields, &first);
-                        produced = true;
+            self.expand_unquoted_part(part, &mut fields, &mut separated, output)?;
+        }
+        Ok(fields)
+    }
+
+    fn expand_unquoted_part(
+        &mut self,
+        part: &WordPart,
+        fields: &mut Vec<String>,
+        separated: &mut bool,
+        output: ExpansionOutput,
+    ) -> Result<Value, CommandFailure> {
+        Ok(match part {
+            WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
+                append_field(fields, separated, text);
+                self.expansion_text(text, output)?
+            }
+            WordPart::DoubleQuoted(parts) => {
+                let expanded = self.expand_quoted_fields(parts)?;
+                let value = match output {
+                    ExpansionOutput::Legacy
+                    | ExpansionOutput::Unsplit
+                    | ExpansionOutput::Fields => Value::Null,
+                    ExpansionOutput::Value => {
+                        let bytes = expanded.iter().map(String::len).sum::<usize>()
+                            + expanded.len().saturating_sub(1);
+                        self.expansion_charges
+                            .push(self.budget.charge_value_bytes(bytes as u64)?);
+                        Value::String(expanded.join(" "))
                     }
-                    for extra in expanded {
-                        fields.push(extra);
-                    }
+                };
+                let mut expanded = expanded.into_iter();
+                if let Some(first) = expanded.next() {
+                    append_field(fields, separated, &first);
                 }
-                WordPart::Arithmetic(expression) => {
-                    let number = self.evaluate_arithmetic(expression)?;
-                    append(&mut fields, &render_number(number));
-                    produced = true;
-                }
-                WordPart::Parameter(parameter) => {
+                fields.extend(expanded);
+                value
+            }
+            WordPart::Arithmetic(expression) => {
+                let text = render_number(self.evaluate_arithmetic(expression)?);
+                append_field(fields, separated, &text);
+                Value::String(text)
+            }
+            WordPart::Parameter(parameter) => match output {
+                ExpansionOutput::Legacy | ExpansionOutput::Unsplit => {
                     let value = self.parameter_value(parameter)?;
-                    produced |= spread(&mut fields, &value);
+                    append_unsplit_value(fields, separated, &value);
+                    value
                 }
-                WordPart::CommandSubstitution(program) => {
-                    let result = self.run_substitution(program)?;
-                    if let Value::String(text) = &result.value {
-                        let mut lines = text.split('\n');
-                        if let Some(first) = lines.next() {
-                            append(&mut fields, first);
-                            produced |= !first.is_empty();
+                ExpansionOutput::Fields | ExpansionOutput::Value => {
+                    self.expand_parameter_fields(parameter, fields, separated)?
+                }
+            },
+            WordPart::CommandSubstitution(program) => {
+                let result = self.run_substitution(program)?;
+                match output {
+                    ExpansionOutput::Legacy => match &result.value {
+                        Value::String(text) => {
+                            if !text.is_empty() {
+                                let mut lines = text.split('\n');
+                                if let Some(first) = lines.next() {
+                                    append_field(fields, separated, first);
+                                }
+                                fields.extend(lines.map(str::to_owned));
+                            }
                         }
-                        for line in lines {
-                            fields.push(line.to_owned());
-                            produced = true;
+                        Value::Null
+                        | Value::Bool(_)
+                        | Value::Number(_)
+                        | Value::Array(_)
+                        | Value::Object(_) => {
+                            append_unsplit_value(fields, separated, &result.value);
                         }
-                    } else {
-                        produced |= spread(&mut fields, &result.value);
+                    },
+                    ExpansionOutput::Unsplit => {
+                        append_unsplit_value(fields, separated, &result.value);
                     }
-                    self.expansion_charges.extend(result.retained);
+                    ExpansionOutput::Fields | ExpansionOutput::Value => {
+                        self.split_expansion(fields, separated, &result.value)?;
+                    }
+                }
+                self.expansion_charges.extend(result.retained);
+                result.value
+            }
+        })
+    }
+
+    fn expansion_text(
+        &mut self,
+        text: &str,
+        output: ExpansionOutput,
+    ) -> Result<Value, CommandFailure> {
+        match output {
+            ExpansionOutput::Legacy | ExpansionOutput::Unsplit | ExpansionOutput::Fields => {
+                Ok(Value::Null)
+            }
+            ExpansionOutput::Value => {
+                self.expansion_charges
+                    .push(self.budget.charge_value_bytes(text.len() as u64)?);
+                Ok(Value::String(text.to_owned()))
+            }
+        }
+    }
+
+    fn expand_parameter_fields(
+        &mut self,
+        parameter: &Parameter,
+        fields: &mut Vec<String>,
+        separated: &mut bool,
+    ) -> Result<Value, CommandFailure> {
+        if let Parameter::Named {
+            name,
+            indices,
+            modifier,
+            length: false,
+        } = parameter
+        {
+            self.budget.enter_nesting()?;
+            let result = self.named_parameter_value(
+                name,
+                indices,
+                modifier,
+                Some(FieldExpansion { fields, separated }),
+            );
+            self.budget.leave_nesting();
+            return result;
+        }
+        let value = self.parameter_value(parameter)?;
+        self.split_expansion(fields, separated, &value)?;
+        Ok(value)
+    }
+
+    fn expand_selected_word(
+        &mut self,
+        word: &Word,
+        split: Option<FieldExpansion<'_>>,
+    ) -> Result<Value, CommandFailure> {
+        match split {
+            Some(split) => self.expand_replacement(word, split.fields, split.separated),
+            None => self.expansion_value(word),
+        }
+    }
+
+    fn finish_parameter(
+        &mut self,
+        value: Value,
+        split: Option<FieldExpansion<'_>>,
+    ) -> Result<Value, CommandFailure> {
+        if let Some(split) = split {
+            self.split_expansion(split.fields, split.separated, &value)?;
+        }
+        Ok(value)
+    }
+
+    fn expand_replacement(
+        &mut self,
+        word: &Word,
+        fields: &mut Vec<String>,
+        separated: &mut bool,
+    ) -> Result<Value, CommandFailure> {
+        if let [WordPart::CommandSubstitution(_)] = word.parts.as_slice() {
+            let result = self.assignment_value(word)?;
+            self.split_expansion(fields, separated, &result.value)?;
+            self.expansion_charges.extend(result.retained);
+            return Ok(result.value);
+        }
+        let mut text = String::new();
+        for part in &word.parts {
+            let value = match part {
+                WordPart::Literal(literal) => {
+                    self.split_text(fields, separated, literal)?;
+                    self.expansion_text(literal, ExpansionOutput::Value)?
+                }
+                WordPart::SingleQuoted(_)
+                | WordPart::DoubleQuoted(_)
+                | WordPart::Parameter(_)
+                | WordPart::CommandSubstitution(_)
+                | WordPart::Arithmetic(_) => {
+                    self.expand_unquoted_part(part, fields, separated, ExpansionOutput::Value)?
+                }
+            };
+            if word.parts.len() == 1 {
+                return Ok(value);
+            }
+            match &value {
+                Value::String(part) => {
+                    self.expansion_charges
+                        .push(self.budget.charge_value_bytes(part.len() as u64)?);
+                    text.push_str(part);
+                }
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::Array(_)
+                | Value::Object(_) => {
+                    let mut charge = self
+                        .budget
+                        .charge_value_bytes(value_bytes(&value).saturating_mul(12))?;
+                    let rendered = quoted_text(&value);
+                    let bytes = rendered.len() as u64;
+                    charge.shrink(charge.bytes().saturating_sub(bytes.saturating_mul(2)));
+                    text.push_str(&rendered);
+                    charge.shrink(bytes);
+                    self.expansion_charges.push(charge);
                 }
             }
         }
+        Ok(Value::String(text))
+    }
 
-        if !produced && fields.len() == 1 && fields[0].is_empty() {
-            return Ok(Vec::new());
+    fn split_expansion(
+        &mut self,
+        fields: &mut Vec<String>,
+        separated: &mut bool,
+        value: &Value,
+    ) -> Result<(), CommandFailure> {
+        match value {
+            Value::String(text) => self.split_text(fields, separated, text)?,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::Array(_)
+            | Value::Object(_) => {
+                append_unsplit_value(fields, separated, value);
+            }
         }
-        Ok(fields)
+        Ok(())
+    }
+
+    fn split_text(
+        &mut self,
+        fields: &mut Vec<String>,
+        separated: &mut bool,
+        text: &str,
+    ) -> Result<(), CommandFailure> {
+        for chunk in text.split_inclusive([' ', '\t', '\n']) {
+            self.budget.charge_step_with(self.invoker)?;
+            let field = chunk.trim_end_matches([' ', '\t', '\n']);
+            if !field.is_empty() {
+                let bytes = (field.len() + size_of::<String>()) as u64;
+                self.expansion_charges
+                    .push(self.budget.charge_value_bytes(bytes)?);
+                append_field(fields, separated, field);
+            }
+            *separated |= field.len() != chunk.len();
+        }
+        Ok(())
     }
 
     fn expand_quoted(&mut self, parts: &[WordPart]) -> Result<String, CommandFailure> {
@@ -3495,7 +3736,7 @@ impl<'a> Evaluator<'a> {
                 length,
             } => {
                 self.budget.enter_nesting()?;
-                let value = self.named_parameter_value(name, indices, modifier);
+                let value = self.named_parameter_value(name, indices, modifier, None);
                 self.budget.leave_nesting();
                 let value = value?;
                 if *length {
@@ -3532,6 +3773,7 @@ impl<'a> Evaluator<'a> {
         name: &str,
         indices: &[Index],
         modifier: &Modifier,
+        mut split: Option<FieldExpansion<'_>>,
     ) -> Result<Value, CommandFailure> {
         let (value, bound) = self.select_parameter(name, indices)?;
         if self.options.nounset && !bound && *modifier == Modifier::None {
@@ -3539,41 +3781,6 @@ impl<'a> Evaluator<'a> {
                 "{name}: unbound variable, and `set -u` is on"
             ))));
         }
-        self.apply_modifier(name, indices, modifier, value, bound)
-    }
-
-    fn select_parameter(
-        &mut self,
-        name: &str,
-        indices: &[Index],
-    ) -> Result<(Value, bool), CommandFailure> {
-        let mut bound = self.lookup(name).is_some();
-        let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
-        for index in indices {
-            match index {
-                Index::At(word) => {
-                    let expanded = self.expand_word(word)?;
-                    let key = expanded.join(" ");
-                    value = value::index(&value, &key);
-                    bound = !value.is_null();
-                }
-                Index::All => {}
-                Index::AllJoined => {
-                    value = Value::String(value::to_lines(&value).join(" "));
-                }
-            }
-        }
-        Ok((value, bound))
-    }
-
-    fn apply_modifier(
-        &mut self,
-        name: &str,
-        indices: &[Index],
-        modifier: &Modifier,
-        value: Value,
-        bound: bool,
-    ) -> Result<Value, CommandFailure> {
         let absent = |colon: bool| {
             if colon {
                 value.is_null() || display(&value).is_empty()
@@ -3581,31 +3788,31 @@ impl<'a> Evaluator<'a> {
                 !bound
             }
         };
-        Ok(match modifier {
+        let value = match modifier {
             Modifier::None => value,
             Modifier::Default { colon, word } => {
                 if absent(*colon) {
-                    self.expansion_value(word)?
+                    self.expand_selected_word(word, split.take())?
                 } else {
                     value
                 }
             }
             Modifier::Assign { colon, word } => {
                 if !absent(*colon) {
-                    return Ok(value);
+                    return self.finish_parameter(value, split);
                 }
                 if !indices.is_empty() {
                     return Err(CommandFailure::usage(format!(
                         "${{{name}[...]:=word}} cannot assign through an index; assign to {name} itself"
                     )));
                 }
-                let substitute = self.expansion_value(word)?;
+                let substitute = self.expand_selected_word(word, split.take())?;
                 self.assign(name, CommandResult::value(substitute.clone()))?;
                 substitute
             }
             Modifier::Require { colon, word } => {
                 if !absent(*colon) {
-                    return Ok(value);
+                    return self.finish_parameter(value, split);
                 }
                 let message = match word {
                     Some(word) => self.expand_quoted(&word.parts)?,
@@ -3619,7 +3826,7 @@ impl<'a> Evaluator<'a> {
                 if absent(*colon) {
                     Value::Null
                 } else {
-                    self.expansion_value(word)?
+                    self.expand_selected_word(word, split.take())?
                 }
             }
             Modifier::StripPrefix(pattern) => {
@@ -3657,7 +3864,33 @@ impl<'a> Evaluator<'a> {
                     text.replacen(&pattern, &replacement, 1)
                 })
             }
-        })
+        };
+        self.finish_parameter(value, split)
+    }
+
+    fn select_parameter(
+        &mut self,
+        name: &str,
+        indices: &[Index],
+    ) -> Result<(Value, bool), CommandFailure> {
+        let mut bound = self.lookup(name).is_some();
+        let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
+        for index in indices {
+            match index {
+                Index::At(word) => {
+                    let key = self
+                        .expand_word_with(word, ExpansionOutput::Legacy)?
+                        .join(" ");
+                    value = value::index(&value, &key);
+                    bound = !value.is_null();
+                }
+                Index::All => {}
+                Index::AllJoined => {
+                    value = Value::String(value::to_lines(&value).join(" "));
+                }
+            }
+        }
+        Ok((value, bound))
     }
 
     fn literal_pattern(&mut self, pattern: &Pattern) -> Result<String, CommandFailure> {
@@ -4173,33 +4406,31 @@ fn append(fields: &mut Vec<String>, text: &str) {
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-fn spread(fields: &mut Vec<String>, value: &Value) -> bool {
+fn append_unsplit_value(fields: &mut Vec<String>, separated: &mut bool, value: &Value) {
     match value {
         Value::Array(items) => {
-            if items.is_empty() {
-                return false;
+            for (index, item) in items.iter().enumerate() {
+                *separated |= index > 0;
+                append_field(fields, separated, &display(item));
             }
-            let mut items = items.iter();
-            if let Some(first) = items.next() {
-                append(fields, &display(first));
-            }
-            for item in items {
-                fields.push(display(item));
-            }
-            true
         }
-        Value::Null => false,
-        scalar => {
-            let text = display(scalar);
-            let produced = !text.is_empty();
-            append(fields, &text);
-            produced
+        Value::Null => {}
+        Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+            let text = display(value);
+            if !text.is_empty() {
+                append_field(fields, separated, &text);
+            }
         }
     }
+}
+
+fn append_field(fields: &mut Vec<String>, separated: &mut bool, text: &str) {
+    if *separated {
+        fields.push(text.to_owned());
+    } else {
+        append(fields, text);
+    }
+    *separated = false;
 }
 
 #[expect(

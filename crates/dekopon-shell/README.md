@@ -49,11 +49,19 @@ Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `
 
 **Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `unset`; the no-op `:`; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
+POSIX IFS word splitting applies to every unquoted string expansion, including parameter expansions
+and command-substitution output. Space, tab and newline runs separate fields; leading and trailing
+whitespace produces no empty fields. Assigning `IFS` does not change these defaults. Quoted
+expansions never field-split; `"$@"` keeps one word per parameter. An unquoted JSON array expansion,
+including `${NAME[@]}`, keeps one word per element without splitting elements further. Assignment
+right-hand sides, `case` subjects and patterns, `[[ ... ]]` operands and here-document bodies do not
+field-split.
+
 **Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
 "Rejected loudly" reaches inside `case` too. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
 
-**Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing to reject *against*; an unquoted expansion holding a JSON array is what produces multiple words here. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
+**Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
 ## `read`
 
@@ -65,8 +73,8 @@ which is what ends the loop. End of input is a status and not a diagnostic, beca
 would be one per loop, every loop.
 
 Several names split the line on whitespace runs with the remainder in the last, exactly as bash
-does. That is a rule local to `read`, not a return of POSIX IFS word splitting: nothing else here
-splits, and there is no `IFS` to configure. `-r` is accepted and changes nothing — backslashes are
+does. This input-consumption rule is unchanged by expansion field splitting;
+there is no `IFS` to configure. `-r` is accepted and changes nothing — backslashes are
 never line continuations here — which is said out loud rather than left as a surprise.
 
 There is no `getopts`. Nothing calls a function in this shell with flags: a model writes both the
@@ -136,7 +144,7 @@ without looking up host files. The cloned input is charged to retained-value bud
 fail when the remaining budget is smaller than the buffer; `cat NAME | cmd` streams instead.
 Expanding buffer bytes into text or passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
 a whole assignment from JSON object or array text retains its structure, while unquoted text
-substitutions split on newlines rather than spaces.
+substitutions split on default-IFS space, tab and newline runs.
 
 `{ ...; }` is a group, not a subshell, and it is spelled out as such: an empty `{ }` and an
 unterminated `{ echo hi` are parse errors naming themselves rather than quietly running nothing.
