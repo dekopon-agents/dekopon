@@ -48,6 +48,7 @@ pub(super) async fn listen(
                                     transport = %name,
                                     kind = "connection",
                                     error = %error,
+                                    "gateway.whatsapp.accept.failed"
                                 );
                                 continue;
                             }
@@ -57,6 +58,7 @@ pub(super) async fn listen(
                                     transport = %name,
                                     kind = "exhausted",
                                     error = %error,
+                                    "gateway.whatsapp.accept.failed"
                                 );
                                 return;
                             }
@@ -65,6 +67,7 @@ pub(super) async fn listen(
                                     event = "gateway_whatsapp_listener_stopped",
                                     transport = %name,
                                     error = %error,
+                                    "gateway.whatsapp.listener.stopped"
                                 );
                                 return;
                             }

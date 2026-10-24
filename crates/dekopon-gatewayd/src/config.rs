@@ -2209,7 +2209,7 @@ pub(crate) fn resolve(
                     typing = ?resolved.settings.typing, working = ?resolved.settings.working,
                     seen = ?resolved.settings.seen, progress = ?resolved.settings.progress,
                     stream = resolved.settings.stream, status_text = resolved.settings.status_text,
-                    cancel_button = resolved.settings.cancel_button);
+                    cancel_button = resolved.settings.cancel_button, "gateway.indicators.effective");
                 indicators.insert(kind, Arc::new(resolved));
             }
         }
@@ -3346,13 +3346,16 @@ routes:
         assert_eq!(record.field("route"), Some("0"));
         assert_eq!(record.field("seen"), Some("Off"));
         assert_eq!(record.field("working"), Some("Off"));
+        assert_eq!(
+            record.field("message"),
+            Some("gateway.indicators.effective")
+        );
         for forbidden in [
             "agent",
             "subject",
             "principal",
             "conversation",
             "conversation_id",
-            "message",
             "payload",
             "token",
             "coordinate",

@@ -54,6 +54,7 @@ impl RecoveringTransport {
             category = error.category(),
             failure = self.failures,
             delay_ms = delay.as_millis() as u64,
+            "gateway.transport.recovering"
         );
         sleep(delay).await;
         Ok(())
@@ -83,7 +84,8 @@ impl RecoveringTransport {
                     self.connected_since = Some(Instant::now());
                     tracing::info!(
                         event = "gateway_transport_connected",
-                        transport = self.name()
+                        transport = self.name(),
+                        "gateway.transport.connected"
                     );
                     return Ok(identity);
                 }

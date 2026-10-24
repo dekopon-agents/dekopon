@@ -723,7 +723,7 @@ impl CodexReducer<'_> {
                             }
                         }
                         WirePart::Unknown(kind) => {
-                            tracing::debug!(event = "unknown_content_part_skipped", kind = %self.secrets.sanitize(kind));
+                            tracing::debug!(event = "unknown_content_part_skipped", kind = %self.secrets.sanitize(kind), "unknown.content.part.skipped");
                         }
                     }
                 }

@@ -3,7 +3,6 @@ use crate::{
     config::memory::{PolicyConfig, ResolvedPolicy},
     memory::generation::prepare,
 };
-use dekopon_test_support::Record;
 
 fn policy(kind: &str, retain: &[&str]) -> ResolvedPolicy {
     let config: PolicyConfig = serde_json::from_value(json!({
@@ -199,8 +198,31 @@ async fn a_failed_summary_replies_and_persists_only_metadata() {
 }
 
 #[tokio::test]
-async fn a_delivered_reply_is_marked_before_memory_persists_under_its_own_span() {
-    let (capture, _guard) = capture_spans();
+async fn memory_persists_after_the_session_span_ends_as_its_sibling() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("persist-test")))
+        .set_default();
     let directory = temporary();
     let journal = temporary();
     let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
@@ -221,31 +243,43 @@ async fn a_delivered_reply_is_marked_before_memory_persists_under_its_own_span()
     )
     .await;
     assert_eq!(driver.replies(), ["reply delivered"]);
-    let records = capture.records();
-    let delivered = records
+    provider.force_flush().unwrap();
+
+    let spans = exported.0.lock().clone();
+    let named = |name: &str| {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("{name} exported"))
+    };
+    let (message, session, persist) = (
+        named("gateway.message"),
+        named("gateway.session"),
+        named("memory.persist"),
+    );
+    assert_eq!(session.parent_span_id, message.span_context.span_id());
+    assert_eq!(persist.parent_span_id, message.span_context.span_id());
+    assert!(session.end_time <= persist.start_time);
+    assert!(persist.end_time <= message.end_time);
+    let delivered = session
+        .events
         .iter()
-        .position(|record| record.field("audit.event") == Some("reply.delivered"))
-        .expect("reply.delivered recorded");
-    assert_eq!(records[delivered].parent(), Some("gateway.session"));
-    assert_eq!(records[delivered].field("outcome"), Some("answered"));
-    let persist = records
-        .iter()
-        .position(|record| {
-            matches!(
-                record,
-                Record::Span {
-                    name: "memory.persist",
-                    ..
-                }
-            )
-        })
-        .expect("memory.persist opened");
-    assert!(delivered < persist);
-    assert_eq!(records[persist].parent(), Some("gateway.session"));
-    let deviation =
-        capture.events_where("dekopon_gatewayd", &[("event", "gateway_memory_deviation")]);
-    assert_eq!(deviation.len(), 1);
-    assert_eq!(deviation[0].parent(), Some("memory.persist"));
+        .find(|event| event.name == "reply.delivered")
+        .expect("reply.delivered on gateway.session");
+    assert!(
+        delivered
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == "outcome"
+                && attribute.value.as_str() == "answered")
+    );
+    assert!(
+        persist
+            .events
+            .iter()
+            .any(|event| event.name == "gateway.memory.deviation")
+    );
+    provider.shutdown().unwrap();
 }
 
 #[tokio::test]

@@ -316,10 +316,17 @@ fn operation<T>(
         let start = Instant::now();
         let result = run();
         span.record("duration_ms", start.elapsed().as_millis() as u64);
-        span.record("outcome", if result.is_ok() { "ok" } else { "refused" });
+        span.record(
+            "outcome",
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "refused"
+            },
+        );
         if let Err(error) = &result {
             span.record("reason", tracing::field::display(error));
-            tracing::warn!(error = %error, "attachment scratch operation refused");
+            tracing::warn!(error = %error, "model.attachment.refused");
         }
         result
     })

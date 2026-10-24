@@ -80,7 +80,12 @@ impl ClientCertVerifier for JailVerifier {
         if uri_names(end_entity).contains(&self.identity) {
             Ok(verified)
         } else {
-            tracing::warn!(target: "model", event = "proxy.client_refused", reason = "identity");
+            tracing::warn!(
+                target: "model",
+                event = "proxy.client_refused",
+                reason = "identity",
+                "proxy.client_refused"
+            );
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ))
@@ -202,7 +207,7 @@ impl Reloading {
             match server_config(&self.files, &self.identity) {
                 Ok(config) => *current = (now, TlsAcceptor::from(config)),
                 Err(error) => {
-                    tracing::warn!(target: "model", event = "proxy.tls_reload_failed", error = %error);
+                    tracing::warn!(target: "model", event = "proxy.tls_reload_failed", error = %error, "proxy.tls_reload_failed");
                 }
             }
         }
@@ -279,7 +284,12 @@ impl Listener {
             let (stream, _) = match accepted {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    tracing::warn!(target: "model", event = "proxy.accept_failed", error = %error);
+                    tracing::warn!(
+                        target: "model",
+                        event = "proxy.accept_failed",
+                        error = %error,
+                        "proxy.accept_failed"
+                    );
                     continue;
                 }
             };
@@ -290,11 +300,11 @@ impl Listener {
                 let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                     Ok(Ok(tls)) => tls,
                     Ok(Err(error)) => {
-                        tracing::info!(target: "model", event = "proxy.handshake_failed", error = %error);
+                        tracing::info!(target: "model", event = "proxy.handshake_failed", error = %error, "proxy.handshake_failed");
                         return;
                     }
                     Err(_elapsed) => {
-                        tracing::info!(target: "model", event = "proxy.handshake_failed", error = "timeout");
+                        tracing::info!(target: "model", event = "proxy.handshake_failed", error = "timeout", "proxy.handshake_failed");
                         return;
                     }
                 };
@@ -303,7 +313,7 @@ impl Listener {
                     .serve_connection(TokioIo::new(tls), service)
                     .await
                 {
-                    tracing::debug!(target: "model", error = %error, "proxy connection ended");
+                    tracing::debug!(target: "model", error = %error, "proxy.connection.ended");
                 }
             });
         }

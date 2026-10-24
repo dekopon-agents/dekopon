@@ -469,7 +469,7 @@ async fn refresh(
                     },
                 )
                 .await?;
-                tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = clock(), cause = "bootstrap-reflected", instruction = "provide a new seed" }, "OAuth refresh sealed");
+                tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = clock(), cause = "bootstrap-reflected", instruction = "provide a new seed" }, "broker.credential.sealed");
                 return Err(SourceError::BootstrapReflected);
             }
             return Ok(RefreshResult::NotDue(
@@ -493,7 +493,7 @@ async fn refresh(
                 },
             )
             .await?;
-            tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = sent_at, cause = "reauthorization-required", instruction = "provide a new seed" }, "OAuth refresh sealed");
+            tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = sent_at, cause = "reauthorization-required", instruction = "provide a new seed" }, "broker.credential.sealed");
             return Err(SourceError::ReauthorizationRequired);
         }
         Err(error) => return Err(error),
@@ -518,7 +518,7 @@ async fn refresh(
             },
         )
         .await?;
-        tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = sent_at, cause = "bootstrap-reflected", instruction = "provide a new seed" }, "OAuth refresh sealed");
+        tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential.as_ref().map_or("unbound", |drn| drn.as_str()), since = sent_at, cause = "bootstrap-reflected", instruction = "provide a new seed" }, "broker.credential.sealed");
         return Err(SourceError::BootstrapReflected);
     }
     let expires_at = sent_at
@@ -567,7 +567,7 @@ async fn save_bytes(path: &Path, lock: PrivateFileLock, bytes: Vec<u8>) -> Resul
     .await
     .map_err(|_source| SourceError::Internal)?;
     saved.map_err(|_source| {
-        tracing::error!(name: "broker.credential.refresh_save_failed", target: "credential", event = "broker.credential.refresh_save_failed", "OAuth refresh record could not be saved");
+        tracing::error!(name: "broker.credential.refresh_save_failed", target: "credential", event = "broker.credential.refresh_save_failed", "broker.credential.refresh_save_failed");
         SourceError::Io
     })
 }
@@ -643,13 +643,13 @@ async fn post(
 pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) {
     match read_record(path, uid) {
         Ok(OAuth2Record::Sealed { since, cause, .. }) => {
-            tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential, since, cause = cause.label(), instruction = "provide a new seed" }, "OAuth refresh sealed at boot");
+            tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential, since, cause = cause.label(), instruction = "provide a new seed" }, "broker.credential.sealed");
         }
         Err(SourceError::Io)
             if std::fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
         Err(error) => {
-            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed")
+            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid")
         }
         Ok(OAuth2Record::Live { .. }) => {}
     }

@@ -142,7 +142,8 @@ impl LocalTransport {
                         tracing::debug!(
                             event = "gateway_local_request_rejected",
                             transport = %name,
-                            reason = "line-too-long"
+                            reason = "line-too-long",
+                            "gateway.local.request.rejected"
                         );
                         break;
                     }
@@ -161,7 +162,8 @@ impl LocalTransport {
                         tracing::debug!(
                             event = "gateway_local_request_rejected",
                             transport = %name,
-                            reason = "malformed-request"
+                            reason = "malformed-request",
+                            "gateway.local.request.rejected"
                         );
                         None
                     })
@@ -174,7 +176,8 @@ impl LocalTransport {
                             tracing::debug!(
                                 event = "gateway_local_request_rejected",
                                 transport = %name,
-                                reason = "ambiguous-request"
+                                reason = "ambiguous-request",
+                                "gateway.local.request.rejected"
                             );
                         });
                         continue;
@@ -211,7 +214,8 @@ impl LocalTransport {
                         tracing::debug!(
                             event = "gateway_local_request_rejected",
                             transport = %name,
-                            reason = "malformed-request"
+                            reason = "malformed-request",
+                            "gateway.local.request.rejected"
                         );
                     });
                     continue;

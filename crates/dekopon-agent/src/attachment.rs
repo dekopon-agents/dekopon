@@ -238,7 +238,7 @@ impl ReplyAttachments {
                         queued.ids.push(id);
                         queued.images.push(image);
                     } else {
-                        tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = "turn send allowance exhausted" }, "asset send failed");
+                        tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = "turn send allowance exhausted" }, "agent.asset.send");
                         note.push_str(
                             "[gateway: turn send allowance exhausted; asset was not queued]\n",
                         );
@@ -247,7 +247,7 @@ impl ReplyAttachments {
                 }
                 Ok(None) => (),
                 Err(error) => {
-                    tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = %error }, "asset send failed");
+                    tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = %error }, "agent.asset.send");
                     note.push_str(&format!(
                         "[gateway: chat-asset:{id} was not queued: {error}]\n"
                     ));
@@ -281,7 +281,7 @@ impl ReplyAttachments {
             AssetDeliveryDisposition::Delivered => None,
         };
         for id in &queued.ids {
-            tracing::info!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = !matches!(disposition, AssetDeliveryDisposition::Abandoned), error }, "asset delivery disposition");
+            tracing::info!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = !matches!(disposition, AssetDeliveryDisposition::Abandoned), error }, "agent.asset.send");
         }
         if disposition != AssetDeliveryDisposition::Delivered && !queued.ids.is_empty() {
             self.registrar.delivery_failed();

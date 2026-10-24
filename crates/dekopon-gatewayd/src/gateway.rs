@@ -393,11 +393,15 @@ impl Gateway {
                             }
                         }
                         Ok(Err(error)) => {
-                            tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped");
+                            tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped", "gateway.wake.store.failed");
                             wakes = None;
                         }
                         Err(_) => {
-                            tracing::error!(event = "gateway_wake_store_failed", wakes = "stopped");
+                            tracing::error!(
+                                event = "gateway_wake_store_failed",
+                                wakes = "stopped",
+                                "gateway.wake.store.failed"
+                            );
                             wakes = None;
                         }
                     }
@@ -406,7 +410,10 @@ impl Gateway {
                     match result {
                         Ok(Some(fired)) => self.start_wake(&mut sessions, fired),
                         Ok(None) => {}
-                        Err(_) => tracing::error!(event = "gateway_wake_task_failed"),
+                        Err(_) => tracing::error!(
+                            event = "gateway_wake_task_failed",
+                            "gateway.wake.task.failed"
+                        ),
                     }
                 },
                 () = async {
@@ -482,7 +489,7 @@ impl Gateway {
                         }
                         TransportEvent::CancelRequested(request) => {
                             if collector.cancel(&request) {
-                                tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via));
+                                tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via), "gateway.input.stop.requested");
                             }
                             cancel_session(&self.runner, &request);
                         },
@@ -511,7 +518,10 @@ impl Gateway {
         .await
         .is_err()
         {
-            tracing::warn!(event = "gateway_sessions_abandoned");
+            tracing::warn!(
+                event = "gateway_sessions_abandoned",
+                "gateway.sessions.abandoned"
+            );
             // A blocking probe cannot be aborted; the runtime's shutdown timeout bounds it.
             ticks.detach_all();
             sessions.abort_all();
@@ -565,13 +575,15 @@ impl Gateway {
                             Ok(Ok(())) => tracing::info!(
                                 audit.event = "gateway.follow",
                                 operation = "banished",
-                                route = index
+                                route = index,
+                                "gateway.follow"
                             ),
                             _ => tracing::warn!(
                                 audit.event = "gateway.follow",
                                 operation = "refused",
                                 route = index,
-                                reason = "persistence"
+                                reason = "persistence",
+                                "gateway.follow"
                             ),
                         }
                     });
@@ -612,7 +624,8 @@ impl Gateway {
                     tracing::info!(
                         event = "gateway_session_stop_requested",
                         transport = %request.transport,
-                        via = "stop-reply"
+                        via = "stop-reply",
+                        "gateway.session.stop.requested"
                     );
                     return;
                 }
@@ -620,7 +633,8 @@ impl Gateway {
                     tracing::debug!(
                         event = "gateway_session_stop_ignored",
                         transport = %request.transport,
-                        reason = outcome.ignored_reason()
+                        reason = outcome.ignored_reason(),
+                        "gateway.session.stop.ignored"
                     );
                     return;
                 }
@@ -651,7 +665,8 @@ impl Gateway {
                 transport = %message.transport,
                 reason = "unrouted",
                 conversation.kind = message.conversation.kind.as_str(),
-                conversation.container = message.conversation.container.as_deref().unwrap_or_default()
+                conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
+                "gateway.message.ignored"
             );
             return;
         };
@@ -700,7 +715,8 @@ impl Gateway {
                             audit.event = "gateway.follow",
                             operation = "refused",
                             route = route_id,
-                            reason = "capacity"
+                            reason = "capacity",
+                            "gateway.follow"
                         );
                     }
                     return;
@@ -709,7 +725,8 @@ impl Gateway {
             tracing::debug!(
                 event = "gateway_message_ignored",
                 transport = %message.transport,
-                reason = "not-addressed"
+                reason = "not-addressed",
+                "gateway.message.ignored"
             );
             return;
         }
@@ -751,7 +768,11 @@ impl Gateway {
         };
         let Some(driver) = self.drivers.get(&message.transport).cloned() else {
             message.receive_span.in_scope(|| {
-                tracing::error!(event = "gateway_message_ignored", reason = "no-driver")
+                tracing::error!(
+                    event = "gateway_message_ignored",
+                    reason = "no-driver",
+                    "gateway.message.ignored"
+                )
             });
             collection::disposition(&message.receive_span, "no-driver");
             return;
@@ -785,12 +806,19 @@ impl Gateway {
             .route(&message)
             .is_some_and(|route| route.wakes && route.agent == agent);
         let receipt = message.receive_span.clone();
-        receipt.in_scope(|| tracing::info!(event = "gateway_wake_fired", wake.id = %id));
+        receipt.in_scope(
+            || tracing::info!(event = "gateway_wake_fired", wake.id = %id, "gateway.wake.fired"),
+        );
         if answering {
             self.start_session(sessions, &generation, message);
             return;
         }
-        receipt.in_scope(|| tracing::warn!(event = "gateway_wake_orphaned", wake.id = %id));
+        receipt.in_scope(|| {
+            tracing::warn!(
+            event = "gateway_wake_orphaned",
+            wake.id = %id,
+            "gateway.wake.orphaned")
+        });
         if let Some(driver) = self.drivers.get(&message.transport).cloned()
             && let MessageId::Wake { notice, .. } = &message.message_id
         {
@@ -926,7 +954,8 @@ impl ReloadState {
                     applied = false,
                     problems = entries.len(),
                     categories = %categories.join(","),
-                    error = %error
+                    error = %error,
+                    "gateway.reload.refused"
                 );
             }
             return;
@@ -942,15 +971,24 @@ impl ReloadState {
                 return;
             }
             match unsettled {
-                Unsettled::Monitor => tracing::warn!(event = "gateway_reload_monitor_failed"),
+                Unsettled::Monitor => tracing::warn!(
+                    event = "gateway_reload_monitor_failed",
+                    "gateway.reload.monitor.failed"
+                ),
                 Unsettled::Refused(reason) => {
-                    tracing::warn!(event = "gateway_reload_refused", applied = false, reason);
+                    tracing::warn!(
+                        event = "gateway_reload_refused",
+                        applied = false,
+                        reason,
+                        "gateway.reload.refused"
+                    );
                 }
                 Unsettled::Proxy(error) => tracing::warn!(
                     event = "gateway_reload_refused",
                     applied = false,
                     reason = "proxy-model",
-                    error = %reload_problem(&GatewaydError::Proxy(error))
+                    error = %reload_problem(&GatewaydError::Proxy(error)),
+                    "gateway.reload.refused"
                 ),
             }
         }
@@ -1056,7 +1094,8 @@ impl ReloadState {
                     event = "gateway_reload_applied",
                     generation.digest = %digest,
                     category.count = 0,
-                    categories = ""
+                    categories = "",
+                    "gateway.reload.applied"
                 );
             }
             return;
@@ -1084,7 +1123,8 @@ impl ReloadState {
             event = "gateway_reload_applied",
             generation.digest = %digest,
             category.count = categories.len(),
-            categories = %categories.join(",")
+            categories = %categories.join(","),
+            "gateway.reload.applied"
         );
         self.gateway_digest = digest;
         self.credentials.retire();

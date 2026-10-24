@@ -978,7 +978,11 @@ pub(crate) fn jitter_below(upper: u64) -> u64 {
     }
     let mut bytes = [0_u8; 8];
     if let Err(error) = getrandom::fill(&mut bytes) {
-        tracing::warn!(event = "gateway_transport_jitter_unavailable", error = %error);
+        tracing::warn!(
+            event = "gateway_transport_jitter_unavailable",
+            error = %error,
+            "gateway.transport.jitter.unavailable"
+        );
         return 0;
     }
     u64::from_le_bytes(bytes) % upper

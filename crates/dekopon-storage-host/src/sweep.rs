@@ -31,7 +31,7 @@ impl StorageHost {
                 Ok(false) => summary.skipped += 1,
                 Err(error) => {
                     summary.errors += 1;
-                    tracing::warn!(storage.namespace = %token, storage.check = %error.class(), error = %dekopon_core::error_chain(&error), "storage sweep could not finish a resource");
+                    tracing::warn!(storage.namespace = %token, storage.check = %error.class(), error = %dekopon_core::error_chain(&error), "storage.sweep.failed");
                 }
             }
         }
@@ -40,7 +40,7 @@ impl StorageHost {
             deleted = summary.deleted,
             skipped = summary.skipped,
             errors = summary.errors,
-            "storage sweep finished"
+            "storage.sweep.finished"
         );
         Ok(summary)
     }
@@ -114,7 +114,7 @@ impl StorageHost {
             .ledger
             .account_sweep(token, before, after, removed)?;
         if removed {
-            tracing::info!(storage.namespace = %token, reason = "idle-ttl", bytes = before.bytes, "expired storage resource deleted");
+            tracing::info!(storage.namespace = %token, reason = "idle-ttl", bytes = before.bytes, "storage.sweep.deleted");
         }
         deletion?;
         Ok(removed)
@@ -132,7 +132,7 @@ fn eligible(
     now: SystemTime,
 ) -> Result<bool, StorageHostError> {
     let Some((scope, values)) = read_identity(base)? else {
-        tracing::warn!(storage.namespace = %token, "storage sweep preserved a resource without identity metadata");
+        tracing::warn!(storage.namespace = %token, reason = "no-identity", "storage.sweep.preserved");
         return Ok(false);
     };
     let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
@@ -150,15 +150,15 @@ fn eligible(
         _ => return Err(base.corrupt("identity", "storage-resource-identity")),
     };
     let provider = provider.parse::<ProviderId>().map_err(|error| {
-        tracing::warn!(storage.namespace = %token, error = %error, "invalid provider in storage identity");
+        tracing::warn!(storage.namespace = %token, error = %error, "storage.sweep.identity.invalid");
         base.corrupt("identity", "storage-resource-identity")
     })?;
     let Some(policy) = policies.get(&(provider, scope)) else {
-        tracing::warn!(storage.namespace = %token, "storage sweep preserved a resource without a current retention policy");
+        tracing::warn!(storage.namespace = %token, reason = "no-policy", "storage.sweep.preserved");
         return Ok(false);
     };
     let Some(last_used) = marker_time(base)? else {
-        tracing::warn!(storage.namespace = %token, "storage sweep preserved a resource without a last-used marker");
+        tracing::warn!(storage.namespace = %token, reason = "no-marker", "storage.sweep.preserved");
         return Ok(false);
     };
     let StorageRetention::IdleTtl(ttl) = policy else {

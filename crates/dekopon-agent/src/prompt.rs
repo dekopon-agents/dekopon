@@ -803,7 +803,7 @@ where
                 tools = offered_tools.as_str(),
                 messages = %transcript(&messages[transcribed..]),
             },
-            "model turn prompt"
+            "agent.model.prompt"
         );
         transcribed = messages.len();
         let model_started = Instant::now();
@@ -835,7 +835,7 @@ where
                         message.count = messages.len(),
                         outcome = if steered { "steered" } else { "interrupted" },
                     },
-                    "model turn interrupted"
+                    "accounting.model.turn"
                 );
                 tracing::info!(
                     target: "dekopon_agent::audit",
@@ -846,7 +846,7 @@ where
                         tool_calls = %tool_calls_json(&[]),
                         stream.interrupted = true,
                     },
-                    "model turn answer"
+                    "agent.model.answer"
                 );
                 drop(model_entered);
                 if steered {
@@ -865,7 +865,7 @@ where
                         outcome = "refused",
                         refusal = %refusal,
                     },
-                    "model turn refused by the token budget"
+                    "accounting.model.turn"
                 );
                 return Err(InferenceError::OverBudget(refusal).into());
             }
@@ -880,7 +880,7 @@ where
                         outcome = "failed",
                         error = %error,
                     },
-                    "model turn failed"
+                    "accounting.model.turn"
                 );
                 return Err(error.into());
             }
@@ -913,7 +913,7 @@ where
                     .is_some_and(|content| !content.trim().is_empty()),
                 outcome = "succeeded",
             },
-            "model turn accounted"
+            "accounting.model.turn"
         );
         tracing::info!(
             target: "dekopon_agent::audit",
@@ -923,7 +923,7 @@ where
                 answer = turn.content.as_deref().unwrap_or_default(),
                 tool_calls = %tool_calls_json(&turn.tool_calls),
             },
-            "model turn answer"
+            "agent.model.answer"
         );
         let requested = u32::try_from(turn.tool_calls.len()).unwrap_or(u32::MAX);
         tool_calls = tool_calls.saturating_add(requested);
@@ -990,7 +990,7 @@ where
                     tool_call.count = turn.tool_calls.len(),
                     error.type = "too-many-tool-calls",
                 },
-                "model tool calls rejected"
+                "agent.tool.rejected"
             );
             return Err(PromptError::TooManyToolCalls {
                 actual: turn.tool_calls.len(),
@@ -1025,7 +1025,7 @@ where
                         audit.event = "agent.reply.declined",
                         model.turn = model_turns,
                     },
-                    "optional chat reply declined"
+                    "agent.reply.declined"
                 );
                 emit(
                     progress,
@@ -1174,7 +1174,7 @@ where
                         gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                         script = script.as_str(),
                     },
-                    "agent tool script"
+                    "agent.tool.script"
                 );
                 check_cancelled(cancellation)?;
                 let outcome = runtime.run_script(&script);
@@ -1186,7 +1186,7 @@ where
                         gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                         output = outcome.output.as_str(),
                     },
-                    "agent tool output"
+                    "agent.tool.output"
                 );
                 outcome
             };
@@ -1341,7 +1341,7 @@ pub(crate) fn reject_tool_call(
             error.type = error_type,
             rejection.fed_back = fed_back,
         },
-        "model tool call rejected"
+        "agent.tool.rejected"
     );
 }
 
@@ -1352,7 +1352,7 @@ fn reject_empty_tool_call(model_turn: u32, position: usize) {
         tool_call.position = position,
         error.type = "empty-tool-call-id",
         rejection.fed_back = false,
-    }, "model tool call rejected");
+    }, "agent.tool.rejected");
 }
 
 const BAD_SCRIPT_ARGUMENTS_FEEDBACK: &str = "dekopon: bash takes one string argument named \
@@ -1488,7 +1488,7 @@ fn inspect_agent_config_into(
             config.bytes = result.len(),
             config.repeated = *already_shown,
         },
-        "agent configuration inspected"
+        "agent.config.inspected"
     );
     *already_shown = true;
     messages.push(ModelMessage::tool(call.id.clone(), result));
@@ -1604,7 +1604,7 @@ fn fetch_asset_into(
             tracing::info!(
                 target: "dekopon_agent::audit",
                 { audit.event = "agent.asset.refused", asset.id = id, reason = reason.as_str() },
-                "chat asset refused"
+                "agent.asset.refused"
             );
             messages.push(ModelMessage::tool(call.id.clone(), reason));
             return Ok(());
@@ -1633,7 +1633,7 @@ fn fetch_asset_into(
         tracing::info!(
             target: "dekopon_agent::audit",
             { audit.event = "agent.asset.refused", asset.id = id, reason = reason.as_str() },
-            "chat asset refused"
+            "agent.asset.refused"
         );
         messages.push(ModelMessage::tool(call.id.clone(), reason));
         return Ok(());
@@ -1650,7 +1650,7 @@ fn fetch_asset_into(
             asset.bytes = asset.data.len(),
             asset.truncated = truncated,
         },
-        "chat asset fetched"
+        "agent.asset.fetched"
     );
     if let Some(text) = text {
         messages.push(ModelMessage::tool(call.id.clone(), text));

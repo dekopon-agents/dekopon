@@ -239,7 +239,11 @@ pub fn session_trace_parent() -> TraceParent {
 fn minted_trace_parent() -> TraceParent {
     let mut bytes = [0_u8; 24];
     if let Err(error) = getrandom::fill(&mut bytes) {
-        tracing::warn!(event = "session_trace_entropy_unavailable", error = %error);
+        tracing::warn!(
+            event = "session_trace_entropy_unavailable",
+            error = %error,
+            "session.trace.entropy.unavailable"
+        );
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -481,7 +485,7 @@ impl BrokerLeg {
             }),
         };
         prepared.inspect_err(|refusal| {
-            tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "chat asset input refused");
+            tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "agent.chat_asset_input.refused");
         })
     }
 }
@@ -751,7 +755,11 @@ impl CapabilityInvoker for BrokerLeg {
             return;
         }
         let Some(text) = ProgressNote::new(text) else {
-            tracing::debug!(event = "agent_progress_note_dropped", reason = "empty");
+            tracing::debug!(
+                event = "agent_progress_note_dropped",
+                reason = "empty",
+                "agent.progress.note.dropped"
+            );
             return;
         };
         if self
@@ -761,7 +769,11 @@ impl CapabilityInvoker for BrokerLeg {
             })
             .is_err()
         {
-            tracing::debug!(event = "agent_progress_note_dropped", reason = "script-cap");
+            tracing::debug!(
+                event = "agent_progress_note_dropped",
+                reason = "script-cap",
+                "agent.progress.note.dropped"
+            );
             return;
         }
         self.emit(ProgressEvent::Note { text, eta });
@@ -953,7 +965,11 @@ impl BrokerLeg {
             Ok(Some((reader, feed))) => (Some(reader), Some(feed)),
             Ok(None) => (None, None),
             Err(error) => {
-                tracing::warn!(event = "gateway_child_stdin_unavailable", error = %error);
+                tracing::warn!(
+                    event = "gateway_child_stdin_unavailable",
+                    error = %error,
+                    "gateway.child.stdin.unavailable"
+                );
                 return UpcallExit {
                     status: ExitCode::FAILURE.get(),
                     stderr: "dekopon-shell: the child script's stdin could not be opened"
@@ -972,7 +988,11 @@ impl BrokerLeg {
                 },
             )
         {
-            tracing::debug!(event = "gateway_upcall_trace_parent_ignored", error = %error);
+            tracing::debug!(
+                event = "gateway_upcall_trace_parent_ignored",
+                error = %error,
+                "gateway.upcall.trace.parent.ignored"
+            );
         }
         let (finished, outcome) = tokio::sync::oneshot::channel();
         let dispatcher = dispatcher.clone();
@@ -1006,7 +1026,11 @@ impl BrokerLeg {
             never = pumped => match never {},
         };
         let Some(outcome) = outcome else {
-            tracing::warn!(event = "gateway_child_script_panicked", parent = %parent);
+            tracing::warn!(
+                event = "gateway_child_script_panicked",
+                parent = %parent,
+                "gateway.child.script.panicked"
+            );
             return UpcallExit {
                 status: CHILD_PANICKED,
                 stderr: "dekopon-shell: the child script panicked".to_owned(),
@@ -1017,7 +1041,11 @@ impl BrokerLeg {
             text.push('\n');
         }
         if let Err(error) = write_child_stdout(stdout, text.as_bytes()).await {
-            tracing::debug!(event = "gateway_child_stdout_unread", error = %error);
+            tracing::debug!(
+                event = "gateway_child_stdout_unread",
+                error = %error,
+                "gateway.child.stdout.unread"
+            );
         }
         UpcallExit {
             status: outcome.exit_code.get(),
@@ -1054,7 +1082,11 @@ async fn pump_child_stdin(source: OwnedFd, sink: std::os::unix::net::UnixStream)
         tokio::io::copy(&mut source, &mut sink).await
     };
     if let Err(error) = pumped.await {
-        tracing::debug!(event = "gateway_child_stdin_ended", error = %error);
+        tracing::debug!(
+            event = "gateway_child_stdin_ended",
+            error = %error,
+            "gateway.child.stdin.ended"
+        );
     }
 }
 

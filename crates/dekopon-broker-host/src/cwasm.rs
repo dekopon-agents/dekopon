@@ -192,7 +192,7 @@ impl Cache {
                     }
                 }
                 remove(&index, "compiled index")?;
-                tracing::warn!(path = %fault_path.display(), reason = %error, "repairing compiled artifact");
+                tracing::warn!(path = %fault_path.display(), reason = %error, "provider.cwasm.repaired");
                 repaired = true;
             }
         }
@@ -221,7 +221,7 @@ impl Cache {
         if existing && let Err(error) = stage("verify", entry.bytes, || verify(&object, &entry)) {
             refuse_unreadable(&error)?;
             remove(&object, "compiled artifact")?;
-            tracing::warn!(path = %object.display(), reason = %error, "repairing compiled artifact");
+            tracing::warn!(path = %object.display(), reason = %error, "provider.cwasm.repaired");
             reusable = false;
             repaired = true;
         }
@@ -491,24 +491,16 @@ pub(crate) fn stage<T>(
         let started = Instant::now();
         let result = work();
         let elapsed_us = micros(started);
-        let outcome = if result.is_ok() { "ok" } else { "error" };
+        let outcome = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        };
         span.record("elapsed_us", elapsed_us);
         span.record("outcome", outcome);
         match &result {
-            Ok(_) => tracing::info!(
-                stage,
-                bytes,
-                elapsed_us,
-                outcome,
-                "provider load stage finished"
-            ),
-            Err(_) => tracing::error!(
-                stage,
-                bytes,
-                elapsed_us,
-                outcome,
-                "provider load stage failed"
-            ),
+            Ok(_) => tracing::info!(stage, bytes, elapsed_us, outcome, "provider.stage.finished"),
+            Err(_) => tracing::error!(stage, bytes, elapsed_us, outcome, "provider.stage.failed"),
         }
         result
     })

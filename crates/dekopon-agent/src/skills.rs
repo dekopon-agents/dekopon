@@ -119,7 +119,7 @@ pub(crate) fn read_skill_into(
             skill.bytes = result.len(),
             skill.repeated = repeated,
         },
-        "skill read"
+        "agent.skill.read"
     );
     messages.push(ModelMessage::tool(call.id.clone(), result));
     Ok(())
@@ -134,7 +134,7 @@ fn refuse(model_turn: u32, call_id: &str, reason: &'static str) {
             gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
             reason = reason,
         },
-        "skill read refused"
+        "agent.skill.refused"
     );
 }
 

@@ -159,6 +159,7 @@ fn refuse(state: &WebhookState, refusal: Refusal, status: StatusCode) -> Respons
             reason = refusal.reason(),
             status = status.as_u16(),
             suppressed,
+            "gateway.whatsapp.webhook.refused"
         );
     }
     content_free(status)
@@ -454,7 +455,8 @@ fn parse_delivery(
                         let Some(asset) = media::inbound_image(&message["image"]) else {
                             tracing::debug!(
                                 event = "gateway_message_ignored",
-                                reason = "image-metadata"
+                                reason = "image-metadata",
+                                "gateway.message.ignored"
                             );
                             continue;
                         };
@@ -480,7 +482,8 @@ fn parse_delivery(
                         event = "gateway_message_ignored",
                         transport = %state.name,
                         reason = "group-unsupported",
-                        message.index = index
+                        message.index = index,
+                        "gateway.message.ignored"
                     );
                     continue;
                 }

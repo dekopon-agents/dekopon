@@ -72,7 +72,8 @@ impl CacheKeySecret {
         })?;
         tracing::warn!(
             event = "gateway_cache_key_secret_reset",
-            reason = reset.as_str()
+            reason = reset.as_str(),
+            "gateway.cache.key.secret.reset"
         );
         Ok(Self::from_bytes(bytes))
     }

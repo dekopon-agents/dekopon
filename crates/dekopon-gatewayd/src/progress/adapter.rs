@@ -112,7 +112,8 @@ impl ProgressSink for ProgressAdapter {
                 reason = match error {
                     mpsc::error::TrySendError::Full(_) => "full",
                     mpsc::error::TrySendError::Closed(_) => "closed",
-                }
+                },
+                "gateway.progress.dropped"
             );
         }
     }
@@ -123,22 +124,22 @@ pub(crate) fn record(event: &ProgressEvent) {
         ProgressEvent::Started { agent, max_steps } => tracing::info!(
             target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "started", agent = agent.as_str(), max_steps = *max_steps },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::ModelTurn { turn, of } => tracing::info!(
             target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "model_turn", turn = *turn, of = *of },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::Steered { turn } => tracing::info!(
             target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "steered", turn = *turn },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::Note { text, eta } => tracing::info!(
             target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.progress", kind = "note", note = text.as_str(), note.eta_s = eta.map(|eta| eta.as_secs()) },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::TextDelta { .. } => {}
         ProgressEvent::Answered {
@@ -156,7 +157,7 @@ pub(crate) fn record(event: &ProgressEvent) {
                 elapsed_ms = duration.as_millis() as u64,
                 first_delta_ms = first_delta.map(|delta| delta.as_millis() as u64),
             },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::ToolStarted {
             word,
@@ -173,7 +174,7 @@ pub(crate) fn record(event: &ProgressEvent) {
                 calls_used = *calls_used,
                 calls_max = *calls_max,
             },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::ToolFinished {
             word,
@@ -185,10 +186,10 @@ pub(crate) fn record(event: &ProgressEvent) {
                 audit.event = "gateway.progress",
                 kind = "tool_finished",
                 word = word.as_str(),
-                outcome = ?outcome,
+                outcome = outcome.label(),
                 elapsed_ms = duration.as_millis() as u64,
             },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::Attachment {
             index,
@@ -203,7 +204,7 @@ pub(crate) fn record(event: &ProgressEvent) {
                 media_type = media_type.as_str(),
                 bytes = *bytes,
             },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::KeepAlive { elapsed, count } => tracing::info!(
             target: "dekopon_gatewayd::audit",
@@ -213,17 +214,17 @@ pub(crate) fn record(event: &ProgressEvent) {
                 elapsed_ms = elapsed.as_millis() as u64,
                 count = *count,
             },
-            "gateway progress"
+            "gateway.progress"
         ),
         ProgressEvent::Cancelled { by } => tracing::info!(
             target: "dekopon_gatewayd::audit",
-            { audit.event = "gateway.progress", kind = "cancelled", by = ?by },
-            "gateway progress"
+            { audit.event = "gateway.progress", kind = "cancelled", by = super::cancel_label(*by) },
+            "gateway.progress"
         ),
         ProgressEvent::Failed { class } => tracing::info!(
             target: "dekopon_gatewayd::audit",
-            { audit.event = "gateway.progress", kind = "failed", class = ?class },
-            "gateway progress"
+            { audit.event = "gateway.progress", kind = "failed", class = class.label() },
+            "gateway.progress"
         ),
         ProgressEvent::Finished {
             outcome,
@@ -235,12 +236,12 @@ pub(crate) fn record(event: &ProgressEvent) {
             {
                 audit.event = "gateway.progress",
                 kind = "finished",
-                outcome = ?outcome,
+                outcome = outcome.label(),
                 elapsed_ms = elapsed.as_millis() as u64,
                 turns = *turns,
                 tool_calls = *tool_calls,
             },
-            "gateway progress"
+            "gateway.progress"
         ),
     }
 }

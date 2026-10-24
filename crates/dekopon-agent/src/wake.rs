@@ -208,7 +208,7 @@ pub(crate) fn wake_into(
                     gen_ai.tool.call.id = dekopon_core::bounded_attribute(call.id.as_str()).as_ref(),
                     reason = refusal.telemetry_kind(),
                 },
-                "wake refused"
+                "agent.wake.refused"
             );
             format!("Not done: {refusal}.")
         }

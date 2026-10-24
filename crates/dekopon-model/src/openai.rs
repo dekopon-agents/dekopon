@@ -570,7 +570,7 @@ impl WireToolCall {
             tracing::debug!(
                 event = "unknown_tool_item_skipped",
                 kind = %secrets.sanitize(&call.kind),
-                "skipped a tool item of a kind this client does not know"
+                "unknown.tool.item.skipped"
             );
             return Ok(None);
         }
@@ -1459,7 +1459,7 @@ mod tests {
                 .find(|attribute| attribute.key.as_str() == key)
                 .map(|attribute| attribute.value.to_string())
         };
-        assert_eq!(attribute("outcome").as_deref(), Some("success"));
+        assert_eq!(attribute("outcome").as_deref(), Some("succeeded"));
         assert_eq!(attribute("stream.deltas"), Some(DELTAS.to_string()));
         for (key, value) in [
             ("usage.input_tokens", "11"),

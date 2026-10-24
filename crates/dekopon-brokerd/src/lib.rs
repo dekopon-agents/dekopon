@@ -124,7 +124,7 @@ where
     let server = BrokerServer::for_generations(Arc::clone(&coordination), limits)?
         .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
-    tracing::info!(event = "broker_started");
+    tracing::info!(event = "broker_started", "broker.started");
     let mut lock_stop = None;
     let stop = async {
         lock_stop = stopped(shutdown, provider_lock.as_ref(), uid, lock_poll).await;
@@ -133,7 +133,8 @@ where
         if let Err(error) = socket_guard.cleanup() {
             tracing::warn!(
                 event = "broker_socket_cleanup_failed",
-                error = %error_chain(&error)
+                error = %error_chain(&error),
+                "broker.socket.cleanup.failed"
             );
         }
     };
@@ -166,12 +167,13 @@ where
     if let Err(error) = &cleanup {
         tracing::warn!(
             event = "broker_socket_cleanup_failed",
-            error = %error_chain(error)
+            error = %error_chain(error),
+            "broker.socket.cleanup.failed"
         );
     }
 
     result?;
-    tracing::info!(event = "broker_stopped");
+    tracing::info!(event = "broker_stopped", "broker.stopped");
     cleanup?;
     match lock_stop {
         None | Some(lock_watch::LockStop::Changed) => Ok(()),
@@ -376,13 +378,14 @@ impl Coordination {
             match (unreported, unreadable) {
                 (false, _) => {}
                 (true, true) => {
-                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error);
+                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error, "broker.reload.monitor.failed");
                 }
                 (true, false) => tracing::warn!(
                     event = "broker_reload_refused",
                     applied = false,
                     problems = count,
-                    error = %error
+                    error = %error,
+                    "broker.reload.refused"
                 ),
             }
             return (active.digest.clone(), GenerationOutcome::Refused);
@@ -433,7 +436,8 @@ impl Coordination {
             event = "broker_reload_applied",
             generation.digest = digest,
             category.count = categories.len(),
-            categories = %categories.join(",")
+            categories = %categories.join(","),
+            "broker.reload.applied"
         );
         GenerationOutcome::Applied
     }
@@ -718,7 +722,7 @@ async fn boot_runtime(
             .cwasm_dir
             .as_ref()
             .map(|path| path.display().to_string()),
-        "broker provider guest-memory budget"
+        "broker.memory.budget"
     );
     if !config.plaintext_hosts.is_empty() {
         let hosts = config.plaintext_hosts.iter().collect::<Vec<_>>().join(", ");

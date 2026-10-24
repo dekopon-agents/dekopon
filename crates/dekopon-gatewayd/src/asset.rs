@@ -288,7 +288,11 @@ impl Downloads {
             if let Err(error) = finished
                 && error.is_panic()
             {
-                tracing::error!(event = "gateway_asset_download_failed", %error);
+                tracing::error!(
+                    event = "gateway_asset_download_failed",
+                    %error,
+                    "gateway.asset.download.failed"
+                );
             }
         }
         tasks.spawn_on(task, runtime)
@@ -1145,7 +1149,7 @@ impl Retention {
     fn miss(&self, id: u64, bytes: usize, reason: &'static str) {
         tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.retention_miss",
             asset.id = id, asset.bytes = bytes, asset.budget = self.budget, reason },
-            "chat asset retention refused");
+            "gateway.asset.retention_miss");
     }
     fn check_size(&self, id: u64, bytes: usize) -> Result<(), BlobError> {
         if self.budget == 0 {
@@ -1206,7 +1210,7 @@ impl Retention {
             Ok(()) => self.bytes -= data.len().max(1),
             Err(BlobError::Capacity) => self.orphans.push(data),
             Err(error) => {
-                tracing::warn!(asset.id = id, %error, "could not reclaim evicted asset");
+                tracing::warn!(asset.id = id, %error, "gateway.asset.reclaim.failed");
                 self.orphans.push(data);
             }
         }
@@ -1448,7 +1452,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             AssetStore::enforce_ceiling(&mut entries, &mut retention, self.store.conversations);
             if let Some(detected) = detected && detected != metadata.content_type {
                 let label: String = metadata.content_type.chars().filter(|c| !c.is_control()).take(128).collect();
-                tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.content_type_mismatch", asset.id = id, asset.content_type = label, asset.detected_type = detected, asset.bytes = metadata.bytes, asset.sha256 = metadata.sha256 }, "declared asset label differs from decoded prefix");
+                tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.content_type_mismatch", asset.id = id, asset.content_type = label, asset.detected_type = detected, asset.bytes = metadata.bytes, asset.sha256 = metadata.sha256 }, "gateway.asset.content_type_mismatch");
             }
             Ok(id)
         }).unwrap_or(Err(BlobError::Unauthorized))
@@ -2723,7 +2727,7 @@ mod retention_tests {
             for label in ["image/png", "image/jpeg"] {
                 let before = capture
                     .text()
-                    .matches("gateway.asset.content_type_mismatch")
+                    .matches("audit.event=\"gateway.asset.content_type_mismatch\"")
                     .count();
                 let (fd, metadata) = received(&bytes, label, encoding);
                 let id = session
@@ -2740,7 +2744,7 @@ mod retention_tests {
                 );
                 let after = capture
                     .text()
-                    .matches("gateway.asset.content_type_mismatch")
+                    .matches("audit.event=\"gateway.asset.content_type_mismatch\"")
                     .count();
                 assert_eq!(after - before, usize::from(label != "image/png"));
                 assert_eq!(
@@ -2864,7 +2868,13 @@ mod retention_tests {
             slot.finish(disposition);
             slot.finish(disposition);
             drop(slot);
-            assert_eq!(capture.text().matches("agent.asset.send").count(), 1);
+            assert_eq!(
+                capture
+                    .text()
+                    .matches("audit.event=\"agent.asset.send\"")
+                    .count(),
+                1
+            );
             let dispatched = disposition != AssetDeliveryDisposition::Abandoned;
             assert!(capture.text().contains(&format!("dispatched={dispatched}")));
             match disposition {

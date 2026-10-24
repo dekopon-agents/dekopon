@@ -244,8 +244,7 @@ impl CredentialFile {
                     event = "chatgpt_credential_save_failed",
                     path = %self.path.display(),
                     error = %error,
-                    "ChatGPT credential rotated but could not be persisted; continuing with the \
-                     in-memory token"
+                    "chatgpt.credential.save.failed"
                 );
                 RefreshOutcome::RotatedUnsaved
             }
@@ -507,7 +506,7 @@ fn poll_device_login(
                 tracing::warn!(
                     event = "chatgpt_device_login_poll_failed",
                     error = %error,
-                    "device authorization poll failed; continuing to poll until the deadline"
+                    "chatgpt.device.login.poll.failed"
                 );
                 transport_failure = Some(error.to_string());
                 interval = backed_off(interval);
@@ -886,14 +885,14 @@ fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) {
                     event = "chatgpt_credential_temporary_orphaned",
                     path = %path.display(),
                     error = %source,
-                    "could not remove an abandoned ChatGPT credential temporary file"
+                    "chatgpt.credential.temporary.orphaned"
                 );
             }
             TemporarySweep::Removed { path } => {
                 tracing::warn!(
                     event = "chatgpt_credential_temporary_swept",
                     path = %path.display(),
-                    "removed an abandoned ChatGPT credential temporary file"
+                    "chatgpt.credential.temporary.swept"
                 );
             }
         }

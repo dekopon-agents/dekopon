@@ -107,6 +107,7 @@ struct Captured {
     span: Option<String>,
     parents: Vec<String>,
     fields: BTreeMap<String, String>,
+    repeated: Vec<String>,
 }
 
 impl Captured {
@@ -116,15 +117,23 @@ impl Captured {
 }
 
 #[derive(Default)]
-struct Fields(BTreeMap<String, String>);
+struct Fields(BTreeMap<String, String>, Vec<String>);
+
+impl Fields {
+    fn insert(&mut self, field: &Field, value: String) {
+        if self.0.insert(field.name().to_owned(), value).is_some() {
+            self.1.push(field.name().to_owned());
+        }
+    }
+}
 
 impl Visit for Fields {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        self.insert(field, format!("{value:?}"));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().to_owned(), value.to_owned());
+        self.insert(field, value.to_owned());
     }
 }
 
@@ -162,10 +171,10 @@ where
         let Some(span) = context.span(&id) else {
             return;
         };
-        let fields = span
+        let (fields, repeated) = span
             .extensions()
             .get::<Fields>()
-            .map(|fields| fields.0.clone())
+            .map(|fields| (fields.0.clone(), fields.1.clone()))
             .unwrap_or_default();
         self.spans.lock().push(Captured {
             span: Some(span.name().to_owned()),
@@ -175,6 +184,7 @@ where
                 .map(|parent| parent.name().to_owned())
                 .collect(),
             fields,
+            repeated,
         });
     }
 }
@@ -260,6 +270,16 @@ fn pipeline_stage_spans_share_an_id_count_bytes_and_inherit_the_script_span() {
         assert_eq!(span.field("shell.command.close_reason"), Some("end"));
         assert!(span.field("shell.command.duration_ns").is_some());
         assert!(span.parents.iter().any(|parent| parent == SCRIPT_SPAN));
+    }
+}
+
+#[test]
+fn a_command_span_records_each_stage_field_once() {
+    let telemetry = capture("echo hello | head -1; echo done");
+    for name in ["echo", "head"] {
+        for span in telemetry.command_spans(name) {
+            assert!(span.repeated.is_empty(), "{name}: {:?}", span.repeated);
+        }
     }
 }
 

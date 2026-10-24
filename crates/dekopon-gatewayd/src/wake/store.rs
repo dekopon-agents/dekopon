@@ -36,7 +36,11 @@ impl From<io::Error> for WakeStoreError {
 
 impl From<WakeStoreError> for WakeRefusal {
     fn from(error: WakeStoreError) -> Self {
-        tracing::error!(event = "gateway_wake_store_failed", error = %error);
+        tracing::error!(
+            event = "gateway_wake_store_failed",
+            error = %error,
+            "gateway.wake.store.failed"
+        );
         Self::Store
     }
 }

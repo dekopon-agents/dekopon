@@ -340,7 +340,7 @@ fn io_error(error_value: AssetIoError) -> wit::Error {
             kind: std::io::ErrorKind::InvalidData,
         } => error(wit::ErrorCode::InvalidEncoding, "invalid base64 asset"),
         AssetIoError::Io { kind } => {
-            tracing::warn!(?kind, "asset I/O failed");
+            tracing::warn!(?kind, "asset.io.failed");
             error(wit::ErrorCode::Io, "asset I/O failed")
         }
         AssetIoError::Worker => error(wit::ErrorCode::Internal, "asset worker failed"),
@@ -447,7 +447,7 @@ impl HandleResource {
                 "asset.content_type" = self.info.content_type,
                 "asset.bytes" = self.info.stored_bytes,
                 "asset.sha256" = digest,
-                "opened asset consumed through WIT"
+                "asset.consumed"
             );
             self.digest_recorded = true;
         }
@@ -570,7 +570,7 @@ pub(crate) fn link_bounded_writer(
                         tracing::info!(
                             "asset.write.guest_bytes" = bytes.len(),
                             "asset.write.copied_bytes" = 0,
-                            "rejected oversized direct WIT list before copying"
+                            "asset.list.refused"
                         );
                         let state = store.data_mut();
                         state.assets.require_active()?;
@@ -584,7 +584,7 @@ pub(crate) fn link_bounded_writer(
                     tracing::info!(
                         "asset.write.guest_bytes" = bytes.len(),
                         "asset.write.copied_bytes" = bytes.len(),
-                        "bounded direct WIT list copy"
+                        "asset.list.copied"
                     );
                     Ok((wit::HostWriter::write(store.data_mut(), resource, bytes).await?,))
                 })
@@ -711,7 +711,7 @@ impl wit::Host for StoreState {
             "asset.id" = id,
             "asset.content_type" = info.content_type,
             "asset.bytes" = row.bytes,
-            "asset opened"
+            "asset.opened"
         );
         Ok(Ok(self.table.push(HandleResource {
             digest_recorded: false,
@@ -804,7 +804,7 @@ impl wit::Host for StoreState {
             "asset.content_type" = handle.info.content_type,
             "asset.bytes" = bytes,
             "asset.sha256" = digest,
-            "asset attached"
+            "asset.attached"
         );
         let Source::File { fd, .. } = &handle.source;
         if let Some(owner) = fd.output_file() {

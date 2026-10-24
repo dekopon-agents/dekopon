@@ -262,7 +262,8 @@ impl Journal {
                 tracing::warn!(
                     event = "gateway_follow",
                     operation = "refused",
-                    reason = "corrupt"
+                    reason = "corrupt",
+                    "gateway.follow"
                 );
                 continue;
             };
@@ -271,7 +272,8 @@ impl Journal {
                 tracing::warn!(
                     event = "gateway_follow",
                     operation = "refused",
-                    reason = "corrupt"
+                    reason = "corrupt",
+                    "gateway.follow"
                 );
                 continue;
             }
@@ -288,7 +290,8 @@ impl Journal {
                     tracing::warn!(
                         event = "gateway_follow",
                         operation = "refused",
-                        reason = "corrupt"
+                        reason = "corrupt",
+                        "gateway.follow"
                     );
                 }
             }
@@ -313,7 +316,8 @@ impl Journal {
                 event = "gateway_follow",
                 operation = "refused",
                 reason = "over-capacity",
-                count = overflow
+                count = overflow,
+                "gateway.follow"
             );
         }
         Ok(markers
@@ -517,7 +521,8 @@ impl Journal {
             tracing::warn!(
                 event = "gateway_memory_retention_failed",
                 reason = "agent-byte-cap",
-                encoded_bytes = encoded.len()
+                encoded_bytes = encoded.len(),
+                "gateway.memory.retention.failed"
             );
             return Ok(());
         }
@@ -548,7 +553,8 @@ impl Journal {
             tracing::warn!(
                 event = "gateway_memory_retention_failed",
                 reason = "agent-byte-cap",
-                encoded_bytes = encoded.len()
+                encoded_bytes = encoded.len(),
+                "gateway.memory.retention.failed"
             );
         }
         Ok(())
@@ -659,12 +665,20 @@ impl Journal {
                         )
                     {
                         remove(&file.path());
-                        tracing::warn!(event = "gateway_journal_reset", reason = "corrupt");
+                        tracing::warn!(
+                            event = "gateway_journal_reset",
+                            reason = "corrupt",
+                            "gateway.journal.reset"
+                        );
                     }
                 }
             } else if is_journal_file(&path) && !path.with_extension(FOLLOW_EXTENSION).exists() {
                 remove(&path);
-                tracing::warn!(event = "gateway_journal_reset", reason = "legacy");
+                tracing::warn!(
+                    event = "gateway_journal_reset",
+                    reason = "legacy",
+                    "gateway.journal.reset"
+                );
             }
         }
         Ok(())
@@ -692,7 +706,10 @@ impl Journal {
                                 .is_ok_and(|modified| modified < limit)
                         }) {
                             remove(&file_path);
-                            tracing::info!(event = "gateway_journal_expired");
+                            tracing::info!(
+                                event = "gateway_journal_expired",
+                                "gateway.journal.expired"
+                            );
                         } else if records {
                             let age = self.age_for(&format!(
                                 "{}/{}",
@@ -701,12 +718,16 @@ impl Journal {
                             ));
                             let horizon = millis(now).saturating_sub(duration_millis(age));
                             match sweep_file(&file_path, horizon) {
-                                Ok(true) => tracing::info!(event = "gateway_journal_expired"),
+                                Ok(true) => tracing::info!(
+                                    event = "gateway_journal_expired",
+                                    "gateway.journal.expired"
+                                ),
                                 Err(JournalError::Corrupt) => {
                                     remove(&file_path);
                                     tracing::warn!(
                                         event = "gateway_journal_reset",
-                                        reason = "corrupt"
+                                        reason = "corrupt",
+                                        "gateway.journal.reset"
                                     );
                                 }
                                 Err(error) => return Err(error),
@@ -729,7 +750,7 @@ impl Journal {
             };
             if stale {
                 remove(&path);
-                tracing::info!(event = "gateway_journal_expired");
+                tracing::info!(event = "gateway_journal_expired", "gateway.journal.expired");
             }
         }
         Ok(())
@@ -774,7 +795,11 @@ fn remove(path: &Path) {
     if let Err(error) = fs::remove_file(path)
         && error.kind() != io::ErrorKind::NotFound
     {
-        tracing::warn!(event = "gateway_journal_remove_failed", kind = %error.kind());
+        tracing::warn!(
+            event = "gateway_journal_remove_failed",
+            kind = %error.kind(),
+            "gateway.journal.remove.failed"
+        );
     }
 }
 

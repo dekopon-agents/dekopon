@@ -258,7 +258,8 @@ impl GithubAppCredential {
                 event = "broker_github_app_credential_reauth_required",
                 credential = %self.name,
                 http.response.status_code = status.as_u16(),
-                "GitHub refused the App JWT: a revoked or wrong key, a deleted App, or a clock more than a minute ahead"
+                causes = "a revoked or wrong key, a deleted App, or a clock more than a minute ahead",
+                "broker.github.app.credential.reauth.required"
             );
             return Err(CredentialRefreshError::ReauthorizationRequired);
         }
@@ -307,7 +308,7 @@ impl GithubAppCredential {
             credential = %self.name,
             category = category,
             error = error.map(|error| tracing::field::display(error_chain(error))),
-            "a GitHub App installation token could not be minted"
+            "broker.github.app.credential.refresh.failed"
         );
     }
 }
@@ -725,7 +726,7 @@ mod tests {
             assert_eq!(events[0].field("error"), None);
             assert_eq!(
                 events[0].field("message"),
-                Some("a GitHub App installation token could not be minted")
+                Some("broker.github.app.credential.refresh.failed")
             );
             let code = status.split(' ').next();
             assert!(capture.records().iter().any(|record| matches!(

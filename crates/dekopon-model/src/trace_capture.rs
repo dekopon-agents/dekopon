@@ -31,7 +31,7 @@ impl TraceCapture {
         assert_eq!(self.text().matches("model.complete").count(), 1);
         assert_eq!(self.field("model.backend"), Some(format!("{backend:?}")));
         assert_eq!(self.field("model.dialect"), Some(format!("{dialect:?}")));
-        assert_eq!(self.field("outcome").as_deref(), Some("\"success\""));
+        assert_eq!(self.field("outcome").as_deref(), Some("\"succeeded\""));
         assert_eq!(self.field("http.status").as_deref(), Some("200"));
         for field in [
             "timing.total_ms",

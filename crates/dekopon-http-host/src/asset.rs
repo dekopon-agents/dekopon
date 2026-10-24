@@ -83,7 +83,7 @@ impl AssetJobs {
         self.spawn(work)
             .await
             .map_err(|failure| {
-                tracing::error!(error = %failure, "asset worker failed");
+                tracing::error!(error = %failure, "http.asset.worker.failed");
                 AssetIoError::Worker
             })?
             .value

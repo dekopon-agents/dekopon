@@ -339,7 +339,8 @@ impl Conversation {
                 reason = match reason {
                     ArenaRefusal::TransientHeadroom => "arena-headroom",
                     ArenaRefusal::DuplicateRecord => "duplicate-record",
-                }
+                },
+                "gateway.memory.retention.failed"
             );
         }
     }
@@ -671,6 +672,7 @@ fn expired(entry: &Conversation, idle_timeout: Duration, now: Instant) -> bool {
 fn evicted(reason: EvictionReason) {
     tracing::info!(
         event = "gateway_conversation_evicted",
-        reason = reason.label()
+        reason = reason.label(),
+        "gateway.conversation.evicted"
     );
 }

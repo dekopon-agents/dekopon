@@ -547,7 +547,7 @@ fn json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     match serde_json::to_writer(&mut count, value) {
         Ok(()) => count.0,
         Err(error) => {
-            tracing::debug!(target: "meter", error = %error, "request size estimate fell back to zero");
+            tracing::debug!(target: "meter", error = %error, "meter.estimate.fallback");
             0
         }
     }

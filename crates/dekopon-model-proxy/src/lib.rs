@@ -359,7 +359,7 @@ async fn call(
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => {
-            tracing::debug!(target: "model", error = %error, "proxy request body refused");
+            tracing::debug!(target: "model", error = %error, "proxy.request.body.refused");
             return span.refused(dialect.sandbox(
                 Problem::TooLarge,
                 "a request body may be at most 8 MiB. Send a smaller request.",
@@ -429,7 +429,7 @@ async fn call(
     let upstream = match send(&proxy.http, model, dialect, headers, Bytes::from(rewritten)).await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = error.kind(), error = %error);
+            tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = error.kind(), error = %error, "proxy.upstream_failed");
             let outcome = match error {
                 SendError::Credential(_) | SendError::CredentialTask(_) => Outcome::NotSent,
                 SendError::Request(_) => Outcome::Failed,
@@ -610,7 +610,7 @@ async fn bounded(mut upstream: reqwest::Response, limit: usize) -> Vec<u8> {
             Ok(Some(_)) => break,
             Ok(None) => break,
             Err(error) => {
-                tracing::debug!(target: "model", error = %error, "upstream error body was cut short");
+                tracing::debug!(target: "model", error = %error, "proxy.upstream.error.truncated");
                 break;
             }
         }

@@ -79,7 +79,8 @@ impl monotonic::Host for StoreState {
                 tracing::error!(
                     event = "provider_monotonic_read",
                     status = "overflow",
-                    ?source
+                    ?source,
+                    "provider.monotonic.read"
                 );
                 return Err(
                     wasmtime::Error::new(source).context("monotonic invocation duration overflow")

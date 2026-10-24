@@ -107,6 +107,7 @@ impl QuotaLedger {
                 event = "storage_namespace_slot_refused",
                 storage.namespace.count = count,
                 storage.namespace.limit = self.limits.max_namespaces,
+                "storage.namespace.slot.refused"
             );
             return Err(StorageHostError::QuotaExceeded);
         }

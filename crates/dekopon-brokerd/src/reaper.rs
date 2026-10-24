@@ -72,12 +72,17 @@ fn finish(
         Ok(Err(error)) => {
             tracing::warn!(
                 event = "storage_sweep_failed",
-                error = %dekopon_core::error_chain(&error)
+                error = %dekopon_core::error_chain(&error),
+                "storage.sweep.failed"
             );
             Ok(())
         }
         Err(error) => {
-            tracing::error!(event = "storage_sweep_task_failed", error = %error);
+            tracing::error!(
+                event = "storage_sweep_task_failed",
+                error = %error,
+                "storage.sweep.task.failed"
+            );
             Err(BrokerdError::StorageReaper(error))
         }
     }

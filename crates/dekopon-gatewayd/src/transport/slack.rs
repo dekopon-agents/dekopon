@@ -156,7 +156,8 @@ impl SlackTransport {
                 tracing::warn!(
                     event = "gateway_transport_silent",
                     transport = %self.name,
-                    phase = "open"
+                    phase = "open",
+                    "gateway.transport.silent"
                 );
                 return Err(TransportError::Closed);
             }
@@ -180,7 +181,8 @@ impl SlackTransport {
                 tracing::warn!(
                     event = "gateway_transport_silent",
                     transport = %self.name,
-                    phase = "read"
+                    phase = "read",
+                    "gateway.transport.silent"
                 );
                 return Err(TransportError::Closed);
             }
@@ -226,7 +228,8 @@ impl SlackTransport {
                 event = "gateway_progress_degraded",
                 transport = %self.name,
                 surface = "cancel-ack",
-                category = error.category()
+                category = error.category(),
+                "gateway.progress.degraded"
             );
         }
         self.pending
@@ -461,7 +464,8 @@ impl SlackTransport {
             tracing::debug!(
                 event = "gateway_conversation_unresolved",
                 transport = "slack",
-                cause
+                cause,
+                "gateway.conversation.unresolved"
             );
             None
         };
@@ -491,7 +495,8 @@ impl SlackTransport {
                     event = "gateway_conversation_unresolved",
                     transport = "slack",
                     cause = "request",
-                    cause_type = %source
+                    cause_type = %source,
+                    "gateway.conversation.unresolved"
                 );
                 received.record("drop.reason", "conversation-unresolved");
                 return None;
@@ -508,7 +513,8 @@ impl SlackTransport {
                     event = "gateway_conversation_unresolved",
                     transport = "slack",
                     cause = "response",
-                    cause_type = %error
+                    cause_type = %error,
+                    "gateway.conversation.unresolved"
                 );
                 received.record("drop.reason", "conversation-unresolved");
                 return None;
@@ -733,7 +739,8 @@ impl ChatDriver for SlackReplier {
             tracing::warn!(
                 event = "gateway_reply_rate_limited",
                 transport = "slack",
-                retry_after_seconds = backoff
+                retry_after_seconds = backoff,
+                "gateway.reply.rate.limited"
             );
             drop(response);
             tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -906,7 +913,8 @@ impl NativeStatus for SlackReplier {
             tracing::warn!(
                 event = "gateway_progress_degraded",
                 transport = "slack",
-                surface = "agent-status"
+                surface = "agent-status",
+                "gateway.progress.degraded"
             );
         }
         result
@@ -1296,7 +1304,8 @@ impl SlackReplier {
             tracing::warn!(
                 event = "gateway_progress_degraded",
                 transport = "slack",
-                surface = "assistant-status"
+                surface = "assistant-status",
+                "gateway.progress.degraded"
             );
         }
         result
@@ -1328,7 +1337,8 @@ impl SlackReplier {
             tracing::warn!(
                 event = "gateway_progress_degraded",
                 transport = "slack",
-                surface = "reaction"
+                surface = "reaction",
+                "gateway.progress.degraded"
             );
         }
     }

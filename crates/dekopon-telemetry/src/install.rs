@@ -149,7 +149,7 @@ impl ConsoleSink {
                         tracing::warn!(
                             audit.event = "telemetry.console.dropped",
                             console.dropped.lines = total,
-                            "console log lines dropped"
+                            "telemetry.console.dropped"
                         );
                         if !NOTICE_DROPPED.get() {
                             reported = total;
@@ -261,7 +261,7 @@ impl ConsoleWorker {
             tracing::warn!(
                 audit.event = "telemetry.console.dropped",
                 console.dropped.lines = total,
-                "console log lines dropped"
+                "telemetry.console.dropped"
             );
         }
         Ok(())
@@ -394,8 +394,7 @@ impl Install {
         let tracer_provider = traces.map(|traces| {
             let tracer = traces.provider.tracer(traces.tracer_name);
             layers.push(
-                tracing_opentelemetry::layer()
-                    .with_tracer(tracer)
+                trace_layer(tracer)
                     .with_filter(otlp_filter(&traces.filter))
                     .boxed(),
             );
@@ -519,6 +518,17 @@ pub enum InstallError {
 #[error("{0}")]
 pub struct ShutdownError(String);
 
+fn trace_layer<S>(
+    tracer: opentelemetry_sdk::trace::Tracer,
+) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_error_events_to_status(false)
+}
+
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
@@ -527,6 +537,41 @@ mod tests {
     use tracing_subscriber::{Layer as _, layer::Context, layer::SubscriberExt as _, registry};
 
     use super::{TelemetryGuard, otlp_filter};
+
+    #[test]
+    fn an_error_field_on_an_event_does_not_set_its_span_status() {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::{
+            error::OTelSdkResult,
+            trace::{SdkTracerProvider, SpanData, SpanExporter},
+        };
+
+        #[derive(Clone, Debug, Default)]
+        struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+        impl SpanExporter for Exported {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                self.0.lock().extend(batch);
+                Ok(())
+            }
+        }
+
+        let exported = Exported::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        tracing::subscriber::with_default(
+            registry().with(super::trace_layer(provider.tracer("status-test"))),
+            || {
+                tracing::info_span!("model.complete").in_scope(|| {
+                    tracing::warn!(error = "upstream said something private");
+                });
+            },
+        );
+        let spans = exported.0.lock().clone();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].status, Status::Unset);
+    }
 
     thread_local! {
         static WRITER_DISPATCH: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> = const {
