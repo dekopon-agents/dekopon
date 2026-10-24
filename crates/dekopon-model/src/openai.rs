@@ -708,6 +708,8 @@ struct ChatStream {
     finished: bool,
     choices_seen: bool,
     finish_reason: Option<FinishReason>,
+    response_id: Option<String>,
+    model: Option<String>,
 }
 
 impl ChatStream {
@@ -717,7 +719,17 @@ impl ChatStream {
         on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         secrets: crate::diagnostic::DiagnosticSecrets<'_>,
     ) -> Result<ControlFlow<()>, InferenceError> {
-        record_model(chunk.id.as_deref(), chunk.model.as_deref(), secrets);
+        for (field, slot, value) in [
+            ("gen_ai.response.id", &mut self.response_id, chunk.id),
+            ("model.returned", &mut self.model, chunk.model),
+        ] {
+            if let Some(value) = value
+                && slot.as_ref() != Some(&value)
+            {
+                tracing::Span::current().record(field, secrets.sanitize(&value));
+                *slot = Some(value);
+            }
+        }
         if let Some(error) = chunk.error {
             return Err(stream_failure(error, secrets));
         }
@@ -1410,6 +1422,50 @@ mod tests {
             InferenceError::Protocol(crate::error::ProtocolFailure::ContinuationMismatch)
         ));
         assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_streamed_call_with_many_deltas_exports_its_outcome_and_usage_within_the_attribute_limit()
+     {
+        const DELTAS: usize = 300;
+        let delta = json!({"id":"chatcmpl-many","model":"reported-model","choices":[{"delta":{"content":"x"}}]});
+        let last = json!({"id":"chatcmpl-many","model":"reported-model","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":300,"total_tokens":311}});
+        let mut body = format!("data: {delta}\n\n").repeat(DELTAS);
+        body.push_str(&format!("data: {last}\n\ndata: [DONE]\n\n"));
+        let server = MockServer::start(vec![MockResponse::sse(&body).split(64)]);
+        let client =
+            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let (turn, span) = crate::trace_capture::exported_model_span(generate(
+            &client,
+            &[],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        ))
+        .await;
+        assert_eq!(turn.unwrap().content.map(|text| text.len()), Some(DELTAS));
+        let attribute = |key: &str| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map(|attribute| attribute.value.to_string())
+        };
+        assert_eq!(attribute("outcome").as_deref(), Some("success"));
+        assert_eq!(attribute("stream.deltas"), Some(DELTAS.to_string()));
+        for (key, value) in [
+            ("usage.input_tokens", "11"),
+            ("usage.output_tokens", "300"),
+            ("usage.total_tokens", "311"),
+        ] {
+            assert_eq!(attribute(key).as_deref(), Some(value), "{key}");
+        }
+        assert_eq!(span.dropped_attributes_count, 0);
+        assert!(
+            span.attributes.len()
+                < opentelemetry_sdk::trace::SpanLimits::default().max_attributes_per_span as usize,
+            "{}",
+            span.attributes.len()
+        );
     }
 
     #[tokio::test]

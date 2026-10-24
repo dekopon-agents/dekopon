@@ -27,10 +27,15 @@ pub(crate) struct SseFramer {
     ended: bool,
 }
 
+impl Drop for SseFramer {
+    fn drop(&mut self) {
+        tracing::Span::current().record("response.bytes", self.bytes);
+    }
+}
+
 impl SseFramer {
     fn push(&mut self, chunk: &[u8]) -> Result<(), crate::error::InferenceError> {
         self.bytes = self.bytes.saturating_add(chunk.len() as u64);
-        tracing::Span::current().record("response.bytes", self.bytes);
         if self.bytes > MAX_STREAM_BYTES {
             return Err(crate::error::ProtocolFailure::StreamTooLarge.into());
         }

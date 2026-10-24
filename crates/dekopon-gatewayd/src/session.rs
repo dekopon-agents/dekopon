@@ -2451,6 +2451,13 @@ async fn session(
         }
     };
     let delivered = progress.terminal(terminal).await;
+    if delivered {
+        tracing::info!(
+            target: "dekopon_gatewayd::audit",
+            { audit.event = "reply.delivered", outcome = completed_outcome },
+            "reply.delivered"
+        );
+    }
     if let Some((turn, window)) = pending_journal.take() {
         crate::memory::generation::persist(post_reply(), window, turn).await;
     }

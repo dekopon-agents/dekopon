@@ -332,12 +332,14 @@ impl RefreshingCredential for GithubAppCredential {
             "broker.credential.refresh",
             credential = %self.name,
             outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
             http.response.status_code = tracing::field::Empty,
         );
         let minted = match self.mint(now).instrument(span.clone()).await {
             Ok(minted) => minted,
             Err(error) => {
                 span.record("outcome", "failed");
+                span.record("otel.status_code", "error");
                 return Err(error);
             }
         };
