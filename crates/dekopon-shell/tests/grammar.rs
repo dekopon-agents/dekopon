@@ -3637,3 +3637,45 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
     );
     assert_eq!(outcome.output, "[1]");
 }
+
+#[test]
+fn substitution_and_parameter_words_match_bash() {
+    let cases = [
+        (r#"echo "$(case ready in ready) echo yes;; esac)""#, "yes"),
+        ("echo \"$(echo hi # a)\n)\"", "hi"),
+        ("echo \"$(cat <<EOF\na)\nEOF\n)\"", "a)"),
+        (r#"echo ${x:-'}'}"#, "}"),
+        (r#"echo ${x:-"("}"#, "("),
+        (r#"x=a/b; echo ${x/'/'/-}"#, "a-b"),
+        (r#"echo "[${x:-  a  b  }]""#, "[  a  b  ]"),
+        (r##"echo "[${x:-#fff}]""##, "[#fff]"),
+        (r#"echo "[${x:-a #b}]""#, "[a #b]"),
+        ("echo \"[${x:-a\tb}]\"", "[a\tb]"),
+        ("echo \"[${x:-a\nb}]\"", "[a\nb]"),
+        (r#"x=v; echo "[${x:+  a  b  }]""#, "[  a  b  ]"),
+        (r#"echo "[${x:=  a  b  }]" "[$x]""#, "[  a  b  ] [  a  b  ]"),
+    ];
+    let actual = cases
+        .iter()
+        .map(|(script, _)| run(script).output)
+        .collect::<Vec<_>>();
+    let expected = cases
+        .iter()
+        .map(|(_, expected)| *expected)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+
+    let refusals = [
+        "echo $(cat <<EOF)\nhi\nEOF\n",
+        "x=$(cat <<EOF)\nprobe upper --text hi\nEOF\n",
+        "echo \"$(cat <<EOF)\"\nhi\nEOF\n",
+    ];
+    let actual = refusals.map(|script| {
+        let outcome = run(script);
+        (outcome.exit_code, outcome.output)
+    });
+    let expected = refusals.map(|_| {
+        (ExitCode::SYNTAX, "dekopon-shell: syntax error: line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\"".to_owned())
+    });
+    assert_eq!(actual, expected);
+}

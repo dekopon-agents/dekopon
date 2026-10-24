@@ -5,13 +5,10 @@ use crate::{
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, Background,
         CaseClause, CasePattern, CaseStatement, Command, Conditional, ConditionalTest, ForLoop,
-        FunctionDefinition, IfStatement, Index, Modifier, Parameter, Pattern, Pipeline, Program,
-        Redirect, RedirectTarget, SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
+        FunctionDefinition, IfStatement, Pattern, Pipeline, Program, Redirect, RedirectTarget,
+        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
-    lexer::{
-        LexError, RawIndex, RawModifier, RawParameter, RawPart, RawWord, Token, TokenKind,
-        tokenize_at,
-    },
+    lexer::{LexError, Lexer, Token, TokenKind},
 };
 
 /// Without this ceiling, deeply nested command substitution overflows the native stack and aborts
@@ -80,15 +77,73 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
 }
 
 fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
-    let tokens = tokenize_at(source, depth)?;
-    let mut parser = Parser::new(source, tokens, depth);
-    let program = parser.parse_program(&[])?;
+    let mut parser = Parser::new(source, depth);
+    let result = parser.parse_program(&[]);
+    if let Some(error) = parser.lex_error.take() {
+        return Err(error.into());
+    }
+    let program = result?;
     if let Some(token) = parser.peek() {
         let line = token.line;
         let kind = token.kind.clone();
         return Err(ParseError::syntax(line, format!("unexpected {kind}")));
     }
     Ok(program)
+}
+
+pub(crate) fn parse_substitution(
+    source: &str,
+    depth: u32,
+    line: usize,
+) -> Result<(Program, usize), ParseError> {
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(too_deep(line, "command substitution `$( ... )`"));
+    }
+    let mut parser = Parser::new(source, depth + 1);
+    parser.substitution = true;
+    let result = parser.parse_program(&[]);
+    if let Some(error) = parser.lex_error.take() {
+        if let Some(close) = parser.lexer.pending_here_doc_close() {
+            parse_nested(&source[..close + 1], depth + 1)?;
+        }
+        return Err(error.into());
+    }
+    let program = result?;
+    let Some(token) = parser.peek() else {
+        return Err(ParseError::syntax(line, "unterminated $( ... )"));
+    };
+    let token_line = token.line;
+    let end = token.offset + 1;
+    match &token.kind {
+        TokenKind::RightParen => {
+            if parser.lexer.offset() != end {
+                // Reparse the bounded prefix to preserve the here-document's delimiter-specific refusal.
+                return parse_nested(&source[..end], depth + 1).and(Err(ParseError::syntax(
+                    token_line,
+                    "unterminated here-document",
+                )));
+            }
+            Ok((program, end))
+        }
+        kind @ (TokenKind::Word(_)
+        | TokenKind::Pipe
+        | TokenKind::Semicolon
+        | TokenKind::DoubleSemicolon
+        | TokenKind::Newline
+        | TokenKind::AndAnd
+        | TokenKind::OrOr
+        | TokenKind::Ampersand
+        | TokenKind::LeftParen
+        | TokenKind::LeftBrace
+        | TokenKind::RightBrace
+        | TokenKind::Redirect { .. }
+        | TokenKind::Duplicate { .. }
+        | TokenKind::Less
+        | TokenKind::HereDoc(_)
+        | TokenKind::LessParen) => {
+            Err(ParseError::syntax(token_line, format!("unexpected {kind}")))
+        }
+    }
 }
 
 fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), ParseError> {
@@ -134,15 +189,21 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     position: usize,
     depth: u32,
+    lexer: Lexer<'a>,
+    lex_error: Option<LexError>,
+    substitution: bool,
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, tokens: Vec<Token>, depth: u32) -> Self {
+    fn new(source: &'a str, depth: u32) -> Self {
         Self {
             source,
-            tokens,
+            tokens: Vec::new(),
             position: 0,
             depth,
+            lexer: Lexer::new(source, depth),
+            lex_error: None,
+            substitution: false,
         }
     }
 
@@ -158,19 +219,31 @@ impl<'a> Parser<'a> {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.position)
+    fn token_at(&mut self, position: usize) -> Option<&Token> {
+        while self.tokens.len() <= position && self.lex_error.is_none() {
+            self.lexer.set_parser_depth(self.depth);
+            match self.lexer.next_token() {
+                Ok(Some(token)) => self.tokens.push(token),
+                Ok(None) => break,
+                Err(error) => self.lex_error = Some(error),
+            }
+        }
+        self.tokens.get(position)
     }
 
-    fn peek_kind(&self) -> Option<&TokenKind> {
+    fn peek(&mut self) -> Option<&Token> {
+        self.token_at(self.position)
+    }
+
+    fn peek_kind(&mut self) -> Option<&TokenKind> {
         self.peek().map(|token| &token.kind)
     }
 
-    fn line(&self) -> usize {
-        self.peek().map_or_else(
-            || self.tokens.last().map_or(1, |token| token.line),
-            |token| token.line,
-        )
+    fn line(&mut self) -> usize {
+        match self.peek() {
+            Some(token) => token.line,
+            None => self.tokens.last().map_or(1, |token| token.line),
+        }
     }
 
     fn skip_newlines(&mut self) {
@@ -192,7 +265,7 @@ impl<'a> Parser<'a> {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    fn peek_reserved(&self) -> Option<&str> {
+    fn peek_reserved(&mut self) -> Option<&'static str> {
         match self.peek_kind()? {
             TokenKind::Word(word) => {
                 let literal = word.as_literal()?;
@@ -235,6 +308,9 @@ impl<'a> Parser<'a> {
         let mut statements = Vec::new();
         loop {
             self.skip_separators();
+            if self.substitution && matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
+                break;
+            }
             match self.peek_kind() {
                 None | Some(TokenKind::RightBrace | TokenKind::DoubleSemicolon) => break,
                 Some(_) => {}
@@ -252,6 +328,11 @@ impl<'a> Parser<'a> {
                 continue;
             }
             statements.push(statement);
+            if self.substitution && matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
+                break;
+            }
+            let reserved = self.peek_reserved().is_some();
+            let line = self.line();
             match self.peek_kind() {
                 None
                 | Some(
@@ -260,9 +341,8 @@ impl<'a> Parser<'a> {
                     | TokenKind::RightBrace
                     | TokenKind::DoubleSemicolon,
                 ) => {}
-                Some(TokenKind::Word(_)) if self.peek_reserved().is_some() => {}
+                Some(TokenKind::Word(_)) if reserved => {}
                 Some(other) => {
-                    let line = self.line();
                     let other = other.clone();
                     return Err(ParseError::syntax(
                         line,
@@ -285,7 +365,8 @@ impl<'a> Parser<'a> {
                 ),
             ));
         }
-        let end = self.peek().map_or(self.source.len(), |token| token.offset);
+        let source_end = self.source.len();
+        let end = self.peek().map_or(source_end, |token| token.offset);
         self.position += 1;
         let text = self.source.get(start..end).unwrap_or_default().trim();
         Ok(Statement::Background(Background {
@@ -339,10 +420,10 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         if !matches!(
-            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            self.token_at(self.position + 1).map(|token| &token.kind),
             Some(TokenKind::LeftParen)
         ) || !matches!(
-            self.tokens.get(self.position + 2).map(|token| &token.kind),
+            self.token_at(self.position + 2).map(|token| &token.kind),
             Some(TokenKind::RightParen)
         ) {
             return Ok(None);
@@ -456,14 +537,12 @@ impl<'a> Parser<'a> {
         self.expect_reserved("in", "a `for` loop")?;
 
         let mut words = Vec::new();
-        while let Some(TokenKind::Word(raw)) = self.peek_kind() {
+        while let Some(TokenKind::Word(word)) = self.peek_kind().cloned() {
             if self.peek_reserved() == Some("do") {
                 break;
             }
-            let raw = raw.clone();
             self.position += 1;
-            let depth = self.depth;
-            words.push(convert_word(&raw, line, depth)?);
+            words.push(word);
         }
 
         self.skip_separators();
@@ -480,16 +559,14 @@ impl<'a> Parser<'a> {
     fn parse_case(&mut self) -> Result<CaseStatement, ParseError> {
         self.expect_reserved("case", "a `case` statement")?;
         let line = self.line();
-        let Some(TokenKind::Word(raw)) = self.peek_kind() else {
+        let Some(TokenKind::Word(word)) = self.peek_kind() else {
             return Err(ParseError::syntax(
                 line,
                 "expected a word to match after `case`",
             ));
         };
-        let raw = raw.clone();
-        let depth = self.depth;
+        let subject = word.clone();
         self.position += 1;
-        let subject = convert_word(&raw, line, depth)?;
         self.skip_newlines();
         self.expect_reserved("in", "a `case` statement")?;
 
@@ -547,7 +624,7 @@ impl<'a> Parser<'a> {
 
     fn parse_case_pattern(&mut self) -> Result<CasePattern, ParseError> {
         let line = self.line();
-        let Some(TokenKind::Word(raw)) = self.peek_kind() else {
+        let Some(TokenKind::Word(word)) = self.peek_kind() else {
             let found = self
                 .peek_kind()
                 .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
@@ -556,17 +633,16 @@ impl<'a> Parser<'a> {
                 format!("expected a `case` pattern, found {found}"),
             ));
         };
-        let raw = raw.clone();
-        let depth = self.depth;
+        let word = word.clone();
+
         self.position += 1;
 
-        if raw.as_literal() == Some("*") {
+        if word.as_literal() == Some("*") {
             return Ok(CasePattern::Any);
         }
 
-        let word = convert_word(&raw, line, depth)?;
-        if word_is_constant(&raw) {
-            if let Some(character) = literal_pattern_metacharacter(&raw) {
+        if word_is_constant(&word) {
+            if let Some(character) = literal_pattern_metacharacter(&word) {
                 return Err(ParseError::syntax(
                     line,
                     unsupported_case_pattern(character),
@@ -643,13 +719,14 @@ impl<'a> Parser<'a> {
             return Ok(Command::Simple(self.parse_simple_command()?));
         };
         let redirects = self.parse_redirects()?;
+        check_duplication_order(&redirects, self.line())?;
         Ok(Command::Compound {
             statement: Box::new(statement),
             redirects,
         })
     }
 
-    fn peek_literal_word(&self, expected: &str) -> bool {
+    fn peek_literal_word(&mut self, expected: &str) -> bool {
         matches!(self.peek_kind(), Some(TokenKind::Word(word)) if word.as_literal() == Some(expected))
     }
 
@@ -720,20 +797,19 @@ impl<'a> Parser<'a> {
 
     fn parse_conditional_test(&mut self) -> Result<Conditional, ParseError> {
         let line = self.line();
-        let depth = self.depth;
-        let mut raws = Vec::new();
+        let mut words = Vec::new();
         loop {
             match self.peek_kind() {
                 Some(TokenKind::Word(word)) if word.as_literal() == Some("]]") => break,
                 Some(TokenKind::Word(word)) => {
                     let word = word.clone();
                     self.position += 1;
-                    raws.push(word);
+                    words.push(word);
                 }
                 Some(TokenKind::Less) => {
                     self.position += 1;
-                    raws.push(RawWord {
-                        parts: vec![RawPart::SingleQuoted("<".to_owned())],
+                    words.push(Word {
+                        parts: vec![WordPart::SingleQuoted("<".to_owned())],
                     });
                 }
                 Some(TokenKind::Redirect {
@@ -741,15 +817,15 @@ impl<'a> Parser<'a> {
                     append: false,
                 }) => {
                     self.position += 1;
-                    raws.push(RawWord {
-                        parts: vec![RawPart::SingleQuoted(">".to_owned())],
+                    words.push(Word {
+                        parts: vec![WordPart::SingleQuoted(">".to_owned())],
                     });
                 }
                 _ => break,
             }
         }
 
-        if raws.is_empty() {
+        if words.is_empty() {
             let found = self
                 .peek_kind()
                 .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
@@ -758,7 +834,7 @@ impl<'a> Parser<'a> {
                 format!("expected a condition inside `[[ ... ]]`, found {found}"),
             ));
         }
-        if raws.len() > 3 {
+        if words.len() > 3 {
             return Err(ParseError::syntax(
                 line,
                 "a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses",
@@ -766,7 +842,7 @@ impl<'a> Parser<'a> {
         }
 
         let mut check_right_pattern = false;
-        if let [_, operator, right] = raws.as_slice() {
+        if let [_, operator, right] = words.as_slice() {
             let operator = operator.as_literal().unwrap_or_default().to_owned();
             if operator == "=~" {
                 return Err(ParseError::syntax(
@@ -788,10 +864,6 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let words = raws
-            .iter()
-            .map(|raw| convert_word(raw, line, depth))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Conditional::Test(ConditionalTest {
             words,
             check_right_pattern,
@@ -827,21 +899,20 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Redirect { source, append }) => {
                     let (source, append) = (*source, *append);
                     let line = self.line();
-                    let depth = self.depth;
                     self.position += 1;
-                    let Some(TokenKind::Word(raw)) = self.peek_kind() else {
+                    let Some(TokenKind::Word(word)) = self.peek_kind() else {
                         return Err(ParseError::syntax(
                             line,
                             "expected an in-memory buffer name after a redirection operator",
                         ));
                     };
-                    let raw = raw.clone();
+                    let word = word.clone();
                     self.position += 1;
                     redirects.push(Redirect {
                         source,
                         target: RedirectTarget::Buffer {
                             append,
-                            target: convert_word(&raw, line, depth)?,
+                            target: word,
                         },
                     });
                 }
@@ -867,7 +938,6 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
-        check_duplication_order(&redirects, self.line())?;
         Ok(redirects)
     }
 
@@ -890,72 +960,28 @@ impl<'a> Parser<'a> {
         let mut after_empty_assignment = false;
 
         loop {
-            match self.peek_kind() {
-                Some(TokenKind::Word(raw)) => {
+            match self.peek_kind().cloned() {
+                Some(TokenKind::Word(word)) => {
                     if words.is_empty() && self.peek_reserved().is_some() {
                         break;
                     }
-                    let raw = raw.clone();
-                    let line = self.line();
-                    let depth = self.depth;
                     self.position += 1;
                     let assignment = if words.is_empty() {
-                        split_assignment(&raw)
+                        split_assignment(&word)
                     } else {
                         None
                     };
                     if let Some((name, value)) = assignment {
                         after_empty_assignment = value.parts.is_empty();
-                        assignments.push(Assignment {
-                            name,
-                            value: convert_word(&value, line, depth)?,
-                        });
+                        assignments.push(Assignment { name, value });
                         continue;
                     }
                     after_empty_assignment = false;
-                    words.push(convert_word(&raw, line, depth)?);
+                    words.push(word);
                 }
-                Some(TokenKind::Redirect { source, append }) => {
-                    let (source, append) = (*source, *append);
-                    let line = self.line();
-                    let depth = self.depth;
-                    self.position += 1;
-                    let Some(TokenKind::Word(raw)) = self.peek_kind() else {
-                        return Err(ParseError::syntax(
-                            line,
-                            "expected an in-memory buffer name after a redirection operator",
-                        ));
-                    };
-                    let raw = raw.clone();
-                    self.position += 1;
+                Some(TokenKind::Redirect { .. } | TokenKind::Duplicate { .. }) => {
                     after_empty_assignment = false;
-                    redirects.push(Redirect {
-                        source,
-                        target: RedirectTarget::Buffer {
-                            append,
-                            target: convert_word(&raw, line, depth)?,
-                        },
-                    });
-                }
-                Some(TokenKind::Duplicate { source, target }) => {
-                    let (source, target) = (*source, *target);
-                    let line = self.line();
-                    self.position += 1;
-                    if source == target {
-                        return Err(ParseError::syntax(
-                            line,
-                            format!(
-                                "`{}>&{}` redirects a stream onto itself and would do nothing",
-                                source.descriptor(),
-                                target.descriptor()
-                            ),
-                        ));
-                    }
-                    after_empty_assignment = false;
-                    redirects.push(Redirect {
-                        source,
-                        target: RedirectTarget::Stream(target),
-                    });
+                    redirects.extend(self.parse_redirects()?);
                 }
                 Some(TokenKind::LeftParen) => {
                     let line = self.line();
@@ -966,7 +992,7 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     if matches!(
-                        self.tokens.get(self.position + 1).map(|token| &token.kind),
+                        self.token_at(self.position + 1).map(|token| &token.kind),
                         Some(TokenKind::LeftParen)
                     ) {
                         return Err(ParseError::syntax(
@@ -980,13 +1006,14 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 Some(TokenKind::RightParen) => {
+                    if self.substitution {
+                        break;
+                    }
                     let line = self.line();
                     return Err(ParseError::syntax(line, "unexpected `)`"));
                 }
-                Some(TokenKind::HereDoc(raw)) => {
-                    let raw = raw.clone();
+                Some(TokenKind::HereDoc(word)) => {
                     let line = self.line();
-                    let depth = self.depth;
                     self.position += 1;
                     if here_doc.is_some() {
                         return Err(ParseError::syntax(
@@ -995,7 +1022,7 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     after_empty_assignment = false;
-                    here_doc = Some(convert_word(&raw, line, depth)?);
+                    here_doc = Some(word);
                 }
                 Some(TokenKind::LessParen) => {
                     let line = self.line();
@@ -1067,12 +1094,12 @@ pub(crate) fn expanded_pattern(character: char) -> String {
     )
 }
 
-fn word_is_constant(word: &RawWord) -> bool {
-    fn parts_are_constant(parts: &[RawPart]) -> bool {
+fn word_is_constant(word: &Word) -> bool {
+    fn parts_are_constant(parts: &[WordPart]) -> bool {
         parts.iter().all(|part| match part {
-            RawPart::Literal(_) | RawPart::SingleQuoted(_) => true,
-            RawPart::DoubleQuoted(inner) => parts_are_constant(inner),
-            RawPart::Parameter(_) | RawPart::CommandSubstitution(_) | RawPart::Arithmetic(_) => {
+            WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
+            WordPart::DoubleQuoted(inner) => parts_are_constant(inner),
+            WordPart::Parameter(_) | WordPart::CommandSubstitution(_) | WordPart::Arithmetic(_) => {
                 false
             }
         })
@@ -1084,9 +1111,9 @@ fn word_is_constant(word: &RawWord) -> bool {
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn literal_pattern_metacharacter(word: &RawWord) -> Option<char> {
+fn literal_pattern_metacharacter(word: &Word) -> Option<char> {
     word.parts.iter().find_map(|part| match part {
-        RawPart::Literal(text) => pattern_metacharacter(text),
+        WordPart::Literal(text) => pattern_metacharacter(text),
         _ => None,
     })
 }
@@ -1102,8 +1129,8 @@ fn is_valid_name(name: &str) -> bool {
     characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-fn split_assignment(word: &RawWord) -> Option<(String, RawWord)> {
-    let RawPart::Literal(first) = word.parts.first()? else {
+fn split_assignment(word: &Word) -> Option<(String, Word)> {
+    let WordPart::Literal(first) = word.parts.first()? else {
         return None;
     };
     let equals = first.find('=')?;
@@ -1114,71 +1141,15 @@ fn split_assignment(word: &RawWord) -> Option<(String, RawWord)> {
     let remainder = &first[equals + 1..];
     let mut parts = Vec::new();
     if !remainder.is_empty() {
-        parts.push(RawPart::Literal(remainder.to_owned()));
+        parts.push(WordPart::Literal(remainder.to_owned()));
     }
     parts.extend(word.parts.iter().skip(1).cloned());
-    Some((name.to_owned(), RawWord { parts }))
+    Some((name.to_owned(), Word { parts }))
 }
 
-fn convert_word(raw: &RawWord, line: usize, depth: u32) -> Result<Word, ParseError> {
-    Ok(Word {
-        parts: convert_parts(&raw.parts, line, depth)?,
-    })
-}
-
-fn convert_parts(raw: &[RawPart], line: usize, depth: u32) -> Result<Vec<WordPart>, ParseError> {
-    raw.iter()
-        .map(|part| convert_part(part, line, depth))
-        .collect::<Result<Vec<_>, _>>()
-}
-
-fn convert_part(raw: &RawPart, line: usize, depth: u32) -> Result<WordPart, ParseError> {
-    Ok(match raw {
-        RawPart::Literal(text) => WordPart::Literal(text.clone()),
-        RawPart::SingleQuoted(text) => WordPart::SingleQuoted(text.clone()),
-        RawPart::DoubleQuoted(parts) => WordPart::DoubleQuoted(convert_parts(parts, line, depth)?),
-        RawPart::Parameter(parameter) => {
-            WordPart::Parameter(convert_parameter(parameter, line, depth)?)
-        }
-        RawPart::CommandSubstitution(body) => {
-            if depth >= MAX_NESTING_DEPTH {
-                return Err(too_deep(line, "command substitution `$( ... )`"));
-            }
-            WordPart::CommandSubstitution(parse_nested(body, depth + 1)?)
-        }
-        RawPart::Arithmetic(body) => WordPart::Arithmetic(parse_arithmetic(body, line, depth)?),
-    })
-}
-
-fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Parameter, ParseError> {
-    Ok(match raw {
-        RawParameter::Named {
-            name,
-            indices,
-            modifier,
-            length,
-        } => Parameter::Named {
-            name: name.clone(),
-            indices: indices
-                .iter()
-                .map(|index| convert_index(index, line, depth))
-                .collect::<Result<Vec<_>, _>>()?,
-            modifier: convert_modifier(modifier, line, depth)?,
-            length: *length,
-        },
-        RawParameter::Positional(position) => Parameter::Positional(*position),
-        RawParameter::AllPositional => Parameter::AllPositional,
-        RawParameter::AllPositionalJoined => Parameter::AllPositionalJoined,
-        RawParameter::PositionalCount => Parameter::PositionalCount,
-        RawParameter::LastStatus => Parameter::LastStatus,
-        RawParameter::LastJob => Parameter::LastJob,
-    })
-}
-
-fn convert_pattern(raw: &RawWord, line: usize, depth: u32) -> Result<Pattern, ParseError> {
-    let word = convert_word(raw, line, depth)?;
-    if word_is_constant(raw) {
-        if let Some(character) = literal_pattern_metacharacter(raw) {
+pub(crate) fn parameter_pattern(word: Word, line: usize) -> Result<Pattern, ParseError> {
+    if word_is_constant(&word) {
+        if let Some(character) = literal_pattern_metacharacter(&word) {
             return Err(ParseError::syntax(
                 line,
                 unsupported_parameter_pattern(character),
@@ -1187,54 +1158,6 @@ fn convert_pattern(raw: &RawWord, line: usize, depth: u32) -> Result<Pattern, Pa
         return Ok(Pattern::Literal(word));
     }
     Ok(Pattern::Expanded(word))
-}
-
-fn convert_index(raw: &RawIndex, line: usize, depth: u32) -> Result<Index, ParseError> {
-    Ok(match raw {
-        RawIndex::At(word) => Index::At(convert_word(word, line, depth)?),
-        RawIndex::All => Index::All,
-        RawIndex::AllJoined => Index::AllJoined,
-    })
-}
-
-fn convert_modifier(raw: &RawModifier, line: usize, depth: u32) -> Result<Modifier, ParseError> {
-    Ok(match raw {
-        RawModifier::None => Modifier::None,
-        RawModifier::Default { colon, word } => Modifier::Default {
-            colon: *colon,
-            word: convert_word(word, line, depth)?,
-        },
-        RawModifier::Assign { colon, word } => Modifier::Assign {
-            colon: *colon,
-            word: convert_word(word, line, depth)?,
-        },
-        RawModifier::Require { colon, word } => Modifier::Require {
-            colon: *colon,
-            word: word
-                .as_ref()
-                .map(|word| convert_word(word, line, depth))
-                .transpose()?,
-        },
-        RawModifier::Alternate { colon, word } => Modifier::Alternate {
-            colon: *colon,
-            word: convert_word(word, line, depth)?,
-        },
-        RawModifier::StripPrefix(pattern) => {
-            Modifier::StripPrefix(convert_pattern(pattern, line, depth)?)
-        }
-        RawModifier::StripSuffix(pattern) => {
-            Modifier::StripSuffix(convert_pattern(pattern, line, depth)?)
-        }
-        RawModifier::Replace {
-            all,
-            pattern,
-            replacement,
-        } => Modifier::Replace {
-            all: *all,
-            pattern: convert_pattern(pattern, line, depth)?,
-            replacement: convert_word(replacement, line, depth)?,
-        },
-    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1406,7 +1329,11 @@ struct ArithParser {
     depth: u32,
 }
 
-fn parse_arithmetic(source: &str, line: usize, depth: u32) -> Result<ArithExpr, ParseError> {
+pub(crate) fn parse_arithmetic(
+    source: &str,
+    line: usize,
+    depth: u32,
+) -> Result<ArithExpr, ParseError> {
     let tokens = tokenize_arithmetic(source, line)?;
     if tokens.is_empty() {
         return Err(ParseError::syntax(line, "empty arithmetic expansion"));
@@ -1598,6 +1525,165 @@ mod tests {
         match parse(source).expect_err("must be rejected") {
             ParseError::Syntax { message, .. } => message,
             ParseError::Lex(error) => error.message,
+        }
+    }
+
+    #[test]
+    fn substitution_reports_unexpected_tokens_at_their_body_lines() {
+        let cases = [
+            ("$(echo })", "line 1: unexpected }"),
+            ("$(echo a ;; )", "line 1: unexpected ;;"),
+        ];
+        let actual = cases.map(|(source, _)| parse(source).expect_err(source).to_string());
+        let expected = cases.map(|(_, expected)| expected.to_owned());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pending_substitution_close_keeps_the_here_doc_refusal() {
+        let source = "echo \"$(cat <<EOF)\"\nhi\nEOF\n";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\""
+        );
+    }
+
+    #[test]
+    fn a_here_doc_interpolation_failure_keeps_its_own_refusal() {
+        let source = "echo $(cat <<EOF; case a in a) true;; esac\n`x`\nEOF\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 2: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+    }
+
+    #[test]
+    fn completed_here_doc_keeps_a_later_backtick_refusal() {
+        let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\n`x`\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 4: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+    }
+
+    #[test]
+    fn completed_here_doc_keeps_a_later_quote_refusal() {
+        let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\necho \"oops\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 4: unterminated double-quoted string"
+        );
+    }
+
+    #[test]
+    fn completed_empty_quoted_here_doc_keeps_a_later_backtick_refusal() {
+        let source = "echo $(cat <<'EOF'; case a in a) true;; esac\nEOF\n`x`\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 3: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+    }
+
+    #[test]
+    fn substitution_keeps_the_whole_case_program() {
+        let command = simple_command_of(r#"echo "$(case ready in ready) echo yes;; esac)""#);
+        assert_eq!(
+            command.words[1],
+            Word {
+                parts: vec![WordPart::DoubleQuoted(vec![WordPart::CommandSubstitution(
+                    crate::ast::Program {
+                        statements: vec![Statement::List(crate::ast::AndOrList {
+                            first: crate::ast::Pipeline {
+                                negated: false,
+                                commands: vec![Command::Compound {
+                                    redirects: vec![],
+                                    statement: Box::new(Statement::Case(
+                                        crate::ast::CaseStatement {
+                                            subject: Word {
+                                                parts: vec![WordPart::Literal("ready".to_owned())]
+                                            },
+                                            clauses: vec![crate::ast::CaseClause {
+                                                patterns: vec![CasePattern::Literal(Word {
+                                                    parts: vec![WordPart::Literal(
+                                                        "ready".to_owned()
+                                                    )]
+                                                })],
+                                                body: crate::ast::Program {
+                                                    statements: vec![Statement::List(
+                                                        crate::ast::AndOrList {
+                                                            first: crate::ast::Pipeline {
+                                                                negated: false,
+                                                                commands: vec![Command::Simple(
+                                                                    simple_command_of("echo yes")
+                                                                )],
+                                                            },
+                                                            rest: vec![],
+                                                        }
+                                                    )],
+                                                },
+                                            }],
+                                        }
+                                    )),
+                                }],
+                            },
+                            rest: vec![],
+                        })],
+                    }
+                )])]
+            }
+        );
+    }
+
+    #[test]
+    fn parameter_default_keeps_quoted_delimiters() {
+        for (source, part) in [
+            (r#"echo ${x:-'}'}"#, WordPart::SingleQuoted("}".to_owned())),
+            (
+                r#"echo ${x:-"("}"#,
+                WordPart::DoubleQuoted(vec![WordPart::Literal("(".to_owned())]),
+            ),
+        ] {
+            assert_eq!(
+                simple_command_of(source).words[1],
+                Word {
+                    parts: vec![WordPart::Parameter(crate::ast::Parameter::Named {
+                        name: "x".to_owned(),
+                        indices: vec![],
+                        length: false,
+                        modifier: crate::ast::Modifier::Default {
+                            colon: true,
+                            word: Word { parts: vec![part] }
+                        },
+                    })]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_default_keeps_whitespace_and_hash_text() {
+        for (source, text) in [
+            (r#"echo "${x:-  a  b  }""#, "  a  b  "),
+            (r##"echo "${x:-#fff}""##, "#fff"),
+        ] {
+            assert_eq!(
+                simple_command_of(source).words[1],
+                Word {
+                    parts: vec![WordPart::DoubleQuoted(vec![WordPart::Parameter(
+                        crate::ast::Parameter::Named {
+                            name: "x".to_owned(),
+                            indices: vec![],
+                            length: false,
+                            modifier: crate::ast::Modifier::Default {
+                                colon: true,
+                                word: Word {
+                                    parts: vec![WordPart::Literal(text.to_owned())]
+                                }
+                            },
+                        }
+                    )])]
+                }
+            );
         }
     }
 
