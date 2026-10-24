@@ -57,6 +57,40 @@ provider paths loads them directly. `check` publishes validated managed componen
 but loads without it, so each run compiles every provider. The peer-UID socket-parent check is runtime-only and skipped, and a configuration with no `identities`
 (the chart renders them into `peers.yaml`) is a warning rather than a problem.
 
+`--workflows DIR` (requires `--provider-set`) also checks essential workflows against the loaded
+candidate: every `*.yaml` file in `DIR`, read under the same file rules as `broker.d`.
+
+```yaml
+apiVersion: dekopon.dev/workflow/v1alpha1
+kind: EssentialWorkflows
+agent: nestedset-github
+subject: slack.t0123abc.u9xyz
+via: dekopon-gatewayd
+scope: {transport: nestedset, transportKind: slack, conversation: directMessage}
+workflows:
+  approve-pr:
+    - step: read
+      argv: [gh, pr, view, "7", -R, o/r, --json, "number,title,author,state,isDraft,headRefOid,baseRefOid"]
+      capability: gh.pull-request.read
+      requests: 1
+    - step: approve
+      argv: [gh, pr, review, "7", -R, o/r, --approve]
+      capability: gh.pull-request.approve
+      requests: 2
+```
+
+`via` names the attesting peer's principal among the candidate `identities`; `subject`, `agent`
+and `scope` form the attestation it would send, with trigger `message` and conversation
+coordinates the check fills in as canonical for the transport kind and subject. `argv` is literal:
+`argv[0]` is the command word. Each step, in order, must pass `grant` (the attestation resolves as
+the serving broker resolves it, `agent.prompt` included), `parse` (the provider's `run-command`
+proposes exactly `capability`), `grant` again for that capability, and, when `requests` is set,
+`budget` (`constraints.http.maxRequests` is at least `requests`; a capability without
+`constraints.http` allows none). The first failure is one problem,
+`would break essential workflows: <workflow>: <step>: <check>: <detail>`. Unknown keys, an empty
+workflow map or step list, `requests: 0` and a directory with no `*.yaml` file are refused when
+the files load. Nothing is invoked and nothing leaves the process.
+
 ## Configuration
 
 The configuration must be a regular single-link file owned by the server UID and must not be
