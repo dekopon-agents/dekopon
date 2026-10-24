@@ -124,7 +124,7 @@ impl LexError {
     }
 }
 
-// Parameter words and command bodies share native-stack depth before an execution budget exists.
+// Counts `${ }` nesting plus the parser depth at each enclosing `$( )`, not compound commands in the same command list.
 const MAX_PARAMETER_NESTING: u32 = 32;
 
 #[cfg(test)]
@@ -1093,6 +1093,14 @@ impl<'a> Lexer<'a> {
                     }
                     if depth == 0 {
                         let end = body_end.unwrap_or(index);
+                        if index != end + close.len_utf8() {
+                            return Err(LexError::new(
+                                opened,
+                                format!(
+                                    "unexpected text between the closing parentheses of {label}"
+                                ),
+                            ));
+                        }
                         return Ok(self.source[start..end].to_owned());
                     }
                 }
