@@ -76,10 +76,6 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
   gateway_uid="$(id -u lab-gateway)"
   ipc_gid="$(getent group lab-ipc | cut -d: -f3)"
   separation="separate UIDs"
-  if [ "$profile" = codex ]; then
-    gateway_uid="$(stat -c %u "$(dirname "$LAB_CODEX_AUTH_JSON")")"
-    separation="separate UIDs; gatewayd runs as the owner of the Codex auth directory"
-  fi
 else
   broker_uid="$(id -u)"
   gateway_uid="$broker_uid"
@@ -126,12 +122,18 @@ json.dump({"ref": "$ref", "sha": "$sha", "scenario": "$scenario", "profile": "$p
                     "separation": "$separation"}}, open(sys.argv[1], "w"), indent=1)
 PYMETA
 
+codex_flags=()
+if [ "$profile" = codex ]; then
+  codex_flags=(--codex-auth "$LAB_CODEX_AUTH_JSON" --max-turns "${LAB_CODEX_MAX_TURNS:-120}")
+  [ -z "${LAB_CODEX_MODEL:-}" ] || codex_flags+=(--codex-model "$LAB_CODEX_MODEL")
+  [ "${LAB_CODEX_SUMMARIZER:-0}" != 1 ] || codex_flags+=(--codex-summarizer)
+fi
 lab_status=0
 python3 "$lab/lab.py" --run "$run" --state "$state" --bin "$state/bin" --scenario "$scenario" \
   --profile "$profile" --otlp "http://127.0.0.1:$otlp_port" \
   --broker-uid "$broker_uid" --gateway-uid "$gateway_uid" --ipc-gid "$ipc_gid" \
   ${LAB_RUST_LOG:+--rust-log "$LAB_RUST_LOG"} ${LAB_REAL_MODEL:+--real-model "$LAB_REAL_MODEL"} \
-  ${LAB_CODEX_AUTH_JSON:+--codex-auth "$LAB_CODEX_AUTH_JSON"} ${LAB_CODEX_MODEL:+--codex-model "$LAB_CODEX_MODEL"} \
+  "${codex_flags[@]}" \
   || lab_status=$?
 
 docker stop --time 10 "$container" >/dev/null

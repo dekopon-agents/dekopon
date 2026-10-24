@@ -62,6 +62,8 @@ class Lab:
             real = {"model": args.real_model, "budget": self.budget}
         self.model = fakemodel.FakeModel(self.run / "model-calls.jsonl", real).start()
         self.summaries_on = True
+        self.codex_auth = self.dirs["gateway"] / "codex" / "auth.json"
+        self.codex_original = None
 
     def event(self, name, **fields):
         self.events.write(json.dumps({"utc": utc(), "t": time.time(), "event": name, **fields}) + "\n")
@@ -77,6 +79,8 @@ class Lab:
         for name, mode in (("broker", 0o700), ("gateway", 0o700)):
             self.dirs[name].mkdir(parents=True, exist_ok=True)
             self.own(self.dirs[name], name, mode)
+        if self.args.profile == "codex":
+            self.copy_codex_auth()
         self.dirs["ipc"].mkdir(parents=True, exist_ok=True)
         if os.geteuid() == 0:
             os.chown(self.dirs["ipc"], self.ids["broker"], self.ids["ipc"])
@@ -145,7 +149,7 @@ class Lab:
             "transports": [{"name": "dev", "kind": "local",
                             "socketPath": str(self.dirs["gateway"] / "dev.sock")}],
             "models": [self.chat_model(model),
-                       model("summarizer", fakemodel.SUMMARY_MODEL, ["summary"], SUMMARIZER_TIMEOUT_MS)],
+                       self.summarizer_model(model)],
             "routes": [route("summary", summary_memory),
                        route("plain", {"mode": "persistent", "recall": "journal"}),
                        route("none", {"mode": "persistent", "recall": "none"})],
@@ -154,11 +158,47 @@ class Lab:
             "telemetry": {"endpoint": self.args.otlp, "transport": "http",
                           "serviceName": "lab-gatewayd", "exportTimeoutMs": 5000}})
 
+    def codex_model(self, name, classes, timeout):
+        return {"name": name, "kind": "chatgptSubscription", "model": self.args.codex_model,
+                "authFile": str(self.codex_auth), "timeoutMs": timeout, "classes": classes}
+
     def chat_model(self, model):
         if self.args.profile == "codex":
-            return {"name": "chat", "kind": "chatgptSubscription", "model": self.args.codex_model,
-                    "authFile": self.args.codex_auth, "timeoutMs": 120000, "classes": ["reasoning"]}
+            return self.codex_model("chat", ["reasoning"], 120000)
         return model("chat", fakemodel.CHAT_MODEL, ["reasoning"], CHAT_TIMEOUT_MS)
+
+    def summarizer_model(self, model):
+        if self.args.profile == "codex" and self.args.codex_summarizer:
+            return self.codex_model("summarizer", ["summary"], SUMMARIZER_TIMEOUT_MS)
+        return model("summarizer", fakemodel.SUMMARY_MODEL, ["summary"], SUMMARIZER_TIMEOUT_MS)
+
+    def copy_codex_auth(self):
+        directory = self.dirs["gateway"] / "codex"
+        directory.mkdir(exist_ok=True)
+        self.own(directory, "gateway", 0o700)
+        self.codex_original = Path(self.args.codex_auth).read_bytes()
+        self.codex_auth.write_bytes(self.codex_original)
+        self.own(self.codex_auth, "gateway", 0o600)
+
+    def write_back_codex_auth(self):
+        if self.codex_original is None or not self.codex_auth.exists():
+            return
+        current = self.codex_auth.read_bytes()
+        if current == self.codex_original:
+            return
+        target = Path(self.args.codex_auth)
+        original = target.stat()
+        temporary = target.with_name(f".{target.name}.lab-{os.getpid()}")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as out:
+            out.write(current)
+            out.flush()
+            os.fsync(out.fileno())
+        if os.geteuid() == 0:
+            os.chown(temporary, original.st_uid, original.st_gid)
+        os.replace(temporary, target)
+        self.codex_original = current
+        self.event("codex-auth-written-back")
 
     def command(self, name, *arguments):
         who = "broker" if name == "brokerd" else "gateway"
@@ -256,9 +296,14 @@ class Lab:
     def close(self):
         for name in ("gatewayd", "brokerd"):
             self.stop(name)
+        self.write_back_codex_auth()
         self.sampling.set()
         self.model.close()
         self.events.close()
+
+
+class TurnBudgetExhausted(Exception):
+    pass
 
 
 def proc_status(pid):
@@ -296,6 +341,8 @@ class Conversation:
             self.socket = None
 
     def send(self, turn, phase="main", deadline=TURN_DEADLINE_S, **tag):
+        if self.lab.args.max_turns and len(self.lab.turns) >= self.lab.args.max_turns:
+            raise TurnBudgetExhausted
         if self.socket is None:
             self.connect()
         tag = {"turn": f"{self.id}-{turn}", **tag}
@@ -469,6 +516,8 @@ def main():
         parser.add_argument(f"--{name}", required=name not in optional)
     for name in ("broker-uid", "gateway-uid", "ipc-gid"):
         parser.add_argument(f"--{name}", type=int, required=True)
+    parser.add_argument("--codex-summarizer", action="store_true")
+    parser.add_argument("--max-turns", type=int, default=0)
     for name, default in (("cost-cap", 2.0), ("price-in", 0.15), ("price-out", 0.60)):
         parser.add_argument(f"--{name}", type=float, default=default)
     args = parser.parse_args()
@@ -498,6 +547,9 @@ def main():
             if lab.budget and lab.budget.exceeded.is_set():
                 status = "aborted: cost cap reached"
             time.sleep(2)
+    except TurnBudgetExhausted:
+        status = f"aborted: turn budget of {args.max_turns} reached"
+        lab.event("turn-budget-exhausted", turns=len(lab.turns))
     except KeyboardInterrupt:
         status = "interrupted"
     except Exception as error:
@@ -534,6 +586,9 @@ def write_outputs(lab, status):
                              row["wall_ms"], row["kind"], "yes" if row["summary_in_flight"] else "no",
                              "yes" if overlap else "no"])
     meta = json.loads((lab.run / "meta.json").read_text())
+    if lab.args.profile == "codex":
+        meta["codex"] = {"model": lab.args.codex_model, "summarizer_on_codex": lab.args.codex_summarizer,
+                         "turn_budget": lab.args.max_turns}
     meta.update(status=status, summarizer_timeout_ms=SUMMARIZER_TIMEOUT_MS, findings=lab.findings, cost=lab.budget.snapshot() if lab.budget else None,
                 finished_utc=utc())
     (lab.run / "meta.json").write_text(json.dumps(meta, indent=1))

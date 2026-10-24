@@ -92,12 +92,17 @@ tokens and refused with 402 once the token-priced spend, or the next request's w
 pass $2; the run then ends as `aborted: cost cap reached`. Scripted failures stay on the fake.
 
 `codex` makes the chat model dekopon's own `chatgptSubscription` client (`LAB_CODEX_MODEL`,
-default `gpt-5-codex`) with `authFile` set to `LAB_CODEX_AUTH_JSON`, used in place: it is never
-copied, read or printed by the lab. A refresh rewrites the file in its own directory, so the
-gateway runs as the UID that owns that directory, and the gateway is given the caller's proxy
-variables. The summarizer stays on the fake, so its scripted behaviours still apply; chat-side
-scripted failures (`act=fail|hang|refuse`) do not exist on this profile. Use a separate eval
-login: the refresh token rotates, and another holder of the same file loses it.
+default `gpt-5-codex`). The lab copies the file named by `LAB_CODEX_AUTH_JSON` into the private
+state directory (0600, gateway UID) and points `authFile` at the copy; it never prints or commits
+it, and the state directory is removed after the run. The refresh token rotates, so if the
+gateway refreshed the copy, the lab writes it back over the original (temporary file, 0600, the
+original's owner, rename) when the daemons stop; a run killed before that leaves the original
+holding a retired token. Use a separate eval login. The cap is a turn budget,
+`LAB_CODEX_MAX_TURNS` (default 120): the turn past it ends the run as `aborted: turn budget of
+N reached`. The summarizer stays on the fake, so its scripted behaviours still apply, unless
+`LAB_CODEX_SUMMARIZER=1` puts it on Codex too; chat-side scripted failures
+(`act=fail|hang|refuse`) do not exist on this profile. The gateway is given the caller's proxy
+variables.
 
 `traces.jsonl` is the collector's unmodified OTLP JSON: each span keeps `traceId`, `spanId`,
 `parentSpanId`, `name`, `kind`, start and end times, attributes, events and status.
