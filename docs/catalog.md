@@ -108,6 +108,17 @@ token, or an internal hostname in `instructions`.**
 Each `spec.skills` entry names a directory in the Agent Skills layout: a directory named after the
 skill, holding a `SKILL.md` and, optionally, supporting files beside it. A `SKILL.md` that uses the specification's front-matter keys loads here unchanged; a key the specification does not define is refused rather than ignored.
 
+A directory may also be a pinned provider's exported skill. A provider calls
+`dekopon_provider_sdk::skills!("gh/SKILL.md", ...)` with paths relative to its crate's `skills/`
+directory. Each file ships as raw bytes in a `dekopon:skill/<skill>/<path>` Wasm custom section.
+The skill name must follow `SkillId` and equal the provider ID or start with `<provider-id>-`.
+`dekopon-brokerd provider --lock-file L --store S skills --out DIR` exports the locked files
+offline; mount the resulting skill at `/etc/dekopon-skills/<skill>` and name that path in
+`spec.skills` as today. Export rejects hidden, empty, dot and parent path segments, duplicates,
+file/directory collisions, missing `SKILL.md`, non-UTF-8 text and the bounds below. Front matter
+is checked by the gateway's directory loader, not the exporter. See the
+[provider command contract](../crates/dekopon-brokerd/README.md#managed-provider-sets).
+
 `SKILL.md` opens with YAML front matter between `---` lines — the opening fence is the first line
 and the closing fence a line of its own; CRLF endings are tolerated — followed by the skill's
 Markdown instructions, its *body*. The front matter is strict, like every other authored document
@@ -151,7 +162,8 @@ What consumes a loaded skill:
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
   text.
 
-A skill is operator-authored text handed to the model, exactly as `instructions` is. It shapes how
+A skill is operator-authored text, or shipped by a pinned provider under the same bounds. It is
+handed to the model, exactly as `instructions` is, and shapes how
 the agent answers and nothing else: it cannot widen a capability, name a principal, or influence an
 authorization decision, and broker policy never reads it. It is also not private — the model reads
 any mounted skill in full through `read_skill`, and an authorized sender can list skill names,

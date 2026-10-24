@@ -120,6 +120,12 @@ enum ProviderCommand {
     List,
     /// Compile and repair locked components, then prune obsolete cwasm files.
     Precompile,
+    /// Export locked providers' embedded skills without network access.
+    Skills {
+        /// Empty or absent destination for skill directories.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+    },
     /// Verify locked bytes and the complete provider set without network access.
     Verify,
 }
@@ -422,6 +428,23 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
                 table
             })?;
         }
+        ProviderCommand::Skills { out } => {
+            let rows = manager.skills(&out).await.map_err(AppError::Provider)?;
+            render(output, &rows, || {
+                use std::fmt::Write as _;
+                let mut table = String::from("PROVIDER\tSKILL\tFILES\tBYTES\tSHA256\n");
+                for row in &rows {
+                    writeln!(
+                        &mut table,
+                        "{}\t{}\t{}\t{}\t{}",
+                        row.provider, row.skill, row.files, row.bytes, row.sha256
+                    )
+                    .expect("writing to a String cannot fail");
+                }
+                table.pop();
+                table
+            })?;
+        }
         ProviderCommand::Verify => {
             let report = manager.verify().await.map_err(AppError::Provider)?;
             render(output, &report, || {
@@ -620,6 +643,36 @@ mod tests {
         ])
         .expect("offline list parses without desired state");
         assert!(validate_cli(&list).is_ok());
+    }
+
+    #[test]
+    fn skills_has_its_own_required_destination_and_accepts_global_flags() {
+        let cli = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "provider",
+            "--lock-file=/store/providers.lock.yaml",
+            "--store=/store/store",
+            "skills",
+            "--out",
+            "/config/provider-skills",
+            "--output",
+            "json",
+        ])
+        .expect("skills parses");
+        assert!(validate_cli(&cli).is_ok());
+        let Some(Command::Provider(provider)) = cli.command else {
+            panic!("provider command")
+        };
+        assert_eq!(provider.output, OutputFormat::Json);
+        assert!(
+            matches!(provider.command, ProviderCommand::Skills { out } if out == std::path::Path::new("/config/provider-skills"))
+        );
+        let error = Cli::try_parse_from(["dekopon-brokerd", "provider", "skills"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

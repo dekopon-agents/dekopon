@@ -5,7 +5,7 @@ identifiers, `SkillId` follows the open Agent Skills name grammar rather than De
 grammar — lowercase ASCII letters, digits, and single hyphens, at most 64 bytes — so a skill
 authored for another client loads here unchanged and one authored here loads there.
 
-It also holds the small helpers that separate processes must not disagree about: the `accept()`
+It also holds the `SKILL.md` filename, skill file/resource byte, count and depth bounds, and the small helpers that separate processes must not disagree about: the `accept()`
 retry classification with its backoff bounds, `error_chain`, which renders a failure and its sources
 as one line, `ProviderFailureDetail`, the bounded `{ code, message }` pair a provider's own typed
 failure travels as from the broker to the audit record and the model, `read_trusted_file`, the one definition of what makes a local file trusted input —

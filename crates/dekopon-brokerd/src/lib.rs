@@ -65,7 +65,8 @@ pub use provider_manager::{
     HARD_MAX_PROVIDER_STATE_BYTES, HARD_MAX_PROVIDER_STORE_BLOBS, HARD_MAX_PROVIDER_STORE_BYTES,
     PROVIDER_ARTIFACT_TYPE, PROVIDER_LAYER_MEDIA_TYPE, ProviderLock, ProviderLockApiVersion,
     ProviderManager, ProviderManagerError, ProviderManagerOptions, ProviderManagerPaths,
-    ProviderSet, ProviderSetApiVersion, ProviderStatus, ProviderSyncReport, ProviderVerifyReport,
+    ProviderSet, ProviderSetApiVersion, ProviderSkillStatus, ProviderStatus, ProviderSyncReport,
+    ProviderVerifyReport,
 };
 pub use secrets::{
     HARD_MAX_SECRET_BYTES, HARD_MAX_SECRET_MAP_BYTES, HARD_MAX_SECRETS, SECRET_MAP_API_VERSION,

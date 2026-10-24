@@ -172,6 +172,16 @@ pub struct ProviderPrecompileReport {
     pub removed_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSkillStatus {
+    pub provider: ProviderId,
+    pub skill: dekopon_core::SkillId,
+    pub files: usize,
+    pub bytes: usize,
+    pub sha256: String,
+}
+
 pub struct ProviderManager {
     paths: ProviderManagerPaths,
     registry: RegistryClient,
@@ -353,6 +363,22 @@ impl ProviderManager {
         result
     }
 
+    pub async fn skills(
+        &self,
+        out: &Path,
+    ) -> Result<Vec<ProviderSkillStatus>, ProviderManagerError> {
+        let sources = load_locked_sources(
+            &self.paths.lock_file,
+            &self.paths.store,
+            socket::current_uid(),
+        )
+        .await?;
+        let out = out.to_path_buf();
+        tokio::task::spawn_blocking(move || export_skills(&sources, &out))
+            .await
+            .map_err(|source| ProviderManagerError::SkillExportTask { source })?
+    }
+
     pub async fn verify(&self) -> Result<ProviderVerifyReport, ProviderManagerError> {
         let uid = socket::current_uid();
         let lock = load_lock(&self.paths.lock_file, uid).await?;
@@ -362,6 +388,117 @@ impl ProviderManager {
             providers: lock.providers.len(),
         })
     }
+}
+
+fn export_skills(
+    sources: &[LockedProviderSource],
+    out: &Path,
+) -> Result<Vec<ProviderSkillStatus>, ProviderManagerError> {
+    match fs::symlink_metadata(out) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(ProviderManagerError::SkillOutputNotDirectory { path: out.into() });
+        }
+        Ok(_) => {
+            if fs::read_dir(out)
+                .map_err(|source| ProviderManagerError::io_at("read skill output", out, source))?
+                .next()
+                .transpose()
+                .map_err(|source| {
+                    ProviderManagerError::io_at("read skill output entry", out, source)
+                })?
+                .is_some()
+            {
+                return Err(ProviderManagerError::SkillOutputNotEmpty { path: out.into() });
+            }
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ProviderManagerError::io_at(
+                "inspect skill output",
+                out,
+                source,
+            ));
+        }
+    }
+    let mut skills =
+        BTreeMap::<String, (ProviderId, Vec<dekopon_broker_host::skills::SkillFile>)>::new();
+    for source in sources {
+        let bytes = source.read().map_err(ProviderManagerError::Host)?;
+        let files = dekopon_broker_host::skills::read(source.provider_id(), &bytes)
+            .map_err(|source| ProviderManagerError::SkillRead { source })?;
+        for file in files {
+            let skill = file.path.split_once('/').expect("reader validated path").0;
+            let entry = skills
+                .entry(skill.into())
+                .or_insert_with(|| (source.provider_id().clone(), Vec::new()));
+            if &entry.0 != source.provider_id() {
+                return Err(ProviderManagerError::DuplicateSkill {
+                    skill: skill.into(),
+                });
+            }
+            entry.1.push(file);
+        }
+    }
+    let reports = skills
+        .iter()
+        .map(|(skill, (provider, files))| {
+            let mut hash = Sha256::new();
+            let mut bytes = 0;
+            for file in files {
+                let relative = file.path.as_str();
+                hash.update((relative.len() as u64).to_be_bytes());
+                hash.update(relative.as_bytes());
+                hash.update((file.bytes.len() as u64).to_be_bytes());
+                hash.update(&file.bytes);
+                bytes += file.bytes.len();
+            }
+            ProviderSkillStatus {
+                provider: provider.clone(),
+                skill: skill.parse().expect("reader validated skill"),
+                files: files.len(),
+                bytes,
+                sha256: hex_digest(hash.finalize().as_slice()),
+            }
+        })
+        .collect();
+    create_skill_directory(out)?;
+    for (_, files) in skills.values() {
+        for file in files {
+            let path = out.join(&file.path);
+            let relative_parent = Path::new(&file.path)
+                .parent()
+                .expect("reader validated path");
+            let mut directory = out.to_path_buf();
+            for segment in relative_parent.components() {
+                directory.push(segment);
+                create_skill_directory(&directory)?;
+            }
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&path)
+                .map_err(|source| {
+                    ProviderManagerError::io_at("create skill file", &path, source)
+                })?;
+            output
+                .set_permissions(fs::Permissions::from_mode(0o644))
+                .map_err(|source| {
+                    ProviderManagerError::io_at("set skill file mode", &path, source)
+                })?;
+            output
+                .write_all(&file.bytes)
+                .map_err(|source| ProviderManagerError::io_at("write skill file", &path, source))?;
+        }
+    }
+    Ok(reports)
+}
+
+fn create_skill_directory(path: &Path) -> Result<(), ProviderManagerError> {
+    fs::create_dir_all(path)
+        .map_err(|source| ProviderManagerError::io_at("create skill directory", path, source))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .map_err(|source| ProviderManagerError::io_at("set skill directory mode", path, source))
 }
 
 pub(crate) async fn load_locked_sources(
@@ -2109,6 +2246,22 @@ fn path_suffix(path: &Option<PathBuf>) -> String {
 
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
+    #[error("could not join skill export")]
+    SkillExportTask {
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("provider skills refused")]
+    SkillRead {
+        #[source]
+        source: dekopon_broker_host::skills::SkillReadError,
+    },
+    #[error("skill output is not a directory: {}", path.display())]
+    SkillOutputNotDirectory { path: PathBuf },
+    #[error("skill output is not empty: {}", path.display())]
+    SkillOutputNotEmpty { path: PathBuf },
+    #[error("skill exported by multiple providers: {skill}")]
+    DuplicateSkill { skill: String },
     #[error("{reason}{}", detail_suffix(detail))]
     Configuration {
         reason: &'static str,
@@ -2669,15 +2822,7 @@ mod tests {
         directory: &Path,
         names: &[&str],
     ) -> (ProviderManager, ProviderManagerPaths) {
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-            .expect("private fixture directory");
-        let paths = ProviderManagerPaths {
-            provider_set: None,
-            lock_file: directory.join("providers.lock.yaml"),
-            store: directory.join("store"),
-        };
-        let store = ProviderStore::open(&paths.store, socket::current_uid(), true).expect("store");
-        let providers = names
+        let components = names
             .iter()
             .map(|name| {
                 let bytes = fs::read(
@@ -2686,9 +2831,30 @@ mod tests {
                         .join(format!("examples/providers/{name}-provider.wasm")),
                 )
                 .expect("checked component");
-                let digest = prefixed_sha256(&bytes);
+                (*name, bytes)
+            })
+            .collect::<Vec<_>>();
+        local_locked_fixture(directory, &components)
+    }
+
+    fn local_locked_fixture(
+        directory: &Path,
+        components: &[(&str, Vec<u8>)],
+    ) -> (ProviderManager, ProviderManagerPaths) {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("private fixture directory");
+        let paths = ProviderManagerPaths {
+            provider_set: None,
+            lock_file: directory.join("providers.lock.yaml"),
+            store: directory.join("store"),
+        };
+        let store = ProviderStore::open(&paths.store, socket::current_uid(), true).expect("store");
+        let providers = components
+            .iter()
+            .map(|(name, bytes)| {
+                let digest = prefixed_sha256(bytes);
                 let path = store.blob_path(&digest).expect("blob path");
-                fs::write(&path, &bytes).expect("install component");
+                fs::write(&path, bytes).expect("install component");
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure blob");
                 LockedProvider {
                     source: format!("ghcr.io/example/{name}:1.0.0"),
@@ -2713,6 +2879,161 @@ mod tests {
         })
         .expect("manager");
         (manager, paths)
+    }
+
+    fn skill_component(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut text = String::from("(component");
+        for (path, bytes) in files {
+            use std::fmt::Write as _;
+            write!(&mut text, " (@custom \"dekopon:skill/{path}\" \"").unwrap();
+            for byte in *bytes {
+                write!(&mut text, "\\{byte:02x}").unwrap();
+            }
+            text.push_str("\")");
+        }
+        text.push(')');
+        wat::parse_str(text).expect("generated skill component")
+    }
+
+    #[tokio::test]
+    async fn skills_exports_exact_bytes_modes_and_deterministic_rows_without_changing_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = skill_component(&[
+            ("gh/SKILL.md", b"skill\r\n"),
+            ("gh/references/a", b"resource"),
+            ("gh-review/SKILL.md", b"review"),
+        ]);
+        let second = skill_component(&[("other/SKILL.md", b"other")]);
+        let (manager, paths) =
+            local_locked_fixture(directory.path(), &[("gh", first), ("other", second)]);
+        let before = dekopon_test_support::snapshot_tree(&paths.store);
+        let lock = fs::read(&paths.lock_file).unwrap();
+        let out = directory.path().join("out");
+        let rows = manager.skills(&out).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    row.provider.as_str(),
+                    row.skill.as_str(),
+                    row.files,
+                    row.bytes
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("gh", "gh", 2, 15),
+                ("gh", "gh-review", 1, 6),
+                ("other", "other", 1, 5)
+            ]
+        );
+        let tree = dekopon_test_support::snapshot_tree(&out);
+        let files = tree
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| (entry.relative.to_str().unwrap(), entry.contents.as_slice()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            vec![
+                ("gh/SKILL.md", &b"skill\r\n"[..]),
+                ("gh/references/a", &b"resource"[..]),
+                ("gh-review/SKILL.md", &b"review"[..]),
+                ("other/SKILL.md", &b"other"[..])
+            ]
+        );
+        assert!(
+            tree.iter()
+                .all(|entry| entry.mode & 0o777 == if entry.is_dir { 0o755 } else { 0o644 })
+        );
+        assert_eq!(fs::metadata(&out).unwrap().mode() & 0o777, 0o755);
+        let again = directory.path().join("again");
+        assert_eq!(manager.skills(&again).await.unwrap(), rows);
+        let again_tree = dekopon_test_support::snapshot_tree(&again);
+        assert_eq!(again_tree, tree);
+        assert_eq!(dekopon_test_support::snapshot_tree(&paths.store), before);
+        assert_eq!(fs::read(&paths.lock_file).unwrap(), lock);
+    }
+
+    #[tokio::test]
+    async fn skill_digest_covers_file_paths_and_payloads() {
+        let mut digests = BTreeSet::new();
+        for (path, payload) in [
+            ("gh/a", &b"first"[..]),
+            ("gh/b", &b"first"[..]),
+            ("gh/a", &b"other"[..]),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (manager, _) = local_locked_fixture(
+                directory.path(),
+                &[(
+                    "gh",
+                    skill_component(&[("gh/SKILL.md", b"s"), (path, payload)]),
+                )],
+            );
+            let rows = manager.skills(&directory.path().join("out")).await.unwrap();
+            assert!(digests.insert(rows[0].sha256.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_provider_skill_names_refuse_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let component = skill_component(&[("gh-review/SKILL.md", b"review")]);
+        let (manager, _) = local_locked_fixture(
+            directory.path(),
+            &[("gh", component.clone()), ("gh-review", component)],
+        );
+        let out = directory.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let before = dekopon_test_support::snapshot_tree(&out);
+        assert!(matches!(
+            manager.skills(&out).await,
+            Err(ProviderManagerError::DuplicateSkill { .. })
+        ));
+        assert_eq!(dekopon_test_support::snapshot_tree(&out), before);
+    }
+
+    #[tokio::test]
+    async fn nonempty_skill_output_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _) = local_locked_fixture(
+            directory.path(),
+            &[("gh", skill_component(&[("gh/SKILL.md", b"s")]))],
+        );
+        let out = directory.path().join("out");
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("keep"), b"keep").unwrap();
+        let before = dekopon_test_support::snapshot_tree(&out);
+        assert!(matches!(
+            manager.skills(&out).await,
+            Err(ProviderManagerError::SkillOutputNotEmpty { .. })
+        ));
+        assert_eq!(dekopon_test_support::snapshot_tree(&out), before);
+    }
+
+    #[tokio::test]
+    async fn mismatched_locked_blob_refuses_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, paths) = local_locked_fixture(
+            directory.path(),
+            &[("gh", skill_component(&[("gh/SKILL.md", b"s")]))],
+        );
+        let source = load_locked_sources(&paths.lock_file, &paths.store, socket::current_uid())
+            .await
+            .unwrap()
+            .remove(0);
+        let mut bytes = fs::read(source.path()).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(source.path(), bytes).unwrap();
+        let out = directory.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let before = dekopon_test_support::snapshot_tree(&out);
+        assert!(matches!(
+            manager.skills(&out).await,
+            Err(ProviderManagerError::Host(
+                BrokerHostError::ArtifactDigestMismatch { .. }
+            ))
+        ));
+        assert_eq!(dekopon_test_support::snapshot_tree(&out), before);
     }
 
     async fn boot_locked(paths: &ProviderManagerPaths) {

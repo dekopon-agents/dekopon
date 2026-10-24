@@ -1547,7 +1547,7 @@ fn loaded_catalog_bytes(
             let root = skill.source();
             record_loaded(
                 &mut loaded,
-                root.join(dekopon_config::skill::SKILL_FILE_NAME),
+                root.join(dekopon_core::SKILL_FILE_NAME),
                 Cow::Borrowed(skill.file().as_bytes()),
             )?;
             for resource in skill.resources() {

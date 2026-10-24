@@ -208,6 +208,23 @@ fn describe_fallback(error: &serde_json::Error) -> String {
     .to_string()
 }
 
+/// Embed files relative to the calling crate's `skills/` directory as Wasm custom sections.
+/// Validation happens when the locked provider's skills are read for export.
+#[macro_export]
+macro_rules! skills {
+    ($($path:literal),* $(,)?) => {
+        $(
+            #[cfg(target_family = "wasm")]
+            const _: () = {
+                #[used]
+                #[unsafe(link_section = concat!("dekopon:skill/", $path))]
+                static FILE: [u8; include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/skills/", $path)).len()] =
+                    *include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/skills/", $path));
+            };
+        )*
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
