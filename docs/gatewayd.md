@@ -336,7 +336,7 @@ offsets, Slack thread ownership and Discord resume/identify state survive recove
 no dedup ring, so a Meta webhook retry — which happens only when its HTTP 200 is lost in the
 network — either joins an in-flight turn as a steer or starts a fresh one and gets a second reply.
 Discord's own resume sequence-number tracking already prevented a resumed connection from replaying
-an event the client had already received, so deleting its now-redundant `SeenIds` ring changes
+an event the client had already received, so deleting its now-redundant dedup ring changes
 nothing about resume.
 
 The fixed policy requires no configuration:

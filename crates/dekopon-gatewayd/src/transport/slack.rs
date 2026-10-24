@@ -3,7 +3,7 @@
 
 use parking_lot::Mutex;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -17,10 +17,7 @@ use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind}
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
-use tokio::{
-    net::TcpStream,
-    time::{Instant, timeout},
-};
+use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tracing::{Instrument as _, Span};
 
@@ -29,13 +26,13 @@ use crate::{
     config::{SLACK_ENDPOINT, SlackExperience},
     progress::ProgressText,
     transport::{
-        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
-        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES,
-        MessageId, MessageRef, NativeStatus, OutboundReply, PastMessage, ProgressLimits,
-        ProgressMessage, ReplyTarget, SeenIds, Status, StatusText, SteerAck, ThreadClaim,
-        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
-        asset_buffer, bound_inbound, credential_client, floor_boundary, receive_span,
-        record_conversation, reserve_for_chunk,
+        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, CappedReadError,
+        ChatDriver, ChatHistory, ChatTransport, Cooldown, InboundMessage, InboundReaction,
+        LivenessTarget, MAX_INBOUND_TEXT_BYTES, MessageId, MessageRef, NativeStatus, OutboundReply,
+        PastMessage, ProgressLimits, ProgressMessage, Recent, ReplyTarget, RetryAfter, Status,
+        StatusText, SteerAck, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
+        read_capped, receive_span, record_conversation,
     },
 };
 
@@ -55,8 +52,6 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(90);
 const LIVENESS_REACTION: &str = "tangerine";
 const PROGRESS_MAX_CHARS: usize = 4_000;
 const PROGRESS_MIN_EDIT_INTERVAL: Duration = Duration::from_secs(3);
-const MAX_PROGRESS_COOLDOWN: Duration = Duration::from_secs(60);
-const DEFAULT_PROGRESS_COOLDOWN: Duration = Duration::from_secs(5);
 const CANCEL_ACTION_ID: &str = "dekopon-cancel";
 const MAX_TRACKED_REACTIONS: usize = 256;
 const MAX_TRACKED_CHANNEL_KINDS: usize = 512;
@@ -73,8 +68,8 @@ pub(crate) struct SlackTransport {
     socket: Option<Socket>,
     identity: TransportIdentity,
     team_id: Option<String>,
-    seen: SeenIds,
-    channel_kinds: Tracked<SlackChannelKind>,
+    seen: Recent<String, ()>,
+    channel_kinds: Recent<String, SlackChannelKind>,
     pending: VecDeque<TransportEvent>,
     experience: SlackExperience,
     deadline: Duration,
@@ -106,15 +101,15 @@ impl SlackTransport {
                 agent_status_available: AtomicBool::new(true),
                 assistant_status_available: AtomicBool::new(true),
                 reaction_available: AtomicBool::new(true),
-                added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
-                progress_cooldown_until: Mutex::new(None),
+                added_reactions: Mutex::new(Recent::new(MAX_TRACKED_REACTIONS)),
+                progress_cooldown: Cooldown::default(),
                 bot_user: OnceLock::new(),
             }),
             socket: None,
             identity: TransportIdentity::default(),
             team_id: None,
-            seen: SeenIds::new(DEDUP_CAPACITY),
-            channel_kinds: Tracked::new(MAX_TRACKED_CHANNEL_KINDS),
+            seen: Recent::new(DEDUP_CAPACITY),
+            channel_kinds: Recent::new(MAX_TRACKED_CHANNEL_KINDS),
             pending: VecDeque::new(),
             experience,
             deadline: LIVENESS_DEADLINE,
@@ -367,7 +362,7 @@ impl SlackTransport {
         // the authoritative app_mention event arrives.
         let explicitly_addressed = event["type"].as_str() == Some("app_mention")
             || self.identity.is_addressed(&bound_inbound(top_text));
-        if !self.seen.insert(format!("{channel}:{ts}")) {
+        if !self.seen.remember(format!("{channel}:{ts}")) {
             return Ok(None);
         }
         let Some(posted_in) = self.channel_kind(channel, event, received).await else {
@@ -468,7 +463,7 @@ impl SlackTransport {
         if channel.is_empty() || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return unresolved("channel-id");
         }
-        if self.replier.progress_cooldown().is_some() {
+        if self.replier.progress_cooldown.remaining().is_some() {
             return unresolved("rate-limited");
         }
         let response = self
@@ -498,7 +493,9 @@ impl SlackTransport {
             }
         };
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            self.replier.begin_cooldown(retry_after(response.headers()));
+            self.replier
+                .progress_cooldown
+                .start(RetryAfter::from_header(response.headers()).wait);
             return unresolved("rate-limited");
         }
         let body = match check_ok(response).await {
@@ -677,8 +674,8 @@ pub(crate) struct SlackReplier {
     agent_status_available: AtomicBool,
     assistant_status_available: AtomicBool,
     reaction_available: AtomicBool,
-    added_reactions: Mutex<Tracked<()>>,
-    progress_cooldown_until: Mutex<Option<Instant>>,
+    added_reactions: Mutex<Recent<String, ()>>,
+    progress_cooldown: Cooldown,
     bot_user: OnceLock<String>,
 }
 
@@ -729,7 +726,7 @@ impl ChatDriver for SlackReplier {
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let backoff = retry_after(response.headers()).as_secs();
+            let backoff = RetryAfter::from_header(response.headers()).wait.as_secs();
             tracing::warn!(
                 event = "gateway_reply_rate_limited",
                 transport = "slack",
@@ -1369,12 +1366,8 @@ impl SlackReplier {
         Value::Array(blocks)
     }
 
-    fn begin_cooldown(&self, wait: Duration) {
-        *self.progress_cooldown_until.lock() = Some(Instant::now() + wait);
-    }
-
     async fn liveness_call(&self, method: &str, body: &Value) -> Result<Value, TransportError> {
-        if self.progress_cooldown().is_some() {
+        if self.progress_cooldown.remaining().is_some() {
             return Err(TransportError::Service {
                 code: "ratelimited".to_owned(),
             });
@@ -1399,7 +1392,8 @@ impl SlackReplier {
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            self.begin_cooldown(retry_after(response.headers()));
+            self.progress_cooldown
+                .start(RetryAfter::from_header(response.headers()).wait);
             return Err(TransportError::Service {
                 code: "ratelimited".to_owned(),
             });
@@ -1412,7 +1406,7 @@ impl SlackReplier {
         method: &str,
         query: &[(&str, &str)],
     ) -> Result<Value, TransportError> {
-        if self.progress_cooldown().is_some() {
+        if self.progress_cooldown.remaining().is_some() {
             return Err(TransportError::Service {
                 code: "ratelimited".to_owned(),
             });
@@ -1429,27 +1423,14 @@ impl SlackReplier {
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            self.begin_cooldown(retry_after(response.headers()));
+            self.progress_cooldown
+                .start(RetryAfter::from_header(response.headers()).wait);
             return Err(TransportError::Service {
                 code: "ratelimited".to_owned(),
             });
         }
         check_ok(response).await
     }
-
-    fn progress_cooldown(&self) -> Option<Duration> {
-        let until = (*self.progress_cooldown_until.lock())?;
-        until.checked_duration_since(Instant::now())
-    }
-}
-
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
-    let seconds = headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(DEFAULT_PROGRESS_COOLDOWN, Duration::from_secs);
-    seconds.min(MAX_PROGRESS_COOLDOWN)
 }
 
 fn markdown_block(text: &str) -> Value {
@@ -1502,43 +1483,6 @@ fn bare_list_marker(line: &str) -> Option<usize> {
     ((1..=9).contains(&digits) && rest.trim().is_empty()).then_some(digits)
 }
 
-struct Tracked<T> {
-    entries: VecDeque<(String, T)>,
-    capacity: usize,
-}
-
-impl<T> Tracked<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn get(&self, key: &str) -> Option<&T> {
-        self.entries
-            .iter()
-            .find(|(candidate, _)| candidate == key)
-            .map(|(_, value)| value)
-    }
-
-    fn insert(&mut self, key: String, value: T) {
-        self.entries.retain(|(candidate, _)| candidate != &key);
-        self.entries.push_back((key, value));
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-        }
-    }
-
-    fn take(&mut self, key: &str) -> Option<T> {
-        let index = self
-            .entries
-            .iter()
-            .position(|(candidate, _)| candidate == key)?;
-        self.entries.remove(index).map(|(_, value)| value)
-    }
-}
-
 fn permanent_agent_error(error: &TransportError) -> bool {
     matches!(
         error,
@@ -1563,13 +1507,13 @@ fn permanent_reaction_error(error: &TransportError) -> bool {
 }
 
 struct SlackThreadOwnership {
-    owned: Mutex<OwnedThreads>,
+    owned: Mutex<Recent<SlackThreadKey, ()>>,
 }
 
 impl SlackThreadOwnership {
     fn new(capacity: usize) -> Self {
         Self {
-            owned: Mutex::new(OwnedThreads::new(capacity)),
+            owned: Mutex::new(Recent::new(capacity)),
         }
     }
 
@@ -1582,12 +1526,12 @@ impl SlackThreadOwnership {
 impl ThreadOwnership for SlackThreadOwnership {
     fn claim(&self, claim: ThreadClaim) {
         let key = SlackThreadKey::from_claim(&claim);
-        self.owned.lock().claim(key);
+        self.owned.lock().insert(key, ());
     }
 
     fn revoke(&self, claim: &ThreadClaim) {
         let key = SlackThreadKey::from_claim(claim);
-        self.owned.lock().revoke(&key);
+        self.owned.lock().take(&key);
     }
 }
 
@@ -1612,46 +1556,6 @@ impl SlackThreadKey {
             channel_id: channel_id.to_ascii_lowercase(),
             thread_ts: thread_ts.to_owned(),
             user_id: user_id.to_ascii_lowercase(),
-        }
-    }
-}
-
-struct OwnedThreads {
-    order: VecDeque<SlackThreadKey>,
-    owned: HashSet<SlackThreadKey>,
-    capacity: usize,
-}
-
-impl OwnedThreads {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            owned: HashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn contains(&self, key: &SlackThreadKey) -> bool {
-        self.owned.contains(key)
-    }
-
-    fn claim(&mut self, key: SlackThreadKey) {
-        if self.owned.contains(&key) {
-            self.order.retain(|candidate| candidate != &key);
-        } else {
-            self.owned.insert(key.clone());
-        }
-        self.order.push_back(key);
-        while self.order.len() > self.capacity {
-            if let Some(evicted) = self.order.pop_front() {
-                self.owned.remove(&evicted);
-            }
-        }
-    }
-
-    fn revoke(&mut self, key: &SlackThreadKey) {
-        if self.owned.remove(key) {
-            self.order.retain(|candidate| candidate != key);
         }
     }
 }
@@ -1821,24 +1725,9 @@ impl AssetFetcher for SlackReplier {
                     code: response.status().as_u16().to_string(),
                 });
             }
-            // Response size is sender-controlled and a chunked response need not declare a length
-            // at all, so only the cutoff applied while reading each chunk actually bounds it.
-            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-            let mut body = asset_buffer(response.content_length(), limit);
-            while let Some(chunk) = response
-                .chunk()
+            read_capped(response, usize::try_from(max_bytes).unwrap_or(usize::MAX))
                 .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?
-            {
-                if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
-                    return Err(TransportError::Service {
-                        code: "asset-too-large".to_owned(),
-                    });
-                }
-                reserve_for_chunk(&mut body, chunk.len(), limit);
-                body.extend_from_slice(&chunk);
-            }
-            Ok(body)
+                .map_err(CappedReadError::asset_error)
         })
     }
 }
@@ -2030,9 +1919,9 @@ mod driver_tests {
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
-        CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
-        MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS,
-        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked, past_message,
+        CANCEL_ACTION_ID, Conversation, ConversationKind, Cooldown, HISTORY_PAGE_LIMIT,
+        MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS, Recent,
+        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, past_message,
     };
     use crate::{
         config::{SlackExperience, TemplateOverrides},
@@ -2089,8 +1978,8 @@ mod driver_tests {
             agent_status_available: AtomicBool::new(true),
             assistant_status_available: AtomicBool::new(true),
             reaction_available: AtomicBool::new(true),
-            added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
-            progress_cooldown_until: Mutex::new(None),
+            added_reactions: Mutex::new(Recent::new(MAX_TRACKED_REACTIONS)),
+            progress_cooldown: Cooldown::default(),
             bot_user: OnceLock::from(BOT_USER.to_owned()),
         }
     }
@@ -3534,7 +3423,7 @@ mod driver_tests {
             1,
             "the cooldown suppresses the next read"
         );
-        assert!(replier.progress_cooldown().is_some());
+        assert!(replier.progress_cooldown.remaining().is_some());
     }
 
     #[tokio::test]
@@ -3551,7 +3440,7 @@ mod driver_tests {
 
     #[test]
     fn a_full_stream_registry_forgets_the_oldest_stream_rather_than_growing() {
-        let mut tracked = Tracked::new(2);
+        let mut tracked = Recent::new(2);
 
         tracked.insert("first".to_owned(), 1_usize);
         tracked.insert("second".to_owned(), 2);
@@ -3572,7 +3461,7 @@ mod driver_tests {
 
 #[cfg(test)]
 mod owned_thread_tests {
-    use super::{OwnedThreads, SlackThreadKey};
+    use super::{Recent, SlackThreadKey};
 
     fn key(thread: &str, user: &str) -> SlackThreadKey {
         SlackThreadKey {
@@ -3588,12 +3477,12 @@ mod owned_thread_tests {
         let first = key("1.000001", "u1");
         let second = key("2.000002", "u1");
         let other_sender = key("1.000001", "u2");
-        let mut owned = OwnedThreads::new(2);
+        let mut owned = Recent::new(2);
 
-        owned.claim(first.clone());
-        owned.claim(second.clone());
-        owned.claim(first.clone());
-        owned.claim(other_sender.clone());
+        owned.insert(first.clone(), ());
+        owned.insert(second.clone(), ());
+        owned.insert(first.clone(), ());
+        owned.insert(other_sender.clone(), ());
 
         assert!(owned.contains(&first), "a refreshed claim remains owned");
         assert!(owned.contains(&other_sender));
@@ -3602,7 +3491,7 @@ mod owned_thread_tests {
             "the least recently authorized claim is evicted"
         );
 
-        owned.revoke(&first);
+        owned.take(&first);
         assert!(!owned.contains(&first));
         assert!(
             owned.contains(&other_sender),

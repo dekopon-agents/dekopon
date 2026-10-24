@@ -3,7 +3,7 @@
 //! opts in and a mention of the bot's managed role can then carry its text.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
@@ -27,13 +27,13 @@ use crate::{
     config::{DISCORD_ENDPOINT, LivenessMode, LivenessSettings},
     progress::ProgressText,
     transport::{
-        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
-        ChatTransport, InboundMessage, InboundReaction, LinkPreviews, LivenessTarget, MessageId,
-        MessageRef, OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget,
-        SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
-        floor_boundary, jitter_below, receive_span, record_conversation, reserve_for_chunk,
-        retry_after_from_body, split_message,
+        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, CappedReadError,
+        ChatDriver, ChatHistory, ChatTransport, Cooldown, InboundMessage, InboundReaction,
+        LinkPreviews, LivenessTarget, MessageId, MessageRef, OutboundReply, PastMessage,
+        ProgressLimits, ProgressMessage, Recent, ReplyTarget, RetryAfter, SteerAck, StreamLimits,
+        StreamedText, TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, bound_inbound, credential_client, floor_boundary, jitter_below, read_capped,
+        receive_span, record_conversation, split_message,
     },
 };
 
@@ -87,8 +87,8 @@ pub(crate) struct DiscordTransport {
     heartbeat_acked: bool,
     last_identify: Option<Instant>,
     message_content: MessageContent,
-    channels: Lookups<ChannelShape>,
-    bot_roles: Lookups<BotRole>,
+    channels: Recent<String, ChannelShape>,
+    bot_roles: Recent<String, BotRole>,
     pending: VecDeque<TransportEvent>,
     native: bool,
 }
@@ -142,8 +142,8 @@ impl DiscordTransport {
                 http,
                 production,
                 rest_lock: Mutex::new(()),
-                rest_cooldown_until: parking_lot::Mutex::new(None),
-                liveness_cooldown_until: parking_lot::Mutex::new(None),
+                rest_cooldown: Default::default(),
+                liveness_cooldown: Default::default(),
                 bot_user: OnceLock::new(),
             }),
             gateway_url: None,
@@ -158,8 +158,8 @@ impl DiscordTransport {
             heartbeat_acked: true,
             last_identify: None,
             message_content,
-            channels: Lookups::new(CHANNEL_SHAPE_CAPACITY),
-            bot_roles: Lookups::new(GUILD_ROLE_CAPACITY),
+            channels: Recent::new(CHANNEL_SHAPE_CAPACITY),
+            bot_roles: Recent::new(GUILD_ROLE_CAPACITY),
             pending: VecDeque::new(),
             native: liveness.mode == LivenessMode::Native,
         })
@@ -703,7 +703,7 @@ impl DiscordTransport {
     /// This never takes the driver's rest_lock, because that lock serializes replies and a 429 here
     /// must not stall the reader that also sends heartbeats.
     async fn lookup(&self, path: &str, event: &'static str) -> Option<Value> {
-        if self.driver.rest_cooldown().is_some() {
+        if self.driver.rest_cooldown.remaining().is_some() {
             tracing::debug!(event = event, transport = %self.name, cause = "rest-cooldown");
             return None;
         }
@@ -770,7 +770,7 @@ impl DiscordTransport {
     }
 
     async fn channel_shape(&mut self, channel_id: &str) -> Option<ChannelShape> {
-        if let Some(shape) = self.channels.get(channel_id) {
+        if let Some(shape) = self.channels.get(channel_id).cloned() {
             return Some(shape);
         }
         let body = self
@@ -803,7 +803,7 @@ impl DiscordTransport {
     }
 
     async fn bot_role(&mut self, guild_id: &str) -> Option<BotRole> {
-        if let Some(role) = self.bot_roles.get(guild_id) {
+        if let Some(role) = self.bot_roles.get(guild_id).cloned() {
             return Some(role);
         }
         let bot = self.identity.user_id.as_deref()?;
@@ -1033,37 +1033,6 @@ impl BotRole {
     }
 }
 
-struct Lookups<V> {
-    order: VecDeque<String>,
-    values: HashMap<String, V>,
-    capacity: usize,
-}
-
-impl<V: Clone> Lookups<V> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            values: HashMap::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn get(&self, key: &str) -> Option<V> {
-        self.values.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: String, value: V) {
-        if self.values.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
-            if self.order.len() > self.capacity
-                && let Some(evicted) = self.order.pop_front()
-            {
-                self.values.remove(&evicted);
-            }
-        }
-    }
-}
-
 pub(crate) struct DiscordDriver {
     endpoint: String,
     token: Redacted<String>,
@@ -1072,8 +1041,8 @@ pub(crate) struct DiscordDriver {
     /// This lock is held across one request only, because sleeping under it for a whole reply
     /// blocked every other session's answer and any in-flight attachment fetch.
     rest_lock: Mutex<()>,
-    rest_cooldown_until: parking_lot::Mutex<Option<Instant>>,
-    liveness_cooldown_until: parking_lot::Mutex<Option<Instant>>,
+    rest_cooldown: Cooldown,
+    liveness_cooldown: Cooldown,
     bot_user: OnceLock<String>,
 }
 
@@ -1235,14 +1204,8 @@ impl DiscordDriver {
             )
             .await?;
         if response.status().as_u16() == 429 {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let body = serde_json::from_slice::<Value>(&bytes)
-                .map_err(TransportError::MalformedResponse)?;
-            if let Some(retry) = retry_after_from_body(&body, MAX_RATE_LIMIT_WAIT) {
-                self.publish_rest_cooldown(retry.wait);
+            if let Some(retry) = RetryAfter::from_response(response, MAX_RATE_LIMIT_WAIT).await? {
+                self.rest_cooldown.start(retry.wait);
             }
             return Err(TransportError::Service {
                 code: "http-429".to_owned(),
@@ -1307,7 +1270,7 @@ impl TypingLease for DiscordDriver {
 
     async fn renew(&self, target: &LivenessTarget) -> Result<(), TransportError> {
         let (channel_id, _, _) = discord_coordinates(target)?;
-        if self.cooling_down() {
+        if self.liveness_cooldown.active() {
             return Ok(());
         }
         self.liveness_empty(self.http.post(format!(
@@ -1495,17 +1458,11 @@ impl CancelButton for DiscordDriver {
 }
 
 impl DiscordDriver {
-    fn cooling_down(&self) -> bool {
-        self.liveness_cooldown_until
-            .lock()
-            .is_some_and(|until| until > Instant::now())
-    }
-
     async fn liveness_send(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, TransportError> {
-        if self.cooling_down() {
+        if self.liveness_cooldown.active() {
             return Err(TransportError::Service {
                 code: "liveness-cooldown".to_owned(),
             });
@@ -1517,21 +1474,16 @@ impl DiscordDriver {
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         if response.status().as_u16() == 429 {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let body = serde_json::from_slice::<Value>(&bytes)
-                .map_err(TransportError::MalformedResponse)?;
-            let retry = retry_after_from_body(&body, MAX_LIVENESS_COOLDOWN)
+            let retry = RetryAfter::from_response(response, MAX_LIVENESS_COOLDOWN)
+                .await?
                 .ok_or(TransportError::Response)?;
-            *self.liveness_cooldown_until.lock() = Some(Instant::now() + retry.wait);
+            self.liveness_cooldown.start(retry.wait);
             return Err(TransportError::Service {
                 code: "http-429".to_owned(),
             });
         }
         if response.status().is_success() {
-            *self.liveness_cooldown_until.lock() = None;
+            self.liveness_cooldown.clear();
         }
         Ok(response)
     }
@@ -1639,69 +1591,45 @@ impl DiscordDriver {
     }
 
     async fn create_message(&self, channel_id: &str, body: &Value) -> Result<(), TransportError> {
-        let url = format!(
-            "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
-            self.endpoint
-        );
-        let encoded = encode(body)?;
-        let mut retried = false;
-        loop {
-            let response = self.post_message(&url, &encoded).await?;
-            if response.status().as_u16() == 429 {
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|source| TransportError::Request(Box::new(source)))?;
-                let body = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(TransportError::MalformedResponse)?;
-                let retry = retry_after_from_body(&body, MAX_RATE_LIMIT_WAIT)
-                    .ok_or(TransportError::Response)?;
-                if retried || retry.capped {
-                    return Err(TransportError::Service {
-                        code: "http-429".to_owned(),
-                    });
-                }
-                self.publish_rest_cooldown(retry.wait);
-                retried = true;
-                continue;
-            }
-            let response = decode(response).await?;
-            let response_id = response["id"].as_str().ok_or(TransportError::Response)?;
-            let response_channel = response["channel_id"]
-                .as_str()
-                .ok_or(TransportError::Response)?;
-            if !is_snowflake(response_id) || response_channel != channel_id {
-                return Err(TransportError::Response);
-            }
-            return Ok(());
-        }
+        self.create_reply(channel_id, body, None).await
     }
 
     async fn create_message_with_images(
         &self,
         channel_id: &str,
         body: &Value,
-        mut images: super::hydration::ImageQueue,
+        images: super::hydration::ImageQueue,
+    ) -> Result<(), TransportError> {
+        self.create_reply(channel_id, body, Some(images)).await
+    }
+
+    async fn create_reply(
+        &self,
+        channel_id: &str,
+        body: &Value,
+        mut images: Option<super::hydration::ImageQueue>,
     ) -> Result<(), TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
-        let attachments = images.filenames();
+        let attachments = images.as_ref().map(super::hydration::ImageQueue::filenames);
         let mut payload = body.clone();
-        payload["attachments"] = Value::Array(
-            attachments
-                .iter()
-                .enumerate()
-                .map(|(index, filename)| {
-                    json!({
-                        "id": index,
-                        "filename": filename,
-                        "description": "Attachment",
+        if let Some(attachments) = &attachments {
+            payload["attachments"] = Value::Array(
+                attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, filename)| {
+                        json!({
+                            "id": index,
+                            "filename": filename,
+                            "description": "Attachment",
+                        })
                     })
-                })
-                .collect(),
-        );
+                    .collect(),
+            );
+        }
         #[allow(
             clippy::map_err_ignore,
             reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
@@ -1710,43 +1638,43 @@ impl DiscordDriver {
         let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
-            let read = images.read_all().await?;
-            let mut form = reqwest::multipart::Form::new().text("payload_json", payload.clone());
-            for (index, image) in read.into_iter().enumerate() {
-                #[allow(
-                    clippy::map_err_ignore,
-                    reason = "mime_str only rejects strings that are not a media type, and \
-                              GeneratedImage::media_type returns a fixed IANA type"
-                )]
-                let part = reqwest::multipart::Part::bytes(image.bytes)
-                    .file_name(image.filename)
-                    .mime_str(&image.media_type)
-                    .map_err(|_| TransportError::Response)?;
-                form = form.part(format!("files[{index}]"), part);
-            }
-            let response = self
-                .send_rest(
-                    self.http
-                        .post(&url)
-                        .header("authorization", format!("Bot {}", self.token.expose()))
-                        .multipart(form),
-                )
-                .await?;
+            let request = self
+                .http
+                .post(&url)
+                .header("authorization", format!("Bot {}", self.token.expose()));
+            let request = if let Some(images) = &mut images {
+                let read = images.read_all().await?;
+                let mut form =
+                    reqwest::multipart::Form::new().text("payload_json", payload.clone());
+                for (index, image) in read.into_iter().enumerate() {
+                    #[allow(
+                        clippy::map_err_ignore,
+                        reason = "mime_str only rejects strings that are not a media type, and \
+                                  GeneratedImage::media_type returns a fixed IANA type"
+                    )]
+                    let part = reqwest::multipart::Part::bytes(image.bytes)
+                        .file_name(image.filename)
+                        .mime_str(&image.media_type)
+                        .map_err(|_| TransportError::Response)?;
+                    form = form.part(format!("files[{index}]"), part);
+                }
+                request.multipart(form)
+            } else {
+                request
+                    .header("content-type", "application/json")
+                    .body(payload.clone())
+            };
+            let response = self.send_rest(request).await?;
             if response.status().as_u16() == 429 {
-                let response_bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|source| TransportError::Request(Box::new(source)))?;
-                let body = serde_json::from_slice::<Value>(&response_bytes)
-                    .map_err(TransportError::MalformedResponse)?;
-                let retry = retry_after_from_body(&body, MAX_RATE_LIMIT_WAIT)
+                let retry = RetryAfter::from_response(response, MAX_RATE_LIMIT_WAIT)
+                    .await?
                     .ok_or(TransportError::Response)?;
                 if retried || retry.capped {
                     return Err(TransportError::Service {
                         code: "http-429".to_owned(),
                     });
                 }
-                self.publish_rest_cooldown(retry.wait);
+                self.rest_cooldown.start(retry.wait);
                 retried = true;
                 continue;
             }
@@ -1755,12 +1683,14 @@ impl DiscordDriver {
             let response_channel = response["channel_id"]
                 .as_str()
                 .ok_or(TransportError::Response)?;
-            let accepted_images = response["attachments"].as_array().is_some_and(|accepted| {
-                accepted.len() == attachments.len()
-                    && accepted.iter().zip(&attachments).all(|(value, filename)| {
-                        value["id"].as_str().is_some_and(is_snowflake)
-                            && value["filename"].as_str() == Some(filename.as_str())
-                    })
+            let accepted_images = attachments.as_ref().is_none_or(|attachments| {
+                response["attachments"].as_array().is_some_and(|accepted| {
+                    accepted.len() == attachments.len()
+                        && accepted.iter().zip(attachments).all(|(value, filename)| {
+                            value["id"].as_str().is_some_and(is_snowflake)
+                                && value["filename"].as_str() == Some(filename.as_str())
+                        })
+                })
             });
             if !is_snowflake(response_id) || response_channel != channel_id || !accepted_images {
                 return Err(TransportError::Response);
@@ -1769,27 +1699,12 @@ impl DiscordDriver {
         }
     }
 
-    async fn post_message(
-        &self,
-        url: &str,
-        encoded: &[u8],
-    ) -> Result<reqwest::Response, TransportError> {
-        self.send_rest(
-            self.http
-                .post(url)
-                .header("authorization", format!("Bot {}", self.token.expose()))
-                .header("content-type", "application/json")
-                .body(encoded.to_vec()),
-        )
-        .await
-    }
-
     async fn send_rest(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, TransportError> {
         for _ in 0..MAX_REST_COOLDOWN_WAITS {
-            let Some(wait) = self.rest_cooldown() else {
+            let Some(wait) = self.rest_cooldown.remaining() else {
                 break;
             };
             tokio::time::sleep(wait).await;
@@ -1799,15 +1714,6 @@ impl DiscordDriver {
             .send()
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))
-    }
-
-    fn publish_rest_cooldown(&self, wait: Duration) {
-        *self.rest_cooldown_until.lock() = Some(Instant::now() + wait);
-    }
-
-    fn rest_cooldown(&self) -> Option<Duration> {
-        let until = (*self.rest_cooldown_until.lock())?;
-        until.checked_duration_since(Instant::now())
     }
 
     fn allows_asset_url(&self, raw: &str) -> bool {
@@ -1859,7 +1765,7 @@ impl DiscordDriver {
         if !self.allows_asset_url(url) {
             return Err(TransportError::Response);
         }
-        let mut response = self
+        let response = self
             .http
             .get(url)
             .send()
@@ -1870,22 +1776,9 @@ impl DiscordDriver {
                 code: format!("http-{}", response.status().as_u16()),
             });
         }
-        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        let mut body = asset_buffer(response.content_length(), limit);
-        while let Some(chunk) = response
-            .chunk()
+        read_capped(response, usize::try_from(max_bytes).unwrap_or(usize::MAX))
             .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?
-        {
-            if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
-                return Err(TransportError::Service {
-                    code: "asset-too-large".to_owned(),
-                });
-            }
-            reserve_for_chunk(&mut body, chunk.len(), limit);
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
+            .map_err(CappedReadError::asset_error)
     }
 
     async fn refresh_asset_url(
@@ -2325,8 +2218,8 @@ mod unit_tests {
             http: client().expect("the shared client builds"),
             production: false,
             rest_lock: Mutex::new(()),
-            rest_cooldown_until: parking_lot::Mutex::new(None),
-            liveness_cooldown_until: parking_lot::Mutex::new(None),
+            rest_cooldown: Default::default(),
+            liveness_cooldown: Default::default(),
             bot_user: std::sync::OnceLock::from(BOT_USER.to_owned()),
         }
     }
@@ -3366,7 +3259,7 @@ mod unit_tests {
             "{throttled:?}"
         );
         assert!(
-            driver.rest_cooldown().is_some(),
+            driver.rest_cooldown.remaining().is_some(),
             "replies wait out the same limit"
         );
     }

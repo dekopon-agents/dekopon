@@ -12642,6 +12642,24 @@ fn a_download_url_away_from_slack_is_not_followed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_slack_download_refuses_an_asset_past_its_ceiling() {
+    let files = spawn_raw_http_mock(|_| (200, "image/png", vec![0; 2048]));
+    let transport = slack(&files.base);
+    let fetcher = transport
+        .asset_fetcher()
+        .expect("Slack fetches its own attachments");
+    let source = AssetSourceRef::Slack {
+        file_id: "F0123".to_owned(),
+        url: format!("{}/f/F0123/shot.png", files.base),
+    };
+    let error = fetcher
+        .fetch(&source, 1024)
+        .await
+        .expect_err("the file exceeds the attachment ceiling");
+    assert!(matches!(error, TransportError::Service { code } if code == "asset-too-large"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
     let elsewhere = spawn_raw_http_mock(|_| (200, "image/png", b"foreign bytes".to_vec()));
     let foreign = format!("{}/f/F0123/shot.png", elsewhere.base);

@@ -4,7 +4,7 @@ use std::{net::IpAddr, time::Instant};
 
 use tracing::Instrument as _;
 
-use crate::transport::{asset_buffer, hydration::HydratedImage, reserve_for_chunk};
+use crate::transport::{CappedReadError, hydration::HydratedImage, read_capped};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
@@ -63,10 +63,7 @@ fn request_failed(error: reqwest::Error) -> TransportError {
     TransportError::Request(Box::new(error.without_url()))
 }
 
-async fn read_body(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, TransportError> {
+async fn read_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, TransportError> {
     if !response.status().is_success() {
         return Err(failure(&format!("http-{}", response.status().as_u16())));
     }
@@ -76,15 +73,12 @@ async fn read_body(
     {
         return Err(failure("response-too-large"));
     }
-    let mut bytes = asset_buffer(response.content_length(), limit);
-    while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(failure("response-too-large"));
-        }
-        reserve_for_chunk(&mut bytes, chunk.len(), limit);
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    read_capped(response, limit)
+        .await
+        .map_err(|error| match error {
+            CappedReadError::TooLarge => failure("response-too-large"),
+            CappedReadError::Request(source) => request_failed(source),
+        })
 }
 
 async fn json_response(response: reqwest::Response) -> Result<Value, TransportError> {

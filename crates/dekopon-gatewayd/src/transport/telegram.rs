@@ -16,13 +16,13 @@ use crate::{
     config::{LivenessMode, LivenessSettings},
     progress::ProgressText,
     transport::{
-        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
-        ChatTransport, InboundMessage, InboundReaction, LinkPreviews, LivenessTarget, MessageId,
-        MessageRef, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SteerAck,
-        StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, asset_buffer, bound_inbound, credential_client,
-        floor_boundary, receive_span, record_conversation, reserve_for_chunk,
-        retry_after_from_body, split_message,
+        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, CappedReadError,
+        ChatDriver, ChatTransport, Cooldown, InboundMessage, InboundReaction, LinkPreviews,
+        LivenessTarget, MessageId, MessageRef, OutboundReply, ProgressLimits, ProgressMessage,
+        ReplyTarget, SteerAck, StreamLimits, StreamedText, TextStream, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, TypingLease, bound_inbound, credential_client,
+        floor_boundary, read_capped, receive_span, record_conversation, retry_after_from_body,
+        split_message,
     },
 };
 
@@ -96,7 +96,7 @@ impl TelegramTransport {
                 endpoint,
                 token: Redacted::new(token),
                 http,
-                liveness_cooldown_until: parking_lot::Mutex::new(None),
+                liveness_cooldown: Cooldown::default(),
             }),
             offset: 0,
             pending: VecDeque::new(),
@@ -433,7 +433,7 @@ impl AssetFetcher for TelegramDriver {
             let path = described["result"]["file_path"]
                 .as_str()
                 .ok_or(TransportError::Response)?;
-            let mut response = self
+            let response = self
                 .http
                 .get(format!(
                     "{}/file/bot{}/{path}",
@@ -448,18 +448,9 @@ impl AssetFetcher for TelegramDriver {
                     code: response.status().as_u16().to_string(),
                 });
             }
-            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-            let mut body = asset_buffer(response.content_length(), limit);
-            while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
-                if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
-                    return Err(TransportError::Service {
-                        code: "asset-too-large".to_owned(),
-                    });
-                }
-                reserve_for_chunk(&mut body, chunk.len(), limit);
-                body.extend_from_slice(&chunk);
-            }
-            Ok(body)
+            read_capped(response, usize::try_from(max_bytes).unwrap_or(usize::MAX))
+                .await
+                .map_err(CappedReadError::asset_error)
         })
     }
 }
@@ -468,7 +459,7 @@ pub(crate) struct TelegramDriver {
     endpoint: String,
     token: Redacted<String>,
     http: reqwest::Client,
-    liveness_cooldown_until: parking_lot::Mutex<Option<tokio::time::Instant>>,
+    liveness_cooldown: Cooldown,
 }
 
 #[async_trait]
@@ -657,11 +648,7 @@ impl TelegramDriver {
     }
 
     async fn liveness_call(&self, method: &str, body: &Value) -> Result<Value, TransportError> {
-        if self
-            .liveness_cooldown_until
-            .lock()
-            .is_some_and(|until| until > tokio::time::Instant::now())
-        {
+        if self.liveness_cooldown.active() {
             return Err(TransportError::Service {
                 code: "cooldown".to_owned(),
             });
@@ -684,11 +671,11 @@ impl TelegramDriver {
         let body =
             serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
         if body["ok"] == Value::Bool(true) {
-            *self.liveness_cooldown_until.lock() = None;
+            self.liveness_cooldown.clear();
             return Ok(body);
         }
         if let Some(retry) = retry_after_from_body(&body["parameters"], MAX_LIVENESS_COOLDOWN) {
-            *self.liveness_cooldown_until.lock() = Some(tokio::time::Instant::now() + retry.wait);
+            self.liveness_cooldown.start(retry.wait);
             return Err(TransportError::Service {
                 code: "retry-after".to_owned(),
             });
@@ -1214,7 +1201,7 @@ mod tests {
             http: credential_client(Duration::from_secs(5))
                 .build()
                 .expect("test client builds"),
-            liveness_cooldown_until: parking_lot::Mutex::new(None),
+            liveness_cooldown: Cooldown::default(),
         }
     }
 

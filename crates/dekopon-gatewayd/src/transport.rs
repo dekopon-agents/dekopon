@@ -1,13 +1,7 @@
 //! The subject is trusted only as service-authenticated routing metadata, never as content; message
 //! text is always untrusted and bounded before reaching a model.
 
-use std::{
-    collections::{HashSet, VecDeque},
-    fmt,
-    ops::Range,
-    sync::Arc,
-    time::Duration,
-};
+use std::{borrow::Borrow, collections::VecDeque, fmt, ops::Range, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dekopon_agent::attachment::GeneratedImage;
@@ -584,6 +578,43 @@ pub(crate) fn asset_buffer(declared: Option<u64>, limit: usize) -> Vec<u8> {
     Vec::with_capacity(hint)
 }
 
+pub(crate) enum CappedReadError {
+    TooLarge,
+    Request(reqwest::Error),
+}
+
+impl CappedReadError {
+    pub(crate) fn asset_error(self) -> TransportError {
+        match self {
+            Self::TooLarge => TransportError::Service {
+                code: "asset-too-large".to_owned(),
+            },
+            Self::Request(source) => TransportError::Request(Box::new(source)),
+        }
+    }
+}
+
+pub(crate) async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, CappedReadError> {
+    // Response size is sender-controlled and a chunked response need not declare a length
+    // at all, so only the cutoff applied while reading each chunk actually bounds it.
+    let mut body = asset_buffer(response.content_length(), limit);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|source| CappedReadError::Request(source.without_url()))?
+    {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(CappedReadError::TooLarge);
+        }
+        reserve_for_chunk(&mut body, chunk.len(), limit);
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 pub(crate) fn compact_json<T>(value: &T, suffix: &[u8]) -> Result<Vec<u8>, serde_json::Error>
 where
     T: serde::Serialize + ?Sized,
@@ -984,10 +1015,59 @@ pub(crate) fn jitter_below(upper: u64) -> u64 {
     u64::from_le_bytes(bytes) % upper
 }
 
+#[derive(Default)]
+pub(crate) struct Cooldown(parking_lot::Mutex<Option<tokio::time::Instant>>);
+
+impl Cooldown {
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        (*self.0.lock())?.checked_duration_since(tokio::time::Instant::now())
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.remaining().is_some_and(|wait| !wait.is_zero())
+    }
+
+    pub(crate) fn start(&self, wait: Duration) {
+        *self.0.lock() = Some(tokio::time::Instant::now() + wait);
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.0.lock() = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RetryAfter {
     pub wait: Duration,
     pub capped: bool,
+}
+
+impl RetryAfter {
+    pub(crate) fn from_header(headers: &reqwest::header::HeaderMap) -> Self {
+        let wait = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::from_secs(5), Duration::from_secs);
+        let max = Duration::from_secs(60);
+        Self {
+            wait: wait.min(max),
+            capped: wait > max,
+        }
+    }
+
+    pub(crate) async fn from_response(
+        response: reqwest::Response,
+        max: Duration,
+    ) -> Result<Option<Self>, TransportError> {
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        let body =
+            serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
+        Ok(retry_after_from_body(&body, max))
+    }
 }
 
 pub(crate) fn retry_after_from_body(body: &Value, max: Duration) -> Option<RetryAfter> {
@@ -1001,48 +1081,74 @@ pub(crate) fn retry_after_from_body(body: &Value, max: Duration) -> Option<Retry
     })
 }
 
-pub(crate) struct SeenIds {
-    order: VecDeque<String>,
-    seen: HashSet<String>,
+pub(crate) struct Recent<K, V> {
+    order: VecDeque<(K, V)>,
     capacity: usize,
 }
 
-impl SeenIds {
+impl<K: PartialEq, V> Recent<K, V> {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             order: VecDeque::with_capacity(capacity),
-            seen: HashSet::with_capacity(capacity),
             capacity,
         }
     }
 
+    pub(crate) fn get<Q: PartialEq + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.order
+            .iter()
+            .find(|(candidate, _)| candidate.borrow() == key)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn contains<Q: PartialEq + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
+        self.get(key).is_some()
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        self.take(&key);
+        self.order.push_back((key, value));
+        if self.order.len() > self.capacity {
+            self.order.pop_front();
+        }
+    }
+
+    pub(crate) fn take<Q: PartialEq + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
+        let index = self
+            .order
+            .iter()
+            .position(|(candidate, _)| candidate.borrow() == key)?;
+        self.order.remove(index).map(|(_, value)| value)
+    }
+}
+
+impl Recent<String, ()> {
     pub(crate) fn insert_if_absent(
         &mut self,
         key: &str,
         accept: impl FnOnce() -> bool,
     ) -> Result<bool, ()> {
-        if self.seen.contains(key) {
+        if self.contains(key) {
             return Ok(false);
         }
         if !accept() {
             return Err(());
         }
-        let inserted = self.insert(key.to_owned());
-        debug_assert!(inserted);
+        self.insert(key.to_owned(), ());
         Ok(true)
     }
 
-    pub(crate) fn insert(&mut self, key: String) -> bool {
-        if !self.seen.insert(key.clone()) {
-            return false;
-        }
-        self.order.push_back(key);
-        if self.order.len() > self.capacity
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.seen.remove(&evicted);
-        }
-        true
+    pub(crate) fn remember(&mut self, key: String) -> bool {
+        self.insert_if_absent(&key, || true).unwrap_or(false)
     }
 }
 
@@ -1070,7 +1176,7 @@ mod tests {
 
     use super::{
         BASE_RECONNECT_DELAY, MAX_RECONNECT_DELAY, MAX_RECONNECT_DOUBLINGS, RECONNECT_JITTER_MS,
-        SeenIds, TextUnit, TransportIdentity, asset_buffer, credential_client_from, is_stop_word,
+        Recent, TextUnit, TransportIdentity, asset_buffer, credential_client_from, is_stop_word,
         jitter_below, reconnect_delay, reserve_for_chunk, retry_after_from_body, split_message,
     };
 
@@ -1177,7 +1283,7 @@ mod tests {
 
     #[test]
     fn failed_acceptance_never_consumes_a_recent_delivery_id() {
-        let mut seen = SeenIds::new(1024);
+        let mut seen = Recent::new(1024);
         assert!(matches!(seen.insert_if_absent("guid", || false), Err(())));
         assert!(matches!(seen.insert_if_absent("guid", || true), Ok(true)));
         assert!(matches!(
@@ -1188,14 +1294,14 @@ mod tests {
 
     #[test]
     fn seen_identifiers_evict_oldest_first() {
-        let mut seen = SeenIds::new(2);
-        assert!(seen.insert("a".to_owned()));
-        assert!(seen.insert("b".to_owned()));
-        assert!(!seen.insert("a".to_owned()), "a repeat is refused");
+        let mut seen = Recent::new(2);
+        assert!(seen.remember("a".to_owned()));
+        assert!(seen.remember("b".to_owned()));
+        assert!(!seen.remember("a".to_owned()), "a repeat is refused");
 
-        assert!(seen.insert("c".to_owned()), "the ring accepts a third");
-        assert!(seen.insert("a".to_owned()), "the oldest was evicted");
-        assert!(!seen.insert("c".to_owned()), "the newest was retained");
+        assert!(seen.remember("c".to_owned()), "the ring accepts a third");
+        assert!(seen.remember("a".to_owned()), "the oldest was evicted");
+        assert!(!seen.remember("c".to_owned()), "the newest was retained");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::Instrument as _;
 
 use super::{
-    ChatDriver, ChatTransport, InboundMessage, MessageId, OutboundReply, ReplyTarget, SeenIds,
+    ChatDriver, ChatTransport, InboundMessage, MessageId, OutboundReply, Recent, ReplyTarget,
     TransportError, TransportEvent, TransportIdentity, bound_inbound, receive_span,
     record_conversation,
     webhook::{self, VerifyFailure},
@@ -98,7 +98,7 @@ struct StateData {
     generation: CurrentGeneration,
     sender: mpsc::Sender<InboundMessage>,
     // Serializes the acceptance decision with the only in-process dedupe owner.
-    accepted: Arc<Mutex<SeenIds>>,
+    accepted: Arc<Mutex<Recent<String, ()>>>,
     refusals: Arc<Mutex<RefusalLog>>,
     concurrent: Arc<Semaphore>,
 }
@@ -320,7 +320,7 @@ impl GithubTransport {
                 secret: Arc::new(Redacted::new(secret.into_bytes())),
                 generation,
                 sender,
-                accepted: Arc::new(Mutex::new(SeenIds::new(RECENT_DELIVERIES))),
+                accepted: Arc::new(Mutex::new(Recent::new(RECENT_DELIVERIES))),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 concurrent: Arc::new(Semaphore::new(webhook::MAX_WEBHOOK_CONCURRENCY)),
             },
@@ -424,7 +424,7 @@ mod tests {
                 secret: Arc::new(Redacted::new(b"secret".to_vec())),
                 generation: CurrentGeneration::boot(Arc::default(), Arc::default()),
                 sender,
-                accepted: Arc::new(Mutex::new(SeenIds::new(RECENT_DELIVERIES))),
+                accepted: Arc::new(Mutex::new(Recent::new(RECENT_DELIVERIES))),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 concurrent: Arc::new(Semaphore::new(1)),
             },
