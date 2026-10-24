@@ -81,7 +81,11 @@ workflows:
 
 `via` names the attesting peer's principal among the candidate `identities`; `subject`, `agent`
 and `scope` form the attestation it would send, with trigger `message` and conversation
-coordinates the check fills in as canonical for the transport kind and subject. `argv` is literal:
+coordinates the check fills in as canonical for the transport kind and subject. Only some of them
+are real values: the Slack container (the subject's team), a Telegram or WhatsApp direct-message id
+(the subject) and a GitHub `owner.repo`. The other conversation ids are placeholders, so a Cedar
+policy pinned to one real `context.conversation.id` denies in the check though it permits live.
+`argv` is literal:
 `argv[0]` is the command word. Each step, in order, must pass `grant` (the attestation resolves as
 the serving broker resolves it, `agent.prompt` included), `parse` (the provider's `run-command`
 proposes exactly `capability`), `grant` again for that capability, and, when `requests` is set,
