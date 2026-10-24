@@ -1,11 +1,14 @@
 //! Constructs the sandbox drops are tokenized rather than skipped, so the parser can reject them by
 //! name instead of silently discarding them, as it would a trailing ampersand.
 
-use std::{fmt, iter::Peekable, str::CharIndices};
+use std::{collections::VecDeque, fmt, iter::Peekable, str::CharIndices};
 
 use thiserror::Error;
 
-use crate::ast::Stream;
+use crate::{
+    ast::{Index, Modifier, Parameter, Stream, Word, WordPart},
+    parser::{self, ParseError},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Token {
@@ -16,7 +19,7 @@ pub struct Token {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
-    Word(RawWord),
+    Word(Word),
     Pipe,
     Semicolon,
     DoubleSemicolon,
@@ -31,7 +34,7 @@ pub enum TokenKind {
     Redirect { source: Stream, append: bool },
     Duplicate { source: Stream, target: Stream },
     Less,
-    HereDoc(RawWord),
+    HereDoc(Word),
     LessParen,
 }
 
@@ -74,95 +77,18 @@ impl fmt::Display for TokenKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RawWord {
-    pub parts: Vec<RawPart>,
-}
-
-impl RawWord {
-    #[must_use]
-    pub fn as_literal(&self) -> Option<&str> {
-        match self.parts.as_slice() {
-            [RawPart::Literal(text)] => Some(text),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn describe(&self) -> String {
-        self.as_literal().map_or_else(
-            || "with expansions".to_owned(),
-            |literal| format!("{literal:?}"),
-        )
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RawPart {
-    Literal(String),
-    SingleQuoted(String),
-    DoubleQuoted(Vec<RawPart>),
-    Parameter(RawParameter),
-    CommandSubstitution(String),
-    Arithmetic(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RawParameter {
-    Named {
-        name: String,
-        indices: Vec<RawIndex>,
-        modifier: RawModifier,
-        length: bool,
-    },
-    Positional(usize),
-    AllPositional,
-    AllPositionalJoined,
-    PositionalCount,
-    LastStatus,
-    LastJob,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RawIndex {
-    At(RawWord),
-    All,
-    AllJoined,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RawModifier {
-    None,
-    Default {
-        colon: bool,
-        word: RawWord,
-    },
-    Assign {
-        colon: bool,
-        word: RawWord,
-    },
-    Require {
-        colon: bool,
-        word: Option<RawWord>,
-    },
-    Alternate {
-        colon: bool,
-        word: RawWord,
-    },
-    StripPrefix(RawWord),
-    StripSuffix(RawWord),
-    Replace {
-        all: bool,
-        pattern: RawWord,
-        replacement: RawWord,
-    },
-}
-
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("line {line}: {message}")]
 pub struct LexError {
     pub line: usize,
     pub message: String,
+}
+
+fn lex_error(error: ParseError) -> LexError {
+    match error {
+        ParseError::Lex(error) => error,
+        ParseError::Syntax { line, message } => LexError::new(line, message),
+    }
 }
 
 const BACKTICK_REJECTION: &str = "backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly";
@@ -198,35 +124,20 @@ impl LexError {
     }
 }
 
-/// Nesting parameter expansions re-enters the tokenizer on the native stack, so without this
-/// ceiling, deeply nested expansions would abort the process instead of returning a lex error.
+// Parameter words and command bodies share native-stack depth before an execution budget exists.
 const MAX_PARAMETER_NESTING: u32 = 32;
 
 #[cfg(test)]
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_at(source, 0)
+    Lexer::new(source, 0).run()
 }
 
-pub(crate) fn tokenize_at(source: &str, depth: u32) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source, depth).run()
-}
-
-fn tokenize_nested(source: &str, depth: u32, line: usize) -> Result<Vec<Token>, LexError> {
-    if depth >= MAX_PARAMETER_NESTING {
-        return Err(LexError::new(
-            line,
-            format!("parameter expansions nested deeper than {MAX_PARAMETER_NESTING}"),
-        ));
-    }
-    Lexer::new(source, depth).run()
-}
-
-struct Lexer<'a> {
+pub(crate) struct Lexer<'a> {
     source: &'a str,
     chars: Peekable<CharIndices<'a>>,
     line: usize,
-    tokens: Vec<Token>,
-    parts: Vec<RawPart>,
+    tokens: VecDeque<Token>,
+    parts: Vec<WordPart>,
     literal: String,
     word_started: bool,
     word_line: usize,
@@ -234,15 +145,16 @@ struct Lexer<'a> {
     token_offset: usize,
     pending_here_docs: Vec<PendingHereDoc>,
     depth: u32,
+    block_depth: u32,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(source: &'a str, depth: u32) -> Self {
+    pub(crate) fn new(source: &'a str, depth: u32) -> Self {
         Self {
             source,
             chars: source.char_indices().peekable(),
             line: 1,
-            tokens: Vec::new(),
+            tokens: VecDeque::new(),
             parts: Vec::new(),
             literal: String::new(),
             word_started: false,
@@ -251,10 +163,32 @@ impl<'a> Lexer<'a> {
             token_offset: 0,
             pending_here_docs: Vec::new(),
             depth,
+            block_depth: 0,
         }
     }
 
     fn run(mut self) -> Result<Vec<Token>, LexError> {
+        let mut tokens = Vec::new();
+        while let Some(token) = self.next_token()? {
+            tokens.push(token);
+        }
+        Ok(tokens)
+    }
+
+    pub(crate) fn set_parser_depth(&mut self, depth: u32) {
+        self.block_depth = depth.saturating_sub(self.depth);
+    }
+
+    fn offset(&mut self) -> usize {
+        self.chars
+            .peek()
+            .map_or(self.source.len(), |(index, _)| *index)
+    }
+
+    pub(crate) fn next_token(&mut self) -> Result<Option<Token>, LexError> {
+        if !self.tokens.is_empty() && self.pending_here_docs.is_empty() {
+            return Ok(self.tokens.pop_front());
+        }
         while let Some((index, character)) = self.chars.next() {
             self.token_offset = index;
             match character {
@@ -284,6 +218,9 @@ impl<'a> Lexer<'a> {
                 }
                 other => self.push_literal(other),
             }
+            if !self.tokens.is_empty() && self.pending_here_docs.is_empty() {
+                return Ok(self.tokens.pop_front());
+            }
         }
         self.finish_word();
         if let Some(pending) = self.pending_here_docs.first() {
@@ -295,13 +232,13 @@ impl<'a> Lexer<'a> {
                 ),
             ));
         }
-        Ok(self.tokens)
+        Ok(self.tokens.pop_front())
     }
 
     fn push(&mut self, kind: TokenKind) {
         let line = self.line;
         let offset = self.token_offset;
-        self.tokens.push(Token { kind, line, offset });
+        self.tokens.push_back(Token { kind, line, offset });
     }
 
     fn push_literal(&mut self, character: char) {
@@ -320,11 +257,11 @@ impl<'a> Lexer<'a> {
     fn flush_literal(&mut self) {
         if !self.literal.is_empty() {
             let literal = std::mem::take(&mut self.literal);
-            self.parts.push(RawPart::Literal(literal));
+            self.parts.push(WordPart::Literal(literal));
         }
     }
 
-    fn push_part(&mut self, part: RawPart) {
+    fn push_part(&mut self, part: WordPart) {
         self.begin_word();
         self.flush_literal();
         self.parts.push(part);
@@ -338,8 +275,8 @@ impl<'a> Lexer<'a> {
         let parts = std::mem::take(&mut self.parts);
         let line = self.word_line;
         self.word_started = false;
-        self.tokens.push(Token {
-            kind: TokenKind::Word(RawWord { parts }),
+        self.tokens.push_back(Token {
+            kind: TokenKind::Word(Word { parts }),
             line,
             offset: self.word_offset,
         });
@@ -374,7 +311,7 @@ impl<'a> Lexer<'a> {
                 // An escaped character is recorded as a single-quoted part, not merged into literal
                 // text, so a case pattern can tell an escaped asterisk from the bare wildcard
                 // default, which would otherwise capture everything.
-                self.push_part(RawPart::SingleQuoted(character.to_string()));
+                self.push_part(WordPart::SingleQuoted(character.to_string()));
                 Ok(())
             }
             None => Err(LexError::new(
@@ -401,13 +338,13 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        self.push_part(RawPart::SingleQuoted(text));
+        self.push_part(WordPart::SingleQuoted(text));
         Ok(())
     }
 
     fn read_double_quoted(&mut self) -> Result<(), LexError> {
         let parts = self.read_interpolated(Some('"'), "unterminated double-quoted string")?;
-        self.push_part(RawPart::DoubleQuoted(parts));
+        self.push_part(WordPart::DoubleQuoted(parts));
         Ok(())
     }
 
@@ -418,7 +355,7 @@ impl<'a> Lexer<'a> {
         &mut self,
         terminator: Option<char>,
         unterminated: &str,
-    ) -> Result<Vec<RawPart>, LexError> {
+    ) -> Result<Vec<WordPart>, LexError> {
         let opened = self.line;
         let escapable: &[char] = if terminator == Some('"') {
             &['"', '\\', '$', '`']
@@ -458,7 +395,7 @@ impl<'a> Lexer<'a> {
                     match part {
                         Some(part) => {
                             if !literal.is_empty() {
-                                parts.push(RawPart::Literal(std::mem::take(&mut literal)));
+                                parts.push(WordPart::Literal(std::mem::take(&mut literal)));
                             }
                             parts.push(part);
                         }
@@ -475,7 +412,7 @@ impl<'a> Lexer<'a> {
             }
         }
         if !literal.is_empty() {
-            parts.push(RawPart::Literal(literal));
+            parts.push(WordPart::Literal(literal));
         }
         Ok(parts)
     }
@@ -498,8 +435,8 @@ impl<'a> Lexer<'a> {
         let (delimiter, expand) = self.read_here_doc_delimiter()?;
         let line = self.line;
         let token = self.tokens.len();
-        self.tokens.push(Token {
-            kind: TokenKind::HereDoc(RawWord { parts: Vec::new() }),
+        self.tokens.push_back(Token {
+            kind: TokenKind::HereDoc(Word { parts: Vec::new() }),
             line,
             offset: self.token_offset,
         });
@@ -582,13 +519,18 @@ impl<'a> Lexer<'a> {
             // produce.
             body.pop();
             let parts = if specification.expand {
-                Self::interpolate_here_doc_body(&body, specification.line, self.depth)?
+                Self::interpolate_here_doc_body(
+                    &body,
+                    specification.line,
+                    self.depth,
+                    self.block_depth,
+                )?
             } else if body.is_empty() {
                 Vec::new()
             } else {
-                vec![RawPart::Literal(body)]
+                vec![WordPart::Literal(body)]
             };
-            self.tokens[specification.token].kind = TokenKind::HereDoc(RawWord { parts });
+            self.tokens[specification.token].kind = TokenKind::HereDoc(Word { parts });
         }
         Ok(())
     }
@@ -637,8 +579,10 @@ impl<'a> Lexer<'a> {
         body: &str,
         line: usize,
         depth: u32,
-    ) -> Result<Vec<RawPart>, LexError> {
+        block_depth: u32,
+    ) -> Result<Vec<WordPart>, LexError> {
         let mut lexer = Lexer::new(body, depth);
+        lexer.block_depth = block_depth;
         lexer.line = line + 1;
         lexer
             .read_interpolated(None, "unterminated here-document")
@@ -653,7 +597,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn read_dollar_part(&mut self, dollar_index: usize) -> Result<Option<RawPart>, LexError> {
+    fn read_dollar_part(&mut self, dollar_index: usize) -> Result<Option<WordPart>, LexError> {
         let Some((_, next)) = self.chars.peek().copied() else {
             return Ok(None);
         };
@@ -663,10 +607,30 @@ impl<'a> Lexer<'a> {
                 if self.chars.peek().map(|(_, character)| *character) == Some('(') {
                     self.chars.next();
                     let body = self.read_balanced(dollar_index, '(', ')', 2, "$(( ... ))")?;
-                    return Ok(Some(RawPart::Arithmetic(body)));
+                    let line = if self.word_started {
+                        self.word_line
+                    } else {
+                        self.line
+                    };
+                    return Ok(Some(WordPart::Arithmetic(
+                        parser::parse_arithmetic(&body, line, self.depth + self.block_depth)
+                            .map_err(lex_error)?,
+                    )));
                 }
-                let body = self.read_balanced(dollar_index, '(', ')', 1, "$( ... )")?;
-                Ok(Some(RawPart::CommandSubstitution(body)))
+                let start = self.offset();
+                let (program, consumed) = parser::parse_substitution(
+                    &self.source[start..],
+                    self.depth + self.block_depth,
+                    self.line,
+                )
+                .map_err(lex_error)?;
+                let end = start + consumed;
+                while self.chars.peek().is_some_and(|(index, _)| *index < end) {
+                    if let Some((_, '\n')) = self.chars.next() {
+                        self.line += 1;
+                    }
+                }
+                Ok(Some(WordPart::CommandSubstitution(program)))
             }
             '{' => {
                 self.chars.next();
@@ -674,23 +638,23 @@ impl<'a> Lexer<'a> {
             }
             '?' => {
                 self.chars.next();
-                Ok(Some(RawPart::Parameter(RawParameter::LastStatus)))
+                Ok(Some(WordPart::Parameter(Parameter::LastStatus)))
             }
             '!' => {
                 self.chars.next();
-                Ok(Some(RawPart::Parameter(RawParameter::LastJob)))
+                Ok(Some(WordPart::Parameter(Parameter::LastJob)))
             }
             '@' => {
                 self.chars.next();
-                Ok(Some(RawPart::Parameter(RawParameter::AllPositional)))
+                Ok(Some(WordPart::Parameter(Parameter::AllPositional)))
             }
             '*' => {
                 self.chars.next();
-                Ok(Some(RawPart::Parameter(RawParameter::AllPositionalJoined)))
+                Ok(Some(WordPart::Parameter(Parameter::AllPositionalJoined)))
             }
             '#' => {
                 self.chars.next();
-                Ok(Some(RawPart::Parameter(RawParameter::PositionalCount)))
+                Ok(Some(WordPart::Parameter(Parameter::PositionalCount)))
             }
             digit if digit.is_ascii_digit() => {
                 self.chars.next();
@@ -700,14 +664,14 @@ impl<'a> Lexer<'a> {
                         .and_then(|value| u8::try_from(value).ok())
                         .unwrap_or_default(),
                 );
-                Ok(Some(RawPart::Parameter(RawParameter::Positional(position))))
+                Ok(Some(WordPart::Parameter(Parameter::Positional(position))))
             }
             first if first.is_ascii_alphabetic() || first == '_' => {
                 let name = self.read_name();
-                Ok(Some(RawPart::Parameter(RawParameter::Named {
+                Ok(Some(WordPart::Parameter(Parameter::Named {
                     name,
                     indices: Vec::new(),
-                    modifier: RawModifier::None,
+                    modifier: Modifier::None,
                     length: false,
                 })))
             }
@@ -728,29 +692,29 @@ impl<'a> Lexer<'a> {
         name
     }
 
-    fn read_braced_parameter(&mut self) -> Result<RawPart, LexError> {
+    fn read_braced_parameter(&mut self) -> Result<WordPart, LexError> {
         let line = self.line;
         match self.chars.peek().map(|(_, character)| *character) {
             Some('?') => {
                 self.chars.next();
                 self.expect_brace_close(line)?;
-                return Ok(RawPart::Parameter(RawParameter::LastStatus));
+                return Ok(WordPart::Parameter(Parameter::LastStatus));
             }
             Some('@') => {
                 self.chars.next();
                 self.expect_brace_close(line)?;
-                return Ok(RawPart::Parameter(RawParameter::AllPositional));
+                return Ok(WordPart::Parameter(Parameter::AllPositional));
             }
             Some('*') => {
                 self.chars.next();
                 self.expect_brace_close(line)?;
-                return Ok(RawPart::Parameter(RawParameter::AllPositionalJoined));
+                return Ok(WordPart::Parameter(Parameter::AllPositionalJoined));
             }
             Some('#') => {
                 self.chars.next();
                 if self.chars.peek().map(|(_, character)| *character) == Some('}') {
                     self.chars.next();
-                    return Ok(RawPart::Parameter(RawParameter::PositionalCount));
+                    return Ok(WordPart::Parameter(Parameter::PositionalCount));
                 }
                 return self.read_named_parameter(line, true);
             }
@@ -776,7 +740,7 @@ impl<'a> Lexer<'a> {
                         format!("positional parameter ${digits} is out of range"),
                     )
                 })?;
-                return Ok(RawPart::Parameter(RawParameter::Positional(position)));
+                return Ok(WordPart::Parameter(Parameter::Positional(position)));
             }
             _ => {}
         }
@@ -784,7 +748,7 @@ impl<'a> Lexer<'a> {
         self.read_named_parameter(line, false)
     }
 
-    fn read_named_parameter(&mut self, line: usize, length: bool) -> Result<RawPart, LexError> {
+    fn read_named_parameter(&mut self, line: usize, length: bool) -> Result<WordPart, LexError> {
         let name = self.read_name();
         if name.is_empty() {
             return Err(LexError::new(line, "empty ${} parameter reference"));
@@ -792,7 +756,7 @@ impl<'a> Lexer<'a> {
 
         let mut indices = Vec::new();
         while self.chars.peek().map(|(_, character)| *character) == Some('[') {
-            if matches!(indices.last(), Some(RawIndex::All | RawIndex::AllJoined)) {
+            if matches!(indices.last(), Some(Index::All | Index::AllJoined)) {
                 return Err(LexError::new(
                     line,
                     format!(
@@ -805,7 +769,7 @@ impl<'a> Lexer<'a> {
         }
 
         let modifier = self.read_modifier(line, &name, length)?;
-        Ok(RawPart::Parameter(RawParameter::Named {
+        Ok(WordPart::Parameter(Parameter::Named {
             name,
             indices,
             modifier,
@@ -818,11 +782,11 @@ impl<'a> Lexer<'a> {
         line: usize,
         name: &str,
         length: bool,
-    ) -> Result<RawModifier, LexError> {
+    ) -> Result<Modifier, LexError> {
         let first = match self.chars.peek().map(|(_, character)| *character) {
             Some('}') => {
                 self.chars.next();
-                return Ok(RawModifier::None);
+                return Ok(Modifier::None);
             }
             Some(character) => character,
             None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
@@ -848,22 +812,22 @@ impl<'a> Lexer<'a> {
         };
 
         let modifier = match operator {
-            '-' => RawModifier::Default {
+            '-' => Modifier::Default {
                 colon,
                 word: self.read_modifier_word(line, &['}'])?.0,
             },
-            '=' => RawModifier::Assign {
+            '=' => Modifier::Assign {
                 colon,
                 word: self.read_modifier_word(line, &['}'])?.0,
             },
             '?' => {
                 let word = self.read_modifier_word(line, &['}'])?.0;
-                RawModifier::Require {
+                Modifier::Require {
                     colon,
                     word: (!word.parts.is_empty()).then_some(word),
                 }
             }
-            '+' => RawModifier::Alternate {
+            '+' => Modifier::Alternate {
                 colon,
                 word: self.read_modifier_word(line, &['}'])?.0,
             },
@@ -882,9 +846,13 @@ impl<'a> Lexer<'a> {
                 }
                 let pattern = self.read_modifier_word(line, &['}'])?.0;
                 if operator == '#' {
-                    RawModifier::StripPrefix(pattern)
+                    Modifier::StripPrefix(
+                        parser::parameter_pattern(pattern, line).map_err(lex_error)?,
+                    )
                 } else {
-                    RawModifier::StripSuffix(pattern)
+                    Modifier::StripSuffix(
+                        parser::parameter_pattern(pattern, line).map_err(lex_error)?,
+                    )
                 }
             }
             '/' => {
@@ -896,11 +864,11 @@ impl<'a> Lexer<'a> {
                 let replacement = if terminator == '/' {
                     self.read_modifier_word(line, &['}'])?.0
                 } else {
-                    RawWord { parts: Vec::new() }
+                    Word { parts: Vec::new() }
                 };
-                RawModifier::Replace {
+                Modifier::Replace {
                     all,
-                    pattern,
+                    pattern: parser::parameter_pattern(pattern, line).map_err(lex_error)?,
                     replacement,
                 }
             }
@@ -923,67 +891,81 @@ impl<'a> Lexer<'a> {
         &mut self,
         line: usize,
         terminators: &[char],
-    ) -> Result<(RawWord, char), LexError> {
-        let mut text = String::new();
-        let mut braces = 0_usize;
-        let mut parens = 0_usize;
-        loop {
-            let Some((_, character)) = self.chars.peek().copied() else {
-                return Err(LexError::new(line, "unterminated ${} parameter reference"));
-            };
-            if braces == 0 && parens == 0 && terminators.contains(&character) {
-                self.chars.next();
-                let word = if text.is_empty() {
-                    RawWord { parts: Vec::new() }
-                } else {
-                    self.sub_word(line, &text)?
-                };
-                return Ok((word, character));
-            }
+    ) -> Result<(Word, char), LexError> {
+        if let Some((_, character)) = self.chars.peek().copied()
+            && terminators.contains(&character)
+        {
             self.chars.next();
-            match character {
-                '{' => braces += 1,
-                '}' => braces = braces.saturating_sub(1),
-                '(' => parens += 1,
-                ')' => parens = parens.saturating_sub(1),
-                '\n' => self.line += 1,
-                '\\' => {
-                    text.push(character);
-                    if let Some((_, escaped)) = self.chars.next() {
-                        text.push(escaped);
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            text.push(character);
+            return Ok((Word::default(), character));
         }
+        let mut lexer = self.parameter_lexer(self.source, line)?;
+        lexer.chars = self.chars.clone();
+        lexer.line = self.line;
+        let result = lexer.read_parameter_word(line, terminators);
+        self.chars = lexer.chars;
+        self.line = lexer.line;
+        result
     }
 
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
-    fn sub_word(&mut self, line: usize, text: &str) -> Result<RawWord, LexError> {
-        let tokens = tokenize_nested(text, self.depth + 1, line)?;
-        let mut parts = Vec::new();
-        for (index, token) in tokens.into_iter().enumerate() {
-            match token.kind {
-                TokenKind::Word(word) => {
-                    if index > 0 {
-                        parts.push(RawPart::SingleQuoted(" ".to_owned()));
-                    }
-                    parts.extend(word.parts);
-                }
-                other => {
+    fn parameter_lexer<'b>(&self, source: &'b str, line: usize) -> Result<Lexer<'b>, LexError> {
+        if self.depth + 1 >= MAX_PARAMETER_NESTING {
+            return Err(LexError::new(
+                line,
+                format!("parameter expansions nested deeper than {MAX_PARAMETER_NESTING}"),
+            ));
+        }
+        let mut lexer = Lexer::new(source, self.depth + 1);
+        lexer.block_depth = self.block_depth;
+        Ok(lexer)
+    }
+
+    fn read_parameter_word(
+        &mut self,
+        line: usize,
+        terminators: &[char],
+    ) -> Result<(Word, char), LexError> {
+        let mut braces = 0_usize;
+        loop {
+            let Some((index, character)) = self.chars.next() else {
+                return Err(LexError::new(line, "unterminated ${} parameter reference"));
+            };
+            if braces == 0 && terminators.contains(&character) {
+                self.flush_literal();
+                return Ok((
+                    Word {
+                        parts: std::mem::take(&mut self.parts),
+                    },
+                    character,
+                ));
+            }
+            match character {
+                '\'' => self.read_single_quoted()?,
+                '"' => self.read_double_quoted()?,
+                '\\' => self.read_escape()?,
+                '$' => self.read_dollar(index)?,
+                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' => {
+                    self.read_operator(character)?;
+                    let operator = self.tokens.back().map(|token| &token.kind);
                     return Err(LexError::new(
                         line,
-                        format!("`{other}` is not allowed inside a ${{}} parameter expansion"),
+                        format!(
+                            "`{}` is not allowed inside a ${{}} parameter expansion",
+                            operator.map_or_else(|| character.to_string(), ToString::to_string)
+                        ),
                     ));
+                }
+                other => {
+                    match other {
+                        '{' => braces += 1,
+                        '}' => braces = braces.saturating_sub(1),
+                        '\n' => self.line += 1,
+                        _ => {}
+                    }
+                    self.push_literal(other);
                 }
             }
         }
-        Ok(RawWord { parts })
     }
 
     fn expect_brace_close(&mut self, line: usize) -> Result<(), LexError> {
@@ -997,7 +979,7 @@ impl<'a> Lexer<'a> {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    fn read_index(&mut self, line: usize) -> Result<RawIndex, LexError> {
+    fn read_index(&mut self, line: usize) -> Result<Index, LexError> {
         let mut text = String::new();
         let mut depth = 0_usize;
         loop {
@@ -1018,11 +1000,11 @@ impl<'a> Lexer<'a> {
             }
         }
         match text.as_str() {
-            "@" => return Ok(RawIndex::All),
-            "*" => return Ok(RawIndex::AllJoined),
+            "@" => return Ok(Index::All),
+            "*" => return Ok(Index::AllJoined),
             _ => {}
         }
-        let tokens = tokenize_nested(&text, self.depth + 1, line)?;
+        let tokens = self.parameter_lexer(&text, line)?.run()?;
         let mut words = tokens.into_iter().filter_map(|token| match token.kind {
             TokenKind::Word(word) => Some(word),
             _ => None,
@@ -1036,7 +1018,7 @@ impl<'a> Lexer<'a> {
                 "${NAME[index]} accepts exactly one index expression",
             ));
         }
-        Ok(RawIndex::At(word))
+        Ok(Index::At(word))
     }
 
     fn read_balanced(
@@ -1230,9 +1212,7 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        RawIndex, RawModifier, RawParameter, RawPart, RawWord, Stream, TokenKind, tokenize,
-    };
+    use super::{Index, Modifier, Parameter, Stream, TokenKind, Word, WordPart, tokenize};
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         tokenize(source)
@@ -1246,7 +1226,7 @@ mod tests {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    fn single_word(source: &str) -> Vec<RawPart> {
+    fn single_word(source: &str) -> Vec<WordPart> {
         match kinds(source).into_iter().next().expect("one token") {
             TokenKind::Word(word) => word.parts,
             other => panic!("expected a word, found {other}"),
@@ -1254,26 +1234,33 @@ mod tests {
     }
 
     #[test]
+    fn parameter_word_newlines_preserve_following_diagnostic_lines() {
+        let error = tokenize("echo \"${x:-a\nb}\"\n${y:^^}").expect_err("unsupported modifier");
+        assert!(error.message.contains("this shell keeps"), "{error}");
+        assert_eq!(error.line, 3);
+    }
+
+    #[test]
     fn splits_words_and_operators() {
         assert_eq!(
             kinds("echo hi | grep h && true"),
             vec![
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("echo".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("echo".to_owned())]
                 }),
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("hi".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("hi".to_owned())]
                 }),
                 TokenKind::Pipe,
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("grep".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("grep".to_owned())]
                 }),
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("h".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("h".to_owned())]
                 }),
                 TokenKind::AndAnd,
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("true".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("true".to_owned())]
                 }),
             ]
         );
@@ -1284,18 +1271,18 @@ mod tests {
         assert_eq!(
             kinds("echo a # trailing\necho b"),
             vec![
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("echo".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("echo".to_owned())]
                 }),
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("a".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("a".to_owned())]
                 }),
                 TokenKind::Newline,
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("echo".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("echo".to_owned())]
                 }),
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("b".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("b".to_owned())]
                 }),
             ]
         );
@@ -1303,14 +1290,17 @@ mod tests {
 
     #[test]
     fn a_hash_inside_a_word_is_literal() {
-        assert_eq!(single_word("a#b"), vec![RawPart::Literal("a#b".to_owned())]);
+        assert_eq!(
+            single_word("a#b"),
+            vec![WordPart::Literal("a#b".to_owned())]
+        );
     }
 
     #[test]
     fn single_quotes_are_fully_literal() {
         assert_eq!(
             single_word(r#"'$VAR $(cmd) \n'"#),
-            vec![RawPart::SingleQuoted(r"$VAR $(cmd) \n".to_owned())]
+            vec![WordPart::SingleQuoted(r"$VAR $(cmd) \n".to_owned())]
         );
     }
 
@@ -1318,16 +1308,16 @@ mod tests {
     fn double_quotes_interpolate_parameters_and_substitutions() {
         assert_eq!(
             single_word(r#""a ${NAME} $(echo b)""#),
-            vec![RawPart::DoubleQuoted(vec![
-                RawPart::Literal("a ".to_owned()),
-                RawPart::Parameter(RawParameter::Named {
+            vec![WordPart::DoubleQuoted(vec![
+                WordPart::Literal("a ".to_owned()),
+                WordPart::Parameter(Parameter::Named {
                     name: "NAME".to_owned(),
                     indices: Vec::new(),
-                    modifier: RawModifier::None,
+                    modifier: Modifier::None,
                     length: false,
                 }),
-                RawPart::Literal(" ".to_owned()),
-                RawPart::CommandSubstitution("echo b".to_owned()),
+                WordPart::Literal(" ".to_owned()),
+                WordPart::CommandSubstitution(crate::parser::parse("echo b").expect("program")),
             ])]
         );
     }
@@ -1336,8 +1326,8 @@ mod tests {
     fn nested_command_substitution_keeps_its_full_body() {
         assert_eq!(
             single_word("$(echo $(echo inner) ')' )"),
-            vec![RawPart::CommandSubstitution(
-                "echo $(echo inner) ')' ".to_owned()
+            vec![WordPart::CommandSubstitution(
+                crate::parser::parse("echo $(echo inner) ')' ").expect("program")
             )]
         );
     }
@@ -1346,29 +1336,37 @@ mod tests {
     fn arithmetic_expansion_is_distinguished_from_command_substitution() {
         assert_eq!(
             single_word("$(( 1 + (2 * 3) ))"),
-            vec![RawPart::Arithmetic(" 1 + (2 * 3) ".to_owned())]
+            vec![WordPart::Arithmetic(crate::ast::ArithExpr::Binary(
+                crate::ast::ArithBinaryOp::Add,
+                Box::new(crate::ast::ArithExpr::Integer(1)),
+                Box::new(crate::ast::ArithExpr::Binary(
+                    crate::ast::ArithBinaryOp::Multiply,
+                    Box::new(crate::ast::ArithExpr::Integer(2)),
+                    Box::new(crate::ast::ArithExpr::Integer(3))
+                ))
+            ))]
         );
     }
 
     #[test]
     fn indexed_parameters_capture_their_index_word() {
         let parts = single_word("${obj[key]}");
-        let RawPart::Parameter(RawParameter::Named { name, indices, .. }) = &parts[0] else {
+        let WordPart::Parameter(Parameter::Named { name, indices, .. }) = &parts[0] else {
             panic!("expected an indexed parameter, found {parts:?}");
         };
         assert_eq!(name, "obj");
         assert_eq!(
             indices.as_slice(),
-            [RawIndex::At(RawWord {
-                parts: vec![RawPart::Literal("key".to_owned())]
+            [Index::At(Word {
+                parts: vec![WordPart::Literal("key".to_owned())]
             })]
         );
 
         let parts = single_word("${list[@]}");
-        let RawPart::Parameter(RawParameter::Named { indices, .. }) = &parts[0] else {
+        let WordPart::Parameter(Parameter::Named { indices, .. }) = &parts[0] else {
             panic!("expected an indexed parameter, found {parts:?}");
         };
-        assert_eq!(indices.as_slice(), [RawIndex::All]);
+        assert_eq!(indices.as_slice(), [Index::All]);
     }
 
     #[test]
@@ -1385,6 +1383,12 @@ mod tests {
             ("echo ${}", "empty ${} parameter reference"),
             ("echo ${name", "unterminated"),
             ("echo ${name:-a|b}", "is not allowed inside"),
+            ("echo ${name:-a;b}", "is not allowed inside"),
+            ("echo ${name:-a&b}", "is not allowed inside"),
+            ("echo ${name:-a<b}", "is not allowed inside"),
+            ("echo ${name:-a>b}", "is not allowed inside"),
+            ("echo ${name:-a(b)c}", "is not allowed inside"),
+            ("echo ${name:-a)b}", "is not allowed inside"),
         ] {
             let error = tokenize(source)
                 .map(|tokens| format!("{tokens:?}"))
@@ -1397,19 +1401,19 @@ mod tests {
     fn positional_parameters_cover_at_hash_and_star() {
         assert_eq!(
             single_word("$@"),
-            vec![RawPart::Parameter(RawParameter::AllPositional)]
+            vec![WordPart::Parameter(Parameter::AllPositional)]
         );
         assert_eq!(
             single_word("$*"),
-            vec![RawPart::Parameter(RawParameter::AllPositionalJoined)]
+            vec![WordPart::Parameter(Parameter::AllPositionalJoined)]
         );
         assert_eq!(
             single_word("${*}"),
-            vec![RawPart::Parameter(RawParameter::AllPositionalJoined)]
+            vec![WordPart::Parameter(Parameter::AllPositionalJoined)]
         );
         assert_eq!(
             single_word("$#"),
-            vec![RawPart::Parameter(RawParameter::PositionalCount)]
+            vec![WordPart::Parameter(Parameter::PositionalCount)]
         );
     }
 
@@ -1422,11 +1426,11 @@ mod tests {
         }
         assert_eq!(
             single_word(r"\`"),
-            vec![RawPart::SingleQuoted("`".to_owned())]
+            vec![WordPart::SingleQuoted("`".to_owned())]
         );
         assert_eq!(
             single_word("'`echo hi`'"),
-            vec![RawPart::SingleQuoted("`echo hi`".to_owned())]
+            vec![WordPart::SingleQuoted("`echo hi`".to_owned())]
         );
     }
 
@@ -1468,12 +1472,12 @@ mod tests {
         }));
         assert!(separated.iter().any(|kind| matches!(
             kind,
-            TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
+            TokenKind::Word(word) if word.parts == vec![WordPart::Literal("2".to_owned())]
         )));
 
         assert!(!kinds("echo hi 2> buf").iter().any(|kind| matches!(
             kind,
-            TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
+            TokenKind::Word(word) if word.parts == vec![WordPart::Literal("2".to_owned())]
         )));
     }
 
@@ -1509,7 +1513,7 @@ mod tests {
         };
         assert_eq!(
             body.parts,
-            vec![RawPart::Literal("hello\nthere".to_owned())]
+            vec![WordPart::Literal("hello\nthere".to_owned())]
         );
     }
 
@@ -1521,11 +1525,11 @@ mod tests {
         assert_eq!(
             expanded.parts,
             vec![
-                RawPart::Literal("id=".to_owned()),
-                RawPart::Parameter(RawParameter::Named {
+                WordPart::Literal("id=".to_owned()),
+                WordPart::Parameter(Parameter::Named {
                     name: "id".to_owned(),
                     indices: Vec::new(),
-                    modifier: RawModifier::None,
+                    modifier: Modifier::None,
                     length: false,
                 }),
             ]
@@ -1541,7 +1545,7 @@ mod tests {
             };
             assert_eq!(
                 literal.parts,
-                vec![RawPart::Literal("id=$id".to_owned())],
+                vec![WordPart::Literal("id=$id".to_owned())],
                 "{source}"
             );
         }
@@ -1554,7 +1558,7 @@ mod tests {
         };
         assert_eq!(
             body.parts,
-            vec![RawPart::Literal("{\"a\": \"\\\"x\\\"\"}".to_owned())]
+            vec![WordPart::Literal("{\"a\": \"\\\"x\\\"\"}".to_owned())]
         );
     }
 
@@ -1563,7 +1567,7 @@ mod tests {
         let TokenKind::HereDoc(body) = &kinds("cat <<-EOF\n\t\tindented\n\tEOF\n")[1] else {
             panic!("expected a here-document token");
         };
-        assert_eq!(body.parts, vec![RawPart::Literal("indented".to_owned())]);
+        assert_eq!(body.parts, vec![WordPart::Literal("indented".to_owned())]);
 
         assert!(tokenize("cat <<-EOF\nbody\n    EOF\n").is_err());
     }
@@ -1592,8 +1596,8 @@ mod tests {
         assert_eq!(
             bodies,
             vec![
-                vec![RawPart::Literal("first".to_owned())],
-                vec![RawPart::Literal("second".to_owned())],
+                vec![WordPart::Literal("first".to_owned())],
+                vec![WordPart::Literal("second".to_owned())],
             ]
         );
     }
@@ -1628,17 +1632,17 @@ mod tests {
         assert_eq!(
             kinds("f() { echo hi; }"),
             vec![
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("f".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("f".to_owned())]
                 }),
                 TokenKind::LeftParen,
                 TokenKind::RightParen,
                 TokenKind::LeftBrace,
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("echo".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("echo".to_owned())]
                 }),
-                TokenKind::Word(super::RawWord {
-                    parts: vec![RawPart::Literal("hi".to_owned())]
+                TokenKind::Word(super::Word {
+                    parts: vec![WordPart::Literal("hi".to_owned())]
                 }),
                 TokenKind::Semicolon,
                 TokenKind::RightBrace,
@@ -1646,16 +1650,16 @@ mod tests {
         );
         assert_eq!(
             single_word("{a,b}"),
-            vec![RawPart::Literal("{a,b}".to_owned())]
+            vec![WordPart::Literal("{a,b}".to_owned())]
         );
     }
 
     #[test]
     fn globbing_characters_are_ordinary_literals() {
-        assert_eq!(single_word("*"), vec![RawPart::Literal("*".to_owned())]);
+        assert_eq!(single_word("*"), vec![WordPart::Literal("*".to_owned())]);
         assert_eq!(
             single_word("a?[b]~"),
-            vec![RawPart::Literal("a?[b]~".to_owned())]
+            vec![WordPart::Literal("a?[b]~".to_owned())]
         );
     }
 

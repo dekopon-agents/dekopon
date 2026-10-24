@@ -163,12 +163,18 @@ pub struct Word {
 
 impl Word {
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn as_literal(&self) -> Option<&str> {
         match self.parts.as_slice() {
             [WordPart::Literal(text)] => Some(text),
             _ => None,
         }
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        self.as_literal().map_or_else(
+            || "with expansions".to_owned(),
+            |literal| format!("{literal:?}"),
+        )
     }
 
     #[must_use]

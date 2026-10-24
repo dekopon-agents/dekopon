@@ -170,7 +170,7 @@ A whole right-hand side keeps its value rather than collapsing to text — `copy
 `${copy[key]}` works, the same deviation that already made `issue=$(gh issue view 12)` followed by
 `${issue[title]}` work. Glued to anything else it is text again.
 
-Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index re-enters the tokenizer on the native
+Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index builds word parts on the native
 stack, so parameter expansions have a fixed ceiling of 32 levels, counting the parser depth
 already reached through enclosing `$( )` substitutions and the compound commands around them.
 Deep or alternating `${ }` and `$( )` nesting is a syntax error rather than a crashed host process.
