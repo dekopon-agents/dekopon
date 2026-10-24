@@ -398,6 +398,7 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
         },
         plaintext_loopback_registries: provider.plaintext_loopback_registries,
     })
+    .await
     .map_err(AppError::Provider)?;
     match provider.command {
         ProviderCommand::Sync { locked } => {

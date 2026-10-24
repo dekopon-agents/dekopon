@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read as _, Write as _},
+    io::{self, Write as _},
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -190,8 +190,12 @@ pub struct ProviderManager {
 }
 
 impl ProviderManager {
-    pub fn new(options: ProviderManagerOptions) -> Result<Self, ProviderManagerError> {
-        let bundle = load_registry_ca_bundle(std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref())?;
+    pub async fn new(options: ProviderManagerOptions) -> Result<Self, ProviderManagerError> {
+        let bundle = load_registry_ca_bundle(
+            std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref(),
+            socket::current_uid(),
+        )
+        .await?;
         let registry = RegistryClient::new(options.plaintext_loopback_registries, bundle)?;
         Ok(Self {
             paths: options.paths,
@@ -1108,11 +1112,12 @@ struct OciDescriptor {
 struct RegistryCaBundle(Vec<reqwest::Certificate>);
 
 impl RegistryCaBundle {
-    const MAX_BYTES: u64 = 65_536;
+    const MAX_BYTES: usize = 65_536;
 }
 
-fn load_registry_ca_bundle(
+async fn load_registry_ca_bundle(
     value: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
 ) -> Result<Option<RegistryCaBundle>, ProviderManagerError> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -1122,21 +1127,15 @@ fn load_registry_ca_bundle(
         path: path.to_owned(),
         cause,
     };
-    let unreadable = |source: io::Error| {
-        refusal(RegistryCaBundleCause::Unreadable {
-            kind: source.kind(),
-        })
-    };
-    let file = fs::File::open(path).map_err(unreadable)?;
-    let mut pem = Vec::new();
-    file.take(RegistryCaBundle::MAX_BYTES + 1)
-        .read_to_end(&mut pem)
-        .map_err(unreadable)?;
-    if pem.len() as u64 > RegistryCaBundle::MAX_BYTES {
-        return Err(refusal(RegistryCaBundleCause::TooLarge));
-    }
+    let pem = read_secure_file(path, expected_uid, RegistryCaBundle::MAX_BYTES)
+        .await
+        .map_err(|source| refusal(RegistryCaBundleCause::File(Box::new(source))))?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "reqwest's parser error is only the fixed text \"invalid certificate encoding\""
+    )]
     let certificates = reqwest::Certificate::from_pem_bundle(&pem)
-        .map_err(|_parser_error| refusal(RegistryCaBundleCause::NoPemCertificate))?;
+        .map_err(|_| refusal(RegistryCaBundleCause::NoPemCertificate))?;
     if certificates.is_empty() {
         return Err(refusal(RegistryCaBundleCause::NoPemCertificate));
     }
@@ -2298,21 +2297,20 @@ fn path_suffix(path: &Option<PathBuf>) -> String {
         .map_or_else(String::new, |path| format!(" at {}", path.display()))
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum RegistryCaBundleCause {
-    #[error("unreadable ({kind})")]
-    Unreadable { kind: io::ErrorKind },
-    #[error("file exceeds 64 KiB")]
-    TooLarge,
+    #[error(transparent)]
+    File(Box<ProviderManagerError>),
     #[error("no PEM certificate")]
     NoPemCertificate,
 }
 
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
-    #[error("{REGISTRY_CA_BUNDLE_ENV} names {}, which cannot be used: {cause}", path.display())]
+    #[error("{REGISTRY_CA_BUNDLE_ENV} names {}, which cannot be used", path.display())]
     RegistryCaBundle {
         path: PathBuf,
+        #[source]
         cause: RegistryCaBundleCause,
     },
     #[error("could not join skill export")]
@@ -2580,9 +2578,12 @@ mod tests {
         );
 
         let reached = TokenApi::serving(&tls, vec![response("200 OK", "{}")]);
-        let mut file = NamedTempFile::new().expect("CA file");
-        file.write_all(tls.ca_pem.as_bytes()).expect("write CA");
-        let bundle = load_registry_ca_bundle(Some(file.path().as_os_str())).expect("bundle");
+        let directory = tempfile::tempdir().expect("CA directory");
+        let file = directory.path().join("ca.pem");
+        fs::write(&file, &tls.ca_pem).expect("write CA");
+        let bundle = load_registry_ca_bundle(Some(file.as_os_str()), socket::current_uid())
+            .await
+            .expect("bundle");
         let client = RegistryClient::new(Vec::new(), bundle).expect("client");
         client
             .send_get(
@@ -2598,54 +2599,92 @@ mod tests {
         assert!(requests[0].starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
     }
 
-    #[test]
-    fn unusable_registry_ca_bundles_are_typed_refusals() {
-        let root = tempfile::tempdir().expect("fixtures");
-        for (name, contents, expected) in [
-            (
-                "empty",
-                Some(Vec::new()),
-                RegistryCaBundleCause::NoPemCertificate,
-            ),
-            (
-                "text",
-                Some(b"not PEM".to_vec()),
-                RegistryCaBundleCause::NoPemCertificate,
-            ),
-            (
-                "large",
-                Some(vec![0; 65_537]),
-                RegistryCaBundleCause::TooLarge,
-            ),
-            (
-                "missing",
-                None,
-                RegistryCaBundleCause::Unreadable {
-                    kind: io::ErrorKind::NotFound,
-                },
-            ),
-        ] {
-            let path = root.path().join(name);
-            if let Some(contents) = contents {
-                fs::write(&path, contents).expect("fixture");
+    async fn registry_ca_bundle_refusal(path: &Path) -> RegistryCaBundleCause {
+        match load_registry_ca_bundle(Some(path.as_os_str()), socket::current_uid()).await {
+            Err(ProviderManagerError::RegistryCaBundle {
+                path: actual,
+                cause,
+            }) => {
+                assert_eq!(actual, path);
+                cause
             }
-            match load_registry_ca_bundle(Some(path.as_os_str())) {
-                Err(ProviderManagerError::RegistryCaBundle {
-                    path: actual,
-                    cause,
-                }) => {
-                    assert_eq!(actual, path);
-                    assert_eq!(cause, expected);
-                }
-                other => panic!("expected typed refusal, got {other:?}"),
-            }
+            other => panic!("expected typed refusal, got {other:?}"),
         }
     }
 
-    #[test]
-    fn unset_or_empty_registry_ca_bundle_leaves_the_client_unchanged() {
+    #[tokio::test]
+    async fn unusable_registry_ca_bundles_are_typed_refusals() {
+        let root = tempfile::tempdir().expect("fixtures");
+        let path = |name: &str, contents: &[u8]| {
+            let path = root.path().join(name);
+            fs::write(&path, contents).expect("fixture");
+            path
+        };
+        assert!(matches!(
+            registry_ca_bundle_refusal(&path("empty", b"")).await,
+            RegistryCaBundleCause::NoPemCertificate
+        ));
+        assert!(matches!(
+            registry_ca_bundle_refusal(&path("text", b"not PEM")).await,
+            RegistryCaBundleCause::NoPemCertificate
+        ));
+        assert!(matches!(
+            registry_ca_bundle_refusal(&path("large", &[0; 65_537])).await,
+            RegistryCaBundleCause::File(file) if matches!(
+                *file,
+                ProviderManagerError::Configuration { reason: STATE_TOO_LARGE, .. }
+            )
+        ));
+        assert!(matches!(
+            registry_ca_bundle_refusal(&root.path().join("missing")).await,
+            RegistryCaBundleCause::File(file) if matches!(
+                *file,
+                ProviderManagerError::Io { ref source, .. }
+                    if source.kind() == io::ErrorKind::NotFound
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_registry_ca_bundle_another_user_can_replace_is_refused() {
+        use std::os::unix::fs::symlink;
+        let tls = crate::test_tls::TestTls::new();
+        let root = tempfile::tempdir().expect("fixtures");
+        let writable = root.path().join("world-writable.pem");
+        fs::write(&writable, &tls.ca_pem).expect("bundle");
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o666)).expect("mode");
+        assert!(matches!(
+            registry_ca_bundle_refusal(&writable).await,
+            RegistryCaBundleCause::File(file) if matches!(
+                *file,
+                ProviderManagerError::FileSecurity { source: Some(ref hygiene), .. }
+                    if matches!(
+                        hygiene.downcast_ref::<FileHygieneError>(),
+                        Some(FileHygieneError::InsecureMode { .. })
+                    )
+            )
+        ));
+
+        let target = root.path().join("target.pem");
+        fs::write(&target, &tls.ca_pem).expect("bundle");
+        let linked = root.path().join("linked.pem");
+        symlink(&target, &linked).expect("symlink");
+        assert!(matches!(
+            registry_ca_bundle_refusal(&linked).await,
+            RegistryCaBundleCause::File(file) if matches!(
+                *file,
+                ProviderManagerError::Io { ref source, .. }
+                    if source.raw_os_error() == Some(libc::ELOOP)
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn unset_or_empty_registry_ca_bundle_leaves_the_client_unchanged() {
         for value in [None, Some(std::ffi::OsStr::new(""))] {
-            let bundle = load_registry_ca_bundle(value).expect("no bundle");
+            let bundle = load_registry_ca_bundle(value, socket::current_uid())
+                .await
+                .expect("no bundle");
             assert!(bundle.is_none());
             RegistryClient::new(Vec::new(), bundle).expect("default client");
         }
@@ -2874,7 +2913,7 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure provider set");
     }
 
-    fn test_manager(
+    async fn test_manager(
         directory: &Path,
         authority: &str,
         sources: &[String],
@@ -2894,6 +2933,7 @@ mod tests {
             paths: paths.clone(),
             plaintext_loopback_registries: vec![authority.to_owned()],
         })
+        .await
         .expect("manager fixture");
         (manager, paths)
     }
@@ -2903,7 +2943,7 @@ mod tests {
         let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let source = format!("{}/test/provider:1.0.0", registry.authority);
-        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]).await;
         manager.sync().await.expect("initial sync publishes");
         let lock = load_lock(&paths.lock_file, socket::current_uid())
             .await
@@ -2984,7 +3024,7 @@ mod tests {
         assert!(blob.exists());
     }
 
-    fn local_precompile_fixture(
+    async fn local_precompile_fixture(
         directory: &Path,
         names: &[&str],
     ) -> (ProviderManager, ProviderManagerPaths) {
@@ -3000,10 +3040,10 @@ mod tests {
                 (*name, bytes)
             })
             .collect::<Vec<_>>();
-        local_locked_fixture(directory, &components)
+        local_locked_fixture(directory, &components).await
     }
 
-    fn local_locked_fixture(
+    async fn local_locked_fixture(
         directory: &Path,
         components: &[(&str, Vec<u8>)],
     ) -> (ProviderManager, ProviderManagerPaths) {
@@ -3043,6 +3083,7 @@ mod tests {
             paths: paths.clone(),
             plaintext_loopback_registries: Vec::new(),
         })
+        .await
         .expect("manager");
         (manager, paths)
     }
@@ -3071,7 +3112,7 @@ mod tests {
         ]);
         let second = skill_component(&[("other/SKILL.md", b"other")]);
         let (manager, paths) =
-            local_locked_fixture(directory.path(), &[("gh", first), ("other", second)]);
+            local_locked_fixture(directory.path(), &[("gh", first), ("other", second)]).await;
         let before = dekopon_test_support::snapshot_tree(&paths.store);
         let lock = fs::read(&paths.lock_file).unwrap();
         let out = directory.path().join("out");
@@ -3134,7 +3175,8 @@ mod tests {
                     "gh",
                     skill_component(&[("gh/SKILL.md", b"s"), (path, payload)]),
                 )],
-            );
+            )
+            .await;
             let rows = manager.skills(&directory.path().join("out")).await.unwrap();
             assert!(digests.insert(rows[0].sha256.clone()));
         }
@@ -3147,7 +3189,8 @@ mod tests {
         let (manager, _) = local_locked_fixture(
             directory.path(),
             &[("gh", component.clone()), ("gh-review", component)],
-        );
+        )
+        .await;
         let out = directory.path().join("out");
         fs::create_dir(&out).unwrap();
         let before = dekopon_test_support::snapshot_tree(&out);
@@ -3164,7 +3207,8 @@ mod tests {
         let (manager, _) = local_locked_fixture(
             directory.path(),
             &[("gh", skill_component(&[("gh/SKILL.md", b"s")]))],
-        );
+        )
+        .await;
         let out = directory.path().join("out");
         fs::create_dir(&out).unwrap();
         fs::write(out.join("keep"), b"keep").unwrap();
@@ -3182,7 +3226,8 @@ mod tests {
         let (manager, paths) = local_locked_fixture(
             directory.path(),
             &[("gh", skill_component(&[("gh/SKILL.md", b"s")]))],
-        );
+        )
+        .await;
         let source = load_locked_sources(&paths.lock_file, &paths.store, socket::current_uid())
             .await
             .unwrap()
@@ -3223,7 +3268,7 @@ mod tests {
     async fn precompile_then_boot_maps_every_component_without_compiling() {
         let directory = tempfile::tempdir().expect("fixture");
         let (manager, paths) =
-            local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]);
+            local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]).await;
         let cold = manager.precompile().await.expect("cold precompile");
         assert_eq!((cold.providers, cold.compiled, cold.repaired), (2, 2, 0));
         let warm = manager.precompile().await.expect("warm precompile");
@@ -3256,7 +3301,7 @@ mod tests {
     async fn precompile_repairs_a_truncated_object_and_a_dangling_index() {
         let directory = tempfile::tempdir().expect("fixture");
         let (manager, paths) =
-            local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]);
+            local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]).await;
         manager.precompile().await.expect("populate cache");
         let root = paths.store.join("cwasm/v1");
         let indexes = fs::read_dir(&root)
@@ -3293,7 +3338,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn precompile_replaces_a_short_object_left_at_its_own_address() {
         let directory = tempfile::tempdir().expect("fixture");
-        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]);
+        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]).await;
         manager.precompile().await.expect("populate cache");
         let root = paths.store.join("cwasm/v1");
         let generation = fs::read_dir(&root)
@@ -3324,7 +3369,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn precompile_does_not_prune_after_a_source_failure() {
         let directory = tempfile::tempdir().expect("fixture");
-        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]);
+        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]).await;
         manager.precompile().await.expect("populate cache");
         let stale = paths.store.join("cwasm/v1/old-engine/stale.json");
         fs::create_dir_all(stale.parent().expect("parent")).expect("old generation");
@@ -3349,7 +3394,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn precompile_refuses_while_sync_holds_the_store() {
         let directory = tempfile::tempdir().expect("fixture");
-        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]);
+        let (manager, paths) = local_precompile_fixture(directory.path(), &["cli-probe"]).await;
         let store = ProviderStore::open(&paths.store, socket::current_uid(), false).expect("store");
         let _owner = store.lock().expect("sync owns store");
         assert!(matches!(
@@ -3707,7 +3752,8 @@ providers:
         let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let source = format!("{}/test/provider:1.0.0", registry.authority);
-        let (manager, _paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        let (manager, _paths) =
+            test_manager(directory.path(), &registry.authority, &[source]).await;
 
         let first = manager
             .sync()
@@ -3767,7 +3813,7 @@ providers:
             "{}/test/provider@{}",
             registry.authority, registry.state.manifest_digest
         );
-        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &[source]).await;
         manager.sync().await.expect("digest source syncs");
         let lock = load_lock(&paths.lock_file, socket::current_uid())
             .await
@@ -3787,7 +3833,8 @@ providers:
         let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let source = format!("{}/test/provider:1.0.0", registry.authority);
-        let (manager, _paths) = test_manager(directory.path(), &registry.authority, &[source]);
+        let (manager, _paths) =
+            test_manager(directory.path(), &registry.authority, &[source]).await;
         manager.sync().await.expect("provider activates");
         let blob = manager.list().await.expect("list")[0].path.clone();
         let bytes = fs::read(&blob).expect("read blob fixture");
@@ -3847,7 +3894,8 @@ providers:
             directory.path(),
             &registry.authority,
             std::slice::from_ref(&first_source),
-        );
+        )
+        .await;
         manager.sync().await.expect("initial provider activates");
         let active = fs::read(&paths.lock_file).expect("read active lock");
 
@@ -3933,6 +3981,7 @@ providers:
             paths: paths.clone(),
             plaintext_loopback_registries: Vec::new(),
         })
+        .await
         .expect("manager");
         let owner = lock_activation(&paths.lock_file, socket::current_uid()).expect("lock owner");
         assert!(matches!(
