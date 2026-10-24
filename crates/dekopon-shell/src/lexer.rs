@@ -518,6 +518,7 @@ impl<'a> Lexer<'a> {
 
     fn read_pending_here_doc_bodies(&mut self) -> Result<(), LexError> {
         let pending = std::mem::take(&mut self.pending_here_docs);
+        self.pending_here_doc_close = None;
         for specification in pending {
             let mut body = self.read_here_doc_body(&specification)?;
             // Values in this shell are not newline-terminated, so the last body line's newline is
@@ -538,7 +539,6 @@ impl<'a> Lexer<'a> {
             };
             self.tokens[specification.token].kind = TokenKind::HereDoc(Word { parts });
         }
-        self.pending_here_doc_close = None;
         Ok(())
     }
 

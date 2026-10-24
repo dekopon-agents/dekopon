@@ -1549,6 +1549,15 @@ mod tests {
     }
 
     #[test]
+    fn a_here_doc_interpolation_failure_keeps_its_own_refusal() {
+        let source = "echo $(cat <<EOF; case a in a) true;; esac\n`x`\nEOF\n)";
+        assert_eq!(
+            parse(source).expect_err(source).to_string(),
+            "line 2: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+        );
+    }
+
+    #[test]
     fn completed_here_doc_keeps_a_later_backtick_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\n`x`\n)";
         assert_eq!(
