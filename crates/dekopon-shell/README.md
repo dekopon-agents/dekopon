@@ -171,8 +171,9 @@ A whole right-hand side keeps its value rather than collapsing to text — `copy
 `${issue[title]}` work. Glued to anything else it is text again.
 
 Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index builds word parts on the native
-stack, so parameter expansions have a fixed ceiling of 32 levels, counting the parser depth
-already reached through enclosing `$( )` substitutions and the compound commands around them.
+stack, so parameter expansions have a fixed ceiling of 32 levels. The count includes the parser
+depth at which each enclosing `$( )` substitution opened, but not the compound commands around the
+expansion in its own command list; those stay under the parser's own ceiling of 64 levels.
 Deep or alternating `${ }` and `$( )` nesting is a syntax error rather than a crashed host process.
 
 ## The two streams
