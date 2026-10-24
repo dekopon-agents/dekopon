@@ -324,7 +324,7 @@ data: [DONE]
     let mut images = 0;
     for (reconstructed, mut sent) in rebuilt.into_iter().zip(sent) {
         for message in sent["messages"].as_array_mut().unwrap() {
-            if let Some(parts) = message["content"].as_array_mut() {
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
                 for part in parts {
                     *part = match part["type"].as_str().unwrap() {
                         "text" => part["text"].clone(),
