@@ -1581,3 +1581,6 @@ fn render_problems(problems: &[capabilities::CapabilityProblem]) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
+
+#[cfg(test)]
+mod test_tls;

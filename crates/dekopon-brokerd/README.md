@@ -854,11 +854,15 @@ Resolution accepts one OCI image manifest with schema 2, exact artifact type
 `application/vnd.dekopon.provider.v1+wasm`, the standard empty OCI config, and exactly one positive,
 bounded `application/wasm` layer. Manifest, token, error, and component streams have independent
 byte ceilings and deadlines. Public registries use anonymous OCI Bearer challenge flow. Private
-registry credentials and custom certificate roots are not accepted; TLS verification cannot be
+registry credentials are not accepted; TLS verification cannot be
 disabled, ambient proxy environment variables are ignored, redirects may never downgrade to
 unapproved plaintext, and plain HTTP is available only to an exact literal loopback authority named
 with `--plaintext-loopback-registry <HOST[:PORT]>` (repeatable, `provider` subcommands only), for
 development and tests.
+
+`DEKOPON_REGISTRY_CA_BUNDLE` optionally names a PEM file of at most 64 KiB. Its roots
+are trusted beside WebPKI for every registry fetch, by every `provider` subcommand and
+by `check --provider-set`. An unusable file refuses the command.
 
 Fetched bytes land at:
 

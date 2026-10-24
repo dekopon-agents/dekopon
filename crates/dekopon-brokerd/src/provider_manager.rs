@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -44,6 +44,8 @@ pub const HARD_MAX_PROVIDER_STATE_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_PROVIDER_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_PROVIDER_STORE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const HARD_MAX_PROVIDER_STORE_BLOBS: usize = 1024;
+
+const REGISTRY_CA_BUNDLE_ENV: &str = "DEKOPON_REGISTRY_CA_BUNDLE";
 
 const HARD_MAX_TOKEN_BYTES: usize = 64 * 1024;
 const HARD_MAX_REGISTRY_ERROR_BYTES: usize = 64 * 1024;
@@ -189,7 +191,8 @@ pub struct ProviderManager {
 
 impl ProviderManager {
     pub fn new(options: ProviderManagerOptions) -> Result<Self, ProviderManagerError> {
-        let registry = RegistryClient::new(options.plaintext_loopback_registries)?;
+        let bundle = load_registry_ca_bundle(std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref())?;
+        let registry = RegistryClient::new(options.plaintext_loopback_registries, bundle)?;
         Ok(Self {
             paths: options.paths,
             registry,
@@ -1098,6 +1101,45 @@ struct OciDescriptor {
     data: Option<String>,
 }
 
+#[derive(Debug)]
+struct RegistryCaBundle(Vec<reqwest::Certificate>);
+
+impl RegistryCaBundle {
+    const MAX_BYTES: u64 = 65_536;
+}
+
+fn load_registry_ca_bundle(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<RegistryCaBundle>, ProviderManagerError> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let path = Path::new(value);
+    let refusal = |cause| ProviderManagerError::RegistryCaBundle {
+        path: path.to_owned(),
+        cause,
+    };
+    let unreadable = |source: io::Error| {
+        refusal(RegistryCaBundleCause::Unreadable {
+            kind: source.kind(),
+        })
+    };
+    let file = fs::File::open(path).map_err(unreadable)?;
+    let mut pem = Vec::new();
+    file.take(RegistryCaBundle::MAX_BYTES + 1)
+        .read_to_end(&mut pem)
+        .map_err(unreadable)?;
+    if pem.len() as u64 > RegistryCaBundle::MAX_BYTES {
+        return Err(refusal(RegistryCaBundleCause::TooLarge));
+    }
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|_parser_error| refusal(RegistryCaBundleCause::NoPemCertificate))?;
+    if certificates.is_empty() {
+        return Err(refusal(RegistryCaBundleCause::NoPemCertificate));
+    }
+    Ok(Some(RegistryCaBundle(certificates)))
+}
+
 struct RegistryClient {
     client: reqwest::Client,
     plaintext: BTreeSet<String>,
@@ -1108,7 +1150,10 @@ struct RegistryClient {
 struct RegistryToken(String);
 
 impl RegistryClient {
-    fn new(plaintext: Vec<String>) -> Result<Self, ProviderManagerError> {
+    fn new(
+        plaintext: Vec<String>,
+        bundle: Option<RegistryCaBundle>,
+    ) -> Result<Self, ProviderManagerError> {
         let mut allowed = BTreeSet::new();
         for registry in plaintext {
             if !is_literal_loopback_registry(&registry) {
@@ -1119,19 +1164,23 @@ impl RegistryClient {
             }
             allowed.insert(registry);
         }
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(REGISTRY_CONNECT_TIMEOUT)
             .no_proxy()
             .http1_only()
             .redirect(registry_redirect_policy(allowed.clone()))
-            .user_agent(concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|source| {
-                ProviderManagerError::registry_source(
-                    "could not initialize bounded OCI registry client",
-                    source,
-                )
-            })?;
+            .user_agent(concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")));
+        if let Some(bundle) = bundle {
+            for certificate in bundle.0 {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder.build().map_err(|source| {
+            ProviderManagerError::registry_source(
+                "could not initialize bounded OCI registry client",
+                source,
+            )
+        })?;
         Ok(Self {
             client,
             plaintext: allowed,
@@ -2246,8 +2295,23 @@ fn path_suffix(path: &Option<PathBuf>) -> String {
         .map_or_else(String::new, |path| format!(" at {}", path.display()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RegistryCaBundleCause {
+    #[error("unreadable ({kind})")]
+    Unreadable { kind: io::ErrorKind },
+    #[error("file exceeds 64 KiB")]
+    TooLarge,
+    #[error("no PEM certificate")]
+    NoPemCertificate,
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
+    #[error("{REGISTRY_CA_BUNDLE_ENV} names {}, which cannot be used: {cause}", path.display())]
+    RegistryCaBundle {
+        path: PathBuf,
+        cause: RegistryCaBundleCause,
+    },
     #[error("could not join skill export")]
     SkillExportTask {
         #[source]
@@ -2486,6 +2550,103 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[tokio::test]
+    async fn private_ca_registry_requires_the_bundle() {
+        use crate::test_tls::{TestTls, TokenApi, response};
+        let tls = TestTls::new();
+        let path = "/v2/example/provider/manifests/1.0.0";
+        let refused = TokenApi::serving(&tls, vec![response("200 OK", "{}")]);
+        let client = RegistryClient::new(Vec::new(), None).expect("client");
+        assert!(
+            client
+                .send_get(
+                    Url::parse(&format!("{}{path}", refused.endpoint)).expect("URL"),
+                    None,
+                    None,
+                    "manifest"
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            refused
+                .requests
+                .recv_timeout(Duration::from_secs(5))
+                .is_err()
+        );
+
+        let reached = TokenApi::serving(&tls, vec![response("200 OK", "{}")]);
+        let mut file = NamedTempFile::new().expect("CA file");
+        file.write_all(tls.ca_pem.as_bytes()).expect("write CA");
+        let bundle = load_registry_ca_bundle(Some(file.path().as_os_str())).expect("bundle");
+        let client = RegistryClient::new(Vec::new(), bundle).expect("client");
+        client
+            .send_get(
+                Url::parse(&format!("{}{path}", reached.endpoint)).expect("URL"),
+                None,
+                None,
+                "manifest",
+            )
+            .await
+            .expect("trusted registry");
+        let requests: Vec<_> = reached.requests.iter().collect();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
+    }
+
+    #[test]
+    fn unusable_registry_ca_bundles_are_typed_refusals() {
+        let root = tempfile::tempdir().expect("fixtures");
+        for (name, contents, expected) in [
+            (
+                "empty",
+                Some(Vec::new()),
+                RegistryCaBundleCause::NoPemCertificate,
+            ),
+            (
+                "text",
+                Some(b"not PEM".to_vec()),
+                RegistryCaBundleCause::NoPemCertificate,
+            ),
+            (
+                "large",
+                Some(vec![0; 65_537]),
+                RegistryCaBundleCause::TooLarge,
+            ),
+            (
+                "missing",
+                None,
+                RegistryCaBundleCause::Unreadable {
+                    kind: io::ErrorKind::NotFound,
+                },
+            ),
+        ] {
+            let path = root.path().join(name);
+            if let Some(contents) = contents {
+                fs::write(&path, contents).expect("fixture");
+            }
+            match load_registry_ca_bundle(Some(path.as_os_str())) {
+                Err(ProviderManagerError::RegistryCaBundle {
+                    path: actual,
+                    cause,
+                }) => {
+                    assert_eq!(actual, path);
+                    assert_eq!(cause, expected);
+                }
+                other => panic!("expected typed refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unset_or_empty_registry_ca_bundle_leaves_the_client_unchanged() {
+        for value in [None, Some(std::ffi::OsStr::new(""))] {
+            let bundle = load_registry_ca_bundle(value).expect("no bundle");
+            assert!(bundle.is_none());
+            RegistryClient::new(Vec::new(), bundle).expect("default client");
+        }
+    }
 
     #[derive(Default)]
     struct SyncCompileState {
@@ -3272,7 +3433,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
         let authority = listener.local_addr().expect("reserved address");
         drop(listener);
-        let registry = RegistryClient::new(vec![authority.to_string()]).expect("client");
+        let registry = RegistryClient::new(vec![authority.to_string()], None).expect("client");
         let sentinel = "request-secret-sentinel";
         let url = Url::parse(&format!("http://{authority}/{sentinel}?token={sentinel}"))
             .expect("request URL");
@@ -3344,10 +3505,10 @@ mod tests {
             )
             .await
         });
-        let client = RegistryClient::new(vec![
-            source_authority.to_string(),
-            target_authority.to_string(),
-        ])
+        let client = RegistryClient::new(
+            vec![source_authority.to_string(), target_authority.to_string()],
+            None,
+        )
         .expect("redirect client");
         let response = client
             .send_get(
@@ -3394,7 +3555,8 @@ mod tests {
             )
             .await
         });
-        let client = RegistryClient::new(vec![loop_authority.to_string()]).expect("loop client");
+        let client =
+            RegistryClient::new(vec![loop_authority.to_string()], None).expect("loop client");
         let error = client
             .send_get(
                 Url::parse(&format!("http://{loop_authority}/loop")).expect("loop URL"),
