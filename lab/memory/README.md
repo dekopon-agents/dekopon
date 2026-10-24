@@ -7,7 +7,7 @@ It lives on the `lab/memory-unify` branch only and is outside every workspace an
 ## Run
 
 ```console
-lab/memory/run.sh <ref> <scenario> [--profile fake|real]
+lab/memory/run.sh <ref> <scenario> [--profile fake|real|codex]
 ```
 
 Needs Linux, Docker (a running daemon), the repository's Rust toolchain, Python 3, `setpriv`
@@ -51,6 +51,9 @@ routine, 20 s timeout) and journal memory on, with three routes selected by conv
 | `restart-mid-summary` | 3 turns, a fourth whose summary hangs, `kill -9` of the gateway while it runs (journal copied to `journal-at-kill/`), restart, 3 more turns; reports whether the killed turn's summary was retried |
 | `unloadable-journal` | 4 turns on `summary` and `plain`, stop, overwrite the smallest journal file with garbage (copy in `journal-before-corrupt/`), boot, 3 more turns each; expects one `gateway_journal_reset` and replies |
 | `summaries-off-vs-on` | 20 turns on `summary` with the summary routine removed, then the gateway restarted with it on, a fresh journal and the same 20 turns |
+| `config-check` | writes the configs and runs `dekopon-gatewayd check` on them; starts no daemon |
+
+Every scenario runs `dekopon-gatewayd check` first (`gatewayd.check.log`) and stops if it fails.
 
 A check whose behaviour the ref does not have reports `not applicable at <ref8>` instead of a pass:
 slot resume applies only when the gateway logs an event or writes a file whose name mentions a slot.
@@ -71,6 +74,7 @@ slot resume applies only when the gateway logs an event or writes a file whose n
 | `rss.csv` | per second per daemon: VmRSS, VmHWM, threads, CPU ticks from `/proc` |
 | `events.jsonl` | the lab's own timeline: daemon start, stop, kill, journal snapshot, corruption |
 | `journal/`, `journal-*/` | journal copies at the end and at the scenario's cut points |
+| `config/` | the generated broker, gateway, catalog and policy files (paths only, no credential) |
 | `artifacts.sha256`, `collector.log` | the binaries tested and the collector's own log |
 
 ## Models
@@ -86,6 +90,19 @@ for the summarizer, which finds the tag inside the source it is asked to summari
 gateway gets a placeholder key and talks to the local proxy. Each request is capped at 1024 output
 tokens and refused with 402 once the token-priced spend, or the next request's worst case, would
 pass $2; the run then ends as `aborted: cost cap reached`. Scripted failures stay on the fake.
+
+`codex` makes the chat model dekopon's own `chatgptSubscription` client (`LAB_CODEX_MODEL`,
+default `gpt-5-codex`) with `authFile` set to `LAB_CODEX_AUTH_JSON`, used in place: it is never
+copied, read or printed by the lab. A refresh rewrites the file in its own directory, so the
+gateway runs as the UID that owns that directory, and the gateway is given the caller's proxy
+variables. The summarizer stays on the fake, so its scripted behaviours still apply; chat-side
+scripted failures (`act=fail|hang|refuse`) do not exist on this profile. Use a separate eval
+login: the refresh token rotates, and another holder of the same file loses it.
+
+`traces.jsonl` is the collector's unmodified OTLP JSON: each span keeps `traceId`, `spanId`,
+`parentSpanId`, `name`, `kind`, start and end times, attributes, events and status.
+`summary.md` reports roots and spans whose parent was never exported (expected only around a
+`kill -9`).
 
 ## What the lab cannot see
 

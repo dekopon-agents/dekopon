@@ -22,6 +22,7 @@ ROUTES = ("summary", "plain", "none")
 SUMMARIZER_TIMEOUT_MS = 20000
 CHAT_TIMEOUT_MS = 30000
 TURN_DEADLINE_S = 150
+PROXY_ENV = {"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE"}
 POLICY = '''@id("lab-user-may-prompt")
 permit(principal == Dekopon::Principal::"lab-user",
  action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"lab-agent")
@@ -108,9 +109,12 @@ class Lab:
         self.own(self.journal, "gateway", 0o700)
 
     def write(self, who, name, value):
+        text = value if isinstance(value, str) else json.dumps(value, indent=1)
         path = self.dirs[who] / name
-        path.write_text(value if isinstance(value, str) else json.dumps(value, indent=1))
+        path.write_text(text)
         self.own(path, who, 0o600)
+        (self.run / "config").mkdir(exist_ok=True)
+        (self.run / "config" / name).write_text(text)
         return path
 
     def write_gateway_config(self):
@@ -140,7 +144,7 @@ class Lab:
                        "serverUid": self.ids["broker"]},
             "transports": [{"name": "dev", "kind": "local",
                             "socketPath": str(self.dirs["gateway"] / "dev.sock")}],
-            "models": [model("chat", fakemodel.CHAT_MODEL, ["reasoning"], CHAT_TIMEOUT_MS),
+            "models": [self.chat_model(model),
                        model("summarizer", fakemodel.SUMMARY_MODEL, ["summary"], SUMMARIZER_TIMEOUT_MS)],
             "routes": [route("summary", summary_memory),
                        route("plain", {"mode": "persistent", "recall": "journal"}),
@@ -150,19 +154,40 @@ class Lab:
             "telemetry": {"endpoint": self.args.otlp, "transport": "http",
                           "serviceName": "lab-gatewayd", "exportTimeoutMs": 5000}})
 
-    def start(self, name):
+    def chat_model(self, model):
+        if self.args.profile == "codex":
+            return {"name": "chat", "kind": "chatgptSubscription", "model": self.args.codex_model,
+                    "authFile": self.args.codex_auth, "timeoutMs": 120000, "classes": ["reasoning"]}
+        return model("chat", fakemodel.CHAT_MODEL, ["reasoning"], CHAT_TIMEOUT_MS)
+
+    def command(self, name, *arguments):
         who = "broker" if name == "brokerd" else "gateway"
         config = self.dirs[who] / ("broker.json" if who == "broker" else "gateway.json")
         env = {"PATH": os.defpath, "HOME": str(self.dirs[who]), "RUST_LOG": self.args.rust_log}
         if who == "gateway":
             env["LAB_MODEL_KEY"] = "lab-fake-model-key"
-        argv = [str(self.bin / f"dekopon-{name}"), "--config", str(config)]
+            if self.args.profile == "codex":
+                env.update({key: value for key, value in os.environ.items() if key in PROXY_ENV})
+        argv = [str(self.bin / f"dekopon-{name}"), *(arguments or ("--config",)), str(config)]
         if self.ids["broker"] != self.ids["gateway"]:
             argv = ["setpriv", f"--reuid={self.ids[who]}", f"--regid={self.ids[who]}",
                     f"--groups={self.ids['ipc']}", "--", *argv]
+        return argv, env, self.dirs[who]
+
+    def check_gateway(self):
+        argv, env, cwd = self.command("gatewayd", "check")
+        with open(self.run / "gatewayd.check.log", "wb") as out:
+            code = subprocess.run(argv, env=env, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
+                                  timeout=120).returncode
+        self.event("gateway-config-check", returncode=code)
+        if code != 0:
+            raise RuntimeError(f"dekopon-gatewayd check exited with {code}; see gatewayd.check.log")
+
+    def start(self, name):
+        argv, env, cwd = self.command(name)
         stdout = open(self.run / f"{name}.stdout.log", "ab")
         stderr = open(self.run / f"{name}.stderr.log", "ab")
-        process = subprocess.Popen(argv, env=env, stdout=stdout, stderr=stderr, cwd=self.dirs[who])
+        process = subprocess.Popen(argv, env=env, stdout=stdout, stderr=stderr, cwd=cwd)
         stdout.close()
         stderr.close()
         self.daemons[name] = process
@@ -433,13 +458,15 @@ SCENARIOS = {
     "restart-mid-summary": run_restart_mid_summary,
     "unloadable-journal": run_unloadable_journal,
     "summaries-off-vs-on": run_summaries_off_vs_on,
+    "config-check": None,
 }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ("run", "state", "bin", "scenario", "profile", "otlp", "rust-log", "real-model"):
-        parser.add_argument(f"--{name}", required=name not in ("rust-log", "real-model"))
+    optional = ("rust-log", "real-model", "codex-auth", "codex-model")
+    for name in ("run", "state", "bin", "scenario", "profile", "otlp", *optional):
+        parser.add_argument(f"--{name}", required=name not in optional)
     for name in ("broker-uid", "gateway-uid", "ipc-gid"):
         parser.add_argument(f"--{name}", type=int, required=True)
     for name, default in (("cost-cap", 2.0), ("price-in", 0.15), ("price-out", 0.60)):
@@ -447,6 +474,9 @@ def main():
     args = parser.parse_args()
     args.rust_log = args.rust_log or "info"
     args.real_model = args.real_model or "openai/gpt-4o-mini"
+    args.codex_model = args.codex_model or "gpt-5-codex"
+    if args.profile == "codex" and not args.codex_auth:
+        raise SystemExit("--profile codex needs --codex-auth")
     if args.scenario not in SCENARIOS:
         raise SystemExit(f"unknown scenario {args.scenario}; one of {', '.join(SCENARIOS)}")
     lab = Lab(args)
@@ -455,17 +485,19 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         lab.prepare()
-        sampler.start()
-        lab.start("brokerd")
-        lab.start("gatewayd")
-        lab.event("scenario-start", scenario=args.scenario)
-        SCENARIOS[args.scenario](lab)
-        lab.event("scenario-end", scenario=args.scenario)
-        drained = lab.model.wait_summaries_idle(SUMMARIZER_TIMEOUT_MS / 1000 + 10)
-        lab.event("summaries-drained" if drained else "summaries-still-running")
-        if lab.budget and lab.budget.exceeded.is_set():
-            status = "aborted: cost cap reached"
-        time.sleep(2)
+        lab.check_gateway()
+        if SCENARIOS[args.scenario] is not None:
+            sampler.start()
+            lab.start("brokerd")
+            lab.start("gatewayd")
+            lab.event("scenario-start", scenario=args.scenario)
+            SCENARIOS[args.scenario](lab)
+            lab.event("scenario-end", scenario=args.scenario)
+            drained = lab.model.wait_summaries_idle(SUMMARIZER_TIMEOUT_MS / 1000 + 10)
+            lab.event("summaries-drained" if drained else "summaries-still-running")
+            if lab.budget and lab.budget.exceeded.is_set():
+                status = "aborted: cost cap reached"
+            time.sleep(2)
     except KeyboardInterrupt:
         status = "interrupted"
     except Exception as error:
@@ -478,7 +510,8 @@ def main():
                 lab.snapshot_journal("journal")
         finally:
             lab.close()
-            sampler.join(timeout=3)
+            if sampler.is_alive():
+                sampler.join(timeout=3)
     write_outputs(lab, status)
     print(f"[lab] {status}", flush=True)
     return 0 if status == "completed" else 1

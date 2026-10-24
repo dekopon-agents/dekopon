@@ -46,6 +46,7 @@ def latency_line(label, values):
 def spans(path):
     services = collections.Counter()
     names = collections.Counter()
+    parents = {}
     for batch in records(path):
         for resource in batch.get("resourceSpans", []):
             service = next((a["value"].get("stringValue") for a in resource.get("resource", {})
@@ -54,7 +55,10 @@ def spans(path):
                 for span in scope.get("spans", []):
                     services[service] += 1
                     names[span.get("name")] += 1
-    return services, names
+                    parents[span.get("spanId")] = span.get("parentSpanId") or None
+    roots = sum(1 for parent in parents.values() if parent is None)
+    orphans = sum(1 for parent in parents.values() if parent is not None and parent not in parents)
+    return services, names, (len(parents), roots, orphans)
 
 
 def log_records(path):
@@ -147,8 +151,9 @@ def build(run):
         if (run / label).exists():
             size, count = tree_bytes(run / label)
             out.append(f"- {label}: {size} bytes in {count} files")
-    services, names = spans(run / "traces.jsonl")
+    services, names, (unique, roots, orphans) = spans(run / "traces.jsonl")
     out.append(f"- spans exported: {dict(services) or 'none'}; log records: {dict(log_records(run / 'logs.jsonl')) or 'none'}")
+    out.append(f"- span parentage: {unique} unique spans, {roots} roots, {orphans} whose parent was never exported")
     if names:
         out.append("- top span names: " + ", ".join(f"{n} {c}" for n, c in names.most_common(8)))
     out += [""]

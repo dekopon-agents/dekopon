@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 022
 
 usage() {
-  echo "usage: $0 <ref> <scenario> [--profile fake|real]" >&2
+  echo "usage: $0 <ref> <scenario> [--profile fake|real|codex]" >&2
   exit 2
 }
 
@@ -18,9 +18,13 @@ while [ "$#" -gt 0 ]; do
     *) usage ;;
   esac
 done
-case "$profile" in fake | real) ;; *) usage ;; esac
+case "$profile" in fake | real | codex) ;; *) usage ;; esac
 if [ "$profile" = real ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
   echo "--profile real reads OPENROUTER_API_KEY from the environment; it is unset" >&2
+  exit 2
+fi
+if [ "$profile" = codex ] && ! [ -f "${LAB_CODEX_AUTH_JSON:-}" ]; then
+  echo "--profile codex reads the auth file named by LAB_CODEX_AUTH_JSON; it is unset or not a file" >&2
   exit 2
 fi
 
@@ -72,6 +76,10 @@ if [ "$(id -u)" -eq 0 ] && command -v useradd >/dev/null; then
   gateway_uid="$(id -u lab-gateway)"
   ipc_gid="$(getent group lab-ipc | cut -d: -f3)"
   separation="separate UIDs"
+  if [ "$profile" = codex ]; then
+    gateway_uid="$(stat -c %u "$(dirname "$LAB_CODEX_AUTH_JSON")")"
+    separation="separate UIDs; gatewayd runs as the owner of the Codex auth directory"
+  fi
 else
   broker_uid="$(id -u)"
   gateway_uid="$broker_uid"
@@ -123,6 +131,7 @@ python3 "$lab/lab.py" --run "$run" --state "$state" --bin "$state/bin" --scenari
   --profile "$profile" --otlp "http://127.0.0.1:$otlp_port" \
   --broker-uid "$broker_uid" --gateway-uid "$gateway_uid" --ipc-gid "$ipc_gid" \
   ${LAB_RUST_LOG:+--rust-log "$LAB_RUST_LOG"} ${LAB_REAL_MODEL:+--real-model "$LAB_REAL_MODEL"} \
+  ${LAB_CODEX_AUTH_JSON:+--codex-auth "$LAB_CODEX_AUTH_JSON"} ${LAB_CODEX_MODEL:+--codex-model "$LAB_CODEX_MODEL"} \
   || lab_status=$?
 
 docker stop --time 10 "$container" >/dev/null
