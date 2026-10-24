@@ -63,6 +63,7 @@ struct Recorder {
     stall_progress: AtomicU32,
     stall_finalize: AtomicU32,
     stall_status: AtomicU32,
+    slow_post: AtomicU32,
     post_attempts: AtomicU32,
     posts: AtomicU32,
 }
@@ -235,6 +236,9 @@ impl ProgressMessage for Surfaces {
         text: &crate::progress::ProgressText,
         _cancel: bool,
     ) -> Result<MessageRef, TransportError> {
+        self.recorder
+            .stalled_for(&self.recorder.slow_post, Duration::from_millis(500))
+            .await;
         self.recorder.post_attempts.fetch_add(1, Ordering::Relaxed);
         self.recorder.stalled(&self.recorder.stall_progress).await;
         if self.recorder.counted(&self.recorder.refuse_progress) {
@@ -301,6 +305,9 @@ impl TextStream for Surfaces {
         text: &StreamedText,
         _cancel: bool,
     ) -> Result<MessageRef, TransportError> {
+        self.recorder
+            .stalled_for(&self.recorder.slow_post, Duration::from_millis(500))
+            .await;
         let mut rendered = text.text.as_str().to_owned();
         if text.truncated {
             rendered.push_str(TRUNCATION_MARKER);
@@ -1907,6 +1914,66 @@ async fn a_steer_staged_after_the_progress_post_gets_its_answer_below_it() {
     );
     let writes = harness.recorder.writes();
     assert_eq!(&writes[1..], [Call::Delete, Call::Reply("done".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_staged_while_the_progress_post_is_in_flight_gets_its_answer_below_it() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.recorder.slow_post.store(1, Ordering::Relaxed);
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    advance(Duration::from_millis(500)).await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    let writes = harness.recorder.writes();
+    assert!(matches!(writes[0], Call::Post(_)));
+    assert_eq!(&writes[1..], [Call::Delete, Call::Reply("done".to_owned())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_steer_staged_while_the_stream_post_is_in_flight_gets_its_answer_below_it() {
+    let mut harness = start(
+        Offers {
+            stream: true,
+            typing: false,
+            status: false,
+            reaction: false,
+            ..Offers::default()
+        },
+        ProgressDetail::Off,
+        liveness(true),
+    );
+    harness.recorder.slow_post.store(1, Ordering::Relaxed);
+    harness.sink.emit(started());
+    let text = recorded_delta();
+    harness.sink.emit(ProgressEvent::TextDelta {
+        turn: 1,
+        cumulative_chars: text.as_str().chars().count(),
+        text: text.clone(),
+    });
+    settle().await;
+    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+    advance(Duration::from_millis(500)).await;
+    assert!(
+        harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("done")))
+            .await
+    );
+    assert_eq!(
+        harness.recorder.calls(),
+        [
+            Call::Stream(text.as_str().to_owned()),
+            Call::StreamDiscard,
+            Call::Reply("done".to_owned())
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]

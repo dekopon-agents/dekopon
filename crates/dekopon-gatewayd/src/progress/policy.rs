@@ -774,6 +774,7 @@ impl Live {
         self.state.elapsed = now.saturating_duration_since(self.started);
         let text = self.line(line);
         let creating = status_text.is_none() && self.message.is_none();
+        let steers_at_post = self.counters.steers.load(Ordering::Relaxed);
         let outcome = if let Some(status_text) = status_text {
             if self.status_text == StatusTextState::Waiting {
                 self.status_text = StatusTextState::HandedOver;
@@ -809,7 +810,7 @@ impl Live {
             Ok(posted) => {
                 breaker.succeeded();
                 if let Some(message) = posted {
-                    self.steers_at_post = self.counters.steers.load(Ordering::Relaxed);
+                    self.steers_at_post = steers_at_post;
                     self.message = Some(message);
                 }
                 tracing::debug!(
@@ -908,6 +909,7 @@ impl Live {
         let chars = text.text.as_str().chars().count();
         let cancel = self.cancel_control();
         let creating = self.message.is_none();
+        let steers_at_post = self.counters.steers.load(Ordering::Relaxed);
         let outcome = bounded(stream.show(&target, self.message.as_ref(), &text, cancel)).await;
         self.stream.clear();
         self.stream.cooldown(limits.min_interval);
@@ -915,7 +917,7 @@ impl Live {
             Ok(message) => {
                 self.breakers.stream.succeeded();
                 if creating {
-                    self.steers_at_post = self.counters.steers.load(Ordering::Relaxed);
+                    self.steers_at_post = steers_at_post;
                 }
                 self.message = Some(message);
                 self.streaming = true;

@@ -331,8 +331,10 @@ final edits may not notify, and a long complete answer may require multiple send
 eligibility, recipient settings, typing dismissal, and actual notification behavior require
 separately authorized live checks, not loopback assertions.
 
-Preserve `policy.rs::discard`: ordinary progress can be deleted on fallback, but partial streams
-are retained even on Telegram/Discord, despite their message-delete APIs. Success removes controls
+Preserve `policy.rs::discard`: ordinary progress can be deleted on fallback. On Telegram,
+Discord and Local a partial stream is deleted too, when a steer was staged after it began,
+when a non-deadline finalize refusal falls back to reply, and when a silent_until_success
+session ends without an answer. A finalize that misses its deadline never deletes it. Success removes controls
 when finalization succeeds; failure/cancellation preserve existing partial-text terminal treatment.
 Shutdown does not rewrite the last surface. Failed or ambiguous cleanup can leave controls or text
 behind, and finalization timeout must never delete a possibly accepted answer. This proposal adds
@@ -416,7 +418,7 @@ Additional transport acceptance cases for the implementation PR (not tests added
 | Discord addressing and Stop | DM/channel/thread REST targets and cancellation keys stay exact; non-mutating ack occurs before blocked queue; foreign press preserves partial text/components; initiating press wins once; ack failure still routes cancellation |
 | Message/control resolution | Auto/button forces delayed prose only where permitted; Off/Complete/button and Auto/Message + Complete/detail-Off/button report all conflicts; successful terminal edits remove keyboard/components; Stream attaches only at first text |
 | WhatsApp restrictions and lease | Exact coupled read/typing body; master Off sends neither; Message degrades once with zero placeholder calls; all Stream/button conflicts in base/overrides aggregate; paused time schedules twenty-second renewals without claiming remote visibility |
-| Terminal and failure paths | Success, failed model, declined reply, cancellation, shutdown, failed final send and partial delivery cease renewal; retained streams versus deletable progress follow existing rules; stale answer/history suppressed after Stop |
+| Terminal and failure paths | Success, failed model, declined reply, cancellation, shutdown, failed final send and partial delivery cease renewal; retained streams versus deletable progress follow `policy.rs::discard`; stale answer/history suppressed after Stop |
 | Refusal and ambiguity | HTTP refusal, malformed success and timeout retain cause; no repeated ambiguous creation, no deletion after ambiguous finalization; oversized/image fallback preserves every supported part and partial-delivery accounting |
 
 Run package-scoped validation first (`cargo test -p dekopon-gatewayd --locked` and relevant gateway
