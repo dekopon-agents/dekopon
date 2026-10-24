@@ -476,6 +476,7 @@ impl<'a> Parser<'a> {
 
     fn parse_if(&mut self) -> Result<IfStatement, ParseError> {
         self.expect_reserved("if", "an `if` statement")?;
+        self.enter("an `if` statement")?;
         let mut branches = Vec::new();
         let condition = self.parse_and_or_list()?;
         self.skip_separators();
@@ -503,6 +504,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_reserved("fi", "an `if` statement")?;
+        self.leave();
         Ok(IfStatement {
             branches,
             otherwise,
@@ -654,14 +656,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_while(&mut self, until: bool) -> Result<WhileLoop, ParseError> {
-        let keyword = if until { "until" } else { "while" };
-        let context = format!("an `{keyword}` loop");
-        self.expect_reserved(keyword, &context)?;
+        let (keyword, context) = if until {
+            ("until", "an `until` loop")
+        } else {
+            ("while", "a `while` loop")
+        };
+        self.expect_reserved(keyword, context)?;
+        self.enter(context)?;
         let condition = self.parse_and_or_list()?;
         self.skip_separators();
-        self.expect_reserved("do", &context)?;
+        self.expect_reserved("do", context)?;
         let body = self.parse_program(&["done"])?;
-        self.expect_reserved("done", &context)?;
+        self.expect_reserved("done", context)?;
+        self.leave();
         Ok(WhileLoop {
             condition,
             body,

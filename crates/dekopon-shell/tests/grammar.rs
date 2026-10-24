@@ -2396,6 +2396,7 @@ fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
         ("echo $((i += 2))", "compound assignment"),
         ("echo $(( 1 > 0 ? 5 : 6 ))", "ternary"),
         ("echo $(( 1 & 2 ))", "bitwise"),
+        ("echo $(( 1 ) x)", "between the closing parentheses"),
     ] {
         let outcome = run(script);
         assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{script}");
@@ -2593,6 +2594,39 @@ fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
     assert_eq!(output("echo $(echo $(echo $(echo deep)))"), "deep");
     let at_the_ceiling = arithmetic_calls_deep(&format!("{}1", "1+".repeat(64)), 12);
     assert_eq!(on_a_two_mib_stack(&at_the_ceiling).output, "65");
+}
+
+#[test]
+fn a_condition_chain_past_the_ceiling_is_refused() {
+    for (script, construct) in [
+        (format!("{}true", "if ".repeat(2_000)), "an `if` statement"),
+        (
+            format!("{}true", "if true; then :; elif ".repeat(2_000)),
+            "a command block",
+        ),
+        (format!("{}true", "while ".repeat(2_000)), "a `while` loop"),
+        (format!("{}true", "until ".repeat(2_000)), "an `until` loop"),
+        (
+            format!("echo $({}true)", "while ".repeat(2_000)),
+            "a `while` loop",
+        ),
+    ] {
+        let outcome = on_a_two_mib_stack(&script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{}", &script[..40]);
+        assert!(
+            outcome
+                .output
+                .contains(&format!("{construct} nested more than 64 levels deep")),
+            "{}",
+            outcome.output
+        );
+    }
+    let nested = format!(
+        "f() {{ {}echo deep{}; }}; f",
+        "while true; do if true; then ".repeat(5),
+        "; break; fi; done".repeat(5)
+    );
+    assert_eq!(on_a_two_mib_stack(&nested).output, "deep");
 }
 
 #[test]
