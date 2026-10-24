@@ -7,6 +7,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.50.6] - 2026-10-24
+
+### Fixed
+
+- A reply to a turn that took a steered message is posted below that message instead of edited into the earlier progress message.
+- Outbound attachments are named for their content type (text/markdown as .md, other text as .txt) instead of .bin.
+
+## [dekopon-chart-0.37.6] - 2026-10-24
+
+### Changed
+
+- Chart 0.37.6 targets core v0.50.6 and renders the `v0.50.6` image tag.
+
 ## [0.50.5] - 2026-10-24
 
 ### Changed

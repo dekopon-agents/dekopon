@@ -32,19 +32,19 @@ the release used by the archive commands below.
 
 ### Prebuilt archives
 
-Release [0.50.5](https://github.com/dekopon-agents/dekopon/releases/tag/v0.50.5) provides standard
+Release [0.50.6](https://github.com/dekopon-agents/dekopon/releases/tag/v0.50.6) provides standard
 archives for macOS ARM64, Linux ARM64, and Linux x86-64, plus separate optimized-Wasmtime Linux
 archives. Each standard archive includes both daemons, licences, and broker/gateway reference
-documents, with a `.sha256` sidecar. The Mac example selects the standard 0.50.5 archive:
+documents, with a `.sha256` sidecar. The Mac example selects the standard 0.50.6 archive:
 
 ```console
-gh release download v0.50.5 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.50.5-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.50.5-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.50.6 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.50.6-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.50.6-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.50.5-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.50.5-aarch64-apple-darwin.tar.gz
-export PATH="$PWD/dekopon-0.50.5-aarch64-apple-darwin:$PATH"
+  dekopon-0.50.6-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.50.6-aarch64-apple-darwin.tar.gz
+export PATH="$PWD/dekopon-0.50.6-aarch64-apple-darwin:$PATH"
 ```
 
 Use the configuration contracts and examples from the same tag as the binaries; a checkout of
@@ -57,8 +57,8 @@ The application release publishes the workspace's crates in dependency order thr
 trusted publishing. Install both daemons at the same available version:
 
 ```console
-cargo install --locked --version 0.50.5 dekopon-brokerd
-cargo install --locked --version 0.50.5 dekopon-gatewayd
+cargo install --locked --version 0.50.6 dekopon-brokerd
+cargo install --locked --version 0.50.6 dekopon-gatewayd
 ```
 
 A crate publication can trail the Git tag or stop partway; use the tap or release archives if the
@@ -73,7 +73,7 @@ also the MSRV (edition 2024):
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
-git checkout v0.50.5
+git checkout v0.50.6
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopon-gatewayd
 dekopon-brokerd --version
@@ -135,7 +135,7 @@ probe authenticates and lists capabilities but invokes nothing. A real local mes
 configured model and provider is a separate acceptance check. Stop the gateway before the broker;
 graceful shutdown does not roll back effects already sent to an endpoint.
 
-This page does not provide a verified end-to-end 0.50.5 Mac starter. The former 0.30.0 walkthrough
+This page does not provide a verified end-to-end 0.50.6 Mac starter. The former 0.30.0 walkthrough
 relied on a bundled provider that current installs do not contain; replacing only its version
 numbers would not establish compatibility.
 
