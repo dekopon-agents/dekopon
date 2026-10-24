@@ -1989,7 +1989,7 @@ where
         &self,
         context: &AuthenticatedContext,
         capability: &CapabilityId,
-    ) -> Result<AuthorizedInvocation, Refusal> {
+    ) -> Result<CapabilityDecision, Refusal> {
         // This check is the actual enforcement under Leniency::Tolerant, not just defense in
         // depth; never weaken it into an assertion or fold it into the policy decision, or an
         // unrouted but policy-anticipated capability would stop being denied.
@@ -2015,12 +2015,72 @@ where
                 ..determined_refusal(reason, decision.determining_policy_ids)
             });
         }
-        Ok(AuthorizedInvocation {
+        Ok(CapabilityDecision {
             set,
             policy_ids: decision.determining_policy_ids,
             slots,
             errors_present: decision.errors_present,
         })
+    }
+
+    #[must_use]
+    pub fn secret_use_or_default(
+        &self,
+        capability: &CapabilityId,
+        proposed: Option<SecretUseProposal>,
+    ) -> Option<SecretUseProposal> {
+        proposed.or_else(|| {
+            let default = self
+                .constraints
+                .get(capability)?
+                .default_secret_use
+                .as_ref()?;
+            Some(match default.sink {
+                DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
+                    secret: default.drn.clone(),
+                },
+            })
+        })
+    }
+
+    /// The serving secret-use decision on an allowed [`CapabilityDecision`];
+    /// `dekopon-brokerd check --workflows` relies on it being the decision `invoke` makes.
+    pub fn bind_secret_use(
+        &self,
+        context: &AuthenticatedContext,
+        capability: &CapabilityId,
+        decision: &mut CapabilityDecision,
+        secret_use: Option<&SecretUseProposal>,
+    ) -> Result<(), Refusal> {
+        let Some(secret_use) = secret_use else {
+            decision.set.constraints.secret_use = None;
+            return Ok(());
+        };
+        let Some(binding) = self.secrets.binding(capability, secret_use) else {
+            return Err(determined_refusal(
+                "secret-denied",
+                decision.policy_ids.clone(),
+            ));
+        };
+        let secret_decision =
+            self.authorize_secret_use(context, capability, &decision.set, secret_use);
+        decision.errors_present |= secret_decision.errors_present;
+        decision
+            .policy_ids
+            .extend(secret_decision.determining_policy_ids);
+        decision.policy_ids.sort();
+        decision.policy_ids.dedup();
+        if !secret_decision.allowed {
+            return Err(Refusal {
+                evaluation: Some(PolicyEvaluation {
+                    errors_present: secret_decision.errors_present,
+                    cause: None,
+                }),
+                ..determined_refusal("secret-denied", decision.policy_ids.clone())
+            });
+        }
+        decision.set.constraints.secret_use = Some(self.secrets.grant(binding));
+        Ok(())
     }
 
     fn authorize_capability(
@@ -2911,10 +2971,6 @@ where
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     async fn invoke_inner(
         &self,
         context: &AuthenticatedContext,
@@ -2959,24 +3015,9 @@ where
                     .map(ControlFlow::Break);
             }
             // Before the decision: a denial still records the defaulted secret it refused.
-            if request.secret_use.is_none()
-                && let Some(default) = self
-                    .constraints
-                    .get(&request.capability)
-                    .and_then(|set| set.default_secret_use.as_ref())
-            {
-                request.secret_use = Some(match default.sink {
-                    DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
-                        secret: default.drn.clone(),
-                    },
-                });
-            }
-            let AuthorizedInvocation {
-                mut set,
-                mut policy_ids,
-                slots,
-                errors_present,
-            } = match self.authorize_invocation(context, &request.capability) {
+            request.secret_use =
+                self.secret_use_or_default(&request.capability, request.secret_use.take());
+            let mut decision = match self.authorize_invocation(context, &request.capability) {
                 Ok(authorized) => authorized,
                 Err(refusal) => {
                     // A policy error denies exactly like a non-match; this is recorded as a flag
@@ -3011,55 +3052,38 @@ where
                         .map(ControlFlow::Break);
                 }
             };
-            authorize.record("policy.errors_present", errors_present);
-            if let Some(secret_use) = request.secret_use.as_ref() {
-                let Some(binding) = self
-                    .secrets
-                    .binding(&request.capability, secret_use)
-                    .cloned()
-                else {
-                    authorize.record("outcome", "secret-denied");
-                    return self
-                        .deny(
-                            context,
-                            &request,
-                            determined_refusal("secret-denied", policy_ids),
-                        )
-                        .await
-                        .map(ControlFlow::Break);
-                };
-                let secret_decision =
-                    self.authorize_secret_use(context, &request.capability, &set, secret_use);
-                authorize.record(
-                    "policy.errors_present",
-                    errors_present || secret_decision.errors_present,
-                );
-                policy_ids.extend(secret_decision.determining_policy_ids.clone());
-                policy_ids.sort();
-                policy_ids.dedup();
-                if !secret_decision.allowed {
-                    authorize.record("outcome", "secret-denied");
-                    if secret_decision.errors_present {
-                        tracing::warn!(
-                            event = "broker_policy_evaluation_error",
-                            invocation = %request.id,
-                            policy.target = "secret",
-                            "broker.policy.evaluation.error"
-                        );
-                    }
-                    return self
-                        .deny(
-                            context,
-                            &request,
-                            determined_refusal("secret-denied", policy_ids),
-                        )
-                        .await
-                        .map(ControlFlow::Break);
+            let bound = self.bind_secret_use(
+                context,
+                &request.capability,
+                &mut decision,
+                request.secret_use.as_ref(),
+            );
+            authorize.record("policy.errors_present", decision.errors_present);
+            if let Err(refusal) = bound {
+                authorize.record("outcome", refusal.reason);
+                if refusal
+                    .evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| evaluation.errors_present)
+                {
+                    tracing::warn!(
+                        event = "broker_policy_evaluation_error",
+                        invocation = %request.id,
+                        policy.target = "secret",
+                        "broker.policy.evaluation.error"
+                    );
                 }
-                set.constraints.secret_use = Some(self.secrets.grant(&binding));
-            } else {
-                set.constraints.secret_use = None;
+                return self
+                    .deny(context, &request, refusal)
+                    .await
+                    .map(ControlFlow::Break);
             }
+            let CapabilityDecision {
+                set,
+                policy_ids,
+                slots,
+                ..
+            } = decision;
             authorize.record("outcome", "allowed");
             Ok(ControlFlow::Continue((set, policy_ids, slots)))
         }
@@ -4303,7 +4327,7 @@ struct PolicyEvaluation {
     cause: Option<String>,
 }
 
-pub struct AuthorizedInvocation {
+pub struct CapabilityDecision {
     pub set: ConstraintSet,
     policy_ids: Vec<String>,
     slots: ChatSlotValues,

@@ -279,19 +279,24 @@ pub(crate) async fn versions(lock: Option<&Path>, uid: u32) -> BTreeMap<Provider
     let Some(lock) = lock else {
         return BTreeMap::new();
     };
-    provider_manager::load_lock(lock, uid)
-        .await
-        .map(|lock| {
-            lock.providers
-                .into_iter()
-                .filter_map(|provider| {
-                    provider
-                        .resolved_version
-                        .map(|version| (provider.provider_id, version))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    match provider_manager::load_lock(lock, uid).await {
+        Ok(lock) => lock
+            .providers
+            .into_iter()
+            .filter_map(|provider| {
+                provider
+                    .resolved_version
+                    .map(|version| (provider.provider_id, version))
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error_chain(&error),
+                "workflow refusals name every provider unversioned: the provider lock is unreadable"
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 pub(crate) async fn run(
@@ -352,7 +357,7 @@ async fn run_step(
             provider: provider(ready, word, versions),
         }))
     };
-    let failure = match broker
+    let proposed = match broker
         .run_command(
             &peer.context,
             peer.attestor.as_ref(),
@@ -363,30 +368,40 @@ async fn run_step(
         )
         .await
     {
-        Ok(CommandRunOutcome::Proposed { capability, .. }) if capability == step.capability => None,
+        Ok(CommandRunOutcome::Proposed {
+            capability,
+            secret_use,
+            ..
+        }) if capability == step.capability => Ok(secret_use),
         Ok(CommandRunOutcome::Proposed { capability, .. }) => {
-            Some(ParseFailure::Proposed { capability })
+            Err(ParseFailure::Proposed { capability })
         }
         Ok(CommandRunOutcome::Rendered {
             stdout,
             stderr,
             status,
-        }) => Some(ParseFailure::Rendered {
+        }) => Err(ParseFailure::Rendered {
             status,
             usage: if stderr.is_empty() { stdout } else { stderr },
         }),
-        Ok(CommandRunOutcome::Failed { error }) => Some(ParseFailure::Failed { code: error.code }),
-        Err(error) => Some(ParseFailure::Host(error)),
+        Ok(CommandRunOutcome::Failed { error }) => Err(ParseFailure::Failed { code: error.code }),
+        Err(error) => Err(ParseFailure::Host(error)),
     };
-    if let Some(failure) = failure {
-        return Err(parse(failure));
-    }
-    let authorized = broker
+    let secret_use = broker.secret_use_or_default(&step.capability, proposed.map_err(parse)?);
+    let mut decision = broker
         .authorize_invocation(&context, &step.capability)
+        .map_err(grant)?;
+    broker
+        .bind_secret_use(
+            &context,
+            &step.capability,
+            &mut decision,
+            secret_use.as_ref(),
+        )
         .map_err(grant)?;
     match step.requests {
         Some(declared) => {
-            let maximum = max_requests(&authorized.set);
+            let maximum = max_requests(&decision.set);
             if maximum < declared.get() {
                 return Err(Refused::Budget { declared, maximum });
             }
