@@ -148,6 +148,7 @@ library uses `tracing` only and installs no subscriber.
 | `model.stream`, `cache.style` | local streamed/buffered mode and `automatic`/`explicitPrefix` encoding |
 | `generation.max_output_tokens`, `generation.temperature`, `generation.top_p`, `reasoning.effort` | authored OpenRouter requests, absent when omitted |
 | `routing.allow_fallbacks`, `routing.require_parameters`, `routing.only`, `cache.ttl` | authored routing/TTL hints; `routing.only` is a bounded comma-separated diagnostic |
+| `tool_choice`, `parallel_tool_calls` | request tool selection (string) and parallel-call permission (boolean), only when the dialect sends that option |
 | `timing.total_ms` | complete exchange duration, including preparation and permitted refresh/resend |
 | `timing.headers_ms` | most recent send-to-headers duration; a Codex resend replaces the earlier value |
 | `timing.first_event_ms`, `stream.first_delta_ms` | time since adapter exchange starts (before preparation) to first SSE event / first visible text; absent when no such event/text exists |
@@ -176,8 +177,12 @@ never enter `model.complete` fields, and `traceparent` is not forwarded to the i
 Counts, byte totals, `output.partial`, `model.stream`, `cache.style` and the reported model are
 recorded once per exchange, not per delta or chunk, so a long stream cannot push `outcome` or
 `usage.*` past the span's attribute limit.
-`agent.model.prompt` includes `tools`: comma-joined names offered to that exact model turn,
-empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a complete tool list.
+`agent.model.prompt` includes `gen_ai.tool.definitions` on the session's `full` event: an
+unbounded JSON array of the exact tool names, descriptions and parameter schemas given to the
+client. The tool set is fixed for the session. Image summaries retain `[mime, N bytes]` and append
+`sha256:<hex>` for decoded bytes read during request preparation. The digest is cached on the blob
+reference without another read. A failed preparation that never read an image has no digest.
+The prompt event is emitted after the model call, including failures, before the answer event.
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
@@ -1154,11 +1159,10 @@ is no blind span ([storage telemetry and audit](#storage-telemetry-and-audit)).
 
 ## Model and tool transcript
 
-The verbatim exchange between the model and its tools rides the **log stream**, not span attributes.
-A conversation is unbounded text: span attributes are the wrong container for it, every trace fetch
-would drag the payload along, and a backend indexes log bodies for full-text search rather than span
-fields. Both signals carry the same `trace_id` and `span_id`, so a log result pivots to the turn it
-belongs to.
+The gateway's OTLP log filter is `job=debug,meter=info`. The `agent.model.prompt`,
+`agent.model.answer` and `agent.tool.*` events therefore reach OpenObserve as span events in the
+traces stream, rather than log records. Reconstruct the transcript from those events within the
+message trace.
 
 These events join the accounting and refusal ones:
 
@@ -1179,7 +1183,7 @@ list strictly contains turn N-1's, and everything appended since was already emi
 re-sending the whole list every turn would cost a long session O(N²) payload bytes of near-
 duplicates. `transcript.scope` says which shape an event carries (`full` or `delta`) and
 `message.count` gives the size of the request actually sent, so a reader can tell a trimmed session
-from a truncated log. Concatenating a session's events in order reconstructs the exact transcript.
+from a truncated event. Concatenating a session's events in order reconstructs the exact transcript.
 
 `accounting.model.turn` carries turn counts, durations, and outcomes. `agent.config.inspected`
 carries only the bounded result byte count and whether this call repeated an earlier one; it never

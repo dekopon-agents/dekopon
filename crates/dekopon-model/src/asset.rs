@@ -1,10 +1,11 @@
 use parking_lot::Mutex;
+use sha2::{Digest as _, Sha256};
 use std::{
     fmt,
     fs::File,
     io::{self, Write},
     os::{fd::OwnedFd, unix::fs::FileExt},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -233,10 +234,16 @@ pub struct BlobReference {
     source: Arc<dyn BlobSource>,
     bytes: usize,
     id: u64,
+    sha256: Arc<OnceLock<String>>,
 }
 impl BlobReference {
     pub fn new(source: Arc<dyn BlobSource>, bytes: usize, id: u64) -> Self {
-        Self { source, bytes, id }
+        Self {
+            source,
+            bytes,
+            id,
+            sha256: Arc::new(OnceLock::new()),
+        }
     }
     #[must_use]
     pub fn len(&self) -> usize {
@@ -247,7 +254,17 @@ impl BlobReference {
         self.bytes == 0
     }
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
-        self.source.read()
+        let bytes = self.source.read()?;
+        self.sha256.get_or_init(|| {
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        });
+        Ok(bytes)
+    }
+    pub(crate) fn sha256(&self) -> Option<&str> {
+        self.sha256.get().map(String::as_str)
     }
     pub fn pin(&self) -> Result<DiskBlob, BlobError> {
         self.source.pin()
@@ -335,6 +352,45 @@ fn operation<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serializing_an_image_uses_the_decoded_read_digest_without_reading_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DecodedSource {
+            blob: DiskBlob,
+            reads: Arc<AtomicUsize>,
+        }
+        impl BlobSource for DecodedSource {
+            fn pin(&self) -> Result<DiskBlob, BlobError> {
+                Ok(self.blob.clone())
+            }
+            fn read(&self) -> Result<Vec<u8>, BlobError> {
+                use base64::Engine as _;
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok(base64::engine::general_purpose::STANDARD
+                    .decode(self.blob.read()?)
+                    .unwrap())
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reference = BlobReference::new(
+            Arc::new(DecodedSource {
+                blob: DiskBlob::from_bytes(b"YWJj").unwrap(),
+                reads: Arc::clone(&reads),
+            }),
+            3,
+            1,
+        );
+        assert_eq!(reference.read().unwrap(), b"abc");
+        let part = crate::model::ContentPart::Image {
+            mime: "image/png".into(),
+            data: reference.clone(),
+        };
+        let expected = "[image/png, 3 bytes] sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(serde_json::to_value(&part).unwrap(), expected);
+        assert_eq!(serde_json::to_value(&part).unwrap(), expected);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn decoded_limit_matches_the_shared_contract() {

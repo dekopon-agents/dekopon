@@ -128,3 +128,31 @@ pub(crate) async fn exported_model_span<F: std::future::Future>(
     provider.shutdown().unwrap();
     (output, span)
 }
+
+pub(crate) fn assert_tool_options(
+    span: &opentelemetry_sdk::trace::SpanData,
+    body: &serde_json::Value,
+) {
+    let options = ["tool_choice", "parallel_tool_calls"];
+    let expected: serde_json::Map<String, serde_json::Value> = options
+        .iter()
+        .filter_map(|key| {
+            body.get(*key)
+                .map(|value| ((*key).to_owned(), value.clone()))
+        })
+        .collect();
+    let actual: serde_json::Map<String, serde_json::Value> = span
+        .attributes
+        .iter()
+        .filter(|attribute| options.contains(&attribute.key.as_str()))
+        .map(|attribute| {
+            let value = match &attribute.value {
+                opentelemetry::Value::String(value) => serde_json::Value::String(value.to_string()),
+                opentelemetry::Value::Bool(value) => serde_json::Value::Bool(*value),
+                value => panic!("tool option has wrong type: {value:?}"),
+            };
+            (attribute.key.to_string(), value)
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}

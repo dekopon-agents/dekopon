@@ -103,7 +103,7 @@ impl OpenAiClient {
                         function,
                     })
                     .collect::<Vec<_>>();
-                compact_json_body(&ChatRequest {
+                let body = ChatRequest {
                     model: &self.model,
                     messages: &messages,
                     tools: &tools,
@@ -113,8 +113,10 @@ impl OpenAiClient {
                     stream_options: self.stream.then_some(StreamOptions {
                         include_usage: true,
                     }),
-                })
-                .map_err(|error| InferenceError::Transport(TransportFailure::Encoding(error)))
+                };
+                span.record("tool_choice", body.tool_choice);
+                compact_json_body(&body)
+                    .map_err(|error| InferenceError::Transport(TransportFailure::Encoding(error)))
             })
             .await
             .and_then(|result| result)
@@ -1030,6 +1032,40 @@ mod tests {
                 "{fields}"
             );
             assert!(fields.contains("error.phase=\"reading-body\""), "{fields}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_span_tool_options_equal_the_sent_body() {
+        for stream in [true, false] {
+            let response = if stream {
+                MockResponse::sse(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+            } else {
+                MockResponse::json(
+                    json!({"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}),
+                )
+            };
+            let server = MockServer::start(vec![response]);
+            let client =
+                OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
+                    .unwrap()
+                    .with_streaming(stream);
+            let (result, span) = crate::trace_capture::exported_model_span(generate(
+                &client,
+                &[],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            ))
+            .await;
+            result.unwrap();
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1);
+            let body: Value =
+                serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+            crate::trace_capture::assert_tool_options(&span, &body);
         }
     }
 

@@ -56,9 +56,11 @@ impl Serialize for ContentPart {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Text(text) => serializer.serialize_str(text),
-            Self::Image { mime, data } => {
-                serializer.serialize_str(&format!("[{mime}, {} bytes]", data.len()))
-            }
+            Self::Image { mime, data } => match data.sha256() {
+                Some(digest) => serializer
+                    .serialize_str(&format!("[{mime}, {} bytes] sha256:{digest}", data.len())),
+                None => serializer.serialize_str(&format!("[{mime}, {} bytes]", data.len())),
+            },
             Self::File { name, mime, data } => {
                 serializer.serialize_str(&format!("[{name} ({mime}), {} bytes]", data.len()))
             }

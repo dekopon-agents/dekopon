@@ -187,6 +187,8 @@ impl CodexClient {
             ))
             .await
             .inspect_err(|_| record_phase(FailurePhase::BeforeSend))??;
+        span.record("tool_choice", body.tool_choice);
+        span.record("parallel_tool_calls", body.parallel_tool_calls);
         let encoded = compact_json_body(&body).map_err(TransportFailure::Encoding)?;
         drop(body);
         let builder = self
@@ -1228,6 +1230,21 @@ mod tests {
         );
         assert_eq!(replay[2]["content"][0]["text"], "unindexed");
         assert_eq!(replay[3]["content"][0]["text"], "again");
+    }
+
+    #[tokio::test]
+    async fn codex_span_tool_options_equal_the_sent_body() {
+        let (_directory, server, client) = fixture(vec![MockResponse::sse(include_str!(
+            "fixtures/codex-answer.sse"
+        ))]);
+        let (result, span) =
+            crate::trace_capture::exported_model_span(generate(&client, &control())).await;
+        result.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        crate::trace_capture::assert_tool_options(&span, &body);
     }
 
     #[tokio::test]

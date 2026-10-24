@@ -186,3 +186,189 @@ async fn the_same_prompt_loop_executes_one_synthetic_tool_and_replays_each_nativ
         server.join();
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_definitions() {
+    use base64::Engine as _;
+    use dekopon_agent::prompt::{AssetSource, FetchedAsset};
+    use dekopon_model::{asset::DiskBlob, openai::OpenAiClient};
+    use dekopon_test_support::{CaptureLayer, Record};
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use tracing_subscriber::prelude::*;
+
+    struct ImageAssets;
+    impl AssetSource for ImageAssets {
+        fn offers_fetch(&self) -> bool {
+            true
+        }
+        fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
+            assert_eq!(id, 1);
+            Ok(FetchedAsset {
+                name: "photo.png".into(),
+                mime: "image/png".into(),
+                data: DiskBlob::from_bytes(b"synthetic pixels").unwrap().into(),
+            })
+        }
+    }
+    struct DescribedRuntime(SyntheticRuntime);
+    impl ScriptRuntime for DescribedRuntime {
+        fn capability_calls_used(&self) -> u32 {
+            self.0.capability_calls_used()
+        }
+        fn run_script(&self, script: &str) -> ScriptOutcome {
+            self.0.run_script(script)
+        }
+        fn command_words(&self) -> Vec<String> {
+            vec!["synthetic".into()]
+        }
+        fn command_word_help(&self) -> BTreeMap<String, String> {
+            BTreeMap::from([("synthetic".into(), "detailed help ".repeat(500))])
+        }
+    }
+    let call = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fetch-1","type":"function","function":{"name":"fetch_chat_asset","arguments":"{\"id\":1}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+    let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"seen\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server = LoopbackServer::sequence([response(call), response(answer), response(answer)]);
+    let timeout = Duration::from_secs(5);
+    let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout)
+        .unwrap()
+        .with_streaming(true);
+    let (_sender, receiver) = tokio::sync::watch::channel(false);
+    let bridge = BlockingModel::new(
+        Arc::new(ModelClient::OpenAiCompatible(client)),
+        tokio::runtime::Handle::current(),
+        receiver,
+        timeout,
+    );
+    let capture = CaptureLayer::workspace();
+    let captured = capture.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard = tracing_subscriber::registry().with(captured).set_default();
+        let runtime = DescribedRuntime(SyntheticRuntime::default());
+        let mut history = History::default();
+        for prompt in ["Look at chat-asset:1", "What did you see?"] {
+            run_prompt_session(
+                &bridge,
+                &runtime,
+                SessionInputs::new(
+                    prompt,
+                    PromptLimits {
+                        max_steps: 3,
+                        max_capability_calls: 1,
+                    },
+                )
+                .with_assets(&ImageAssets),
+                &mut history,
+            )
+            .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let sent: Vec<Value> = (0..3).map(|_| body(&server.request_text())).collect();
+    server.join();
+    let mut messages = Vec::new();
+    let mut definitions = Value::Null;
+    let mut exchange = serde_json::Map::new();
+    let mut rebuilt = Vec::new();
+    for record in capture.records() {
+        match record {
+            Record::Span {
+                name: "model.complete",
+                ..
+            } => {
+                for key in ["model.dialect", "tool_choice", "parallel_tool_calls"] {
+                    if let Some(value) = record.field(key) {
+                        exchange.insert(
+                            key.into(),
+                            if key == "parallel_tool_calls" {
+                                serde_json::from_str(value).unwrap()
+                            } else {
+                                json!(value)
+                            },
+                        );
+                    }
+                }
+            }
+            Record::Event { .. } if record.field("audit.event") == Some("agent.model.prompt") => {
+                if record.field("transcript.scope") == Some("full") {
+                    messages.clear();
+                    let encoded = record.field("gen_ai.tool.definitions").unwrap();
+                    assert!(encoded.len() > 4096);
+                    definitions = serde_json::from_str(encoded).unwrap();
+                } else {
+                    assert!(record.field("gen_ai.tool.definitions").is_none());
+                }
+                messages.extend(
+                    serde_json::from_str::<Vec<Value>>(record.field("messages").unwrap()).unwrap(),
+                );
+                assert_eq!(
+                    messages.len(),
+                    record
+                        .field("message.count")
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                );
+                rebuilt.push(json!({"messages":messages,"tools":definitions,"exchange":exchange}));
+                exchange.clear();
+            }
+            Record::Span { .. } | Record::Event { .. } => {}
+        }
+    }
+    assert_eq!(rebuilt.len(), sent.len());
+    let mut images = 0;
+    for (reconstructed, mut sent) in rebuilt.into_iter().zip(sent) {
+        for message in sent["messages"].as_array_mut().unwrap() {
+            if let Some(parts) = message["content"].as_array_mut() {
+                for part in parts {
+                    *part = match part["type"].as_str().unwrap() {
+                        "text" => part["text"].clone(),
+                        "image_url" => {
+                            let url = part["image_url"]["url"].as_str().unwrap();
+                            let (mime, encoded) = url
+                                .strip_prefix("data:")
+                                .unwrap()
+                                .split_once(";base64,")
+                                .unwrap();
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(encoded)
+                                .unwrap();
+                            images += 1;
+                            json!(format!(
+                                "[{mime}, {} bytes] sha256:{}",
+                                bytes.len(),
+                                Sha256::digest(&bytes)
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<String>()
+                            ))
+                        }
+                        kind => panic!("unexpected wire part {kind}"),
+                    };
+                }
+            }
+        }
+        let tools: Vec<Value> = sent["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"].clone())
+            .collect();
+        let mut exchange = json!({"model.dialect":"chat-completions"});
+        for key in ["tool_choice", "parallel_tool_calls"] {
+            if let Some(value) = sent.get(key) {
+                exchange[key] = value.clone();
+            }
+        }
+        assert_eq!(
+            reconstructed,
+            json!({"messages":sent["messages"],"tools":tools,"exchange":exchange})
+        );
+    }
+    assert!(images > 0);
+}

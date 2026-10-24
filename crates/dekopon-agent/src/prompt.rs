@@ -751,6 +751,9 @@ where
         model_tools.push(asset_tool());
     }
 
+    let tool_definitions =
+        serde_json::to_string(&model_tools).unwrap_or_else(|_| "<unserializable>".to_owned());
+
     let session_span = tracing::info_span!(
         "prompt.session",
         prompt.max_steps = limits.max_steps,
@@ -791,21 +794,6 @@ where
             stream.first_delta_ms = tracing::field::Empty,
         );
         let model_entered = model_span.enter();
-        let scope = if transcribed == 0 { "full" } else { "delta" };
-        let offered_tools = offered_tool_names(model_tools.iter().map(|tool| tool.name.as_str()));
-        tracing::info!(
-            target: "dekopon_agent::audit",
-            {
-                audit.event = "agent.model.prompt",
-                model.turn = model_turns,
-                transcript.scope = scope,
-                message.count = messages.len(),
-                tools = offered_tools.as_str(),
-                messages = %transcript(&messages[transcribed..]),
-            },
-            "agent.model.prompt"
-        );
-        transcribed = messages.len();
         let model_started = Instant::now();
         emit(
             progress,
@@ -819,6 +807,21 @@ where
             let mut on_event = |event| stream.observe(event);
             model.complete(&messages, &model_tools, options, &mut on_event)
         };
+        let scope = if transcribed == 0 { "full" } else { "delta" };
+        let definitions = (transcribed == 0).then_some(tool_definitions.as_str());
+        tracing::info!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.model.prompt",
+                model.turn = model_turns,
+                transcript.scope = scope,
+                message.count = messages.len(),
+                gen_ai.tool.definitions = definitions,
+                messages = %transcript(&messages[transcribed..]),
+            },
+            "agent.model.prompt"
+        );
+        transcribed = messages.len();
         stream.record_on(&model_span);
         let turn = match completion {
             Ok(turn) => turn,
@@ -1677,21 +1680,6 @@ fn fetch_asset_into(
         part,
     ]));
     Ok(())
-}
-
-fn offered_tool_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    let mut offered = names.collect::<Vec<_>>().join(",");
-    const LIMIT: usize = 4096;
-    const MARKER: &str = "[…]";
-    if offered.len() > LIMIT {
-        let mut end = LIMIT - MARKER.len();
-        while !offered.is_char_boundary(end) {
-            end -= 1;
-        }
-        offered.truncate(end);
-        offered.push_str(MARKER);
-    }
-    offered
 }
 
 fn clamp_textual_asset(mut text: String) -> String {
@@ -4493,26 +4481,27 @@ mod tests {
                     &[("audit.event", "agent.model.prompt"), ("model.turn", turn)],
                 );
                 assert_eq!(prompts.len(), 1);
-                assert_eq!(prompts[0].field("tools"), Some(tools), "turn {turn}");
+                let definitions = prompts[0].field("gen_ai.tool.definitions");
+                if turn == "1" {
+                    let definitions: Value = serde_json::from_str(definitions.unwrap()).unwrap();
+                    assert_eq!(
+                        definitions
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|tool| tool["name"].as_str().unwrap())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        tools
+                    );
+                } else {
+                    assert!(definitions.is_none());
+                }
             }
             let observed = model.scripted.observed_tools.lock();
             assert_eq!(observed.len(), 2);
             assert_eq!(observed[0], observed[1]);
         }
-    }
-
-    #[test]
-    fn offered_tool_names_mark_incomplete_lists_and_encode_empty_lists() {
-        assert_eq!(super::offered_tool_names(std::iter::empty()), "");
-        assert_eq!(
-            super::offered_tool_names(["script", "read_asset"].into_iter()),
-            "script,read_asset"
-        );
-        let long = "é".repeat(3000);
-        let bounded = super::offered_tool_names([long.as_str()].into_iter());
-        assert!(bounded.len() <= 4096);
-        assert!(bounded.ends_with("[…]"));
-        assert!(!bounded.contains('�'));
     }
 
     #[test]

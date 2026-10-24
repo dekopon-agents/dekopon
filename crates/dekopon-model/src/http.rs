@@ -97,6 +97,8 @@ impl InferenceHttp {
             model.dialect = dialect,
             model.stream = tracing::field::Empty,
             cache.style = tracing::field::Empty,
+            tool_choice = tracing::field::Empty,
+            parallel_tool_calls = tracing::field::Empty,
             model.returned = tracing::field::Empty,
             model.upstream = tracing::field::Empty,
             gen_ai.response.id = tracing::field::Empty,

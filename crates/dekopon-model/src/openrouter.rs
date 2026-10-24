@@ -148,7 +148,7 @@ impl OpenRouterClient {
             require_parameters: routing.require_parameters,
             only: routing.only.as_deref(),
         });
-        let body = compact_json_body(&RouterRequest {
+        let body = RouterRequest {
             model: &self.model,
             messages,
             tools,
@@ -160,8 +160,9 @@ impl OpenRouterClient {
             reasoning: self.settings.reasoning.as_ref(),
             provider,
             session_id: request.options.prompt_cache_key(),
-        })
-        .map_err(TransportFailure::Encoding)?;
+        };
+        tracing::Span::current().record("tool_choice", body.tool_choice);
+        let body = compact_json_body(&body).map_err(TransportFailure::Encoding)?;
         Ok(body)
     }
 
