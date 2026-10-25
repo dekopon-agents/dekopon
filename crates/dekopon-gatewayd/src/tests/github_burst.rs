@@ -299,6 +299,9 @@ async fn a_delivery_past_the_global_limit_is_refused_and_redelivers() {
         answer("report"),
     ));
     let mut fixture = fixture(Arc::new(Arc::clone(&model)), 8).await;
+    let admissions = Admissions::default();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(admissions.clone()));
     let mut sessions = tokio::task::JoinSet::new();
     for n in 1..=8 {
         assert_eq!(
@@ -363,11 +366,25 @@ async fn a_delivery_past_the_global_limit_is_refused_and_redelivers() {
         9,
         "same GUID executes exactly once after redelivery"
     );
+    let records = admissions.0.lock();
+    assert!(
+        records
+            .iter()
+            .any(|row| row["outcome"] == "busy" && row["github.deliveries"] == json!(["ninth"]))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|row| row["outcome"] == "started" && row["github.deliveries"] == json!(["pr-1"]))
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_repositoryless_event_is_acknowledged_and_ignored() {
     let mut fixture = fixture(Arc::new(ModelScript::forbidden()), 8).await;
+    let admissions = Admissions::default();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(admissions.clone()));
     for (event, body, status) in [
         ("ping", json!({}), axum::http::StatusCode::OK),
         (
@@ -395,6 +412,11 @@ async fn a_repositoryless_event_is_acknowledged_and_ignored() {
             status
         );
     }
+    let ignored = admissions.0.lock();
+    assert_eq!(ignored.len(), 2);
+    assert!(ignored.iter().all(|row| row["outcome"] == "ignored"));
+    assert_eq!(ignored[0]["github.deliveries"], json!(["ping"]));
+    assert_eq!(ignored[1]["github.deliveries"], json!(["new_event"]));
     assert!(fixture.broker.recorded().is_empty());
     assert!(fixture.transport.try_delivery_for_test().is_err());
 }

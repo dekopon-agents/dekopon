@@ -1025,6 +1025,31 @@ pub(crate) mod tests {
             .status(),
             StatusCode::OK
         );
+        let queued_span = receive_span(ChatTransportKind::Github);
+        let queued = process(
+            &state,
+            signed(&body, b"secret", "queued", "pull_request"),
+            &queued_span,
+        );
+        tokio::pin!(queued);
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        assert_eq!(count(), (2, 2));
+        assert_eq!(
+            process(
+                &state,
+                signed(&body, b"secret", "retry", "pull_request"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(count(), (2, 2), "a full queue records no accepted identity");
+        let TransportEvent::Delivery(_, ticket) = receiver.try_recv().unwrap() else {
+            panic!("queued ticket")
+        };
+        ticket.answer(Acked::Ignored);
+        assert_eq!(queued.await.status(), StatusCode::OK);
         let retry_span = receive_span(ChatTransportKind::Github);
         let retry = process(
             &state,
