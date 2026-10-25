@@ -19630,6 +19630,7 @@ fn openrouter_model(name: &str, model: &str, timeout_ms: u64) -> Value {
         "name": name,
         "model": model,
         "apiKeyEnv": PROBE_KEY_VARIABLE,
+        "modalities": ["image"],
         "timeoutMs": timeout_ms,
         "routing": { "requireParameters": true }
     })
@@ -19679,7 +19680,16 @@ fn spawn_fake_vendor() -> FakeVendor {
                         .expect("probe names its model")
                         .to_owned();
                 let request: Value = serde_json::from_str(&body).unwrap();
-                assert_canary_request(&request);
+                assert_canary_request(&request, usize::from(model != "vendor/text-only"));
+                let has_image = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| {
+                        message["content"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] == "image_url")
+                        })
+                    });
                 recorded_requests.lock().push(request);
                 recorded.lock().push(model.clone());
                 if model == "vendor/deadline" {
@@ -19688,6 +19698,7 @@ fn spawn_fake_vendor() -> FakeVendor {
                 let (status, content_type, response) = if model == "vendor/refused"
                     || model == "vendor/outage"
                     || model == "vendor/image-refused"
+                    || (model == "vendor/text-only" && has_image)
                 {
                     let authorization = headers
                         .lines()
@@ -19728,7 +19739,7 @@ fn spawn_fake_vendor() -> FakeVendor {
     }
 }
 
-fn assert_canary_request(request: &Value) {
+fn assert_canary_request(request: &Value, expected_images: usize) {
     assert_eq!(request["tools"].as_array().unwrap().len(), 1);
     assert_eq!(request["tools"][0]["function"]["name"], "canary");
     let images = request["messages"]
@@ -19739,13 +19750,15 @@ fn assert_canary_request(request: &Value) {
         .flatten()
         .filter(|part| part["type"] == "image_url")
         .collect::<Vec<_>>();
-    assert_eq!(images.len(), 1);
-    assert!(
-        images[0]["image_url"]["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,")
-    );
+    assert_eq!(images.len(), expected_images);
+    for image in images {
+        assert!(
+            image["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
     assert_eq!(request["max_tokens"], 16);
 }
 
@@ -22113,7 +22126,7 @@ async fn canary_result(model: &str, passes: bool) {
     }
     assert_eq!(vendor.asked.lock().as_slice(), [model]);
     assert_eq!(vendor.requests.lock().len(), 1);
-    assert_canary_request(&vendor.requests.lock()[0]);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
 }
 
 #[tokio::test]
@@ -22144,7 +22157,7 @@ async fn rebinding_an_unchanged_model_is_probed_but_unchanged_bindings_are_not()
     assert!(report.problems.is_empty(), "{report:?}");
     assert_eq!(vendor.asked.lock().as_slice(), ["vendor/second"]);
     assert_eq!(vendor.requests.lock().len(), 1);
-    assert_canary_request(&vendor.requests.lock()[0]);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
 }
 
 #[tokio::test]
@@ -22191,7 +22204,7 @@ async fn catalog_rebinding_uses_the_active_routes_and_refuses_the_reload() {
     assert_eq!(problem.routes, ["dev:reviewer"]);
     assert_eq!(vendor.asked.lock().as_slice(), ["vendor/image-refused"]);
     assert_eq!(vendor.requests.lock().len(), 1);
-    assert_canary_request(&vendor.requests.lock()[0]);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
     assert_eq!(active_routes.serving("first"), ["dev:reviewer"]);
 }
 
@@ -22219,7 +22232,7 @@ async fn a_canary_deadline_names_the_model_and_routes() {
         crate::ProbeError::Vendor(InferenceError::DeadlineExceeded)
     ));
     assert_eq!(vendor.requests.lock().len(), 1);
-    assert_canary_request(&vendor.requests.lock()[0]);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
 }
 
 #[tokio::test]
@@ -22229,3 +22242,113 @@ async fn canary_arguments_must_match_the_declared_tool() {
 
 #[path = "tests/lost_task.rs"]
 mod lost_task;
+
+#[tokio::test]
+async fn a_text_only_model_passes_the_tool_canary_without_an_image() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    let mut model = openrouter_model("router", "vendor/text-only", 5_000);
+    model.as_object_mut().unwrap().remove("modalities");
+    document["models"] = json!([model]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::Every, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/text-only"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 0);
+    assert_eq!(
+        vendor.requests.lock()[0]["messages"][1]["content"],
+        "Confirm this text turn by calling canary."
+    );
+}
+
+#[tokio::test]
+async fn a_candidate_catalog_override_does_not_rebind_the_against_baseline() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let candidate_catalog = root.path().join("candidate-agents.yaml");
+    fs::write(&candidate_catalog, catalog_text(true, Some("vision"))).unwrap();
+    let mut document = document(root.path());
+    let mut first = openrouter_model("first", "vendor/first", 5_000);
+    first["classes"] = json!(["reasoning"]);
+    let mut second = openrouter_model("second", "vendor/image-refused", 5_000);
+    second["classes"] = json!(["vision"]);
+    document["models"] = json!([first, second]);
+    let path = write_config(root.path(), &document);
+    let live = root.path().join("live.json");
+    fs::copy(&path, &live).unwrap();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let (_, report) = crate::load_candidate(
+        &path,
+        Some(&candidate_catalog),
+        config::LoadMode::Check,
+        Some((&crate::ProbeScope::ChangedFrom(live), &environment)),
+    )
+    .await;
+    let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(problem.model, "second");
+    assert_eq!(problem.routes, ["dev:reviewer"]);
+    assert!(
+        matches!(&problem.source, crate::ProbeError::Vendor(InferenceError::Provider(failure)) if failure.status == Some(400))
+    );
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/image-refused"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+}
+
+#[tokio::test]
+async fn an_unloadable_baseline_catalog_probes_even_when_candidate_routes_fail() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([openrouter_model("router", "vendor/refused", 5_000)]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    document["catalogPath"] = json!(root.path().join("missing-catalog.yaml"));
+    let live = root.path().join("live.json");
+    fs::copy(&path, &live).unwrap();
+    fs::write(&live, serde_json::to_vec(&document).unwrap()).unwrap();
+    document["catalogPath"] = json!(root.path().join("dekopon.yaml"));
+    document["routes"][0]["agent"] = json!("missing-agent");
+    write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::ChangedFrom(live), &vendor).await;
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, crate::CheckWarning::BaselineRoutes { .. }))
+    );
+    assert_eq!(report.problems.len(), 2, "{report:?}");
+    assert!(report.problems.iter().any(
+        |problem| matches!(problem, crate::GatewaydError::Route(RouteError { problems })
+        if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { .. }]))
+    ));
+    assert!(report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Probe(problem)
+        if problem.model == "router" && matches!(&problem.source,
+            crate::ProbeError::Vendor(InferenceError::Provider(failure)) if failure.status == Some(400)))));
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/refused"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+}

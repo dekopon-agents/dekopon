@@ -11,10 +11,13 @@ do not understand rather than guessing.
 ## Image-and-tool model canary
 
 `dekopon-gatewayd check --probe [--against <live config>]` and the reload gate now send one
-capped request containing a built-in one-pixel PNG and one fixed tool to each changed `openrouter`
-model. Exactly one well-formed call to that tool is required; no second request is made. A route
+capped request with one fixed tool to each changed `openrouter` model. Models declaring
+`modalities: [image]` also receive a built-in one-pixel PNG; text-only models receive a text turn.
+Exactly one well-formed call to the tool is required; no second request is made. A route
 newly binding an otherwise unchanged model also selects it for probing. An unchanged route and
-model do not select it under `--against` or reload.
+model do not select it under `--against` or reload. The `--against` baseline uses its own
+`catalogPath`; a candidate's `--catalog` override never changes the baseline binding. If the
+baseline catalog cannot load, the probe warns and checks every model.
 
 A vendor refusal, malformed tool call or deadline refuses the candidate; reload keeps the running
 configuration serving. The existing 16-output-token cap and 30-second bound (or shorter model

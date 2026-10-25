@@ -505,7 +505,6 @@ pub(crate) async fn load_candidate_against(
     probe: Option<(&ProbeScope, &probe::Vendor)>,
     active: Option<(&ResolvedConfig, &config::GatewaySources, &RoutingTable)>,
 ) -> (Option<Candidate>, CheckReport) {
-    let baseline_catalog_override = catalog_path.is_some();
     let mut report = CheckReport::default();
     let before_config = config::source_snapshot(config_path, None, current_uid()).await;
     let (config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
@@ -581,10 +580,7 @@ pub(crate) async fn load_candidate_against(
                 config,
                 routes.as_ref(),
                 scope,
-                probe::Baseline {
-                    active: active.map(|(config, _, routes)| (config, routes)),
-                    catalog: catalog.as_ref().filter(|_| baseline_catalog_override),
-                },
+                active.map(|(config, _, routes)| (config, routes)),
                 vendor,
                 &mut report,
             )

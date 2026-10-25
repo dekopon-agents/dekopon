@@ -107,20 +107,15 @@ fn render_routes(routes: &[String]) -> String {
     }
 }
 
-pub(crate) struct Baseline<'a> {
-    pub active: Option<(&'a ResolvedConfig, &'a RoutingTable)>,
-    pub catalog: Option<&'a dekopon_config::LocalCatalog>,
-}
-
 pub(crate) async fn probe(
     config: &ResolvedConfig,
     routes: Option<&RoutingTable>,
     scope: &ProbeScope,
-    against: Baseline<'_>,
+    active: Option<(&ResolvedConfig, &RoutingTable)>,
     vendor: &Vendor,
     report: &mut CheckReport,
 ) {
-    let loaded_baseline = if against.active.is_some() {
+    let loaded_baseline = if active.is_some() {
         None
     } else {
         match scope {
@@ -139,19 +134,14 @@ pub(crate) async fn probe(
             }
         }
     };
-    let baseline = against
-        .active
+    let baseline = active
         .map(|(config, _)| config)
         .or(loaded_baseline.as_ref());
-    let baseline_routes = if let Some((_, routes)) = against.active {
+    let baseline_routes = if let Some((_, routes)) = active {
         Some(Cow::Borrowed(routes))
     } else {
         baseline.as_ref().and_then(|old| {
-            let catalog = against.catalog.map(Cow::Borrowed).map_or_else(
-                || dekopon_config::LocalCatalog::load(&old.catalog_path).map(Cow::Owned),
-                Ok,
-            );
-            match catalog
+            match dekopon_config::LocalCatalog::load(&old.catalog_path)
                 .map_err(GatewaydError::Catalog)
                 .and_then(|catalog| RoutingTable::bind(old, &catalog).map_err(GatewaydError::from))
             {
@@ -169,10 +159,8 @@ pub(crate) async fn probe(
         if baseline
             .as_ref()
             .is_some_and(|old| old.models.iter().any(|old| old == model))
-            && routes.is_none_or(|routes| {
-                baseline_routes
-                    .as_ref()
-                    .is_some_and(|old| !routes.new_binding(model.name(), old))
+            && baseline_routes.as_ref().is_some_and(|old| {
+                routes.is_none_or(|routes| !routes.new_binding(model.name(), old))
             })
         {
             continue;
@@ -211,8 +199,6 @@ async fn probe_model(
 ) -> Result<Option<NotProbed>, ProbeError> {
     match model {
         ModelConfig::Openrouter {
-            name,
-            model,
             api_key_env,
             timeout_ms,
             generation,
@@ -231,7 +217,7 @@ async fn probe_model(
                 cache: cache.clone(),
             };
             let timeout = Duration::from_millis(*timeout_ms).min(PROBE_TIMEOUT);
-            probe_openrouter(name, model, api_key_env, timeout, settings, vendor)
+            probe_openrouter(model, api_key_env, timeout, settings, vendor)
                 .await
                 .map(|()| None)
         }
@@ -242,23 +228,21 @@ async fn probe_model(
 }
 
 async fn probe_openrouter(
-    name: &str,
-    vendor_model: &str,
+    model: &ModelConfig,
     api_key_env: &str,
     timeout: Duration,
     settings: Settings,
     vendor: &Vendor,
 ) -> Result<(), ProbeError> {
+    let name = model.name();
     let token = model_credential(name, api_key_env, (vendor.environment)(api_key_env))?;
-    let mut client = OpenRouterClient::new(vendor_model, token, timeout, settings)?.with_name(name);
+    let mut client =
+        OpenRouterClient::new(model.vendor_model(), token, timeout, settings)?.with_name(name);
     if let Some(endpoint) = &vendor.openrouter_endpoint {
         client = client.with_loopback_endpoint(endpoint)?;
     }
     let control = TurnControl::new(tokio::sync::watch::channel(false).1, timeout)?;
-    let messages = [
-        ModelMessage::system(
-            "Call the canary tool exactly once with no arguments after viewing the attached image.",
-        ),
+    let user = if model.accepts_images() {
         ModelMessage::user_with_parts(vec![ContentPart::Image {
             mime: "image/png".to_owned(),
             data: dekopon_model::asset::DiskBlob::from_bytes(&[
@@ -269,11 +253,17 @@ async fn probe_openrouter(
             ])
             .map_err(InferenceError::from)?
             .into(),
-        }]),
+        }])
+    } else {
+        ModelMessage::user("Confirm this text turn by calling canary.")
+    };
+    let messages = [
+        ModelMessage::system("Call the canary tool exactly once with no arguments."),
+        user,
     ];
     let tools = [ModelTool {
         name: "canary".to_owned(),
-        description: "Confirm the image can be received.".to_owned(),
+        description: "Confirm the canary turn can be received.".to_owned(),
         parameters: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
     }];
     let turn = client
