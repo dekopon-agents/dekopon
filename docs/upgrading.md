@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Console joins the workspace
+## Console joins the workspace (0.52.0)
 
 `dekopon-console` now ships with core in release archives and both stock and memory-optimized
 Dekopon images. Point the deployment's `console.image` at `ghcr.io/dekopon-agents/dekopon` with
@@ -17,7 +17,7 @@ the matching release tag and selected variant. Chart values and templates are un
 installs the console from the Dekopon release. The `dekopon` formula continues to own only the
 daemon executables. No configuration, CLI flag, environment key or broker frame migration is needed.
 
-## Image-and-tool model canary
+## Image-and-tool model canary (0.52.0)
 
 `dekopon-gatewayd check --probe [--against <live config>]` and the reload gate now send one
 capped request with one fixed tool to each changed `openrouter` model. Models declaring
@@ -35,13 +35,22 @@ warnings, and plain `check` still reads no credential. No configuration migratio
 Boot does not run the vendor canary; run `check --probe --against <live config>` in deployment CI
 before restarting with a candidate.
 
-## Turn-started jobs share the turn's capability-call budget
+## Turn-started jobs share the turn's capability-call budget (0.52.0)
 
 A gateway binary swap requires no configuration, broker protocol or provider WIT change.
 A route's `maxCapabilityCalls` bounds the turn's scripts, nested providers, and all jobs
 it starts and their children together. Exhaustion reports the existing `CapabilityCalls`
 limit. Turn-started jobs keep their independent `jobTimeoutMs` deadline; probe- and
 job-started jobs keep sharing their starter's deadline and budgets.
+
+## Trace names, mixed-kind principals and the config-check peers copy (0.52.0)
+
+No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
+
+- Update saved trace queries, dashboards and alerts. `model.complete` reports a failure only as `error.type`; its `error` and `error.kind` are gone. `outcome` reads `succeeded`/`failed` on `model.complete` (was `success`), `provider.registry_load`, `provider.compile` and `provider.load_stage` (was `ok`/`error`), and `succeeded` on `asset.spool` (was `ok`). `gateway.progress` `outcome`, `class` and `by` read `answered`, `step-budget` and `user:button` (was `Answered`, `StepBudget`, `User { via: Button }`; observability.md lists every value), span events carry stable dotted names, post-reply memory work is a `memory.persist` span beside `gateway.session`, and `agent.model.prompt` carries `gen_ai.tool.definitions` instead of a `tools` field.
+- Run the new `dekopon-brokerd check` over the deployment's broker configuration: a principal whose subjects mix people, channels and repositories now refuses to load.
+- Chart 0.39.0's config-check hook copies the chart-rendered `peers.yaml` into the candidate broker configuration whenever `configCheck.broker.configMap`, `broker.configDirectory.configMap` and `broker.configDirectory.peers` are set, and refuses a candidate that already has a `peers.yaml` key.
+- Upgrade a provider that builds `chat-asset:N` from a bare number first: unquoted references now travel in one `Run` frame, and the asset provider needs 0.3.0 or later.
 
 ## Process spans removed (0.51.0)
 
