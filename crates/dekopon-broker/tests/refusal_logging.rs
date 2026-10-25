@@ -410,7 +410,7 @@ async fn out_of_namespace_subjects_keep_the_same_opaque_refusal_whether_mapped_o
 }
 
 #[tokio::test]
-async fn omitted_namespaces_do_not_disclose_unmapped_subjects() {
+async fn omitted_namespaces_allow_the_unmapped_refusal_cause() {
     let (broker, _) = broker().await;
     let grant = AttestorGrant { namespaces: None };
     let refusal = broker
@@ -425,12 +425,12 @@ async fn omitted_namespaces_do_not_disclose_unmapped_subjects() {
         .expect_err("unmapped inspection is refused");
     assert!(matches!(
         refusal.session,
-        dekopon_broker_protocol::SessionRefusal::Other
+        dekopon_broker_protocol::SessionRefusal::UnmappedSubject
     ));
     let response = dekopon_broker_protocol::ResponseEnvelope::session_refused(&refusal.session);
     let expected = dekopon_broker_protocol::ResponseEnvelope::error(
-        dekopon_broker_protocol::ERROR_UNAUTHENTICATED,
-        "attestation refused: no attestor authority for this subject",
+        "unmapped-subject",
+        "subject is not mapped",
     );
     assert_eq!(
         serde_json::to_value(response).unwrap(),
