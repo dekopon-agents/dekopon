@@ -359,7 +359,8 @@ pub(crate) fn run(
         None,
         invoker,
         limits,
-        &TreeContext::new(limits, CallBudget::new(limits.max_capability_calls)),
+        &TreeContext::new(limits, CallBudget::new(limits.max_capability_calls))
+            .with_cancel(invoker.cancel_signals()),
     )
 }
 

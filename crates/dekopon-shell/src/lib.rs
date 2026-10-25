@@ -788,6 +788,15 @@ mod tests {
     }
 
     #[test]
+    fn run_with_prev_refuses_an_already_cancelled_invoker() {
+        let (handle, signal) = dekopon_process::CancelSignal::pair();
+        handle.cancel();
+        let outcome =
+            Interpreter::new(Limits::default()).run_with_prev("echo ok", "", &Cancellation(signal));
+        assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
+    }
+
+    #[test]
     fn a_sleep_wakes_for_cancellation_without_waiting_for_the_deadline() {
         let (flip, cancelled) = dekopon_process::CancelSignal::pair();
         let worker = std::thread::spawn(move || {
