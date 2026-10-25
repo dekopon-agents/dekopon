@@ -70,8 +70,9 @@ pub struct ShellRuntime<I> {
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str) -> ScriptOutcome {
-        self.invoker.script_started(self.limits.timeout);
-        let tree = TreeContext::new(self.limits, self.calls.clone());
+        let tree = TreeContext::new(self.limits, self.calls.clone())
+            .with_cancel(self.invoker.cancel_signal());
+        self.invoker.script_started(&tree);
         let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
         // reports out of order.
@@ -100,19 +101,18 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
-    fn script_started(&self, timeout: Duration) {
-        self.direct.script_started(timeout);
+    fn script_started(&self, tree: &TreeContext) {
+        self.direct.script_started(tree);
         if let Some(broker) = &self.broker {
-            broker.script_started(timeout);
+            broker.script_started(tree);
         }
     }
 
-    fn cancelled(&self) -> bool {
-        self.direct.cancelled()
-            || self
-                .broker
-                .as_ref()
-                .is_some_and(|broker| broker.cancelled())
+    fn cancel_signal(&self) -> CancelSignal {
+        self.broker.as_ref().map_or_else(
+            || self.direct.cancel_signal(),
+            |broker| broker.cancel_signal(),
+        )
     }
 
     fn granted(&self) -> Vec<String> {
@@ -328,21 +328,6 @@ pub enum BrokerLegError {
     DuplicateCapabilities { capabilities: String },
 }
 
-#[cfg(unix)]
-struct ScriptCancellation {
-    signal: CancelSignal,
-    timer: Option<tokio::task::JoinHandle<()>>,
-}
-
-#[cfg(unix)]
-impl Drop for ScriptCancellation {
-    fn drop(&mut self) {
-        if let Some(timer) = &self.timer {
-            timer.abort();
-        }
-    }
-}
-
 /// A client of brokerd's authorization path, never a participant: it only submits proposals and
 /// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
@@ -358,7 +343,7 @@ pub struct BrokerLeg {
     chat_memory: Option<ChatMemorySurface>,
     principal: Option<PrincipalId>,
     cancel: CancelSignal,
-    script_cancel: parking_lot::Mutex<Option<ScriptCancellation>>,
+    script_tree: parking_lot::Mutex<Option<TreeContext>>,
     attachments: Option<Arc<ReplyAttachments>>,
     asset_inputs: Option<ChatAssetInputs>,
     progress: Option<Arc<dyn ProgressSink>>,
@@ -403,7 +388,7 @@ impl BrokerLeg {
             chat_memory,
             principal,
             cancel: CancelSignal::never(),
-            script_cancel: parking_lot::Mutex::new(None),
+            script_tree: parking_lot::Mutex::new(None),
             attachments: None,
             asset_inputs: None,
             progress: None,
@@ -576,38 +561,16 @@ fn snapshot(
 
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
-    fn cancelled(&self) -> bool {
-        self.effective_cancel().is_cancelled()
+    fn cancel_signal(&self) -> CancelSignal {
+        self.cancel.clone()
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "owner: BrokerLeg script; bound: one timer per script, aborted and joined on script_finished"
-    )]
-    fn script_started(&self, timeout: Duration) {
-        let (handle, signal) = CancelSignal::pair();
-        let parent = self.cancel.clone();
-        let timer = self.runtime.spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep(timeout) => {},
-                () = parent.cancelled() => {},
-            }
-            handle.cancel();
-        });
-        *self.script_cancel.lock() = Some(ScriptCancellation {
-            signal,
-            timer: Some(timer),
-        });
+    fn script_started(&self, tree: &TreeContext) {
+        *self.script_tree.lock() = Some(tree.clone());
     }
 
     fn script_finished(&self) {
-        let script = self.script_cancel.lock().take();
-        if let Some(mut script) = script
-            && let Some(timer) = script.timer.take()
-        {
-            timer.abort();
-            let _joined = self.runtime.block_on(timer);
-        }
+        self.script_tree.lock().take();
         self.notes.store(0, Ordering::Relaxed);
     }
 
@@ -675,7 +638,8 @@ impl CapabilityInvoker for BrokerLeg {
             calls_used: self.calls.used(),
             calls_max: self.calls.maximum(),
         });
-        let cancel = self.effective_cancel();
+        let cancel = &self.cancel;
+        let tree = self.script_tree.lock().clone();
         let mut run = self.runtime.block_on(async {
             tokio::select! {
                 biased;
@@ -688,7 +652,17 @@ impl CapabilityInvoker for BrokerLeg {
                         message: dekopon_core::error_chain(&error),
                     },
                 },
-                () = cancel.cancelled() => CommandRun::Denied {
+                () = async {
+                    tokio::select! {
+                        () = cancel.cancelled() => {},
+                        () = async {
+                            match tree {
+                                Some(tree) => tokio::time::sleep(tree.remaining()).await,
+                                None => std::future::pending().await,
+                            }
+                        } => {},
+                    }
+                } => CommandRun::Denied {
                     reason: "session-cancelled".to_owned(),
                 },
             }
@@ -744,7 +718,7 @@ impl CapabilityInvoker for BrokerLeg {
             report,
         } = proposal;
         let capability = capability.as_str();
-        let cancelled = self.cancelled();
+        let cancelled = self.cancel.is_cancelled() || tree.cancel().is_cancelled();
         let calls_used = self.calls.used();
         // Checks the capability exists before reporting it on the progress surface, since reporting
         // an unvalidated identifier first would let a model put invented text on a person's chat
@@ -828,13 +802,6 @@ impl CapabilityInvoker for BrokerLeg {
 
 #[cfg(unix)]
 impl BrokerLeg {
-    fn effective_cancel(&self) -> CancelSignal {
-        self.script_cancel
-            .lock()
-            .as_ref()
-            .map_or_else(|| self.cancel.clone(), |script| script.signal.clone())
-    }
-
     async fn prepare_run_assets(
         &self,
         argv: &[dekopon_shell::Arg],
@@ -867,7 +834,7 @@ impl BrokerLeg {
     ) -> dekopon_shell::RunResult {
         use dekopon_broker_protocol::{RunOutcome, RunRequest};
         use dekopon_shell::{RunResult, render_command};
-        if self.cancelled() {
+        if self.cancel.is_cancelled() || tree.cancel().is_cancelled() {
             return RunResult::Returned(CapabilityCallResult::Denied {
                 reason: "session-cancelled".to_owned(),
             });
@@ -877,7 +844,7 @@ impl BrokerLeg {
         let invocation_text = invocation.to_string();
         let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
-        let cancel = self.effective_cancel();
+        let cancel = &self.cancel;
         let prepared = self.runtime.block_on(async {
             tokio::select! {
                 biased;
@@ -1104,7 +1071,7 @@ impl BrokerLeg {
         // A child script runs on its own scoped thread, never inside this future: its broker calls
         // re-enter `Handle::block_on`, which panics on a thread already inside one. Cancel drops this
         // future and its connection first; the scope then joins a child that sees the same cancel.
-        let cancel = self.effective_cancel();
+        let cancel = &self.cancel;
         let submitted = std::thread::scope(|scope| {
             self.runtime.block_on(async {
                 tokio::select! {
@@ -2217,7 +2184,13 @@ mod tests {
             let directory = private_broker_directory();
             let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
             leg.command_words.insert("probe".to_owned());
-            leg.script_started(Duration::from_secs(5));
+            leg.script_started(&TreeContext::new(
+                Limits {
+                    timeout: Duration::from_secs(5),
+                    ..Limits::default()
+                },
+                CallBudget::new(32),
+            ));
             let run = tokio::task::spawn_blocking(move || {
                 let result = leg.run_command("probe", &["--help".to_owned()], false);
                 leg.script_finished();
@@ -2302,7 +2275,7 @@ mod tests {
                 chat_memory: None,
                 principal: None,
                 cancel: CancelSignal::never(),
-                script_cancel: parking_lot::Mutex::new(None),
+                script_tree: parking_lot::Mutex::new(None),
                 attachments: None,
                 asset_inputs: None,
                 progress: None,

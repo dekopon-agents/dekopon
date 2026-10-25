@@ -366,8 +366,8 @@ pub fn run_parsed<I: CapabilityInvoker + ?Sized>(
 }
 
 pub trait CapabilityInvoker: Send + Sync {
-    fn cancelled(&self) -> bool {
-        false
+    fn cancel_signal(&self) -> dekopon_process::CancelSignal {
+        dekopon_process::CancelSignal::never()
     }
 
     fn granted(&self) -> Vec<String>;
@@ -416,7 +416,7 @@ pub trait CapabilityInvoker: Send + Sync {
         let _ = (text, eta);
     }
 
-    fn script_started(&self, _timeout: Duration) {}
+    fn script_started(&self, _tree: &TreeContext) {}
 
     fn script_finished(&self) {}
 
@@ -440,8 +440,8 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 }
 
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
-    fn cancelled(&self) -> bool {
-        self.as_ref().cancelled()
+    fn cancel_signal(&self) -> dekopon_process::CancelSignal {
+        self.as_ref().cancel_signal()
     }
 
     fn granted(&self) -> Vec<String> {
@@ -480,8 +480,8 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().note(text, eta);
     }
 
-    fn script_started(&self, timeout: Duration) {
-        self.as_ref().script_started(timeout);
+    fn script_started(&self, tree: &TreeContext) {
+        self.as_ref().script_started(tree);
     }
 
     fn script_finished(&self) {
@@ -599,7 +599,8 @@ impl Interpreter {
             &TreeContext::new(
                 self.limits,
                 CallBudget::new(self.limits.max_capability_calls),
-            ),
+            )
+            .with_cancel(invoker.cancel_signal()),
         )
     }
 

@@ -40,7 +40,7 @@ use dekopon_process::{CallBudget, CancelHandle, CancelSignal, Limits as ShellLim
 use dekopon_shell::CapabilityInvoker as _;
 use futures_util::StreamExt as _;
 use thiserror::Error;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
 
 use crate::{
@@ -979,7 +979,6 @@ impl Drop for ProbeAdmission {
 pub(crate) struct SessionCancellation {
     state: Arc<AtomicU8>,
     source: Arc<Mutex<Option<CancelSource>>>,
-    woken: Arc<Notify>,
     handle: CancelHandle,
     signal: CancelSignal,
     model: tokio::sync::watch::Sender<bool>,
@@ -991,7 +990,6 @@ impl SessionCancellation {
         Self {
             state: Arc::new(AtomicU8::new(SESSION_RUNNING)),
             source: Arc::new(Mutex::new(None)),
-            woken: Arc::new(Notify::new()),
             handle,
             signal,
             model: tokio::sync::watch::channel(false).0,
@@ -1044,13 +1042,12 @@ impl SessionCancellation {
                 .is_ok();
             if won {
                 *recorded = Some(source);
+                self.handle.cancel();
             }
             won
         };
         if cancelled {
-            self.handle.cancel();
             self.model.send_replace(true);
-            self.woken.notify_waiters();
         }
         cancelled
     }
@@ -1060,15 +1057,7 @@ impl SessionCancellation {
     }
 
     pub(crate) async fn cancelled(&self) {
-        loop {
-            // Register the notified future before checking cancellation state, or a cancel arriving
-            // between the two checks is silently missed.
-            let woken = self.woken.notified();
-            if self.state.load(Ordering::Acquire) == SESSION_CANCELLED {
-                return;
-            }
-            woken.await;
-        }
+        self.signal.cancelled().await;
     }
 
     pub(crate) fn signal(&self) -> CancelSignal {

@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{LimitExceeded, Limits};
+use crate::{CancelSignal, LimitExceeded, Limits};
 
 #[derive(Clone, Debug)]
 pub struct CallBudget {
@@ -51,6 +51,7 @@ impl CallBudget {
 
 #[derive(Clone, Debug)]
 pub struct TreeContext {
+    cancel: CancelSignal,
     deadline: Instant,
     timeout: Duration,
     calls: CallBudget,
@@ -102,6 +103,7 @@ impl TreeContext {
     pub fn new(limits: Limits, calls: CallBudget) -> Self {
         let started = Instant::now();
         Self {
+            cancel: CancelSignal::never(),
             deadline: started.checked_add(limits.timeout).unwrap_or(started),
             timeout: limits.timeout,
             calls,
@@ -111,7 +113,19 @@ impl TreeContext {
         }
     }
 
+    pub fn with_cancel(mut self, cancel: CancelSignal) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn cancel(&self) -> &CancelSignal {
+        &self.cancel
+    }
+
     pub fn charge_step(&self) -> Result<(), LimitExceeded> {
+        if self.cancel.is_cancelled() {
+            return Err(LimitExceeded::Cancelled);
+        }
         self.steps
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(1)

@@ -632,6 +632,7 @@ impl JobContext {
     }
 
     fn run(&self, seed: JobSeed, tree: &TreeContext, signal: CancelSignal) -> Ended {
+        let tree = tree.clone().with_cancel(signal.clone());
         let Some(leg) = self.connect(signal) else {
             return Ended {
                 exit: ExitCode::FAILURE,
@@ -639,7 +640,7 @@ impl JobContext {
                 ending: Ending::Ran { expired: false },
             };
         };
-        let outcome = Interpreter::new(self.limits).run_seed(seed, &leg, tree);
+        let outcome = Interpreter::new(self.limits).run_seed(seed, &leg, &tree);
         Ended {
             exit: outcome.exit_code,
             output: outcome.output,

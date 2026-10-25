@@ -77,11 +77,11 @@ impl<I: CapabilityInvoker> CapabilityInvoker for Decider<'_, I> {
     fn granted(&self) -> Vec<String> {
         self.inner.granted()
     }
-    fn cancelled(&self) -> bool {
-        self.inner.cancelled()
+    fn cancel_signal(&self) -> dekopon_process::CancelSignal {
+        self.inner.cancel_signal()
     }
-    fn script_started(&self, timeout: std::time::Duration) {
-        self.inner.script_started(timeout);
+    fn script_started(&self, tree: &dekopon_process::TreeContext) {
+        self.inner.script_started(tree);
     }
     fn script_finished(&self) {
         self.inner.script_finished();

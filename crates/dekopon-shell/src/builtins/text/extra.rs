@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use clap::{Arg, ArgAction, Command};
 
 use crate::{
-    CapabilityInvoker, ExitCode,
+    ExitCode,
     builtins::{CommandFailure, parse_flags},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
@@ -45,16 +45,10 @@ impl ExtraStream {
         arguments: &[String],
         reader: &mut PipeReader,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
-        self.run_parsed(
-            Operation::parse(self, arguments)?.0,
-            reader,
-            budget,
-            invoker,
-            emit,
-        )
+        self.run_parsed(Operation::parse(self, arguments)?.0, reader, budget, emit)
     }
 
     pub(crate) fn run_parsed(
@@ -62,20 +56,20 @@ impl ExtraStream {
         operation: Operation,
         reader: &mut PipeReader,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
         let mut state = State::new(operation);
         if matches!(self, Self::Wc) {
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
-                budget.charge_step_with(invoker)?;
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+                budget.charge_step()?;
                 state.count_chunk(&chunk)?;
             }
         } else {
             let mut pending = Vec::new();
             let mut charges = Vec::new();
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
-                budget.charge_step_with(invoker)?;
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+                budget.charge_step()?;
                 let mut rest = chunk.as_slice();
                 while !rest.is_empty() {
                     let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
@@ -88,7 +82,6 @@ impl ExtraStream {
                             std::mem::take(&mut pending),
                             std::mem::take(&mut charges),
                             budget,
-                            invoker,
                             &mut emit,
                         )?
                     {
@@ -97,10 +90,10 @@ impl ExtraStream {
                 }
             }
             if !pending.is_empty() {
-                state.line(pending, charges, budget, invoker, &mut emit)?;
+                state.line(pending, charges, budget, &mut emit)?;
             }
         }
-        state.finish(budget, invoker, &mut emit)?;
+        state.finish(budget, &mut emit)?;
         Ok(ExitCode::SUCCESS)
     }
 }
@@ -328,7 +321,7 @@ impl State {
         bytes: Vec<u8>,
         charges: Vec<RetainedBytes>,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<bool, CommandFailure> {
         let line = std::str::from_utf8(bytes.strip_suffix(b"\n").unwrap_or(&bytes)).map_err(
@@ -336,11 +329,11 @@ impl State {
         )?;
         match &self.operation {
             Operation::Cut { delimiter, mode } => {
-                if !emit_cut(line, *delimiter, mode, budget, invoker, emit)? {
+                if !emit_cut(line, *delimiter, mode, budget, emit)? {
                     return Ok(false);
                 }
                 if bytes.ends_with(b"\n") {
-                    super::sed::emit_chunks(b"\n", budget, invoker, emit)
+                    super::sed::emit_chunks(b"\n", budget, emit)
                 } else {
                     Ok(true)
                 }
@@ -349,7 +342,7 @@ impl State {
                 if self.run > 0
                     && self.previous.strip_suffix(b"\n").unwrap_or(&self.previous)
                         != bytes.strip_suffix(b"\n").unwrap_or(&bytes)
-                    && !self.flush_run(budget, invoker, emit)?
+                    && !self.flush_run(budget, emit)?
                 {
                     return Ok(false);
                 }
@@ -372,7 +365,7 @@ impl State {
     fn flush_run(
         &mut self,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<bool, CommandFailure> {
         let Operation::Uniq {
@@ -384,17 +377,11 @@ impl State {
             return Ok(true);
         };
         if (!duplicates || self.run > 1) && (!unique || self.run == 1) {
-            if count
-                && !super::sed::emit_chunks(
-                    format!("{} ", self.run).as_bytes(),
-                    budget,
-                    invoker,
-                    emit,
-                )?
+            if count && !super::sed::emit_chunks(format!("{} ", self.run).as_bytes(), budget, emit)?
             {
                 return Ok(false);
             }
-            if !super::sed::emit_chunks(&self.previous, budget, invoker, emit)? {
+            if !super::sed::emit_chunks(&self.previous, budget, emit)? {
                 return Ok(false);
             }
         }
@@ -407,12 +394,12 @@ impl State {
     fn finish(
         &mut self,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<(), CommandFailure> {
         match self.operation {
             Operation::Uniq { .. } => {
-                self.flush_run(budget, invoker, emit)?;
+                self.flush_run(budget, emit)?;
             }
             Operation::Sort {
                 reverse,
@@ -436,21 +423,21 @@ impl State {
                 });
                 let mut last: Option<&[u8]> = None;
                 for (line, _charge) in &self.sorted {
-                    budget.charge_step_with(invoker)?;
+                    budget.charge_step()?;
                     let line = line.strip_suffix(b"\n").unwrap_or(line);
                     if unique && last == Some(line) {
                         continue;
                     }
-                    if last.is_some() && !super::sed::emit_chunks(b"\n", budget, invoker, emit)? {
+                    if last.is_some() && !super::sed::emit_chunks(b"\n", budget, emit)? {
                         return Ok(());
                     }
-                    if !super::sed::emit_chunks(line, budget, invoker, emit)? {
+                    if !super::sed::emit_chunks(line, budget, emit)? {
                         return Ok(());
                     }
                     last = Some(line);
                 }
                 if last.is_some() && self.ended {
-                    super::sed::emit_chunks(b"\n", budget, invoker, emit)?;
+                    super::sed::emit_chunks(b"\n", budget, emit)?;
                 }
             }
             Operation::Wc {
@@ -481,7 +468,7 @@ impl State {
                     [one] => serde_json::json!(one),
                     _ => serde_json::json!(chosen),
                 };
-                super::sed::emit_chunks(format!("{result}\n").as_bytes(), budget, invoker, emit)?;
+                super::sed::emit_chunks(format!("{result}\n").as_bytes(), budget, emit)?;
             }
             Operation::Cut { .. } => {}
         }
@@ -494,13 +481,13 @@ fn emit_cut(
     delimiter: char,
     mode: &CutMode,
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<bool, CommandFailure> {
     match mode {
         CutMode::Fields(selection) => {
             if !line.contains(delimiter) {
-                return super::sed::emit_chunks(line.as_bytes(), budget, invoker, emit);
+                return super::sed::emit_chunks(line.as_bytes(), budget, emit);
             }
             let mut first = true;
             let mut encoded = [0; 4];
@@ -513,13 +500,12 @@ fn emit_cut(
                     && !super::sed::emit_chunks(
                         delimiter.encode_utf8(&mut encoded).as_bytes(),
                         budget,
-                        invoker,
                         emit,
                     )?
                 {
                     return Ok(false);
                 }
-                if !super::sed::emit_chunks(field.as_bytes(), budget, invoker, emit)? {
+                if !super::sed::emit_chunks(field.as_bytes(), budget, emit)? {
                     return Ok(false);
                 }
                 first = false;
@@ -532,7 +518,6 @@ fn emit_cut(
                     && !super::sed::emit_chunks(
                         &line.as_bytes()[start..start + character.len_utf8()],
                         budget,
-                        invoker,
                         emit,
                     )?
                 {

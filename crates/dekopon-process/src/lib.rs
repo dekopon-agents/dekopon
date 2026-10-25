@@ -69,7 +69,7 @@ impl CancelHandle {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CancelSignal {
     receiver: watch::Receiver<bool>,
 }

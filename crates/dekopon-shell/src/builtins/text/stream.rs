@@ -1,5 +1,5 @@
 use crate::{
-    CapabilityInvoker, ExitCode,
+    ExitCode,
     builtins::{
         CommandFailure,
         text::{
@@ -68,10 +68,10 @@ impl TextStream {
         arguments: &[String],
         reader: &mut PipeReader,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
-        self.run_parsed(self.parse(arguments)?.0, reader, budget, invoker, emit)
+        self.run_parsed(self.parse(arguments)?.0, reader, budget, emit)
     }
 
     pub(crate) fn run_parsed(
@@ -79,14 +79,14 @@ impl TextStream {
         operation: Operation,
         reader: &mut PipeReader,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
         let mut pending = Vec::new();
         let mut charges: Vec<RetainedBytes> = Vec::new();
         let mut progress = LineProgress::default();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
-            budget.charge_step_with(invoker)?;
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+            budget.charge_step()?;
             let mut rest = chunk.as_slice();
             while !rest.is_empty() {
                 let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
@@ -101,7 +101,6 @@ impl TextStream {
                         (&pending, &mut charges),
                         &mut progress,
                         budget,
-                        invoker,
                         &mut emit,
                     )? {
                         return Ok(ExitCode::SUCCESS);
@@ -118,7 +117,6 @@ impl TextStream {
                 (&pending, &mut charges),
                 &mut progress,
                 budget,
-                invoker,
                 &mut emit,
             )? {
                 return Ok(ExitCode::SUCCESS);
@@ -129,7 +127,6 @@ impl TextStream {
                 && !super::sed::emit_chunks(
                     format!("{}\n", progress.matches).as_bytes(),
                     budget,
-                    invoker,
                     &mut emit,
                 )?
             {
@@ -150,7 +147,7 @@ fn process_line(
     line_bytes: (&[u8], &mut Vec<RetainedBytes>),
     progress: &mut LineProgress,
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<bool, CommandFailure> {
     let (bytes, charges) = line_bytes;
@@ -173,14 +170,7 @@ fn process_line(
             if matches!(config.mode, GrepMode::Lines) && (config.before > 0 || config.after > 0) {
                 if selected {
                     for (index, saved, _charges) in std::mem::take(&mut progress.before) {
-                        if !emit_grep(
-                            config,
-                            progress,
-                            (index, &saved, false),
-                            budget,
-                            invoker,
-                            emit,
-                        )? {
+                        if !emit_grep(config, progress, (index, &saved, false), budget, emit)? {
                             return Ok(false);
                         }
                     }
@@ -192,7 +182,6 @@ fn process_line(
                         progress,
                         (progress.index, bytes, selected),
                         budget,
-                        invoker,
                         emit,
                     )? {
                         return Ok(false);
@@ -216,21 +205,20 @@ fn process_line(
                 && !super::sed::emit_chunks(
                     format!("{}:", progress.index).as_bytes(),
                     budget,
-                    invoker,
                     emit,
                 )?
             {
                 return Ok(false);
             }
-            super::sed::emit_chunks(line.as_bytes(), budget, invoker, emit)?
+            super::sed::emit_chunks(line.as_bytes(), budget, emit)?
         }
-        Operation::Sed(substitution) => substitution.emit(line, budget, invoker, emit)?,
+        Operation::Sed(substitution) => substitution.emit(line, budget, emit)?,
     };
     if !emitted {
         return Ok(false);
     }
     if terminated {
-        super::sed::emit_chunks(b"\n", budget, invoker, emit)
+        super::sed::emit_chunks(b"\n", budget, emit)
     } else {
         Ok(true)
     }
@@ -241,24 +229,24 @@ fn emit_grep(
     progress: &mut LineProgress,
     line: (usize, &[u8], bool),
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<bool, CommandFailure> {
     let (index, bytes, selected) = line;
     if progress.last_emitted > 0
         && index > progress.last_emitted.saturating_add(1)
-        && !super::sed::emit_chunks(b"--\n", budget, invoker, emit)?
+        && !super::sed::emit_chunks(b"--\n", budget, emit)?
     {
         return Ok(false);
     }
     progress.last_emitted = index;
     if config.number() {
         let marker = if selected { ':' } else { '-' };
-        if !super::sed::emit_chunks(format!("{index}{marker}").as_bytes(), budget, invoker, emit)? {
+        if !super::sed::emit_chunks(format!("{index}{marker}").as_bytes(), budget, emit)? {
             return Ok(false);
         }
     }
-    super::sed::emit_chunks(bytes, budget, invoker, emit)
+    super::sed::emit_chunks(bytes, budget, emit)
 }
 
 #[cfg(test)]
