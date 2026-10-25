@@ -2993,6 +2993,7 @@ where
             .iter()
             .filter(|(capability, set)| {
                 (set.route.is_generic() || effective_memory_surface)
+                    && storage_scope_permits(context, set)
                     && self
                         .authorize_capability(context, capability, set, None)
                         .allowed
