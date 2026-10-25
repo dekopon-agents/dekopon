@@ -1573,8 +1573,7 @@ fn is_textual(mime: &str) -> bool {
 fn asset_tool() -> ModelTool {
     ModelTool {
         name: ASSET_TOOL_NAME.to_owned(),
-        description: "Show the contents of chat-asset:N from this conversation. Look before you \
-                      describe a file."
+        description: "Show an image or document attached to this conversation as chat-asset:N. Look before you describe a file."
             .to_owned(),
         parameters: json!({
             "type": "object",
@@ -4074,6 +4073,42 @@ mod tests {
 
     struct OutcomeCapabilities;
 
+    impl OutcomeCapabilities {
+        fn parse_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            _stdin_piped: bool,
+        ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+            if word != "probe" {
+                return None;
+            }
+            let proposed = |capability: &str, input: Value| {
+                Ok(dekopon_shell::CommandProposal {
+                    capability: capability.to_owned(),
+                    input,
+                    secret_use: None,
+                    report: None,
+                })
+            };
+            let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            Some(match argv.as_slice() {
+                ["--help"] => Err(CommandRun::Rendered {
+                    stdout: "Usage: probe <get|door|broken|vault>\n".to_owned(),
+                    stderr: String::new(),
+                    status: 0,
+                }),
+                ["get", "--post-id", id] => proposed("posts.get", json!({ "postId": id })),
+                ["door"] => proposed("locked.door", json!({})),
+                ["broken"] => proposed("broken.thing", json!({})),
+                ["vault"] => proposed("vault.open", json!({})),
+                _ => Err(CommandRun::Failed {
+                    message: "probe: usage: probe <get|door|broken|vault>".to_owned(),
+                }),
+            })
+        }
+    }
+
     impl CapabilityInvoker for OutcomeCapabilities {
         fn granted(&self) -> Vec<String> {
             ["posts.get", "locked.door", "broken.thing"]
@@ -4090,36 +4125,44 @@ mod tests {
             BTreeMap::from([("probe".to_owned(), "Usage: probe <COMMAND>".to_owned())])
         }
 
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            argv: &[String],
-            _stdin_piped: bool,
-        ) -> Option<CommandRun> {
-            if word != "probe" {
-                return None;
+            call: dekopon_shell::RunCall,
+            streams: dekopon_shell::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> dekopon_shell::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return dekopon_shell::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    dekopon_shell::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+                None => dekopon_shell::render_run(call, None, streams),
             }
-            let proposed = |capability: &str, input: Value| CommandRun::Proposed {
-                capability: capability.to_owned(),
-                input,
-                secret_use: None,
-                report: None,
-            };
-            let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            Some(match argv.as_slice() {
-                ["--help"] => CommandRun::Rendered {
-                    stdout: "Usage: probe <get|door|broken|vault>\n".to_owned(),
-                    stderr: String::new(),
-                    status: 0,
-                },
-                ["get", "--post-id", id] => proposed("posts.get", json!({ "postId": id })),
-                ["door"] => proposed("locked.door", json!({})),
-                ["broken"] => proposed("broken.thing", json!({})),
-                ["vault"] => proposed("vault.open", json!({})),
-                _ => CommandRun::Failed {
-                    message: "probe: usage: probe <get|door|broken|vault>".to_owned(),
-                },
-            })
         }
 
         fn describe(&self, _capability: &str) -> Option<dekopon_shell::CapabilityDescription> {

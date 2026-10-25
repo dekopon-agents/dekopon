@@ -396,7 +396,11 @@ supplied, so an export failure can never be re-exported through the exporter tha
 
 ### Daemon exit and shutdown records
 
-Both daemons report the same two facts on the way out, in the same shape:
+Both daemons report terminal failures and telemetry shutdown failures. The broker writes its
+`broker_exit` JSON diagnostic directly to stderr before stopping the runtime, independently of
+`RUST_LOG` and the best-effort stdout queue. This terminal diagnostic is not offered to OTLP;
+serving records keep their nonblocking stdout and exporter paths. Telemetry shutdown uses only
+the time remaining on the broker's shared shutdown deadline and is skipped once it expires.
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
@@ -646,7 +650,7 @@ the journal directory, with `reason` `missing`, `loose-mode` or `malformed`; it 
 secret. Every conversation's cache key changes once after it.
 
 `gateway_indicators_effective` is emitted once per resolved route/conversation kind at
-configuration load: route index, transport name, kind, mode, status, typing, working, seen,
+boot and each activated reload: route index, transport name, kind, mode, status, typing, working, seen,
 progress, stream, status-text, and cancel-button values only. It contains no subject,
 conversation coordinate, principal, message, credential or model text. It is configuration
 telemetry, not a broker decision or an indication that a chat service accepted a reaction.

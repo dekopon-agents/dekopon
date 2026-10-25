@@ -177,6 +177,24 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
         observed: mpsc::SyncSender<String>,
     }
 
+    impl HeldProducer {
+        fn parse_command(
+            &self,
+            word: &str,
+            _: &[String],
+            _: bool,
+        ) -> Option<Result<dekopon_shell::CommandProposal, dekopon_shell::CommandRun>> {
+            (word == "hold").then(|| {
+                Ok(dekopon_shell::CommandProposal {
+                    capability: "test.hold".to_owned(),
+                    input: Value::Null,
+                    secret_use: None,
+                    report: None,
+                })
+            })
+        }
+    }
+
     impl CapabilityInvoker for HeldProducer {
         fn granted(&self) -> Vec<String> {
             vec!["test.hold".to_owned()]
@@ -184,18 +202,44 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
         fn has_command_word(&self, word: &str) -> bool {
             word == "hold"
         }
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            _: &[String],
-            _: bool,
-        ) -> Option<dekopon_shell::CommandRun> {
-            (word == "hold").then(|| dekopon_shell::CommandRun::Proposed {
-                capability: "test.hold".to_owned(),
-                input: Value::Null,
-                secret_use: None,
-                report: None,
-            })
+            call: dekopon_shell::RunCall,
+            streams: dekopon_shell::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> dekopon_shell::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return dekopon_shell::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    dekopon_shell::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+                None => dekopon_shell::render_run(call, None, streams),
+            }
         }
         fn invoke(
             &self,

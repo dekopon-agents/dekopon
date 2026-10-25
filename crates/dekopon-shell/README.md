@@ -12,12 +12,6 @@ pub trait CapabilityInvoker: Send + Sync {
     fn is_granted(&self, capability: &str) -> bool { /* scans `granted` */ }
     fn command_words(&self) -> Vec<String> { /* none */ }
     fn has_command_word(&self, word: &str) -> bool { /* scans `command_words` */ }
-    fn run_command(
-        &self,
-        word: &str,
-        argv: &[String],
-        stdin_piped: bool,
-    ) -> Option<CommandRun> { /* None: no provider owns the word */ }
     fn run(&self, call: RunCall, streams: Streams, tree: &dekopon_process::TreeContext)
         -> RunResult;
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> { /* None */ }
@@ -57,11 +51,11 @@ Literal `<word> --help` uses `command_word_help()` at exit `0`, without a frame 
 so it works even on a spent budget. A cached page over 2048 bytes shows a UTF-8-safe prefix and the
 truncation marker. `h=$(gh --help)` captures that cached page like any other value.
 
-The default direct invoker retains `run_command`/`CommandRun` parsing and invokes a proposal through
-`invoke`; the legacy broker `RunCommand` parse-only operation also remains. These are separate from
-the normal gateway's single-frame path. Direct proposal reports follow the proposal into `invoke`,
-and dropping a refused proposal settles its report as failed. Invokers without a broker refuse
-secret-use proposals.
+A direct invoker implements `run` and keeps parsing private to its own leg. `SessionInvoker`
+selects the direct or broker leg before handing over streams. Proposal reports follow the proposal
+into `invoke`, and dropping a refused proposal settles its report as failed. Invokers without a
+broker refuse secret-use proposals. The broker retains the legacy `RunCommand` operation for old
+clients.
 
 A capability that ran and failed reports `<id>: failed: <classification>` at exit `1`, and when
 the broker's classification came from the provider's own typed failure its code and message follow:

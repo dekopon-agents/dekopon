@@ -451,6 +451,51 @@ fn wiki_page(title: &str) -> Value {
 
 struct EvalInvoker;
 
+impl EvalInvoker {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        _stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let proposed = |capability: &str, input: Value| {
+            Ok(dekopon_shell::CommandProposal {
+                capability: capability.to_owned(),
+                input,
+                secret_use: None,
+                report: None,
+            })
+        };
+        let rendered = |page: &str| {
+            Err(CommandRun::Rendered {
+                stdout: page.to_owned(),
+                stderr: String::new(),
+                status: 0,
+            })
+        };
+        let usage = |message: &str| {
+            Err(CommandRun::Failed {
+                message: message.to_owned(),
+            })
+        };
+        Some(match (word, argv.as_slice()) {
+            ("gh", ["--help"]) => rendered(GH_HELP),
+            ("gh", ["pr", "view", number]) => proposed("gh.pr.view", json!({ "number": number })),
+            ("gh", ["pr", "list"]) => proposed("gh.pr.list", json!({})),
+            ("gh", ["pr", "close", number]) => proposed("gh.pr.close", json!({ "number": number })),
+            ("gh", ["pr", "merge", number]) => proposed("gh.pr.merge", json!({ "number": number })),
+            ("gh", _) => usage("gh: usage: gh pr <view|list|close|merge> [number]"),
+            ("wiki", ["--help"]) => rendered(WIKI_HELP),
+            ("wiki", ["page", "--title", title]) => {
+                proposed("wiki.page", json!({ "title": title }))
+            }
+            ("wiki", _) => usage("wiki: usage: wiki page --title <title>"),
+            _ => return None,
+        })
+    }
+}
+
 impl CapabilityInvoker for EvalInvoker {
     fn granted(&self) -> Vec<String> {
         GRANTED.iter().map(|id| (*id).to_owned()).collect()
@@ -467,36 +512,44 @@ impl CapabilityInvoker for EvalInvoker {
         ])
     }
 
-    fn run_command(&self, word: &str, argv: &[String], _stdin_piped: bool) -> Option<CommandRun> {
-        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
-        let proposed = |capability: &str, input: Value| CommandRun::Proposed {
-            capability: capability.to_owned(),
-            input,
-            secret_use: None,
-            report: None,
-        };
-        let rendered = |page: &str| CommandRun::Rendered {
-            stdout: page.to_owned(),
-            stderr: String::new(),
-            status: 0,
-        };
-        let usage = |message: &str| CommandRun::Failed {
-            message: message.to_owned(),
-        };
-        Some(match (word, argv.as_slice()) {
-            ("gh", ["--help"]) => rendered(GH_HELP),
-            ("gh", ["pr", "view", number]) => proposed("gh.pr.view", json!({ "number": number })),
-            ("gh", ["pr", "list"]) => proposed("gh.pr.list", json!({})),
-            ("gh", ["pr", "close", number]) => proposed("gh.pr.close", json!({ "number": number })),
-            ("gh", ["pr", "merge", number]) => proposed("gh.pr.merge", json!({ "number": number })),
-            ("gh", _) => usage("gh: usage: gh pr <view|list|close|merge> [number]"),
-            ("wiki", ["--help"]) => rendered(WIKI_HELP),
-            ("wiki", ["page", "--title", title]) => {
-                proposed("wiki.page", json!({ "title": title }))
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
             }
-            ("wiki", _) => usage("wiki: usage: wiki page --title <title>"),
-            _ => return None,
-        })
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
 
     fn invoke(

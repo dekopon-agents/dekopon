@@ -19,6 +19,22 @@ struct Processes {
     seen: Mutex<Vec<(String, bool, bool)>>,
 }
 
+impl Processes {
+    fn parse_command(
+        &self,
+        word: &str,
+        _: &[String],
+        stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        Some(Ok(dekopon_shell::CommandProposal {
+            capability: format!("proc.{word}"),
+            input: json!({ "stdinPiped": stdin_piped }),
+            secret_use: None,
+            report: None,
+        }))
+    }
+}
+
 impl CapabilityInvoker for Processes {
     fn granted(&self) -> Vec<String> {
         ["flood", "relay", "probe", "note"]
@@ -32,13 +48,44 @@ impl CapabilityInvoker for Processes {
             .to_vec()
     }
 
-    fn run_command(&self, word: &str, _: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        Some(CommandRun::Proposed {
-            capability: format!("proc.{word}"),
-            input: json!({ "stdinPiped": stdin_piped }),
-            secret_use: None,
-            report: None,
-        })
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
 
     fn invoke(

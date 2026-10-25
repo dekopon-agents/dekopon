@@ -194,6 +194,7 @@ jobs:
       # Match release.yml's native runner, action, shared key, toolchain and build flags.
       # No sccache wrapper here: release artifact builds do not use one either.
       - name: Cache Linux release dependencies
+        id: release-dependency-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-release-v1-${{ matrix.target }}
@@ -202,4 +203,5 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Build only: no tests, provider downloads, packaging, signing or publication.
       - name: Warm release CLI dependencies
+        if: steps.release-dependency-cache.outputs.cache-hit != 'true'
         run: cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console --target ${{ matrix.target }}

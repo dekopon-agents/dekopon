@@ -28,6 +28,67 @@ impl Default for Fixture {
     }
 }
 
+impl Fixture {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        if word != PROBE {
+            return None;
+        }
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(match argv.as_slice() {
+            ["--help"] => Err(CommandRun::Rendered {
+                stdout: PROBE_HELP.to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }),
+            ["upper", "--text", text] => proposal("cli-probe.upper", json!({ "text": text })),
+            ["upper", "-"] if stdin_piped => proposal("cli-probe.upper", json!({ "text": null })),
+            ["upper", "-"] => Err(CommandRun::Failed {
+                message: "probe: no input was piped for -".to_owned(),
+            }),
+            ["object", flags @ ..] => match object_from_flags(flags) {
+                Some(object) => proposal("fixture.object", object),
+                None => Err(CommandRun::Failed {
+                    message: "probe: object takes --key value pairs".to_owned(),
+                }),
+            },
+            ["json-text"] => Err(CommandRun::Rendered {
+                stdout: "{\"headSha\":\"0123456789012345678901234567890123456789\"}\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }),
+            ["list"] => proposal("fixture.list", json!({})),
+            ["null"] => proposal("fixture.null", json!({})),
+            ["fetch"] => proposal("http-probe.fetch", json!({})),
+            ["denied"] => proposal("policy.denied", json!({})),
+            ["broken"] => proposal("provider.broken", json!({})),
+            ["refused"] => proposal("provider.refused", json!({})),
+            ["ungranted"] => proposal("nothing.granted", json!({})),
+            ["decline"] => Err(CommandRun::Failed {
+                message: "probe: declined".to_owned(),
+            }),
+            ["errored"] => Err(CommandRun::Errored {
+                message: "could not connect to broker socket".to_owned(),
+            }),
+            ["cancelled"] => Err(CommandRun::Denied {
+                reason: "session-cancelled".to_owned(),
+            }),
+            _ => Err(CommandRun::Rendered {
+                stdout: String::new(),
+                stderr: format!(
+                    "error: unrecognized subcommand '{}'\n\nUsage: probe <COMMAND>\n",
+                    argv.first().copied().unwrap_or_default()
+                ),
+                status: 2,
+            }),
+        })
+    }
+}
+
 impl CapabilityInvoker for Fixture {
     fn granted(&self) -> Vec<String> {
         vec![
@@ -61,58 +122,44 @@ impl CapabilityInvoker for Fixture {
         std::collections::BTreeMap::from([(PROBE.to_owned(), PROBE_HELP.to_owned())])
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        if word != PROBE {
-            return None;
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
         }
-        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
-        Some(match argv.as_slice() {
-            ["--help"] => CommandRun::Rendered {
-                stdout: PROBE_HELP.to_owned(),
-                stderr: String::new(),
-                status: 0,
-            },
-            ["upper", "--text", text] => proposal("cli-probe.upper", json!({ "text": text })),
-            ["upper", "-"] if stdin_piped => proposal("cli-probe.upper", json!({ "text": null })),
-            ["upper", "-"] => CommandRun::Failed {
-                message: "probe: no input was piped for -".to_owned(),
-            },
-            ["object", flags @ ..] => match object_from_flags(flags) {
-                Some(object) => proposal("fixture.object", object),
-                None => CommandRun::Failed {
-                    message: "probe: object takes --key value pairs".to_owned(),
-                },
-            },
-            ["json-text"] => CommandRun::Rendered {
-                stdout: "{\"headSha\":\"0123456789012345678901234567890123456789\"}\n".to_owned(),
-                stderr: String::new(),
-                status: 0,
-            },
-            ["list"] => proposal("fixture.list", json!({})),
-            ["null"] => proposal("fixture.null", json!({})),
-            ["fetch"] => proposal("http-probe.fetch", json!({})),
-            ["denied"] => proposal("policy.denied", json!({})),
-            ["broken"] => proposal("provider.broken", json!({})),
-            ["refused"] => proposal("provider.refused", json!({})),
-            ["ungranted"] => proposal("nothing.granted", json!({})),
-            ["decline"] => CommandRun::Failed {
-                message: "probe: declined".to_owned(),
-            },
-            ["errored"] => CommandRun::Errored {
-                message: "could not connect to broker socket".to_owned(),
-            },
-            ["cancelled"] => CommandRun::Denied {
-                reason: "session-cancelled".to_owned(),
-            },
-            _ => CommandRun::Rendered {
-                stdout: String::new(),
-                stderr: format!(
-                    "error: unrecognized subcommand '{}'\n\nUsage: probe <COMMAND>\n",
-                    argv.first().copied().unwrap_or_default()
-                ),
-                status: 2,
-            },
-        })
     }
 
     fn invoke(
@@ -188,13 +235,13 @@ impl CapabilityInvoker for Fixture {
     }
 }
 
-fn proposal(capability: &str, input: Value) -> CommandRun {
-    CommandRun::Proposed {
+fn proposal(capability: &str, input: Value) -> Result<dekopon_shell::CommandProposal, CommandRun> {
+    Ok(dekopon_shell::CommandProposal {
         capability: capability.to_owned(),
         input,
         secret_use: None,
         report: None,
-    }
+    })
 }
 
 fn object_from_flags(flags: &[&str]) -> Option<Value> {
@@ -2689,6 +2736,17 @@ fn the_value_byte_ceiling_stops_runaway_string_growth() {
 fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
     struct Slow;
 
+    impl Slow {
+        fn parse_command(
+            &self,
+            word: &str,
+            _argv: &[String],
+            _stdin_piped: bool,
+        ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+            (word == "slow").then(|| proposal("slow.call", json!({})))
+        }
+    }
+
     impl CapabilityInvoker for Slow {
         fn granted(&self) -> Vec<String> {
             vec!["slow.call".to_owned()]
@@ -2698,13 +2756,44 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             word == "slow"
         }
 
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            _argv: &[String],
-            _stdin_piped: bool,
-        ) -> Option<CommandRun> {
-            (word == "slow").then(|| proposal("slow.call", json!({})))
+            call: dekopon_shell::RunCall,
+            streams: dekopon_shell::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> dekopon_shell::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return dekopon_shell::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    dekopon_shell::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+                None => dekopon_shell::render_run(call, None, streams),
+            }
         }
 
         fn invoke(
@@ -3265,6 +3354,33 @@ struct OrderedFixture {
     release: mpsc::SyncSender<()>,
 }
 
+impl OrderedFixture {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        if argv == ["upper", "--text", "held"] || argv == ["line", "second"] {
+            self.released
+                .lock()
+                .recv_timeout(Duration::from_secs(2))
+                .expect("consumer observed first output before producer supplied second line");
+        }
+        if argv == ["line", "second"] {
+            return Some(Err(CommandRun::Rendered {
+                stdout: "second\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }));
+        }
+        if argv == ["upper", "--text", "release"] {
+            self.release.send(()).expect("producer still waiting");
+        }
+        self.fixture.parse_command(word, argv, stdin_piped)
+    }
+}
+
 impl CapabilityInvoker for OrderedFixture {
     fn granted(&self) -> Vec<String> {
         self.fixture.granted()
@@ -3274,24 +3390,44 @@ impl CapabilityInvoker for OrderedFixture {
         self.fixture.has_command_word(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        if argv == ["upper", "--text", "held"] || argv == ["line", "second"] {
-            self.released
-                .lock()
-                .recv_timeout(Duration::from_secs(2))
-                .expect("consumer observed first output before producer supplied second line");
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
         }
-        if argv == ["line", "second"] {
-            return Some(CommandRun::Rendered {
-                stdout: "second\n".to_owned(),
-                stderr: String::new(),
-                status: 0,
-            });
-        }
-        if argv == ["upper", "--text", "release"] {
-            self.release.send(()).expect("producer still waiting");
-        }
-        self.fixture.run_command(word, argv, stdin_piped)
     }
 
     fn invoke(
@@ -3346,6 +3482,18 @@ struct StdinFixture {
     received: Mutex<Vec<bool>>,
 }
 
+impl StdinFixture {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        self.received.lock().push(stdin_piped);
+        self.fixture.parse_command(word, argv, stdin_piped)
+    }
+}
+
 impl CapabilityInvoker for StdinFixture {
     fn granted(&self) -> Vec<String> {
         self.fixture.granted()
@@ -3355,9 +3503,44 @@ impl CapabilityInvoker for StdinFixture {
         self.fixture.has_command_word(word)
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        self.received.lock().push(stdin_piped);
-        self.fixture.run_command(word, argv, stdin_piped)
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
 
     fn invoke(

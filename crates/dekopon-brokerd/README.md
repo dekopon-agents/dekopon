@@ -387,7 +387,9 @@ broker logs `broker_stopped` and exits. Shutdown grace must cover one configured
 two complete frame deadlines, and it is one deadline for the whole shutdown, fixed when acceptance
 stops: the connection drain, a storage sweep still running and the telemetry flush all share it.
 A clean drain exits 0. Past the deadline remaining connections are aborted and the process exits
-non-zero; telemetry not flushed by then is dropped.
+non-zero; telemetry not flushed by then is dropped. The deadline starts before the socket is
+removed. Terminal failures emit one `broker_exit` JSON diagnostic directly on stderr before
+runtime shutdown, even when no time remains to drain the best-effort stdout queue or exporters.
 
 A managed broker (`providerSet`) also watches the lock it booted from. Every 2 s it hashes the file;
 two consecutive reads that agree with each other and differ from the loaded bytes are a change, and

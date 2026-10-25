@@ -4,7 +4,7 @@ use dekopon_broker_protocol::ChatTransportKind;
 use tokio::time::Instant;
 
 use crate::{
-    asset::MAX_ASSETS_PER_CONVERSATION,
+    asset::MAX_ASSETS_PER_MESSAGE,
     config::TransportConfig,
     follow,
     routes::BoundRoute,
@@ -108,7 +108,7 @@ impl Collector {
         reason = "reshaped by the unit that next rewrites this"
     )]
     pub(crate) fn offer(&mut self, route: RouteIdentity, message: InboundMessage) -> Offered {
-        if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_CONVERSATION {
+        if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_MESSAGE {
             message.receive_span.in_scope(|| record_received(&message));
             return Offered::Refused(message, "input-limit");
         }
@@ -140,7 +140,7 @@ impl Collector {
             }
             let assets: usize = batch.members.iter().map(|member| member.assets.len()).sum();
             if batch.members.len() == MAX_ENVELOPES
-                || assets + message.assets.len() > MAX_ASSETS_PER_CONVERSATION
+                || assets + message.assets.len() > MAX_ASSETS_PER_MESSAGE
                 || combined_text(batch.members.iter().chain(std::iter::once(&message))).len()
                     > MAX_INBOUND_TEXT_BYTES
             {
@@ -575,6 +575,15 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(group.assets.len(), 2);
         }
+    }
+
+    #[test]
+    fn a_thirty_third_attachment_in_one_message_is_refused_input_limit() {
+        let mut collector = collector(0, 4);
+        assert!(matches!(
+            collector.offer(route("a"), message(33, "files")),
+            Offered::Refused(_, "input-limit")
+        ));
     }
 
     #[test]

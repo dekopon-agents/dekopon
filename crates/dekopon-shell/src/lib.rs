@@ -62,7 +62,7 @@
 //! use std::io::Write;
 //!
 //! use dekopon_shell::{
-//!     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Streams,
+//!     CapabilityCallResult, CapabilityInvoker, Interpreter, Streams,
 //! };
 //! use dekopon_process::Limits;
 //! use serde_json::json;
@@ -79,28 +79,17 @@
 //!         vec!["probe".to_owned()]
 //!     }
 //!
-//!     fn run_command(
-//!         &self,
-//!         word: &str,
-//!         argv: &[String],
-//!         _stdin_piped: bool,
-//!     ) -> Option<CommandRun> {
-//!         if word != "probe" {
-//!             return None;
-//!         }
-//!         Some(match argv {
-//!             [command, flag, text] if command == "upper" && flag == "--text" => {
-//!                 CommandRun::Proposed {
-//!                     capability: "cli-probe.upper".to_owned(),
-//!                     input: json!({ "text": text }),
-//!                     secret_use: None,
-//!                     report: None,
-//!                 }
+//!     fn run(&self, call: dekopon_shell::RunCall, streams: Streams, tree: &dekopon_process::TreeContext) -> dekopon_shell::RunResult {
+//!         let argv = call.argv.iter().map(ToString::to_string).collect::<Vec<_>>();
+//!         match argv.as_slice() {
+//!             [command, flag, text] if call.word == "probe" && command == "upper" && flag == "--text" => {
+//!                 let capability = "cli-probe.upper".to_owned();
+//!                 let input = json!({ "text": text });
+//!                 let result = self.invoke(dekopon_shell::CommandProposal::new(capability.clone(), input.clone(), None), streams, tree);
+//!                 dekopon_shell::RunResult::Invoked { capability, input, secret_use: None, result }
 //!             }
-//!             _ => CommandRun::Failed {
-//!                 message: "usage: probe upper --text <text>".to_owned(),
-//!             },
-//!         })
+//!             _ => dekopon_shell::render_command(streams, "", "usage: probe upper --text <text>".to_owned(), 2),
+//!         }
 //!     }
 //!
 //!     fn invoke(
@@ -221,15 +210,6 @@ pub enum CapabilityCallResult {
 
 #[derive(Debug)]
 pub enum CommandRun {
-    Proposed {
-        capability: String,
-        input: Value,
-        /// The secret reference is intent, never authority: the broker authorizes it separately
-        /// from the capability, and an invoker with no broker behind it must refuse it rather than
-        /// treat it as approved.
-        secret_use: Option<SecretUseProposal>,
-        report: Option<CommandReport>,
-    },
     Rendered {
         stdout: String,
         stderr: String,
@@ -302,42 +282,8 @@ pub fn render_command(streams: Streams, stdout: &str, stderr: String, status: u8
     })
 }
 
-pub fn run_parsed<I: CapabilityInvoker + ?Sized>(
-    invoker: &I,
-    call: RunCall,
-    parsed: Option<CommandRun>,
-    streams: Streams,
-    tree: &TreeContext,
-) -> RunResult {
+pub fn render_run(call: RunCall, parsed: Option<CommandRun>, streams: Streams) -> RunResult {
     match parsed {
-        Some(CommandRun::Proposed {
-            capability,
-            input,
-            secret_use,
-            report,
-        }) => {
-            if !invoker.is_granted(&capability) {
-                return render_command(
-                    streams,
-                    "",
-                    format!(
-                        "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
-                        call.word, capability
-                    ),
-                    127,
-                );
-            }
-            let mut proposal =
-                CommandProposal::new(capability.clone(), input.clone(), secret_use.clone());
-            proposal.report = report;
-            let result = invoker.invoke(proposal, streams, tree);
-            RunResult::Invoked {
-                capability,
-                input,
-                secret_use,
-                result,
-            }
-        }
         Some(CommandRun::Rendered {
             stdout,
             stderr,
@@ -387,21 +333,8 @@ pub trait CapabilityInvoker: Send + Sync {
             .any(|candidate| candidate == word)
     }
 
-    /// Running a command word grants nothing: any proposal it makes is invoked through the same
-    /// budget, denial, and telemetry path as every other capability call.
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        let _ = (word, argv, stdin_piped);
-        None
-    }
-
-    fn run(&self, call: RunCall, streams: Streams, tree: &TreeContext) -> RunResult {
-        let argv = call
-            .argv
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let parsed = self.run_command(&call.word, &argv, streams.stdin.is_some());
-        run_parsed(self, call, parsed, streams, tree)
+    fn run(&self, call: RunCall, streams: Streams, _tree: &TreeContext) -> RunResult {
+        render_run(call, None, streams)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -459,10 +392,6 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn has_command_word(&self, word: &str) -> bool {
         self.as_ref().has_command_word(word)
-    }
-
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        self.as_ref().run_command(word, argv, stdin_piped)
     }
 
     fn run(&self, call: RunCall, streams: Streams, tree: &TreeContext) -> RunResult {
@@ -633,6 +562,35 @@ mod tests {
         retained: Mutex<Vec<u64>>,
     }
 
+    impl RecordingInvoker {
+        fn parse_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            stdin_piped: bool,
+        ) -> Option<Result<crate::CommandProposal, CommandRun>> {
+            if matches!(word, "retained" | "render") {
+                let stdout = if word == "retained" {
+                    self.retained.lock().push(self.tree.as_ref()?.value_bytes());
+                    String::new()
+                } else {
+                    "abcdefgh".to_owned()
+                };
+                return Some(Err(CommandRun::Rendered {
+                    stdout,
+                    stderr: String::new(),
+                    status: 0,
+                }));
+            }
+            Some(Ok(crate::CommandProposal {
+                capability: word.to_owned(),
+                input: json!({ "argv": argv, "stdin": stdin_piped.then_some("") }),
+                secret_use: None,
+                report: None,
+            }))
+        }
+    }
+
     impl CapabilityInvoker for RecordingInvoker {
         fn granted(&self) -> Vec<String> {
             vec!["cli-probe.upper".to_owned()]
@@ -654,31 +612,44 @@ mod tests {
             matches!(word, "gh-extra" | "retained" | "render")
         }
 
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            argv: &[String],
-            stdin_piped: bool,
-        ) -> Option<CommandRun> {
-            if matches!(word, "retained" | "render") {
-                let stdout = if word == "retained" {
-                    self.retained.lock().push(self.tree.as_ref()?.value_bytes());
-                    String::new()
-                } else {
-                    "abcdefgh".to_owned()
-                };
-                return Some(CommandRun::Rendered {
-                    stdout,
-                    stderr: String::new(),
-                    status: 0,
-                });
+            call: crate::RunCall,
+            streams: crate::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> crate::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return crate::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    crate::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => crate::render_run(call, Some(rendered), streams),
+                None => crate::render_run(call, None, streams),
             }
-            Some(CommandRun::Proposed {
-                capability: word.to_owned(),
-                input: json!({ "argv": argv, "stdin": stdin_piped.then_some("") }),
-                secret_use: None,
-                report: None,
-            })
         }
 
         fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -1038,19 +1009,6 @@ mod tests {
             BTreeMap::from([("gh".to_owned(), "gh: recorded help".to_owned())])
         );
         assert!(shared.has_command_word("gh-extra"));
-        let Some(CommandRun::Proposed {
-            capability,
-            input,
-            secret_use,
-            report,
-        }) = shared.run_command("gh", &["pr".to_owned()], true)
-        else {
-            panic!("expected proposal")
-        };
-        assert_eq!(capability, "gh");
-        assert_eq!(input, json!({"argv": ["pr"], "stdin": ""}));
-        assert!(secret_use.is_none());
-        assert!(report.is_none());
         assert_eq!(
             shared.describe("gh.pr-view").map(|it| it.description),
             Some("recorded".to_owned())
@@ -1071,6 +1029,24 @@ mod tests {
         }
     }
 
+    impl ProposingInvoker {
+        fn parse_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            stdin_piped: bool,
+        ) -> Option<Result<crate::CommandProposal, CommandRun>> {
+            (word == "httpprobe").then(|| {
+                Ok(crate::CommandProposal {
+                    capability: "http-probe.fetch".to_owned(),
+                    input: json!({ "argv": argv, "stdin": stdin_piped.then_some("") }),
+                    secret_use: self.secret_use.clone(),
+                    report: None,
+                })
+            })
+        }
+    }
+
     impl CapabilityInvoker for ProposingInvoker {
         fn granted(&self) -> Vec<String> {
             vec!["http-probe.fetch".to_owned()]
@@ -1080,18 +1056,44 @@ mod tests {
             vec!["httpprobe".to_owned()]
         }
 
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            argv: &[String],
-            stdin_piped: bool,
-        ) -> Option<CommandRun> {
-            (word == "httpprobe").then(|| CommandRun::Proposed {
-                capability: "http-probe.fetch".to_owned(),
-                input: json!({ "argv": argv, "stdin": stdin_piped.then_some("") }),
-                secret_use: self.secret_use.clone(),
-                report: None,
-            })
+            call: crate::RunCall,
+            streams: crate::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> crate::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return crate::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    crate::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => crate::render_run(call, Some(rendered), streams),
+                None => crate::render_run(call, None, streams),
+            }
         }
 
         fn invoke(
@@ -1136,6 +1138,25 @@ mod tests {
         read: bool,
     }
 
+    impl ChildInputInvoker {
+        fn parse_command(
+            &self,
+            word: &str,
+            _argv: &[String],
+            stdin_piped: bool,
+        ) -> Option<Result<crate::CommandProposal, CommandRun>> {
+            self.seen.lock().push(stdin_piped);
+            (word == "httpprobe").then(|| {
+                Ok(crate::CommandProposal {
+                    capability: "http-probe.fetch".to_owned(),
+                    input: serde_json::Value::Null,
+                    secret_use: None,
+                    report: None,
+                })
+            })
+        }
+    }
+
     impl CapabilityInvoker for ChildInputInvoker {
         fn granted(&self) -> Vec<String> {
             vec!["http-probe.fetch".to_owned()]
@@ -1145,19 +1166,44 @@ mod tests {
             vec!["httpprobe".to_owned()]
         }
 
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            _argv: &[String],
-            stdin_piped: bool,
-        ) -> Option<CommandRun> {
-            self.seen.lock().push(stdin_piped);
-            (word == "httpprobe").then(|| CommandRun::Proposed {
-                capability: "http-probe.fetch".to_owned(),
-                input: serde_json::Value::Null,
-                secret_use: None,
-                report: None,
-            })
+            call: crate::RunCall,
+            streams: crate::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> crate::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return crate::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    crate::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => crate::render_run(call, Some(rendered), streams),
+                None => crate::render_run(call, None, streams),
+            }
         }
 
         fn invoke(
@@ -1248,6 +1294,25 @@ mod tests {
         stop: dekopon_process::CancelSignal,
     }
 
+    impl PanickingInputInvoker {
+        fn parse_command(
+            &self,
+            word: &str,
+            _argv: &[String],
+            stdin_piped: bool,
+        ) -> Option<Result<crate::CommandProposal, CommandRun>> {
+            assert!(stdin_piped, "child stage inherits script stdin");
+            (word == "httpprobe").then(|| {
+                Ok(crate::CommandProposal {
+                    capability: "http-probe.fetch".to_owned(),
+                    input: serde_json::Value::Null,
+                    secret_use: None,
+                    report: None,
+                })
+            })
+        }
+    }
+
     impl CapabilityInvoker for PanickingInputInvoker {
         fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
             vec![self.stop.clone()]
@@ -1261,19 +1326,44 @@ mod tests {
             vec!["httpprobe".to_owned()]
         }
 
-        fn run_command(
+        fn run(
             &self,
-            word: &str,
-            _argv: &[String],
-            stdin_piped: bool,
-        ) -> Option<CommandRun> {
-            assert!(stdin_piped, "child stage inherits script stdin");
-            (word == "httpprobe").then(|| CommandRun::Proposed {
-                capability: "http-probe.fetch".to_owned(),
-                input: serde_json::Value::Null,
-                secret_use: None,
-                report: None,
-            })
+            call: crate::RunCall,
+            streams: crate::Streams,
+            tree: &dekopon_process::TreeContext,
+        ) -> crate::RunResult {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+                Some(Ok(proposal)) => {
+                    let capability = proposal.capability.clone();
+                    let input = proposal.input.clone();
+                    let secret_use = proposal.secret_use.clone();
+                    if !self.is_granted(&capability) {
+                        return crate::render_command(
+                            streams,
+                            "",
+                            format!(
+                                "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                                call.word, capability
+                            ),
+                            127,
+                        );
+                    }
+                    let result = self.invoke(proposal, streams, tree);
+                    crate::RunResult::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                    }
+                }
+                Some(Err(rendered)) => crate::render_run(call, Some(rendered), streams),
+                None => crate::render_run(call, None, streams),
+            }
         }
 
         fn invoke(

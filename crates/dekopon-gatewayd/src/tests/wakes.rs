@@ -174,6 +174,23 @@ fn a_baseline_never_fires_and_a_broken_probe_is_never_stored() {
 
 struct ChecksStatus(u8);
 
+impl ChecksStatus {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        _stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, dekopon_shell::CommandRun>> {
+        assert_eq!(word, "gh");
+        assert_eq!(argv, ["pr", "checks", "-R", "owner/repo", "42"]);
+        Some(Err(dekopon_shell::CommandRun::Rendered {
+            stdout: "check table must not enter the probe".to_owned(),
+            stderr: String::new(),
+            status: self.0,
+        }))
+    }
+}
+
 impl dekopon_shell::CapabilityInvoker for ChecksStatus {
     fn granted(&self) -> Vec<String> {
         Vec::new()
@@ -183,19 +200,44 @@ impl dekopon_shell::CapabilityInvoker for ChecksStatus {
         vec!["gh".to_owned()]
     }
 
-    fn run_command(
+    fn run(
         &self,
-        word: &str,
-        argv: &[String],
-        _stdin_piped: bool,
-    ) -> Option<dekopon_shell::CommandRun> {
-        assert_eq!(word, "gh");
-        assert_eq!(argv, ["pr", "checks", "-R", "owner/repo", "42"]);
-        Some(dekopon_shell::CommandRun::Rendered {
-            stdout: "check table must not enter the probe".to_owned(),
-            stderr: String::new(),
-            status: self.0,
-        })
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
 
     fn invoke(
