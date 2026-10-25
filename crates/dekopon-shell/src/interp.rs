@@ -3673,6 +3673,7 @@ impl<'a> Evaluator<'a> {
         separated: &mut bool,
         text: &str,
     ) -> Result<(), CommandFailure> {
+        self.budget.charge_step_with(self.invoker)?;
         for chunk in text.split_inclusive([' ', '\t', '\n']) {
             let field = chunk.trim_end_matches([' ', '\t', '\n']);
             if !field.is_empty() {

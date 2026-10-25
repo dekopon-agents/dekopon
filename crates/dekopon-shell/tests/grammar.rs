@@ -3959,3 +3959,20 @@ fn conditional_chains_preserve_precedence_short_circuiting_and_steps() {
         assert_eq!(outcome.steps, steps, "{script}");
     }
 }
+
+#[test]
+fn repeated_blank_expansions_exhaust_the_step_budget() {
+    let script = format!("v=' '; : {}", "$v ".repeat(64));
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_steps: 32,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("step budget exhausted"),
+        "{outcome:?}"
+    );
+}
