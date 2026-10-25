@@ -296,6 +296,7 @@ fn chat_claim() -> Attestation {
                 id: "c0123abc".to_owned(),
                 thread: Some("1712345678.000100".to_owned()),
             },
+            delivery: None,
             trigger: dekopon_broker_protocol::Trigger::Message,
         },
     )

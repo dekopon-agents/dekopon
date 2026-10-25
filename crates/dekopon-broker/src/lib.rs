@@ -62,7 +62,7 @@ use dekopon_capability::{
     StorageInterface, StorageRetention, StorageScope, broker::AuthorizationGate,
 };
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, PrincipalKind,
     ProviderFailureDetail, ProviderId, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
     SecretUseProposal, SubjectSegment, SubjectService, TraceId, error_chain,
 };
@@ -263,6 +263,8 @@ pub struct AuthenticatedContext {
     attested_subject: Option<ExternalSubject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_scope: Option<ChatScopeClaim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    space: Option<PrincipalId>,
 }
 
 impl AuthenticatedContext {
@@ -311,6 +313,7 @@ impl AuthenticatedContext {
             via,
             attested_subject,
             chat_scope,
+            space: None,
         })
     }
 
@@ -322,6 +325,7 @@ impl AuthenticatedContext {
             via: None,
             attested_subject: Some(subject),
             chat_scope: None,
+            space: None,
         }
     }
 
@@ -1238,6 +1242,14 @@ impl IdentityDirectory {
         self.mappings.get(subject)
     }
 
+    #[must_use]
+    pub fn principal_kind(&self, principal: &PrincipalId) -> PrincipalKind {
+        self.mappings
+            .iter()
+            .find_map(|(subject, mapped)| (mapped == principal).then(|| subject.kind()))
+            .unwrap_or(PrincipalKind::Service)
+    }
+
     pub fn principals(&self) -> impl Iterator<Item = &PrincipalId> {
         self.mappings.values()
     }
@@ -1271,6 +1283,7 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
         transport: context
             .chat_scope()
             .map(|scope| scope.transport.to_string()),
+        started_by: turn_started_by(context).map(|started| started.as_str().to_owned()),
         trigger: context
             .chat_scope()
             .map(|scope| scope.trigger.as_str().to_owned()),
@@ -1281,6 +1294,44 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
             thread: scope.conversation.thread.clone(),
         }),
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TurnStartedBy {
+    Person,
+    Message,
+    Wake,
+    Job,
+    Probe,
+}
+
+impl TurnStartedBy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Message => "message",
+            Self::Wake => "wake",
+            Self::Job => "job",
+            Self::Probe => "probe",
+        }
+    }
+}
+
+fn turn_started_by(context: &AuthenticatedContext) -> Option<TurnStartedBy> {
+    context.chat_scope().map(|scope| match scope.trigger {
+        Trigger::Message
+            if context
+                .attested_subject()
+                .is_some_and(|subject| subject.kind() == PrincipalKind::Person) =>
+        {
+            TurnStartedBy::Person
+        }
+        Trigger::Message => TurnStartedBy::Message,
+        Trigger::Wake => TurnStartedBy::Wake,
+        Trigger::Job => TurnStartedBy::Job,
+        Trigger::Probe => TurnStartedBy::Probe,
+    })
 }
 
 /// A watch probe runs unattended every tick, so it may only read, whatever owner policy permits.
@@ -1606,6 +1657,7 @@ pub enum BrokerBuildError {
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AuditEvent {
     Decision {
+        authority: Box<DecisionAuthority>,
         invocation: InvocationId,
         trace: TraceId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1682,7 +1734,6 @@ pub enum AuditEvent {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_detail: Option<ProviderFailureDetail>,
-        /// Sanitized HTTP metadata; never paths, queries, headers, or bodies.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         http_calls: Vec<HttpCallEvidence>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2008,18 +2059,20 @@ where
         if !decision.allowed {
             let reason = denial_reason(&decision, "policy-denied");
             return Err(Refusal {
-                evaluation: Some(PolicyEvaluation {
-                    errors_present: decision.errors_present,
-                    cause: decision.refusal,
-                }),
-                ..determined_refusal(reason, decision.determining_policy_ids)
+                evaluation: Some(Box::new(PolicyEvaluation {
+                    errors_present: decision.policy.errors_present,
+                    cause: decision.policy.refusal,
+                    space: decision.space,
+                })),
+                ..determined_refusal(reason, decision.policy.determining_policy_ids)
             });
         }
         Ok(CapabilityDecision {
             set,
-            policy_ids: decision.determining_policy_ids,
+            policy_ids: decision.policy.determining_policy_ids,
             slots,
-            errors_present: decision.errors_present,
+            space: decision.space,
+            errors_present: decision.policy.errors_present,
         })
     }
 
@@ -2062,18 +2115,22 @@ where
         };
         let secret_decision =
             self.authorize_secret_use(context, capability, &decision.set, secret_use);
-        decision.errors_present |= secret_decision.errors_present;
+        let secret_allowed = secret_decision.allowed;
+        let secret_errors = secret_decision.errors_present;
+        decision.errors_present |= secret_errors;
+        merge_space_decision(&mut decision.space, secret_decision.space);
         decision
             .policy_ids
-            .extend(secret_decision.determining_policy_ids);
+            .extend(secret_decision.policy.determining_policy_ids);
         decision.policy_ids.sort();
         decision.policy_ids.dedup();
-        if !secret_decision.allowed {
+        if !secret_allowed {
             return Err(Refusal {
-                evaluation: Some(PolicyEvaluation {
-                    errors_present: secret_decision.errors_present,
+                evaluation: Some(Box::new(PolicyEvaluation {
+                    errors_present: secret_errors,
                     cause: None,
-                }),
+                    space: decision.space.clone(),
+                })),
                 ..determined_refusal("secret-denied", decision.policy_ids.clone())
             });
         }
@@ -2087,7 +2144,7 @@ where
         capability: &CapabilityId,
         set: &ConstraintSet,
         facts: Option<dekopon_policy::HttpRequestFacts>,
-    ) -> PolicyDecision {
+    ) -> EvaluatedDecision {
         let request = PolicyRequest {
             principal: context.principal().clone(),
             target: PolicyTarget::Capability {
@@ -2098,17 +2155,56 @@ where
             },
             context: policy_context(context),
         };
-        Self::decide_capability(&self.policy, request, facts)
+        Self::evaluate(&self.policy, request, facts, context.space.as_ref())
     }
 
-    fn decide_capability(
+    fn evaluate(
         policy: &PolicyEngine,
         request: PolicyRequest,
         facts: Option<dekopon_policy::HttpRequestFacts>,
-    ) -> PolicyDecision {
-        match facts {
+        space: Option<&PrincipalId>,
+    ) -> EvaluatedDecision {
+        let evaluate = |request, facts| match facts {
             Some(facts) => policy.authorize_http(request, facts),
             None => policy.authorize(request),
+        };
+        if space.is_none() {
+            return EvaluatedDecision {
+                policy: evaluate(request, facts),
+                space: None,
+            };
+        }
+        let mut asker = evaluate(request.clone(), facts.clone());
+        let space = space.map(|id| {
+            let verdict = evaluate(
+                PolicyRequest {
+                    principal: id.clone(),
+                    ..request
+                },
+                facts,
+            );
+            let denied_by = match (asker.allowed, verdict.allowed) {
+                (true, true) => None,
+                (false, true) => Some(DenyingPrincipal::Asker),
+                (true, false) => Some(DenyingPrincipal::Space),
+                (false, false) => Some(DenyingPrincipal::Both),
+            };
+            let result = SpaceDecision {
+                id: id.clone(),
+                asker_allowed: Some(asker.allowed),
+                allowed: Some(verdict.allowed),
+                policy_ids: verdict.determining_policy_ids,
+                denied_by,
+            };
+            asker.allowed &= verdict.allowed;
+            asker.errors_present |= verdict.errors_present;
+            asker.refusal = asker.refusal.take().or(verdict.refusal);
+            asker.opaque_body = asker.opaque_body.or(verdict.opaque_body);
+            result
+        });
+        EvaluatedDecision {
+            policy: asker,
+            space,
         }
     }
 
@@ -2118,17 +2214,22 @@ where
         capability: &CapabilityId,
         set: &ConstraintSet,
         proposal: &SecretUseProposal,
-    ) -> PolicyDecision {
-        self.policy.authorize(PolicyRequest {
-            principal: context.principal().clone(),
-            target: PolicyTarget::SecretUse {
-                secret: proposal.secret().clone(),
-                capability: capability.clone(),
-                provider: set.provider.clone(),
-                sink: proposal.sink(),
+    ) -> EvaluatedDecision {
+        Self::evaluate(
+            &self.policy,
+            PolicyRequest {
+                principal: context.principal().clone(),
+                target: PolicyTarget::SecretUse {
+                    secret: proposal.secret().clone(),
+                    capability: capability.clone(),
+                    provider: set.provider.clone(),
+                    sink: proposal.sink(),
+                },
+                context: policy_context(context),
             },
-            context: policy_context(context),
-        })
+            None,
+            context.space.as_ref(),
+        )
     }
 
     /// This is the session gate: permitting a principal to talk to an agent is its own explicit
@@ -2137,14 +2238,19 @@ where
         &self,
         context: &AuthenticatedContext,
         agent: &AgentId,
-    ) -> PolicyDecision {
-        self.policy.authorize(PolicyRequest {
-            principal: context.principal().clone(),
-            target: PolicyTarget::AgentPrompt {
-                agent: agent.clone(),
+    ) -> EvaluatedDecision {
+        Self::evaluate(
+            &self.policy,
+            PolicyRequest {
+                principal: context.principal().clone(),
+                target: PolicyTarget::AgentPrompt {
+                    agent: agent.clone(),
+                },
+                context: policy_context(context),
             },
-            context: policy_context(context),
-        })
+            None,
+            context.space.as_ref(),
+        )
     }
 
     /// Every capability listing filters this same set of Cedar evaluations, so what is listed can
@@ -2569,7 +2675,11 @@ where
         grant: Option<&AttestorGrant>,
         claim: &Attestation,
     ) -> (AuthenticatedContext, Option<Refusal>) {
-        let refused = || peer.with_refused_subject(claim.subject.clone());
+        let refused = || {
+            let mut context = peer.with_refused_subject(claim.subject.clone());
+            context.chat_scope = claim.scope.clone();
+            context
+        };
         let Some(grant) = grant else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
@@ -2579,6 +2689,9 @@ where
         let Some(principal) = self.identities.resolve(&claim.subject) else {
             return (refused(), Some(unevaluated_refusal("unmapped-subject")));
         };
+        if self.identities.principal_kind(principal) == PrincipalKind::Space {
+            return (refused(), Some(unevaluated_refusal("attestation-denied")));
+        }
         let actor = Actor::Agent {
             agent: claim.agent.clone(),
         };
@@ -2605,6 +2718,13 @@ where
                 {
                     return (refused(), Some(unevaluated_refusal("attestation-denied")));
                 }
+                if scope
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| !delivery.is_canonical_for(&scope))
+                {
+                    return (refused(), Some(unevaluated_refusal("attestation-denied")));
+                }
                 AuthenticatedContext::attested_chat(
                     principal.clone(),
                     actor,
@@ -2620,9 +2740,34 @@ where
                 claim.subject.clone(),
             ),
         };
-        let Ok(context) = derived else {
+        let Ok(mut context) = derived else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
+        context.space = context.chat_scope().and_then(|scope| {
+            let in_space = match scope.conversation.kind {
+                ConversationKind::Channel | ConversationKind::Thread => true,
+                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => false,
+            };
+            if !in_space {
+                return None;
+            }
+            let service = match scope.kind {
+                ChatTransportKind::Slack => "slack",
+                ChatTransportKind::Discord => "discord",
+                ChatTransportKind::Telegram
+                | ChatTransportKind::Whatsapp
+                | ChatTransportKind::Github
+                | ChatTransportKind::Local => return None,
+            };
+            let container = scope.conversation.container.as_deref()?;
+            let subject = format!("{service}.{container}.{}", scope.conversation.id)
+                .parse()
+                .ok()?;
+            self.identities
+                .resolve(&subject)
+                .filter(|mapped| self.identities.principal_kind(mapped) == PrincipalKind::Space)
+                .cloned()
+        });
         let decision = self.authorize_agent_prompt(&context, &claim.agent);
         if decision.allowed {
             (context, None)
@@ -3076,21 +3221,22 @@ where
                     .await
                     .map(ControlFlow::Break);
             }
-            let CapabilityDecision {
-                set,
-                policy_ids,
-                slots,
-                ..
-            } = decision;
             authorize.record("outcome", "allowed");
-            Ok(ControlFlow::Continue((set, policy_ids, slots)))
+            Ok(ControlFlow::Continue(decision))
         }
         .instrument(authorize.clone())
         .await?;
-        let (set, policy_ids, slots) = match authorized {
+        let decision = match authorized {
             ControlFlow::Break(denied) => return Ok(denied),
             ControlFlow::Continue(allowed) => allowed,
         };
+        let CapabilityDecision {
+            set,
+            policy_ids,
+            slots,
+            space,
+            ..
+        } = decision;
         let execute = tracing::info_span!(
             "broker.execute",
             provider = %set.provider,
@@ -3113,9 +3259,11 @@ where
         } else if let Some(credential) = self.constraints.credential_for(&set, context.actor()) {
             execute.record("credential", credential);
         }
-        self.execute(context, request, set, policy_ids, slots, assets, outputs)
-            .instrument(execute)
-            .await
+        self.execute(
+            context, request, set, policy_ids, slots, space, assets, outputs,
+        )
+        .instrument(execute)
+        .await
     }
 
     async fn deny(
@@ -3128,8 +3276,16 @@ where
             reason,
             wire,
             policy_ids,
+            evaluation,
             ..
         } = refusal;
+        let authority = decision_authority(
+            context,
+            self.identities.principal_kind(context.principal()),
+            evaluation
+                .as_ref()
+                .and_then(|evaluation| evaluation.space.clone()),
+        );
         let decision_id = format!("deny-{}", request.id);
         let decision = self.decision_reference(&decision_id);
         let trace = request.trace_parent.trace();
@@ -3149,6 +3305,7 @@ where
             constraints: None,
             allowed: false,
             reason: Some(reason),
+            space: authority.space.as_ref(),
         };
         let storage_host = self.registry.storage_host();
         let storage_backed =
@@ -3164,6 +3321,7 @@ where
             decision_evidence_digest("policy-decision", &material)?
         };
         self.record_audit(AuditEvent::Decision {
+            authority,
             invocation: request.id.clone(),
             trace,
             principal: Some(context.principal().clone()),
@@ -3181,7 +3339,9 @@ where
             decision_id: decision_id.clone(),
             policy_ids,
             policy_error_ids: Vec::new(),
-            policy_errors_present: None,
+            policy_errors_present: evaluation
+                .as_ref()
+                .and_then(|evaluation| context.space.as_ref().map(|_| evaluation.errors_present)),
             decision_point: "invocation".to_owned(),
             policy_digest: Some(self.policy_digest.clone()),
             allowed: false,
@@ -3288,12 +3448,18 @@ where
         set: ConstraintSet,
         policy_ids: Vec<String>,
         slots: ChatSlotValues,
+        space: Option<SpaceDecision>,
         assets: dekopon_broker_host::asset::AssetInputs,
         outputs: &mut dekopon_broker_host::asset::AssetOutputs,
     ) -> Result<InvocationResult, BrokerError> {
         // Deliberately non-mutating here: the authorization decision must be recorded before
         // materialize can create a namespace, rotate a generation pointer, or update lifecycle
         // state.
+        let authority = decision_authority(
+            context,
+            self.identities.principal_kind(context.principal()),
+            space,
+        );
         let mut storage_preparation = self.prepare_storage_grant(context, &request, &set)?;
         if let Some(preparation) = &storage_preparation {
             tracing::Span::current().record("storage.namespace", preparation.namespace());
@@ -3384,6 +3550,8 @@ where
             let risk = set.risk;
             let invocation = invocation_id.clone();
             let capability = capability.clone();
+            let authority = authority.clone();
+            let space = context.space.clone();
             let context = policy_context(context);
             let sequence = std::sync::atomic::AtomicUsize::new(0);
             Arc::new(move |facts: dekopon_broker_host::HttpRequestFacts| {
@@ -3412,8 +3580,10 @@ where
                 // Cedar measures its recursion reserve against stacker's thread bounds, which a
                 // Wasmtime fiber stack falls outside, so it evaluates on a segment stacker tracks.
                 let result = stacker::grow(POLICY_STACK_BYTES, || {
-                    Self::decide_capability(&policy, request, Some(facts))
+                    Self::evaluate(&policy, request, Some(facts), space.as_ref())
                 });
+                let mut authority = authority.clone();
+                authority.space = result.space.clone();
                 let material = DecisionMaterial {
                     invocation: &invocation,
                     trace,
@@ -3425,11 +3595,12 @@ where
                     secret_use: None,
                     provider: Some(&provider),
                     authorized_by: &broker_principal,
-                    policy_ids: &result.determining_policy_ids,
+                    policy_ids: &result.policy.determining_policy_ids,
                     policy_digest: &policy_digest,
                     constraints: None,
                     allowed: result.allowed,
                     reason: (!result.allowed).then(|| denial_reason(&result, "policy-denied")),
+                    space: authority.space.as_ref(),
                 };
                 let digest = decision_evidence_digest("policy-decision", &material);
                 let ordinal = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3466,6 +3637,7 @@ where
                     }
                 };
                 let event = AuditEvent::Decision {
+                    authority,
                     invocation: invocation.clone(),
                     trace,
                     principal: Some(principal.clone()),
@@ -3478,12 +3650,12 @@ where
                     provider: Some(provider.clone()),
                     authorized_by: Some(broker_principal.clone()),
                     decision_id,
-                    policy_ids: result.determining_policy_ids,
-                    policy_error_ids: result.erroring_policy_ids,
-                    policy_errors_present: Some(result.errors_present),
+                    policy_ids: result.policy.determining_policy_ids,
+                    policy_error_ids: result.policy.erroring_policy_ids,
+                    policy_errors_present: Some(result.policy.errors_present),
                     decision_point: "http.request".to_owned(),
                     policy_digest: Some(policy_digest.clone()),
-                    allowed: result.allowed,
+                    allowed: result.policy.allowed,
                     reason,
                     decision_digest,
                     storage_scope_commitment: None,
@@ -3494,7 +3666,7 @@ where
                 Box::pin(async move {
                     emit_audit_event(&event);
                     match audit.append(event).await {
-                        Ok(()) => result.allowed,
+                        Ok(()) => result.policy.allowed,
                         Err(source) => {
                             report_audit_failure("decision", &invocation, &source);
                             false
@@ -3514,7 +3686,33 @@ where
                 set.constraints.clone(),
             )
             .map_err(|source| BrokerError::Authorization { source })?;
-        let decision_digest = if let Some(preparation) = storage_preparation.as_ref() {
+        let decision_digest = if authority.space.is_some() {
+            let material = DecisionMaterial {
+                invocation: &invocation_id,
+                trace,
+                principal: context.principal(),
+                actor: context.actor(),
+                via: context.via(),
+                attested_subject: context.attested_subject(),
+                capability: &capability,
+                secret_use: authorized.proposal().secret_use.as_ref(),
+                provider: Some(&set.provider),
+                authorized_by: &self.broker_principal,
+                policy_ids: &policy_ids,
+                policy_digest: &self.policy_digest,
+                constraints: Some(&set.constraints),
+                allowed: true,
+                reason: None,
+                space: authority.space.as_ref(),
+            };
+            if let Some(preparation) = storage_preparation.as_ref() {
+                let bytes = serde_json::to_vec(&material)
+                    .map_err(|source| BrokerError::DecisionEvidence { source })?;
+                preparation.evidence_commitment("policy-decision", &bytes)
+            } else {
+                decision_evidence_digest("policy-decision", &material)?
+            }
+        } else if let Some(preparation) = storage_preparation.as_ref() {
             let bytes = serde_json::to_vec(&authorized)
                 .map_err(|source| BrokerError::DecisionEvidence { source })?;
             preparation.evidence_commitment("authorized-invocation", &bytes)
@@ -3529,6 +3727,7 @@ where
         };
 
         self.record_audit(AuditEvent::Decision {
+            authority,
             invocation: invocation_id.clone(),
             trace,
             principal: Some(context.principal().clone()),
@@ -4279,6 +4478,7 @@ fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
                 id,
                 thread,
             },
+        delivery,
         trigger,
     } = scope;
     *kind == ChatTransportKind::Local
@@ -4287,6 +4487,7 @@ fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
         && id == CONSOLE_SMOKE_TRANSPORT
         && thread.is_none()
         && *trigger == Trigger::Message
+        && delivery.is_none()
 }
 
 fn console_smoke_delivery(
@@ -4306,29 +4507,121 @@ fn console_smoke_delivery(
             connection,
             sequence,
         },
-        placeholder @ (DeliveryIdentity::Slack { .. }
+        placeholder @ (DeliveryIdentity::Github { .. }
+        | DeliveryIdentity::Slack { .. }
         | DeliveryIdentity::Discord { .. }
         | DeliveryIdentity::Telegram { .. }
         | DeliveryIdentity::Whatsapp { .. }) => placeholder,
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DenyingPrincipal {
+    Asker,
+    Space,
+    Both,
+}
+
+impl DenyingPrincipal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asker => "asker",
+            Self::Space => "space",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceDecision {
+    id: PrincipalId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asker_allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    policy_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    denied_by: Option<DenyingPrincipal>,
+}
+
+struct EvaluatedDecision {
+    policy: PolicyDecision,
+    space: Option<SpaceDecision>,
+}
+impl std::ops::Deref for EvaluatedDecision {
+    type Target = PolicyDecision;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
+fn merge_space_decision(previous: &mut Option<SpaceDecision>, next: Option<SpaceDecision>) {
+    if let Some(mut next) = next {
+        if let Some(previous) = previous.as_ref() {
+            next.asker_allowed = next
+                .asker_allowed
+                .zip(previous.asker_allowed)
+                .map(|(a, b)| a && b);
+            next.allowed = next.allowed.zip(previous.allowed).map(|(a, b)| a && b);
+            next.policy_ids.extend(previous.policy_ids.iter().cloned());
+            next.policy_ids.sort();
+            next.policy_ids.dedup();
+        }
+        *previous = Some(next);
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionAuthority {
+    principal_kind: PrincipalKind,
+    started_by: Option<TurnStartedBy>,
+    chat: Option<ChatScopeClaim>,
+    space: Option<SpaceDecision>,
+}
+
+fn decision_authority(
+    context: &AuthenticatedContext,
+    kind: PrincipalKind,
+    space: Option<SpaceDecision>,
+) -> Box<DecisionAuthority> {
+    Box::new(DecisionAuthority {
+        principal_kind: kind,
+        started_by: turn_started_by(context),
+        chat: context.chat_scope.clone(),
+        space: space.or_else(|| {
+            context.space.as_ref().map(|id| SpaceDecision {
+                id: id.clone(),
+                asker_allowed: None,
+                allowed: None,
+                policy_ids: Vec::new(),
+                denied_by: None,
+            })
+        }),
+    })
+}
+
 pub struct Refusal {
     pub reason: &'static str,
     wire: &'static str,
     pub policy_ids: Vec<String>,
-    evaluation: Option<PolicyEvaluation>,
+    evaluation: Option<Box<PolicyEvaluation>>,
 }
 
 struct PolicyEvaluation {
     errors_present: bool,
     cause: Option<String>,
+    space: Option<SpaceDecision>,
 }
 
 pub struct CapabilityDecision {
     pub set: ConstraintSet,
     policy_ids: Vec<String>,
     slots: ChatSlotValues,
+    space: Option<SpaceDecision>,
     errors_present: bool,
 }
 
@@ -4366,14 +4659,19 @@ fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal 
     }
 }
 
-fn decided_refusal(decision: PolicyDecision, denied: &'static str) -> Refusal {
-    determined_refusal(
-        denial_reason(&decision, denied),
-        decision.determining_policy_ids,
-    )
+fn decided_refusal(decision: EvaluatedDecision, denied: &'static str) -> Refusal {
+    let reason = denial_reason(&decision, denied);
+    Refusal {
+        evaluation: Some(Box::new(PolicyEvaluation {
+            errors_present: decision.errors_present,
+            cause: decision.policy.refusal,
+            space: decision.space,
+        })),
+        ..determined_refusal(reason, decision.policy.determining_policy_ids)
+    }
 }
 
-const fn denial_reason(decision: &PolicyDecision, denied: &'static str) -> &'static str {
+fn denial_reason(decision: &EvaluatedDecision, denied: &'static str) -> &'static str {
     if decision.errors_present {
         "policy-error"
     } else {
@@ -4401,6 +4699,7 @@ fn report_inspection_refusal(
 fn emit_audit_event(event: &AuditEvent) {
     match event {
         AuditEvent::Decision {
+            authority,
             invocation,
             principal,
             actor,
@@ -4427,6 +4726,21 @@ fn emit_audit_event(event: &AuditEvent) {
             target: "dekopon_broker::audit",
             {
                 audit.event = "broker.decision",
+                principal.kind = authority.principal_kind.as_str(),
+                turn.started_by = authority.started_by.map(TurnStartedBy::as_str),
+                space.id = authority.space.as_ref().map(|space| space.id.as_str()),
+                asker.allowed = authority.space.as_ref().and_then(|space| space.asker_allowed),
+                space.allowed = authority.space.as_ref().and_then(|space| space.allowed),
+                space.policy.ids = authority.space.as_ref().and_then(|space| joined(&space.policy_ids)),
+                decision.denied_by = authority.space.as_ref().and_then(|space| space.denied_by.map(DenyingPrincipal::as_str)),
+                transport.id = authority.chat.as_ref().map(|chat| chat.transport.as_str()),
+                transport.kind = authority.chat.as_ref().map(|chat| chat.kind.to_string()),
+                conversation.kind = authority.chat.as_ref().map(|chat| chat.conversation.kind.as_str()),
+                conversation.container = authority.chat.as_ref().and_then(|chat| chat.conversation.container.as_deref()),
+                conversation.id = authority.chat.as_ref().map(|chat| chat.conversation.id.as_str()),
+                conversation.thread = authority.chat.as_ref().and_then(|chat| chat.conversation.thread.as_deref()),
+                delivery.kind = authority.chat.as_ref().and_then(|chat| chat.delivery.as_ref().map(delivery_kind)),
+                delivery.id = authority.chat.as_ref().and_then(|chat| chat.delivery.as_ref().map(delivery_id)),
                 invocation.id = %invocation,
                 capability.id = %capability,
                 decision.id = decision_id.as_str(),
@@ -4514,6 +4828,33 @@ fn emit_audit_event(event: &AuditEvent) {
             },
             "broker.execution"
         ),
+    }
+}
+
+fn delivery_kind(delivery: &DeliveryIdentity) -> &'static str {
+    match delivery {
+        DeliveryIdentity::Slack { .. } => "slack",
+        DeliveryIdentity::Discord { .. } => "discord",
+        DeliveryIdentity::Telegram { .. } => "telegram",
+        DeliveryIdentity::Whatsapp { .. } => "whatsapp",
+        DeliveryIdentity::Local { .. } => "local",
+        DeliveryIdentity::Github { .. } => "github",
+    }
+}
+
+fn delivery_id(delivery: &DeliveryIdentity) -> String {
+    match delivery {
+        DeliveryIdentity::Slack { timestamp, .. } => timestamp.clone(),
+        DeliveryIdentity::Discord { message, .. }
+        | DeliveryIdentity::Telegram { message, .. }
+        | DeliveryIdentity::Whatsapp { message, .. } => message.clone(),
+        DeliveryIdentity::Github { delivery } => delivery.clone(),
+        DeliveryIdentity::Local {
+            boot_nonce,
+            connection,
+            sequence,
+            ..
+        } => format!("{boot_nonce}-{connection}-{sequence}"),
     }
 }
 
@@ -4654,6 +4995,8 @@ struct DecisionMaterial<'a> {
     constraints: Option<&'a ExecutionConstraints>,
     allowed: bool,
     reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    space: Option<&'a SpaceDecision>,
 }
 
 fn decision_evidence_digest(label: &str, value: &impl Serialize) -> Result<String, BrokerError> {

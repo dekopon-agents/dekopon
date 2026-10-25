@@ -396,6 +396,14 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
             if subjects == ["discord.1", "slack.t0123abc.u9xyz"]
     ));
 
+    let mut mixed = document.clone();
+    mixed["principals"] =
+        json!({"cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "slack.t0123abc.c0123abc"]}});
+    write_config(&path, &mixed);
+    assert!(
+        matches!(config::load(&path, uid).await, Err(config::ConfigError::MixedSubjectKinds { principal }) if principal.as_str() == "cpetersen")
+    );
+
     for namespaces in [
         json!(["sms"]),
         json!(["slack.T0123ABC"]),
@@ -1948,12 +1956,33 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
             owner.prepare(&old_digest, uid).await,
             (next_digest.clone(), GenerationOutcome::Prepared)
         );
+        assert!(
+            capture
+                .events_where(
+                    "dekopon_broker::audit",
+                    &[("audit.event", "broker.policy.loaded")]
+                )
+                .is_empty()
+        );
         assert_eq!(owner.commit(&next_digest, uid), GenerationOutcome::Applied);
         assert_eq!(owner.active().digest, next_digest);
         assert_ne!(owner.active().ready.broker.policy_digest(), old_policy);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
+    let loaded = capture.events_where(
+        "dekopon_broker::audit",
+        &[("audit.event", "broker.policy.loaded")],
+    );
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded[0].field("policy.digest"),
+        Some(owner.active().ready.broker.policy_digest())
+    );
+    assert_eq!(
+        loaded[0].field("identity.digest"),
+        Some(owner.active().ready.identity_digest.as_str())
+    );
     let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
     assert_eq!(applied.len(), 1);
     assert_eq!(
@@ -3266,6 +3295,8 @@ async fn check_passes_the_conditional_write_example_in_place() {
         None,
     )
     .await;
+    assert!(report.policy_digest.is_some());
+    assert!(report.identity_digest.is_some());
     assert!(
         report.problems.is_empty(),
         "{:?}",
@@ -3402,6 +3433,7 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     .expect("example decodes");
     let socket = directory.path().join("run/broker.sock");
     let credentials = directory.path().join("broker-credentials.yaml");
+    document["identities"][0]["uid"] = json!(current_uid());
     document["socketPath"] = json!(socket);
     document["credentialsPath"] = json!(credentials);
     document["providers"] =
@@ -3425,6 +3457,24 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     )));
     assert!(!socket.parent().expect("socket parent").exists());
     assert!(!credentials.exists());
+    fs::create_dir(socket.parent().expect("socket parent")).expect("private socket parent");
+    fs::set_permissions(
+        socket.parent().expect("socket parent"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restrict socket parent");
+    write_owner_only(&credentials, b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: api-token\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.com]\n    secret: conditional-write-fixture-only\n");
+    let (candidate, boot_report) = super::load_candidate(&path, super::Mode::Boot).await;
+    assert!(boot_report.problems.is_empty(), "{boot_report:?}");
+    let candidate = candidate.expect("serving conditional-write configuration");
+    assert_eq!(
+        report.policy_digest.as_deref(),
+        Some(candidate.ready.broker.policy_digest())
+    );
+    assert_eq!(
+        report.identity_digest.as_deref(),
+        Some(candidate.ready.identity_digest.as_str())
+    );
 }
 
 pub(super) struct ManagedBroker {

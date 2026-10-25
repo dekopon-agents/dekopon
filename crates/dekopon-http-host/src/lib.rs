@@ -621,6 +621,8 @@ pub struct HttpCallEvidence {
     /// must not leak into evidence or cost the guest's byte grant.
     pub request_bytes: u64,
     pub response_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub credential_injected: bool,
 }
@@ -995,6 +997,7 @@ impl BufferedHttpClient {
             status: None,
             request_bytes: prepared.request_bytes,
             response_bytes: 0,
+            upstream_request_id: None,
             credential_injected: false,
         });
         if let Some(header) = credential_header {

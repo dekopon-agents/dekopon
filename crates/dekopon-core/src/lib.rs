@@ -43,7 +43,7 @@ pub use skill::{
     MAX_SKILL_RESOURCE_DEPTH, MAX_SKILL_RESOURCES, MAX_SKILL_TOTAL_BYTES, SKILL_FILE_NAME, SkillId,
     SkillIdError,
 };
-pub use subject::{ExternalSubject, SubjectError, SubjectSegment, SubjectService};
+pub use subject::{ExternalSubject, PrincipalKind, SubjectError, SubjectSegment, SubjectService};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{

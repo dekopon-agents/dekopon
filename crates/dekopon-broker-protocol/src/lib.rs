@@ -296,6 +296,8 @@ pub struct ChatScopeClaim {
     pub kind: ChatTransportKind,
     pub conversation: Conversation,
     pub trigger: Trigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryIdentity>,
 }
 
 impl fmt::Debug for ChatScopeClaim {
@@ -435,6 +437,10 @@ impl Attestation {
     rename_all_fields = "camelCase"
 )]
 pub enum DeliveryIdentity {
+    Github {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        delivery: String,
+    },
     Slack {
         #[serde(deserialize_with = "deserialize_scope_part")]
         channel: String,
@@ -488,6 +494,7 @@ impl DeliveryIdentity {
     pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
         let conversation = &scope.conversation;
         match (self, scope.kind) {
+            (Self::Github { delivery }, ChatTransportKind::Github) => bounded_scope_part(delivery),
             (Self::Slack { channel, timestamp }, ChatTransportKind::Slack) => {
                 channel == &conversation.id && canonical_slack_timestamp(timestamp)
             }

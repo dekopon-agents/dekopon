@@ -157,6 +157,7 @@ fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
                 id: "c0123abc".to_owned(),
                 thread: Some("1712345678.000100".to_owned()),
             },
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     )
