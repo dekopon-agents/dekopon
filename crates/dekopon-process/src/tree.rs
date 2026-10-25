@@ -36,7 +36,7 @@ impl CallBudget {
     pub fn charge(&self) -> Result<(), LimitExceeded> {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                (used < self.maximum).then_some(used + 1)
+                used.checked_add(1).filter(|next| *next <= self.maximum)
             })
             .map(|_| ())
             .map_err(|_used| LimitExceeded::CapabilityCalls {
@@ -175,5 +175,23 @@ impl TreeContext {
     #[must_use]
     pub fn calls(&self) -> &CallBudget {
         &self.calls
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CallBudget, LimitExceeded, Ordering};
+
+    #[test]
+    fn exhausted_maximum_call_budget_returns_the_typed_error() {
+        let budget = CallBudget::new(u32::MAX);
+        budget.used.store(u32::MAX - 1, Ordering::Relaxed);
+
+        assert_eq!(budget.charge(), Ok(()));
+        assert_eq!(
+            budget.charge(),
+            Err(LimitExceeded::CapabilityCalls { maximum: u32::MAX })
+        );
+        assert_eq!(budget.used(), u32::MAX);
     }
 }
