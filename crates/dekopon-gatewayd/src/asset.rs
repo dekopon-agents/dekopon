@@ -365,6 +365,18 @@ impl AssetStore {
         Publication::new(&self.retention, access)
     }
 
+    pub(crate) async fn finish_publications(&self) {
+        if !self.retention.lock().has_finished_publications() {
+            return;
+        }
+        let retention = Arc::clone(&self.retention);
+        match tokio::task::spawn_blocking(move || retention.lock().finish_publications()).await {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => tracing::warn!(%error, "gateway.asset.reclaim.failed"),
+            Err(error) => tracing::warn!(%error, "gateway.asset.reclaim.failed"),
+        }
+    }
+
     pub(crate) fn report_startup(&self) -> Result<(), BlobError> {
         self.retention.lock().report_startup()
     }
@@ -372,6 +384,7 @@ impl AssetStore {
     pub async fn shutdown(&self) {
         let mut tasks = std::mem::take(&mut *self.downloads.tasks.lock());
         tasks.shutdown().await;
+        self.finish_publications().await;
     }
 
     #[cfg(test)]
@@ -2028,7 +2041,7 @@ mod retention_tests {
             ),
             Err(crate::memory::journal::JournalError::Corrupt)
         ));
-        drop(pending);
+        pending.finish_blocking();
         assert_eq!(
             store
                 .pin(&access, id, Recency::Keep)
@@ -2075,6 +2088,34 @@ mod retention_tests {
         );
     }
 
+    #[tokio::test]
+    async fn publication_drop_defers_filesystem_cleanup_until_awaited_blocking_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(directory.path())
+            .unwrap();
+        let access = access("async-cleanup");
+        let publication = store.publication(&access).unwrap();
+        let id = register(&store, &access);
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        drop(publication);
+        assert_eq!(store.retention.lock().bytes, 3);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("blobs"))
+                .unwrap()
+                .count(),
+            1
+        );
+        store.finish_publications().await;
+        assert_eq!(store.retention.lock().bytes, 0);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("blobs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn terminal_publication_reclaims_unjournaled_uploads_but_protects_live_handoffs() {
         let directory = tempfile::tempdir().unwrap();
@@ -2098,7 +2139,7 @@ mod retention_tests {
         store.inventory(&access("sweep"));
         journal_inventory(&journal, &cancelled, &[], SystemTime::now());
         assert_eq!(store.retention.lock().bytes, 3);
-        drop(pending);
+        pending.finish_blocking();
         assert_eq!(store.retention.lock().bytes, 0);
         assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 0);
         let committed = access("committed");
@@ -2111,7 +2152,7 @@ mod retention_tests {
             &store.inventory(&committed),
             SystemTime::now(),
         );
-        drop(pending);
+        pending.finish_blocking();
         let aborted = store.publication(&committed).unwrap();
         let id = register(&store, &committed);
         drop(store.admit(&committed, id, b"ccc").unwrap());
@@ -2119,9 +2160,9 @@ mod retention_tests {
         let following = store.publication(&committed).unwrap();
         let id = register(&store, &committed);
         drop(store.admit(&committed, id, b"ddd").unwrap());
-        drop(aborted);
+        aborted.finish_blocking();
         assert_eq!(store.retention.lock().bytes, 9);
-        drop(following);
+        following.finish_blocking();
         assert_eq!(store.retention.lock().bytes, 3);
         assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
     }

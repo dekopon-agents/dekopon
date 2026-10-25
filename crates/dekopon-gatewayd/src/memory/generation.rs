@@ -324,11 +324,14 @@ pub(crate) async fn persist(
     runner: &SessionRunner,
     route: &BoundRoute,
     cancellation: &SessionCancellation,
-    reply: PostReply,
+    mut reply: PostReply,
 ) {
-    persist_turn(runner, route, cancellation, reply)
+    let mut publication = reply.publication.take();
+    persist_turn(runner, route, cancellation, reply, &mut publication)
         .instrument(tracing::info_span!("memory.persist"))
         .await;
+    drop(publication);
+    runner.assets.finish_publications().await;
 }
 
 async fn persist_turn(
@@ -336,12 +339,13 @@ async fn persist_turn(
     route: &BoundRoute,
     cancellation: &SessionCancellation,
     reply: PostReply,
+    publication: &mut Option<crate::asset::Publication>,
 ) {
     let PostReply {
         key,
         granted,
         access,
-        publication,
+        publication: _,
         window,
         turn,
     } = reply;
@@ -420,11 +424,11 @@ async fn persist_turn(
         );
         return;
     }
+    let publication = publication.take();
     let published = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = span.enter();
-            let _publication = publication;
-            journal.append(
+            let result = journal.append(
                 &stem,
                 &journal::Entry {
                     at: SystemTime::now(),
@@ -435,7 +439,11 @@ async fn persist_turn(
                     prepared: prepared.as_ref(),
                 },
                 window,
-            )
+            );
+            if let Some(publication) = publication {
+                publication.finish_blocking();
+            }
+            result
         })
     })
     .await;

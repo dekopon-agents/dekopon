@@ -98,7 +98,7 @@ pub(crate) struct Retention {
     references: HashSet<StoredKey>,
     orphans: Vec<DiskBlob>,
     starting: bool,
-    publications: Vec<Weak<PublicationRange>>,
+    publications: Vec<Arc<PublicationRange>>,
     #[cfg(test)]
     pub(super) after_publish_error: Option<io::ErrorKind>,
 }
@@ -592,7 +592,7 @@ impl Retention {
                     && !self
                         .publications
                         .iter()
-                        .filter_map(Weak::upgrade)
+                        .filter(|publication| Arc::strong_count(publication) > 1)
                         .any(|publication| publication.contains(key, stored.id)))
                 || row
                     .asset
@@ -666,6 +666,27 @@ impl Retention {
         }
     }
 
+    pub(super) fn has_finished_publications(&self) -> bool {
+        self.publications
+            .iter()
+            .any(|publication| Arc::strong_count(publication) == 1)
+    }
+
+    pub(super) fn finish_publications(&mut self) -> Result<(), BlobError> {
+        while let Some(index) = self
+            .publications
+            .iter()
+            .position(|publication| Arc::strong_count(publication) == 1)
+        {
+            let publication = self.publications.swap_remove(index);
+            self.finish_pending(
+                &publication.key.conversation.journal_stem(),
+                publication.end.load(Ordering::Acquire),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn retain_record(&mut self, keys: impl IntoIterator<Item = StoredKey>) {
         self.references.extend(keys);
         for binding in &mut self.index.bindings {
@@ -684,7 +705,7 @@ impl Retention {
                 || self
                     .publications
                     .iter()
-                    .filter_map(Weak::upgrade)
+                    .filter(|publication| Arc::strong_count(publication) > 1)
                     .any(|publication| publication.contains_stored(&binding.key))
         });
         self.collect()
@@ -756,12 +777,20 @@ impl Publication {
             key: access.key.clone(),
             end: AtomicU64::new(u64::MAX),
         });
-        retention.lock().publications.push(Arc::downgrade(&range));
+        retention.lock().publications.push(Arc::clone(&range));
         Some(Self {
             retention: Arc::clone(retention),
             access: access.clone(),
             range,
         })
+    }
+
+    pub(crate) fn finish_blocking(self) {
+        let retention = Arc::clone(&self.retention);
+        drop(self);
+        if let Err(error) = retention.lock().finish_publications() {
+            tracing::warn!(%error, "gateway.asset.reclaim.failed");
+        }
     }
 
     pub(crate) fn seal(self) -> Self {
@@ -774,19 +803,8 @@ impl Publication {
 
 impl Drop for Publication {
     fn drop(&mut self) {
-        let mut retention = self.retention.lock();
-        retention
-            .publications
-            .retain(|publication| !publication.ptr_eq(&Arc::downgrade(&self.range)));
-        let end = self
-            .range
+        self.range
             .end
-            .load(Ordering::Acquire)
-            .min(self.access.next_asset_id());
-        if let Err(error) =
-            retention.finish_pending(&self.range.key.conversation.journal_stem(), end)
-        {
-            tracing::warn!(%error, "gateway.asset.reclaim.failed");
-        }
+            .fetch_min(self.access.next_asset_id(), Ordering::AcqRel);
     }
 }

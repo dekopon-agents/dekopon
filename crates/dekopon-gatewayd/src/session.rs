@@ -1824,17 +1824,41 @@ impl SessionSteers {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
 async fn session(
     runner: &SessionRunner,
     route: &BoundRoute,
     message: &InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
+) -> Ended {
+    runner.assets.finish_publications().await;
+    let mut publication = None;
+    let ended = session_turn(
+        runner,
+        route,
+        message,
+        driver,
+        cancellation,
+        &mut publication,
+    )
+    .await;
+    drop(publication);
+    runner.assets.finish_publications().await;
+    ended
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::wildcard_enum_match_arm,
+    reason = "reshaped by the unit that next rewrites this"
+)]
+async fn session_turn(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    message: &InboundMessage,
+    driver: &Arc<dyn ChatDriver>,
+    cancellation: SessionCancellation,
+    publication: &mut Option<asset::Publication>,
 ) -> Ended {
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
@@ -2147,7 +2171,7 @@ async fn session(
     .collect::<Vec<_>>()
     .join("\n\n");
     let images_supported = route.model.accepts_images();
-    let publication = runner.assets.publication(&asset_access);
+    *publication = runner.assets.publication(&asset_access);
     let delta = delta
         .and_then(|delta| delta.block(&runner.assets, &asset_access))
         .map(ConversationTurn::unanswered);
@@ -2545,7 +2569,7 @@ async fn session(
                 key: key.clone(),
                 granted,
                 access: journal_access,
-                publication: publication.map(asset::Publication::seal),
+                publication: publication.take().map(asset::Publication::seal),
                 window,
                 turn,
             });
