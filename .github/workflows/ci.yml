@@ -91,7 +91,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Release-profile compile gate; tag workflows still perform the final linked builds.
       - name: Check release CLIs
-        run: cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+        run: cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
       - name: Detect unused dependencies
         run: cargo machete
       - name: Verify gateway excludes privileged broker machinery
@@ -99,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-gatewayd --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy|console|tui) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi
@@ -112,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
-          if grep -Eq '^dekopon-(agent|shell|process|config) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(agent|shell|process|config|console|tui) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi
@@ -207,6 +207,10 @@ jobs:
         run: cargo test --workspace --all-features --locked --no-run
       # Cargo.toml builds Cranelift optimized in dev: this step went from ~17 min to ~2 (#334).
       - name: Run workspace tests
+        env:
+          DEKOPON_TEST_BROKERD: ${{ github.workspace }}/target/debug/dekopon-brokerd
+          DEKOPON_TEST_PROBE_WASM: ${{ github.workspace }}/examples/providers/cli-probe-provider.wasm
+          DEKOPON_TEST_ASSET_WASM: ${{ github.workspace }}/examples/providers/http-probe-provider.wasm
         run: cargo test --workspace --all-features --locked --lib --bins --tests
       # Stable Cargo cannot precompile doctests with --no-run. Run them exactly once here.
       - name: Test documentation
@@ -451,7 +455,7 @@ jobs:
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
-        run: cargo build --locked -p dekopon-brokerd -p dekopon-gatewayd
+        run: cargo build --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
       - name: Upload the broker for the chart check
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -1504,13 +1504,18 @@ fn validate_capability_responses<A: AuditLog>(
     // reachable only through attested sessions that can't be enumerated at startup, so the broker
     // bounds their worst case instead.
     let (capabilities, command_words, command_word_help) = broker.capability_ceiling();
+    let space = capabilities
+        .iter()
+        .map(|available| available.capability.id.clone())
+        .collect();
     let response = ResponseEnvelope::chat_capabilities(
         capabilities,
         command_words,
         command_word_help,
         broker.chat_memory_ceiling(),
         broker.principal_ceiling(),
-    );
+    )
+    .with_space(Some(space));
     let length = encoded_capability_response(&response)?;
     if length > maximum {
         return Err(BrokerdError::CapabilityCeilingTooLarge { length, maximum });

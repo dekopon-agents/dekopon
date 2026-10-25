@@ -32,7 +32,7 @@ VERSION = TAG[1:]
 TARGETS = ("aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu")
 
 
-def render() -> str:
+def render(formula="dekopon") -> str:
     """Render a formula through the entry point the tap workflow invokes."""
     with tempfile.TemporaryDirectory() as workspace:
         checksums = Path(workspace) / "checksums"
@@ -46,6 +46,8 @@ def render() -> str:
         output = Path(workspace) / "dekopon.rb"
         argv = [
             "render-homebrew-formula.py",
+            "--formula",
+            formula,
             "--repository",
             "dekopon-agents/dekopon",
             "--tag",
@@ -68,6 +70,17 @@ def render() -> str:
 class RenderHomebrewFormulaTests(unittest.TestCase):
     def setUp(self) -> None:
         self.formula = render()
+
+    def test_console_formula_keeps_its_name_and_has_disjoint_executable_ownership(self):
+        console = render("dekopon-console")
+        self.assertIn("class DekoponConsole < Formula", console)
+        self.assertIn('github.com/dekopon-agents/dekopon/releases/download/', console)
+        def installed(text):
+            return {name for line in re.findall(r"^    bin.install (.+)$", text, re.MULTILINE)
+                    for name in re.findall(r'"([^"]+)"', line)}
+        self.assertEqual(installed(console), {"dekopon-console"})
+        self.assertFalse(installed(console) & installed(self.formula))
+        self.assertIn('shell_output("#{bin}/dekopon-console --version")', console)
 
     def test_optimized_sidecars_do_not_change_stock_homebrew_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

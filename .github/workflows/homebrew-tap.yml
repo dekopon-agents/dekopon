@@ -178,15 +178,23 @@ jobs:
             --assets assets.json \
             --output tap/Formula/dekopon.rb
 
+          python3 source/.github/scripts/render-homebrew-formula.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --checksums checksums \
+            --assets assets.json \
+            --formula dekopon-console \
+            --output tap/Formula/dekopon-console.rb
+
           cd tap
           # Re-running the same release renders identical bytes and commits nothing.
-          if git diff --quiet -- Formula/dekopon.rb; then
+          if git diff --quiet -- Formula/dekopon.rb Formula/dekopon-console.rb; then
             echo "::notice::Formula already matches $RELEASE_TAG; nothing to push."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/dekopon.rb
+          git add Formula/dekopon.rb Formula/dekopon-console.rb
           git commit -m "chore: update dekopon to ${version}" \
             -m "Rendered from the archives ${RELEASE_TAG} published in ${GITHUB_REPOSITORY}."
           git push origin HEAD:main

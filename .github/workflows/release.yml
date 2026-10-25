@@ -122,7 +122,7 @@ jobs:
           cache-workspace-crates: true
           cache-bin: false
       - name: Build CLIs
-        run: cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd --target ${{ matrix.target }}
+        run: cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console --target ${{ matrix.target }}
       - name: Create archive and checksum
         shell: bash
         run: |
@@ -132,9 +132,11 @@ jobs:
           mkdir -p "staging/$archive"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-gatewayd" "staging/$archive/"
+          cp "target/${{ matrix.target }}/release/dekopon-console" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
           cp crates/dekopon-gatewayd/README.md "staging/$archive/GATEWAY.md"
+          cp crates/dekopon-console/README.md "staging/$archive/CONSOLE.md"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - name: Upload CLI archive
@@ -191,7 +193,7 @@ jobs:
           spec=$(python3 -c 'import tomllib; p = tomllib.load(open(".cargo/wasmtime-optimization.toml", "rb"))["patch"]["crates-io"]["wasmtime"]; print("git+" + p["git"] + "?rev=" + p["rev"] + "#wasmtime")')
           cargo --config .cargo/wasmtime-optimization.toml tree --locked -p "$spec"
           cargo --config .cargo/wasmtime-optimization.toml build --release --locked \
-            -p dekopon-brokerd -p dekopon-gatewayd --target "$TARGET"
+            -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console --target "$TARGET"
       - name: Create archive and checksum
         shell: bash
         run: |
@@ -201,9 +203,11 @@ jobs:
           mkdir -p "staging/$archive"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-gatewayd" "staging/$archive/"
+          cp "target/${{ matrix.target }}/release/dekopon-console" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
           cp crates/dekopon-brokerd/README.md "staging/$archive/BROKER.md"
           cp crates/dekopon-gatewayd/README.md "staging/$archive/GATEWAY.md"
+          cp crates/dekopon-console/README.md "staging/$archive/CONSOLE.md"
           tar -C staging -czf "$archive.tar.gz" "$archive"
           shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
       - name: Upload CLI archive

@@ -49,12 +49,12 @@ and its chat/model credentials. The chart supplies file placement and permission
 references define their contents. [ChatGPT subscription credentials](#the-chatgpt-credential-is-seeded-once)
 and [managed provider sets](#the-managed-provider-set-comes-from-the-claim) have additional preparation steps.
 
-From the registry, using **chart version `0.38.0`**, not application version `0.51.0`:
+From the registry, using **chart version `0.40.0`**, not application version `0.53.0`:
 
 ```console
-helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.38.0
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.40.0
 helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
-  --version 0.38.0 -n dekopon --create-namespace -f my-values.yaml
+  --version 0.40.0 -n dekopon --create-namespace -f my-values.yaml
 ```
 
 `helm` itself takes the `oci://` prefix here — that is the Helm CLI's own registry syntax and it is
@@ -626,6 +626,9 @@ whatever the hook later says. Render a second set from the same files (a kustomi
 directory, `dekopon-check-*`), annotated as hooks of the same phase with a lower sync wave than the
 Job, so they exist before it starts. `againstConfigMap` names the live gateway ConfigMap: only a
 model absent from it or changed in it is probed, so an unchanged model costs no vendor call.
+The check also mounts the Deployment's live catalog read-only at `paths.catalogDir`, using
+`gateway.catalog.existingConfigMap` and its key projection or the chart-rendered catalog.
+The live gateway configuration must resolve its catalog at that chart-configured path.
 
 A root init container copies the broker ConfigMaps into a `0700` directory owned by `65532`, as
 `0600` regular files, because `dekopon-brokerd check` refuses the symlinks a ConfigMap mount is made
@@ -670,7 +673,9 @@ both checks by hand on the rendered candidate first.
 ## Operator console
 
 `console.enabled` adds a third container that runs `dekopon-console --idle` as UID 65535 from
-`console.image`. It mounts the runtime directory and the gateway catalog read-only and a small
+`console.image`, which the deployment must point at the Dekopon image
+`ghcr.io/dekopon-agents/dekopon` at the matching release (including the memory-optimized variant
+when selected). The image includes the console on PATH. It mounts the runtime directory and the gateway catalog read-only and a small
 memory `/tmp`; it reaches the broker only through IPC group 65534 and gets no model, provider or
 gateway credential. Exec starts a fresh process configured by the container environment:
 
@@ -742,7 +747,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.51.0
+ghcr.io/dekopon-agents/dekopon:v0.53.0
 ```
 
 There is no `latest`. `image.digest` is empty by default; set it to pin across the
@@ -807,7 +812,7 @@ spec:
   source:
     repoURL: ghcr.io/dekopon-agents/charts   # bare: no oci:// prefix on this source type
     chart: dekopon
-    targetRevision: 0.38.0                    # the CHART version, not appVersion
+    targetRevision: 0.40.0                    # the CHART version, not appVersion
     helm:
       valueFiles: []
       values: |
