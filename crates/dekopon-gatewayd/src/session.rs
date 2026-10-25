@@ -3633,7 +3633,7 @@ mod inventory_prompt_tests {
     use crate::asset::{AssetSourceRef, PendingAsset};
     use crate::transport::MAX_INBOUND_TEXT_BYTES;
 
-    fn check(path: InventoryPath, empty: bool) {
+    fn registered() -> asset::Registered {
         let key = ConversationKey::private(
             &"reviewer".parse().unwrap(),
             "dev",
@@ -3641,7 +3641,7 @@ mod inventory_prompt_tests {
             &"tel.15550000001".parse().unwrap(),
         );
         let store = AssetStore::new(8, crate::ONE_SHOT_ASSET_IDLE);
-        let registered = store.assets_for(
+        store.assets_for(
             &key,
             (1..=200)
                 .map(|id| PendingAsset {
@@ -3654,7 +3654,11 @@ mod inventory_prompt_tests {
                 })
                 .collect(),
             Instant::now(),
-        );
+        )
+    }
+
+    fn check(path: InventoryPath, empty: bool) {
+        let registered = registered();
         let principal = "mapped-participant-with-a-longer-name".parse().unwrap();
         let delivery = "[gateway: a previous asset send did not complete. Sent flags remain set; no automatic retry was made.]";
         let stop = StopCause::MaxSteps.notice();
@@ -3704,6 +3708,41 @@ mod inventory_prompt_tests {
                 assert!(!prompt.contains(&stop));
             }
         }
+    }
+
+    #[test]
+    fn a_message_near_the_limit_keeps_arrivals_in_a_shrunken_note() {
+        let mut registered = registered();
+        registered.arrived = vec![200];
+        let principal = "mapped-participant".parse().unwrap();
+        let expected_note = "\n  chat-asset:200 — file-200.png (image/png, 1 KB) — attached to this message\n  199 older files, chat-asset:1 to chat-asset:199, are not listed for space; each number still works.";
+        let text = "x".repeat(
+            MAX_INBOUND_TEXT_BYTES
+                - attribution_header(Some(&principal)).len()
+                - 2
+                - expected_note.len(),
+        );
+        let prompt = PromptFrame {
+            principal: Some(&principal),
+            delivery: None,
+            stop: None,
+        }
+        .inventory(
+            &text,
+            &registered,
+            true,
+            asset::TextReader::AssetCat,
+            InventoryPath::Turn,
+        );
+        assert_eq!(
+            prompt,
+            format!(
+                "{}{}\n\n{expected_note}",
+                attribution_header(Some(&principal)),
+                text
+            )
+        );
+        assert_eq!(bound_inbound(&prompt), prompt);
     }
 
     #[test]

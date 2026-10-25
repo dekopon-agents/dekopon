@@ -631,6 +631,13 @@ impl NoteLine {
         }
     }
 
+    fn is_shown(self) -> bool {
+        match self {
+            Self::Shown => true,
+            Self::Cat | Self::ImagesOff | Self::CommandOnly | Self::Invisible => false,
+        }
+    }
+
     fn render(self, asset: &AssetRef, arrived: bool) -> String {
         let AssetRef {
             id,
@@ -693,7 +700,7 @@ pub(crate) fn reference_note(
     for asset in &inventory {
         let kind = NoteLine::for_asset(asset, images_supported, reader);
         let line = kind.render(asset, registered.arrived.contains(&asset.id));
-        full_shown |= kind == NoteLine::Shown;
+        full_shown |= kind.is_shown();
         if full.len() + line.len() + 1 + if full_shown { FOOTER.len() } else { 0 } > budget {
             complete = false;
             break;
@@ -730,7 +737,7 @@ pub(crate) fn reference_note(
             }
             let kind = NoteLine::for_asset(asset, images_supported, reader);
             let line = kind.render(asset, arrived);
-            let next_shown = shown || kind == NoteLine::Shown;
+            let next_shown = shown || kind.is_shown();
             let footer = if framed && next_shown {
                 FOOTER.len()
             } else {
