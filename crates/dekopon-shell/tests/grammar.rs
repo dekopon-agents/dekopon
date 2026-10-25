@@ -1235,7 +1235,7 @@ fn unquoted_arrays_expand_element_by_element() {
     );
     assert_eq!(
         output(r#"s="one two"; count() { echo $#; }; count $s"#),
-        "1"
+        "2"
     );
 }
 
@@ -1466,9 +1466,9 @@ fn a_binary_named_buffer_refuses_text_capture_and_provider_stdin() {
 }
 
 #[test]
-fn substitution_trims_only_trailing_line_feeds_and_splits_on_lines() {
+fn substitution_trims_only_trailing_line_feeds_and_splits_on_default_ifs() {
     assert_eq!(output("v=$(printf 'x\\n\\n'); printf '%s' \"$v\""), "x");
-    assert_eq!(output("count() { echo $#; }; count $(printf 'a b')"), "1");
+    assert_eq!(output("count() { echo $#; }; count $(printf 'a b')"), "2");
     assert_eq!(output("count() { echo $#; }; count $(printf 'a\\nb')"), "2");
 }
 
@@ -3752,6 +3752,175 @@ fn substitution_and_parameter_words_match_bash() {
 }
 
 #[test]
+fn unquoted_defaults_split_whitespace_and_quoted_defaults_preserve_it() {
+    assert_eq!(
+        output(r#"f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f ${x:-  a  b  }"#),
+        "2\n<a>\n<b>"
+    );
+    assert_eq!(output(r#"printf '<%s>' "${x:-  a  b  }""#), "<  a  b  >");
+}
+
+#[test]
+fn unquoted_strings_and_substitutions_split_every_default_ifs_character() {
+    for expansion in ["$v", "${v}", "$(printf 'a b\\tc\\nd')"] {
+        let script = format!(
+            "v='a b\tc\nd'; f() {{ echo $#; for word in \"$@\"; do echo \"<$word>\"; done; }}; f {expansion}; f \"{expansion}\""
+        );
+        assert_eq!(
+            output(&script),
+            "4\n<a>\n<b>\n<c>\n<d>\n1\n<a b\tc\nd>",
+            "{expansion}"
+        );
+    }
+}
+
+#[test]
+fn array_elements_keep_whitespace_when_expanded_unquoted() {
+    for expansion in ["$v", "${v[@]}"] {
+        let script = format!(
+            r#"v=$(printf '["a b","c d"]' | jq '.'); f() {{ echo $#; for word in "$@"; do echo "<$word>"; done; }}; f {expansion}"#
+        );
+        assert_eq!(output(&script), "2\n<a b>\n<c d>", "{expansion}");
+    }
+}
+
+#[test]
+fn assigning_ifs_does_not_configure_field_splitting() {
+    assert_eq!(
+        output(
+            r#"IFS=,; v=' a,b  c '; f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f $v"#
+        ),
+        "2\n<a,b>\n<c>"
+    );
+}
+
+#[test]
+fn assignments_and_case_keep_expansion_whitespace() {
+    assert_eq!(
+        output(
+            r#"v='  a  b  '; copy=pre${v}post; printf '<%s>' "$copy"; case $v in '  a  b  ') echo subject;; esac; case '  a  b  ' in $v) echo pattern;; esac"#
+        ),
+        "<pre  a  b  post>subject\npattern"
+    );
+}
+
+#[test]
+fn split_boundaries_survive_adjacent_word_parts() {
+    assert_eq!(
+        output(
+            r#"v=' a '; f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f pre${v}post; f ${v}${v}; f ${v}""; f ""${v}"#
+        ),
+        "3\n<pre>\n<a>\n<post>\n2\n<a>\n<a>\n2\n<a>\n<>\n2\n<>\n<a>"
+    );
+}
+
+#[test]
+fn selected_modifier_words_preserve_their_quote_protection_and_assign_once() {
+    assert_eq!(
+        output(
+            r#"f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f ${x:-" a b "}; f ${x:-a\ b}; f ${x:=' a b '}; f ${x:+" c d "}; echo "[$x]"; f ${missing:-${also_missing:-" n o "}}; produce() { echo evaluated >&2; printf ' e f '; }; f ${y:=$(produce)}; echo "[$y]""#
+        ),
+        "1\n< a b >\n1\n<a b>\n2\n<a>\n<b>\n1\n< c d >\n[ a b ]\n1\n< n o >\nevaluated\n2\n<e>\n<f>\n[ e f ]"
+    );
+}
+
+#[test]
+fn dynamic_json_indices_preserve_whitespace() {
+    assert_eq!(
+        output(r#"obj=$(printf '{"a  b":"v"}' | jq '.'); key='a  b'; echo "${obj[$key]}""#),
+        "v"
+    );
+}
+
+#[test]
+fn field_splitting_obeys_the_step_budget() {
+    let script = format!("v='{}'; : $v", "a ".repeat(100));
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_steps: 20,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("step budget exhausted"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn split_fields_are_charged_to_the_value_budget() {
+    let script = format!("v='{}'; : $v", "a ".repeat(50));
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_value_bytes: 256,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+}
+
+#[test]
+fn quoted_modifier_words_keep_their_existing_substitution_text() {
+    assert_eq!(
+        output(r#"echo "${x:-pre$(printf 'a\nb')post}""#),
+        "prea bpost"
+    );
+}
+
+#[test]
+fn quoted_json_indices_keep_their_existing_substitution_text() {
+    assert_eq!(
+        output(
+            r#"obj=$(printf '{"a b":"space","a\\nb":"newline"}' | jq '.'); echo "${obj[$(printf 'a\nb')]}""#
+        ),
+        "space"
+    );
+}
+
+#[test]
+fn literal_local_assignments_keep_values_while_expanded_command_names_split() {
+    assert_eq!(
+        output(
+            r#"v='a  b'; f() { local x=$v; echo "<$x>"; }; f; g() { cmd=local; $cmd x=$v; echo "<$x>"; }; g"#
+        ),
+        "<a  b>\n<a>"
+    );
+}
+
+#[test]
+fn local_array_expansions_keep_their_existing_element_words() {
+    assert_eq!(
+        output(r#"v=$(printf '["a b","c d"]' | jq '.'); f() { local x=$v; echo "<$x>"; }; f"#),
+        "<a b>"
+    );
+}
+
+#[test]
+fn unquoted_all_positionals_split_each_parameter_independently() {
+    for expansion in ["$@", "${@}"] {
+        let script = format!(
+            r#"f() {{ echo $#; for word in "$@"; do echo "<$word>"; done; }}; g() {{ f {expansion}; f "{expansion}"; }}; g 'a b' c"#
+        );
+        assert_eq!(
+            output(&script),
+            "3\n<a>\n<b>\n<c>\n2\n<a b>\n<c>",
+            "{expansion}"
+        );
+    }
+}
+
+#[test]
+fn separator_only_expansions_do_not_spend_steps_per_byte() {
+    let script = format!("v='{}'; : $v", " ".repeat(131_072));
+    let outcome = run(&script);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
+}
+
+#[test]
 fn conditional_chains_build_evaluate_and_drop_on_a_two_mib_stack() {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -3793,5 +3962,79 @@ fn conditional_chains_preserve_precedence_short_circuiting_and_steps() {
         let outcome = run(script);
         assert_eq!(outcome.exit_code.get(), expected, "{script}");
         assert_eq!(outcome.steps, steps, "{script}");
+    }
+}
+
+#[test]
+fn repeated_blank_expansions_exhaust_the_step_budget() {
+    let script = format!("v=' '; : {}", "$v ".repeat(64));
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_steps: 32,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("step budget exhausted"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn unquoted_selected_words_preserve_substitution_newlines_in_assignments() {
+    for script in [
+        r#"x=${missing:-pre$(printf 'a\nb')post}; printf '<%s>' "$x""#,
+        r#"f() { local x=${missing:-pre$(printf 'a\nb')post}; printf '<%s>' "$x"; }; f"#,
+        r#": ${x:=pre$(printf 'a\nb')post}; printf '<%s>' "$x""#,
+        r#"x=${missing:-${also_missing:-pre$(printf 'a\nb')post}}; printf '<%s>' "$x""#,
+        r#"set=1; x=${set:+pre$(printf 'a\nb')post}; printf '<%s>' "$x""#,
+    ] {
+        assert_eq!(output(script), "<prea\nbpost>", "{script}");
+    }
+}
+
+#[test]
+fn unquoted_selected_words_preserve_substitution_newlines_in_conditionals() {
+    for script in [
+        r#"expected=$(printf 'prea\nbpost'); case ${missing:-pre$(printf 'a\nb')post} in "$expected") echo matched;; *) echo failed;; esac"#,
+        r#"expected=$(printf 'prea\nbpost'); case $expected in ${missing:-pre$(printf 'a\nb')post}) echo matched;; *) echo failed;; esac"#,
+        r#"expected=$(printf 'prea\nbpost'); if [[ ${missing:-pre$(printf 'a\nb')post} == "$expected" ]]; then echo matched; else echo failed; fi"#,
+        r#"expected=$(printf 'prea\nbpost'); if [[ "$expected" == ${missing:-pre$(printf 'a\nb')post} ]]; then echo matched; else echo failed; fi"#,
+    ] {
+        assert_eq!(output(script), "matched", "{script}");
+    }
+}
+
+#[test]
+fn here_document_selected_words_preserve_substitution_newlines() {
+    assert_eq!(
+        output("cat <<EOF\n${missing:-pre$(printf 'a\\nb')post}\nEOF"),
+        "prea\nbpost"
+    );
+}
+
+#[test]
+fn replacement_text_preserves_nested_default_substitution_newlines() {
+    assert_eq!(
+        output(r#"v=z; x=${v/z/${missing:-pre$(printf 'a\nb')post}}; printf '<%s>' "$x""#),
+        "<prea\nbpost>"
+    );
+}
+
+#[test]
+fn prefix_and_suffix_patterns_preserve_nested_default_substitution_newlines() {
+    for (script, expected) in [
+        (
+            r#"v=$(printf 'prea\nbpost'); x=${v#${missing:-pre$(printf 'a\nb')}}; printf '<%s>' "$x""#,
+            "<post>",
+        ),
+        (
+            r#"v=$(printf 'prea\nbpost'); x=${v%${missing:-$(printf 'a\nb')post}}; printf '<%s>' "$x""#,
+            "<pre>",
+        ),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
     }
 }
