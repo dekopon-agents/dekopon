@@ -3735,6 +3735,7 @@ where
                 reason: None,
                 space: authority.space.as_ref(),
             };
+            let material = (&authorized, material);
             if let Some(preparation) = storage_preparation.as_ref() {
                 let bytes = serde_json::to_vec(&material)
                     .map_err(|source| BrokerError::DecisionEvidence { source })?;

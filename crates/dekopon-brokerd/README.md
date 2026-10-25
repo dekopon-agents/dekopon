@@ -42,15 +42,18 @@ loading, Cedar policy against the declared world, capability blocks, constraint 
 loaded manifests, frame and memory ceilings — through the function boot uses, and stops before
 binding anything. Every stage whose inputs loaded runs, and one that could not (providers when the
 provider set failed to resolve, say) is a warning naming it. It prints every problem and warning
-at once, one per line or as `{ "ok", "problems", "warnings", "policyDigest", "identityDigest" }`. When the policy stage succeeds, it also prints `policy.digest` and `identity.digest` as tab-separated lines before `ok`, and exits 0
+at once, one per line or as `{ "ok", "problems", "warnings", "policyDigest", "identityDigest" }`. When the policy stage succeeds, it prints `identity.digest` as a tab-separated line before `ok`, and also prints `policy.digest` when the secret-name catalogue was read, and exits 0
 with no problems, 1 with problems and 2 on a usage error. Configuration files may be the invoking
 user's own 0644 files, as in a Git checkout; symlinks and group/world-writable files are still
 refused. Runtime paths are not required to exist and are never touched: the socket and its parent,
 `credentialsPath`, `assets.rootPath`, `storage.rootPath` (a throwaway directory
 stands in for it), `providerSet.lockPath`/`storePath` and `http.extraCABundles`. `check` reads only
-the DRNs from `secretMapPath`, with the same private-file hygiene and byte bound as boot, so both
-policy builds use the complete secret-name catalogue and report the same policy digest. Secret
-sources and values are never read or resolved. Each credential a capability can select is reported
+the DRNs from `secretMapPath` when readable, with the same private-file hygiene and byte bound as
+boot, so both policy builds use the complete secret-name catalogue and report the same policy
+digest. When the map is absent or unreadable, check admits policy-named secrets with
+`SecretRequired` warnings and omits `policy.digest`; `identity.digest` is still reported and the
+missing map is not a problem. A readable malformed map is a problem. Secret sources and values
+are never read or resolved. Each credential a capability can select is reported
 as a warning naming what boot will require; credential destination coverage, secret source
 descriptors and bindings are not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
 (its lock and blobs, kept between checks), which fetches from the registry; a configuration naming

@@ -553,3 +553,45 @@ async fn a_space_can_distinguish_a_persons_message_from_a_wake() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allowed_space_decisions_commit_to_the_invocation_input() {
+    let (broker, audit) = space_broker(SPACE_PROMPT,
+        r#"@id("space-capability") permit(principal == Dekopon::Principal::"space", action == Dekopon::Action::"cli-probe.reverse", resource);"#).await;
+    let grant = AttestorGrant { namespaces: None };
+    let claim = channel_claim(
+        ChatTransportKind::Slack,
+        ConversationKind::Channel,
+        "c0123abc",
+        dekopon_broker::Trigger::Message,
+    );
+    for text in ["first", "second"] {
+        let mut proposal = request(400, "cli-probe.reverse");
+        proposal.input = json!({"text": text});
+        broker
+            .invoke(
+                &gateway(),
+                Some(&grant),
+                Some(&claim.bound_to(proposal.id.clone())),
+                proposal,
+                Default::default(),
+            )
+            .await
+            .expect("accounted invocation");
+    }
+    let digests = audit
+        .records()
+        .into_iter()
+        .filter_map(|event| match event {
+            dekopon_broker::AuditEvent::Decision {
+                allowed: true,
+                decision_digest,
+                ..
+            } => Some(decision_digest),
+            dekopon_broker::AuditEvent::Decision { allowed: false, .. }
+            | dekopon_broker::AuditEvent::Execution { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(digests.len(), 2);
+    assert_ne!(digests[0], digests[1]);
+}

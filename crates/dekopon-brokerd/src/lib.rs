@@ -592,23 +592,31 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
             reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Scratch => {
-            let names = match config.secret_map_path.as_deref() {
-                Some(path) => keep(
-                    &mut report.problems,
-                    secrets::load_names(path, uid)
-                        .await
-                        .map_err(BrokerdError::from),
-                ),
-                None => Some(Vec::new()),
+            let secrets = match config.secret_map_path.as_deref() {
+                Some(path) => match secrets::load_names(path, uid).await {
+                    Ok(names) => Some(Secrets::Names(names)),
+                    Err(secrets::SecretMapError::Read { .. }) => Some(Secrets::Unchecked),
+                    Err(
+                        error @ (secrets::SecretMapError::Decode { .. }
+                        | secrets::SecretMapError::Validation { .. }
+                        | secrets::SecretMapError::Client { .. }
+                        | secrets::SecretMapError::Source { .. }
+                        | secrets::SecretMapError::Catalog { .. }),
+                    ) => {
+                        report.problems.push(error.into());
+                        None
+                    }
+                },
+                None => Some(Secrets::Unchecked),
             };
             keep(&mut report.problems, scratch_host(&config, &mut scratch))
-                .zip(names)
-                .map(|(storage, names)| Runtime {
+                .zip(secrets)
+                .map(|(storage, secrets)| Runtime {
                     credentials: match config.credentials_path {
                         Some(_) => Credentials::Unchecked,
                         None => Credentials::Loaded(CredentialStore::empty()),
                     },
-                    secrets: Secrets::Names(names),
+                    secrets,
                     fingerprint: None,
                     storage,
                     assets: None,
@@ -1043,6 +1051,7 @@ enum Credentials {
 enum Secrets {
     Loaded(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog),
     Names(Vec<SecretDrn>),
+    Unchecked,
 }
 
 struct Runtime {
@@ -1181,20 +1190,34 @@ async fn prepare(
     let world = world.map(|world| match &runtime.secrets {
         Secrets::Loaded(catalog, _) => world.with_secrets(catalog.drns().cloned()),
         Secrets::Names(names) => world.with_secrets(names.iter().cloned()),
+        Secrets::Unchecked => world,
     });
+    let secrets_unchecked = match &runtime.secrets {
+        Secrets::Loaded(_, _) | Secrets::Names(_) => false,
+        Secrets::Unchecked => true,
+    };
     let (secret_catalog, scheduled) = match runtime.secrets {
         Secrets::Loaded(catalog, scheduled) => (Some(catalog), Some(scheduled)),
-        Secrets::Names(_) => (None, None),
+        Secrets::Names(_) | Secrets::Unchecked => (None, None),
     };
     let identity_digest = world.as_ref().map(PolicyWorld::identity_digest);
     let policy = world.and_then(|world| {
         keep(
             &mut problems,
-            build_policy(&config.policies, world, config.strict, warnings),
+            build_policy(
+                &config.policies,
+                world,
+                config.strict,
+                secrets_unchecked,
+                warnings,
+            ),
         )
     });
     report.identity_digest = identity_digest.clone();
-    report.policy_digest = policy.as_ref().map(|policy| policy.digest().to_owned());
+    report.policy_digest = policy
+        .as_ref()
+        .filter(|_| !secrets_unchecked)
+        .map(|policy| policy.digest().to_owned());
     let (constraint_sets, capability_problems) =
         capabilities::constraint_sets(&config.capabilities, |provider| {
             let declared = registry
@@ -1300,26 +1323,44 @@ fn keep<T>(problems: &mut Vec<BrokerdError>, result: Result<T, BrokerdError>) ->
 
 fn build_policy(
     policies: &str,
-    world: PolicyWorld,
+    mut world: PolicyWorld,
     strict: bool,
+    secrets_unchecked: bool,
     warnings: &mut Vec<StartupWarning>,
 ) -> Result<PolicyEngine, BrokerdError> {
-    let (policy, unresolved) = if strict {
-        PolicyEngine::new(policies, &world).map(|policy| (policy, Vec::new()))
-    } else {
-        PolicyEngine::new_lenient(policies, &world)
+    let mut admitted = BTreeSet::new();
+    loop {
+        let built = if strict {
+            PolicyEngine::new(policies, &world).map(|policy| (policy, Vec::new()))
+        } else {
+            PolicyEngine::new_lenient(policies, &world)
+        };
+        let source = match built {
+            Ok((policy, unresolved)) => {
+                warnings.extend(unresolved.into_iter().map(|entry| {
+                    StartupWarning::UnresolvedPolicyName {
+                        policy: entry.policy,
+                        kind: entry.kind.label(),
+                        name: entry.name,
+                    }
+                }));
+                return Ok(policy);
+            }
+            Err(source) => source,
+        };
+        let PolicyBuildError::UnknownSecret { policy, secret } = &source else {
+            return Err(BrokerdError::Policy { source });
+        };
+        let drn = match secret.parse::<SecretDrn>() {
+            Ok(drn) if secrets_unchecked && admitted.insert(drn.clone()) => drn,
+            Ok(_) | Err(_) => return Err(BrokerdError::Policy { source }),
+        };
+        warnings.push(StartupWarning::SecretRequired {
+            policy: policy.clone(),
+            secret: secret.clone(),
+        });
+        world = world.with_secrets([drn]);
     }
-    .map_err(|source| BrokerdError::Policy { source })?;
-    warnings.extend(
-        unresolved
-            .into_iter()
-            .map(|entry| StartupWarning::UnresolvedPolicyName {
-                policy: entry.policy,
-                kind: entry.kind.label(),
-                name: entry.name,
-            }),
-    );
-    Ok(policy)
 }
 
 /// Never leaves this process: a check builds no server, so no request can carry it.
@@ -1389,6 +1430,8 @@ pub enum StartupWarning {
     Broker(dekopon_broker::StartupWarning),
     #[error("credential {name} is selected by a capability; boot requires it in credentialsPath")]
     CredentialRequired { name: String },
+    #[error("policy {policy} names secret {secret}; boot requires it in secretMapPath")]
+    SecretRequired { policy: String, secret: String },
     #[error("no identities; boot requires them, from a fragment or the chart's peers.yaml")]
     IdentitiesRequired,
     #[error("{stage} not checked: a stage it needs failed")]
@@ -1427,7 +1470,9 @@ impl StartupWarning {
                 { audit.event = "config.startup.warning", reason = "skipped-stage" },
                 "{self}"
             ),
-            Self::CredentialRequired { .. } | Self::IdentitiesRequired => tracing::warn!(
+            Self::CredentialRequired { .. }
+            | Self::SecretRequired { .. }
+            | Self::IdentitiesRequired => tracing::warn!(
                 target: "dekopon_brokerd::audit",
                 { audit.event = "config.startup.warning", reason = "unchecked-reference" },
                 "{self}"

@@ -3063,6 +3063,39 @@ async fn changed_storage_refuses_without_creating_the_candidate_root() {
 }
 
 #[tokio::test]
+async fn check_without_a_readable_secret_map_warns_and_reports_only_the_identity_digest() {
+    let mut fixture = ResidentFixture::boot().await;
+    let secret = "drn:com.xrl:secret:test:api/token";
+    write_owner_only(&fixture.cedar, format!(
+        r#"{POLICIES}
+        @id("checkout-secret") permit(principal, action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"{secret}");"#
+    ).as_bytes());
+    for map in [Some("chart-mounted-secrets.yaml"), None] {
+        match map {
+            Some(path) => fixture.document["secretMapPath"] = json!(path),
+            None => {
+                fixture
+                    .document
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("secretMapPath");
+            }
+        }
+        write_config(&fixture.path, &fixture.document);
+        let report = super::check(&fixture.path, None, None).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        assert!(report.policy_digest.is_none());
+        assert_eq!(
+            report.identity_digest.as_deref(),
+            Some(fixture.active.ready.identity_digest.as_str())
+        );
+        assert!(report.warnings.iter().any(|warning| matches!(warning,
+            super::StartupWarning::SecretRequired { policy, secret: required }
+                if policy == "checkout-secret" && required == secret)));
+    }
+}
+
+#[tokio::test]
 async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_policy() {
     let fixture = ResidentFixture::boot_with(|root, document| {
         document["secretMapPath"] = json!("bindings.yaml");
@@ -3326,7 +3359,7 @@ async fn check_passes_the_conditional_write_example_in_place() {
         None,
     )
     .await;
-    assert!(report.policy_digest.is_some());
+    assert!(report.policy_digest.is_none());
     assert!(report.identity_digest.is_some());
     assert!(
         report.problems.is_empty(),
