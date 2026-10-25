@@ -2703,6 +2703,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
                 thread: Some("1712345678.000100".to_owned()),
             },
             trigger: Trigger::Message,
+            delivery: None,
         },
     );
     let (assets, output) = stdio(None);
