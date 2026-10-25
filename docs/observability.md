@@ -226,7 +226,7 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (once per session, for an unknown tool or a malformed `bash` call) — never the model's own tool name or arguments |
+| `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (the first turn with a rejection, for an unknown tool or a malformed `bash` call); `warn` when `rejection.fed_back = true`, `error` when false — never the model's own tool name or arguments |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
@@ -732,7 +732,7 @@ different quantities. `usage.input_tokens` rises for the same reason, and for re
 
 **The history size gets its own fields.** `gateway.session` carries `conversation.turns` and
 `conversation.bytes` — how many prior exchanges this message replayed and how many bytes they
-occupied; on `sharedConversation` the byte count includes each retained gateway-authored
+occupied; in every scope the byte count includes each retained gateway-authored
 participant label. Both are zero on a `oneShot` route and on the first message of any
 conversation, which makes "seeded or not" a filter rather than a guess.
 Every successful recall that seeds a window logs `gateway_recalled` at info with `source`
@@ -771,9 +771,9 @@ put either into the eviction record.
 
 The history itself is not a new signal. It is chat text and model output, and it goes where those
 already go: the session's first `agent.model.prompt` carries its opening message list, which on a
-seeded session includes the replayed window. Shared scope adds participant principal names to
-those prompt events, and not to spans, eviction events, or cache key events. Those labels are part
-of every shared prompt sent to the selected model provider independently of telemetry.
+seeded session includes the replayed window. In every scope, participant principal names reach
+those prompt events, and not spans, eviction events, or cache key events. Those labels are part
+of every person-originated prompt sent to the selected model provider independently of telemetry.
 
 ### Reading the prompt cache
 

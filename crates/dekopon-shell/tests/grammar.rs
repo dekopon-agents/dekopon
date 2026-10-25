@@ -3710,6 +3710,20 @@ fn substitution_and_parameter_words_match_bash() {
         ("echo \"[${x:-a\nb}]\"", "[a\nb]"),
         (r#"x=v; echo "[${x:+  a  b  }]""#, "[  a  b  ]"),
         (r#"echo "[${x:=  a  b  }]" "[$x]""#, "[  a  b  ] [  a  b  ]"),
+        (r#"echo "[${x:-'a'}]""#, "['a']"),
+        (r#"echo "[${x:-"a"}]""#, "[a]"),
+        (r#"echo "[${x:-'}'}]""#, "['}']"),
+        (r#"y=v; echo "[${x:-'$y'}]""#, "['v']"),
+        (r#"echo "[${x:-'a\'}]""#, r"['a\']"),
+        (r#"x=v; echo "[${x:+'a'}]""#, "['a']"),
+        (r#"echo "[${x:='a'}]" "[$x]""#, "['a'] ['a']"),
+        (r#"echo "[${x:-${x:-'a'}}]""#, "['a']"),
+        (r#"echo "[${x:-a\"b}]""#, r#"[a"b]"#),
+        (r#"echo "[${x:-a\b}]""#, r"[a\b]"),
+        (r#"echo "[${x:-\'a\'}]""#, r"[\'a\']"),
+        (r#"echo "[${x:-a\}b}]""#, "[a}b]"),
+        (r#"x=ab; echo "[${x#'a'}]""#, "[b]"),
+        ("cat <<EOF\n[${x:-'a'}] [${x:-a\\b}]\nEOF\n", r"['a'] [a\b]"),
     ];
     let actual = cases
         .iter()
@@ -3734,4 +3748,49 @@ fn substitution_and_parameter_words_match_bash() {
         (ExitCode::SYNTAX, "dekopon-shell: syntax error: line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\"".to_owned())
     });
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn conditional_chains_build_evaluate_and_drop_on_a_two_mib_stack() {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                for (terms, separator, expected) in [
+                    (vec!["-n a"; 10_000], " && ", 0),
+                    (vec!["-z a"; 10_000], " || ", 1),
+                    (vec!["-z a || -n a && -n a"; 10_000], " || ", 0),
+                    (vec!["-n a && -z a"; 10_000], " || ", 1),
+                ] {
+                    let script = format!("[[ {} ]]", terms.join(separator));
+                    let outcome = run(&script);
+                    assert_eq!(outcome.exit_code.get(), expected, "{}", outcome.output);
+                }
+                for script in [
+                    format!("[[ {} && ]]", vec!["-n a"; 10_000].join(" && ")),
+                    format!("[[ {} || ]]", vec!["-n a"; 10_000].join(" || ")),
+                ] {
+                    assert_eq!(run(&script).exit_code, ExitCode::SYNTAX);
+                }
+            })
+            .expect("spawn conditional thread")
+            .join()
+            .expect("join conditional thread");
+    });
+}
+
+#[test]
+fn conditional_chains_preserve_precedence_short_circuiting_and_steps() {
+    for (script, expected, steps) in [
+        ("[[ -n a || -z a && -z a ]]", 0, 5),
+        ("[[ -z a && -n a || -n a ]]", 0, 7),
+        ("[[ -z a && -n a && -n a ]]", 1, 6),
+        ("[[ -n a || -n a || -n a ]]", 0, 6),
+        ("[[ -n a || 1 -eq invalid ]]", 0, 5),
+        ("[[ -z a && 1 -eq invalid ]]", 1, 5),
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code.get(), expected, "{script}");
+        assert_eq!(outcome.steps, steps, "{script}");
+    }
 }

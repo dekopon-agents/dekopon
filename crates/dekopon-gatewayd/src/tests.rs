@@ -5333,7 +5333,10 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         Instant::now(),
     );
     assert_eq!(remembered.history.turns().len(), 1);
-    assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
+    assert_eq!(
+        remembered.history.turns()[0].user(),
+        "[gateway: unmapped participant]\nOK, thanks"
+    );
     assert_eq!(remembered.history.turns()[0].answer(), None);
     assert!(matches!(
         observed
@@ -7276,7 +7279,7 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         models.prompt(0),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?")
+            ("user", "[gateway: unmapped participant]\nwhat broke?")
         ]),
         "the first message of a conversation starts clean"
     );
@@ -7284,9 +7287,12 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            ("user", "[gateway: unmapped participant]\nwhat broke?"),
             ("assistant", "Two things broke."),
-            ("user", "and the second one?"),
+            (
+                "user",
+                "[gateway: unmapped participant]\nand the second one?"
+            ),
         ]),
         "instructions first, then what the conversation remembers, then the new message"
     );
@@ -7324,7 +7330,10 @@ async fn only_an_image_restricted_reply_adapter_gets_the_assets_note_and_limits_
     let limits = "[gateway: 4 steps, 8 capability calls and 5 minutes per message.]";
     assert_eq!(
         models.prompt(0),
-        transcript(&[("system", limits), ("user", "hello")])
+        transcript(&[
+            ("system", limits),
+            ("user", "[gateway: unmapped participant]\nhello")
+        ])
     );
     assert_eq!(
         models.prompt(1),
@@ -7336,7 +7345,7 @@ async fn only_an_image_restricted_reply_adapter_gets_the_assets_note_and_limits_
                     crate::session::RESTRICTED_REPLY_ASSETS_NOTE
                 )
             ),
-            ("user", "hello")
+            ("user", "[gateway: unmapped participant]\nhello")
         ])
     );
 }
@@ -7364,9 +7373,12 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "and the second one?")
+            (
+                "user",
+                "[gateway: unmapped participant]\nand the second one?"
+            )
         ]),
-        "a oneShot route is exactly the behavior every route had before conversations existed"
+        "a oneShot route carries attribution without replaying prior exchanges"
     );
     assert_eq!(
         runner.conversations.tracked(),
@@ -7465,16 +7477,22 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[("system", &expected_instructions()), ("user", "and mine?")]),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("user", "[gateway: unmapped participant]\nand mine?")
+        ]),
         "the second sender's first message must not carry the first sender's exchange"
     );
     assert_eq!(
         models.prompt(2),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what happened to mine?"),
+            (
+                "user",
+                "[gateway: unmapped participant]\nwhat happened to mine?"
+            ),
             ("assistant", "Your deploy failed."),
-            ("user", "and now?"),
+            ("user", "[gateway: unmapped participant]\nand now?"),
         ]),
         "each sender continues their own conversation and nobody else's"
     );
@@ -7739,7 +7757,10 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[("system", &expected_instructions()), ("user", "and now?")]),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("user", "[gateway: unmapped participant]\nand now?")
+        ]),
         "a changed grant set starts with neither the old transcript nor attachment metadata"
     );
 }
@@ -7777,7 +7798,7 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
         second[1],
         (
             "user".to_owned(),
-            "what is this?\n[gateway: attached chat-asset:1 — shot.png]".to_owned()
+            "[gateway: unmapped participant]\nwhat is this?\n[gateway: attached chat-asset:1 — shot.png]".to_owned()
         ),
         "the recorded turn keeps the arrival and drops the inventory note"
     );
@@ -7785,11 +7806,9 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
         second[2],
         ("assistant".to_owned(), "A screenshot.".to_owned())
     );
-    assert!(
-        second[3]
-            .1
-            .starts_with("and now?\n\n[gateway: files in this conversation")
-    );
+    assert!(second[3].1.starts_with(
+        "[gateway: unmapped participant]\nand now?\n\n[gateway: files in this conversation"
+    ));
     assert!(second[3].1.contains("shot.png"), "{second:?}");
 }
 
@@ -7877,10 +7896,10 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            ("user", "[gateway: unmapped participant]\nwhat broke?"),
             (
                 "user",
-                "[gateway: the previous turn stopped before answering: the model call failed (protocol). Capability calls already made were not undone.]\ntry again"
+                "[gateway: unmapped participant]\n[gateway: the previous turn stopped before answering: the model call failed (protocol). Capability calls already made were not undone.]\ntry again"
             ),
         ]),
         "an unanswered turn replays the question and nothing in the answer's place"
@@ -8899,7 +8918,10 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     )
     .await;
 
-    assert_eq!(driver.replies(), vec!["what broke?".to_owned()]);
+    assert_eq!(
+        driver.replies(),
+        vec!["[gateway: unmapped participant]\nwhat broke?".to_owned()]
+    );
     assert_eq!(
         runner.conversations.tracked(),
         1,
@@ -17597,12 +17619,7 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
                 .sum::<usize>(),
             1
         );
-        let expected_head = match memory.scope {
-            MemoryScope::PrivateConversation => format!("{NOTICE}\n"),
-            MemoryScope::SharedConversation => {
-                format!("[gateway: unmapped participant]\n{NOTICE}\n")
-            }
-        };
+        let expected_head = format!("[gateway: unmapped participant]\n{NOTICE}\n");
         assert!(
             current.starts_with(&expected_head),
             "authoritative attribution, complete notice, then untrusted text"
@@ -17629,6 +17646,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
+#[path = "tests/attribution.rs"]
+mod attribution;
 #[path = "tests/generation.rs"]
 mod generation;
 #[path = "tests/github_http_invocation.rs"]
@@ -18401,10 +18420,13 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
             ("system", &expected_instructions()),
             (
                 "user",
-                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nwhat broke?"
+                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\n[gateway: unmapped participant]\nwhat broke?"
             ),
             ("assistant", "Two things broke."),
-            ("user", "and the second one?"),
+            (
+                "user",
+                "[gateway: unmapped participant]\nand the second one?"
+            ),
         ]),
     );
 }
@@ -18683,7 +18705,7 @@ async fn a_failed_history_read_still_answers_from_an_empty_window() {
         models.prompt(0),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "read this thread")
+            ("user", "[gateway: unmapped participant]\nread this thread")
         ]),
     );
 }
@@ -18748,12 +18770,17 @@ async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
     let caught_up = &delivered[delivered.len() - 2..];
     assert_eq!(caught_up[0], ("user".to_owned(), block.to_owned()));
     assert!(
-        caught_up[1].1.starts_with("what did they post?"),
+        caught_up[1]
+            .1
+            .starts_with("[gateway: authenticated participant: xavier]\nwhat did they post?"),
         "{caught_up:?}"
     );
     let following = models.prompt(2);
     let (_, latest) = following.last().expect("the next mention");
-    assert!(latest.starts_with("anything new?"), "{latest}");
+    assert!(
+        latest.starts_with("[gateway: authenticated participant: xavier]\nanything new?"),
+        "{latest}"
+    );
     let replayed = following
         .iter()
         .map(|(_, text)| text.as_str())
@@ -18812,7 +18839,7 @@ async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
         prompt[prompt.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\nunaddressed"),
-            ("user", "next"),
+            ("user", "[gateway: authenticated participant: xavier]\nnext"),
         ])
     );
 }
@@ -19168,7 +19195,10 @@ async fn an_unaddressed_continuation_catches_up_on_what_others_posted() {
         continued[continued.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\nposted meanwhile"),
-            ("user", "and another thing"),
+            (
+                "user",
+                "[gateway: authenticated participant: xavier]\nand another thing"
+            ),
         ])
     );
 }
@@ -19207,7 +19237,7 @@ async fn a_folded_steer_is_not_replayed_by_the_next_mention() {
         prompt[prompt.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\nunaddressed"),
-            ("user", "next"),
+            ("user", "[gateway: authenticated participant: xavier]\nnext"),
         ])
     );
 }
@@ -19295,7 +19325,10 @@ async fn a_late_mention_reads_nothing_older_than_forget_after() {
         prompt[prompt.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\njust now"),
-            ("user", "catch me up"),
+            (
+                "user",
+                "[gateway: authenticated participant: xavier]\ncatch me up"
+            ),
         ])
     );
 }
@@ -21306,7 +21339,7 @@ async fn the_stop_notice_reaches_the_next_turn_once() {
     let notice = "[gateway: the previous turn stopped before answering: the model call failed (deadline-exceeded). Capability calls already made were not undone.]";
     assert_eq!(
         models.prompt(1).last().unwrap().1,
-        format!("{notice}\nsecond question")
+        format!("[gateway: unmapped participant]\n{notice}\nsecond question")
     );
     assert!(
         models
@@ -21609,7 +21642,7 @@ async fn fresh_after_wall_clock(kind: ConversationKind) {
     assert_eq!(driver.replies().last().unwrap(), "fresh answer");
     let prompt = next.prompt(0);
     assert_eq!(prompt.len(), 2);
-    assert_eq!(prompt[1], ("user".to_owned(), "[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnew question".to_owned()));
+    assert_eq!(prompt[1], ("user".to_owned(), "[gateway: unmapped participant]\n[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnew question".to_owned()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -21727,7 +21760,10 @@ async fn a_sealed_conversation_stays_sealed_after_a_restart() {
                 assert_eq!(next.prompt(0).len(), 2);
                 assert_eq!(
                     next.prompt(0)[1],
-                    ("user".to_owned(), "after restart".to_owned())
+                    (
+                        "user".to_owned(),
+                        "[gateway: unmapped participant]\nafter restart".to_owned()
+                    )
                 );
             }
             ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
@@ -21847,7 +21883,10 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         turn.exchanges().is_empty(),
         "the resident window excludes durable tool bytes"
     );
-    assert_eq!(turn.user(), "do the work");
+    assert_eq!(
+        turn.user(),
+        "[gateway: authenticated participant: xavier]\ndo the work"
+    );
     assert_eq!(turn.answer(), Some("done"));
     let bytes = fs::read_to_string(
         journal_dir
@@ -21958,3 +21997,6 @@ async fn a_cold_platform_recall_skips_messages_before_the_seal() {
     assert!(recalled.contains("at the seal"));
     assert!(recalled.contains("after the seal"));
 }
+
+#[path = "tests/lost_task.rs"]
+mod lost_task;

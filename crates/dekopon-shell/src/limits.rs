@@ -54,7 +54,6 @@ pub enum LimitExceeded {
 pub struct Budget {
     limits: Limits,
     tree: TreeContext,
-    depth: u32,
 }
 
 impl Budget {
@@ -68,11 +67,7 @@ impl Budget {
 
     #[must_use]
     pub fn start_tree(limits: Limits, tree: TreeContext) -> Self {
-        Self {
-            limits,
-            tree,
-            depth: 0,
-        }
+        Self { limits, tree }
     }
 
     pub(crate) const fn tree(&self) -> &TreeContext {
@@ -83,7 +78,6 @@ impl Budget {
         Self {
             limits: self.limits,
             tree: self.tree.clone(),
-            depth: self.depth,
         }
     }
 
@@ -117,20 +111,6 @@ impl Budget {
     #[must_use]
     pub fn remaining(&self) -> Duration {
         self.tree.remaining()
-    }
-
-    pub fn enter_nesting(&mut self) -> Result<(), LimitExceeded> {
-        if self.depth >= self.limits.max_recursion_depth {
-            return Err(LimitExceeded::RecursionDepth {
-                maximum: self.limits.max_recursion_depth,
-            });
-        }
-        self.depth = self.depth.saturating_add(1);
-        Ok(())
-    }
-
-    pub fn leave_nesting(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
     }
 
     /// Capability calls are budgeted independently of steps, since one script can loop to drive
@@ -351,22 +331,6 @@ mod tests {
             budget.charge_step(),
             Err(LimitExceeded::Steps { maximum: 3 })
         );
-    }
-
-    #[test]
-    fn recursion_depth_is_capped_and_released() {
-        let mut budget = Budget::start(Limits {
-            max_recursion_depth: 2,
-            ..Limits::default()
-        });
-        assert!(budget.enter_nesting().is_ok());
-        assert!(budget.enter_nesting().is_ok());
-        assert_eq!(
-            budget.enter_nesting(),
-            Err(LimitExceeded::RecursionDepth { maximum: 2 })
-        );
-        budget.leave_nesting();
-        assert!(budget.enter_nesting().is_ok());
     }
 
     #[test]

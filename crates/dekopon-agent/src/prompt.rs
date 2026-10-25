@@ -51,7 +51,6 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
-const MAX_IGNORED_ARGUMENT_NAMES_BYTES: usize = 256;
 
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
@@ -764,7 +763,7 @@ where
     let mut transcribed = 0_usize;
     let mut asset_bytes = 0_usize;
     let mut agent_config_shown = false;
-    let mut rejection_fed_back = false;
+    let mut first_rejected_turn = None;
     let mut skill_reads = SkillReads::default();
     let mut suggestions = Vec::new();
 
@@ -1114,12 +1113,11 @@ where
                 fetch_asset_into(&mut messages, source, &call, model_turns, &mut asset_bytes)?;
                 continue;
             }
-            // The model-selected tool name is excluded from telemetry because it is untrusted model
-            // output; an operator reads it from stderr instead.
             if call.function.name != SCRIPT_TOOL_NAME {
                 let answered = feed_back_rejection(
                     &mut messages,
-                    &mut rejection_fed_back,
+                    &mut first_rejected_turn,
+                    model_turns,
                     &call,
                     unknown_tool_feedback(&model_tools),
                 );
@@ -1134,7 +1132,8 @@ where
                 Err(error) => {
                     let answered = feed_back_rejection(
                         &mut messages,
-                        &mut rejection_fed_back,
+                        &mut first_rejected_turn,
+                        model_turns,
                         &call,
                         BAD_SCRIPT_ARGUMENTS_FEEDBACK.to_owned(),
                     );
@@ -1332,17 +1331,31 @@ pub(crate) fn reject_tool_call(
     error_type: &'static str,
     fed_back: bool,
 ) {
-    tracing::error!(
-        target: "dekopon_agent::audit",
-        {
-            audit.event = "agent.tool.rejected",
-            model.turn = model_turn,
-            gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
-            error.type = error_type,
-            rejection.fed_back = fed_back,
-        },
-        "agent.tool.rejected"
-    );
+    if fed_back {
+        tracing::warn!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.tool.rejected",
+                model.turn = model_turn,
+                gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
+                error.type = error_type,
+                rejection.fed_back = fed_back,
+            },
+            "agent.tool.rejected"
+        );
+    } else {
+        tracing::error!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.tool.rejected",
+                model.turn = model_turn,
+                gen_ai.tool.call.id = dekopon_core::bounded_attribute(call_id).as_ref(),
+                error.type = error_type,
+                rejection.fed_back = fed_back,
+            },
+            "agent.tool.rejected"
+        );
+    }
 }
 
 fn reject_empty_tool_call(model_turn: u32, position: usize) {
@@ -1372,14 +1385,14 @@ fn unknown_tool_feedback(tools: &[ModelTool]) -> String {
 
 fn feed_back_rejection(
     messages: &mut Vec<ModelMessage>,
-    fed_back: &mut bool,
+    first_rejected_turn: &mut Option<u32>,
+    model_turn: u32,
     call: &ModelToolCall,
     feedback: String,
 ) -> bool {
-    if *fed_back {
+    if *first_rejected_turn.get_or_insert(model_turn) != model_turn {
         return false;
     }
-    *fed_back = true;
     messages.push(ModelMessage::tool(call.id.clone(), feedback));
     true
 }
@@ -1739,7 +1752,7 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct BashArguments {
     command: String,
     #[serde(flatten)]
@@ -1751,14 +1764,13 @@ impl BashArguments {
         if self.ignored.is_empty() {
             return None;
         }
-        let mut names = self
+        let names = self
             .ignored
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(",");
-        names.truncate(names.floor_char_boundary(MAX_IGNORED_ARGUMENT_NAMES_BYTES));
-        Some(names)
+        Some(dekopon_core::bounded_attribute(&names).into_owned())
     }
 }
 
@@ -1955,8 +1967,9 @@ mod tests {
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
         PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
         ScriptRuntime, Seal, SessionInputs, Steer, SteerSource, agent_config_tool, asset_argument,
-        format_script_outcome, run_prompt, run_prompt_session, run_prompt_with_history,
-        run_prompt_with_history_and_options, script_tool,
+        format_script_outcome, reject_tool_call, run_prompt, run_prompt_session,
+        run_prompt_with_history, run_prompt_with_history_and_options, script_argument, script_tool,
+        unknown_tool_feedback,
     };
 
     struct ScriptedModel {
@@ -4006,7 +4019,7 @@ mod tests {
     #[test]
     fn the_bash_description_stays_short() {
         let words = SCRIPT_TOOL_DESCRIPTION.split_whitespace().count();
-        assert!(words <= 500, "{words} words: cut before appending");
+        assert!(words <= 300, "{words} words: cut before appending");
     }
 
     #[test]
@@ -5006,7 +5019,81 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_tool_is_answered_once_and_the_second_ends_the_session() {
+    fn every_rejection_in_the_first_bad_turn_is_answered_but_later_turns_end() {
+        for later_rejection in [false, true] {
+            let mut first = tool_call("unknown", "unknown", json!({}));
+            first
+                .tool_calls
+                .extend(tool_call("malformed", SCRIPT_TOOL_NAME, json!({})).tool_calls);
+            let model = ScriptedModel::new([
+                script_call("good", "echo before"),
+                first,
+                if later_rejection {
+                    tool_call("later", "unknown", json!({}))
+                } else {
+                    answer("recovered")
+                },
+            ]);
+            let result = run_prompt(&model, &RecordingRuntime::new(0), "go", None, limits(4, 32));
+            if later_rejection {
+                assert!(matches!(result, Err(PromptError::UnknownTool(name)) if name == "unknown"));
+            } else {
+                assert_eq!(result.expect("first bad turn recovers").answer, "recovered");
+            }
+            let feedback = model.tool_messages();
+            assert_eq!(
+                &feedback[2..],
+                [
+                    unknown_tool_feedback(&[
+                        script_tool(&[], &BTreeMap::new()),
+                        crate::improvement::improvement_tool(),
+                    ]),
+                    BAD_SCRIPT_ARGUMENTS_FEEDBACK.to_owned()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn answered_rejections_warn_and_unanswered_rejections_error() {
+        use dekopon_test_support::{CaptureLayer, Record};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = CaptureLayer::workspace();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                reject_tool_call(1, "answered", "unknown-tool", true);
+                reject_tool_call(2, "unanswered", "unknown-tool", false);
+            },
+        );
+        let records = capture.records();
+        let events = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Event { level, .. } => Some((*level, record.field("rejection.fed_back"))),
+                Record::Span { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, [("WARN", Some("true")), ("ERROR", Some("false"))]);
+    }
+
+    #[test]
+    fn ignored_argument_names_use_the_shared_attribute_bound() {
+        let name = "é".repeat(3000);
+        let arguments = script_argument(
+            SCRIPT_TOOL_NAME,
+            &json!({"command": "true", name.clone(): 1}).to_string(),
+        )
+        .expect("command with ignored argument");
+        assert_eq!(
+            arguments.ignored_names().as_deref(),
+            Some(dekopon_core::bounded_attribute(&name).as_ref())
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_gets_feedback_only_in_the_first_bad_turn() {
         let model = ScriptedModel::new([
             tool_call("call-1", "echo_echo", json!({})),
             tool_call("call-2", "echo_echo", json!({})),
@@ -5075,7 +5162,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bash_call_without_a_string_command_is_answered_once_then_ends_the_session() {
+    fn a_bash_call_without_a_string_command_gets_feedback_only_in_the_first_bad_turn() {
         for arguments in [r#"{"script":"echo hi"}"#, r#"{"command":42}"#, "{}"] {
             let bad = |id: &str| {
                 AssistantTurn::new(
@@ -5299,7 +5386,7 @@ mod tests {
     }
 
     #[test]
-    fn arguments_that_are_not_a_json_object_are_answered_once_then_refused() {
+    fn non_object_bash_arguments_get_feedback_only_in_the_first_bad_turn() {
         let bad = |id: &str| {
             AssistantTurn::new(
                 None,

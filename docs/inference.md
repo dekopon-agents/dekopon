@@ -267,11 +267,11 @@ keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
 `persistent` is the route default; `oneShot` disables history replay. A persistent route seeds the prompt with
 compacted `(question, final answer)` pairs ahead of the new message, oldest dropped first until both
-the turn and byte bounds hold. A shared turn is prefixed with
+the turn and byte bounds hold. Every person-originated turn, in every scope, is prefixed with
 `[gateway: authenticated participant: <principal>]` before it is sent and retained, naming the
 broker principal the sender maps to, or `[gateway: unmapped participant]` when the broker named
-none, so that principal name is model input whatever the telemetry gate says; private and one-shot turns carry
-no participant prefix. Consumed steers join the turn's user text in history.
+none, so that principal name is model input whatever the telemetry gate says.
+Consumed steers join the turn's user text in history.
 
 Every new session opens a fresh attested broker leg before inference; same-sender steers use the
 running session's leg. An empty grant stops before the
