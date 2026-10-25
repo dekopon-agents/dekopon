@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use axum::{
-    Router,
+    Extension, Router,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::Response,
@@ -259,13 +259,17 @@ fn guid(value: &str) -> bool {
         })
 }
 
-async fn receive(State(state): State<StateData>, request: Request) -> Response {
+async fn receive(
+    State(state): State<StateData>,
+    Extension(deadline): Extension<webhook::RequestDeadline>,
+    request: Request,
+) -> Response {
     let Ok(_permit) = Arc::clone(&state.concurrent).try_acquire_owned() else {
         return refuse(&state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
     let received = receive_span(ChatTransportKind::Github);
-    match tokio::time::timeout(
-        webhook::WEBHOOK_REQUEST_TIMEOUT,
+    match tokio::time::timeout_at(
+        deadline.0,
         process(&state, request, &received).instrument(received.clone()),
     )
     .await
@@ -634,7 +638,12 @@ impl GithubTransport {
         request: Request,
     ) -> impl Future<Output = Response> + use<> {
         let state = self.state.clone();
-        async move { receive(State(state), request).await }
+        async move {
+            let deadline = webhook::RequestDeadline(
+                tokio::time::Instant::now() + webhook::WEBHOOK_REQUEST_TIMEOUT,
+            );
+            receive(State(state), Extension(deadline), request).await
+        }
     }
 
     #[cfg(test)]
@@ -842,7 +851,7 @@ pub(crate) mod tests {
         let mut socket = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let body = serde_json::to_vec(&pr()).expect("body");
         let request = signed(&body, b"secret", "delayed-headers", "pull_request");
         let mut headers = format!(
@@ -869,6 +878,80 @@ pub(crate) mod tests {
         assert_eq!(
             response.lines().next(),
             Some("HTTP/1.1 503 Service Unavailable")
+        );
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[
+                        ("event", "gateway_github_webhook_refused"),
+                        ("reason", "timeout")
+                    ]
+                )
+                .len(),
+            1
+        );
+        ticket.answer(Acked::Admitted);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pooled_webhook_requests_reconnect_and_receive_timeout_responses() {
+        let (state, mut receiver) = routed_state().await;
+        let (capture, _guard) = crate::tests::capture_spans();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        let address = probe.local_addr().expect("address");
+        drop(probe);
+        let router = Router::new()
+            .route(CALLBACK, post(receive))
+            .with_state(state);
+        let mut server = tokio::task::JoinSet::new();
+        webhook::listen(address, router, "github".into(), &mut server)
+            .await
+            .expect("listen");
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .pool_max_idle_per_host(1)
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("client");
+        let url = format!("http://{address}{CALLBACK}");
+        let ping = signed(b"{}", b"secret", "pooled-ping", "ping");
+        let first = client
+            .post(&url)
+            .headers(ping.headers().clone())
+            .body("{}")
+            .send()
+            .await
+            .expect("ping response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let close = first.headers().get(axum::http::header::CONNECTION).cloned();
+        first.bytes().await.expect("drain first response");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let body = serde_json::to_vec(&pr()).expect("body");
+        let request = signed(&body, b"secret", "pooled-second", "pull_request");
+        let send = client
+            .post(&url)
+            .headers(request.headers().clone())
+            .body(body)
+            .send();
+        let (response, event) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(send, receiver.recv())
+        })
+        .await
+        .expect("bounded second request");
+        let TransportEvent::Delivery(_, ticket) = event.expect("delivery") else {
+            panic!("admission ticket")
+        };
+        assert_eq!(
+            response
+                .expect("second response, not silent close")
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            close.as_ref().map(|value| value.as_bytes()),
+            Some(b"close".as_slice())
         );
         assert_eq!(
             capture
