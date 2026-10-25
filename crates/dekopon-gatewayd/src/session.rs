@@ -1872,6 +1872,20 @@ async fn session(
             return MessageOutcome::FollowInactive.into();
         }
     }
+    let mut sealed = sealed_conversation(
+        runner,
+        &key,
+        route
+            .memory
+            .window()
+            .map_or(crate::config::DEFAULT_FORGET_AFTER, |window| {
+                window.forget_after
+            }),
+    )
+    .await;
+    if reject_sealed_thread(runner, message, driver, sealed).await {
+        return MessageOutcome::Sealed.into();
+    }
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::SessionRefused(
@@ -1985,41 +1999,20 @@ async fn session(
             },
             message.conversation.thread.clone(),
         );
-    }
-    let sealed = sealed_conversation(
-        runner,
-        &key,
-        route
-            .memory
-            .window()
-            .map_or(crate::config::DEFAULT_FORGET_AFTER, |window| {
-                window.forget_after
-            }),
-    )
-    .await;
-    match message.conversation.kind {
-        ConversationKind::Thread if sealed.is_some() => {
-            revoke_thread_ownership(runner, message);
-            tracing::info!(
-                event = "gateway_session_rejected",
-                reason = "sealed",
-                "gateway.session.rejected"
-            );
-            if !is_follow
-                && !message
-                    .thread_continuation
-                    .as_ref()
-                    .is_some_and(|continuation| continuation.inherited)
-                && answer(driver, message, SEALED_THREAD_REPLY).await
-            {
-                reply_delivered(MessageOutcome::Sealed);
-            }
+        sealed = sealed_conversation(
+            runner,
+            &key,
+            route
+                .memory
+                .window()
+                .map_or(crate::config::DEFAULT_FORGET_AFTER, |window| {
+                    window.forget_after
+                }),
+        )
+        .await;
+        if reject_sealed_thread(runner, message, driver, sealed).await {
             return MessageOutcome::Sealed.into();
         }
-        ConversationKind::Thread
-        | ConversationKind::DirectMessage
-        | ConversationKind::GroupDirectMessage
-        | ConversationKind::Channel => {}
     }
     // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
     let granted = leg.granted();
@@ -2811,6 +2804,39 @@ async fn session(
             journal: pending_journal,
         }
     }
+}
+
+async fn reject_sealed_thread(
+    runner: &SessionRunner,
+    message: &InboundMessage,
+    driver: &Arc<dyn ChatDriver>,
+    sealed: Option<SealedConversation>,
+) -> bool {
+    match message.conversation.kind {
+        ConversationKind::Thread if sealed.is_some() => {
+            revoke_thread_ownership(runner, message);
+            tracing::info!(
+                event = "gateway_session_rejected",
+                reason = "sealed",
+                "gateway.session.rejected"
+            );
+            if !matches!(message.message_id, MessageId::Follow(_))
+                && !message
+                    .thread_continuation
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.inherited)
+                && answer(driver, message, SEALED_THREAD_REPLY).await
+            {
+                reply_delivered(MessageOutcome::Sealed);
+            }
+            return true;
+        }
+        ConversationKind::Thread
+        | ConversationKind::DirectMessage
+        | ConversationKind::GroupDirectMessage
+        | ConversationKind::Channel => {}
+    }
+    false
 }
 
 async fn sealed_conversation(
