@@ -38,7 +38,8 @@ fn synthetic_records_have_live_traces_and_process_scoped_identity() {
         dekopon_broker_protocol::DeliveryIdentity::Slack { .. }
         | dekopon_broker_protocol::DeliveryIdentity::Discord { .. }
         | dekopon_broker_protocol::DeliveryIdentity::Telegram { .. }
-        | dekopon_broker_protocol::DeliveryIdentity::Whatsapp { .. } => {
+        | dekopon_broker_protocol::DeliveryIdentity::Whatsapp { .. }
+        | dekopon_broker_protocol::DeliveryIdentity::Github { .. } => {
             panic!("record must use Local")
         }
     };
