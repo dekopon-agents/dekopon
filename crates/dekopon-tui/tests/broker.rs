@@ -2,6 +2,12 @@
 //! Run with DEKOPON_TEST_BROKERD and DEKOPON_TEST_PROBE_WASM pointing to verified artifacts.
 
 #![cfg(unix)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 
 use dekopon_agent::{SessionInvoker, ShellRuntime, prompt::ScriptRuntime as _};
 use dekopon_broker_protocol::{BrokerClient, ChatScopeClaim, FrameLimits};
@@ -266,6 +272,10 @@ async fn console_shell_runs_provider_child_through_real_broker() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the existing end-to-end witness keeps setup, operation and assertions together"
+)]
 async fn published_client_against_real_broker_allows_only_attested_agent_surface() {
     let Some(fixture) = broker(true).await else {
         eprintln!("broker fixture env absent; integration not exercised");

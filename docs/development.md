@@ -315,6 +315,10 @@ For deployment diagnosis, inspect the deployed runtime version/ref and provider 
 
 ### Root workspace
 
+The gateway dependency gate rejects privileged broker machinery and both `dekopon-console` and
+`dekopon-tui`. The broker dependency gate rejects unprivileged orchestration and both console
+crates. Neither daemon may acquire the console through a normal dependency.
+
 This is the complete list of root-workspace commands behind the required `quality (stable)` context and the `dependency policy` job, in each lane's order in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml); the comment above each command is what it gates.
 
 ```console

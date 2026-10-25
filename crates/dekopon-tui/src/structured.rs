@@ -147,6 +147,10 @@ pub async fn run(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the structured runner carries its input, output and two test-controlled deadlines"
+)]
 async fn run_with_limits<R: AsyncRead + Unpin, W: io::Write>(
     mut app: App,
     client: BrokerClient,

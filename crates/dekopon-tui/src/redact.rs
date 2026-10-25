@@ -224,7 +224,9 @@ fn walk(
         }
         // A secret key holding a non-string is still a secret: `{"token": 12345678901234567890}`
         // is a credential wearing a number's clothes.
-        other if key_says_secret && !other.is_null() => {
+        other @ (Value::Null | Value::Bool(_) | Value::Number(_))
+            if key_says_secret && !other.is_null() =>
+        {
             found.push(Redaction {
                 path: path.clone(),
                 reason: RedactionReason::Key,
@@ -260,7 +262,7 @@ fn walk(
             }
             Value::Object(mapped)
         }
-        scalar => scalar.clone(),
+        scalar @ (Value::Null | Value::Bool(_) | Value::Number(_)) => scalar.clone(),
     }
 }
 

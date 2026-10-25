@@ -8,7 +8,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -46,6 +46,7 @@ use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, CommandRun,
     JobControl, Streams,
 };
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{mpsc::unbounded_channel, watch};
 
@@ -424,7 +425,7 @@ pub async fn open_agent_with_assets(
     Ok(leg
         .with_provider_attachments(Arc::new(ReplyAttachments::new(
             0,
-            store.clone(),
+            Arc::<assets::ConsoleAssets>::clone(&store),
             "console (no delivery)".to_owned(),
         )))
         .with_chat_asset_inputs(ChatAssetInputs::new(store)))
@@ -488,7 +489,7 @@ impl StopFlag {
     /// Requests a stop at the session's next cooperative boundary.
     pub fn request(&self) {
         self.requested.send_replace(true);
-        if let Some(handle) = self.broker.lock().expect("stop lock").as_ref() {
+        if let Some(handle) = self.broker.lock().as_ref() {
             handle.cancel();
         }
     }
@@ -502,7 +503,7 @@ impl StopFlag {
     /// Clears the flag for the next session.
     pub fn reset(&self) {
         self.requested.send_replace(false);
-        *self.broker.lock().expect("stop lock") = None;
+        *self.broker.lock() = None;
     }
 }
 
@@ -515,7 +516,7 @@ impl StopFlag {
 
     /// Binds Stop to the current broker leg as well as the model loop.
     pub fn bind_broker(&self, handle: CancelHandle) {
-        *self.broker.lock().expect("stop lock") = Some(handle);
+        *self.broker.lock() = Some(handle);
     }
 }
 
@@ -656,7 +657,7 @@ pub async fn run_turn(
         let _entered = span.enter();
         let sequence = Sequence::default();
         let calls = CallBudget::new(options.prompt_limits.max_capability_calls);
-        let leg = Arc::new(leg.with_progress(progress.clone(), calls.clone()));
+        let leg = Arc::new(leg.with_progress(Arc::clone(&progress), calls.clone()));
         let runtime = RecordingRuntime::new(
             ShellRuntime {
                 invoker: RecordingInvoker::new(
@@ -806,6 +807,10 @@ impl CapabilityInvoker for LegHandle {
 
 /// Opens a channel for one session's events.
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: one RunningTurn drained and joined by the event loop; bound: one active turn with configured prompt steps, capability calls and interpreter limits"
+)]
 pub fn session_channel() -> (
     tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,

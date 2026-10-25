@@ -313,6 +313,10 @@ pub enum Action {
 /// Maps one key press onto a state change, and possibly an action.
 ///
 /// Split from the loop so the whole of the console's key handling is testable without a terminal.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled terminal key codes are ignored to preserve console input behavior"
+)]
 pub fn on_key(app: &mut App, key: KeyEvent, stop: &StopFlag) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
@@ -384,6 +388,10 @@ pub fn on_key(app: &mut App, key: KeyEvent, stop: &StopFlag) -> Option<Action> {
     None
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled terminal key codes are ignored to preserve console input behavior"
+)]
 fn on_composing_key(app: &mut App, key: KeyEvent, stop: &StopFlag) -> Option<Action> {
     match key.code {
         KeyCode::Esc if app.request_stop() => stop.request(),
@@ -428,7 +436,7 @@ fn on_composing_key(app: &mut App, key: KeyEvent, stop: &StopFlag) -> Option<Act
                     app.shell_top = None;
                     Some(Action::Shell(line))
                 }
-                _ => None,
+                Pane::Agents | Pane::Detail => None,
             };
         }
         _ => {}
@@ -451,6 +459,10 @@ fn clear_agent_context(app: &mut App, history: &mut History, limits: HistoryLimi
     *history = History::new(limits);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatcher borrows the existing event loop state for one action"
+)]
 pub(crate) async fn dispatch(
     app: &mut App,
     action: Action,
@@ -475,6 +487,14 @@ pub fn console_turn_span(kind: &'static str) -> tracing::Span {
     tracing::info_span!(parent: None, "console.turn", console.origin = "dekopon-console", console.kind = kind)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatcher borrows the existing event loop state for one action"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive action dispatcher preserves the console state transitions"
+)]
 async fn dispatch_in_context(
     app: &mut App,
     action: Action,
@@ -560,7 +580,7 @@ async fn dispatch_in_context(
                 options.subject.clone(),
                 agent.clone(),
                 options.scope.clone(),
-                assets.clone(),
+                Arc::clone(&assets),
             )
             .await
             {
@@ -621,6 +641,10 @@ async fn dispatch_in_context(
             stop.reset();
             let (handle_cancel, signal) = CancelSignal::pair();
             stop.bind_broker(handle_cancel);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "owner: RunningTurn retained by the event loop and joined on completion or shutdown; bound: one active turn admitted by app.busy and running"
+            )]
             let handle = tokio::spawn(
                 crate::session::run_turn(
                     leg.with_cancel_signal(signal),
@@ -771,6 +795,7 @@ async fn dispatch_in_context(
             stop.bind_broker(handle_cancel);
             let previous = std::mem::replace(history, History::new(options.history_limits));
             let span = tracing::Span::current();
+            #[expect(clippy::disallowed_methods, reason = "owner: RunningTurn retained by the event loop and joined on completion or shutdown; bound: one active turn admitted by app.busy and running")]
             let handle = tokio::spawn(async move {
                 tokio::task::spawn_blocking(move || {
                     let _entered = span.enter();

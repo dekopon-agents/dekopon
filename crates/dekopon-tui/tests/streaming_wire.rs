@@ -1,5 +1,12 @@
 //! Always-run wire witness: console wrappers over the pinned broker client's real FD transport.
 #![cfg(unix)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
+
 use dekopon_broker_protocol::{
     AssetEncoding, BrokerClient, CommandRunOutcome, DescriptorStream, FrameLimits, NewAsset,
     ResponseEnvelope,
@@ -20,6 +27,10 @@ use std::{
 };
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the existing end-to-end witness keeps setup, operation and assertions together"
+)]
 async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -111,7 +122,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
         subject.clone(),
         agent.clone(),
         None,
-        inventory.clone(),
+        Arc::<ConsoleAssets>::clone(&inventory),
     )
     .await
     .unwrap();

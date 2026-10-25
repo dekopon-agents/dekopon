@@ -13,6 +13,15 @@
 //! behalf of an attested subject, and the broker alone decides it.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 #![cfg(unix)]
 
 pub mod app;

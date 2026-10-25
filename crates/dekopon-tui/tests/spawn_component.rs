@@ -1,6 +1,13 @@
 //! Adapted from core tag v0.33.0 `crates/dekopon-brokerd/tests/fixture/spawn_component.rs`
 //! (original SHA256 f20704f76e334baf69551d3b2ea72cc820ea32f5611bb0ddbd9ffec372f05e5d).
 //! Unlike the core's drain-only fixture, forward the child's bytes to provider stdout.
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
+
 use std::io::Write as _;
 
 use serde_json::json;

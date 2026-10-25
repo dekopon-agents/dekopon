@@ -1,8 +1,8 @@
-# Dekopon container image: one image, both daemon binaries, assembled from a published release.
+# Dekopon container image: one image, both daemon binaries and the console, assembled from a published release.
 #
 # Nothing is compiled here. `release.yml` already builds, checksums, and provenance-attests
 # `dekopon-<version>-<target>.tar.gz` for `x86_64-unknown-linux-gnu` and
-# `aarch64-unknown-linux-gnu`, each carrying both daemon executables. The image ships exactly those
+# `aarch64-unknown-linux-gnu`, each carrying both daemon executables and the console. The image ships exactly those
 # bytes — the ones users download and can verify — rather than a second, independently compiled
 # set that merely ought to match. `ci/stage-image-context.sh` verifies each archive against its
 # `.sha256` sidecar and its attestation before extracting the executables into the context, and
@@ -21,7 +21,7 @@
 #
 # This file expects a staged context and is not buildable from the repository root. The context is
 # constructed by `ci/stage-image-context.sh` rather than filtered out of a checkout: it contains
-# the Dockerfile, `dist/<arch>/` with the two executables from each release archive, `providers/`
+# the Dockerfile, `dist/<arch>/` with the three executables from each release archive, `providers/`
 # with checked-in components, and the two licences — nothing else, because nothing else was
 # put there. A `.dockerignore` denylist would have to keep excluding the rest of the repository
 # correctly forever; an allowlist is true by construction.

@@ -75,8 +75,9 @@ class RenderHomebrewFormulaTests(unittest.TestCase):
         console = render("dekopon-console")
         self.assertIn("class DekoponConsole < Formula", console)
         self.assertIn('github.com/dekopon-agents/dekopon/releases/download/', console)
-        installed = lambda text: set(re.findall(r'"([^"]+)"',
-            re.search(r"^    bin.install (.+)$", text, re.MULTILINE).group(1)))
+        def installed(text):
+            return {name for line in re.findall(r"^    bin.install (.+)$", text, re.MULTILINE)
+                    for name in re.findall(r'"([^"]+)"', line)}
         self.assertEqual(installed(console), {"dekopon-console"})
         self.assertFalse(installed(console) & installed(self.formula))
         self.assertIn('shell_output("#{bin}/dekopon-console --version")', console)

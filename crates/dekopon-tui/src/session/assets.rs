@@ -205,7 +205,7 @@ mod tests {
                 .unwrap(),
             b"returned"
         );
-        let inputs = ChatAssetInputs::new(store.clone());
+        let inputs = ChatAssetInputs::new(std::sync::Arc::<ConsoleAssets>::clone(&store));
         let (prepared, pins) = inputs
             .prepare(&json!({"file": "chat-asset:2"}), 0)
             .await

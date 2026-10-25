@@ -54,7 +54,7 @@ impl CapabilityInvoker for Probe {
             command == "consume",
             "pipe presence is forwarded, not buffered input"
         );
-        let reports = self.reports.clone();
+        let reports = std::sync::Arc::clone(&self.reports);
         Some(CommandRun::Proposed {
             capability: format!("probe.{command}"),
             input: json!({"command": command}),
@@ -109,7 +109,11 @@ fn recording_preserves_descriptor_pipeline_reports_lifecycle_and_shared_budget()
     let sequence = Sequence::default();
     let runtime = RecordingRuntime::new(
         ShellRuntime {
-            invoker: RecordingInvoker::new(probe.clone(), events.clone(), sequence.clone()),
+            invoker: RecordingInvoker::new(
+                std::sync::Arc::clone(&probe),
+                events.clone(),
+                sequence.clone(),
+            ),
             limits: Limits::default(),
             calls: calls.clone(),
         },
@@ -166,7 +170,7 @@ fn recording_forwards_cancellation_before_a_provider_effect() {
     let probe = Arc::new(Probe::default());
     probe.cancelled.store(true, Ordering::SeqCst);
     let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
-    let invoker = RecordingInvoker::new(probe.clone(), events, Sequence::default());
+    let invoker = RecordingInvoker::new(std::sync::Arc::clone(&probe), events, Sequence::default());
     assert!(invoker.cancelled());
     let outcome = ShellRuntime {
         invoker,

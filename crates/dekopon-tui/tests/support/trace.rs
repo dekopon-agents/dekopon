@@ -177,6 +177,10 @@ fn is_descendant(spans: &[Span], child: &Span, ancestor: &Span) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the existing end-to-end witness keeps setup, operation and assertions together"
+)]
 async fn console_turn_exports_one_causal_trace_through_model_script_broker_and_provider() {
     if std::env::var_os("DEKOPON_TEST_BROKERD").is_none()
         || std::env::var_os("DEKOPON_TEST_PROBE_WASM").is_none()

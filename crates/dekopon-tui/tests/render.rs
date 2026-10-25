@@ -4,6 +4,13 @@
 //! carry a control sequence into a frame, that a secret is not drawn, and that each pane says the
 //! thing an operator would otherwise have to guess.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
+
 use dekopon_protocol::{Agent, AgentKind, AgentSpec, ApiVersion, ObjectMeta};
 use dekopon_tui::{App, Mode, Notice, Pane, ui};
 use ratatui::{Terminal, backend::TestBackend};

@@ -4,6 +4,13 @@
 //! console connects to anything. They were untested for the whole time this lived inside `dekopon`,
 //! which is how `--api-key-env` could have stopped requiring `--endpoint` without anyone noticing.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
+
 use std::{path::Path, process::Command};
 
 use tempfile::TempDir;

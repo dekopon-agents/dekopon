@@ -8,6 +8,15 @@
 //! capability call it makes is a proposal the broker alone decides.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 
 use std::{
     collections::HashSet,
@@ -39,6 +48,10 @@ mod telemetry;
     version,
     about = "Interactive terminal console for a running Dekopon broker",
     long_about = None
+)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent CLI switches preserve the existing command-line contract"
 )]
 struct Cli {
     /// Path to a YAML or JSON agent catalog.
@@ -190,6 +203,10 @@ fn main() -> ExitCode {
 /// Returns before drawing anything when the catalog will not load, no broker is listening, or the
 /// credential guard refuses. Once the console is drawing, only a terminal failure comes back here:
 /// a refused hop or a failed session is something the console shows and stays open after.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the existing startup sequence validates CLI modes before creating any broker or model client"
+)]
 fn execute(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<(), ConsoleError> {
     let document = match &cli.profiles {
         Some(path) => read_profiles(path)?,

@@ -41,7 +41,7 @@ pub fn broker_refusal(error: &(dyn Error + 'static)) -> Option<(String, String)>
             link.downcast_ref::<BrokerLegError>()
                 .and_then(|leg| match leg {
                     BrokerLegError::Client(client) => Some(client),
-                    _ => None,
+                    BrokerLegError::DuplicateCapabilities { .. } => None,
                 })
         });
         if let Some(ClientError::Remote { code, message }) = client {

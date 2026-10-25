@@ -252,3 +252,8 @@ To assemble the optimized image from a release that includes its archives:
 ```console
 ci/stage-image-context.sh v0.34.0 "$work" wasmtime-optimization
 ```
+
+Pull requests use the newest published archive. While that release predates the workspace
+console, CI runs the staging contract tests and reports that full image validation is unavailable.
+Once a published release contains the console crate, the normal image checks resume. Publication
+always requires all three executables; a missing console in a release archive fails staging.

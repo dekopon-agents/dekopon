@@ -44,7 +44,7 @@ OFFERED = {
 # in OFFERED above.
 RETIRED = {"x86_64-apple-darwin"}
 
-# The executables every archive carries, in the order the formula names them:
+# The executables the daemon formula installs, in the order it names them:
 # (binary name, the one-line description `brew info` prints).
 #
 # One definition, exactly as OFFERED is for platforms: `bin.install`, the caveats count

@@ -91,6 +91,10 @@ fn terminal_guard_restores_after_normal_exit_and_panic_when_run_under_a_pty() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the existing end-to-end witness keeps setup, operation and assertions together"
+)]
 fn cancelled_running_event_loop_restores_pty_after_join() {
     use std::{
         io::{Read as _, Write as _},
