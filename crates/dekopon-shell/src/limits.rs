@@ -76,6 +76,10 @@ impl Budget {
         self.tree.calls().charge()
     }
 
+    pub fn refund_capability_call(&mut self) {
+        self.tree.calls().refund();
+    }
+
     #[must_use]
     pub fn capability_calls(&self) -> u32 {
         self.tree.calls().used()

@@ -21,7 +21,7 @@ mod model;
 mod runtime;
 mod transcripts;
 
-pub use broker::{BrokerFixture, Reply};
+pub use broker::{BrokerFixture, Reply, next_broker_reply};
 pub use capture::{CaptureLayer, Fields, Record};
 pub use driver::{
     DriverCall, FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver,

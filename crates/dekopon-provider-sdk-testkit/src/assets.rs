@@ -1,4 +1,4 @@
-use dekopon_broker_host::asset::{AssetInputs, references};
+use dekopon_broker_host::asset::AssetInputs;
 use dekopon_broker_protocol::{AssetEncoding, AssetRow};
 use dekopon_capability::AssetConstraints;
 use dekopon_http_host::asset::{AssetDirectory, AssetFile};
@@ -62,10 +62,10 @@ impl Fixtures {
         }))
     }
 
-    pub fn inputs(&self, input: &Value) -> Result<AssetInputs, HarnessError> {
-        let descriptors = references(input)
-            .into_iter()
-            .filter_map(|id| self.files.iter().find(|(row, _)| row.id == id))
+    pub fn inputs(&self, _input: &Value) -> Result<AssetInputs, HarnessError> {
+        let descriptors = self
+            .files
+            .iter()
             .map(|(_, file)| file.file().try_clone().map(Into::into))
             .collect::<Result<_, _>>()?;
         Ok(AssetInputs {
@@ -83,7 +83,7 @@ mod tests {
     use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 
     #[test]
-    fn fixtures_pass_only_referenced_read_only_files_and_remove_their_directory() {
+    fn fixtures_hand_every_explicit_input_to_the_invocation_and_remove_their_directory() {
         let fixtures = Fixtures::new(
             None,
             vec![InputAsset {
@@ -97,7 +97,7 @@ mod tests {
         let path = fixtures._root.path().to_owned();
         let unreferenced = fixtures.inputs(&json!({})).unwrap();
         assert_eq!(unreferenced.rows.len(), 1);
-        assert!(unreferenced.descriptors.is_empty());
+        assert_eq!(unreferenced.descriptors.len(), 1);
         let mut inputs = fixtures.inputs(&json!({"image":"chat-asset:1"})).unwrap();
         let file = std::fs::File::from(inputs.descriptors.pop().unwrap());
         assert_eq!(file.metadata().unwrap().nlink(), 0);

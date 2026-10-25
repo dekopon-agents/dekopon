@@ -23,8 +23,8 @@ log exporter loses audit; that is the accepted consequence of the constitution's
 crash-durable audit ([non-goals](design.md#non-goals)).
 
 **A span is a span of time; a log is a fact that is not a duration.** A log event justifies itself
-as a payload — text too large or too unbounded for a span attribute, the model and tool transcript
-below — or as a survivor: costs, refusals, and errors, which outlive trace retention and sampling.
+as a payload — text too large or too unbounded for a span attribute — or as a survivor: costs,
+refusals, and errors, which outlive trace retention and sampling.
 An `X.started` event is neither, because the span's start time is strictly better and carries
 parent and duration besides.
 
@@ -122,8 +122,7 @@ its `cost_details` land only on `model.complete`, as `usage.cost` and the
 `usage.upstream_inference_*` fields. They are best effort: a non-numeric value is skipped and never
 fails the turn, and unknown members beside them are ignored.
 
-`accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
-URL path or query, no headers, no bodies. It fires for every attempt, including one refused before
+`accounting.http.request` carries the same sanitized set as its span: no URL path or query, no headers, no bodies. `HttpCallEvidence` alone also carries the bounded `X-GitHub-Request-Id` response value as `upstreamRequestId`. It fires for every attempt, including one refused before
 a destination was resolved, because that attempt consumed a unit of the invocation's request
 budget. A field a record cannot know — a provider's unreported token count, or a method, authority,
 and status on a refusal — is absent rather than zero, so a missing field means "unreported" and
@@ -148,6 +147,7 @@ library uses `tracing` only and installs no subscriber.
 | `model.stream`, `cache.style` | local streamed/buffered mode and `automatic`/`explicitPrefix` encoding |
 | `generation.max_output_tokens`, `generation.temperature`, `generation.top_p`, `reasoning.effort` | authored OpenRouter requests, absent when omitted |
 | `routing.allow_fallbacks`, `routing.require_parameters`, `routing.only`, `cache.ttl` | authored routing/TTL hints; `routing.only` is a bounded comma-separated diagnostic |
+| `tool_choice`, `parallel_tool_calls` | request tool selection (string) and parallel-call permission (boolean), only when the dialect sends that option |
 | `timing.total_ms` | complete exchange duration, including preparation and permitted refresh/resend |
 | `timing.headers_ms` | most recent send-to-headers duration; a Codex resend replaces the earlier value |
 | `timing.first_event_ms`, `stream.first_delta_ms` | time since adapter exchange starts (before preparation) to first SSE event / first visible text; absent when no such event/text exists |
@@ -176,8 +176,12 @@ never enter `model.complete` fields, and `traceparent` is not forwarded to the i
 Counts, byte totals, `output.partial`, `model.stream`, `cache.style` and the reported model are
 recorded once per exchange, not per delta or chunk, so a long stream cannot push `outcome` or
 `usage.*` past the span's attribute limit.
-`agent.model.prompt` includes `tools`: comma-joined names offered to that exact model turn,
-empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a complete tool list.
+`agent.model.prompt` includes `gen_ai.tool.definitions` on the session's `full` event: an
+unbounded JSON array of the exact tool names, descriptions and parameter schemas given to the
+client. The tool set is fixed for the session. Image summaries retain `[mime, N bytes]` and append
+`sha256:<hex>` for decoded bytes read during request preparation. The digest is cached on the blob
+reference without another read. A failed preparation that never read an image has no digest.
+The prompt event is emitted after the model call, including failures, before the answer event.
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
@@ -246,10 +250,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never
-reduced to a category — because a suggestion nobody can read is not a suggestion. Unlike a model's
-own prompt and answer text, which rides the log stream only when the embedding binary opts into
-payload telemetry, this record is unconditional: offering `suggest_improvement` is itself what puts
-the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
+reduced to a category — because a suggestion nobody can read is not a suggestion. This record is
+unconditional: offering `suggest_improvement` is itself what puts the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
 the model wrote into those fields.
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
@@ -275,14 +277,15 @@ Mapped agent-permission refusals emit one structured `gateway_session_rejected` 
 ## The broker audit record
 
 Every broker decision is one structured log record, emitted from inside the span that made it and
-therefore inside the caller's trace. Two events carry the whole record:
+therefore inside the caller's trace. Three events carry decision, execution and policy activation records:
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
-| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, `decision.point`, `policy.error_ids` and `policy.errors_present` at the HTTP request point, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
-| `broker.execution` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, optional `provider.artifact_sha256` (the full lowercase SHA-256 of the loaded component), `secret`/`secret.sink`, `storage.scope_commitment`/`storage.evidence`, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error`, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected`. It carries no request-only decision fields or verdict |
+| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, `decision.point`, `policy.error_ids` and `policy.errors_present` at the HTTP request point, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision. Also `principal.kind`; `turn.started_by` on a chat claim; the attested `transport.id`, `transport.kind`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; and `delivery.kind`/`delivery.id` when supplied. In a space, `space.id`, `asker.allowed`, `space.allowed`, `space.policy.ids`, and on refusal `decision.denied_by` (`asker`, `space`, `both`). A refusal before Cedar carries only `space.id`; `policy.ids` remains the asker's and `policy.errors_present` covers either evaluation |
+| `broker.execution` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, optional `provider.artifact_sha256` (the full lowercase SHA-256 of the loaded component), `secret`/`secret.sink`, `storage.scope_commitment`/`storage.evidence`, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error`, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, `credentialInjected`, and optional `upstreamRequestId` (the first `X-GitHub-Request-Id` response value, 1–64 visible ASCII bytes; invalid values are dropped). It carries no request-only decision fields or verdict |
+| `broker.policy.loaded` | info | `dekopon-brokerd` | `policy.digest` and `identity.digest` when a policy set starts serving at boot or an applied reload; no source revision, and no event for prepare, abort or check. The identity digest covers subject mappings and principal groups; match a deployment by recomputing both with `check` |
 
-Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
+All three ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
 record does not carry it, so a present field always means the broker knew it. The artifact
 field is derived from the loaded registry, never a desired provider pin; unknown artifacts omit it. A storage-routed
 decision carries every field a non-storage one does, plus its scope commitment and evidence.
@@ -310,8 +313,7 @@ character boundary and suffixed `…[truncated]` like every other bounded value.
 provider wrote about its own refusal, never provider output, which stays a digest.
 
 Nothing here can carry secret bytes. `secret` and `credential` are the symbolic names owner
-configuration already holds, and the HTTP evidence is the same sanitized set the `http.request`
-span carries: no URL path or query, no headers, no bodies.
+configuration already holds, and HTTP evidence carries the sanitized `http.request` fields plus the bounded `X-GitHub-Request-Id` response value. No URL path or query, other header or body is recorded.
 
 The W3C trace id is not a field of the record, and it reaches it two ways. With export configured,
 the record is emitted inside `broker.authorize` or `broker.execute`, which descend from the
@@ -434,10 +436,11 @@ including disabled trace export, neither ID is fabricated.
 
 ## Trace context across the socket
 
-`InvocationRequest`, `DeliveredTurnRequest`, and `runCommand` each carry a mandatory W3C
+`InvocationRequest`, `DeliveredTurnRequest`, `run`, and `runCommand` each carry a mandatory W3C
 `traceParent`. The shared broker leg fills it from the span that requested the capability or ran the
-command word, and the broker opens `broker.invocation` — `broker.command_run` for a command word —
-beneath it as a remote parent, so one trace spans both processes. The trace
+command word. For `run`, the broker opens `broker.invocation` beneath that remote parent and a child
+`broker.command_run` for parsing; authorization and execution stay under the invocation. Legacy
+`runCommand` opens `broker.command_run` directly beneath the remote parent, so one trace spans both processes. The trace
 identifier inside it is the only correlation identifier the system has: every span the broker opens
 for the call and every audit record it emits sits inside that trace, and the invocation identifier
 extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
@@ -463,7 +466,7 @@ capability exactly as for any other. Provider input rides the `input` fields bel
 word's argv, piped value, and output ride `provider.run_command`, so a header or body a command
 takes as an argument or prints as output is on the span like any other argument or output. The
 credential a sink injects and the wire request the HTTP host builds from it stay out of spans, and
-audit records carry no headers or bodies.
+audit records carry no headers or bodies except the bounded `X-GitHub-Request-Id` response value in HTTP evidence.
 
 An attested proposal adds routing fields to both spans: `broker.invocation` records the claimed
 `subject` and `agent`, and `broker.authorize` records the `subject` and the `via` peer the broker
@@ -683,9 +686,15 @@ carries the running `count` of events the policy's bounded queue could not take,
 `gateway_progress_terminal_unobserved` carries nothing at all: the ending was written on screen and
 the session task that asked for it had already gone, so the receipt saying whether the person was
 told went nowhere.
-A permanent Slack installation fallback emits the same degraded record with `transport=slack` and a
-`surface` of `agent-status`, `assistant-status` or `reaction`, which is a transport-wide breaker rather than a
-per-session one. `gateway_session_stop_requested` carries the transport and
+A permanent Slack installation fallback emits the same degraded record with a `surface` of
+`agent-status`, `assistant-status` or `reaction`, which is a transport-wide breaker rather than a
+per-session one. For `reaction`, `transport` is the configured transport name and `category` is the
+typed Slack error category: `missing_scope` (the bot needs `reactions:write`) or
+`not_allowed_token_type` (the installation supplied the wrong token type). This warning is emitted
+once per transport instance, disables later working and seen reaction calls, and never fails the
+answer. Correct the Slack app's scopes or token outside the gateway and restart it to reset the
+breaker. The status surfaces still carry `transport=slack`.
+`gateway_session_stop_requested` carries the transport and
 `via` (`native-stop`, `button`, `stop-reply`, `wall-clock`); `gateway_session_stop_ignored` carries
 the transport and `reason` (`no-session`, `other-subject`, `already-ended`). Three transport-side
 records sit beside those. `gateway_cancel_ack_failed` (debug, Discord) and
@@ -842,7 +851,7 @@ migration is implemented here.
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
+| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `run` beneath `broker.invocation`, or per legacy `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `console-smoke-claim-denied`, `console-real-scope-denied`, `chat-attestation-denied`, `chat-scope-required`, `probe-write`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`, `input` and `input.bytes`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; a `failed` outcome sets the span status to `Error`, described by `error`; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
@@ -850,9 +859,7 @@ migration is implemented here.
 | `provider.invoke` | `dekopon-broker-host` | capability, provider, `input` and `input.bytes`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure. An HTTP grant with `propagateTrace: true` propagates this span as the outbound `traceparent` when an OTel context exists; otherwise no trace header is sent. |
 
-`http.request` fields mirror `HttpCallEvidence` exactly: the span reports the same call the audit
-record carries, so URL paths and queries, request and response headers, and both bodies are absent
-here for the same reason they are absent from evidence. A test in `dekopon-http-host` drives a real
+`http.request` fields describe the same call as `HttpCallEvidence`; evidence alone also carries the bounded `X-GitHub-Request-Id` response value. URL paths and queries, other request and response headers, and both bodies are absent from evidence, and no header is recorded on the span. A test in `dekopon-http-host` drives a real
 loopback request whose path, query, header, and body are each a distinct sentinel and asserts that
 none of them reach a span field.
 
@@ -928,10 +935,11 @@ in `--oauth2-bearer '${drn:…}'`; that is a name and is recorded as one, and th
 resolved inside the broker after authorization and never reaches the guest or this span.
 
 `broker.command_run` is the command word's half of `broker.invocation`. `dekopon-brokerd` opens it
-for every `runCommand` beneath the `traceParent` the client sent, so the guest call that turns argv
-into a proposal sits inside the message's trace instead of starting its own. `outcome` is `proposed`
-when the guest returned a capability proposal, which the client then submits as an ordinary
-invocation; `rendered` when the guest answered by itself; `failed` when it declined the argv; and
+for every `run` beneath `broker.invocation`, whose remote parent is the client's `traceParent`.
+The guest call turns argv into a proposal, and the broker authorizes and executes it within the same
+invocation. Legacy `runCommand` opens the parsing span directly beneath the client's `traceParent`
+and returns the proposal for a separate `invoke`. `outcome` is `proposed`
+when the guest returned a capability proposal; `rendered` when the guest answered by itself; `failed` when it declined the argv; and
 `error` when the run did not complete — no provider declares the word, the input passed
 `maxInputBytes`, the guest trapped, or its answer did not decode — whose cause
 `command.resolve.failed` records.
@@ -1132,7 +1140,7 @@ withholds half of it serves nobody the constitution recognizes ([goal
 | `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — argv, drained provider or buffered-builtin input when recorded, and the rendered command result |
 | `provider.run_command` | `command.arguments`, `command.stdin`, `command.output` — the argv, the piped value, and the guest's answer |
 | `http.request` | `url.full` — the destination with its path and query |
-| model/tool log events | the verbatim transcript; see below |
+| model/tool span events | the verbatim transcript; see below |
 
 The six command fields and both `input` fields cut at the same place. A value of up to 4096 bytes
 passes unchanged; a longer one is cut at the last character boundary within 4096 bytes and suffixed
@@ -1157,17 +1165,16 @@ is no blind span ([storage telemetry and audit](#storage-telemetry-and-audit)).
 
 ## Model and tool transcript
 
-The verbatim exchange between the model and its tools rides the **log stream**, not span attributes.
-A conversation is unbounded text: span attributes are the wrong container for it, every trace fetch
-would drag the payload along, and a backend indexes log bodies for full-text search rather than span
-fields. Both signals carry the same `trace_id` and `span_id`, so a log result pivots to the turn it
-belongs to.
+The gateway's OTLP log filter is `job=debug,meter=info`. The `agent.model.prompt`,
+`agent.model.answer` and `agent.tool.*` events therefore reach OpenObserve as span events in the
+traces stream, rather than log records. Reconstruct the transcript from those events within the
+message trace.
 
 These events join the accounting and refusal ones:
 
 | Event | Carries |
 |---|---|
-| `agent.model.prompt` | The session's opening message list on its first turn, and on every later turn only the messages appended since the previous one |
+| `agent.model.prompt` | The session's message list on `full` events, and only the messages appended since the previous event on `delta` events |
 | `agent.model.answer` | Assistant text and the tool calls it requested, with arguments; `stream.interrupted = true` when a cancellation cut the turn short, and the text is then what had arrived |
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
@@ -1176,13 +1183,15 @@ These events join the accounting and refusal ones:
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 | `gateway.wake.scheduled` | The wake id, whether it is a watch, and the canonical subject it will speak as; the note and probe script are in the `agent.model.answer` tool call that asked for it |
 
-`agent.model.prompt` is emitted whole once per session and extended thereafter. Turn N's message
-list strictly contains turn N-1's, and everything appended since was already emitted by
-`agent.model.answer`, `agent.tool.script`, and `agent.tool.output` on the turn that produced it, so
-re-sending the whole list every turn would cost a long session O(N²) payload bytes of near-
-duplicates. `transcript.scope` says which shape an event carries (`full` or `delta`) and
+`agent.model.prompt` is emitted whole at session start and extended while prior content is unchanged.
+Sending only appended messages between full events avoids O(N²) duplicate payload bytes in a long
+session. `transcript.scope` says which shape an event carries (`full` or `delta`) and
 `message.count` gives the size of the request actually sent, so a reader can tell a trimmed session
-from a truncated log. Concatenating a session's events in order reconstructs the exact transcript.
+from a truncated event. After a steered cancellation or a change to previously transcribed content
+during preparation, the next prompt event is `full` again,
+including tool definitions and image digests resolved during the request. Released or unauthorized
+assets appear as the same text substitution that preparation sent to the model. A reader replaces
+its accumulated transcript on each `full` event and appends each `delta` to reconstruct the exact transcript.
 
 `accounting.model.turn` carries turn counts, durations, and outcomes. `agent.config.inspected`
 carries only the bounded result byte count and whether this call repeated an earlier one; it never
@@ -1197,7 +1206,7 @@ A mounted skill takes the same route as that meta result. The listing the model 
 one-line descriptions under one sentence that says to call `read_skill` — is a system message of its own,
 placed after the standing instructions, so it rides the first turn's `full` `agent.model.prompt`.
 The skill's text does not: a `read_skill` result is appended to the conversation like any other tool
-message and reaches the log stream only inside the following turn's `agent.model.prompt` delta.
+message and reaches the message trace only inside the following turn's `agent.model.prompt` delta.
 Neither `agent.tool.script` nor `agent.tool.output` fires for a skill read; `agent.skill.read`
 records the name, the path, and the byte count.
 

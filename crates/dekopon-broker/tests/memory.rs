@@ -188,6 +188,7 @@ fn claim_for(conversation: &str) -> Attestation {
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
             conversation: slack_conversation(conversation),
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     )
@@ -212,6 +213,7 @@ fn local_claim(transport: &str, conversation: &str) -> Attestation {
                 id: conversation.to_owned(),
                 thread: None,
             },
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     )

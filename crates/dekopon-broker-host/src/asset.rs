@@ -4,8 +4,8 @@ use dekopon_broker_protocol::{
 };
 use dekopon_capability::AssetConstraints;
 use dekopon_core::{
+    AssetNumber,
     base64::{self, Validator},
-    chat_asset_marker as reference,
 };
 use dekopon_http_host::{
     CHUNK_BYTES, FilePart, Representation,
@@ -28,7 +28,7 @@ const MAX_INVOCATION_BYTES: u64 = dekopon_core::asset::MAX_DECODED_INVOCATION_BY
 pub enum AssetAdmissionError {
     #[error("too many asset rows")]
     TooManyRows,
-    #[error("asset descriptor count does not match references")]
+    #[error("asset descriptor count does not match rows")]
     DescriptorCount,
     #[error("duplicate asset table row")]
     DuplicateRow,
@@ -202,7 +202,6 @@ impl AssetState {
 
     pub(crate) async fn invoke(
         inputs: AssetInputs,
-        references: Vec<u64>,
         grant: AssetConstraints,
         directory: Option<AssetDirectory>,
         origin: String,
@@ -212,23 +211,19 @@ impl AssetState {
             if inputs.rows.len() > MAX_ASSET_ROWS {
                 return Err(AssetAdmissionError::TooManyRows);
             }
-            if references.len() != inputs.descriptors.len()
-                || references.len() > MAX_ASSET_DESCRIPTORS
+            if (!inputs.descriptors.is_empty() && inputs.rows.len() != inputs.descriptors.len())
+                || inputs.descriptors.len() > MAX_ASSET_DESCRIPTORS
             {
                 return Err(AssetAdmissionError::DescriptorCount);
             }
             let ids: BTreeSet<_> = inputs.rows.iter().map(|row| row.id).collect();
-            if ids.len() != inputs.rows.len() {
+            if !inputs.descriptors.is_empty() && ids.len() != inputs.rows.len() {
                 return Err(AssetAdmissionError::DuplicateRow);
             }
-            let mut passed = Vec::with_capacity(references.len());
+            let mut passed = Vec::with_capacity(inputs.descriptors.len());
             let mut total = 0_u64;
-            for (id, fd) in references.into_iter().zip(inputs.descriptors) {
-                let row = inputs
-                    .rows
-                    .iter()
-                    .find(|row| row.id == id)
-                    .ok_or(AssetAdmissionError::UnknownReference)?;
+            for (row, fd) in inputs.rows.iter().zip(inputs.descriptors) {
+                let id = row.id;
                 let file = File::from(fd);
                 let metadata = file.metadata().map_err(AssetIoError::from)?;
                 let flags = rustix::fs::fcntl_getfl(&file)
@@ -289,39 +284,6 @@ impl AssetState {
         self.require_active()?;
         Ok(self.directory.clone())
     }
-}
-
-pub fn references(input: &serde_json::Value) -> Vec<u64> {
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
-    fn walk(input: &serde_json::Value, found: &mut Vec<u64>) {
-        match input {
-            serde_json::Value::String(text) => {
-                if let Some(id) = reference(text)
-                    && found.len() <= MAX_ASSET_DESCRIPTORS
-                    && !found.contains(&id)
-                {
-                    found.push(id);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    walk(value, found);
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for value in values.values() {
-                    walk(value, found);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut found = Vec::new();
-    walk(input, &mut found);
-    found
 }
 
 fn error(code: wit::ErrorCode, message: &str) -> wit::Error {
@@ -672,16 +634,20 @@ impl wit::Host for StoreState {
         text: String,
     ) -> wasmtime::Result<Result<Resource<HandleResource>, wit::Error>> {
         self.assets.require_active()?;
-        let Some(id) = reference(&text) else {
+        let Some(id) = AssetNumber::parse(&text).map(AssetNumber::get) else {
             return Ok(self.assets.refuse(error(
                 wit::ErrorCode::UnknownReference,
-                "reference was not passed with this invocation",
+                &format!(
+                    "{text} was not handed to this command; write it as its own unquoted word"
+                ),
             )));
         };
         let Some((_, file)) = self.assets.inputs.iter().find(|(key, _)| key.0 == id) else {
             return Ok(self.assets.refuse(error(
                 wit::ErrorCode::UnknownReference,
-                "reference was not passed with this invocation",
+                &format!(
+                    "{text} was not handed to this command; write it as its own unquoted word"
+                ),
             )));
         };
         if self.assets.outputs.removed.contains(&id) {
@@ -925,7 +891,7 @@ mod tests {
         directory: Option<AssetDirectory>,
         grant: AssetConstraints,
         inputs: AssetInputs,
-        refs: Vec<u64>,
+        _refs: Vec<u64>,
     ) -> StoreState {
         let runtime =
             Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default()).unwrap();
@@ -940,15 +906,10 @@ mod tests {
             )
             .unwrap()
             .into_data();
-        state.assets = AssetState::invoke(
-            inputs,
-            refs,
-            grant,
-            directory,
-            "provider:probe.attach".to_owned(),
-        )
-        .await
-        .unwrap();
+        state.assets =
+            AssetState::invoke(inputs, grant, directory, "provider:probe.attach".to_owned())
+                .await
+                .unwrap();
         state
     }
 
@@ -968,6 +929,28 @@ mod tests {
             cancel: None,
             upcalls: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_unhanded_reference_names_the_unquoted_word_remedy() {
+        let mut state = state(
+            None,
+            AssetConstraints::default(),
+            AssetInputs::default(),
+            vec![],
+        )
+        .await;
+        let failure = state
+            .open("chat-asset:9".to_owned())
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, wit::ErrorCode::UnknownReference);
+        assert_eq!(
+            failure.message,
+            "chat-asset:9 was not handed to this command; write it as its own unquoted word"
+        );
     }
 
     #[tokio::test]
@@ -1006,14 +989,8 @@ mod tests {
         for bytes in [None, Some(1), Some(0)] {
             let mut inputs = input(File::open(file.path()).unwrap(), 0, false);
             inputs.rows[0].bytes = bytes;
-            let result = AssetState::invoke(
-                inputs,
-                vec![1],
-                AssetConstraints::default(),
-                None,
-                "chat".into(),
-            )
-            .await;
+            let result =
+                AssetState::invoke(inputs, AssetConstraints::default(), None, "chat".into()).await;
             if bytes == Some(0) {
                 assert!(result.is_ok());
             } else {
@@ -1443,14 +1420,9 @@ mod tests {
                     .descriptors
                     .push(File::open(file.path()).unwrap().into());
             }
-            let result = AssetState::invoke(
-                inputs,
-                vec![1, 2, 3, 4, 5],
-                AssetConstraints::default(),
-                None,
-                "test".to_owned(),
-            )
-            .await;
+            let result =
+                AssetState::invoke(inputs, AssetConstraints::default(), None, "test".to_owned())
+                    .await;
             if extra == 0 {
                 assert!(result.is_ok());
             } else {
@@ -1703,7 +1675,6 @@ mod tests {
         assert!(
             AssetState::invoke(
                 input(file.reopen().unwrap(), 0, false),
-                vec![1],
                 AssetConstraints::default(),
                 None,
                 "provider:probe".to_owned()
@@ -1713,36 +1684,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reference_discovery_is_distinct_ordered_and_bounded_at_the_first_overflow() {
-        assert_eq!(
-            references(&serde_json::json!([
-                "chat-asset:2",
-                "chat-asset:1",
-                "chat-asset:2",
-                "chat-asset:01",
-                "chat-asset:0"
-            ])),
-            vec![2, 1]
-        );
-        assert_eq!(
-            references(&serde_json::json!([
-                "chat-asset:1",
-                "chat-asset:2",
-                "chat-asset:3",
-                "chat-asset:4",
-                "chat-asset:5"
-            ]))
-            .len(),
-            MAX_ASSET_DESCRIPTORS
-        );
-        let many = serde_json::Value::Array(
-            (1..1000)
-                .map(|id| serde_json::json!(format!("chat-asset:{id}")))
-                .collect(),
-        );
-        assert_eq!(references(&many).len(), MAX_ASSET_DESCRIPTORS + 1);
-    }
     #[tokio::test]
     async fn a_capacity_one_channel_sink_suspends_and_resumes_the_real_guest_without_changing_wit()
     {
@@ -1781,7 +1722,6 @@ mod tests {
         .unwrap();
         store.data_mut().assets = AssetState::invoke(
             AssetInputs::default(),
-            vec![],
             AssetConstraints::default(),
             Some(AssetDirectory::new(root.path().to_owned(), 100)),
             "provider:http-probe.fetch".to_owned(),
@@ -1832,7 +1772,6 @@ mod tests {
             };
             let admitted = AssetState::invoke(
                 inputs,
-                vec![],
                 AssetConstraints::default(),
                 None,
                 "provider:probe".to_owned(),
@@ -1853,7 +1792,6 @@ mod tests {
             file.as_file().set_len(bytes).unwrap();
             let admitted = AssetState::invoke(
                 input(File::open(file.path()).unwrap(), bytes, false),
-                vec![1],
                 AssetConstraints::default(),
                 None,
                 "provider:probe".to_owned(),

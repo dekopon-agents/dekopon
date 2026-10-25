@@ -1057,8 +1057,9 @@ fn input_asset_bytes_and_references_do_not_leak_between_calls() {
     assert!(failure.http_calls.is_empty());
     assert!(matches!(
         *failure.error,
-        dekopon_broker_host::BrokerHostError::AssetInput {
-            source: dekopon_broker_host::asset::AssetAdmissionError::DescriptorCount
+        dekopon_broker_host::BrokerHostError::HostCallRejected {
+            reason: "asset-call-rejected",
+            ..
         }
     ));
 }

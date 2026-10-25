@@ -26,14 +26,13 @@ Everything lives in the `Dekopon` namespace.
 
 | Entity type | Instances | Role |
 | --- | --- | --- |
-| `Dekopon::Principal` | enumerated from peer identities and subject mappings | principal of every action |
+| `Dekopon::Principal` | enumerated from peer identities and subject mappings | principal of every action; required String `kind` |
 | `Dekopon::Provider` | enumerated from loaded provider manifests | resource of every capability action |
 | `Dekopon::Agent` | **not** enumerated; matched by UID | resource of `agent.prompt` |
 | `Dekopon::Secret` | public DRNs from the owner-only private map | resource of `secret.use` |
 
 Actions are one `Dekopon::Action::"<capability-id>"` per loaded capability, plus the fixed
-`agent.prompt` and `secret.use` actions. None of the entities carry attributes: a policy matches
-them with `==` and `in`, and there is no entity data for an expression to read.
+`agent.prompt` and `secret.use` actions. `Principal` carries the required String attribute `kind` (`person`, `space`, `repository` or `service`); the other entities carry no attributes. A policy can read `principal.kind` without a `has` guard and match entities with `==` and `in`.
 
 Agents are the one type whose instances are not declared, because the agent catalog belongs to the
 gateway rather than the broker. Everything else is enumerated, and that is what turns a typo into a
@@ -68,7 +67,7 @@ Every action requires the string fields `via` and `agent`. Capability actions ad
 public DRN was proposed for. A request missing a required field is refused before policy evaluation,
 even if a policy would otherwise permit it.
 
-All three action types optionally carry `subject`, `transportKind`, `transport`, `trigger`, and
+All three action types optionally carry `subject`, `transportKind`, `transport`, `trigger`, `startedBy`, and
 `conversation`. When present, `conversation` requires `kind` and `id`; its `container` and `thread`
 fields are optional. Policies must guard optional fields with `has` before reading them. Ordinary
 policies' strict validation also prevents a field from being read on an action that never carries it.
@@ -122,7 +121,7 @@ Names must be bounded portable identifiers and unique across the set; two polici
 would make an explanation ambiguous, so it refuses startup.
 
 `PolicyEngine::digest()` is a `sha256:` fingerprint over the canonicalized policy set plus the
-sorted entity and action identifiers, domain-separated with `dekopon-policy-v1\0`. Two brokers
+sorted entity and action identifiers, principal kinds and group memberships, domain-separated with `dekopon-policy-v1\0`. Two brokers
 reporting the same digest evaluated the same authorization surface. It is recorded alongside
 `policy.ids` as `policy.digest`, and it is a correlation aid rather than a wire-format contract.
 

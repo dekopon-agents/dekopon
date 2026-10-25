@@ -24,6 +24,9 @@ struct Command {
 }
 #[derive(Subcommand)]
 enum Action {
+    AssetSend {
+        reference: String,
+    },
     /// Fetch one broker-authorized URI
     Fetch(FetchArgs),
     /// Read a resource, then write only if its observed etag still matches
@@ -187,6 +190,12 @@ impl Provider for HttpProbe {
     type Capabilities = (Fetch, ConditionalWrite, Purge);
     fn propose(args: Command, _: bool) -> Result<Proposal<Self>, Usage> {
         match args.action {
+            Action::AssetSend { reference } => Ok(Proposal::to::<Purge>(PurgeInput {
+                uri: None,
+                asset_mode: Some("send".to_owned()),
+                reference: Some(reference),
+                bytes: None,
+            })),
             Action::Fetch(fetch) => {
                 let input = FetchInput {
                     uri: Some(fetch.uri.uri),

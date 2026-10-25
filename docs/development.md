@@ -72,14 +72,16 @@ Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exi
 
 Generic model types and transports belong in `dekopon-model`; the shared bounded prompt/tool loop belongs in `dekopon-agent` (`prompt.rs`), which `dekopon-gatewayd` and external clients embed. `dekopon-model` holds no image client: producing an image is a provider effect, so the credential lives behind the broker and the gateway only delivers the bytes. Keep provider credentials inside the broker. Asset bytes cross broker IPC only as read-only descriptors; typed metadata stays out of the shell payload path. Mock network protocols in tests; never read or import another application's credential store.
 
-Asset proposals retain exact `chat-asset:<N>` references. The agent resolves distinct string leaves
-into pinned read-only descriptors and uses the protocol's typed `InvokeAssets` and
-`AssetInvocationOutcome`; no provider result byte-object parser or marker expansion remains.
+Provider argv carries typed references for whole unquoted `chat-asset:<N>` words. The agent resolves
+and pins distinct references, numbers indices by first occurrence, and sends only their rows and
+read-only descriptors in one `Run` frame. One `Ran` response reports parsing, refusal or the invoked
+proposal and its result; repeated references share a row and descriptor. Quoted or embedded marker
+text stays text. Gateway-built proposals retain `Invoke`; no proposal JSON walk discovers files.
 `attachment.rs` owns the gateway-facing registration/send traits; `dekopon-gatewayd::asset` owns scoped
 numbering, retention and output sniffing. Update the descriptor, lifetime, queue, transport and
 failure-note tests together. See [asset handles](gatewayd.md#asset-handles-and-delivery).
 
-Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text whether or not payload telemetry is on, same as every other model-authored record (goal 2). The contract is in [`improvement.md`](improvement.md).
+Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2). The contract is in [`improvement.md`](improvement.md).
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must validate its own capability-specific fields and constraints.
 
@@ -259,14 +261,15 @@ Return to the untouched checkout for stock builds and publication. If working in
 optimized checkout, restore its tracked `Cargo.lock` and omit `--config` to return to stock.
 `.github/workflows/wasmtime-optimization.yml` runs the optimized test and release build above.
 The RPi runs the optimized ARM64 image, so CI runs it on native `ubuntu-24.04-arm` for every Rust
-pull request. Pushes to `main` that touch Rust inputs and manual dispatch run both lanes; a pull
-request that changes the overlay, its lock or that workflow also runs native `ubuntu-24.04`.
+pull request. Pushes to `main` that touch Rust inputs and manual dispatch run both lanes; native
+`ubuntu-24.04` runs after merge or on manual dispatch.
 x86-64 is a supported, tested architecture for this build; its lane runs beside ARM64, never
 behind it. Neither lane is a required check, so fork availability does not block the normal
 validation path. Main-branch runs save each architecture's `wasmtime-optimization-v1` dependency
 cache that pull requests restore, and a newer merge queues behind a running main-branch run
 instead of cancelling it, so both caches stay current. Changing the pin requires regenerating
-`.cargo/wasmtime-optimization.lock` with Cargo in an isolated checkout and passing both lanes.
+`.cargo/wasmtime-optimization.lock` with Cargo in an isolated checkout and passing both lanes,
+with x86-64 passing after merge or through a manual dispatch on the branch.
 Never copy the optimized lock into a release-publication checkout. The independent existing
 `tracing-core` patch still applies to workspace builds; this option does not remove that exception.
 

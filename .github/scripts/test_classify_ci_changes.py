@@ -51,6 +51,16 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_docs",
         )
 
+    def test_optimized_wasmtime_lock_selects_rust_and_its_companion_lanes(self) -> None:
+        self.assert_selected(
+            [".cargo/wasmtime-optimization.lock"],
+            "run_rust",
+            "run_otel",
+            "run_package",
+            "run_dependencies",
+            "run_docs",
+        )
+
     def test_crate_manifest_runs_package_and_dependency_checks(self) -> None:
         self.assert_selected(
             ["crates/dekopon-core/Cargo.toml"],

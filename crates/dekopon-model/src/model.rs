@@ -1,4 +1,4 @@
-use std::{fmt, ops::ControlFlow};
+use std::{borrow::Cow, fmt, ops::ControlFlow};
 
 use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 
@@ -56,9 +56,11 @@ impl Serialize for ContentPart {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Text(text) => serializer.serialize_str(text),
-            Self::Image { mime, data } => {
-                serializer.serialize_str(&format!("[{mime}, {} bytes]", data.len()))
-            }
+            Self::Image { mime, data } => match data.sha256() {
+                Some(digest) => serializer
+                    .serialize_str(&format!("[{mime}, {} bytes] sha256:{digest}", data.len())),
+                None => serializer.serialize_str(&format!("[{mime}, {} bytes]", data.len())),
+            },
             Self::File { name, mime, data } => {
                 serializer.serialize_str(&format!("[{name} ({mime}), {} bytes]", data.len()))
             }
@@ -178,6 +180,67 @@ pub enum ModelMessage {
 }
 
 impl ModelMessage {
+    pub fn for_metering(&self) -> Cow<'_, Self> {
+        match self {
+            Self::User {
+                content: MessageContent::Parts(parts),
+            } => {
+                let mut metered = None;
+                for (index, part) in parts.iter().enumerate() {
+                    match part {
+                        ContentPart::Image { mime, data } => {
+                            metered.get_or_insert_with(|| parts.clone())[index] =
+                                ContentPart::Text(format!("[{mime}, {} bytes]", data.len()));
+                        }
+                        ContentPart::Text(_) | ContentPart::File { .. } => {}
+                    }
+                }
+                match metered {
+                    Some(parts) => Cow::Owned(Self::user_with_parts(parts)),
+                    None => Cow::Borrowed(self),
+                }
+            }
+            Self::System { .. }
+            | Self::User {
+                content: MessageContent::Text(_),
+            }
+            | Self::Assistant { .. }
+            | Self::ToolResults { .. } => Cow::Borrowed(self),
+        }
+    }
+
+    pub fn prepared_for_trace(&self) -> Cow<'_, Self> {
+        match self {
+            Self::User {
+                content: MessageContent::Parts(parts),
+            } => {
+                let mut prepared = None;
+                for (index, part) in parts.iter().enumerate() {
+                    let notice = match part {
+                        ContentPart::Image { data, .. } | ContentPart::File { data, .. } => {
+                            data.prepared_notice()
+                        }
+                        ContentPart::Text(_) => None,
+                    };
+                    if let Some(notice) = notice {
+                        prepared.get_or_insert_with(|| parts.clone())[index] =
+                            ContentPart::Text(notice);
+                    }
+                }
+                match prepared {
+                    Some(parts) => Cow::Owned(Self::user_with_parts(parts)),
+                    None => Cow::Borrowed(self),
+                }
+            }
+            Self::System { .. }
+            | Self::User {
+                content: MessageContent::Text(_),
+            }
+            | Self::Assistant { .. }
+            | Self::ToolResults { .. } => Cow::Borrowed(self),
+        }
+    }
+
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self::System {

@@ -73,9 +73,8 @@ use dekopon_agent::{
 };
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
-    CommandRunOutcome, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
-    DescriptorStream, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
-    ResponseEnvelope,
+    Conversation, ConversationKind, ConversationKindMatch, ConversationMatch, DescriptorStream,
+    FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{AgentId, ExternalSubject};
@@ -1972,6 +1971,7 @@ async fn authorize_github_fixture(
             transport: inbound.transport.parse().unwrap(),
             kind: inbound.transport_kind,
             conversation: inbound.conversation,
+            delivery: None,
             trigger: inbound.message_id.trigger(),
         },
     );
@@ -4344,7 +4344,7 @@ fn probe_listing() -> ResponseEnvelope {
     ResponseEnvelope::capabilities(
         vec![capability("cli-probe.upper")],
         vec!["probe".to_owned()],
-        BTreeMap::new(),
+        BTreeMap::from([("probe".to_owned(), "Usage: probe <COMMAND>\n".to_owned())]),
     )
 }
 
@@ -4393,7 +4393,8 @@ async fn stub_broker_assets(
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("secure stub socket");
     let (observed, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for (response, descriptors) in responses {
+        let mut responses = responses.into_iter().collect();
+        while !VecDeque::is_empty(&responses) {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
@@ -4404,6 +4405,8 @@ async fn stub_broker_assets(
             else {
                 return;
             };
+            let (response, descriptors) =
+                dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
             let _ = observed.send(request);
             use std::os::fd::AsFd;
             let passed: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
@@ -4555,6 +4558,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
             transport: "support-whatsapp".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
             conversation: inbound.conversation.clone(),
+            delivery: None,
             trigger: dekopon_broker_protocol::Trigger::Message,
         },
     );
@@ -5357,18 +5361,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![
-            probe_listing(),
-            ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
-                stdout: "Usage: probe <COMMAND>\n".to_owned(),
-                stderr: String::new(),
-                status: 0,
-            }),
-        ],
-    )
-    .await;
+    let (broker, mut observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
     let models = ModelScript::new([script_call("probe --help"), answer("done")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5390,18 +5383,9 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
             .request,
         BrokerRequest::Capabilities { .. }
     ));
-    let run = observed.recv().await.expect("the command run").request;
-    assert!(
-        matches!(
-            &run,
-            BrokerRequest::RunCommand { word, argv, stdin_piped: false, .. }
-                if word == "probe" && argv == &["--help".to_owned()]
-        ),
-        "{run:?}"
-    );
     assert!(
         observed.try_recv().is_err(),
-        "rendered text proposes nothing to invoke"
+        "literal help uses only the cached page"
     );
     let tool = tool_message(&models, 1);
     assert!(tool.contains("Usage: probe <COMMAND>"), "{tool}");
@@ -5482,22 +5466,11 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
     assert!(
         matches!(
             &run,
-            BrokerRequest::RunCommand { word, argv, .. }
-                if word == "probe" && argv == &["upper", "--text", "maybe"]
+            BrokerRequest::Run { word, argv, .. }
+                if word == "probe" && argv == &["upper", "--text", "maybe"].map(|text| dekopon_broker_protocol::Arg::Text(text.to_owned()))
         ),
         "{run:?}"
     );
-    assert!(matches!(
-        observed
-            .recv()
-            .await
-            .expect("capability invocation")
-            .request,
-        BrokerRequest::Invoke {
-            attestation: Some(Attestation { scope: Some(_), .. }),
-            ..
-        }
-    ));
     assert!(
         observed.try_recv().is_err(),
         "the warning is not a delivered model answer and must not be durably recorded"
@@ -12843,9 +12816,15 @@ async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlis
 
     let prepared = tokio::task::spawn_blocking(move || {
         let input = json!({"images": ["chat-asset:1"]});
-        let (assets, pins) = tokio::runtime::Handle::current()
-            .block_on(inputs.prepare(&input, 4))
-            .expect("one reference");
+        let dekopon_agent::attachment::PreparedRun { assets, pins, .. } =
+            tokio::runtime::Handle::current()
+                .block_on(inputs.prepare_run(
+                    &[dekopon_shell::Arg::Asset(
+                        dekopon_core::AssetNumber::parse("chat-asset:1").unwrap(),
+                    )],
+                    4,
+                ))
+                .expect("one reference");
         assert_eq!(assets.descriptors.len(), 1);
         assert_eq!(assets.rows[0].origin, "chat");
         assert_eq!(pins[0].read().unwrap(), b"\x89PNG\r\n\x1a\nshot");
@@ -15660,18 +15639,29 @@ async fn parked_broker(
     let entered = Arc::clone(&reached);
     let released = Arc::clone(&release);
     tokio::spawn(async move {
-        for response in answer_first {
+        let mut responses = answer_first
+            .into_iter()
+            .chain([parked_answer])
+            .map(|response| (response, Vec::new()))
+            .collect();
+        while !VecDeque::is_empty(&responses) {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
             let mut stream = DescriptorStream::new(stream);
-            if stream
+            let Ok((request, inputs)) = stream
                 .read_frame::<RequestEnvelope>(FrameLimits::default())
                 .await
-                .is_err()
-            {
+            else {
                 return;
+            };
+            let (response, _) =
+                dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
+            if responses.is_empty() {
+                entered.notify_one();
+                released.notified().await;
             }
+            drop(inputs);
             if stream
                 .write_frame(&response, &[], FrameLimits::default())
                 .await
@@ -15680,29 +15670,6 @@ async fn parked_broker(
                 return;
             }
         }
-        let Ok((stream, _)) = listener.accept().await else {
-            return;
-        };
-        let mut stream = DescriptorStream::new(stream);
-        let Ok((_request, streams)) = stream
-            .read_frame::<RequestEnvelope>(FrameLimits::default())
-            .await
-        else {
-            return;
-        };
-        entered.notify_one();
-        released.notified().await;
-        // A real broker closes the provider's streams before it answers.
-        drop(streams);
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "the parked call is released only after the test has already cancelled the \
-                      session, so the client may well be gone; what the test asserts on is the \
-                      cancellation, not this write"
-        )]
-        let _ = stream
-            .write_frame(&parked_answer, &[], FrameLimits::default())
-            .await;
     });
     (
         ResolvedBroker {
@@ -16371,15 +16338,6 @@ async fn a_steer_keeps_the_original_wall_clock_deadline() {
     .await;
     model.release_next();
     model.wait_until_asked().await;
-    assert!(
-        capture.events().into_iter().any(|(fields, _)| {
-            fields.contains(" audit.event=\"agent.model.prompt\"")
-                && fields.contains(" model.turn=2")
-                && fields.contains("and one more thing")
-        }),
-        "the steer is taken into the running session before its deadline: {}",
-        capture.events_text()
-    );
 
     assert_eq!(
         wall_clock_stops_after(&capture, Duration::from_millis(19_999)).await,
@@ -16393,6 +16351,15 @@ async fn a_steer_keeps_the_original_wall_clock_deadline() {
     );
     model.release_next();
     session.await.expect("the stopped session unwinds");
+    assert!(
+        capture.events().into_iter().any(|(fields, _)| {
+            fields.contains(" audit.event=\"agent.model.prompt\"")
+                && fields.contains(" model.turn=2")
+                && fields.contains("and one more thing")
+        }),
+        "the steer is taken into the running session before its deadline: {}",
+        capture.events_text()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -16845,22 +16812,30 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 listing.request,
                 BrokerRequest::Capabilities { .. }
             ));
-            let _command = observed.recv().await.expect("command");
-            let BrokerRequest::Invoke {
+            let BrokerRequest::Run {
                 invocation,
+                word,
+                argv,
+                assets,
                 attestation: Some(claim),
                 ..
-            } = observed.recv().await.expect("proposal").request
+            } = observed.recv().await.expect("edit run").request
             else {
-                panic!("attested proposal")
+                panic!("attested run");
             };
-            assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
+            assert_eq!(word, "gpt-image");
             assert_eq!(
-                invocation.input["images"][0],
-                format!("chat-asset:{}", edit + 1)
+                assets.iter().map(|row| row.id).collect::<Vec<_>>(),
+                [u64::try_from(edit + 1).unwrap()]
             );
-            observed.recv().await.expect("send command");
-            observed.recv().await.expect("send invocation");
+            assert!(argv.contains(&dekopon_broker_protocol::Arg::Asset(
+                dekopon_broker_protocol::AssetIndex::try_from(0).unwrap()
+            )));
+            assert!(claim.binds(&invocation));
+            assert!(matches!(
+                observed.recv().await.expect("send run").request,
+                BrokerRequest::Run { .. }
+            ));
             assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
         }
@@ -17678,13 +17653,16 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     );
     assert_eq!(models.tool_names(0), models.tool_names(1));
     assert!(tool_message(&models, 1).contains("chat-asset:1"));
-    for _ in 0..4 {
+    for _ in 0..2 {
         observed.recv().await.unwrap();
     }
-    let BrokerRequest::Invoke { invocation, .. } = observed.recv().await.unwrap().request else {
-        panic!("second invocation")
+    let BrokerRequest::Run { argv, assets, .. } = observed.recv().await.unwrap().request else {
+        panic!("second run");
     };
-    assert_eq!(invocation.input["images"][0], "chat-asset:1");
+    assert_eq!(assets.iter().map(|row| row.id).collect::<Vec<_>>(), [1]);
+    assert!(argv.contains(&dekopon_broker_protocol::Arg::Asset(
+        dekopon_broker_protocol::AssetIndex::try_from(0).unwrap()
+    )));
     assert_eq!(driver.replies(), vec!["Two produced images.".to_owned()]);
 }
 
@@ -17997,6 +17975,7 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
             transport: message.transport.parse().unwrap(),
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
+            delivery: None,
             trigger: message.message_id.trigger(),
         },
     );
@@ -18191,7 +18170,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         dekopon_broker_protocol::Trigger::Message
     );
     let unlisted = broker.request().await;
-    let BrokerRequest::RunCommand {
+    let BrokerRequest::Run {
         attestation: Some(unlisted_claim),
         word: unlisted_word,
         argv: unlisted_argv,
@@ -18206,12 +18185,17 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         dekopon_broker_protocol::Trigger::Message
     );
     assert_eq!(unlisted_word, "probe");
-    assert_eq!(unlisted_argv, ["reverse", "--text", "secret"]);
+    assert_eq!(
+        unlisted_argv,
+        ["reverse", "--text", "secret"]
+            .map(|text| dekopon_broker_protocol::Arg::Text(text.to_owned()))
+    );
     let command = broker.request().await;
-    let BrokerRequest::RunCommand {
+    let BrokerRequest::Run {
         attestation: Some(claim),
         word,
         argv,
+        invocation,
         ..
     } = command.request
     else {
@@ -18223,24 +18207,12 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         dekopon_broker_protocol::Trigger::Message
     );
     assert_eq!(word, "probe");
-    assert_eq!(argv, ["upper", "--text", "hello"]);
-    let invocation = broker.request().await;
-    let BrokerRequest::Invoke {
-        attestation: Some(claim),
-        invocation,
-        ..
-    } = invocation.request
-    else {
-        panic!("third request must invoke the named capability: {invocation:?}");
-    };
-    assert_eq!(claim.subject, inbound.subject);
     assert_eq!(
-        claim.scope.as_ref().unwrap().trigger,
-        dekopon_broker_protocol::Trigger::Message
+        argv,
+        ["upper", "--text", "hello"]
+            .map(|text| dekopon_broker_protocol::Arg::Text(text.to_owned()))
     );
-    assert!(claim.binds(&invocation.id));
-    assert_eq!(invocation.capability.to_string(), "cli-probe.upper");
-    assert_eq!(invocation.input, json!({"text": "hello"}));
+    assert!(claim.binds(&invocation));
     assert!(
         broker.recorded().is_empty(),
         "two fresh capabilities requests, one permitted invocation and no unlisted invocation"
@@ -18484,7 +18456,7 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
         dekopon_test_support::Record::Span { name: "gateway.message", .. }
         if record.field("outcome") == Some("failed"))));
     let mut requests = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..3 {
         requests.push(
             tokio::time::timeout(Duration::from_secs(3), observed.recv())
                 .await
@@ -18492,14 +18464,8 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
                 .expect("broker request is recorded"),
         );
     }
-    assert!(
-        matches!(&requests[2].request, BrokerRequest::Invoke { invocation, .. }
-        if invocation.capability.as_str() == "cli-probe.upper")
-    );
-    assert!(
-        matches!(&requests[4].request, BrokerRequest::Invoke { invocation, .. }
-        if invocation.capability.as_str() == "dekopon-provider-follow.leave")
-    );
+    assert!(matches!(&requests[1].request, BrokerRequest::Run { word, .. } if word == "probe"));
+    assert!(matches!(&requests[2].request, BrokerRequest::Run { word, .. } if word == "follow"));
     assert!(observed.try_recv().is_err());
 }
 
@@ -18613,16 +18579,9 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
             .unwrap()
             .unwrap()
             .request,
-        BrokerRequest::RunCommand { .. }
+        BrokerRequest::Run { .. }
     ));
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(3), observed.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .request,
-        BrokerRequest::Invoke { .. }
-    ));
+    assert!(observed.try_recv().is_err());
 }
 
 #[tokio::test]

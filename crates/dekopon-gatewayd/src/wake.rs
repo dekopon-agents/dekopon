@@ -87,6 +87,7 @@ impl Anchor {
                 transport: self.transport.clone(),
                 kind: self.kind,
                 conversation: self.conversation.clone(),
+                delivery: None,
                 trigger,
             },
         )

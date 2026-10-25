@@ -469,13 +469,20 @@ scope and generation fences are unchanged.
 
 ## Asset handles and delivery
 
-The gateway's conversation-generation table is the only asset inventory: uploads and provider
-outputs have scoped `chat-asset:<N>` references, never model-supplied paths. Every exact matching
-proposal string leaf is resolved automatically, in first-occurrence order; repeated references
-share one pin and descriptor. Data URLs in proposals are refused before broker submission.
-The proposal JSON remains unchanged. Only referenced files cross the broker boundary as read-only,
-close-on-exec descriptors; the complete bounded metadata table and remaining-send allowance ride
-beside the invocation. Broker subject, Cedar and HTTP authorization are unchanged.
+The gateway's conversation-generation table is the asset inventory. To hand a file to a provider
+command, write `chat-asset:N` as its own unquoted word. Quoted references, escaped text, variable
+values and references inside larger words are plain text. Builtins never read attachments;
+use `asset cat chat-asset:3 | head` to pipe file text into a builtin.
+
+Each provider command sends one `Run` frame and receives one `Ran` response. The gateway resolves
+and pins at most five distinct references, numbers indices by first occurrence, and sends only
+those metadata rows and read-only, close-on-exec descriptors. Repeated references share one pin
+and descriptor. Pins last until the response or cancellation. Data URLs in argv, including the
+value after the first `=`, are refused before submission. The broker parses the command word and
+authorizes its proposal through the existing subject, Cedar, grants, secret-use and HTTP checks.
+An unquoted literal `<word> --help` uses the cached page without a frame or capability-call charge.
+The legacy `RunCommand` operation remains for old consoles; `Invoke` carries metadata but no asset
+input descriptors, so an unrebuilt console can run plain commands but cannot hand files to them.
 
 A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded

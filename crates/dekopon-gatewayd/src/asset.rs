@@ -2441,10 +2441,14 @@ mod retention_tests {
             assert_eq!(input(&session, a).unwrap_err(), ChatAssetRefusal::Reclaimed);
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
             let inputs = ChatAssetInputs::new(Arc::new(session));
-            let proposal = json!([format!("chat-asset:{b}"), format!("chat-asset:{a}")]);
+            let proposal = [b, a].map(|id| {
+                dekopon_shell::Arg::Asset(
+                    dekopon_core::AssetNumber::parse(&format!("chat-asset:{id}")).unwrap(),
+                )
+            });
             let original = proposal.clone();
             assert!(matches!(
-                Handle::current().block_on(inputs.prepare(&proposal, 4)),
+                Handle::current().block_on(inputs.prepare_run(&proposal, 4)),
                 Err(ChatAssetRefusal::Reclaimed)
             ));
             assert_eq!(proposal, original, "no partial edit reaches submission");
@@ -2689,7 +2693,12 @@ mod retention_tests {
         }
         assert_eq!(store.retention.lock().bytes, 5 * encoded.len());
         let inputs = ChatAssetInputs::new(Arc::<SessionAssets>::clone(&session));
-        let (assets, pins) = inputs.prepare(&json!(references), 4).await.unwrap();
+        let argv = references
+            .iter()
+            .map(|text| dekopon_shell::Arg::Asset(dekopon_core::AssetNumber::parse(text).unwrap()))
+            .collect::<Vec<_>>();
+        let dekopon_agent::attachment::PreparedRun { assets, pins, .. } =
+            inputs.prepare_run(&argv, 4).await.unwrap();
         assert_eq!(assets.descriptors.len(), 5);
         assert_eq!(
             pins.iter().map(DiskBlob::len).sum::<usize>(),

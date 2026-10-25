@@ -19,11 +19,6 @@ on:
       - "examples/conditional-write/**"
       - "examples/providers/**"
       - "wit/**"
-  pull_request:
-    paths:
-      - ".cargo/wasmtime-optimization.lock"
-      - ".cargo/wasmtime-optimization.toml"
-      - ".github/workflows/wasmtime-optimization.yml"
   workflow_dispatch:
 
 permissions:
@@ -45,8 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ci.yml already calls this with the ARM64 runner on every Rust pull request.
-        os: ${{ fromJSON(inputs.runners || (github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]')) }}
+        os: ${{ fromJSON(inputs.runners || '["ubuntu-24.04", "ubuntu-24.04-arm"]') }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

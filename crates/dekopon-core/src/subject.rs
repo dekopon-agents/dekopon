@@ -8,6 +8,27 @@ use thiserror::Error;
 
 use crate::MAX_IDENTIFIER_LENGTH;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrincipalKind {
+    Person,
+    Space,
+    Repository,
+    Service,
+}
+
+impl PrincipalKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Space => "space",
+            Self::Repository => "repository",
+            Self::Service => "service",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum SubjectService {
@@ -110,8 +131,6 @@ impl ExternalSubject {
         Self::build(SubjectService::Slack, Some(tenant), subject)
     }
 
-    /// Discord user identifiers are global, not server-scoped, so unlike Slack there's no tenant
-    /// segment; the guild is just routing context.
     pub fn discord(user: &str) -> Result<Self, SubjectError> {
         let subject = numeric_segment(user, "subject")?;
         Self::build(SubjectService::Discord, None, subject)
@@ -163,6 +182,20 @@ impl ExternalSubject {
             });
         }
         Ok(candidate)
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> PrincipalKind {
+        match self.service {
+            SubjectService::Slack if self.subject.starts_with(['c', 'g']) => PrincipalKind::Space,
+            SubjectService::Discord if self.tenant.is_some() => PrincipalKind::Space,
+            SubjectService::Github => PrincipalKind::Repository,
+            SubjectService::Slack
+            | SubjectService::Discord
+            | SubjectService::Telegram
+            | SubjectService::Whatsapp
+            | SubjectService::Tel => PrincipalKind::Person,
+        }
     }
 
     #[must_use]
@@ -237,7 +270,9 @@ impl FromStr for ExternalSubject {
         if segments.next().is_some() {
             return Err(SubjectError::TooManySegments);
         }
-        let (tenant, subject) = if service.requires_tenant() {
+        let (tenant, subject) = if service.requires_tenant()
+            || (service == SubjectService::Discord && third.is_some())
+        {
             let subject = third.ok_or(SubjectError::MissingSegment { segment: "subject" })?;
             (Some(second), subject)
         } else {
@@ -251,7 +286,9 @@ impl FromStr for ExternalSubject {
             .transpose()?;
         let subject = require_canonical_segment(service, SubjectSegment::Subject, subject)?;
         let numeric = match service {
-            SubjectService::Discord => is_discord_snowflake(&subject),
+            SubjectService::Discord => {
+                is_discord_snowflake(&subject) && tenant.as_deref().is_none_or(is_discord_snowflake)
+            }
             SubjectService::Whatsapp => {
                 !subject.starts_with('0') && subject.bytes().all(|byte| byte.is_ascii_digit())
             }
@@ -386,6 +423,28 @@ mod tests {
         );
         assert!(ExternalSubject::github(&"x".repeat(40), "repo").is_err());
         assert!(ExternalSubject::github("owner", &"x".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn subject_kind_follows_the_subject_form() {
+        use super::PrincipalKind;
+        for (form, kind) in [
+            ("slack.team.channel", PrincipalKind::Space),
+            ("slack.team.group", PrincipalKind::Space),
+            ("slack.team.user", PrincipalKind::Person),
+            ("slack.team.worker", PrincipalKind::Person),
+            ("discord.123.456", PrincipalKind::Space),
+            ("discord.123", PrincipalKind::Person),
+            ("github.owner.repo", PrincipalKind::Repository),
+            ("telegram.123", PrincipalKind::Person),
+            ("whatsapp.123", PrincipalKind::Person),
+            ("tel.123", PrincipalKind::Person),
+        ] {
+            let subject: ExternalSubject = form.parse().expect("canonical subject");
+            assert_eq!(subject.kind(), kind);
+            assert_eq!(subject.canonical(), form);
+        }
+        assert!("discord.123.456.789".parse::<ExternalSubject>().is_err());
     }
 
     #[test]

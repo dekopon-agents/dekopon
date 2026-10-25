@@ -358,6 +358,9 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
         ProtocolError::DescriptorIndex => "descriptor-index",
         ProtocolError::DescriptorFlags { .. } => "descriptor-flags",
         ProtocolError::TooManyAssetRows => "too-many-asset-rows",
+        ProtocolError::UnknownAssetIndex => "unknown-asset-index",
+        ProtocolError::UnreferencedAsset => "unreferenced-asset",
+        ProtocolError::DuplicateAssetRow => "duplicate-asset-row",
         ProtocolError::InvalidGenerationDigest => "invalid-generation-digest",
     }
 }
@@ -485,25 +488,15 @@ where
             .map_err(ConnectionError::Write)?;
         return Ok(());
     };
-    let received = stream.read_frame::<RequestEnvelope>(limits).await.and_then(
-        |(request, mut descriptors)| {
-            request.request.validate()?;
-            if !descriptors.is_empty() && !matches!(request.request, BrokerRequest::Invoke { .. }) {
-                return Err(ProtocolError::UnexpectedDescriptors);
-            }
-            let streams = if let BrokerRequest::Invoke {
-                streams: Some(shape),
-                ..
-            } = &request.request
-            {
-                Some(Streams::split_from(&mut descriptors, *shape)?)
-            } else {
-                None
-            };
-            Ok((request, descriptors, streams))
-        },
-    );
-    let (request, descriptors, streams) = match received {
+    let received = stream
+        .read_frame::<RequestEnvelope>(limits)
+        .await
+        .and_then(|(request, descriptors)| ReceivedRequest::admit(request, descriptors));
+    let ReceivedRequest {
+        request,
+        descriptors,
+        streams,
+    } = match received {
         Ok(request) => request,
         Err(error) => {
             // Timeout, oversized frame, and bad JSON share one wire code; only the bounded message
@@ -628,6 +621,184 @@ where
                     span.in_scope(|| report_command_run_failure(&word, &error));
                     ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
                 }
+            }
+        }
+        BrokerRequest::Run {
+            attestation,
+            invocation,
+            trace_parent,
+            word,
+            argv,
+            assets,
+            sends_remaining,
+            streams: _,
+        } => {
+            use dekopon_broker_protocol::{Arg, RunOutcome};
+            if !claim_is_valid(attestation.as_ref(), Some(&invocation)) {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            let span = match attestation.as_ref() {
+                Some(claim) => tracing::info_span!(
+                    "broker.invocation",
+                    invocation = %invocation,
+                    capability = tracing::field::Empty,
+                    trace = %trace_parent.trace(),
+                    subject = %claim.subject,
+                    agent = %claim.agent,
+                ),
+                None => tracing::info_span!(
+                    "broker.invocation",
+                    invocation = %invocation,
+                    capability = tracing::field::Empty,
+                    trace = %trace_parent.trace(),
+                ),
+            };
+            adopt_trace_parent(&span, trace_parent);
+            let command_span = tracing::info_span!(parent: &span, "broker.command_run", word = %word, outcome = tracing::field::Empty, otel.status_code = tracing::field::Empty);
+            let argv = argv
+                .into_iter()
+                .map(|argument| match argument {
+                    Arg::Text(text) => text,
+                    Arg::Asset(index) => {
+                        format!("chat-asset:{}", assets[usize::from(index.get())].id)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let parsed = broker
+                .run_command(
+                    context,
+                    peer.attestor.as_ref(),
+                    attestation.as_ref(),
+                    &word,
+                    &argv,
+                    streams
+                        .as_ref()
+                        .is_some_and(|streams| streams.stdin.is_some()),
+                )
+                .instrument(command_span.clone())
+                .await;
+            match &parsed {
+                Ok(outcome) => {
+                    command_span.record("outcome", command_run_outcome(outcome));
+                }
+                Err(_) => {
+                    command_span.record("outcome", "error");
+                    command_span.record("otel.status_code", "error");
+                }
+            }
+            let (capability, input, secret_use) = match parsed {
+                Ok(CommandRunOutcome::Proposed {
+                    capability,
+                    input,
+                    secret_use,
+                }) => (capability, input, secret_use),
+                Ok(CommandRunOutcome::Rendered {
+                    stdout,
+                    stderr,
+                    status,
+                }) => {
+                    return answer_run(
+                        &mut stream,
+                        limits,
+                        RunOutcome::Rendered {
+                            stdout,
+                            stderr,
+                            status,
+                        },
+                    )
+                    .await;
+                }
+                Ok(CommandRunOutcome::Failed { error }) => {
+                    return answer_run(&mut stream, limits, RunOutcome::Refused { error }).await;
+                }
+                Err(error @ dekopon_broker_host::BrokerHostError::UnknownCommandWord { .. }) => {
+                    command_span.in_scope(|| report_command_run_failure(&word, &error));
+                    return answer_run(&mut stream, limits, RunOutcome::NotFound).await;
+                }
+                Err(error) => {
+                    command_span.in_scope(|| report_command_run_failure(&word, &error));
+                    return answer_run(
+                        &mut stream,
+                        limits,
+                        RunOutcome::Refused {
+                            error: dekopon_broker_protocol::ComponentFailure {
+                                code: "command-failed".to_owned(),
+                                message: "command word could not be run".to_owned(),
+                            },
+                        },
+                    )
+                    .await;
+                }
+            };
+            let granted = broker
+                .capability_surface(context, peer.attestor.as_ref(), attestation.as_ref())
+                .is_some_and(|(capabilities, _, _, _)| {
+                    capabilities
+                        .iter()
+                        .any(|available| available.capability.id == capability)
+                });
+            if !granted {
+                return answer_run(&mut stream, limits, RunOutcome::NotGranted { capability })
+                    .await;
+            }
+            span.record("capability", capability.as_str());
+            let reported = (capability.clone(), input.clone(), secret_use.clone());
+            let invocation = dekopon_broker_protocol::InvocationRequest {
+                id: invocation,
+                trace_parent,
+                capability,
+                input,
+                secret_use,
+            };
+            if !claim_is_valid(attestation.as_ref(), Some(&invocation.id)) {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            let parent = invocation.id.clone();
+            let (cancel, signal) = watch::channel(false);
+            let (upcalls, requests) = mpsc::channel(1);
+            let operation = broker
+                .invoke(
+                    context,
+                    peer.attestor.as_ref(),
+                    attestation.as_ref(),
+                    invocation,
+                    dekopon_broker_host::asset::AssetInputs {
+                        rows: assets,
+                        descriptors,
+                        sends_remaining,
+                        streams,
+                        cancel: Some(signal),
+                        upcalls: Some(upcalls),
+                    },
+                )
+                .instrument(span.clone());
+            let upcaller = Upcaller {
+                parent: &parent,
+                span: &span,
+                limits,
+            };
+            let outcome = upcaller
+                .converse(&mut stream, operation, requests, &cancel)
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    outputs = outcome.assets;
+                    ResponseEnvelope {
+                        api_version: ProtocolVersion::V1Alpha2,
+                        response: dekopon_broker_protocol::BrokerResponse::Ran {
+                            outcome: RunOutcome::Invoked {
+                                capability: reported.0,
+                                input: reported.1,
+                                secret_use: reported.2,
+                                result: outcome.result,
+                                attached: std::mem::take(&mut outputs.attached),
+                                removed: std::mem::take(&mut outputs.removed),
+                                sent: std::mem::take(&mut outputs.sent),
+                            },
+                        },
+                    }
+                }
+                Err(error) => return write_broker_failure(&mut stream, limits, error).await,
             }
         }
         BrokerRequest::Invoke {
@@ -879,6 +1050,7 @@ impl Upcaller<'_> {
                 Ok(())
             }
             BrokerRequest::Capabilities { .. }
+            | BrokerRequest::Run { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
@@ -1027,6 +1199,77 @@ pub enum ServerError {
     },
     #[error("broker connections did not finish within the shutdown grace period")]
     ShutdownTimeout,
+}
+
+async fn answer_run(
+    stream: &mut DescriptorStream,
+    limits: FrameLimits,
+    outcome: dekopon_broker_protocol::RunOutcome,
+) -> Result<(), ConnectionError> {
+    stream
+        .write_frame(
+            &ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                response: dekopon_broker_protocol::BrokerResponse::Ran { outcome },
+            },
+            &[],
+            limits,
+        )
+        .await
+        .map_err(ConnectionError::Write)
+}
+
+struct ReceivedRequest {
+    request: RequestEnvelope,
+    descriptors: Vec<std::os::fd::OwnedFd>,
+    streams: Option<Streams>,
+}
+
+impl ReceivedRequest {
+    fn admit(
+        request: RequestEnvelope,
+        mut descriptors: Vec<std::os::fd::OwnedFd>,
+    ) -> Result<Self, ProtocolError> {
+        request.request.validate()?;
+        let streams = match &request.request {
+            BrokerRequest::Run {
+                assets, streams, ..
+            } => {
+                let streams = Streams::split_from(&mut descriptors, *streams)?;
+                if assets.len() != descriptors.len() {
+                    return Err(ProtocolError::DescriptorIndex);
+                }
+                Some(streams)
+            }
+            BrokerRequest::Invoke { streams, .. } => {
+                let streams = streams
+                    .map(|shape| Streams::split_from(&mut descriptors, shape))
+                    .transpose()?;
+                if !descriptors.is_empty() {
+                    return Err(ProtocolError::UnexpectedDescriptors);
+                }
+                streams
+            }
+            BrokerRequest::Capabilities { .. }
+            | BrokerRequest::RunCommand { .. }
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::UpcallResult { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => {
+                if !descriptors.is_empty() {
+                    return Err(ProtocolError::UnexpectedDescriptors);
+                }
+                None
+            }
+        };
+        Ok(Self {
+            request,
+            descriptors,
+            streams,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1370,5 +1613,69 @@ mod generation_tests {
         let state = coordination.state.lock();
         assert!(Arc::ptr_eq(&state.active, &committed));
         assert!(state.prepared.is_none());
+    }
+}
+
+#[cfg(test)]
+mod run_admission_tests {
+    use super::*;
+    use std::os::fd::AsFd as _;
+    use tokio::io::AsyncReadExt as _;
+
+    async fn rejected(
+        index: u8,
+        rows: usize,
+        descriptor_count: usize,
+    ) -> (ProtocolError, Vec<tokio::net::UnixStream>) {
+        let request: RequestEnvelope = serde_json::from_value(serde_json::json!({
+            "apiVersion":"dekopon.dev/broker/v1alpha2",
+            "request":{"operation":"run", "traceParent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "invocation":"rejected", "word":"probe", "argv":[{"asset":index}], "assets":(0..rows).map(|id| serde_json::json!({"id":id+1,"contentType":"image/png","encoding":"identity","bytes":0,"origin":"chat","sent":false})).collect::<Vec<_>>(), "sendsRemaining":4,"streams":{"stdin":false}}
+        })).unwrap();
+        let mut passed = Vec::new();
+        let mut observers = Vec::new();
+        for _ in 0..descriptor_count {
+            let (descriptor, observer) = tokio::net::UnixStream::pair().unwrap();
+            passed.push(descriptor);
+            observers.push(observer);
+        }
+        let (sender, receiver) = tokio::net::UnixStream::pair().unwrap();
+        let mut sender = DescriptorStream::new(sender);
+        let mut receiver = DescriptorStream::new(receiver);
+        sender
+            .write_frame(
+                &request,
+                &passed.iter().map(|fd| fd.as_fd()).collect::<Vec<_>>(),
+                FrameLimits::default(),
+            )
+            .await
+            .unwrap();
+        drop(passed);
+        let (request, descriptors) = receiver
+            .read_frame::<RequestEnvelope>(FrameLimits::default())
+            .await
+            .unwrap();
+        let error = match ReceivedRequest::admit(request, descriptors) {
+            Err(error) => error,
+            Ok(_) => panic!("refused frame"),
+        };
+        (error, observers)
+    }
+
+    #[tokio::test]
+    async fn an_unknown_index_is_refused_and_closes_every_descriptor() {
+        let (error, observers) = rejected(4, 2, 3).await;
+        assert!(matches!(error, ProtocolError::UnknownAssetIndex));
+        for mut observer in observers {
+            assert_eq!(observer.read(&mut [0]).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_without_its_descriptor_is_refused() {
+        let (error, observers) = rejected(0, 1, 1).await;
+        assert!(matches!(error, ProtocolError::DescriptorIndex));
+        for mut observer in observers {
+            assert_eq!(observer.read(&mut [0]).await.unwrap(), 0);
+        }
     }
 }

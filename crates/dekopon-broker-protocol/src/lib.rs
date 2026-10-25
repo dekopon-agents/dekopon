@@ -318,6 +318,8 @@ pub struct ChatScopeClaim {
     pub kind: ChatTransportKind,
     pub conversation: Conversation,
     pub trigger: Trigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryIdentity>,
 }
 
 impl fmt::Debug for ChatScopeClaim {
@@ -457,6 +459,10 @@ impl Attestation {
     rename_all_fields = "camelCase"
 )]
 pub enum DeliveryIdentity {
+    Github {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        delivery: String,
+    },
     Slack {
         #[serde(deserialize_with = "deserialize_scope_part")]
         channel: String,
@@ -510,6 +516,7 @@ impl DeliveryIdentity {
     pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
         let conversation = &scope.conversation;
         match (self, scope.kind) {
+            (Self::Github { delivery }, ChatTransportKind::Github) => bounded_scope_part(delivery),
             (Self::Slack { channel, timestamp }, ChatTransportKind::Slack) => {
                 channel == &conversation.id && canonical_slack_timestamp(timestamp)
             }
@@ -859,6 +866,20 @@ pub enum BrokerRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    Run {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+        #[serde(rename = "traceParent")]
+        trace_parent: TraceParent,
+        invocation: InvocationId,
+        word: String,
+        argv: Vec<Arg>,
+        #[serde(default)]
+        assets: Vec<AssetRow>,
+        #[serde(rename = "sendsRemaining")]
+        sends_remaining: u8,
+        streams: StreamDescriptors,
+    },
     RunCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
@@ -904,6 +925,31 @@ pub enum BrokerRequest {
 impl BrokerRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
+            Self::Run { argv, assets, .. } => {
+                if assets.len() > MAX_ASSET_DESCRIPTORS {
+                    return Err(ProtocolError::TooManyAssetRows);
+                }
+                let mut named = [false; MAX_ASSET_DESCRIPTORS];
+                for argument in argv {
+                    if let Arg::Asset(index) = argument {
+                        let index = usize::from(index.0);
+                        if index >= assets.len() {
+                            return Err(ProtocolError::UnknownAssetIndex);
+                        }
+                        named[index] = true;
+                    }
+                }
+                let mut ids = std::collections::BTreeSet::new();
+                for (index, row) in assets.iter().enumerate() {
+                    if !ids.insert(row.id) {
+                        return Err(ProtocolError::DuplicateAssetRow);
+                    }
+                    if !named[index] {
+                        return Err(ProtocolError::UnreferencedAsset);
+                    }
+                }
+                Ok(())
+            }
             Self::Invoke { assets, .. } if assets.len() > MAX_ASSET_ROWS => {
                 Err(ProtocolError::TooManyAssetRows)
             }
@@ -932,6 +978,88 @@ fn valid_generation_digest(digest: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub struct RunRequest {
+    pub invocation: InvocationId,
+    pub trace_parent: TraceParent,
+    pub word: String,
+    pub argv: Vec<Arg>,
+}
+
+#[cfg(unix)]
+pub struct RunResponse {
+    pub outcome: RunOutcome,
+    pub descriptors: Vec<OwnedFd>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum Arg {
+    Text(String),
+    Asset(AssetIndex),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct AssetIndex(u8);
+
+impl AssetIndex {
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for AssetIndex {
+    type Error = ProtocolError;
+    fn try_from(index: u8) -> Result<Self, Self::Error> {
+        if usize::from(index) < MAX_ASSET_DESCRIPTORS {
+            Ok(Self(index))
+        } else {
+            Err(ProtocolError::UnknownAssetIndex)
+        }
+    }
+}
+
+impl From<AssetIndex> for u8 {
+    fn from(index: AssetIndex) -> Self {
+        index.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the frozen wire contract keeps InvocationResult inline"
+)]
+pub enum RunOutcome {
+    Rendered {
+        stdout: String,
+        stderr: String,
+        status: u8,
+    },
+    Refused {
+        error: ComponentFailure,
+    },
+    NotGranted {
+        capability: CapabilityId,
+    },
+    NotFound,
+    Invoked {
+        capability: CapabilityId,
+        input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_use: Option<SecretUseProposal>,
+        result: InvocationResult,
+        #[serde(default)]
+        attached: Vec<NewAsset>,
+        #[serde(default)]
+        removed: Vec<u64>,
+        #[serde(default)]
+        sent: Vec<u64>,
+    },
 }
 
 pub const MAX_ASSET_ROWS: usize = 32;
@@ -1237,6 +1365,9 @@ impl ResponseEnvelope {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "camelCase")]
 pub enum BrokerResponse {
+    Ran {
+        outcome: RunOutcome,
+    },
     Capabilities {
         capabilities: Vec<AvailableCapability>,
         #[serde(default)]
@@ -1562,6 +1693,12 @@ pub enum ProtocolError {
     InvalidGenerationDigest,
     #[error("broker frame has too many asset rows")]
     TooManyAssetRows,
+    #[error("unknown asset index")]
+    UnknownAssetIndex,
+    #[error("unreferenced asset row")]
+    UnreferencedAsset,
+    #[error("duplicate asset row")]
+    DuplicateAssetRow,
     #[error("frame maximum must be between 1 and {maximum} bytes")]
     InvalidFrameLimit { maximum: usize },
     #[error("frame I/O timeout must be greater than zero")]
@@ -1658,6 +1795,7 @@ impl BrokerClient {
                 }
             }
             BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::Upcall { .. }
             | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
@@ -1691,6 +1829,7 @@ impl BrokerClient {
             BrokerResponse::CommandRun { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::Upcall { .. }
             | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
@@ -1699,6 +1838,99 @@ impl BrokerClient {
 
     /// Strict alternation: the broker writes nothing while a child runs, so no read is outstanding
     /// and a parked invocation is bounded by the caller's cancellation, not the io timer.
+    pub async fn run(
+        &self,
+        attestation: Option<Attestation>,
+        request: RunRequest,
+        assets: InvokeAssets,
+        mut upcalls: impl AsyncFnMut(Upcall) -> UpcallExit,
+    ) -> Result<RunResponse, ClientError> {
+        let attestation = attestation.map(|claim| claim.bound_to(request.invocation.clone()));
+        if assets.descriptors.len() > MAX_ASSET_DESCRIPTORS {
+            return Err(ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source: ProtocolError::TooManyDescriptors,
+            });
+        }
+        let shape = assets.streams.as_ref().map(Streams::descriptors);
+        let descriptors: Vec<_> = assets
+            .descriptors
+            .iter()
+            .chain(
+                assets
+                    .streams
+                    .as_ref()
+                    .and_then(|streams| streams.stdin.as_ref()),
+            )
+            .chain(assets.streams.as_ref().map(|streams| &streams.stdout))
+            .map(|fd| fd.as_fd())
+            .collect();
+        let mut stream = self
+            .open(
+                RequestEnvelope {
+                    api_version: ProtocolVersion::V1Alpha2,
+                    request: BrokerRequest::Run {
+                        attestation,
+                        invocation: request.invocation,
+                        trace_parent: request.trace_parent,
+                        word: request.word,
+                        argv: request.argv,
+                        assets: assets.rows,
+                        sends_remaining: assets.sends_remaining,
+                        streams: shape.ok_or(ClientError::Protocol {
+                            phase: ExchangePhase::Request,
+                            source: ProtocolError::MissingStreamDescriptors,
+                        })?,
+                    },
+                },
+                &descriptors,
+            )
+            .await?;
+        let (response, descriptors) = loop {
+            let (response, descriptors) = stream
+                .read_frame_when_ready::<ResponseEnvelope>(self.limits)
+                .await
+                .and_then(|(response, descriptors)| {
+                    validate_response_descriptors(&response.response, descriptors.len())?;
+                    Ok((response.response, descriptors))
+                })
+                .map_err(response_failure)?;
+            let BrokerResponse::Upcall {
+                parent,
+                script,
+                trace_parent,
+                stdin,
+            } = response
+            else {
+                break (response, descriptors);
+            };
+            let streams = UpcallStreams::receive(stdin, descriptors).map_err(response_failure)?;
+            let exit = upcalls(Upcall {
+                parent,
+                script,
+                trace_parent,
+                streams,
+            })
+            .await;
+            stream
+                .write_frame(&RequestEnvelope::upcall_result(exit), &[], self.limits)
+                .await
+                .map_err(response_failure)?;
+        };
+        match response {
+            BrokerResponse::Ran { outcome } => Ok(RunResponse {
+                outcome,
+                descriptors,
+            }),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn invoke(
         &self,
         attestation: Option<Attestation>,
@@ -1784,6 +2016,7 @@ impl BrokerClient {
             }),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. }
             | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
@@ -1803,6 +2036,7 @@ impl BrokerClient {
             BrokerResponse::Invocation { result, .. } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. }
             | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
@@ -1826,6 +2060,7 @@ impl BrokerClient {
             BrokerResponse::Generation { digest, outcome } => Ok((digest, outcome)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
@@ -1856,6 +2091,7 @@ impl BrokerClient {
             BrokerResponse::Generation { digest, outcome } => Ok((digest, outcome)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
@@ -1867,6 +2103,7 @@ impl BrokerClient {
             BrokerRequest::CommitGeneration { digest }
             | BrokerRequest::AbortGeneration { digest } => digest,
             BrokerRequest::Capabilities { .. }
+            | BrokerRequest::Run { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
@@ -1886,6 +2123,7 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Generation { .. }
             | BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
@@ -2056,7 +2294,10 @@ fn validate_response_descriptors(
 ) -> Result<(), ProtocolError> {
     match response {
         BrokerResponse::Upcall { stdin, .. } => stdin.check(count)?,
-        BrokerResponse::Invocation { attached, .. } => {
+        BrokerResponse::Invocation { attached, .. }
+        | BrokerResponse::Ran {
+            outcome: RunOutcome::Invoked { attached, .. },
+        } => {
             if attached.len() != count
                 || attached
                     .iter()
@@ -2371,3 +2612,6 @@ impl BrokerSocketDiscovery {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod run_tests;
