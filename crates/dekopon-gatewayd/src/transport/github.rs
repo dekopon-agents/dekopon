@@ -398,9 +398,10 @@ fn ignored(state: &StateData, delivery: &str, reason: &str) {
         reason,
         "gateway.github.ignored"
     );
-    tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.admission",
-        outcome = "ignored", transport = %state.name, github.deliveries = &[delivery],
-        queue.depth = 0 }, "gateway.admission");
+    dekopon_telemetry::with_event_string_array("github.deliveries", &[delivery], || {
+        tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.admission",
+            outcome = "ignored", transport = %state.name, queue.depth = 0 }, "gateway.admission");
+    });
 }
 
 fn field<'a>(root: &'a Value, path: &str, max: usize) -> Option<&'a str> {

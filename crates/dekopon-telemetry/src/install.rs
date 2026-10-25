@@ -285,19 +285,29 @@ where
         let native = opentelemetry::Context::current();
         let span = native.span();
         let ids = span.span_context();
-        if !ids.is_valid() {
+        let array = native.get::<crate::EventStringArray>();
+        if !ids.is_valid() && array.is_none() {
             return self.0.format_event(context, writer, event);
         }
         let mut json = String::new();
         self.0
             .format_event(context, fmt::format::Writer::new(&mut json), event)?;
         let object = json.strip_suffix("}\n").ok_or(std::fmt::Error)?;
-        writeln!(
-            writer,
-            "{object},\"trace_id\":\"{}\",\"span_id\":\"{}\"}}",
-            ids.trace_id(),
-            ids.span_id(),
-        )
+        writer.write_str(object)?;
+        if ids.is_valid() {
+            write!(
+                writer,
+                ",\"trace_id\":\"{}\",\"span_id\":\"{}\"",
+                ids.trace_id(),
+                ids.span_id()
+            )?;
+        }
+        if let Some(array) = array {
+            let name = serde_json::to_string(array.name).map_err(|_| std::fmt::Error)?;
+            let values = serde_json::to_string(&array.values).map_err(|_| std::fmt::Error)?;
+            write!(writer, ",{name}:{values}")?;
+        }
+        writeln!(writer, "}}")
     }
 }
 

@@ -1025,7 +1025,7 @@ impl SeenIds {
         }
     }
 
-    pub(super) fn reserve(&mut self, key: &str) -> github::Reservation {
+    fn reserve(&mut self, key: &str) -> github::Reservation {
         if self.seen.contains(key) {
             return github::Reservation::Committed;
         }
@@ -1035,13 +1035,14 @@ impl SeenIds {
         github::Reservation::New
     }
 
-    pub(super) fn answer(&mut self, key: &str, commit: bool) {
+    fn answer(&mut self, key: &str, commit: bool) {
         self.reserved.remove(key);
         if commit {
             self.insert(key.to_owned());
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_if_absent(
         &mut self,
         key: &str,

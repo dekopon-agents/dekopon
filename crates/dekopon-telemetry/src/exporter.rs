@@ -271,6 +271,7 @@ impl ExporterSettings {
             .build();
         Ok(SdkLoggerProvider::builder()
             .with_resource(self.resource())
+            .with_log_processor(EventArrayProcessor)
             .with_log_processor(processor)
             .build())
     }
@@ -633,5 +634,35 @@ mod tests {
             settings.tracer_provider().expect("trace exporter builds");
             settings.logger_provider().expect("log exporter builds");
         }
+    }
+}
+
+#[derive(Debug)]
+struct EventArrayProcessor;
+
+impl logs::LogProcessor for EventArrayProcessor {
+    fn emit(&self, record: &mut logs::SdkLogRecord, _: &opentelemetry::InstrumentationScope) {
+        use opentelemetry::logs::LogRecord as _;
+        let context = opentelemetry::Context::current();
+        if let Some(array) = context.get::<crate::EventStringArray>() {
+            record.add_attribute(
+                array.name,
+                opentelemetry::logs::AnyValue::ListAny(Box::new(
+                    array
+                        .values
+                        .iter()
+                        .cloned()
+                        .map(opentelemetry::logs::AnyValue::from)
+                        .collect(),
+                )),
+            );
+        }
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+    fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
     }
 }

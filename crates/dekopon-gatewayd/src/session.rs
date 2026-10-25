@@ -594,13 +594,21 @@ pub(crate) fn record_admission(
         | MessageId::Wake { .. }
         | MessageId::Job { .. } => None,
     };
-    tracing::info!(
-        target: "dekopon_gatewayd::audit",
-        { audit.event = "gateway.admission", outcome, busy.cause = cause,
-          transport = %message.transport, conversation.id = %message.conversation.key(),
-          queue.depth = depth, github.deliveries = deliveries.as_deref() },
-        "gateway.admission"
-    );
+    let emit = || {
+        tracing::info!(
+            target: "dekopon_gatewayd::audit",
+            { audit.event = "gateway.admission", outcome, busy.cause = cause,
+              transport = %message.transport, conversation.id = %message.conversation.key(),
+              queue.depth = depth },
+            "gateway.admission"
+        )
+    };
+    match deliveries {
+        Some(deliveries) => {
+            dekopon_telemetry::with_event_string_array("github.deliveries", &deliveries, emit)
+        }
+        None => emit(),
+    }
 }
 
 impl SessionGate {
