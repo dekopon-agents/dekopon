@@ -8,6 +8,15 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Durable attachment store and per-issue GitHub conversations (0.55.0)
+
+A gateway with a journal needs one configuration change; no provider WIT or SDK re-pin. Before upgrading:
+
+- With `sessions.journal` set, the gateway refuses to start without `sessions.assets.path`, a directory that neither equals, contains nor sits inside the journal directory; `sessions.assets` without `sessions.journal` is refused too. A 0.54.0 gateway refuses `sessions.assets`, so the key and the image roll out, and revert, together. With the chart, set `gateway.assets.enabled: true` beside `gateway.journal.enabled` and point `sessions.assets.path` at `gateway.assets.mountPath` (default `/var/lib/dekopon-gatewayd/assets`). `dekopon-gatewayd check --probe --against` cannot load a 0.54.0-shaped baseline with a journal, so it warns that the baseline did not load and probes every model. For the upgrade itself, compare against a baseline that already carries `sessions.assets.path` (with the chart, point `configCheck.gateway.againstConfigMap` at such a ConfigMap) or expect every model to be probed.
+- The default `sessions.assetRetentionBytes` rises from 256 MiB to 1 GiB. With a journal, retained uploads live on the state claim, so its filesystem needs that much free, or set a smaller budget. The chart's `volumeSizes.gatewayTmp` and `volumeSizes.brokerAssets` defaults rise to 1152Mi; a deployment that sets either explicitly, or runs without a journal, must size them for the 1 GiB budget plus staging. At startup the gateway logs `gateway.asset.store_started` with the store's free bytes and budget.
+- GitHub deliveries share one conversation per issue or pull request (or one per repository) instead of one per delivery, and a delivery refused at session admission is answered 503 instead of 200.
+- Rust callers: `ExitCode`, `JOBS_OFF`, `JobId`, `JobOutcome`, `JobState`, `JobSummary` and `JobWait` move from `dekopon_shell` to `dekopon_process`; `ExitCode::from_capability_result(&result)` becomes `ExitCode::from(&result)`.
+
 ## Attachment inventory without a per-conversation cap (0.54.0)
 
 No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
