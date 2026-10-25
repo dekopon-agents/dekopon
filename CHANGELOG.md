@@ -11,6 +11,7 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- The broker's terminal `broker_exit` diagnostic is written to stderr instead of stdout and OTLP.
 - The conversation inventory note lists every file that fits, newest first, and the fetch tool names images and documents explicitly.
 
 ### Removed
@@ -20,6 +21,7 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Brokers that exhaust their shutdown grace period emit the terminal failure diagnostic before exiting nonzero.
 - Effective gateway indicator settings are logged at boot and each activated reload instead of on unchanged reload ticks.
 
 ## [dekopon-chart-0.41.0] - 2026-10-25
