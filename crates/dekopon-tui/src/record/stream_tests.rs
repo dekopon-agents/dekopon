@@ -5,7 +5,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime as _};
@@ -34,11 +33,14 @@ impl CapabilityInvoker for Probe {
     fn command_words(&self) -> Vec<String> {
         vec!["probe".into()]
     }
-    fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        let (handle, signal) = dekopon_process::CancelSignal::pair();
+        if self.cancelled.load(Ordering::SeqCst) {
+            handle.cancel();
+        }
+        vec![signal]
     }
-    fn script_started(&self, timeout: Duration) {
-        assert_eq!(timeout, Limits::default().timeout);
+    fn script_started(&self, _tree: &mut dekopon_process::TreeContext) {
         self.starts.fetch_add(1, Ordering::SeqCst);
     }
     fn script_finished(&self) {
@@ -171,7 +173,7 @@ fn recording_forwards_cancellation_before_a_provider_effect() {
     probe.cancelled.store(true, Ordering::SeqCst);
     let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let invoker = RecordingInvoker::new(std::sync::Arc::clone(&probe), events, Sequence::default());
-    assert!(invoker.cancelled());
+    assert!(invoker.cancel_signals()[0].is_cancelled());
     let outcome = ShellRuntime {
         invoker,
         limits: Limits::default(),
