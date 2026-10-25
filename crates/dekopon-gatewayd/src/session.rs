@@ -1415,10 +1415,6 @@ fn platform_window(
     if !pending_user.is_empty() {
         turns.push(ConversationTurn::unanswered(pending_user));
     }
-    let excess = assets
-        .len()
-        .saturating_sub(asset::MAX_ASSETS_PER_CONVERSATION);
-    assets.drain(..excess);
     RecalledWindow {
         history: History::from_turns(window.limits, turns),
         assets,
@@ -1506,11 +1502,90 @@ fn counted(count: u64, one: &str, many: &str) -> String {
 /// Only this first line is attribution the gateway vouches for, naming the broker principal the
 /// attested sender maps to; the rest is untrusted user text that can contain lookalike labels or
 /// prompt injection, even under the local-dev transport.
+fn attribution_header(principal: Option<&PrincipalId>) -> String {
+    match principal {
+        Some(principal) => format!("[gateway: authenticated participant: {principal}]\n"),
+        None => "[gateway: unmapped participant]\n".to_owned(),
+    }
+}
+
 fn attributed_prompt(principal: Option<&PrincipalId>, text: &str) -> String {
-    bound_inbound(&match principal {
-        Some(principal) => format!("[gateway: authenticated participant: {principal}]\n{text}"),
-        None => format!("[gateway: unmapped participant]\n{text}"),
-    })
+    bound_inbound(&format!("{}{text}", attribution_header(principal)))
+}
+
+fn inventory_prompt(
+    text: &str,
+    registered: &asset::Registered,
+    images_supported: bool,
+    reader: asset::TextReader,
+    principal: Option<&PrincipalId>,
+    notice_bytes: usize,
+) -> String {
+    let text = if text.trim().is_empty() { "" } else { text };
+    let separator = if text.is_empty() { "" } else { "\n\n" };
+    let budget = crate::transport::MAX_INBOUND_TEXT_BYTES
+        .saturating_sub(text.len())
+        .saturating_sub(separator.len())
+        .saturating_sub(attribution_header(principal).len())
+        .saturating_sub(notice_bytes);
+    let note = asset::reference_note(registered, images_supported, reader, budget);
+    debug_assert_eq!(note.listed + note.omitted, registered.inventory.len());
+    debug_assert!(note.bytes <= budget);
+    if note.text.is_empty() {
+        text.to_owned()
+    } else {
+        format!("{text}{separator}{}", note.text)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InventoryPath {
+    Turn,
+    Follow,
+    Steer,
+}
+
+struct PromptFrame<'a> {
+    principal: Option<&'a PrincipalId>,
+    delivery: Option<&'a str>,
+    stop: Option<&'a str>,
+}
+
+impl PromptFrame<'_> {
+    fn inventory(
+        &self,
+        text: &str,
+        registered: &asset::Registered,
+        images_supported: bool,
+        reader: asset::TextReader,
+        path: InventoryPath,
+    ) -> String {
+        let reserved = self.delivery.map_or(0, |notice| notice.len() + 1)
+            + self.stop.map_or(0, |notice| notice.len() + 1);
+        let text = inventory_prompt(
+            text,
+            registered,
+            images_supported,
+            reader,
+            self.principal,
+            reserved,
+        );
+        let text = match path {
+            InventoryPath::Turn | InventoryPath::Follow => match self.stop {
+                Some(notice) => bound_inbound(&format!("{notice}\n{text}")),
+                None => text,
+            },
+            InventoryPath::Steer => text,
+        };
+        let text = match path {
+            InventoryPath::Turn => match self.delivery {
+                Some(notice) => bound_inbound(&format!("{notice}\n{text}")),
+                None => text,
+            },
+            InventoryPath::Follow | InventoryPath::Steer => text,
+        };
+        attributed_prompt(self.principal, &text)
+    }
 }
 
 fn message_span(
@@ -1755,6 +1830,9 @@ struct SessionSteers {
     store: Arc<AssetStore>,
     access: AssetAccess,
     images_supported: bool,
+    text_reader: asset::TextReader,
+    delivery_notice: Option<&'static str>,
+    stop_notice: Option<String>,
     principal: Option<PrincipalId>,
     received_at: tokio::time::Instant,
     raw_texts: Mutex<Vec<String>>,
@@ -1802,11 +1880,18 @@ impl SessionSteers {
                         .assets_for_access(&self.access, steer.assets, Instant::now());
                 let recorded =
                     bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
-                let prompt = match asset::reference_note(&registered, self.images_supported) {
-                    Some(note) => bound_inbound(&format!("{text}\n\n{note}")),
-                    None => text,
-                };
-                let prompt = attributed_prompt(self.principal.as_ref(), &prompt);
+                let prompt = PromptFrame {
+                    principal: self.principal.as_ref(),
+                    delivery: self.delivery_notice,
+                    stop: self.stop_notice.as_deref(),
+                }
+                .inventory(
+                    &text,
+                    &registered,
+                    self.images_supported,
+                    self.text_reader,
+                    InventoryPath::Steer,
+                );
                 let recorded = attributed_prompt(self.principal.as_ref(), &recorded);
                 self.raw_texts.lock().push(steer.text);
                 Steer::Person { prompt, recorded }
@@ -2157,10 +2242,10 @@ async fn session(
         runner
             .assets
             .assets_for_access(&asset_access, message.assets.clone(), Instant::now());
-    let text = match asset::reference_note(&registered, images_supported) {
-        Some(note) if message.text.trim().is_empty() => note,
-        Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
-        None => message.text.clone(),
+    let text_reader = if leg.is_granted("asset.cat") {
+        asset::TextReader::AssetCat
+    } else {
+        asset::TextReader::Absent
     };
     let recorded = bound_inbound(&format!(
         "{}{}",
@@ -2169,22 +2254,33 @@ async fn session(
     ));
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
-    let stop_notice = runner.pending_notices.lock().remove(&key);
+    let stop_notice = runner
+        .pending_notices
+        .lock()
+        .remove(&key)
+        .map(|PendingNotice(cause)| cause.notice());
+    let text = PromptFrame {
+        principal: principal.as_ref(),
+        delivery: delivery_notice,
+        stop: stop_notice.as_deref(),
+    }
+    .inventory(
+        &message.text,
+        &registered,
+        images_supported,
+        text_reader,
+        if is_follow {
+            InventoryPath::Follow
+        } else {
+            InventoryPath::Turn
+        },
+    );
     let frame = |text: String| {
         let text = match &delivery_notice {
             Some(note) => bound_inbound(&format!("{note}\n{text}")),
             None => text,
         };
         attributed_prompt(principal.as_ref(), &text)
-    };
-    let text = match stop_notice {
-        Some(PendingNotice(cause)) => bound_inbound(&format!("{}\n{text}", cause.notice())),
-        None => text,
-    };
-    let text = if is_follow {
-        attributed_prompt(principal.as_ref(), &text)
-    } else {
-        frame(text)
     };
     let recorded = if is_follow {
         attributed_prompt(principal.as_ref(), &recorded)
@@ -2205,6 +2301,9 @@ async fn session(
         store: Arc::clone(&runner.assets),
         access: asset_access,
         images_supported,
+        text_reader,
+        delivery_notice,
+        stop_notice,
         principal: principal.clone(),
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),
@@ -3525,5 +3624,102 @@ impl From<tokio::task::JoinError> for TaskFailure {
             },
             Err(_cancelled) => Self::Cancelled,
         }
+    }
+}
+
+#[cfg(test)]
+mod inventory_prompt_tests {
+    use super::*;
+    use crate::asset::{AssetSourceRef, PendingAsset};
+    use crate::transport::MAX_INBOUND_TEXT_BYTES;
+
+    fn check(path: InventoryPath, empty: bool) {
+        let key = ConversationKey::private(
+            &"reviewer".parse().unwrap(),
+            "dev",
+            "fitted",
+            &"tel.15550000001".parse().unwrap(),
+        );
+        let store = AssetStore::new(8, crate::ONE_SHOT_ASSET_IDLE);
+        let registered = store.assets_for(
+            &key,
+            (1..=200)
+                .map(|id| PendingAsset {
+                    name: format!("file-{id}.png"),
+                    mime: "image/png".into(),
+                    size: Some(1024),
+                    source: Some(AssetSourceRef::Telegram {
+                        file_id: id.to_string(),
+                    }),
+                })
+                .collect(),
+            Instant::now(),
+        );
+        let principal = "mapped-participant-with-a-longer-name".parse().unwrap();
+        let delivery = "[gateway: a previous asset send did not complete. Sent flags remain set; no automatic retry was made.]";
+        let stop = StopCause::MaxSteps.notice();
+        let text = if empty {
+            String::new()
+        } else {
+            "x".repeat(15 * 1024)
+        };
+        let text = match path {
+            InventoryPath::Steer => {
+                format!("[gateway: sent while you were working, +123s]\n{text}")
+            }
+            InventoryPath::Turn | InventoryPath::Follow => text,
+        };
+        let prompt = PromptFrame {
+            principal: Some(&principal),
+            delivery: Some(delivery),
+            stop: Some(&stop),
+        }
+        .inventory(&text, &registered, true, asset::TextReader::AssetCat, path);
+        assert_eq!(bound_inbound(&prompt), prompt);
+        assert!(prompt.len() <= MAX_INBOUND_TEXT_BYTES);
+        assert!(!prompt.contains("[message truncated by the gateway]"));
+        assert!(prompt.starts_with(
+            "[gateway: authenticated participant: mapped-participant-with-a-longer-name]\n"
+        ));
+        assert!(prompt.contains(
+            "chat-asset:200 — file-200.png (image/png, 1 KB) — attached to this message"
+        ));
+        assert!(
+            prompt.ends_with(
+                "Call fetch_chat_asset with the number to look at an image or document.]"
+            )
+        );
+        match path {
+            InventoryPath::Turn => {
+                assert!(prompt.contains(delivery));
+                assert!(prompt.contains(&stop));
+            }
+            InventoryPath::Follow => {
+                assert!(!prompt.contains(delivery));
+                assert!(prompt.contains(&stop));
+            }
+            InventoryPath::Steer => {
+                assert!(prompt.contains("[gateway: sent while you were working, +123s]"));
+                assert!(!prompt.contains(delivery));
+                assert!(!prompt.contains(&stop));
+            }
+        }
+    }
+
+    #[test]
+    fn a_turn_note_survives_notices_and_mapped_attribution_without_a_cut() {
+        check(InventoryPath::Turn, false);
+    }
+    #[test]
+    fn a_follow_note_survives_notices_and_mapped_attribution_without_a_cut() {
+        check(InventoryPath::Follow, false);
+    }
+    #[test]
+    fn a_steer_note_survives_its_header_and_mapped_attribution_without_a_cut() {
+        check(InventoryPath::Steer, false);
+    }
+    #[test]
+    fn an_empty_text_note_survives_notices_and_mapped_attribution_without_a_cut() {
+        check(InventoryPath::Turn, true);
     }
 }

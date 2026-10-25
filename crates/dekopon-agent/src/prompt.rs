@@ -1573,8 +1573,7 @@ fn is_textual(mime: &str) -> bool {
 fn asset_tool() -> ModelTool {
     ModelTool {
         name: ASSET_TOOL_NAME.to_owned(),
-        description: "Show the contents of chat-asset:N from this conversation. Look before you \
-                      describe a file."
+        description: "Show an image or document attached to this conversation as chat-asset:N. Look before you describe a file."
             .to_owned(),
         parameters: json!({
             "type": "object",
