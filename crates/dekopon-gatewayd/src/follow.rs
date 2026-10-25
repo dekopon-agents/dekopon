@@ -311,8 +311,8 @@ impl<I> FollowInvoker<I> {
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
-    fn cancelled(&self) -> bool {
-        self.inner.cancelled()
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        self.inner.cancel_signals()
     }
     fn granted(&self) -> Vec<String> {
         self.inner.granted()
@@ -370,8 +370,8 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
     fn note(&self, text: &str, eta: Option<Duration>) {
         self.inner.note(text, eta);
     }
-    fn script_started(&self, timeout: Duration) {
-        self.inner.script_started(timeout);
+    fn script_started(&self, tree: &mut TreeContext) {
+        self.inner.script_started(tree);
     }
     fn script_finished(&self) {
         self.inner.script_finished();

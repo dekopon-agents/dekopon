@@ -1,7 +1,6 @@
 use regex_bites::Regex;
 
 use crate::{
-    CapabilityInvoker,
     builtins::{CommandFailure, unsupported_flag},
     limits::Budget,
     pipe::CHUNK_BYTES,
@@ -144,7 +143,7 @@ impl Substitution {
         &self,
         line: &str,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<bool, CommandFailure> {
         match &self.matcher {
@@ -154,7 +153,6 @@ impl Substitution {
                     .find_iter(line)
                     .map(|found| found.start()..found.end()),
                 budget,
-                invoker,
                 emit,
             ),
             Matcher::Literal {
@@ -165,7 +163,6 @@ impl Substitution {
                 line.match_indices(needle)
                     .map(|(start, _)| start..start + needle.len()),
                 budget,
-                invoker,
                 emit,
             ),
             Matcher::Literal {
@@ -188,7 +185,6 @@ impl Substitution {
                             line.is_char_boundary(range.start) && line.is_char_boundary(range.end)
                         }),
                     budget,
-                    invoker,
                     emit,
                 )
             }
@@ -200,13 +196,13 @@ impl Substitution {
         line: &str,
         matches: impl Iterator<Item = std::ops::Range<usize>>,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<bool, CommandFailure> {
         let mut cursor = 0;
         for found in matches {
-            if !emit_chunks(&line.as_bytes()[cursor..found.start], budget, invoker, emit)?
-                || !emit_chunks(self.replacement.as_bytes(), budget, invoker, emit)?
+            if !emit_chunks(&line.as_bytes()[cursor..found.start], budget, emit)?
+                || !emit_chunks(self.replacement.as_bytes(), budget, emit)?
             {
                 return Ok(false);
             }
@@ -215,18 +211,18 @@ impl Substitution {
                 break;
             }
         }
-        emit_chunks(&line.as_bytes()[cursor..], budget, invoker, emit)
+        emit_chunks(&line.as_bytes()[cursor..], budget, emit)
     }
 }
 
 pub(crate) fn emit_chunks(
     bytes: &[u8],
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<bool, CommandFailure> {
     for chunk in bytes.chunks(CHUNK_BYTES) {
-        budget.charge_step_with(invoker)?;
+        budget.charge_step()?;
         if !emit(chunk)? {
             return Ok(false);
         }

@@ -463,10 +463,10 @@ fn a_filter_that_never_yields_is_killed_at_the_deadline() {
     assert_eq!(filter(".", json!(1)).exit_code.get(), 0);
 }
 
-struct Cancelled(Instant);
+struct Cancelled(dekopon_process::CancelSignal);
 impl CapabilityInvoker for Cancelled {
-    fn cancelled(&self) -> bool {
-        self.0.elapsed() >= Duration::from_millis(200)
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        vec![self.0.clone()]
     }
     fn granted(&self) -> Vec<String> {
         Vec::new()
@@ -485,7 +485,14 @@ impl CapabilityInvoker for Cancelled {
 fn a_cancelled_turn_kills_its_jq_stage() {
     worker();
     let start = Instant::now();
-    let outcome = Interpreter::new(Limits::default()).run("jq -n 'def f: f; f'", &Cancelled(start));
+    let (handle, signal) = dekopon_process::CancelSignal::pair();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            handle.cancel();
+        });
+        Interpreter::new(Limits::default()).run("jq -n 'def f: f; f'", &Cancelled(signal))
+    });
     assert_eq!(outcome.exit_code.get(), 130, "{outcome:?}");
     assert!(start.elapsed() < Duration::from_secs(2));
 }

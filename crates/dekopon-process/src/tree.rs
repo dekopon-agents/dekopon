@@ -1,4 +1,5 @@
 use std::{
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -6,7 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{LimitExceeded, Limits};
+use crate::{CancelSignal, LimitExceeded, Limits};
+use tokio::time::Sleep;
 
 #[derive(Clone, Debug)]
 pub struct CallBudget {
@@ -51,8 +53,9 @@ impl CallBudget {
 
 #[derive(Clone, Debug)]
 pub struct TreeContext {
+    cancel: Vec<CancelSignal>,
+    cancel_deadline: Option<Arc<Pin<Box<Sleep>>>>,
     deadline: Instant,
-    timeout: Duration,
     calls: CallBudget,
     steps: Arc<AtomicU64>,
     retained: Arc<AtomicU64>,
@@ -102,8 +105,9 @@ impl TreeContext {
     pub fn new(limits: Limits, calls: CallBudget) -> Self {
         let started = Instant::now();
         Self {
+            cancel: Vec::new(),
+            cancel_deadline: None,
             deadline: started.checked_add(limits.timeout).unwrap_or(started),
-            timeout: limits.timeout,
             calls,
             steps: Arc::new(AtomicU64::new(0)),
             retained: Arc::new(AtomicU64::new(0)),
@@ -111,7 +115,33 @@ impl TreeContext {
         }
     }
 
+    pub fn with_cancel(mut self, cancel: Vec<CancelSignal>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn with_parent_cancel(mut self, cancel: CancelSignal) -> Self {
+        self.cancel.push(cancel);
+        self
+    }
+
+    pub fn with_script_timer(mut self, timer: Option<Pin<Box<Sleep>>>) -> Self {
+        self.cancel_deadline = timer.map(Arc::new);
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.iter().any(CancelSignal::is_cancelled)
+            || self
+                .cancel_deadline
+                .as_ref()
+                .is_some_and(|timer| timer.is_elapsed())
+    }
+
     pub fn charge_step(&self) -> Result<(), LimitExceeded> {
+        if self.is_cancelled() {
+            return Err(LimitExceeded::Cancelled);
+        }
         self.steps
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(1)
@@ -147,14 +177,10 @@ impl TreeContext {
         self.retained.load(Ordering::Relaxed)
     }
 
-    pub fn max_value_bytes(&self) -> u64 {
-        self.limits.max_value_bytes
-    }
-
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
         if Instant::now() >= self.deadline {
             Err(LimitExceeded::Deadline {
-                timeout_ms: self.timeout.as_millis(),
+                timeout_ms: self.limits.timeout.as_millis(),
             })
         } else {
             Ok(())
@@ -168,7 +194,14 @@ impl TreeContext {
 
     #[must_use]
     pub fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.cancel_deadline.as_ref().map_or_else(
+            || self.deadline.saturating_duration_since(Instant::now()),
+            |timer| {
+                timer
+                    .deadline()
+                    .saturating_duration_since(tokio::time::Instant::now())
+            },
+        )
     }
 
     #[must_use]

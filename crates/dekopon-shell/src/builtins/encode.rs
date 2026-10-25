@@ -2,7 +2,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use super::{CommandFailure, unsupported_flag};
 use crate::{
-    CapabilityInvoker,
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
@@ -13,7 +12,7 @@ pub(crate) fn stream(
     arguments: &[String],
     reader: &mut PipeReader,
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
     let mut decode = false;
@@ -35,7 +34,7 @@ pub(crate) fn stream(
     let mut pending = Vec::with_capacity(4);
     let mut finished = false;
     let mut process = |chunk: &[u8], budget: &mut Budget| -> Result<bool, CommandFailure> {
-        budget.charge_step_with(invoker)?;
+        budget.charge_step()?;
         for &byte in chunk {
             if decode && byte.is_ascii_whitespace() {
                 continue;
@@ -71,7 +70,7 @@ pub(crate) fn stream(
             return Ok(());
         }
     } else {
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
             if !process(&chunk, budget)? {
                 return Ok(());
             }
@@ -83,7 +82,7 @@ pub(crate) fn stream(
                 "base64: invalid input: incomplete group",
             ));
         }
-        budget.charge_step_with(invoker)?;
+        budget.charge_step()?;
         emit(STANDARD.encode(&pending).as_bytes())?;
     }
     Ok(())

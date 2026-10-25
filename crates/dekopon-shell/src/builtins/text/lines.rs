@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use clap::{Arg, Command};
 
 use crate::{
-    CapabilityInvoker,
     builtins::{CommandFailure, parse_flags, unsupported_flag},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
@@ -127,7 +126,7 @@ impl LineCommand {
         selection: Selection,
         reader: &mut PipeReader,
         budget: &mut Budget,
-        invoker: &dyn CapabilityInvoker,
+
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<(), CommandFailure> {
         if matches!(
@@ -137,8 +136,8 @@ impl LineCommand {
             return Ok(());
         }
         if let Selection::FirstBytes(mut remaining) = selection {
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
-                budget.charge_step_with(invoker)?;
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+                budget.charge_step()?;
                 let n = remaining.min(chunk.len());
                 if !emit(&chunk[..n])? || n == remaining {
                     return Ok(());
@@ -151,8 +150,8 @@ impl LineCommand {
         let mut pending_charges = Vec::new();
         let mut kept: VecDeque<(Vec<u8>, Vec<RetainedBytes>)> = VecDeque::new();
         let mut line_number = 0usize;
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget, invoker)? {
-            budget.charge_step_with(invoker)?;
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+            budget.charge_step()?;
             let mut rest = chunk.as_slice();
             while !rest.is_empty() {
                 let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
@@ -218,7 +217,7 @@ impl LineCommand {
             }
         }
         for (line, _charge) in kept {
-            budget.charge_step_with(invoker)?;
+            budget.charge_step()?;
             if !emit(&line)? {
                 break;
             }

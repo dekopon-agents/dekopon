@@ -172,6 +172,7 @@ pub struct ProviderPrecompileReport {
     pub repaired: usize,
     pub removed_files: u64,
     pub removed_bytes: u64,
+    pub peak_rss_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -339,9 +340,10 @@ impl ProviderManager {
             repaired = 0_u64,
             removed_files = 0_u64,
             removed_bytes = 0_u64,
+            peak_rss_bytes = tracing::field::Empty,
             error = tracing::field::Empty,
         );
-        let result = async {
+        let mut result = async {
             let uid = socket::current_uid();
             let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
             let store = ProviderStore::open(&self.paths.store, uid, false)?;
@@ -358,10 +360,18 @@ impl ProviderManager {
                 repaired: report.repaired,
                 removed_files: report.removed_files,
                 removed_bytes: report.removed_bytes,
+                peak_rss_bytes: None,
             })
         }
         .instrument(span.clone())
         .await;
+        let peak = dekopon_broker_host::peak_rss_bytes();
+        if let Some(bytes) = peak {
+            span.record("peak_rss_bytes", bytes);
+        }
+        if let Ok(report) = &mut result {
+            report.peak_rss_bytes = peak;
+        }
         if let Err(error) = &result {
             let chain = dekopon_core::error_chain(error);
             let message = dekopon_core::bounded_attribute(&chain);
@@ -3269,11 +3279,57 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture");
         let (manager, paths) =
             local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]).await;
-        let cold = manager.precompile().await.expect("cold precompile");
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+        let capture = dekopon_test_support::CaptureLayer::new();
+        let cold = manager
+            .precompile()
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await
+            .expect("cold precompile");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                serde_json::to_value(&cold).expect("JSON report")["peakRssBytes"]
+                    .as_u64()
+                    .expect("RSS number")
+                    > 0
+            );
+            let records = capture.records();
+            let span = records
+                .iter()
+                .find(|record| {
+                    matches!(
+                        record,
+                        dekopon_test_support::Record::Span {
+                            name: "provider.precompile",
+                            ..
+                        }
+                    ) && record.field("peak_rss_bytes").is_some()
+                })
+                .expect("precompile span");
+            assert!(
+                span.field("peak_rss_bytes")
+                    .expect("RSS attribute")
+                    .parse::<u64>()
+                    .expect("integer RSS")
+                    > 0
+            );
+        }
         assert_eq!((cold.providers, cold.compiled, cold.repaired), (2, 2, 0));
         let warm = manager.precompile().await.expect("warm precompile");
+        let mut json = serde_json::to_value(&warm).expect("JSON report");
+        let peak = json
+            .as_object_mut()
+            .expect("report object")
+            .remove("peakRssBytes")
+            .expect("RSS key always present");
+        #[cfg(target_os = "linux")]
+        assert!(peak.as_u64().expect("RSS number") > 0);
+        #[cfg(not(target_os = "linux"))]
+        assert!(peak.is_null());
         assert_eq!(
-            serde_json::to_value(&warm).expect("JSON report"),
+            json,
             serde_json::json!({
                 "providers": 2, "compiled": 0, "repaired": 0,
                 "removedFiles": 0, "removedBytes": 0,
