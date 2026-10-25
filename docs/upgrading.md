@@ -283,9 +283,9 @@ participant label reads `[gateway: authenticated participant: <principal>]` inst
 canonical subject, or `[gateway: unmapped participant]`; rewrite instructions that quote the old
 label.
 
-Embedders that send `{"script": …}` to the `bash` tool must send `{"command": …}` instead.
-In the current prompt loop, a model's `script` calls in the first turn with such a rejection
-are answered with the tool shape; one in a later turn ends the session. The bash description no longer explains `cmd &` / `$!` / `wait` / `kill`; this matters only on routes
+Embedders that send `{"script": …}` to the `bash` tool must send `{"command": …}` instead. A
+model's first `script` call is answered once with the tool shape; a second ends the session. The
+bash description no longer explains `cmd &` / `$!` / `wait` / `kill`; this matters only on routes
 with `jobTimeoutMs`.
 
 Chart 0.26.0 defaults the broker memory limit to 2Gi, and `image.tag` follows appVersion. Install
