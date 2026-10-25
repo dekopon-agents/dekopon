@@ -422,6 +422,7 @@ async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
                 id: "c0123abc".to_owned(),
                 thread: Some("1712345678.000100".to_owned()),
             },
+            delivery: None,
             trigger: Trigger::Message,
         },
     );
@@ -1311,6 +1312,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
                     id: format!("owner.{repo}"),
                     thread: Some(guid.into()),
                 },
+                delivery: None,
                 trigger: Trigger::Message,
             },
         )
@@ -1381,6 +1383,7 @@ async fn mismatched_smoke_delivery_reaches_broker_denial_not_duplicate_socket_ca
                 id: "console-smoke".to_owned(),
                 thread: None,
             },
+            delivery: None,
             trigger: Trigger::Message,
         },
     );
@@ -2025,6 +2028,7 @@ async fn real_broker_probe_child_and_probe_started_job_refuse_write_on_same_leg(
                     id: "c0123abc".to_owned(),
                     thread: Some("1712345678.000100".to_owned()),
                 },
+                delivery: None,
                 trigger: Trigger::Probe,
             },
         );
@@ -2107,6 +2111,7 @@ async fn real_broker_refuses_probe_and_job_child_writes_during_spawn_upcalls() {
                     id: "c0123abc".to_owned(),
                     thread: Some("1712345678.000100".to_owned()),
                 },
+                delivery: None,
                 trigger,
             },
         );
@@ -2698,6 +2703,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
                 thread: Some("1712345678.000100".to_owned()),
             },
             trigger: Trigger::Message,
+            delivery: None,
         },
     );
     let (assets, output) = stdio(None);

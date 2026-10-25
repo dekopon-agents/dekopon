@@ -43,7 +43,7 @@ fn subject(canonical: &str) -> ExternalSubject {
 }
 
 fn caller_subject(name: &str) -> ExternalSubject {
-    subject(&format!("slack.t0123abc.{}", name.replace('-', "")))
+    subject(&format!("slack.t0123abc.u{}", name.replace('-', "")))
 }
 
 fn callers<'a>(names: impl IntoIterator<Item = &'a str>) -> IdentityDirectory {
@@ -1379,6 +1379,7 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
                 id: "c0123abc".to_owned(),
                 thread: Some("1712345678.000100".to_owned()),
             },
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     )
@@ -3038,6 +3039,7 @@ fn smoke_claim() -> Attestation {
                 id: "console-smoke".to_owned(),
                 thread: None,
             },
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     )
@@ -3888,4 +3890,90 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
         other => panic!("expected a rendered usage error, got {other:?}"),
     }
     assert!(audit.records().is_empty(), "running a word decides nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spaces_request_forbid_stops_http_before_the_network() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider");
+    let server =
+        LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let mappings = [
+        (subject(SLACK_SUBJECT), principal("caller")),
+        (subject("slack.t0123abc.c0123abc"), principal("space")),
+    ];
+    let world = PolicyWorld::new(
+        [principal("caller"), principal("space")],
+        [(
+            "http-probe.fetch".parse().expect("capability"),
+            "http-probe".parse().expect("provider"),
+        )],
+    )
+    .expect("world")
+    .with_subjects(mappings.clone());
+    let policy = r#"@id("both") permit(principal, action, resource);
+        @id("space-request") forbid(principal == Dekopon::Principal::"space", action == Dekopon::Action::"http-probe.fetch", resource) when { context has request };"#;
+    let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        PolicyEngine::new(policy, &world).expect("policy"),
+        catalog([(
+            "http-probe.fetch",
+            set("http-probe", loopback_constraints(server.authority())),
+        )]),
+        CredentialStore::empty(),
+        IdentityDirectory::new(mappings).expect("directory"),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker");
+    let claim = Attestation::for_chat(
+        subject(SLACK_SUBJECT),
+        agent("provider-test"),
+        dekopon_broker::ChatScopeClaim {
+            transport: "slack".parse().expect("transport"),
+            kind: dekopon_broker::ChatTransportKind::Slack,
+            conversation: dekopon_broker::Conversation {
+                kind: dekopon_broker::ConversationKind::Channel,
+                container: Some("t0123abc".into()),
+                id: "c0123abc".into(),
+                thread: Some("1712345678.000100".into()),
+            },
+            trigger: dekopon_broker::Trigger::Message,
+            delivery: None,
+        },
+    );
+    let request = request(
+        "space-request",
+        "http-probe.fetch",
+        json!({"uri": format!("http://{}/reply", server.authority()), "method": "GET"}),
+    );
+    let (host, _stdout) = std::os::unix::net::UnixStream::pair().expect("stdout");
+    let result = broker
+        .invoke(
+            &service_context(GATEWAY),
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&claim.bound_to(request.id.clone())),
+            request,
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("accounted invocation");
+    assert_ne!(
+        result.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    assert!(audit.records().iter().any(|event| matches!(event, AuditEvent::Decision { decision_point, allowed: false, policy_ids, .. } if decision_point == "http.request" && policy_ids == &["both".to_owned()])));
+    assert!(server.recorded().is_empty());
 }

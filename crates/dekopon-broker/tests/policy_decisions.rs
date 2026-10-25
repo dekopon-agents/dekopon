@@ -81,6 +81,19 @@ fn policy_engine() -> PolicyEngine {
 }
 
 async fn broker() -> Broker<InMemoryAuditLog> {
+    configured_broker(
+        policy_engine(),
+        IdentityDirectory::new([(subject(), principal("cpetersen"))]).expect("directory"),
+        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+    )
+    .await
+}
+
+async fn configured_broker(
+    policy: PolicyEngine,
+    identities: IdentityDirectory,
+    audit: Arc<InMemoryAuditLog>,
+) -> Broker<InMemoryAuditLog> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -90,13 +103,12 @@ async fn broker() -> Broker<InMemoryAuditLog> {
     Broker::new(
         registry,
         principal("broker-test"),
-        policy_engine(),
+        policy,
         ConstraintCatalog::new([constraint_set("cli-probe.reverse")])
             .expect("one capability builds a catalog"),
         CredentialStore::empty(),
-        IdentityDirectory::new([(subject(), principal("cpetersen"))])
-            .expect("one mapping builds a directory"),
-        Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
+        identities,
+        audit,
         BrokerLimits::default(),
     )
     .expect("the broker starts")
@@ -150,6 +162,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                 id: "c0123abc".to_owned(),
                 thread: Some("1712345678.000100".to_owned()),
             },
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     );
@@ -275,6 +288,7 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
                 id: "1338356895504793623".to_owned(),
                 thread: None,
             },
+            delivery: None,
             trigger: dekopon_broker::Trigger::Message,
         },
     );
@@ -287,4 +301,306 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
             )
             .is_none()
     );
+}
+
+async fn space_broker(
+    space_prompt: &str,
+    space_capability: &str,
+) -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
+    let mappings = [
+        (SLACK_SUBJECT, "asker"),
+        ("discord.123", "asker"),
+        ("slack.t0123abc.c0123abc", "space"),
+        ("slack.t0123abc.g0123abc", "space"),
+        ("discord.999.456", "space"),
+    ]
+    .map(|(subject, name)| (subject.parse().expect("subject"), principal(name)));
+    let world = PolicyWorld::new(
+        [principal("asker"), principal("space"), principal("gateway")],
+        [(capability("cli-probe.reverse"), provider())],
+    )
+    .expect("world")
+    .with_subjects(mappings.clone());
+    let policy = format!(
+        r#"
+        @id("asker") permit(principal == Dekopon::Principal::"asker", action, resource);
+        {space_prompt}
+        {space_capability}
+    "#
+    );
+    let audit = Arc::new(InMemoryAuditLog::new(64).expect("audit"));
+    let broker = configured_broker(
+        PolicyEngine::new(&policy, &world).expect("policy"),
+        IdentityDirectory::new(mappings).expect("directory"),
+        Arc::clone(&audit),
+    )
+    .await;
+    (broker, audit)
+}
+
+fn channel_claim(
+    kind: ChatTransportKind,
+    conversation_kind: ConversationKind,
+    id: &str,
+    trigger: dekopon_broker::Trigger,
+) -> Attestation {
+    let (subject, container, thread) = match kind {
+        ChatTransportKind::Slack => (
+            subject(),
+            Some("t0123abc".to_owned()),
+            Some("1712345678.000100".to_owned()),
+        ),
+        ChatTransportKind::Discord => (
+            "discord.123".parse().expect("subject"),
+            (conversation_kind != ConversationKind::DirectMessage).then(|| "999".to_owned()),
+            (conversation_kind == ConversationKind::Thread).then(|| "789".to_owned()),
+        ),
+        ChatTransportKind::Telegram
+        | ChatTransportKind::Whatsapp
+        | ChatTransportKind::Github
+        | ChatTransportKind::Local => panic!("table only covers Slack and Discord"),
+    };
+    Attestation::for_chat(
+        subject,
+        agent("some-agent"),
+        ChatScopeClaim {
+            transport: "chat".parse().expect("transport"),
+            kind,
+            conversation: Conversation {
+                kind: conversation_kind,
+                container,
+                id: id.to_owned(),
+                thread,
+            },
+            trigger,
+            delivery: None,
+        },
+    )
+}
+
+fn gateway() -> AuthenticatedContext {
+    AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
+        },
+    )
+    .expect("gateway")
+}
+
+const SPACE_PROMPT: &str = r#"@id("space-prompt") permit(principal == Dekopon::Principal::"space", action == Dekopon::Action::"agent.prompt", resource);"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mapped_channels_and_their_threads_require_both_principals_and_list_the_intersection() {
+    let (broker, _) = space_broker(SPACE_PROMPT, "").await;
+    for (index, (kind, conversation_kind, id, denied)) in [
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            "c0123abc",
+            true,
+        ),
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::Thread,
+            "c0123abc",
+            true,
+        ),
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            "cother",
+            false,
+        ),
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::DirectMessage,
+            "d0123abc",
+            false,
+        ),
+        (
+            ChatTransportKind::Discord,
+            ConversationKind::Channel,
+            "456",
+            true,
+        ),
+        (
+            ChatTransportKind::Discord,
+            ConversationKind::Thread,
+            "456",
+            true,
+        ),
+        (
+            ChatTransportKind::Discord,
+            ConversationKind::Channel,
+            "457",
+            false,
+        ),
+        (
+            ChatTransportKind::Discord,
+            ConversationKind::DirectMessage,
+            "123",
+            false,
+        ),
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::Thread,
+            "g0123abc",
+            true,
+        ),
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::Thread,
+            "gother",
+            false,
+        ),
+        (
+            ChatTransportKind::Slack,
+            ConversationKind::GroupDirectMessage,
+            "g0123abc",
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let claim = channel_claim(
+            kind,
+            conversation_kind,
+            id,
+            dekopon_broker::Trigger::Message,
+        );
+        let grant = AttestorGrant { namespaces: None };
+        let (context, refusal) = broker.resolve_context(&gateway(), Some(&grant), &claim);
+        assert!(refusal.is_none());
+        let decision =
+            broker.authorize_invocation(&context, &request(index, "cli-probe.reverse").capability);
+        if denied {
+            assert_eq!(
+                decision.err().expect("space denial").reason,
+                "policy-denied"
+            );
+        } else {
+            assert!(decision.is_ok());
+        }
+        let surface = broker
+            .capability_surface(&gateway(), Some(&grant), Some(&claim))
+            .expect("session allowed");
+        assert_eq!(surface.0.is_empty(), denied);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_must_allow_the_session_gate() {
+    let (broker, audit) = space_broker("", "").await;
+    let grant = AttestorGrant { namespaces: None };
+    let claim = channel_claim(
+        ChatTransportKind::Slack,
+        ConversationKind::Channel,
+        "c0123abc",
+        dekopon_broker::Trigger::Message,
+    );
+    let refusal = match broker.session_surface(&gateway(), Some(&grant), Some(&claim)) {
+        Ok(_) => panic!("space must refuse the session"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(refusal.reason, "agent-denied");
+    assert_eq!(
+        refusal.session,
+        dekopon_broker_protocol::SessionRefusal::Other
+    );
+    let proposal = request(300, "cli-probe.reverse");
+    let result = broker
+        .invoke(
+            &gateway(),
+            Some(&grant),
+            Some(&claim.bound_to(proposal.id.clone())),
+            proposal,
+            Default::default(),
+        )
+        .await
+        .expect("accounted refusal");
+    assert_eq!(
+        result.result.error.as_deref(),
+        Some("chat-attestation-denied")
+    );
+    assert!(audit.records().iter().any(|event| matches!(event, dekopon_broker::AuditEvent::Decision { reason: Some(reason), .. } if reason == "agent-denied")));
+    let dm = channel_claim(
+        ChatTransportKind::Slack,
+        ConversationKind::DirectMessage,
+        "d0123abc",
+        dekopon_broker::Trigger::Message,
+    );
+    assert!(
+        broker
+            .session_surface(&gateway(), Some(&grant), Some(&dm))
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_can_distinguish_a_persons_message_from_a_wake() {
+    let grant = AttestorGrant { namespaces: None };
+    let (broker, _) = space_broker(SPACE_PROMPT, r#"@id("person-turn") permit(principal == Dekopon::Principal::"space", action == Dekopon::Action::"cli-probe.reverse", resource) when { context has startedBy && context.startedBy == "person" };"#).await;
+    for (trigger, allowed) in [
+        (dekopon_broker::Trigger::Message, true),
+        (dekopon_broker::Trigger::Wake, false),
+    ] {
+        let claim = channel_claim(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            "c0123abc",
+            trigger,
+        );
+        let (context, refusal) = broker.resolve_context(&gateway(), Some(&grant), &claim);
+        assert!(refusal.is_none());
+        assert_eq!(
+            broker
+                .authorize_invocation(&context, &capability("cli-probe.reverse"))
+                .is_ok(),
+            allowed
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allowed_space_decisions_commit_to_the_invocation_input() {
+    let (broker, audit) = space_broker(SPACE_PROMPT,
+        r#"@id("space-capability") permit(principal == Dekopon::Principal::"space", action == Dekopon::Action::"cli-probe.reverse", resource);"#).await;
+    let grant = AttestorGrant { namespaces: None };
+    let claim = channel_claim(
+        ChatTransportKind::Slack,
+        ConversationKind::Channel,
+        "c0123abc",
+        dekopon_broker::Trigger::Message,
+    );
+    for text in ["first", "second"] {
+        let mut proposal = request(400, "cli-probe.reverse");
+        proposal.input = json!({"text": text});
+        broker
+            .invoke(
+                &gateway(),
+                Some(&grant),
+                Some(&claim.bound_to(proposal.id.clone())),
+                proposal,
+                Default::default(),
+            )
+            .await
+            .expect("accounted invocation");
+    }
+    let digests = audit
+        .records()
+        .into_iter()
+        .filter_map(|event| match event {
+            dekopon_broker::AuditEvent::Decision {
+                allowed: true,
+                decision_digest,
+                ..
+            } => Some(decision_digest),
+            dekopon_broker::AuditEvent::Decision { allowed: false, .. }
+            | dekopon_broker::AuditEvent::Execution { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(digests.len(), 2);
+    assert_ne!(digests[0], digests[1]);
 }

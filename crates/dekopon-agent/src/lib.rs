@@ -2721,6 +2721,7 @@ mod tests {
                             id: "c0123abc".to_owned(),
                             thread: None,
                         },
+                        delivery: None,
                         trigger,
                     };
                     let attestation = Attestation::for_chat(
@@ -2778,6 +2779,7 @@ mod tests {
                             id: "c0123abc".to_owned(),
                             thread: None,
                         },
+                        delivery: None,
                         trigger,
                     };
                     let attestation = Attestation::for_chat(

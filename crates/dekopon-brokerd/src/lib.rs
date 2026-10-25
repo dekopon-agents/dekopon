@@ -124,6 +124,7 @@ where
     let server = BrokerServer::for_generations(Arc::clone(&coordination), limits)?
         .with_shutdown_deadline(deadline.clone());
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
+    coordination.active().ready.policy_loaded();
     tracing::info!(event = "broker_started", "broker.started");
     let mut lock_stop = None;
     let stop = async {
@@ -212,11 +213,12 @@ pub struct CheckProviders {
 pub struct CheckReport {
     pub problems: Vec<BrokerdError>,
     pub warnings: Vec<StartupWarning>,
+    pub policy_digest: Option<String>,
+    pub identity_digest: Option<String>,
     private_sources: Vec<PathBuf>,
 }
 
-/// Runs the startup validation `run` runs, then stops: no socket, no credentials file, no secret
-/// map, no asset root and no provider storage root is touched.
+/// Check reads only DRNs from the secret map; it never opens secret sources or resolves values.
 pub async fn check(
     config_path: impl AsRef<Path>,
     providers: Option<CheckProviders>,
@@ -432,6 +434,7 @@ impl Coordination {
         }
         let categories = state.active.snapshot.changed_categories(&next.snapshot);
         state.active = next;
+        state.active.ready.policy_loaded();
         tracing::info!(
             event = "broker_reload_applied",
             generation.digest = digest,
@@ -589,22 +592,35 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
             reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Scratch => {
-            keep(&mut report.problems, scratch_host(&config, &mut scratch)).map(|storage| Runtime {
-                credentials: match config.credentials_path {
-                    Some(_) => Credentials::Unchecked,
-                    None => Credentials::Loaded(CredentialStore::empty()),
+            let secrets = match config.secret_map_path.as_deref() {
+                Some(path) => match secrets::load_names(path, uid).await {
+                    Ok(names) => Some(Secrets::Names(names)),
+                    Err(secrets::SecretMapError::Read { .. }) => Some(Secrets::Unchecked),
+                    Err(
+                        error @ (secrets::SecretMapError::Decode { .. }
+                        | secrets::SecretMapError::Validation { .. }
+                        | secrets::SecretMapError::Client { .. }
+                        | secrets::SecretMapError::Source { .. }
+                        | secrets::SecretMapError::Catalog { .. }),
+                    ) => {
+                        report.problems.push(error.into());
+                        None
+                    }
                 },
-                secrets: match config.secret_map_path {
-                    Some(_) => Secrets::Unchecked,
-                    None => Secrets::Loaded(
-                        dekopon_broker::SecretCatalog::empty(),
-                        secrets::ScheduledCatalog::default(),
-                    ),
-                },
-                fingerprint: None,
-                storage,
-                assets: None,
-            })
+                None => Some(Secrets::Names(Vec::new())),
+            };
+            keep(&mut report.problems, scratch_host(&config, &mut scratch))
+                .zip(secrets)
+                .map(|(storage, secrets)| Runtime {
+                    credentials: match config.credentials_path {
+                        Some(_) => Credentials::Unchecked,
+                        None => Credentials::Loaded(CredentialStore::empty()),
+                    },
+                    secrets,
+                    fingerprint: None,
+                    storage,
+                    assets: None,
+                })
         }
     };
     let (Some(frame_limits), Some(mut runtime), true) = (frame_limits, runtime, providers_resolved)
@@ -636,7 +652,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
         config,
         frame_limits.max_frame_bytes,
         runtime,
-        &mut report.warnings,
+        &mut report,
         resident_registry,
     )
     .await;
@@ -1034,6 +1050,7 @@ enum Credentials {
 
 enum Secrets {
     Loaded(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog),
+    Names(Vec<SecretDrn>),
     Unchecked,
 }
 
@@ -1046,10 +1063,21 @@ struct Runtime {
 }
 
 struct Ready {
+    identity_digest: String,
     broker: Arc<Broker<TraceOnlyAuditLog>>,
     scheduled: secrets::ScheduledCatalog,
     identities: BTreeMap<u32, MappedPeer>,
     registry: BrokerProviderRegistry,
+}
+
+impl Ready {
+    fn policy_loaded(&self) {
+        tracing::info!(
+            target: "dekopon_broker::audit",
+            { audit.event = "broker.policy.loaded", policy.digest = self.broker.policy_digest(), identity.digest = self.identity_digest.as_str() },
+            "broker.policy.loaded"
+        );
+    }
 }
 
 /// Every problem found before the broker is built is returned together; the policy and the
@@ -1062,9 +1090,10 @@ async fn prepare(
     config: ResolvedConfig,
     max_frame_bytes: usize,
     runtime: Runtime,
-    warnings: &mut Vec<StartupWarning>,
+    report: &mut CheckReport,
     resident_registry: Option<BrokerProviderRegistry>,
 ) -> Result<Ready, Vec<BrokerdError>> {
+    let warnings = &mut report.warnings;
     let uid = current_uid();
     // Locked artifacts were checked at boot; a pruned old blob is not a new authority source.
     for provider in config
@@ -1137,6 +1166,12 @@ async fn prepare(
         )
         .map(|world| {
             world
+                .with_subjects(config.principals.iter().flat_map(|(principal, entry)| {
+                    entry
+                        .subjects
+                        .iter()
+                        .map(|subject| (subject.clone(), principal.clone()))
+                }))
                 .with_group_members(config.principals.iter().flat_map(|(principal, entry)| {
                     entry
                         .groups
@@ -1152,16 +1187,21 @@ async fn prepare(
         })
         .map_err(|source| BrokerdError::Policy { source }),
     );
-    let (secret_catalog, scheduled, secrets_unchecked) = match runtime.secrets {
-        Secrets::Loaded(catalog, scheduled) => (Some(catalog), Some(scheduled), false),
-        Secrets::Unchecked => (None, None, true),
+    let world = world.map(|world| match &runtime.secrets {
+        Secrets::Loaded(catalog, _) => world.with_secrets(catalog.drns().cloned()),
+        Secrets::Names(names) => world.with_secrets(names.iter().cloned()),
+        Secrets::Unchecked => world,
+    });
+    let secrets_unchecked = match &runtime.secrets {
+        Secrets::Loaded(_, _) | Secrets::Names(_) => false,
+        Secrets::Unchecked => true,
     };
+    let (secret_catalog, scheduled) = match runtime.secrets {
+        Secrets::Loaded(catalog, scheduled) => (Some(catalog), Some(scheduled)),
+        Secrets::Names(_) | Secrets::Unchecked => (None, None),
+    };
+    let identity_digest = world.as_ref().map(PolicyWorld::identity_digest);
     let policy = world.and_then(|world| {
-        let world = world.with_secrets(
-            secret_catalog
-                .iter()
-                .flat_map(|catalog| catalog.drns().cloned()),
-        );
         keep(
             &mut problems,
             build_policy(
@@ -1173,6 +1213,11 @@ async fn prepare(
             ),
         )
     });
+    report.identity_digest = identity_digest.clone();
+    report.policy_digest = policy
+        .as_ref()
+        .filter(|_| !secrets_unchecked)
+        .map(|policy| policy.digest().to_owned());
     let (constraint_sets, capability_problems) =
         capabilities::constraint_sets(&config.capabilities, |provider| {
             let declared = registry
@@ -1264,6 +1309,7 @@ async fn prepare(
     validate_capability_responses(&broker, &identities, max_frame_bytes)
         .map_err(|error| vec![error])?;
     Ok(Ready {
+        identity_digest: identity_digest.expect("a ready policy has an identity world"),
         broker: Arc::new(broker),
         scheduled: scheduled.unwrap_or_default(),
         identities,
@@ -1275,8 +1321,6 @@ fn keep<T>(problems: &mut Vec<BrokerdError>, result: Result<T, BrokerdError>) ->
     result.map_err(|error| problems.push(error)).ok()
 }
 
-/// A secret map is broker-private and absent from a checkout, so an unchecked build admits each
-/// secret a policy names and reports it, and keeps validating everything else.
 fn build_policy(
     policies: &str,
     mut world: PolicyWorld,

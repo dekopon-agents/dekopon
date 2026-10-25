@@ -1085,6 +1085,7 @@ fn every_action_declares_exactly_these_context_attributes() {
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
             "trigger": { "type": "String", "required": false },
+            "startedBy": { "type": "String", "required": false },
             "conversation": {
                 "type": "Record",
                 "required": false,
@@ -1501,4 +1502,98 @@ fn the_digest_moves_when_membership_changes() {
     )
     .expect("loads");
     assert_ne!(before.digest(), after.digest());
+}
+
+#[test]
+fn principal_kind_is_required_and_subjectless_peers_are_services() {
+    let kinds = world().with_subjects([
+        (
+            "slack.team.channel".parse().expect("space subject"),
+            "cpetersen".parse().expect("principal"),
+        ),
+        (
+            "slack.team.user".parse().expect("person subject"),
+            "direct-caller".parse().expect("principal"),
+        ),
+    ]);
+    let policy = PolicyEngine::new(
+        r#"@id("kind") permit(principal, action, resource) when { principal.kind == "space" };"#,
+        &kinds,
+    )
+    .expect("kind needs no has guard");
+    assert!(
+        policy
+            .authorize(capability_request(
+                "cpetersen",
+                "cli-probe.reverse",
+                session()
+            ))
+            .allowed
+    );
+    assert!(
+        !policy
+            .authorize(capability_request(
+                "direct-caller",
+                "cli-probe.reverse",
+                session()
+            ))
+            .allowed
+    );
+    let service = PolicyEngine::new(
+        r#"@id("kind") permit(principal, action, resource) when { principal.kind == "service" };"#,
+        &world(),
+    )
+    .expect("service kind");
+    assert!(
+        service
+            .authorize(capability_request(
+                "direct-caller",
+                "cli-probe.reverse",
+                session()
+            ))
+            .allowed
+    );
+}
+
+#[test]
+fn moving_a_subject_between_same_kind_principals_changes_only_the_identity_digest() {
+    let first = world().with_subjects([(
+        "slack.team.user".parse().expect("subject"),
+        "cpetersen".parse().expect("principal"),
+    )]);
+    let second = world().with_subjects([(
+        "slack.team.user".parse().expect("subject"),
+        "direct-caller".parse().expect("principal"),
+    )]);
+    let extra = [
+        (
+            "slack.team.u1".parse().expect("subject"),
+            "cpetersen".parse().expect("principal"),
+        ),
+        (
+            "slack.team.u2".parse().expect("subject"),
+            "direct-caller".parse().expect("principal"),
+        ),
+    ];
+    let first = first.with_subjects(extra.clone());
+    let second = second.with_subjects(extra);
+    let source = "@id(\"all\") permit(principal, action, resource);";
+    assert_eq!(
+        PolicyEngine::new(source, &first).expect("policy").digest(),
+        PolicyEngine::new(source, &second).expect("policy").digest()
+    );
+    assert_ne!(first.identity_digest(), second.identity_digest());
+}
+
+#[test]
+fn identity_digest_binds_each_group_to_its_principal() {
+    let first = world().with_group_members([(
+        "cpetersen".parse().expect("principal"),
+        "direct-caller".parse().expect("group"),
+    )]);
+    let second = world().with_group_members([(
+        "direct-caller".parse().expect("principal"),
+        "direct-caller".parse().expect("group"),
+    )]);
+    assert_ne!(first.identity_digest(), second.identity_digest());
 }

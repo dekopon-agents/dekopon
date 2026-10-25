@@ -122,8 +122,7 @@ its `cost_details` land only on `model.complete`, as `usage.cost` and the
 `usage.upstream_inference_*` fields. They are best effort: a non-numeric value is skipped and never
 fails the turn, and unknown members beside them are ignored.
 
-`accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
-URL path or query, no headers, no bodies. It fires for every attempt, including one refused before
+`accounting.http.request` carries the same sanitized set as its span: no URL path or query, no headers, no bodies. `HttpCallEvidence` alone also carries the bounded `X-GitHub-Request-Id` response value as `upstreamRequestId`. It fires for every attempt, including one refused before
 a destination was resolved, because that attempt consumed a unit of the invocation's request
 budget. A field a record cannot know — a provider's unreported token count, or a method, authority,
 and status on a refusal — is absent rather than zero, so a missing field means "unreported" and
@@ -278,14 +277,15 @@ Mapped agent-permission refusals emit one structured `gateway_session_rejected` 
 ## The broker audit record
 
 Every broker decision is one structured log record, emitted from inside the span that made it and
-therefore inside the caller's trace. Two events carry the whole record:
+therefore inside the caller's trace. Three events carry decision, execution and policy activation records:
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
-| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, `decision.point`, `policy.error_ids` and `policy.errors_present` at the HTTP request point, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
-| `broker.execution` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, optional `provider.artifact_sha256` (the full lowercase SHA-256 of the loaded component), `secret`/`secret.sink`, `storage.scope_commitment`/`storage.evidence`, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error`, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected`. It carries no request-only decision fields or verdict |
+| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, `decision.point`, `policy.error_ids` and `policy.errors_present` at the HTTP request point, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision. Also `principal.kind`; `turn.started_by` on a chat claim; the attested `transport.id`, `transport.kind`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; and `delivery.kind`/`delivery.id` when supplied. In a space, `space.id`, `asker.allowed`, `space.allowed`, `space.policy.ids`, and on refusal `decision.denied_by` (`asker`, `space`, `both`). A refusal before Cedar carries only `space.id`; `policy.ids` remains the asker's and `policy.errors_present` covers either evaluation |
+| `broker.execution` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.ids`, `policy.digest`, optional `provider.artifact_sha256` (the full lowercase SHA-256 of the loaded component), `secret`/`secret.sink`, `storage.scope_commitment`/`storage.evidence`, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error`, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, `credentialInjected`, and optional `upstreamRequestId` (the first `X-GitHub-Request-Id` response value, 1–64 visible ASCII bytes; invalid values are dropped). It carries no request-only decision fields or verdict |
+| `broker.policy.loaded` | info | `dekopon-brokerd` | `policy.digest` and `identity.digest` when a policy set starts serving at boot or an applied reload; no source revision, and no event for prepare, abort or check. The identity digest covers subject mappings and principal groups; match a deployment by recomputing both with `check` |
 
-Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
+All three ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
 record does not carry it, so a present field always means the broker knew it. The artifact
 field is derived from the loaded registry, never a desired provider pin; unknown artifacts omit it. A storage-routed
 decision carries every field a non-storage one does, plus its scope commitment and evidence.
@@ -313,8 +313,7 @@ character boundary and suffixed `…[truncated]` like every other bounded value.
 provider wrote about its own refusal, never provider output, which stays a digest.
 
 Nothing here can carry secret bytes. `secret` and `credential` are the symbolic names owner
-configuration already holds, and the HTTP evidence is the same sanitized set the `http.request`
-span carries: no URL path or query, no headers, no bodies.
+configuration already holds, and HTTP evidence carries the sanitized `http.request` fields plus the bounded `X-GitHub-Request-Id` response value. No URL path or query, other header or body is recorded.
 
 The W3C trace id is not a field of the record, and it reaches it two ways. With export configured,
 the record is emitted inside `broker.authorize` or `broker.execute`, which descend from the
@@ -467,7 +466,7 @@ capability exactly as for any other. Provider input rides the `input` fields bel
 word's argv, piped value, and output ride `provider.run_command`, so a header or body a command
 takes as an argument or prints as output is on the span like any other argument or output. The
 credential a sink injects and the wire request the HTTP host builds from it stay out of spans, and
-audit records carry no headers or bodies.
+audit records carry no headers or bodies except the bounded `X-GitHub-Request-Id` response value in HTTP evidence.
 
 An attested proposal adds routing fields to both spans: `broker.invocation` records the claimed
 `subject` and `agent`, and `broker.authorize` records the `subject` and the `via` peer the broker
@@ -860,9 +859,7 @@ migration is implemented here.
 | `provider.invoke` | `dekopon-broker-host` | capability, provider, `input` and `input.bytes`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure. An HTTP grant with `propagateTrace: true` propagates this span as the outbound `traceparent` when an OTel context exists; otherwise no trace header is sent. |
 
-`http.request` fields mirror `HttpCallEvidence` exactly: the span reports the same call the audit
-record carries, so URL paths and queries, request and response headers, and both bodies are absent
-here for the same reason they are absent from evidence. A test in `dekopon-http-host` drives a real
+`http.request` fields describe the same call as `HttpCallEvidence`; evidence alone also carries the bounded `X-GitHub-Request-Id` response value. URL paths and queries, other request and response headers, and both bodies are absent from evidence, and no header is recorded on the span. A test in `dekopon-http-host` drives a real
 loopback request whose path, query, header, and body are each a distinct sentinel and asserts that
 none of them reach a span field.
 
