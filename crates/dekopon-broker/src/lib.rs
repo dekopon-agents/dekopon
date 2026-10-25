@@ -2795,7 +2795,11 @@ where
         if decision.allowed {
             (context, None)
         } else {
-            let named_denial = !decision.errors_present;
+            let named_denial = !decision.errors_present
+                && match decision.space.as_ref().and_then(|space| space.denied_by) {
+                    Some(DenyingPrincipal::Space) => false,
+                    Some(DenyingPrincipal::Asker | DenyingPrincipal::Both) | None => true,
+                };
             let mut refusal = decided_refusal(decision, "agent-denied");
             if named_denial {
                 refusal.session = dekopon_broker_protocol::SessionRefusal::AgentDenied {

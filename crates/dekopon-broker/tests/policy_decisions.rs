@@ -500,6 +500,15 @@ async fn a_space_must_allow_the_session_gate() {
         "c0123abc",
         dekopon_broker::Trigger::Message,
     );
+    let refusal = match broker.session_surface(&gateway(), Some(&grant), Some(&claim)) {
+        Ok(_) => panic!("space must refuse the session"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(refusal.reason, "agent-denied");
+    assert_eq!(
+        refusal.session,
+        dekopon_broker_protocol::SessionRefusal::Other
+    );
     let proposal = request(300, "cli-probe.reverse");
     let result = broker
         .invoke(
@@ -524,8 +533,8 @@ async fn a_space_must_allow_the_session_gate() {
     );
     assert!(
         broker
-            .capability_surface(&gateway(), Some(&grant), Some(&dm))
-            .is_some()
+            .session_surface(&gateway(), Some(&grant), Some(&dm))
+            .is_ok()
     );
 }
 

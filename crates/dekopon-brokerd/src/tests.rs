@@ -3063,13 +3063,15 @@ async fn changed_storage_refuses_without_creating_the_candidate_root() {
 }
 
 #[tokio::test]
-async fn check_without_a_readable_secret_map_warns_and_reports_only_the_identity_digest() {
+async fn check_distinguishes_an_unreadable_secret_map_from_an_unset_key() {
     let mut fixture = ResidentFixture::boot().await;
     let secret = "drn:com.xrl:secret:test:api/token";
     write_owner_only(&fixture.cedar, format!(
         r#"{POLICIES}
         @id("checkout-secret") permit(principal, action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"{secret}");"#
     ).as_bytes());
+    let identity_digest = fixture.active.ready.identity_digest.clone();
+    drop(fixture.active);
     for map in [Some("chart-mounted-secrets.yaml"), None] {
         match map {
             Some(path) => fixture.document["secretMapPath"] = json!(path),
@@ -3083,15 +3085,36 @@ async fn check_without_a_readable_secret_map_warns_and_reports_only_the_identity
         }
         write_config(&fixture.path, &fixture.document);
         let report = super::check(&fixture.path, None, None).await;
-        assert!(report.problems.is_empty(), "{report:?}");
         assert!(report.policy_digest.is_none());
         assert_eq!(
             report.identity_digest.as_deref(),
-            Some(fixture.active.ready.identity_digest.as_str())
+            Some(identity_digest.as_str())
         );
-        assert!(report.warnings.iter().any(|warning| matches!(warning,
-            super::StartupWarning::SecretRequired { policy, secret: required }
-                if policy == "checkout-secret" && required == secret)));
+        match map {
+            Some(_) => {
+                assert!(report.problems.is_empty(), "{report:?}");
+                assert!(report.warnings.iter().any(|warning| matches!(warning,
+                    super::StartupWarning::SecretRequired { policy, secret: required }
+                        if policy == "checkout-secret" && required == secret)));
+            }
+            None => {
+                let boot_report = super::load_candidate(&fixture.path, super::Mode::Boot)
+                    .await
+                    .1;
+                for report in [report, boot_report] {
+                    assert!(
+                        matches!(report.problems.as_slice(),
+                        [super::BrokerdError::Policy { source: dekopon_broker::PolicyBuildError::UnknownSecret { policy, secret: unknown } }]
+                            if policy == "checkout-secret" && unknown == secret),
+                        "{report:?}"
+                    );
+                    assert!(!report.warnings.iter().any(|warning| matches!(
+                        warning,
+                        super::StartupWarning::SecretRequired { .. }
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -3359,7 +3382,7 @@ async fn check_passes_the_conditional_write_example_in_place() {
         None,
     )
     .await;
-    assert!(report.policy_digest.is_none());
+    assert!(report.policy_digest.is_some());
     assert!(report.identity_digest.is_some());
     assert!(
         report.problems.is_empty(),
@@ -3531,9 +3554,8 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     let (candidate, boot_report) = super::load_candidate(&path, super::Mode::Boot).await;
     assert!(boot_report.problems.is_empty(), "{boot_report:?}");
     let candidate = candidate.expect("serving conditional-write configuration");
-    assert!(report.policy_digest.is_none());
     assert_eq!(
-        boot_report.policy_digest.as_deref(),
+        report.policy_digest.as_deref(),
         Some(candidate.ready.broker.policy_digest())
     );
     assert_eq!(

@@ -607,7 +607,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                         None
                     }
                 },
-                None => Some(Secrets::Unchecked),
+                None => Some(Secrets::Names(Vec::new())),
             };
             keep(&mut report.problems, scratch_host(&config, &mut scratch))
                 .zip(secrets)
