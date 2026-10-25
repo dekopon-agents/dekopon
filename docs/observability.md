@@ -270,7 +270,7 @@ the span `Error` without a description.
 
 Every broker-confirmed unmapped refusal emits a notice, including repeats and unrelated strangers during the reply cooldown. The incoming transport rate bounds notice volume, and the existing session gate bounds simultaneous broker/refusal work. Only replies share a gateway-wide one-per-second slot. That slot retains a timestamp, and each attempt still asks the broker afresh. There is no delayed send, identity cache or retry. A fresh process starts with an available reply slot, and the serving path never waits for a telemetry exporter.
 
-Mapped agent-permission refusals retain an operational `gateway_session_rejected` record (`reason=agent-denied`, or `unauthorized` for an empty grant), without this `audit.event` owner-notice selector. Other authentication failures retain their existing behavior. OpenObserve alert routing and delivery are the homelab's responsibility; the notice is best-effort telemetry, not a DM or channel post.
+Mapped agent-permission refusals emit one structured `gateway_session_rejected` record with message `gateway.session.rejected`, carrying the same typed transport, route, conversation and subject fields listed above, and `reason=agent-denied` or `unauthorized` for an empty grant. These records contain no message text and omit the `audit.event` owner-notice selector; only unmapped strangers trigger owner notices. Other authentication failures retain their existing behavior. OpenObserve alert routing and delivery are the homelab's responsibility; the notice is best-effort telemetry, not a DM or channel post.
 
 ## The broker audit record
 

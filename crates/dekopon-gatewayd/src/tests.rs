@@ -6972,18 +6972,24 @@ async fn a_mapped_agent_denial_names_the_principal_without_an_owner_notice() {
             )
             .is_empty()
     );
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_gatewayd",
-                &[
-                    ("event", "gateway_session_rejected"),
-                    ("reason", "agent-denied")
-                ]
-            )
-            .len(),
-        1
-    );
+    let rejections =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+    assert_eq!(rejections.len(), 1, "{}", capture.events_text());
+    let rejection = &rejections[0];
+    for (key, expected) in [
+        ("transport", "dev"),
+        ("route", "0"),
+        ("conversation.kind", "directMessage"),
+        ("conversation.container", ""),
+        ("conversation.id", "dev"),
+        ("conversation.thread", ""),
+        ("reason", "agent-denied"),
+    ] {
+        assert_eq!(rejection.field(key), Some(expected));
+    }
+    let expected = subject().canonical();
+    assert_eq!(rejection.field("subject"), Some(expected.as_str()));
+    assert!(!format!("{rejection:?}").contains("private mapped message"));
 }
 
 #[tokio::test]
@@ -7028,6 +7034,24 @@ async fn a_mapped_empty_grant_gets_a_named_reply_without_an_owner_notice() {
             )
             .is_empty()
     );
+    let rejections =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+    assert_eq!(rejections.len(), 1, "{}", capture.events_text());
+    let rejection = &rejections[0];
+    for (key, expected) in [
+        ("transport", "dev"),
+        ("route", "0"),
+        ("conversation.kind", "directMessage"),
+        ("conversation.container", ""),
+        ("conversation.id", "dev"),
+        ("conversation.thread", ""),
+        ("reason", "unauthorized"),
+    ] {
+        assert_eq!(rejection.field(key), Some(expected));
+    }
+    let expected = subject().canonical();
+    assert_eq!(rejection.field("subject"), Some(expected.as_str()));
+    assert!(!format!("{rejection:?}").contains("private empty grant message"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1944,6 +1944,18 @@ async fn session(
                 SessionRefusal::AgentDenied { principal } => {
                     tracing::info!(
                         event = "gateway_session_rejected",
+                        transport = message.transport.as_str(),
+                        route = route.route_index,
+                        conversation.kind = message.conversation.kind.as_str(),
+                        conversation.container = message
+                            .conversation
+                            .container
+                            .as_deref()
+                            .unwrap_or_default(),
+                        conversation.id = message.conversation.id.as_str(),
+                        conversation.thread =
+                            message.conversation.thread.as_deref().unwrap_or_default(),
+                        subject = message.subject.canonical(),
                         reason = "agent-denied",
                         "gateway.session.rejected"
                     );
@@ -2002,6 +2014,17 @@ async fn session(
             .remove(&key, EvictionReason::GrantChanged);
         tracing::info!(
             event = "gateway_session_rejected",
+            transport = message.transport.as_str(),
+            route = route.route_index,
+            conversation.kind = message.conversation.kind.as_str(),
+            conversation.container = message
+                .conversation
+                .container
+                .as_deref()
+                .unwrap_or_default(),
+            conversation.id = message.conversation.id.as_str(),
+            conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
+            subject = message.subject.canonical(),
             reason = "unauthorized",
             "gateway.session.rejected"
         );
