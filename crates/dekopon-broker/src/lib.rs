@@ -1215,8 +1215,6 @@ impl AttestorGrant {
         Ok(())
     }
 
-    /// Without `namespaces` an attestor may speak for exactly the mapped subjects, which the
-    /// identity directory has already resolved by the time this is asked.
     #[must_use]
     pub fn permits(&self, subject: &ExternalSubject) -> bool {
         self.namespaces.as_ref().is_none_or(|namespaces| {
@@ -2219,6 +2217,11 @@ where
             };
             asker.allowed &= verdict.allowed;
             asker.errors_present |= verdict.errors_present;
+            asker
+                .erroring_policy_ids
+                .extend(verdict.erroring_policy_ids);
+            asker.erroring_policy_ids.sort();
+            asker.erroring_policy_ids.dedup();
             asker.refusal = asker.refusal.take().or(verdict.refusal);
             asker.opaque_body = asker.opaque_body.or(verdict.opaque_body);
             result
