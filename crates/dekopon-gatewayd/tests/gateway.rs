@@ -1046,9 +1046,15 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                     "[gateway: 4 steps and 4 capability calls per message.]"
                 )
             ),
-            ("user", "what broke?"),
+            (
+                "user",
+                "[gateway: authenticated participant: cpetersen]\nwhat broke?"
+            ),
             ("assistant", "Two things broke."),
-            ("user", "and the second one?"),
+            (
+                "user",
+                "[gateway: authenticated participant: cpetersen]\nand the second one?"
+            ),
         ]
     );
 

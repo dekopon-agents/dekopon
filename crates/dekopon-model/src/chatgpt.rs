@@ -1301,14 +1301,14 @@ mod tests {
             description: "Run a sandboxed script".to_owned(),
             parameters: json!({
                 "type": "object",
-                "properties": {"script": {"type": "string"}},
-                "required": ["script"],
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
             }),
         }
     }
 
     fn scripted_turn(turn: u32, call_id: &str, script: &str) -> crate::model::AssistantTurn {
-        tool_turn(turn, call_id, "bash", &json!({"script": script}))
+        tool_turn(turn, call_id, "bash", &json!({"command": script}))
     }
 
     fn tool_turn(
@@ -1395,7 +1395,7 @@ mod tests {
                 kind: "function".to_owned(),
                 function: crate::model::ModelFunctionCall {
                     name: "bash".to_owned(),
-                    arguments: r#"{"script":"ls"}"#.to_owned(),
+                    arguments: r#"{"command":"ls"}"#.to_owned(),
                 },
             }],
             None,
@@ -1423,7 +1423,7 @@ mod tests {
                 {"type": "message", "role": "assistant",
                  "content": [{"type": "output_text", "text": "here you go", "annotations": []}]},
                 {"type": "function_call", "call_id": "call-9", "name": "bash",
-                 "arguments": "{\"script\":\"ls\"}"},
+                 "arguments": "{\"command\":\"ls\"}"},
                 {"type": "function_call_output", "call_id": "call-9", "output": "one file"},
             ])
         );

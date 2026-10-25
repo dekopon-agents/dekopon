@@ -1866,8 +1866,8 @@ mod tests {
             description: "Run a sandboxed script".to_owned(),
             parameters: json!({
                 "type": "object",
-                "properties": {"script": {"type": "string"}},
-                "required": ["script"],
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
             }),
         };
         let tools = vec![OpenAiTool {
@@ -1902,7 +1902,7 @@ mod tests {
                     kind: "function".to_owned(),
                     function: ModelFunctionCall {
                         name: "bash".to_owned(),
-                        arguments: r#"{"script":"ls | wc -l"}"#.to_owned(),
+                        arguments: r#"{"command":"ls | wc -l"}"#.to_owned(),
                     },
                 }],
                 None,
@@ -2396,14 +2396,14 @@ mod tests {
                 name: "one tool call, arguments in fragments, content null throughout",
                 stream: frames(&[
                     r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#,
-                    r#"{"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"function":{"arguments":"{\"script\":"}}]},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]}"#,
                     r#"{"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"function":{"arguments":"\"ls | wc -l\"}"}}]},"finish_reason":null}]}"#,
                     r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
                     r#"{"choices":[],"usage":{"prompt_tokens":80,"completion_tokens":12,"total_tokens":92}}"#,
                     "[DONE]",
                 ]),
                 expected: Expected::Completion(
-                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"script\":\"ls | wc -l\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":80,"completion_tokens":12,"total_tokens":92}}"#,
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls | wc -l\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":80,"completion_tokens":12,"total_tokens":92}}"#,
                 ),
             },
             Recorded {
@@ -2411,35 +2411,35 @@ mod tests {
                 stream: frames(&[
                     r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#,
                     r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"inspect_agent_config","arguments":""}}]}}]}"#,
-                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"script\":\"date\"}"}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"date\"}"}}]}}]}"#,
                     r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{}"}}]}}]}"#,
                     r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
                     "[DONE]",
                 ]),
                 expected: Expected::Completion(
-                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"script\":\"date\"}"}},{"id":"call_2","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"date\"}"}},{"id":"call_2","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
                 ),
             },
             Recorded {
                 name: "llama.cpp: a whole tool call in one fragment, and no [DONE]",
                 stream: frames(&[
-                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"script\":\"uname -a\"}"}}]},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"command\":\"uname -a\"}"}}]},"finish_reason":null}]}"#,
                     r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
                 ]),
                 expected: Expected::Completion(
-                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"script\":\"uname -a\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"command\":\"uname -a\"}"}}]},"finish_reason":"tool_calls"}]}"#,
                 ),
             },
             Recorded {
                 name: "Ollama: every call of a batch reported at index 0",
                 stream: frames(&[
-                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"script\":\"date\"}"}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"date\"}"}}]}}]}"#,
                     r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]}}]}"#,
                     r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
                     "[DONE]",
                 ]),
                 expected: Expected::Completion(
-                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"script\":\"date\"}"}},{"id":"call_b","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"command\":\"date\"}"}},{"id":"call_b","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
                 ),
             },
             Recorded {
