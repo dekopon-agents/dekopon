@@ -7,6 +7,74 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-10-25
+
+### Added
+
+- Report peakRssBytes in precompile/check JSON and peak_rss_bytes on provider compile/precompile spans.
+- A Slack or Discord channel subject in principals maps a space; in that channel and its threads every broker decision needs both the asker's and the space's policy to allow it.
+- Cedar policies can read principal.kind (person, space, repository or service) and context.startedBy.
+- broker.decision records the principal's kind, what started the turn, the attested conversation and, in a space, the space, both verdicts and who denied; broker.policy.loaded and dekopon-brokerd check report the policy and identity digests.
+- broker.execution's http.calls carry GitHub's X-GitHub-Request-Id.
+- dekopon-brokerd check --workflows refuses a provider set or policy that would break an operator-declared essential workflow
+- The chart's configCheck.broker.workflowsConfigMap passes candidate essential workflows to the config-check hook, which now also checks the chart-rendered peers.yaml and refuses a candidate peers.yaml key as the Deployment does.
+
+### Changed
+
+- The operator console ships with Dekopon releases and images while keeping its existing Homebrew install command.
+- The script tree now carries cancellation for shell execution.
+- dekopon-brokerd refuses a principal whose subjects mix people, channels and repositories.
+- Model traces include complete tool definitions for each session.
+- Model prompt traces remove the tools field in favor of complete tool definitions.
+- Model exchange spans report the tool options sent by each dialect.
+- Model prompt trace events are emitted after the model call completes.
+- Image transcript summaries identify decoded inputs by SHA-256.
+- Provider commands hand unquoted attachment references through one Run frame with only their named rows and descriptors.
+- Unquoted shell expansions now split on default IFS whitespace, including command-substitution output.
+- TreeContext, CallBudget, RetainedBytes, Limits, LimitExceeded and DEFAULT_* limits now live in dekopon-process.
+- Answer every unknown-tool or malformed bash call in the first rejected model turn so the session can recover.
+- Log answered tool rejections at warn and unanswered rejections at error.
+- Bound ignored bash argument names with the shared telemetry attribute limit.
+- dekopon-brokerd check --workflows refuses every step of a workflow file whose via principal more than one candidate identity has, instead of checking the lowest UID's grant.
+- dekopon-brokerd check --workflows names the essential workflows file or directory, not the broker configuration, when one cannot be read.
+- dekopon_broker::AuthorizedInvocation is renamed CapabilityDecision; the secret-use decision is public as Broker::bind_secret_use and Broker::secret_use_or_default.
+- A message that waited behind the conversation's running turn links that turn's `gateway.message`.
+- `memory.persist` runs after `gateway.session` ends, as its sibling under `gateway.message`, so `gateway.session` ends at the reply.
+- Every span event is named by a stable dotted name (its `audit.event`, or its `event` with `_` read as `.`) instead of prose or a source location.
+- `shell.command` records its stage fields once, and `model.complete` reports a failure only as `error.type`, dropping `error` and `error.kind`.
+- `outcome` labels are `succeeded`/`failed` on `model.complete` (was `success`), `provider.registry_load`, `provider.compile` and `provider.load_stage` (was `ok`/`error`) and `succeeded` on `asset.spool` (was `ok`); `gateway.progress` labels `outcome`, `class` and `by` in lowercase (was `Answered`, `StepBudget`, `User { via: Button }`).
+- Post-reply memory work nests under a new `memory.persist` span, and `gateway.session` carries a `reply.delivered` event at the moment the reply reaches the chat.
+- Failed model calls, broker executions and credential refreshes set the OTLP span status to error, and `model.complete` adds `error.type`.
+
+### Removed
+
+- Proposal JSON walks for attachment reference discovery.
+
+### Fixed
+
+- Slack reaction degradation records name the configured transport and classify missing scope or wrong token type.
+- Give unmapped chat senders a friendly refusal and a bounded structured owner notice, and name mapped agent-permission refusals.
+- Probe newly bound route models with a declared tool, and a built-in image for image models, before accepting configuration checks or reloads.
+- Direct messages and private or one-shot turns identify their authenticated participant in gateway prompts and recorded conversation history.
+- Prevent long [[ ]] boolean chains from overflowing the native stack.
+- Name the enclosing shell construct when its parse nesting is refused, so dispatch guards preserve existing limits without hand-paired body counters.
+- dekopon-brokerd refuses a DEKOPON_REGISTRY_CA_BUNDLE file that is a symlink, is not owned by the broker UID, is group/world writable, or sits in an unprotected directory, the same rules as the provider lock.
+- Inside double quotes or a here-document, `${x:-w}`, `${x:=w}` and `${x:+w}` keep single quotes in `w` as text and treat backslashes as bash does there, so `echo "[${x:-'a'}]"` prints `['a']`.
+- Detached jobs started by a turn and their children spend the starting turn's capability-call budget while retaining their job deadline.
+- An `error` field on an event no longer becomes its span's status description, so upstream provider text stays out of span status.
+- A long streamed model call keeps its `outcome` and `usage.*` fields on `model.complete`; counters and byte totals are recorded once when the call ends instead of per delta.
+- A model transport failure records the whole error source chain, so a TLS failure names the certificate problem instead of only "error sending request".
+
+## [dekopon-chart-0.39.0] - 2026-10-25
+
+### Added
+
+- The chart's configCheck.broker.workflowsConfigMap passes candidate essential workflows to the config-check hook, which now also checks the chart-rendered peers.yaml and refuses a candidate peers.yaml key as the Deployment does.
+
+### Changed
+
+- Chart 0.39.0 targets core v0.52.0 and renders the `v0.52.0` image tag.
+
 ## [0.51.0] - 2026-10-24
 
 ### Added
