@@ -144,8 +144,9 @@ all claims; another sender must mention and authorize independently.
 Persistent history is private per authenticated subject unless the route explicitly sets
 `scope: sharedConversation`. Slack sharing is normally root-thread scoped: independently authorized
 participants in that root thread then share retained turns and attachment references, while every
-message receives its own broker decision. Shared turns send canonical Slack subject IDs to the
-model provider; this example does not opt in.
+message receives its own broker decision. Every person-originated turn, in every scope, carries
+a gateway-authored participant label naming the sender's broker principal or saying `unmapped participant`.
+That label reaches the model provider. This example does not opt into shared history.
 
 In Agent mode, Dekopon sets `processing` once—Slack owns the standard Working UI and one-hour
 processing timeout—sends the durable reply, and queues `active` cleanup.

@@ -1747,7 +1747,6 @@ struct SessionSteers {
     store: Arc<AssetStore>,
     access: AssetAccess,
     images_supported: bool,
-    scope: Option<MemoryScope>,
     principal: Option<PrincipalId>,
     received_at: tokio::time::Instant,
     raw_texts: Mutex<Vec<String>>,
@@ -1793,16 +1792,14 @@ impl SessionSteers {
                 let registered =
                     self.store
                         .assets_for_access(&self.access, steer.assets, Instant::now());
-                let mut recorded =
+                let recorded =
                     bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
-                let mut prompt = match asset::reference_note(&registered, self.images_supported) {
+                let prompt = match asset::reference_note(&registered, self.images_supported) {
                     Some(note) => bound_inbound(&format!("{text}\n\n{note}")),
                     None => text,
                 };
-                if self.scope == Some(MemoryScope::SharedConversation) {
-                    prompt = attributed_prompt(self.principal.as_ref(), &prompt);
-                    recorded = attributed_prompt(self.principal.as_ref(), &recorded);
-                }
+                let prompt = attributed_prompt(self.principal.as_ref(), &prompt);
+                let recorded = attributed_prompt(self.principal.as_ref(), &recorded);
                 self.raw_texts.lock().push(steer.text);
                 Steer::Person { prompt, recorded }
             })
@@ -2088,17 +2085,12 @@ async fn session(
     let journal_access = asset_access.clone();
     let delivery_notice = runner.assets.take_delivery_notice(&asset_access);
     let stop_notice = runner.pending_notices.lock().remove(&key);
-    let shared = window.map(|window| window.scope) == Some(MemoryScope::SharedConversation);
     let frame = |text: String| {
         let text = match &delivery_notice {
             Some(note) => bound_inbound(&format!("{note}\n{text}")),
             None => text,
         };
-        if shared {
-            attributed_prompt(principal.as_ref(), &text)
-        } else {
-            text
-        }
+        attributed_prompt(principal.as_ref(), &text)
     };
     let text = match stop_notice {
         Some(PendingNotice(cause)) => bound_inbound(&format!("{}\n{text}", cause.notice())),
@@ -2128,7 +2120,6 @@ async fn session(
         store: Arc::clone(&runner.assets),
         access: asset_access,
         images_supported,
-        scope: window.map(|window| window.scope),
         principal: principal.clone(),
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),

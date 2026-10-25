@@ -546,7 +546,7 @@ async fn admission_remains_held_until_generation_and_append_finish() {
     );
     assert_eq!(
         recall.history.turns().last().map(ConversationTurn::user),
-        Some("two")
+        Some("[gateway: unmapped participant]\ntwo")
     );
 }
 

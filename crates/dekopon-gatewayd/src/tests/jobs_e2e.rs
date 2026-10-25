@@ -402,7 +402,9 @@ async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
     let prompt = models.prompt(2);
     assert!(
         prompt.iter().any(|(role, text)| role == "user"
-            && text.starts_with("[gateway: job 1 finished, exit 0, after")
+            && text.starts_with(
+                "[gateway: unmapped participant]\n[gateway: job 1 finished, exit 0, after"
+            )
             && text.contains("sleep 1 && echo finished\nfinished")),
         "{prompt:?}"
     );
@@ -781,19 +783,37 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     assert_eq!(
         window(2),
         turns(&[
-            ("user", &format!("{}person said this", label(1))),
+            (
+                "user",
+                &format!(
+                    "{}[gateway: unmapped participant]\nperson said this",
+                    label(1)
+                )
+            ),
             ("assistant", "finished"),
-            ("user", "what did I say?"),
+            ("user", "[gateway: unmapped participant]\nwhat did I say?"),
         ])
     );
     assert_eq!(
         window(3),
         turns(&[
-            ("user", &format!("{}person said this", label(1))),
+            (
+                "user",
+                &format!(
+                    "{}[gateway: unmapped participant]\nperson said this",
+                    label(1)
+                )
+            ),
             ("assistant", "finished"),
-            ("user", &format!("{}what did I say?", label(2))),
+            (
+                "user",
+                &format!(
+                    "{}[gateway: unmapped participant]\nwhat did I say?",
+                    label(2)
+                )
+            ),
             ("assistant", "remembered"),
-            ("user", "and before that?"),
+            ("user", "[gateway: unmapped participant]\nand before that?"),
         ])
     );
 }
