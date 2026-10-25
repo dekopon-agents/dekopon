@@ -33,7 +33,7 @@ the templated request before egress. `ChatSlot` and `RequestTemplate` are
 re-exported by the testkit.
 
 Storage and external components have no native typed provider; their fixture
-integration tests live in `dekopon-broker-host/tests/fixture_host.rs` and use
+integration tests live in `dekopon-broker-host/tests/integration/fixture_host.rs` and use
 exact authorized grants against the real storage host. Neither harness grants
 production authority or evaluates policy.
 

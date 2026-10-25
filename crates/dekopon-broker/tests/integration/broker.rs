@@ -2916,7 +2916,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         assert_eq!(
             actor,
             &Some(Actor::Service {
-                principal: crate::principal("gateway")
+                principal: self::principal("gateway")
             })
         );
         assert!(
