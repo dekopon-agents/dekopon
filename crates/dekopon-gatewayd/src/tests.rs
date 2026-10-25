@@ -22601,7 +22601,11 @@ async fn space_shared_replay_keeps_the_window_when_speakers_grants_differ() {
         let directory = temporary();
         let responses = ["cli-probe.upper", "cli-probe.reverse"].map(|id| {
             let response = listings(1, &[id]).remove(0);
-            response.with_space(space.then(|| vec!["cli-probe.upper".parse().expect("capability")]))
+            response.with_space(space.then(|| {
+                ["cli-probe.reverse", "cli-probe.upper"]
+                    .map(|id| id.parse().expect("capability"))
+                    .into()
+            }))
         });
         let (broker, _observed) = stub_broker(directory.path(), responses.into()).await;
         let models = ModelScript::new([answer("first answer"), answer("second answer")]);
@@ -22650,9 +22654,11 @@ async fn space_shared_replay_keeps_the_window_when_speakers_grants_differ() {
 async fn an_empty_asker_grant_does_not_evict_the_space_window() {
     let directory = temporary();
     let responses = [vec!["cli-probe.upper"], vec![], vec!["cli-probe.reverse"]].map(|ids| {
-        listings(1, &ids)
-            .remove(0)
-            .with_space(Some(vec!["cli-probe.upper".parse().expect("capability")]))
+        listings(1, &ids).remove(0).with_space(Some(
+            ["cli-probe.reverse", "cli-probe.upper"]
+                .map(|id| id.parse().expect("capability"))
+                .into(),
+        ))
     });
     let (broker, _observed) = stub_broker(directory.path(), responses.into()).await;
     let models = ModelScript::new([answer("retained answer"), answer("continued answer")]);
