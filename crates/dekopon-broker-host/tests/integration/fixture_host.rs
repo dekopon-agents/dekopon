@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+#[path = "../fixture/mod.rs"]
 mod fixture;
 
 use dekopon_test_support::provider_fixture;
