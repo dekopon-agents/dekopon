@@ -178,7 +178,7 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
 #[test]
 fn whatsapp_example_uses_the_typed_default_media_collection_window() {
     let config: GatewaydConfig =
-        serde_yaml::from_str(include_str!("../../../examples/whatsapp/gatewayd.yaml"))
+        serde_yaml::from_str(include_str!("../../../../examples/whatsapp/gatewayd.yaml"))
             .expect("WhatsApp example strictly decodes");
     assert!(matches!(
         &config.transports[0],
