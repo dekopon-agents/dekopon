@@ -94,11 +94,12 @@ impl SlackTransport {
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         let thread_ownership = Arc::new(SlackThreadOwnership::new(OWNED_THREAD_CAPACITY));
         Ok(Self {
-            name,
+            name: name.clone(),
             endpoint: endpoint.clone(),
             app_token: Redacted::new(app_token),
             http: http.clone(),
             replier: Arc::new(SlackReplier {
+                name,
                 endpoint,
                 bot_token: Redacted::new(bot_token),
                 http,
@@ -676,6 +677,7 @@ impl ChatTransport for SlackTransport {
 }
 
 pub(crate) struct SlackReplier {
+    name: String,
     endpoint: String,
     bot_token: Redacted<String>,
     http: reqwest::Client,
@@ -1332,12 +1334,14 @@ impl SlackReplier {
     }
 
     fn reaction_failed(&self, error: &TransportError) {
-        if permanent_reaction_error(error) && self.reaction_available.swap(false, Ordering::AcqRel)
+        if let Some(cause) = PermanentReactionError::classify(error)
+            && self.reaction_available.swap(false, Ordering::AcqRel)
         {
             tracing::warn!(
                 event = "gateway_progress_degraded",
-                transport = "slack",
+                transport = %self.name,
                 surface = "reaction",
+                category = cause.category(),
                 "gateway.progress.degraded"
             );
         }
@@ -1564,12 +1568,46 @@ fn permanent_agent_error(error: &TransportError) -> bool {
     )
 }
 
-fn permanent_reaction_error(error: &TransportError) -> bool {
-    matches!(
-        error,
-        TransportError::Service { code }
-            if matches!(code.as_str(), "missing_scope" | "not_allowed_token_type")
-    )
+enum PermanentReactionError {
+    MissingScope,
+    NotAllowedTokenType,
+}
+
+impl PermanentReactionError {
+    fn classify(error: &TransportError) -> Option<Self> {
+        match error {
+            TransportError::Service { code } => match code.as_str() {
+                "missing_scope" => Some(Self::MissingScope),
+                "not_allowed_token_type" => Some(Self::NotAllowedTokenType),
+                _ => None,
+            },
+            TransportError::AssetType { .. }
+            | TransportError::Attachment(_)
+            | TransportError::AttachmentTask { .. }
+            | TransportError::MissingCredential { .. }
+            | TransportError::EmptyCredential { .. }
+            | TransportError::NonUtf8Credential { .. }
+            | TransportError::Request(_)
+            | TransportError::DisallowedIntents
+            | TransportError::Response
+            | TransportError::MalformedResponse(_)
+            | TransportError::PartialDelivery
+            | TransportError::ConnectTimeout
+            | TransportError::RecoveryExhausted { .. }
+            | TransportError::IdentityChanged
+            | TransportError::Closed
+            | TransportError::Io(_)
+            | TransportError::InsecureSocket { .. }
+            | TransportError::Subject(_) => None,
+        }
+    }
+
+    fn category(&self) -> &'static str {
+        match self {
+            Self::MissingScope => "missing_scope",
+            Self::NotAllowedTokenType => "not_allowed_token_type",
+        }
+    }
 }
 
 struct SlackThreadOwnership {
@@ -2090,6 +2128,7 @@ mod driver_tests {
 
     fn replier_with(endpoint: &str, experience: SlackExperience) -> SlackReplier {
         SlackReplier {
+            name: "scientist-slack".to_owned(),
             endpoint: endpoint.to_owned(),
             bot_token: Redacted::new("xoxb-test-bot-token".to_owned()),
             http: credential_client(SLACK_REQUEST_TIMEOUT)
@@ -2446,6 +2485,150 @@ mod driver_tests {
             })
         );
         assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_reaction_scope_records_the_installation_cause_and_preserves_answers() {
+        permanent_reaction_failure_preserves_answers("missing_scope").await;
+    }
+
+    #[tokio::test]
+    async fn wrong_reaction_token_records_the_installation_cause_and_preserves_answers() {
+        permanent_reaction_failure_preserves_answers("not_allowed_token_type").await;
+    }
+
+    async fn permanent_reaction_failure_preserves_answers(code: &'static str) {
+        use crate::progress::{ProgressPolicy, Terminal};
+        use dekopon_agent::{ProgressEvent, ProgressSink as _};
+
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        let observed = Arc::clone(&attempted);
+        let mock = spawn_slack_mock(move |path, body| {
+            if path == "/api/reactions.add" {
+                (200, json!({"ok": false, "error": code}))
+            } else {
+                if path == "/api/chat.postMessage" {
+                    observed.notify_one();
+                }
+                accepting(path, body)
+            }
+        });
+        let transport = transport(&mock.base, SlackExperience::Classic);
+        for message_ts in [INBOUND_TS, POSTED_TS] {
+            let inputs = reaction_progress_inputs(&transport, message_ts);
+            let target = inputs.target.clone().expect("Slack message target");
+            let (mut policy, sink) = ProgressPolicy::start(inputs);
+            sink.emit(ProgressEvent::Started {
+                agent: "tester".to_owned(),
+                max_steps: 8,
+            });
+            sink.emit(ProgressEvent::Answered {
+                turn: 1,
+                tool_calls: 1,
+                duration: std::time::Duration::ZERO,
+                first_delta: None,
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempted.notified())
+                .await
+                .expect("the started turn posts its progress surface");
+            assert!(ChatDriver::reaction(transport.replier.as_ref()).is_none());
+            assert!(
+                InboundReaction::set(transport.replier.as_ref(), &target, true)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                SteerAck::seen(transport.replier.as_ref(), &target)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                policy
+                    .terminal(Terminal::Answered(OutboundReply::text("All good.")))
+                    .await
+            );
+        }
+        assert_eq!(
+            mock.body("/api/reactions.add"),
+            json!({
+                "channel": CHANNEL, "timestamp": INBOUND_TS, "name": "tangerine",
+            })
+        );
+        let answers: Vec<_> = mock
+            .calls()
+            .into_iter()
+            .filter(|(path, _)| path == "/api/chat.update")
+            .collect();
+        assert_eq!(answers.len(), 2);
+        for (_, body) in answers {
+            assert_eq!(body["text"], "All good.");
+        }
+        let degraded: Vec<_> = capture
+            .records()
+            .into_iter()
+            .filter(|record| {
+                record.field("event") == Some("gateway_progress_degraded")
+                    && record.field("surface") == Some("reaction")
+            })
+            .collect();
+        assert_eq!(degraded.len(), 1, "{}", capture.events_text());
+        assert_eq!(degraded[0].field("transport"), Some("scientist-slack"));
+        assert_eq!(degraded[0].field("category"), Some(code));
+        let records = capture.text();
+        for token in ["xoxb-test-bot-token", "xapp-test-app-token"] {
+            assert!(!records.contains(token));
+        }
+    }
+
+    fn reaction_progress_inputs(
+        transport: &SlackTransport,
+        message_ts: &str,
+    ) -> crate::progress::ProgressInputs {
+        use crate::{
+            config::{
+                LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness, WorkingReaction,
+            },
+            progress::{KeepAlive, ProgressInputs},
+            session::SessionCancellation,
+            transport::ReplyTarget,
+        };
+        let (templates, problems) =
+            Templates::resolve(&TemplateOverrides::default(), "Stopped.", "Failed.");
+        assert!(problems.is_empty());
+        let liveness = Arc::new(ResolvedLiveness {
+            settings: LivenessSettings {
+                mode: LivenessMode::Native,
+                working: WorkingReaction::Auto,
+                progress: ProgressSurface::Message,
+                ..LivenessSettings::default()
+            },
+            keep_alive: KeepAlive::default(),
+            templates,
+        });
+        let mut target = target();
+        if let LivenessTarget::Slack { message_ts: ts, .. } = &mut target {
+            *ts = message_ts.to_owned();
+        }
+        ProgressInputs {
+            driver: Arc::clone(&transport.replier) as Arc<dyn ChatDriver>,
+            target: Some(target),
+            reply: ReplyTarget::Slack {
+                channel: CHANNEL.to_owned(),
+                thread_ts: Some(message_ts.to_owned()),
+            },
+            transport: transport.name.clone(),
+            detail: ProgressDetail::Plain,
+            settings: liveness.settings,
+            keep_alive: liveness.keep_alive.clone(),
+            liveness,
+            cancellation: SessionCancellation::new(),
+            max_duration: None,
+            silent_until_success: false,
+        }
     }
 
     #[tokio::test]
