@@ -898,9 +898,10 @@ unapproved plaintext, and plain HTTP is available only to an exact literal loopb
 with `--plaintext-loopback-registry <HOST[:PORT]>` (repeatable, `provider` subcommands only), for
 development and tests.
 
-`DEKOPON_REGISTRY_CA_BUNDLE` optionally names a PEM file of at most 64 KiB. Its roots
-are trusted beside WebPKI for every registry fetch, by every `provider` subcommand and
-by `check --provider-set`. An unusable file refuses the command.
+`DEKOPON_REGISTRY_CA_BUNDLE` optionally names a PEM file of at most 64 KiB, read under the same
+rules as the lock: owned by the broker UID with a protected parent, regular, single-link, not a
+symlink, and not group/world writable. Its roots are trusted beside WebPKI for every registry fetch,
+by every `provider` subcommand and by `check --provider-set`. An unusable file refuses the command.
 
 Fetched bytes land at:
 
