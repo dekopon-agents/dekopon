@@ -77,7 +77,7 @@ into pinned read-only descriptors and uses the protocol's typed `InvokeAssets` a
 numbering, retention and output sniffing. Update the descriptor, lifetime, queue, transport and
 failure-note tests together. See [asset handles](gatewayd.md#asset-handles-and-delivery).
 
-Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text whether or not payload telemetry is on, same as every other model-authored record (goal 2). The contract is in [`improvement.md`](improvement.md).
+Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2). The contract is in [`improvement.md`](improvement.md).
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must validate its own capability-specific fields and constraints.
 
