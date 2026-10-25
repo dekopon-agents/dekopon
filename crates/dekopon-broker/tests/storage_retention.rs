@@ -253,7 +253,8 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
     let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
     async {
         let temporary = tempfile::tempdir().unwrap();
-        let (broker, _storage) = build_broker(temporary.path(), false).await;
+        let root = temporary.path().canonicalize().unwrap().join("storage");
+        let (broker, _storage) = build_broker(&root, false).await;
         let gateway = AuthenticatedContext::new(
             "gateway".parse().unwrap(),
             Actor::Service {
