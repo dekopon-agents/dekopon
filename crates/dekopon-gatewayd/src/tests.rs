@@ -17896,6 +17896,8 @@ mod generation;
 mod github_http_invocation;
 #[path = "tests/github_invocation.rs"]
 mod github_invocation;
+#[path = "tests/jobs_burn_in.rs"]
+mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
 #[path = "tests/reload_evidence.rs"]

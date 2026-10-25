@@ -242,3 +242,112 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
         0
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
+    use dekopon_test_support::{CaptureLayer, Record};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let capture = CaptureLayer::workspace();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    async {
+        let temporary = tempfile::tempdir().unwrap();
+        let (broker, _storage) = build_broker(temporary.path(), false).await;
+        let gateway = AuthenticatedContext::new(
+            "gateway".parse().unwrap(),
+            Actor::Service {
+                principal: "gateway".parse().unwrap(),
+            },
+        )
+        .unwrap();
+        let request = InvocationRequest {
+            id: "job-write-join".parse().unwrap(),
+            capability: "storage-probe.run".parse().unwrap(),
+            trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+                .parse()
+                .unwrap(),
+            input: json!({}),
+            secret_use: None,
+        };
+        let claim = Attestation::for_chat(
+            "slack.t0123abc.u9xyz".parse().unwrap(),
+            "reviewer".parse().unwrap(),
+            ChatScopeClaim {
+                transport: "scientist-slack".parse().unwrap(),
+                kind: ChatTransportKind::Slack,
+                conversation: Conversation {
+                    kind: ConversationKind::Thread,
+                    container: Some("t0123abc".to_owned()),
+                    id: "c0123abc".to_owned(),
+                    thread: Some("1712345678.000100".to_owned()),
+                },
+                trigger: Trigger::Job,
+            },
+        )
+        .bound_to(request.id.clone());
+        let grant = AttestorGrant {
+            namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        };
+        let result = broker
+            .invoke(
+                &gateway,
+                Some(&grant),
+                Some(&claim),
+                request,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let records = capture.records();
+    let authorize: Vec<_> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Record::Span {
+                    name: "broker.authorize",
+                    ..
+                }
+            ) && r.field("invocation").is_some()
+        })
+        .collect();
+    assert_eq!(authorize.len(), 1, "{records:?}");
+    for (field, value) in [("trigger", "job"), ("outcome", "allowed")] {
+        let updates: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Record::Span {
+                        name: "broker.authorize",
+                        ..
+                    }
+                )
+            })
+            .filter_map(|r| r.field(field))
+            .collect();
+        assert_eq!(updates, [value]);
+    }
+    assert_eq!(authorize[0].field("invocation"), Some("job-write-join"));
+    assert_eq!(authorize[0].field("capability"), Some("storage-probe.run"));
+    for name in ["broker.decision", "broker.execution"] {
+        let rows: Vec<_> = records
+            .iter()
+            .filter(|r| r.field("audit.event") == Some(name))
+            .collect();
+        assert_eq!(rows.len(), 1, "{records:?}");
+        assert_eq!(rows[0].field("invocation.id"), Some("job-write-join"));
+        assert_eq!(rows[0].field("capability.id"), Some("storage-probe.run"));
+        if name == "broker.decision" {
+            assert_eq!(rows[0].field("decision.allowed"), Some("true"));
+            assert_eq!(rows[0].parent(), Some("broker.execute"));
+        } else {
+            assert_eq!(rows[0].field("effect"), Some("LocalWrite"));
+        }
+    }
+}
