@@ -604,3 +604,35 @@ async fn allowed_space_decisions_commit_to_the_invocation_input() {
     assert_eq!(digests.len(), 2);
     assert_ne!(digests[0], digests[1]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_only_policy_error_records_its_id() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    let (broker, _) = space_broker(SPACE_PROMPT,
+        r#"@id("space-error") permit(principal == Dekopon::Principal::"space", action == Dekopon::Action::"cli-probe.reverse", resource) when { context.request.method == "POST" };"#).await;
+    let claim = channel_claim(
+        ChatTransportKind::Slack,
+        ConversationKind::Channel,
+        "c0123abc",
+        dekopon_broker::Trigger::Message,
+    );
+    let proposal = request(401, "cli-probe.reverse");
+    let capture = dekopon_test_support::CaptureLayer::new();
+    broker
+        .invoke(
+            &gateway(),
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&claim.bound_to(proposal.id.clone())),
+            proposal,
+            Default::default(),
+        )
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await
+        .expect("accounted invocation");
+    let decisions =
+        capture.events_where("dekopon_broker::audit", &[("decision.point", "capability")]);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].field("policy.error_ids"), Some("space-error"));
+}

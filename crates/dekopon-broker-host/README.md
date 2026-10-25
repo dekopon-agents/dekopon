@@ -55,9 +55,9 @@ into the broker's authority surface:
   refuses a missing source/engine index; publisher mode is used by provider sync under the store
   lock to fill the cache. A hit stream-verifies compiled bytes once per registry boot before
   mapping. Reader errors fail loading, never trigger fallback or repair. No invocation rehashes or reopens files.
-  The operator must keep mapped inodes unchanged until every registry using them exits. One private
-  `cwasm::deserialize` function is the sole scoped unsafe exception, calling Wasmtime's file API;
-  the rest of the crate denies unsafe code. See the [broker configuration contract](../dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
+  The operator must keep mapped inodes unchanged until every registry using them exits. The private
+  `cwasm::deserialize` function has a scoped unsafe exception for Wasmtime's file API;
+  the test-component memo deserializer has its own scoped exception, and the crate otherwise denies unsafe code. See the [broker configuration contract](../dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
 - `max_total_memory_bytes` bounds the guest linear memory reservable across concurrently live
   stores, and defaults to 256 MiB — four stores at the default per-store ceiling. Per-store limits
   bound one invocation; with this set to `None` the worst case is the daemon's connection ceiling

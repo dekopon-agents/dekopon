@@ -284,11 +284,14 @@ impl FromStr for ExternalSubject {
         let tenant = tenant
             .map(|tenant| require_canonical_segment(service, SubjectSegment::Tenant, tenant))
             .transpose()?;
+        if service == SubjectService::Discord {
+            if let Some(tenant) = &tenant {
+                numeric_segment(tenant, "tenant")?;
+            }
+        }
         let subject = require_canonical_segment(service, SubjectSegment::Subject, subject)?;
         let numeric = match service {
-            SubjectService::Discord => {
-                is_discord_snowflake(&subject) && tenant.as_deref().is_none_or(is_discord_snowflake)
-            }
+            SubjectService::Discord => is_discord_snowflake(&subject),
             SubjectService::Whatsapp => {
                 !subject.starts_with('0') && subject.bytes().all(|byte| byte.is_ascii_digit())
             }
@@ -423,6 +426,19 @@ mod tests {
         );
         assert!(ExternalSubject::github(&"x".repeat(40), "repo").is_err());
         assert!(ExternalSubject::github("owner", &"x".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn an_invalid_discord_tenant_is_reported_before_the_subject() {
+        for form in ["discord.0.123", "discord.0.0"] {
+            assert_eq!(
+                form.parse::<ExternalSubject>(),
+                Err(super::SubjectError::InvalidSegment {
+                    segment: "tenant",
+                    value: "0".to_owned(),
+                })
+            );
+        }
     }
 
     #[test]
