@@ -7,6 +7,29 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-10-25
+
+### Changed
+
+- The broker's terminal `broker_exit` diagnostic is written to stderr instead of stdout and OTLP.
+- The conversation inventory note lists every file that fits, newest first, and the fetch tool names images and documents explicitly.
+
+### Removed
+
+- The 32-attachment conversation cap and idle expiry for live-generation inventories; one-shot inventories retain their one-hour idle bound.
+- The shared command-word parsing API and whole-conversation attachment rows on gateway Invoke calls.
+
+### Fixed
+
+- Brokers that exhaust their shutdown grace period emit the terminal failure diagnostic before exiting nonzero.
+- Effective gateway indicator settings are logged at boot and each activated reload instead of on unchanged reload ticks.
+
+## [dekopon-chart-0.41.0] - 2026-10-25
+
+### Changed
+
+- Chart 0.41.0 targets core v0.54.0 and renders the `v0.54.0` image tag.
+
 ## [0.53.0] - 2026-10-25
 
 ### Added

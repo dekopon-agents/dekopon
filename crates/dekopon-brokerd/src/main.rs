@@ -8,6 +8,11 @@
     )
 )]
 #[cfg(unix)]
+mod observed;
+#[cfg(unix)]
+use observed::observed;
+
+#[cfg(unix)]
 use std::{io, path::PathBuf, process::ExitCode};
 
 #[cfg(unix)]
@@ -159,10 +164,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(start());
-    // Blocking work still running here outlived the shutdown deadline; it ends with the process.
-    runtime.shutdown_background();
-    code
+    observed::finish(runtime, start())
 }
 
 #[cfg(unix)]
@@ -288,59 +290,6 @@ async fn execute(cli: Cli) -> ExitCode {
             .await
         }
     }
-}
-
-/// Installs one mode's subscriber, runs it to completion, and flushes what it recorded.
-#[cfg(unix)]
-async fn observed(
-    install: Install,
-    work: impl Future<Output = Result<(), AppError>>,
-    deadline: Option<dekopon_brokerd::ShutdownDeadline>,
-) -> ExitCode {
-    let telemetry = match install.install() {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("dekopon-brokerd: could not install tracing subscriber: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let code = match work.await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            tracing::error!(event = "broker_exit", error = %error_chain(&error), "broker.exit");
-            ExitCode::FAILURE
-        }
-    };
-    let flushed = match deadline
-        .as_ref()
-        .and_then(dekopon_brokerd::ShutdownDeadline::get)
-    {
-        None => telemetry.shutdown(),
-        Some(deadline) => {
-            let flush = tokio::task::spawn_blocking(move || telemetry.shutdown());
-            match tokio::time::timeout_at(deadline, flush).await {
-                Ok(Ok(flushed)) => flushed,
-                Ok(Err(error)) => {
-                    eprintln!("dekopon-brokerd: telemetry flush failed: {error}");
-                    return code;
-                }
-                Err(_) => {
-                    eprintln!(
-                        "dekopon-brokerd: telemetry flush abandoned at the shutdown deadline"
-                    );
-                    return code;
-                }
-            }
-        }
-    };
-    if let Err(error) = flushed {
-        tracing::error!(
-            event = "broker_telemetry_shutdown_failed",
-            error = %error,
-            "broker.telemetry.shutdown.failed"
-        );
-    }
-    code
 }
 
 #[cfg(unix)]
