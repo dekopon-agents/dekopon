@@ -748,7 +748,11 @@ pub async fn run_turn(
 pub struct LegHandle(pub Arc<BrokerLeg>);
 
 impl CapabilityInvoker for LegHandle {
-    fn script_started(&self, tree: &mut TreeContext) {
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        self.0.cancel_signals()
+    }
+
+    fn script_started(&self, tree: &mut dekopon_process::TreeContext) {
         self.0.script_started(tree);
     }
 
