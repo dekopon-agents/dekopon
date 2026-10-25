@@ -78,9 +78,11 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   exactly as an invocation does. The script tree carries the embedder's Stop signal
   from `BrokerLeg::with_cancel_signal` and the script deadline; command words wait on
   both in place, without a per-script timer task.
-  Either drops a command word in flight, after which the script reads `session-cancelled`. A transport
-  failure after submission reaches the script as `RunResult::Uncertain`, naming its cause without
-  refunding the call. Cancellation before submission returns `session-cancelled` and refunds it.
+  Cancellation at the initial check returns `session-cancelled`; cancellation during asset
+  preparation or at the final pre-submission check returns `script-cancelled`. Both return
+  `RunResult::Returned` and refund the call. In-flight cancellation returns `RunResult::Uncertain`
+  with `script-cancelled` and retains the charge. A transport failure after submission reaches the
+  script as `RunResult::Uncertain`, naming its cause without refunding the call.
   The same signal read synchronously refuses a capability call the script starts after Stop;
   that is a cooperative boundary rather than a refusal decision, which stays the broker's.
 - `IdSequence` — one session's W3C trace and the collision-free invocation identifiers that
