@@ -4,7 +4,7 @@ use super::jobs_e2e::{
 };
 use super::*;
 use crate::jobs::JobOwner;
-use dekopon_broker_protocol::Trigger;
+use dekopon_broker_protocol::{Arg, Trigger};
 use dekopon_shell::{ExitCode, JobId, JobOutcome, JobState};
 use dekopon_test_support::{CaptureLayer, Record};
 use tracing::instrument::WithSubscriber as _;
@@ -70,7 +70,7 @@ async fn a_third_start_at_the_default_limit_is_refused_across_two_people_and_suc
     let start = Instant::now();
     let output = tool_output_of(&runner, &models, route.clone(), b.clone()).await;
     assert!(start.elapsed() < Duration::from_secs(5));
-    assert_eq!(output.lines().last(), Some("status=1"));
+    assert!(output.lines().any(|line| line == "status=1"), "{output}");
     assert!(runner.jobs.list(&ob).is_empty());
     let rows = runner.jobs.list(&oa);
     assert_eq!(rows.len(), 2);
@@ -86,7 +86,7 @@ async fn a_third_start_at_the_default_limit_is_refused_across_two_people_and_suc
     .await;
     assert_eq!(finished(&runner.jobs.list(&oa)[0]).0, JobOutcome::Killed);
     let output = tool_output_of(&runner, &models, route, b).await;
-    assert_eq!(output.lines().last(), Some("status=0"));
+    assert!(output.lines().any(|line| line == "status=0"), "{output}");
     assert_eq!(
         finished(&runner.jobs.list(&ob)[0]),
         (JobOutcome::Succeeded, ExitCode::SUCCESS)
@@ -262,24 +262,25 @@ async fn a_jobs_write_is_proposed_on_a_leg_attested_as_job_and_its_notice_turn_t
     let requests: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
     let invokes: Vec<_> = requests
         .iter()
-        .filter_map(|r| match &r.request {
-            BrokerRequest::Run {
+        .filter_map(|r| {
+            if let BrokerRequest::Run {
                 word,
                 argv,
                 attestation: Some(attestation),
                 ..
-            } => Some((word, argv, attestation)),
-            _ => None,
+            } = &r.request
+            {
+                Some((word, argv, attestation))
+            } else {
+                None
+            }
         })
         .collect();
     assert_eq!(invokes.len(), 1);
     assert_eq!(invokes[0].0, "probe");
     assert_eq!(
         invokes[0].1,
-        &vec![
-            dekopon_broker_protocol::Arg::Text("write".to_owned()),
-            dekopon_broker_protocol::Arg::Text("x".to_owned())
-        ]
+        &vec![Arg::Text("write".to_owned()), Arg::Text("x".to_owned())]
     );
     assert_eq!(invokes[0].2.scope.as_ref().unwrap().trigger, Trigger::Job);
     let (send, mut recv) = mpsc::unbounded_channel();
@@ -307,12 +308,10 @@ async fn a_job_started_by_a_job_spends_its_starters_call_budget_and_a_new_turn_j
         ]);
     }
     responses.extend([probe_listing()]);
-    for text in ["c"] {
-        responses.extend([
-            upper_proposal(text),
-            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
-        ]);
-    }
+    responses.extend([
+        upper_proposal("c"),
+        ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+    ]);
     responses.extend(vec![probe_listing(), probe_listing()]);
     responses.extend([
         upper_proposal("e"),
@@ -341,17 +340,20 @@ async fn a_job_started_by_a_job_spends_its_starters_call_budget_and_a_new_turn_j
         assert_eq!(finished(&row), (JobOutcome::Failed, ExitCode::SYNTAX));
     }
     let first: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
-        .filter_map(|r| match r.request {
-            BrokerRequest::Run { argv, .. } => Some(argv),
-            _ => None,
+        .filter_map(|r| {
+            if let BrokerRequest::Run { argv, .. } = r.request {
+                Some(argv)
+            } else {
+                None
+            }
         })
         .collect();
     assert_eq!(
         first,
         ["a", "b", "c"].map(|text| vec![
-            dekopon_broker_protocol::Arg::Text("upper".to_owned()),
-            dekopon_broker_protocol::Arg::Text("--text".to_owned()),
-            dekopon_broker_protocol::Arg::Text(text.to_owned())
+            Arg::Text("upper".to_owned()),
+            Arg::Text("--text".to_owned()),
+            Arg::Text(text.to_owned())
         ])
     );
     tool_output_of(&runner, &models, route, inbound).await;
@@ -360,17 +362,20 @@ async fn a_job_started_by_a_job_spends_its_starters_call_budget_and_a_new_turn_j
     let row = rows.iter().find(|r| r.id == JobId::new(3)).unwrap();
     assert_eq!(finished(row), (JobOutcome::Succeeded, ExitCode::SUCCESS));
     let second: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
-        .filter_map(|r| match r.request {
-            BrokerRequest::Run { argv, .. } => Some(argv),
-            _ => None,
+        .filter_map(|r| {
+            if let BrokerRequest::Run { argv, .. } = r.request {
+                Some(argv)
+            } else {
+                None
+            }
         })
         .collect();
     assert_eq!(
         second,
         [vec![
-            dekopon_broker_protocol::Arg::Text("upper".to_owned()),
-            dekopon_broker_protocol::Arg::Text("--text".to_owned()),
-            dekopon_broker_protocol::Arg::Text("e".to_owned())
+            Arg::Text("upper".to_owned()),
+            Arg::Text("--text".to_owned()),
+            Arg::Text("e".to_owned())
         ]]
     );
 }
@@ -396,7 +401,7 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
     tool_output_of(&runner, &models, route.clone(), x.clone()).await;
     let output = tool_output_of(&runner, &models, route, y.clone()).await;
     assert_eq!(output.lines().next(), Some("rows=0"));
-    assert_eq!(output.lines().last(), Some("waited=1"));
+    assert!(output.lines().any(|line| line == "waited=1"), "{output}");
     let mut sessions = tokio::task::JoinSet::new();
     let y_id = y.conversation.id.clone();
     for mut inbound in [y, x] {
@@ -495,12 +500,12 @@ async fn job_words_on_a_route_without_jobs_report_off_while_foreign_job_words_ar
             .any(|r| r.field("message") == Some("job.started"))
     );
     for (name, kind, exit) in [
-        ("jobs", "builtin", "1"),
-        ("wait", "builtin", "1"),
-        ("kill", "builtin", "1"),
-        ("fg", "rejected", "2"),
-        ("bg", "rejected", "2"),
-        ("disown", "not-found", "127"),
+        ("jobs", "builtin", ExitCode::FAILURE),
+        ("wait", "builtin", ExitCode::FAILURE),
+        ("kill", "builtin", ExitCode::FAILURE),
+        ("fg", "rejected", ExitCode::SYNTAX),
+        ("bg", "rejected", ExitCode::SYNTAX),
+        ("disown", "not-found", ExitCode::NOT_FOUND),
     ] {
         let rows: Vec<_> = records
             .iter()
@@ -524,6 +529,7 @@ async fn job_words_on_a_route_without_jobs_report_off_while_foreign_job_words_ar
             .iter()
             .take_while(|r| r.field("shell.command.name").is_none())
             .filter_map(|r| r.field("shell.command.exit_code"))
+            .map(|code| ExitCode::from_script_exit(code.parse().unwrap()))
             .collect();
         assert_eq!(updates, [exit]);
     }

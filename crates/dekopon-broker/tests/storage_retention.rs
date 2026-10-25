@@ -267,7 +267,7 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
             trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
                 .parse()
                 .unwrap(),
-            input: json!({}),
+            input: json!({"mode":"quota-denial"}),
             secret_use: None,
         };
         let claim = Attestation::for_chat(
@@ -299,7 +299,11 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
             )
             .await
             .unwrap();
-        assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
+        assert_eq!(
+            result.result.outcome,
+            InvocationOutcome::Failed,
+            "{result:?}"
+        );
     }
     .with_subscriber(subscriber)
     .await;
