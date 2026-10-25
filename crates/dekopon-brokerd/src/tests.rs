@@ -1220,6 +1220,27 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
     );
 }
 
+fn mapped_slack_channel_claim() -> dekopon_broker_protocol::Attestation {
+    dekopon_broker_protocol::Attestation::for_chat(
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "chat-agent"
+            .parse::<dekopon_core::AgentId>()
+            .expect("agent"),
+        dekopon_broker_protocol::ChatScopeClaim {
+            transport: "scientist-slack".parse().expect("transport"),
+            kind: dekopon_broker_protocol::ChatTransportKind::Slack,
+            conversation: dekopon_broker_protocol::Conversation {
+                kind: dekopon_broker_protocol::ConversationKind::Channel,
+                container: Some("t0123abc".to_owned()),
+                id: "cspace".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
+            trigger: dekopon_broker_protocol::Trigger::Message,
+            delivery: None,
+        },
+    )
+}
+
 #[tokio::test]
 async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     dekopon_broker_host::enable_test_component_memoization();
@@ -1230,8 +1251,8 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
     };
     use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-    use dekopon_broker_protocol::{Attestation, ResponseEnvelope};
-    use dekopon_core::{Actor, AgentId, CapabilityId, PrincipalId};
+    use dekopon_broker_protocol::ResponseEnvelope;
+    use dekopon_core::{Actor, CapabilityId, PrincipalId};
 
     use super::{BrokerdError, MappedPeer, validate_capability_responses};
 
@@ -1321,22 +1342,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         !capabilities.is_empty(),
         "the ceiling must see what policy grants an attested principal"
     );
-    let claim = Attestation::for_chat(
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
-        "chat-agent".parse::<AgentId>().expect("agent"),
-        dekopon_broker_protocol::ChatScopeClaim {
-            transport: "scientist-slack".parse().expect("transport"),
-            kind: dekopon_broker_protocol::ChatTransportKind::Slack,
-            conversation: dekopon_broker_protocol::Conversation {
-                kind: dekopon_broker_protocol::ConversationKind::Channel,
-                container: Some("t0123abc".to_owned()),
-                id: "cspace".to_owned(),
-                thread: Some("1712345678.000100".to_owned()),
-            },
-            trigger: dekopon_broker_protocol::Trigger::Message,
-            delivery: None,
-        },
-    );
+    let claim = mapped_slack_channel_claim();
     let attestor = dekopon_broker::AttestorGrant {
         namespaces: Some(vec!["slack.t0123abc".to_owned()]),
     };
