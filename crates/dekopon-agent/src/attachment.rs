@@ -1,10 +1,7 @@
 use dekopon_broker_protocol::{
     AssetEncoding, AssetRow, InvokeAssets, MAX_ASSET_DESCRIPTORS, NewAsset,
 };
-use dekopon_core::{
-    base64::{DecoderReader, STANDARD},
-    chat_asset_marker,
-};
+use dekopon_core::base64::{DecoderReader, STANDARD};
 use dekopon_model::asset::{BlobError, DiskBlob};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -345,6 +342,12 @@ pub trait ChatAssetSource: Send + Sync {
     fn resolve_input(&self, id: u64) -> ResolveFuture<'_>;
     fn rows(&self) -> Vec<AssetRow>;
 }
+pub struct PreparedRun {
+    pub argv: Vec<dekopon_broker_protocol::Arg>,
+    pub assets: InvokeAssets,
+    pub pins: Vec<DiskBlob>,
+}
+
 pub struct ChatAssetInputs {
     source: Arc<dyn ChatAssetSource>,
 }
@@ -357,28 +360,43 @@ impl ChatAssetInputs {
         input: &Value,
         sends_remaining: u8,
     ) -> Result<(InvokeAssets, Vec<DiskBlob>), ChatAssetRefusal> {
-        let references = references(input)?;
-        let mut pins = Vec::with_capacity(references.len());
-        let mut descriptors = Vec::with_capacity(references.len());
-        let mut total = 0usize;
-        for id in references {
-            let ResolvedInput { row, blob } = self.source.resolve_input(id).await?;
-            let decoded = GeneratedImage::new(blob.clone(), row.content_type, row.encoding)
-                .decoded_len()
-                .map_err(ChatAssetRefusal::Storage)?;
-            total = input_total(total, decoded)?;
-            descriptors.push(blob.descriptor().map_err(ChatAssetRefusal::Storage)?);
-            pins.push(blob);
-        }
+        let _ = input;
         Ok((
             InvokeAssets {
                 rows: self.source.rows(),
-                descriptors,
+                descriptors: Vec::new(),
                 sends_remaining,
                 streams: None,
             },
-            pins,
+            Vec::new(),
         ))
+    }
+
+    pub async fn prepare_run(
+        &self,
+        argv: &[dekopon_shell::Arg],
+        sends_remaining: u8,
+    ) -> Result<PreparedRun, ChatAssetRefusal> {
+        let (argv, ids) = run_arguments(argv)?;
+        let mut assets = InvokeAssets {
+            sends_remaining,
+            ..Default::default()
+        };
+        let mut pins = Vec::with_capacity(ids.len());
+        let mut total = 0;
+        for id in ids {
+            let ResolvedInput { row, blob } = self.source.resolve_input(id).await?;
+            let decoded = GeneratedImage::new(blob.clone(), row.content_type.clone(), row.encoding)
+                .decoded_len()
+                .map_err(ChatAssetRefusal::Storage)?;
+            total = input_total(total, decoded)?;
+            assets
+                .descriptors
+                .push(blob.descriptor().map_err(ChatAssetRefusal::Storage)?);
+            assets.rows.push(row);
+            pins.push(blob);
+        }
+        Ok(PreparedRun { argv, assets, pins })
     }
 }
 fn input_total(total: usize, bytes: usize) -> Result<usize, ChatAssetRefusal> {
@@ -388,47 +406,50 @@ fn input_total(total: usize, bytes: usize) -> Result<usize, ChatAssetRefusal> {
         .ok_or(ChatAssetRefusal::ByteBudget)
 }
 
-pub fn references(input: &Value) -> Result<Vec<u64>, ChatAssetRefusal> {
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
-    fn walk(input: &Value, ids: &mut Vec<u64>) -> Result<(), ChatAssetRefusal> {
-        match input {
-            Value::String(text) => {
-                if text
-                    .trim_start()
-                    .get(..5)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
-                {
+pub fn run_arguments(
+    argv: &[dekopon_shell::Arg],
+) -> Result<(Vec<dekopon_broker_protocol::Arg>, Vec<u64>), ChatAssetRefusal> {
+    use dekopon_broker_protocol::{Arg, AssetIndex};
+    let mut ids = Vec::new();
+    let mut arguments = Vec::with_capacity(argv.len());
+    for argument in argv {
+        arguments.push(match argument {
+            dekopon_shell::Arg::Text(text) => {
+                let candidate = text
+                    .split_once('=')
+                    .map_or(text.as_str(), |(_, value)| value);
+                if [text.as_str(), candidate].iter().any(|text| {
+                    text.trim_start()
+                        .get(..5)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+                }) {
                     return Err(ChatAssetRefusal::DataUrl);
                 }
-                if let Some(id) = chat_asset_marker(text)
-                    && !ids.contains(&id)
-                {
-                    if ids.len() == MAX_ASSET_DESCRIPTORS {
-                        return Err(ChatAssetRefusal::PerInvocationLimit);
+                Arg::Text(text.clone())
+            }
+            dekopon_shell::Arg::Asset(number) => {
+                let id = number.get();
+                let index = match ids.iter().position(|known| *known == id) {
+                    Some(index) => index,
+                    None => {
+                        if ids.len() == MAX_ASSET_DESCRIPTORS {
+                            return Err(ChatAssetRefusal::PerInvocationLimit);
+                        }
+                        ids.push(id);
+                        ids.len() - 1
                     }
-                    ids.push(id);
-                }
+                };
+                Arg::Asset(
+                    AssetIndex::try_from(
+                        u8::try_from(index)
+                            .map_err(|_overflow| ChatAssetRefusal::PerInvocationLimit)?,
+                    )
+                    .map_err(|_overflow| ChatAssetRefusal::PerInvocationLimit)?,
+                )
             }
-            Value::Array(items) => {
-                for item in items {
-                    walk(item, ids)?;
-                }
-            }
-            Value::Object(fields) => {
-                for value in fields.values() {
-                    walk(value, ids)?;
-                }
-            }
-            _ => (),
-        }
-        Ok(())
+        });
     }
-    let mut ids = Vec::new();
-    walk(input, &mut ids)?;
-    Ok(ids)
+    Ok((arguments, ids))
 }
 
 #[cfg(test)]
@@ -479,90 +500,106 @@ mod tests {
                 .collect()
         }
     }
-    #[tokio::test]
-    async fn references_are_distinct_in_first_occurrence_order_and_never_expanded() {
-        let proposal = json!(["chat-asset:2", {"image":"chat-asset:1"}, "chat-asset:2"]);
-        assert_eq!(references(&proposal), Ok(vec![2, 1]));
-        let a = DiskBlob::from_bytes(b"first").unwrap();
-        let b = DiskBlob::from_descriptor(
-            DiskBlob::from_bytes(b"second")
-                .unwrap()
-                .descriptor()
-                .unwrap(),
-            6,
-        )
-        .unwrap();
-        let inputs = ChatAssetInputs::new(Arc::new(Source { blobs: vec![a, b] }));
-        for _ in 0..2 {
-            let (assets, pins) = inputs.prepare(&proposal, 3).await.unwrap();
-            assert_eq!(assets.rows.len(), 2);
-            assert_eq!(assets.sends_remaining, 3);
-            assert_eq!(pins.len(), 2);
-            for (fd, expected) in assets
-                .descriptors
-                .into_iter()
-                .zip([b"second".as_slice(), b"first".as_slice()])
-            {
-                let file = File::from(fd);
-                assert!(
-                    rustix::io::fcntl_getfd(&file)
-                        .unwrap()
-                        .contains(rustix::io::FdFlags::CLOEXEC)
-                );
-                assert_eq!(
-                    rustix::fs::fcntl_getfl(&file).unwrap() & rustix::fs::OFlags::ACCMODE,
-                    rustix::fs::OFlags::RDONLY
-                );
-                let mut bytes = vec![0; expected.len()];
-                file.read_exact_at(&mut bytes, 0).unwrap();
-                assert_eq!(bytes, expected);
-            }
-        }
-        assert_eq!(proposal[0], "chat-asset:2");
+    fn arguments(ids: &[u64]) -> Vec<dekopon_shell::Arg> {
+        ids.iter()
+            .map(|id| {
+                dekopon_shell::Arg::Asset(
+                    dekopon_core::AssetNumber::parse(&format!("chat-asset:{id}")).unwrap(),
+                )
+            })
+            .collect()
     }
+
     #[tokio::test]
-    async fn five_eight_mib_inputs_fit_and_a_sixth_reference_is_refused_before_fetch() {
+    async fn only_named_rows_cross() {
+        let inputs = ChatAssetInputs::new(Arc::new(Source {
+            blobs: (1..=40)
+                .map(|id| DiskBlob::from_bytes(&[id]).unwrap())
+                .collect(),
+        }));
+        let PreparedRun { argv, assets, pins } =
+            inputs.prepare_run(&arguments(&[7, 3, 7]), 4).await.unwrap();
+        assert_eq!(
+            assets.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [7, 3]
+        );
+        assert_eq!(pins.len(), 2);
+        assert_eq!(
+            serde_json::to_value(argv).unwrap(),
+            json!([{"asset":0},{"asset":1},{"asset":0}])
+        );
+        for (descriptor, id) in assets.descriptors.into_iter().zip([7, 3]) {
+            let file = File::from(descriptor);
+            let mut byte = [0];
+            file.read_exact_at(&mut byte, 0).unwrap();
+            assert_eq!(byte, [id]);
+            assert!(
+                rustix::io::fcntl_getfd(&file)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            assert_eq!(
+                rustix::fs::fcntl_getfl(&file).unwrap() & rustix::fs::OFlags::ACCMODE,
+                rustix::fs::OFlags::RDONLY
+            );
+        }
+    }
+
+    #[test]
+    fn a_sixth_distinct_reference_is_refused_before_the_frame() {
+        assert_eq!(
+            run_arguments(&arguments(&[1, 2, 3, 4, 5, 6])),
+            Err(ChatAssetRefusal::PerInvocationLimit)
+        );
+    }
+
+    #[test]
+    fn a_data_url_after_an_equals_sign_is_refused() {
+        for text in ["data:text/plain,YQ==", "--image= DATA:text/plain,YQ=="] {
+            assert_eq!(
+                run_arguments(&[dekopon_shell::Arg::Text(text.to_owned())]),
+                Err(ChatAssetRefusal::DataUrl)
+            );
+        }
+        assert!(
+            run_arguments(&[dekopon_shell::Arg::Text("xdata:text/plain,YQ==".to_owned())]).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quoted_reference_does_not_open() {
+        let inputs = ChatAssetInputs::new(Arc::new(Source { blobs: Vec::new() }));
+        let PreparedRun { assets, pins, .. } = inputs
+            .prepare_run(&[dekopon_shell::Arg::Text("chat-asset:9".to_owned())], 4)
+            .await
+            .unwrap();
+        assert!(assets.rows.is_empty());
+        assert!(assets.descriptors.is_empty());
+        assert!(pins.is_empty());
+        assert!(matches!(
+            inputs.prepare_run(&arguments(&[9]), 4).await,
+            Err(ChatAssetRefusal::UnknownAsset)
+        ));
+    }
+
+    #[tokio::test]
+    async fn five_eight_mib_inputs_fit() {
         let inputs = ChatAssetInputs::new(Arc::new(Source {
             blobs: (0..5)
                 .map(|_| DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES]).unwrap())
                 .collect(),
         }));
-        let proposal = json!([
-            "chat-asset:1",
-            "chat-asset:2",
-            "chat-asset:3",
-            "chat-asset:4",
-            "chat-asset:5"
-        ]);
-        let (assets, pins) = inputs.prepare(&proposal, 4).await.unwrap();
+        let PreparedRun { assets, pins, .. } = inputs
+            .prepare_run(&arguments(&[1, 2, 3, 4, 5]), 4)
+            .await
+            .unwrap();
         assert_eq!(assets.descriptors.len(), 5);
         assert_eq!(
             pins.iter().map(DiskBlob::len).sum::<usize>(),
             MAX_INVOCATION_ASSET_BYTES
         );
-        assert_eq!(
-            references(&json!([
-                "chat-asset:1",
-                "chat-asset:2",
-                "chat-asset:3",
-                "chat-asset:4",
-                "chat-asset:5",
-                "chat-asset:6"
-            ])),
-            Err(ChatAssetRefusal::PerInvocationLimit)
-        );
     }
-    #[test]
-    fn proposal_data_urls_are_refused_in_every_nested_string_position() {
-        for input in [
-            json!("data:image/png;base64,UE5H"),
-            json!({"nested":["DATA:text/plain;base64,YQ=="]}),
-            json!([" data:image/jpeg;base64,YQ=="]),
-        ] {
-            assert_eq!(references(&input), Err(ChatAssetRefusal::DataUrl));
-        }
-        assert!(ChatAssetRefusal::DataUrl.note().contains("chat-asset:<N>"));
-    }
+
     #[test]
     fn invocation_decoded_byte_budget_accepts_the_edge_and_refuses_one_past() {
         assert_eq!(

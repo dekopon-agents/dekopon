@@ -1741,7 +1741,9 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
         Value::Number(number) => number.as_u64(),
         Value::String(text) => {
             let text = text.trim();
-            dekopon_core::chat_asset_marker(text).or_else(|| text.parse().ok())
+            dekopon_core::AssetNumber::parse(text)
+                .map(dekopon_core::AssetNumber::get)
+                .or_else(|| text.parse().ok())
         }
         _ => None,
     });
@@ -1802,6 +1804,9 @@ only when the next step needs a result you do not have yet.
 - Provider command words are programs inside the script, like `gh pr view 12`; their `--help` \
 pages are below, or run `<word> --help`. `cap --list` prints the granted capability IDs. A \
 refusal is a fact to report: nothing escalates past the grants.
+- Files: write `chat-asset:N` as its own unquoted word to hand that file to a command, as in \
+`asset cat chat-asset:3 | head`. Quoted, or inside a larger word, it is plain text. Builtins never \
+read files.
 - Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist; \
 patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
 loudly and by name: `eval`, backticks, subshells, and `<<<` are errors.
@@ -4081,6 +4086,10 @@ mod tests {
 
         fn command_words(&self) -> Vec<String> {
             vec!["probe".to_owned()]
+        }
+
+        fn command_word_help(&self) -> BTreeMap<String, String> {
+            BTreeMap::from([("probe".to_owned(), "Usage: probe <COMMAND>".to_owned())])
         }
 
         fn run_command(

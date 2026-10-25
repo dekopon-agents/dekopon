@@ -198,6 +198,29 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         pages
     }
 
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &TreeContext,
+    ) -> dekopon_shell::RunResult {
+        if self.direct.has_command_word(&call.word) {
+            let argv = call
+                .argv
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let parsed = self
+                .direct
+                .run_command(&call.word, &argv, streams.stdin.is_some());
+            return dekopon_shell::run_parsed(self, call, parsed, streams, tree);
+        }
+        match &self.broker {
+            Some(broker) => broker.run(call, streams, tree),
+            None => dekopon_shell::run_parsed(self, call, None, streams, tree),
+        }
+    }
+
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.direct
             .run_command(word, argv, stdin_piped)
@@ -467,21 +490,13 @@ impl BrokerLeg {
         let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
         let prepared = match &self.asset_inputs {
             Some(inputs) => inputs.prepare(input, remaining).await,
-            None => attachment::references(input).and_then(|ids| {
-                if ids.is_empty() {
-                    Ok((
-                        dekopon_broker_protocol::InvokeAssets {
-                            rows: Vec::new(),
-                            descriptors: Vec::new(),
-                            sends_remaining: remaining,
-                            streams: None,
-                        },
-                        Vec::new(),
-                    ))
-                } else {
-                    Err(ChatAssetRefusal::UnknownAsset)
-                }
-            }),
+            None => Ok((
+                dekopon_broker_protocol::InvokeAssets {
+                    sends_remaining: remaining,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )),
         };
         prepared.inspect_err(|refusal| {
             tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "agent.chat_asset_input.refused");
@@ -618,6 +633,34 @@ impl CapabilityInvoker for BrokerLeg {
 
     fn has_command_word(&self, word: &str) -> bool {
         self.command_words.contains(word)
+    }
+
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let word = CommandWord::new(&call.word);
+        self.emit(ProgressEvent::ToolStarted {
+            word: word.clone(),
+            argument_count: bounded_count(call.argv.len()),
+            calls_used: self.calls.used(),
+            calls_max: self.calls.maximum(),
+        });
+        let started = Instant::now();
+        let outcome = self.run_call(call, streams, tree);
+        let result = match &outcome {
+            dekopon_shell::RunResult::Invoked { result, .. }
+            | dekopon_shell::RunResult::Returned(result)
+            | dekopon_shell::RunResult::Uncertain(result) => result,
+        };
+        self.emit(ProgressEvent::ToolFinished {
+            word,
+            outcome: call_outcome(result),
+            duration: started.elapsed(),
+        });
+        outcome
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
@@ -792,6 +835,252 @@ impl BrokerLeg {
             .map_or_else(|| self.cancel.clone(), |script| script.signal.clone())
     }
 
+    async fn prepare_run_assets(
+        &self,
+        argv: &[dekopon_shell::Arg],
+        sends_remaining: u8,
+    ) -> Result<attachment::PreparedRun, ChatAssetRefusal> {
+        match &self.asset_inputs {
+            Some(inputs) => inputs.prepare_run(argv, sends_remaining).await,
+            None => {
+                let (argv, ids) = attachment::run_arguments(argv)?;
+                if !ids.is_empty() {
+                    return Err(ChatAssetRefusal::UnknownAsset);
+                }
+                Ok(attachment::PreparedRun {
+                    argv,
+                    assets: dekopon_broker_protocol::InvokeAssets {
+                        sends_remaining,
+                        ..Default::default()
+                    },
+                    pins: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn run_call(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &TreeContext,
+    ) -> dekopon_shell::RunResult {
+        use dekopon_broker_protocol::{RunOutcome, RunRequest};
+        use dekopon_shell::{RunResult, render_command};
+        if self.cancelled() {
+            return RunResult::Returned(CapabilityCallResult::Denied {
+                reason: "session-cancelled".to_owned(),
+            });
+        }
+        let word = call.word.clone();
+        let invocation = self.identifiers.next_invocation();
+        let invocation_text = invocation.to_string();
+        let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let cancel = self.effective_cancel();
+        let prepared = self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                () = tokio::time::sleep(tree.remaining()) => None,
+                result = async {
+                    let prepared = self.prepare_run_assets(&call.argv, remaining).await?;
+                    let output = streams.stdout.try_clone().map_err(|error| {
+                        ChatAssetRefusal::Storage(dekopon_model::asset::BlobError::from(error))
+                    })?;
+                    Ok::<_, ChatAssetRefusal>((prepared, output))
+                } => Some(result),
+            }
+        });
+        let (
+            attachment::PreparedRun {
+                argv,
+                mut assets,
+                pins: _pins,
+            },
+            output,
+        ) = match prepared {
+            None => {
+                return RunResult::Returned(CapabilityCallResult::Denied {
+                    reason: "script-cancelled".to_owned(),
+                });
+            }
+            Some(Err(refusal)) => {
+                tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "agent.chat_asset_input.refused");
+                return RunResult::Returned(CapabilityCallResult::Denied {
+                    reason: format!(
+                        "the gateway refused this call before it reached the broker: {}",
+                        refusal.note()
+                    ),
+                });
+            }
+            Some(Ok(prepared)) => prepared,
+        };
+        if cancel.is_cancelled() || tree.remaining().is_zero() {
+            return RunResult::Returned(CapabilityCallResult::Denied {
+                reason: "script-cancelled".to_owned(),
+            });
+        }
+        assets.streams = Some(dekopon_broker_protocol::Streams {
+            stdin: streams.stdin,
+            stdout: streams.stdout,
+        });
+        let submitted = std::thread::scope(|scope| {
+            self.runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    outcome = self.client.run(
+                        self.attestation.clone(),
+                        RunRequest { invocation, trace_parent: self.identifiers.trace_parent(), word: call.word, argv },
+                        assets,
+                        async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
+                    ) => Some(outcome),
+                    () = cancel.cancelled() => None,
+                    () = tokio::time::sleep(tree.remaining()) => None,
+                }
+            })
+        });
+        match submitted {
+            None => RunResult::Uncertain(CapabilityCallResult::Denied {
+                reason: "script-cancelled".to_owned(),
+            }),
+            Some(Err(error))
+                if !matches!(&error, ClientError::Remote { .. }) && !error.may_have_executed() =>
+            {
+                RunResult::Returned(CapabilityCallResult::Failed {
+                    error: error.to_string(),
+                    detail: None,
+                })
+            }
+            Some(Err(error)) => RunResult::Uncertain(CapabilityCallResult::Denied {
+                reason: format!(
+                    "the broker did not record an outcome for this invocation and it may already have taken effect; do not resubmit it ({error})"
+                ),
+            }),
+            Some(Ok(response)) => {
+                let streams = dekopon_shell::Streams {
+                    stdin: None,
+                    stdout: output,
+                };
+                match response.outcome {
+                    RunOutcome::Rendered {
+                        stdout,
+                        stderr,
+                        status,
+                    } => render_command(streams, &stdout, stderr, status),
+                    RunOutcome::Refused { error } => render_command(streams, "", error.message, 2),
+                    RunOutcome::NotFound => render_command(
+                        streams,
+                        "",
+                        format!("dekopon-shell: {word}: command not found\n"),
+                        127,
+                    ),
+                    RunOutcome::NotGranted { capability } => render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {word}: requires capability {capability}, which is not granted in this session\n"
+                        ),
+                        127,
+                    ),
+                    RunOutcome::Invoked {
+                        capability,
+                        input,
+                        secret_use,
+                        result,
+                        attached,
+                        removed,
+                        sent,
+                    } => {
+                        let result = self.receive_outcome(
+                            dekopon_broker_protocol::AssetInvocationOutcome {
+                                result,
+                                attached,
+                                removed,
+                                sent,
+                                descriptors: response.descriptors,
+                            },
+                            capability.as_str(),
+                            &invocation_text,
+                        );
+                        RunResult::Invoked {
+                            capability: capability.to_string(),
+                            input,
+                            secret_use,
+                            result,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn receive_outcome(
+        &self,
+        outcome: dekopon_broker_protocol::AssetInvocationOutcome,
+        capability: &str,
+        invocation: &str,
+    ) -> CapabilityCallResult {
+        let result = outcome.result;
+        match result.outcome {
+            InvocationOutcome::Succeeded => {
+                let note = if let Some(slot) = &self.attachments {
+                    slot.receive(
+                        outcome.attached,
+                        outcome.descriptors,
+                        outcome.removed,
+                        outcome.sent,
+                        capability,
+                        invocation,
+                    )
+                } else if !outcome.attached.is_empty()
+                    || !outcome.removed.is_empty()
+                    || !outcome.sent.is_empty()
+                {
+                    "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]".to_owned()
+                } else {
+                    String::new()
+                };
+                let mut stderr = result
+                    .detail
+                    .map(|detail| detail.message)
+                    .unwrap_or_default();
+                if !note.is_empty() {
+                    if !stderr.is_empty() && !stderr.ends_with('\n') {
+                        stderr.push('\n');
+                    }
+                    stderr.push_str(&note);
+                    stderr.push('\n');
+                }
+                if stderr.is_empty() {
+                    CapabilityCallResult::Succeeded
+                } else {
+                    CapabilityCallResult::SucceededWithStderr(stderr)
+                }
+            }
+            InvocationOutcome::Denied => CapabilityCallResult::Denied {
+                reason: result
+                    .error
+                    .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
+            },
+            InvocationOutcome::Failed => match result.exit_status {
+                Some(status) => CapabilityCallResult::Exited {
+                    status,
+                    stderr: result
+                        .detail
+                        .map(|detail| detail.message)
+                        .unwrap_or_default(),
+                },
+                None => CapabilityCallResult::Failed {
+                    error: result
+                        .error
+                        .unwrap_or_else(|| "the broker reported a failed invocation".to_owned()),
+                    detail: result.detail,
+                },
+            },
+        }
+    }
+
     fn submit(
         &self,
         capability: &str,
@@ -860,64 +1149,7 @@ impl BrokerLeg {
                 ),
             },
             Some(Ok((Ok(outcome), invocation))) => {
-                let result = outcome.result;
-                match result.outcome {
-                    InvocationOutcome::Succeeded => {
-                        let note = if let Some(slot) = &self.attachments {
-                            slot.receive(
-                                outcome.attached,
-                                outcome.descriptors,
-                                outcome.removed,
-                                outcome.sent,
-                                capability,
-                                &invocation,
-                            )
-                        } else if !outcome.attached.is_empty()
-                            || !outcome.removed.is_empty()
-                            || !outcome.sent.is_empty()
-                        {
-                            "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]".to_owned()
-                        } else {
-                            String::new()
-                        };
-                        let mut stderr = result
-                            .detail
-                            .map(|detail| detail.message)
-                            .unwrap_or_default();
-                        if !note.is_empty() {
-                            if !stderr.is_empty() && !stderr.ends_with('\n') {
-                                stderr.push('\n');
-                            }
-                            stderr.push_str(&note);
-                            stderr.push('\n');
-                        }
-                        if stderr.is_empty() {
-                            CapabilityCallResult::Succeeded
-                        } else {
-                            CapabilityCallResult::SucceededWithStderr(stderr)
-                        }
-                    }
-                    InvocationOutcome::Denied => CapabilityCallResult::Denied {
-                        reason: result
-                            .error
-                            .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
-                    },
-                    InvocationOutcome::Failed => match result.exit_status {
-                        Some(status) => CapabilityCallResult::Exited {
-                            status,
-                            stderr: result
-                                .detail
-                                .map(|detail| detail.message)
-                                .unwrap_or_default(),
-                        },
-                        None => CapabilityCallResult::Failed {
-                            error: result.error.unwrap_or_else(|| {
-                                "the broker reported a failed invocation".to_owned()
-                            }),
-                            detail: result.detail,
-                        },
-                    },
-                }
+                self.receive_outcome(outcome, capability, &invocation)
             }
             Some(Ok((Err(ClientError::Remote { code, message }), _)))
                 if code == ERROR_UNAUTHENTICATED =>
@@ -1583,19 +1815,20 @@ mod tests {
                 .expect("secure stub socket");
             let (observed, receiver) = mpsc::unbounded_channel();
             tokio::spawn(async move {
-                for response in responses {
+                let mut responses = responses
+                    .into_iter()
+                    .map(|response| (response, Vec::new()))
+                    .collect();
+                while !std::collections::VecDeque::is_empty(&responses) {
                     let (stream, _) = listener.accept().await.expect("stub broker accepts");
                     let mut stream = DescriptorStream::new(stream);
                     let (request, _) = stream
                         .read_frame::<RequestEnvelope>(FrameLimits::default())
                         .await
                         .expect("stub broker reads one request");
-                    #[allow(
-                        clippy::let_underscore_must_use,
-                        reason = "`stub_leg` drops the observation receiver immediately, so a \
-                                  closed channel is the ordinary case for every unobserved test"
-                    )]
-                    let _ = observed.send(request);
+                    let (response, _) =
+                        dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
+                    drop(observed.send(request));
                     stream
                         .write_frame(&response, &[], FrameLimits::default())
                         .await
@@ -1604,6 +1837,182 @@ mod tests {
             });
 
             (leg_with(&socket, attestation), receiver)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_run_error_is_uncertain_and_never_refunds_its_call() {
+            let directory = private_broker_directory();
+            let (mut leg, mut observed) = stub_leg_observing(
+                directory.path(),
+                vec![ResponseEnvelope::error(
+                    dekopon_broker_protocol::ERROR_BROKER_UNAVAILABLE,
+                    "unavailable",
+                )],
+                None,
+            )
+            .await;
+            leg.command_words.insert("probe".to_owned());
+            let calls = dekopon_process::CallBudget::new(1);
+            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let outcome = tokio::task::spawn_blocking(move || {
+                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
+                    "probe upper",
+                    &leg,
+                    &tree,
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome.exit_code, ExitCode::DENIED);
+            assert!(outcome.output.contains("do not resubmit it"));
+            assert_eq!(calls.used(), 1);
+            assert!(matches!(
+                observed.recv().await.unwrap().request,
+                BrokerRequest::Run { .. }
+            ));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cancellation_during_asset_resolution_refunds_without_a_frame() {
+            use crate::attachment::{ChatAssetInputs, ChatAssetSource, ResolveFuture};
+            struct PendingAsset(Mutex<Option<oneshot::Sender<()>>>);
+            impl ChatAssetSource for PendingAsset {
+                fn resolve_input(&self, _: u64) -> ResolveFuture<'_> {
+                    let entered = self.0.lock().take().unwrap();
+                    Box::pin(async move {
+                        entered.send(()).unwrap();
+                        std::future::pending().await
+                    })
+                }
+                fn rows(&self) -> Vec<dekopon_broker_protocol::AssetRow> {
+                    Vec::new()
+                }
+            }
+            let directory = private_broker_directory();
+            let socket = directory.path().join("broker.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (entered, resolving) = oneshot::channel();
+            let (handle, signal) = CancelSignal::pair();
+            let mut leg = leg_for(&socket)
+                .with_cancel_signal(signal)
+                .with_chat_asset_inputs(ChatAssetInputs::new(Arc::new(PendingAsset(Mutex::new(
+                    Some(entered),
+                )))));
+            leg.command_words.insert("probe".to_owned());
+            let calls = dekopon_process::CallBudget::new(1);
+            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let run = tokio::task::spawn_blocking(move || {
+                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
+                    "probe chat-asset:1",
+                    &leg,
+                    &tree,
+                )
+            });
+            resolving.await.unwrap();
+            assert_eq!(calls.used(), 1);
+            handle.cancel();
+            let outcome = run.await.unwrap();
+            assert_eq!(outcome.exit_code, ExitCode::DENIED);
+            assert_eq!(calls.used(), 0);
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cancellation_after_a_run_frame_keeps_its_call_charged() {
+            let directory = private_broker_directory();
+            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
+            leg.command_words.insert("probe".to_owned());
+            let (handle, signal) = CancelSignal::pair();
+            let leg = leg.with_cancel_signal(signal);
+            let calls = dekopon_process::CallBudget::new(1);
+            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let run = tokio::task::spawn_blocking(move || {
+                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
+                    "probe upper",
+                    &leg,
+                    &tree,
+                )
+            });
+            assert!(matches!(
+                observed.recv().await.unwrap().request,
+                BrokerRequest::Run { .. }
+            ));
+            handle.cancel();
+            let outcome = run.await.unwrap();
+            assert_eq!(outcome.exit_code, ExitCode::DENIED);
+            assert_eq!(calls.used(), 1);
+            drop(release);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn pre_frame_asset_refusals_emit_one_reason_and_submit_no_frame() {
+            use crate::attachment::{
+                ChatAssetInputs, ChatAssetRefusal, ChatAssetSource, ResolveFuture,
+            };
+            use tracing_subscriber::prelude::*;
+            struct UnknownAsset;
+            impl ChatAssetSource for UnknownAsset {
+                fn resolve_input(&self, _: u64) -> ResolveFuture<'_> {
+                    Box::pin(async { Err(ChatAssetRefusal::UnknownAsset) })
+                }
+                fn rows(&self) -> Vec<dekopon_broker_protocol::AssetRow> {
+                    Vec::new()
+                }
+            }
+            for (script, refusal) in [
+                (
+                    "probe --image='data:image/png;base64,AAAA'",
+                    ChatAssetRefusal::DataUrl,
+                ),
+                ("probe chat-asset:9", ChatAssetRefusal::UnknownAsset),
+                (
+                    "probe chat-asset:1 chat-asset:2 chat-asset:3 chat-asset:4 chat-asset:5 chat-asset:6",
+                    ChatAssetRefusal::PerInvocationLimit,
+                ),
+            ] {
+                let directory = private_broker_directory();
+                let socket = directory.path().join("broker.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let mut leg = leg_for(&socket)
+                    .with_chat_asset_inputs(ChatAssetInputs::new(Arc::new(UnknownAsset)));
+                leg.command_words.insert("probe".to_owned());
+                let capture = dekopon_test_support::CaptureLayer::new();
+                let subscriber = tracing_subscriber::registry().with(capture.clone());
+                let calls = dekopon_process::CallBudget::new(1);
+                let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+                let outcome = tokio::task::spawn_blocking(move || {
+                    tracing::subscriber::with_default(subscriber, || {
+                        dekopon_shell::Interpreter::new(Limits::default())
+                            .run_with_tree(script, &leg, &tree)
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(outcome.exit_code, ExitCode::DENIED);
+                assert_eq!(calls.used(), 0);
+                let events = capture.events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.chat_asset_input.refused")],
+                );
+                assert_eq!(events.len(), 1);
+                match &events[0] {
+                    dekopon_test_support::Record::Event { target, level, .. } => {
+                        assert_eq!(target, "dekopon_agent::audit");
+                        assert_eq!(*level, "WARN");
+                    }
+                    dekopon_test_support::Record::Span { .. } => panic!("expected a refusal event"),
+                }
+                assert_eq!(events[0].field("reason"), Some(refusal.reason()));
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            }
         }
 
         fn leg_for(socket: &Path) -> BrokerLeg {
@@ -1975,6 +2384,7 @@ mod tests {
 
             struct Call {
                 stream: DescriptorStream,
+                run: bool,
                 uri: String,
                 attestation: Option<Attestation>,
                 trace_parent: TraceParent,
@@ -2065,12 +2475,29 @@ mod tests {
                     drop(out);
                     self.stream
                         .write_frame(
-                            &ResponseEnvelope::invocation(
-                                result(outcome, None),
-                                Vec::new(),
-                                Vec::new(),
-                                Vec::new(),
-                            ),
+                            &if self.run {
+                                ResponseEnvelope {
+                                    api_version: ProtocolVersion::V1Alpha2,
+                                    response: BrokerResponse::Ran {
+                                        outcome: dekopon_broker_protocol::RunOutcome::Invoked {
+                                            capability: CAPABILITY.parse().unwrap(),
+                                            input: json!({"uri":self.uri}),
+                                            secret_use: None,
+                                            result: result(outcome, None),
+                                            attached: Vec::new(),
+                                            removed: Vec::new(),
+                                            sent: Vec::new(),
+                                        },
+                                    },
+                                }
+                            } else {
+                                ResponseEnvelope::invocation(
+                                    result(outcome, None),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                            },
                             &[],
                             FrameLimits::default(),
                         )
@@ -2102,7 +2529,30 @@ mod tests {
                         .read_frame::<RequestEnvelope>(FrameLimits::default())
                         .await
                         .expect("fake broker reads a request");
+                    let run = matches!(&request.request, BrokerRequest::Run { .. });
                     let (attestation, invocation) = match request.request {
+                        BrokerRequest::Run {
+                            attestation,
+                            invocation,
+                            trace_parent,
+                            argv,
+                            ..
+                        } => {
+                            let uri = match argv.last() {
+                                Some(dekopon_broker_protocol::Arg::Text(text)) => text.as_str(),
+                                _ => "",
+                            };
+                            (
+                                attestation,
+                                dekopon_broker_protocol::InvocationRequest {
+                                    id: invocation,
+                                    trace_parent,
+                                    capability: CAPABILITY.parse().unwrap(),
+                                    input: json!({"uri":uri}),
+                                    secret_use: None,
+                                },
+                            )
+                        }
                         BrokerRequest::RunCommand { argv, .. } => {
                             let proposal =
                                 ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
@@ -2132,6 +2582,7 @@ mod tests {
                         }
                     };
                     return Call {
+                        run,
                         stream,
                         uri: invocation.input["uri"]
                             .as_str()
@@ -3452,9 +3903,9 @@ mod tests {
             assert_eq!(
                 sink.labels(),
                 vec![
-                    "started probe arguments=2 calls=0/4".to_owned(),
-                    "finished probe Denied".to_owned(),
                     "started probe arguments=2 calls=1/4".to_owned(),
+                    "finished probe Denied".to_owned(),
+                    "started probe arguments=2 calls=2/4".to_owned(),
                     "finished probe Denied".to_owned(),
                 ]
             );
@@ -3565,7 +4016,7 @@ mod tests {
             assert_eq!(
                 sink.labels(),
                 vec![
-                    "started probe arguments=2 calls=0/4".to_owned(),
+                    "started probe arguments=2 calls=1/4".to_owned(),
                     "finished probe Failed".to_owned(),
                 ],
                 "{}",

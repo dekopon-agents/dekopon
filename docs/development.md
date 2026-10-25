@@ -70,9 +70,11 @@ Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exi
 
 Generic model types and transports belong in `dekopon-model`; the shared bounded prompt/tool loop belongs in `dekopon-agent` (`prompt.rs`), which `dekopon-gatewayd` and external clients embed. `dekopon-model` holds no image client: producing an image is a provider effect, so the credential lives behind the broker and the gateway only delivers the bytes. Keep provider credentials inside the broker. Asset bytes cross broker IPC only as read-only descriptors; typed metadata stays out of the shell payload path. Mock network protocols in tests; never read or import another application's credential store.
 
-Asset proposals retain exact `chat-asset:<N>` references. The agent resolves distinct string leaves
-into pinned read-only descriptors and uses the protocol's typed `InvokeAssets` and
-`AssetInvocationOutcome`; no provider result byte-object parser or marker expansion remains.
+Provider argv carries typed references for whole unquoted `chat-asset:<N>` words. The agent resolves
+and pins distinct references, numbers indices by first occurrence, and sends only their rows and
+read-only descriptors in one `Run` frame. One `Ran` response reports parsing, refusal or the invoked
+proposal and its result; repeated references share a row and descriptor. Quoted or embedded marker
+text stays text. Gateway-built proposals retain `Invoke`; no proposal JSON walk discovers files.
 `attachment.rs` owns the gateway-facing registration/send traits; `dekopon-gatewayd::asset` owns scoped
 numbering, retention and output sniffing. Update the descriptor, lifetime, queue, transport and
 failure-note tests together. See [asset handles](gatewayd.md#asset-handles-and-delivery).

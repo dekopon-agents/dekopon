@@ -22,6 +22,10 @@ impl CapabilityInvoker for Replay {
             .collect()
     }
 
+    fn command_word_help(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([("python".to_owned(), "ok\n".to_owned())])
+    }
+
     fn has_command_word(&self, word: &str) -> bool {
         matches!(word, "gh" | "python" | "ssh" | "turso" | "date")
     }
@@ -130,10 +134,7 @@ fn nestedset_and_gylmar() -> [Recipe; 5] {
         Recipe {
             name: "R5 ville python help and code",
             script: "python --help; python -c 'result = 1'",
-            calls: vec![
-                call("python", &["--help"], None),
-                call("python", &["-c", "result = 1"], None),
-            ],
+            calls: vec![call("python", &["-c", "result = 1"], None)],
             output: "ok\nok",
         },
     ]

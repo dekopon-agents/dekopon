@@ -56,6 +56,10 @@ impl CapabilityInvoker for Fixture {
         word == PROBE
     }
 
+    fn command_word_help(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([(PROBE.to_owned(), PROBE_HELP.to_owned())])
+    }
+
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         if word != PROBE {
             return None;
