@@ -2766,7 +2766,7 @@ async fn a_memory_word_refused_by_a_gate_is_not_found_and_refunded() {
     .await
     .unwrap();
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
-    assert!(outcome.output.contains("command not found"));
+    assert_eq!(outcome.output, "dekopon-shell: probe: command not found");
     assert_eq!(calls.used(), 0);
     assert!(harness.audit.records().is_empty());
     harness.stop().await;

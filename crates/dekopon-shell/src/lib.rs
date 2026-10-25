@@ -291,7 +291,13 @@ pub enum RunResult {
 pub fn render_command(streams: Streams, stdout: &str, stderr: String, status: u8) -> RunResult {
     use std::io::Write as _;
     let mut output = std::os::unix::net::UnixStream::from(streams.stdout);
-    if output.write_all(stdout.as_bytes()).is_err() {
+    if let Err(error) = output.write_all(stdout.as_bytes()) {
+        tracing::warn!(
+            event = "shell_command_stdout_failed",
+            error.kind = ?error.kind(),
+            errno = error.raw_os_error(),
+            "shell.command_stdout.failed"
+        );
         return RunResult::Returned(CapabilityCallResult::Failed {
             error: "command stdout could not be written".to_owned(),
             detail: None,

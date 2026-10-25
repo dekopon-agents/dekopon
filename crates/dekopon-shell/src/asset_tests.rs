@@ -178,3 +178,61 @@ fn concurrent_stages_cannot_overrun_the_call_budget() {
     assert_eq!(*probe.runs.lock(), 1);
     assert_eq!(calls.used(), 1);
 }
+
+#[test]
+fn a_render_failure_records_its_io_cause_once() {
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let captured = Capture(Arc::default());
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || writer.clone())
+        .finish();
+    let (output, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(peer);
+    let result = tracing::subscriber::with_default(subscriber, || {
+        render_command(
+            Streams {
+                stdin: None,
+                stdout: output.into(),
+            },
+            "output",
+            String::new(),
+            0,
+        )
+    });
+    match result {
+        RunResult::Returned(CapabilityCallResult::Failed { error, detail }) => {
+            assert_eq!(error, "command stdout could not be written");
+            assert!(detail.is_none());
+        }
+        RunResult::Invoked { .. }
+        | RunResult::Uncertain(_)
+        | RunResult::Returned(
+            CapabilityCallResult::Succeeded
+            | CapabilityCallResult::SucceededWithStderr(_)
+            | CapabilityCallResult::Exited { .. }
+            | CapabilityCallResult::Denied { .. }
+            | CapabilityCallResult::NotFound,
+        ) => panic!("a closed stdout must return a failure"),
+    }
+    let bytes = captured.0.lock();
+    let events = serde_json::Deserializer::from_slice(&bytes)
+        .into_iter::<Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["fields"]["event"], "shell_command_stdout_failed");
+    assert_eq!(events[0]["fields"]["error.kind"], "BrokenPipe");
+    assert_eq!(events[0]["fields"]["errno"], 32);
+}
