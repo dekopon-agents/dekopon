@@ -579,15 +579,15 @@ impl Retention {
                 | Attachment::Evicted
                 | Attachment::NotStored(_) => (),
             }
+            let stored = StoredKey::of(key, &row.asset);
             if self.dir.is_none()
-                || key.generation.is_none()
+                || (key.generation.is_none() && !self.references.contains(&stored))
                 || row
                     .asset
                     .source
                     .as_ref()
                     .is_some_and(|source| Refill::of(source) == Refill::None)
             {
-                let stored = StoredKey::of(key, &row.asset);
                 self.index.bindings.retain(|binding| binding.key != stored);
             }
         }

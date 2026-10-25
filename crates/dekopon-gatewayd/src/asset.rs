@@ -2004,7 +2004,7 @@ mod retention_tests {
             .unwrap();
         store.attach_journal(&journal).unwrap();
         let first = access("first");
-        let second = access("second");
+        let second = AssetAccess::one_shot(access("second").key.conversation);
         let now = SystemTime::now();
         for access in [&first, &second] {
             let id = register(&store, access);
@@ -2309,6 +2309,37 @@ mod retention_tests {
             Err(BlobError::Reclaimed)
         );
         assert!(store.pin(&access, second, Recency::Keep).unwrap().is_some());
+    }
+
+    #[test]
+    fn trimming_a_named_row_never_deletes_its_durable_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let access = access("trim");
+        let first = register(&store, &access);
+        drop(store.admit(&access, first, b"aaa").unwrap());
+        journal_inventory(
+            &journal,
+            &access,
+            &store.inventory(&access),
+            SystemTime::now(),
+        );
+        for _ in 0..MAX_ASSETS_PER_CONVERSATION {
+            register(&store, &access);
+        }
+        assert!(store.get_access(&access, first, Instant::now()).is_none());
+        assert_eq!(store.retention.lock().bytes, 3);
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
     }
 
     #[test]
