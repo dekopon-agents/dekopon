@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
-use crate::{ExitCode, JOBS_OFF, JobId, JobState, JobWait};
+use dekopon_process::{ExitCode, JOBS_OFF, JobId, JobState, JobWait};
 
 pub(super) struct Jobs;
 pub(super) struct Wait;

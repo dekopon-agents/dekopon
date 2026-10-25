@@ -1,11 +1,10 @@
 use super::extra::ExtraStream;
 use crate::{
-    ExitCode,
     builtins::{CommandFailure, FatalError},
     limits::Budget,
-    pipe::{self, PipeReader, WriteOutcome},
 };
-use dekopon_process::{LimitExceeded, Limits};
+use dekopon_process::pipe::{self, PipeReader, WriteOutcome};
+use dekopon_process::{ExitCode, LimitExceeded, Limits};
 
 fn arguments(command: ExtraStream) -> Vec<String> {
     match command {
@@ -22,7 +21,12 @@ fn four_text_commands_charge_each_small_pipe_chunk() {
         ExtraStream::Wc,
         ExtraStream::Sort,
     ] {
-        let (mut writer, mut reader) = pipe::pipe();
+        let (mut writer, mut reader) = pipe::pipe(
+            None,
+            None,
+            crate::interp::telemetry::stage_read,
+            crate::interp::telemetry::stage_write,
+        );
         for _ in 0..5 {
             assert_eq!(writer.write(b"x\n"), WriteOutcome::Accepted);
         }
@@ -63,7 +67,11 @@ fn four_text_commands_notice_cancellation_between_chunks() {
 #[test]
 fn cut_selects_characters_from_a_near_limit_line_without_retaining_copies() {
     let text = "é".repeat(2048);
-    let mut reader = PipeReader::from_bytes(text.as_bytes().to_vec());
+    let mut reader = PipeReader::from_bytes(
+        text.as_bytes().to_vec(),
+        None,
+        crate::interp::telemetry::stage_read,
+    );
     let mut budget = Budget::start(Limits {
         max_value_bytes: text.len() as u64,
         ..Limits::default()
@@ -92,7 +100,11 @@ fn streaming_cut_selects_unsorted_overlapping_fields_and_characters() {
         (vec!["-d", ":", "-f", "3,1-2,2"], "a:b:c:d\n", "a:b:c\n"),
         (vec!["-c", "3,1-2,2"], "éßγδ\n", "éßγ\n"),
     ] {
-        let mut reader = PipeReader::from_bytes(input.as_bytes().to_vec());
+        let mut reader = PipeReader::from_bytes(
+            input.as_bytes().to_vec(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
         let mut budget = Budget::start(Limits::default());
         let mut output = Vec::new();
         ExtraStream::Cut
@@ -114,7 +126,11 @@ fn streaming_cut_selects_unsorted_overlapping_fields_and_characters() {
 }
 
 fn sorted(arguments: &[&str], input: &str) -> Result<String, CommandFailure> {
-    let mut reader = PipeReader::from_bytes(input.as_bytes().to_vec());
+    let mut reader = PipeReader::from_bytes(
+        input.as_bytes().to_vec(),
+        None,
+        crate::interp::telemetry::stage_read,
+    );
     let mut budget = Budget::start(Limits::default());
     let mut output = Vec::new();
     ExtraStream::Sort.run(
@@ -180,7 +196,11 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
         max_value_bytes: 3,
         ..Limits::default()
     });
-    let mut reader = PipeReader::from_bytes(b"a\nb\n".to_vec());
+    let mut reader = PipeReader::from_bytes(
+        b"a\nb\n".to_vec(),
+        None,
+        crate::interp::telemetry::stage_read,
+    );
     let failure = ExtraStream::Sort
         .run(&[], &mut reader, &mut budget, |_| Ok(true))
         .expect_err("two retained two-byte lines do not fit in three bytes");
@@ -188,7 +208,11 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
         failure,
         CommandFailure::Fatal(FatalError::Limit(LimitExceeded::ValueBytes { .. }))
     ));
-    let mut reader = PipeReader::from_bytes(b"a\nb\n".to_vec());
+    let mut reader = PipeReader::from_bytes(
+        b"a\nb\n".to_vec(),
+        None,
+        crate::interp::telemetry::stage_read,
+    );
     let mut budget = Budget::start(Limits {
         max_value_bytes: 4,
         ..Limits::default()
@@ -200,6 +224,10 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
                 .expect("retained bytes are refunded"),
             ExitCode::SUCCESS
         );
-        reader = PipeReader::from_bytes(b"a\nb\n".to_vec());
+        reader = PipeReader::from_bytes(
+            b"a\nb\n".to_vec(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
     }
 }

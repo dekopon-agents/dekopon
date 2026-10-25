@@ -1,13 +1,14 @@
+use dekopon_process::{
+    CallBudget, ExitCode, JOBS_OFF, JobId, JobSummary, JobWait, Limits, TreeContext,
+};
 use parking_lot::Mutex;
 use std::{sync::mpsc, time::Duration};
 
 use serde_json::{Value, json};
 
-use dekopon_process::{CallBudget, Limits, TreeContext};
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
-    Interpreter, JOBS_OFF, JobControl, JobId, JobRefusal, JobSeed, JobSummary, JobWait,
-    ScriptOutcome,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, Interpreter,
+    JobControl, JobRefusal, JobSeed, ScriptOutcome,
 };
 
 const PROBE: &str = "probe";
@@ -3506,13 +3507,13 @@ impl JobControl for StubJobs {
             .map(|(index, text)| {
                 let id = JobId::new(index as u64 + 1);
                 let state = if waited.contains(&id) {
-                    dekopon_shell::JobState::Finished {
-                        outcome: dekopon_shell::JobOutcome::Succeeded,
+                    dekopon_process::JobState::Finished {
+                        outcome: dekopon_process::JobOutcome::Succeeded,
                         exit: ExitCode::SUCCESS,
                         after: Duration::from_secs(1),
                     }
                 } else {
-                    dekopon_shell::JobState::Running {
+                    dekopon_process::JobState::Running {
                         elapsed: Duration::from_secs(12),
                     }
                 };

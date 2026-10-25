@@ -2,9 +2,10 @@
 //! script's own assignments, and reading something like an API key by name sees it as unset, not
 //! the host's real value.
 
+use crate::interp::telemetry::StageObservation;
+use dekopon_process::pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome};
+use dekopon_process::{CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, TreeContext};
 mod nesting;
-
-use dekopon_process::{CallBudget, LimitExceeded, Limits, TreeContext};
 
 use std::{
     cmp::Ordering,
@@ -21,7 +22,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CapabilityCallResult, CapabilityInvoker, ExitCode, JOBS_OFF, JobSeed, ScriptOutcome,
+    CapabilityCallResult, CapabilityInvoker, JobSeed, ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
         CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
@@ -35,7 +36,6 @@ use crate::{
     job::ScriptJobs,
     limits::{Budget, OutputBuffer},
     parser::{expanded_pattern, parse, pattern_metacharacter},
-    pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome},
     value::{self, display},
 };
 
@@ -77,7 +77,7 @@ enum Sink {
 #[derive(Debug)]
 enum StageInput {
     Inherited,
-    Piped(PipeReader),
+    Piped(PipeReader<StageObservation>),
 }
 
 enum SimpleBuiltinMode {
@@ -151,7 +151,7 @@ struct StageSetup {
 /// Ends when upstream ends, the provider stops reading or `finished` is set once the call has
 /// returned; either way the dropped socket is the provider's end of input.
 fn pump_stdin(
-    reader: &mut PipeReader,
+    reader: &mut PipeReader<StageObservation>,
     mut socket: UnixStream,
     budget: &crate::limits::Budget,
     finished: &AtomicBool,
@@ -159,7 +159,7 @@ fn pump_stdin(
     if socket.set_write_timeout(Some(pipe::POLL)).is_err() {
         return;
     }
-    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read_unless(budget, finished) {
+    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read_unless(budget.tree(), finished) {
         let mut remaining = chunk.as_slice();
         while !remaining.is_empty() {
             if budget.tree().is_cancelled()
@@ -199,7 +199,11 @@ mod pump_tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 pump_stdin(
-                    &mut PipeReader::from_bytes(vec![b'x'; 1024 * 1024]),
+                    &mut PipeReader::from_bytes(
+                        vec![b'x'; 1024 * 1024],
+                        None,
+                        crate::interp::telemetry::stage_read,
+                    ),
                     socket,
                     &budget,
                     &AtomicBool::new(false),
@@ -243,7 +247,7 @@ fn record_compound_outcome(span: Option<&tracing::Span>, executed: &Result<Execu
 struct StageOutcome {
     status: Result<ExitCode, FatalError>,
     diagnostics: Vec<String>,
-    enclosing: Option<PipeReader>,
+    enclosing: Option<PipeReader<StageObservation>>,
 }
 
 enum Stage<'scope> {
@@ -367,7 +371,7 @@ pub(crate) fn run(
 pub(crate) fn run_with_tree(
     script: &str,
     prev: Option<&str>,
-    stdin: Option<PipeReader>,
+    stdin: Option<PipeReader<StageObservation>>,
     invoker: &dyn CapabilityInvoker,
     limits: Limits,
     tree: &TreeContext,
@@ -546,8 +550,8 @@ struct Evaluator<'a> {
     diagnostics_depth: Option<usize>,
     expansion_charges: Vec<dekopon_process::RetainedBytes>,
     script_stdin: bool,
-    stdin: Vec<PipeReader>,
-    stdout: Option<PipeWriter>,
+    stdin: Vec<PipeReader<StageObservation>>,
+    stdout: Option<PipeWriter<StageObservation>>,
     reader_gone: bool,
     stdout_redirected: bool,
     shared_charges: Vec<dekopon_process::RetainedBytes>,
@@ -680,7 +684,7 @@ impl<'a> Evaluator<'a> {
         telemetry::stage_write(
             text.len() + usize::from(!result.suppress_newline),
             true,
-            None,
+            &None,
         );
         if result.suppress_newline {
             self.output.push_fragment(&text);
@@ -1143,9 +1147,9 @@ impl<'a> Evaluator<'a> {
         }
 
         let line = match input {
-            StageInput::Piped(mut reader) => reader.read_line(&self.budget)?,
+            StageInput::Piped(mut reader) => reader.read_line(self.budget.tree())?,
             StageInput::Inherited => match self.stdin.last_mut() {
-                Some(reader) => reader.read_line(&self.budget)?,
+                Some(reader) => reader.read_line(self.budget.tree())?,
                 None => None,
             },
         };
@@ -1295,10 +1299,15 @@ impl<'a> Evaluator<'a> {
             let mut input = StageInput::Inherited;
             let mut running = Vec::with_capacity(producers.len());
             for (index, command) in producers.iter().enumerate() {
-                let (writer, reader) = pipe::pipe();
+                let (writer, reader) = pipe::pipe(
+                    None,
+                    None,
+                    crate::interp::telemetry::stage_read,
+                    crate::interp::telemetry::stage_write,
+                );
                 let stage_input = std::mem::replace(
                     &mut input,
-                    StageInput::Piped(reader.with_meter(Arc::clone(&meters[index + 1]))),
+                    StageInput::Piped(reader.with_context(Some(Arc::clone(&meters[index + 1])))),
                 );
                 running.push(self.spawn_stage(
                     scope,
@@ -1311,7 +1320,7 @@ impl<'a> Evaluator<'a> {
                     },
                     command,
                     stage_input,
-                    writer.with_meter(Arc::clone(&meters[index])),
+                    writer.with_context(Some(Arc::clone(&meters[index]))),
                 ));
             }
             if !producers.is_empty() {
@@ -1415,7 +1424,7 @@ impl<'a> Evaluator<'a> {
         setup: StageSetup,
         command: &'env Command,
         input: StageInput,
-        writer: PipeWriter,
+        writer: PipeWriter<StageObservation>,
     ) -> Stage<'scope>
     where
         'a: 'env,
@@ -1510,7 +1519,10 @@ impl<'a> Evaluator<'a> {
         self.script_stdin && self.stdin.len() == 1
     }
 
-    fn snapshot(&mut self, writer: PipeWriter) -> Result<Evaluator<'a>, LimitExceeded> {
+    fn snapshot(
+        &mut self,
+        writer: PipeWriter<StageObservation>,
+    ) -> Result<Evaluator<'a>, LimitExceeded> {
         let mut frames = Vec::with_capacity(self.frames.len());
         for frame in &self.frames {
             let mut local_charges = BTreeMap::new();
@@ -1654,15 +1666,8 @@ impl<'a> Evaluator<'a> {
             };
             let mut excerpt = Vec::new();
             let mut truncated = false;
-            loop {
-                let chunk = if let Some(reader) = piped.as_mut() {
-                    reader.read(&self.budget)?
-                } else if let Some(reader) = self.stdin.last_mut() {
-                    reader.read(&self.budget)?
-                } else {
-                    break;
-                };
-                let ReadOutcome::Bytes(chunk) = chunk else {
+            while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
+                let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
                     break;
                 };
                 self.budget.charge_step()?;
@@ -1689,15 +1694,8 @@ impl<'a> Evaluator<'a> {
                 StageInput::Piped(reader) => Some(reader),
                 StageInput::Inherited => None,
             };
-            loop {
-                let chunk = if let Some(reader) = piped.as_mut() {
-                    reader.read(&self.budget)?
-                } else if let Some(reader) = self.stdin.last_mut() {
-                    reader.read(&self.budget)?
-                } else {
-                    break;
-                };
-                let ReadOutcome::Bytes(chunk) = chunk else {
+            while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
+                let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
                     break;
                 };
                 self.budget.charge_step()?;
@@ -1731,13 +1729,13 @@ impl<'a> Evaluator<'a> {
             },
         };
         let mut partial = Vec::new();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
             budget.charge_step()?;
             if discard {
                 continue;
             }
             let Some(writer) = stdout.as_mut().filter(|_| !routed) else {
-                telemetry::stage_write(chunk.len(), true, None);
+                telemetry::stage_write(chunk.len(), true, &None);
                 partial.extend_from_slice(&chunk);
                 let complete = lossy_complete_prefix(&partial);
                 if !into_capture && !collect {
@@ -2027,7 +2025,11 @@ impl<'a> Evaluator<'a> {
                             return Err(limit.into());
                         }
                     }
-                    StageInput::Piped(PipeReader::from_bytes(text.into_bytes()))
+                    StageInput::Piped(PipeReader::from_bytes(
+                        text.into_bytes(),
+                        None,
+                        crate::interp::telemetry::stage_read,
+                    ))
                 }
                 Err(failure) => {
                     self.restore_all(restore);
@@ -2399,7 +2401,7 @@ impl<'a> Evaluator<'a> {
                 }
                 if matches!(stdout_sink, Sink::Value) && !capture_output && self.captures.is_empty()
                 {
-                    telemetry::stage_write(chunk.len(), true, None);
+                    telemetry::stage_write(chunk.len(), true, &None);
                     utf8_pending.extend_from_slice(chunk);
                     let complete = lossy_complete_prefix(&utf8_pending);
                     self.output
@@ -2448,7 +2450,13 @@ impl<'a> Evaluator<'a> {
         command: &str,
         operand: Option<&str>,
         input: StageInput,
-    ) -> Result<(PipeReader, Option<dekopon_process::RetainedBytes>), CommandFailure> {
+    ) -> Result<
+        (
+            PipeReader<StageObservation>,
+            Option<dekopon_process::RetainedBytes>,
+        ),
+        CommandFailure,
+    > {
         if let Some(name) = operand.filter(|name| *name != "-") {
             check_buffer_operand(command, name)?;
             if name == DEV_NULL {
@@ -2460,7 +2468,10 @@ impl<'a> Evaluator<'a> {
                 ))
             })?;
             let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-            return Ok((PipeReader::from_bytes(bytes.clone()), Some(charge)));
+            return Ok((
+                PipeReader::from_bytes(bytes.clone(), None, crate::interp::telemetry::stage_read),
+                Some(charge),
+            ));
         }
         Ok((
             match input {
@@ -2936,7 +2947,8 @@ impl<'a> Evaluator<'a> {
             ))
         };
         let (stdout, provider_stdout) = UnixStream::pair().map_err(unopened)?;
-        let output = PipeReader::from_socket(stdout).map_err(unopened)?;
+        let output = PipeReader::from_socket(stdout, None, crate::interp::telemetry::stage_read)
+            .map_err(unopened)?;
         let stdin = match input {
             StageInput::Inherited if !self.provider_reads_script_stdin() => None,
             StageInput::Piped(_) | StageInput::Inherited => {
@@ -3018,7 +3030,7 @@ impl<'a> Evaluator<'a> {
         };
         self.budget.check_deadline()?;
         let mut copied = copied?;
-        let status = ExitCode::from_capability_result(&result);
+        let status = ExitCode::from(&result);
         match result {
             CapabilityCallResult::Succeeded => {}
             CapabilityCallResult::SucceededWithStderr(stderr)
@@ -3284,7 +3296,7 @@ impl<'a> Evaluator<'a> {
         let mut status = ExitCode::SUCCESS;
         loop {
             let line = match piped.as_mut().or_else(|| self.stdin.last_mut()) {
-                Some(reader) => reader.read_line(&self.budget)?,
+                Some(reader) => reader.read_line(self.budget.tree())?,
                 None => None,
             };
             let Some(line) = line else { break };
@@ -4137,7 +4149,7 @@ fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
     value::from_lines(lines)
 }
 
-fn write_display(stdout: &mut PipeWriter, value: &Value) -> WriteOutcome {
+fn write_display(stdout: &mut PipeWriter<StageObservation>, value: &Value) -> WriteOutcome {
     match value {
         Value::String(text) => stdout.write(text.as_bytes()),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {

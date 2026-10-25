@@ -27,6 +27,7 @@ parking_lot.workspace = true
 dekopon-agent = { workspace = true, optional = true }
 dekopon-broker-protocol.workspace = true
 dekopon-model.workspace = true
+dekopon-process.workspace = true
 dekopon-shell.workspace = true
 tokio.workspace = true
 tracing.workspace = true

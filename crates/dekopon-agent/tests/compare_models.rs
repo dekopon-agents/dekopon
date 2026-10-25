@@ -11,7 +11,8 @@ use dekopon_model::{
     inference::ModelClient,
     openrouter::{OpenRouterClient, settings::Settings},
 };
-use dekopon_shell::{ExitCode, ScriptOutcome};
+use dekopon_process::ExitCode;
+use dekopon_shell::ScriptOutcome;
 use dekopon_test_support::LoopbackServer;
 use parking_lot::Mutex;
 use serde_json::{Value, json};

@@ -1,9 +1,9 @@
+use dekopon_process::pipe::CHUNK_BYTES;
 use regex_bites::Regex;
 
 use crate::{
     builtins::{CommandFailure, unsupported_flag},
     limits::Budget,
-    pipe::CHUNK_BYTES,
 };
 
 const HELP: &str = "-e -E";

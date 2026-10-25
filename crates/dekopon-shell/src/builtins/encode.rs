@@ -1,16 +1,15 @@
+use crate::interp::telemetry::StageObservation;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use dekopon_process::pipe::{PipeReader, ReadOutcome};
 
 use super::{CommandFailure, unsupported_flag};
-use crate::{
-    limits::Budget,
-    pipe::{PipeReader, ReadOutcome},
-};
+use crate::limits::Budget;
 
 pub(crate) const HELP: &str = "-d";
 
 pub(crate) fn stream(
     arguments: &[String],
-    reader: &mut PipeReader,
+    reader: &mut PipeReader<StageObservation>,
     budget: &mut Budget,
 
     mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -70,7 +69,7 @@ pub(crate) fn stream(
             return Ok(());
         }
     } else {
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
             if !process(&chunk, budget)? {
                 return Ok(());
             }

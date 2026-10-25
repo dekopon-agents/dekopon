@@ -50,7 +50,8 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter};
+    use crate::{CapabilityCallResult, CapabilityInvoker, Interpreter};
+    use dekopon_process::ExitCode;
     use dekopon_process::Limits;
 
     use super::{Resolution, resolve};

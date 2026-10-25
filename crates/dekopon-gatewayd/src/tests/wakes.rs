@@ -2,7 +2,8 @@ use std::time::SystemTime;
 
 use dekopon_agent::wake::{WAKE_TOOL_NAME, WakeId, WakeRefusal};
 use dekopon_broker_protocol::Trigger;
-use dekopon_shell::{ExitCode, ScriptOutcome};
+use dekopon_process::ExitCode;
+use dekopon_shell::ScriptOutcome;
 
 use super::*;
 use crate::{

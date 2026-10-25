@@ -54,8 +54,8 @@ fn evaluator(invoker: &dyn CapabilityInvoker, limits: Limits) -> Evaluator<'_> {
         testing_status: 0,
         stderr_capture: Vec::new(),
         counters: telemetry::ScriptCounters::default(),
-        last_status: crate::ExitCode::SUCCESS,
-        last_substitution_status: crate::ExitCode::SUCCESS,
+        last_status: dekopon_process::ExitCode::SUCCESS,
+        last_substitution_status: dekopon_process::ExitCode::SUCCESS,
         jobs: crate::job::ScriptJobs::default(),
     }
 }
@@ -98,7 +98,10 @@ fn runtime_paths_preserve_their_measured_ceilings() {
         let error = super::FatalError::Limit(dekopon_process::LimitExceeded::RecursionDepth {
             maximum: 32,
         });
-        assert_eq!(evaluator.report_fatal(&error), crate::ExitCode::SYNTAX);
+        assert_eq!(
+            evaluator.report_fatal(&error),
+            dekopon_process::ExitCode::SYNTAX
+        );
         assert_eq!(
             evaluator.output.render(),
             "dekopon-shell: function calls, `$( )` substitutions, `${ }` expansions and compound commands (`if`, `for`, `while`, `case`, `{ }`, `[[ ]]`) nested deeper than 32 levels while running; replace recursion with a loop, or move inner results into variables first"
@@ -149,7 +152,12 @@ fn nested_errors_refund_depth_and_pipeline_stages_inherit_it() {
         .expect("both units refunded after error");
     evaluator
         .nested(|this| {
-            let (writer, _reader) = crate::pipe::pipe();
+            let (writer, _reader) = dekopon_process::pipe::pipe(
+                None,
+                None,
+                crate::interp::telemetry::stage_read,
+                crate::interp::telemetry::stage_write,
+            );
             let mut child = this.snapshot(writer)?;
             child.nested(|child| {
                 assert!(matches!(

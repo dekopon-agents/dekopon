@@ -1218,7 +1218,7 @@ where
                     tool: SCRIPT_TOOL_NAME.into(),
                     request: vec![Representation::original(&script[..request_cut], "")],
                     result: vec![Representation::original(&output[..cut], "")],
-                    outcome: if outcome.exit_code == dekopon_shell::ExitCode::SUCCESS {
+                    outcome: if outcome.exit_code == dekopon_process::ExitCode::SUCCESS {
                         "success"
                     } else {
                         "failure"
@@ -1946,9 +1946,8 @@ mod tests {
         ModelToolCall,
     };
     use dekopon_model_token_governor::ModelUsage;
-    use dekopon_shell::{
-        CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
-    };
+    use dekopon_process::ExitCode;
+    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun, ScriptOutcome};
     use serde_json::{Value, json};
 
     use crate::meta::{

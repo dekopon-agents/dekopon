@@ -1356,6 +1356,7 @@ dependencies = [
  "dekopon-agent",
  "dekopon-broker-protocol",
  "dekopon-model",
+ "dekopon-process",
  "dekopon-shell",
  "parking_lot",
  "tempfile",

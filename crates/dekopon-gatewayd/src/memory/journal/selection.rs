@@ -5,9 +5,9 @@ use crate::config::{
 };
 use dekopon_agent::prompt::{ConversationTurn, History, Representation};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
-use dekopon_process::TreeContext;
+use dekopon_process::{ExitCode, TreeContext};
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ExitCode, Streams,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Streams,
 };
 use serde::Serialize;
 use serde_json::{Value, json};

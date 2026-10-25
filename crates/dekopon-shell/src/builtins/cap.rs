@@ -64,12 +64,13 @@ impl Builtin for Cap {
 
 #[cfg(test)]
 mod tests {
+    use dekopon_process::ExitCode;
     use parking_lot::Mutex;
 
     use serde_json::json;
 
     use crate::{
-        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode, Interpreter,
+        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, Interpreter,
         builtins::{CommandFailure, test_support::run_builtin_with_invoker},
     };
     use dekopon_process::Limits;

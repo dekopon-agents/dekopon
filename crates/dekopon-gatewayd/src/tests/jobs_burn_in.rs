@@ -5,7 +5,7 @@ use super::jobs_e2e::{
 use super::*;
 use crate::jobs::JobOwner;
 use dekopon_broker_protocol::{Arg, Trigger};
-use dekopon_shell::{ExitCode, JobId, JobOutcome, JobState};
+use dekopon_process::{ExitCode, JobId, JobOutcome, JobState};
 use dekopon_test_support::{CaptureLayer, Record};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;

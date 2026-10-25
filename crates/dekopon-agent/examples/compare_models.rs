@@ -9,7 +9,8 @@ use dekopon_model::{
     inference::ModelClient,
     openrouter::{OpenRouterClient, settings::Settings},
 };
-use dekopon_shell::{ExitCode, ScriptOutcome};
+use dekopon_process::ExitCode;
+use dekopon_shell::ScriptOutcome;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use thiserror::Error;
 

@@ -1,3 +1,5 @@
+use crate::interp::telemetry::StageObservation;
+use dekopon_process::pipe::{PipeReader, ReadOutcome};
 use std::collections::VecDeque;
 
 use clap::{Arg, Command};
@@ -5,7 +7,6 @@ use clap::{Arg, Command};
 use crate::{
     builtins::{CommandFailure, parse_flags, unsupported_flag},
     limits::Budget,
-    pipe::{PipeReader, ReadOutcome},
 };
 use dekopon_process::RetainedBytes;
 
@@ -124,7 +125,7 @@ impl LineCommand {
     pub(crate) fn run(
         self,
         selection: Selection,
-        reader: &mut PipeReader,
+        reader: &mut PipeReader<StageObservation>,
         budget: &mut Budget,
 
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -136,7 +137,7 @@ impl LineCommand {
             return Ok(());
         }
         if let Selection::FirstBytes(mut remaining) = selection {
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
                 budget.charge_step()?;
                 let n = remaining.min(chunk.len());
                 if !emit(&chunk[..n])? || n == remaining {
@@ -150,7 +151,7 @@ impl LineCommand {
         let mut pending_charges = Vec::new();
         let mut kept: VecDeque<(Vec<u8>, Vec<RetainedBytes>)> = VecDeque::new();
         let mut line_number = 0usize;
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
             budget.charge_step()?;
             let mut rest = chunk.as_slice();
             while !rest.is_empty() {

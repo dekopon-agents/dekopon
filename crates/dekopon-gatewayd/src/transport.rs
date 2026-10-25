@@ -85,7 +85,7 @@ pub(crate) enum MessageId {
         notice: String,
     },
     Job {
-        id: dekopon_shell::JobId,
+        id: dekopon_process::JobId,
         agent: dekopon_core::AgentId,
     },
 }

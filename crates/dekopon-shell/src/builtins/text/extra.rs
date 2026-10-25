@@ -1,14 +1,14 @@
+use crate::interp::telemetry::StageObservation;
+use dekopon_process::pipe::{PipeReader, ReadOutcome};
+use dekopon_process::{ExitCode, RetainedBytes};
 use std::cmp::Ordering;
 
 use clap::{Arg, ArgAction, Command};
 
 use crate::{
-    ExitCode,
     builtins::{CommandFailure, parse_flags},
     limits::Budget,
-    pipe::{PipeReader, ReadOutcome},
 };
-use dekopon_process::RetainedBytes;
 
 use super::cut::Selection;
 
@@ -43,7 +43,7 @@ impl ExtraStream {
     pub(crate) fn run(
         self,
         arguments: &[String],
-        reader: &mut PipeReader,
+        reader: &mut PipeReader<StageObservation>,
         budget: &mut Budget,
 
         emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -54,21 +54,21 @@ impl ExtraStream {
     pub(crate) fn run_parsed(
         self,
         operation: Operation,
-        reader: &mut PipeReader,
+        reader: &mut PipeReader<StageObservation>,
         budget: &mut Budget,
 
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<ExitCode, CommandFailure> {
         let mut state = State::new(operation);
         if matches!(self, Self::Wc) {
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
                 budget.charge_step()?;
                 state.count_chunk(&chunk)?;
             }
         } else {
             let mut pending = Vec::new();
             let mut charges = Vec::new();
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+            while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
                 budget.charge_step()?;
                 let mut rest = chunk.as_slice();
                 while !rest.is_empty() {

@@ -29,12 +29,11 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
-use dekopon_process::{CallBudget, CancelSignal, Limits as ShellLimits, TreeContext};
+use dekopon_process::{CallBudget, CancelSignal, ExitCode, Limits as ShellLimits, TreeContext};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, Interpreter, JobControl,
-    ScriptOutcome,
+    CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, JobControl, ScriptOutcome,
 };
 use serde_json::Value;
 #[cfg(unix)]
@@ -1567,30 +1566,30 @@ mod tests {
         fn start(
             &self,
             seed: dekopon_shell::JobSeed,
-        ) -> Result<dekopon_shell::JobId, dekopon_shell::JobRefusal> {
+        ) -> Result<dekopon_process::JobId, dekopon_shell::JobRefusal> {
             self.calls.lock().push(format!("start {}", seed.text()));
-            Ok(dekopon_shell::JobId::new(7))
+            Ok(dekopon_process::JobId::new(7))
         }
 
-        fn list(&self) -> Vec<dekopon_shell::JobSummary> {
+        fn list(&self) -> Vec<dekopon_process::JobSummary> {
             self.calls.lock().push("list".to_owned());
             Vec::new()
         }
 
         fn wait(
             &self,
-            ids: &[dekopon_shell::JobId],
+            ids: &[dekopon_process::JobId],
             _keep_waiting: &dyn Fn() -> bool,
-        ) -> Vec<Result<dekopon_shell::JobWait, dekopon_shell::JobRefusal>> {
+        ) -> Vec<Result<dekopon_process::JobWait, dekopon_shell::JobRefusal>> {
             ids.iter()
                 .map(|id| {
                     self.calls.lock().push(format!("wait {id}"));
-                    Ok(dekopon_shell::JobWait::Interrupted)
+                    Ok(dekopon_process::JobWait::Interrupted)
                 })
                 .collect()
         }
 
-        fn kill(&self, id: dekopon_shell::JobId) -> Result<(), dekopon_shell::JobRefusal> {
+        fn kill(&self, id: dekopon_process::JobId) -> Result<(), dekopon_shell::JobRefusal> {
             self.calls.lock().push(format!("kill {id}"));
             Ok(())
         }
@@ -1626,11 +1625,11 @@ mod tests {
             .run("echo a &", &invoker);
         assert_eq!(outcome.output, "[7]");
         let jobs = invoker.job_control().expect("the broker leg's job control");
-        let id = dekopon_shell::JobId::new(7);
+        let id = dekopon_process::JobId::new(7);
         assert!(jobs.list().is_empty());
         assert_eq!(
             jobs.wait(&[id], &|| false),
-            [Ok(dekopon_shell::JobWait::Interrupted)]
+            [Ok(dekopon_process::JobWait::Interrupted)]
         );
         assert_eq!(jobs.kill(id), Ok(()));
         assert_eq!(
@@ -1729,10 +1728,11 @@ mod tests {
             AgentId, ExternalSubject, ProviderFailureDetail, SecretDrn, SecretUseProposal,
         };
         use dekopon_process::CancelSignal;
+        use dekopon_process::ExitCode;
         use dekopon_process::Limits;
         use dekopon_shell::{
             CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
-            CommandRun, ExitCode,
+            CommandRun,
         };
         use serde_json::json;
         use tokio::{
@@ -2346,10 +2346,9 @@ mod tests {
                 Trigger, UpcallStdin,
             };
             use dekopon_process::CancelSignal;
+            use dekopon_process::ExitCode;
             use dekopon_process::{CallBudget, Limits, TreeContext};
-            use dekopon_shell::{
-                CapabilityCallResult, CapabilityInvoker as _, CommandProposal, ExitCode,
-            };
+            use dekopon_shell::{CapabilityCallResult, CapabilityInvoker as _, CommandProposal};
             use opentelemetry::trace::TracerProvider as _;
             use serde_json::json;
             use tokio::{
@@ -2838,24 +2837,27 @@ mod tests {
                 fn start(
                     &self,
                     _seed: dekopon_shell::JobSeed,
-                ) -> Result<dekopon_shell::JobId, dekopon_shell::JobRefusal> {
+                ) -> Result<dekopon_process::JobId, dekopon_shell::JobRefusal> {
                     panic!("child job controller panicked")
                 }
 
-                fn list(&self) -> Vec<dekopon_shell::JobSummary> {
+                fn list(&self) -> Vec<dekopon_process::JobSummary> {
                     Vec::new()
                 }
 
                 fn wait(
                     &self,
-                    _ids: &[dekopon_shell::JobId],
+                    _ids: &[dekopon_process::JobId],
                     _keep_waiting: &dyn Fn() -> bool,
-                ) -> Vec<Result<dekopon_shell::JobWait, dekopon_shell::JobRefusal>>
+                ) -> Vec<Result<dekopon_process::JobWait, dekopon_shell::JobRefusal>>
                 {
                     Vec::new()
                 }
 
-                fn kill(&self, _id: dekopon_shell::JobId) -> Result<(), dekopon_shell::JobRefusal> {
+                fn kill(
+                    &self,
+                    _id: dekopon_process::JobId,
+                ) -> Result<(), dekopon_shell::JobRefusal> {
                     Ok(())
                 }
             }

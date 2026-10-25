@@ -3,26 +3,21 @@ use std::{
     io::Read,
     os::unix::net::UnixStream,
     sync::{
-        Arc,
         atomic::{self, AtomicBool},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     time::Duration,
 };
 
-use crate::{
-    interp::telemetry::{self, StageMeter},
-    limits::Budget,
-};
-use dekopon_process::{LimitExceeded, RetainedBytes};
+use crate::{LimitExceeded, RetainedBytes, TreeContext};
 
-pub(crate) struct ChargedBytes {
-    pub(crate) bytes: Vec<u8>,
+pub struct ChargedBytes {
+    pub bytes: Vec<u8>,
     charges: Vec<RetainedBytes>,
 }
 
 impl ChargedBytes {
-    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<RetainedBytes>) {
+    pub fn into_parts(self) -> (Vec<u8>, Vec<RetainedBytes>) {
         (self.bytes, self.charges)
     }
 
@@ -37,52 +32,53 @@ impl ChargedBytes {
         &mut self,
         chunk: impl IntoIterator<Item = u8>,
         len: usize,
-        budget: &Budget,
+        budget: &TreeContext,
     ) -> Result<(), LimitExceeded> {
-        self.charges.push(budget.charge_value_bytes(len as u64)?);
+        self.charges.push(budget.retain(len as u64)?);
         self.bytes.extend(chunk);
         Ok(())
     }
 }
 
-pub(crate) const CHUNK_BYTES: usize = 4 * 1024;
+pub const CHUNK_BYTES: usize = 4 * 1024;
 
 const CAPACITY_CHUNKS: usize = 16;
 
-pub(crate) const POLL: Duration = Duration::from_secs(1);
+pub const POLL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ReadOutcome {
+pub enum ReadOutcome {
     Bytes(Vec<u8>),
     End,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
-pub(crate) enum WriteOutcome {
+pub enum WriteOutcome {
     Accepted,
     ReaderGone,
 }
 
 #[derive(Debug)]
-pub(crate) struct PipeWriter {
+pub struct PipeWriter<C = ()> {
     sender: SyncSender<Vec<u8>>,
-    meter: Option<Arc<StageMeter>>,
+    context: C,
+    observe: fn(usize, bool, &C),
 }
 
-impl PipeWriter {
-    pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
-        self.meter = Some(meter);
+impl<C> PipeWriter<C> {
+    pub fn with_context(mut self, context: C) -> Self {
+        self.context = context;
         self
     }
 
-    pub(crate) fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
+    pub fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
         for chunk in bytes.chunks(CHUNK_BYTES) {
             if self.sender.send(chunk.to_vec()).is_err() {
-                telemetry::stage_write(0, false, self.meter.as_ref());
+                (self.observe)(0, false, &self.context);
                 return WriteOutcome::ReaderGone;
             }
-            telemetry::stage_write(chunk.len(), true, self.meter.as_ref());
+            (self.observe)(chunk.len(), true, &self.context);
         }
         WriteOutcome::Accepted
     }
@@ -96,55 +92,62 @@ enum Source {
 }
 
 #[derive(Debug)]
-pub(crate) struct PipeReader {
+pub struct PipeReader<C = ()> {
     source: Source,
     pending: VecDeque<u8>,
     ended: bool,
-    meter: Option<Arc<StageMeter>>,
+    context: C,
+    observe: fn(usize, &C),
 }
 
-impl Default for PipeReader {
+impl<C: Default> Default for PipeReader<C> {
     fn default() -> Self {
-        Self::from_bytes(Vec::new())
+        Self::from_bytes(Vec::new(), C::default(), |_, _| {})
     }
 }
 
-impl PipeReader {
-    pub(crate) fn with_meter(mut self, meter: Arc<StageMeter>) -> Self {
-        self.meter = Some(meter);
+impl<C> PipeReader<C> {
+    pub fn with_context(mut self, context: C) -> Self {
+        self.context = context;
         self
     }
 
     /// Reads a provider's stdout; dropping the reader closes the socket, so the provider's next
     /// write finds its reader gone.
-    pub(crate) fn from_socket(socket: UnixStream) -> std::io::Result<Self> {
+    pub fn from_socket(
+        socket: UnixStream,
+        context: C,
+        observe: fn(usize, &C),
+    ) -> std::io::Result<Self> {
         socket.set_read_timeout(Some(POLL))?;
         Ok(Self {
             source: Source::Socket(socket),
             pending: VecDeque::new(),
             ended: false,
-            meter: None,
+            context,
+            observe,
         })
     }
 
-    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+    pub fn from_bytes(bytes: Vec<u8>, context: C, observe: fn(usize, &C)) -> Self {
         Self {
             source: Source::Fixed,
             pending: bytes.into(),
             ended: true,
-            meter: None,
+            context,
+            observe,
         }
     }
 
-    pub(crate) fn read(&mut self, budget: &Budget) -> Result<ReadOutcome, LimitExceeded> {
+    pub fn read(&mut self, budget: &TreeContext) -> Result<ReadOutcome, LimitExceeded> {
         self.read_unless(budget, &AtomicBool::new(false))
     }
 
     /// Reads as [`Self::read`] until `stopped` is set, then reports the end without ending the
     /// stream, so a later reader still finds whatever was not yet read.
-    pub(crate) fn read_unless(
+    pub fn read_unless(
         &mut self,
-        budget: &Budget,
+        budget: &TreeContext,
 
         stopped: &AtomicBool,
     ) -> Result<ReadOutcome, LimitExceeded> {
@@ -153,21 +156,17 @@ impl PipeReader {
                 .pending
                 .drain(..self.pending.len().min(CHUNK_BYTES))
                 .collect();
-            telemetry::stage_read(bytes.len(), self.meter.as_ref());
+            (self.observe)(bytes.len(), &self.context);
             return Ok(ReadOutcome::Bytes(bytes));
         }
         loop {
             if self.ended {
                 return Ok(ReadOutcome::End);
             }
-            if let Source::Fixed = self.source {
-                self.ended = true;
-                continue;
-            }
             if stopped.load(atomic::Ordering::Relaxed) {
                 return Ok(ReadOutcome::End);
             }
-            if budget.tree().is_cancelled() {
+            if budget.is_cancelled() {
                 return Err(LimitExceeded::Cancelled);
             }
             budget.check_deadline()?;
@@ -212,15 +211,15 @@ impl PipeReader {
                 }
             };
             if !counted.is_empty() {
-                telemetry::stage_read(counted.len(), self.meter.as_ref());
+                (self.observe)(counted.len(), &self.context);
                 return Ok(ReadOutcome::Bytes(counted));
             }
         }
     }
 
-    pub(crate) fn read_line(
+    pub fn read_line(
         &mut self,
-        budget: &Budget,
+        budget: &TreeContext,
     ) -> Result<Option<ChargedBytes>, LimitExceeded> {
         let mut line = ChargedBytes::new();
         loop {
@@ -231,39 +230,33 @@ impl PipeReader {
             }
             let len = self.pending.len();
             line.extend(self.pending.drain(..), len, budget)?;
-            match self.read_more(budget)? {
-                true => {}
-                false if line.bytes.is_empty() => return Ok(None),
-                false => {
-                    return Ok(Some(line));
-                }
+            match self.read(budget)? {
+                ReadOutcome::Bytes(chunk) => self.pending.extend(chunk),
+                ReadOutcome::End => return Ok((!line.bytes.is_empty()).then_some(line)),
             }
-        }
-    }
-
-    fn read_more(&mut self, budget: &Budget) -> Result<bool, LimitExceeded> {
-        match self.read(budget)? {
-            ReadOutcome::Bytes(chunk) => {
-                self.pending.extend(chunk);
-                Ok(true)
-            }
-            ReadOutcome::End => Ok(false),
         }
     }
 }
 
-pub(crate) fn pipe() -> (PipeWriter, PipeReader) {
+pub fn pipe<R, W>(
+    reader_context: R,
+    writer_context: W,
+    read: fn(usize, &R),
+    write: fn(usize, bool, &W),
+) -> (PipeWriter<W>, PipeReader<R>) {
     let (sender, receiver) = sync_channel(CAPACITY_CHUNKS);
     (
         PipeWriter {
             sender,
-            meter: None,
+            context: writer_context,
+            observe: write,
         },
         PipeReader {
             source: Source::Channel(receiver),
             pending: VecDeque::new(),
             ended: false,
-            meter: None,
+            context: reader_context,
+            observe: read,
         },
     )
 }
@@ -271,12 +264,12 @@ pub(crate) fn pipe() -> (PipeWriter, PipeReader) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dekopon_process::Limits;
+    use crate::{CallBudget, Limits};
 
     #[test]
     fn a_line_read_leaves_the_rest_of_the_chunk_for_the_next_reader() {
-        let budget = Budget::start(Limits::default());
-        let (mut writer, mut reader) = pipe();
+        let budget = TreeContext::new(Limits::default(), CallBudget::new(32));
+        let (mut writer, mut reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         assert_eq!(writer.write(b"a\nbc"), WriteOutcome::Accepted);
         drop(writer);
         assert_eq!(
@@ -295,11 +288,14 @@ mod tests {
 
     #[test]
     fn a_growing_line_and_drain_are_charged_before_appending() {
-        let budget = Budget::start(Limits {
-            max_value_bytes: 12,
-            ..Limits::default()
-        });
-        let (mut writer, mut reader) = pipe();
+        let budget = TreeContext::new(
+            Limits {
+                max_value_bytes: 12,
+                ..Limits::default()
+            },
+            CallBudget::new(32),
+        );
+        let (mut writer, mut reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
         drop(writer);
         assert!(matches!(
@@ -311,11 +307,14 @@ mod tests {
 
     #[test]
     fn a_read_past_the_deadline_fails_without_waiting() {
-        let budget = Budget::start(Limits {
-            timeout: Duration::ZERO,
-            ..Limits::default()
-        });
-        let (_writer, mut reader) = pipe();
+        let budget = TreeContext::new(
+            Limits {
+                timeout: Duration::ZERO,
+                ..Limits::default()
+            },
+            CallBudget::new(32),
+        );
+        let (_writer, mut reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         assert!(matches!(
             reader.read(&budget),
             Err(LimitExceeded::Deadline { .. })
@@ -324,7 +323,7 @@ mod tests {
 
     #[test]
     fn a_writer_learns_the_reader_is_gone_instead_of_blocking() {
-        let (mut writer, reader) = pipe();
+        let (mut writer, reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         drop(reader);
         assert_eq!(writer.write(b"x"), WriteOutcome::ReaderGone);
     }

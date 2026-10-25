@@ -1,3 +1,6 @@
+use crate::interp::telemetry::StageObservation;
+use dekopon_process::pipe::{PipeReader, ReadOutcome};
+use dekopon_process::{ExitCode, LimitExceeded};
 use std::{
     io::{self, BufRead as _, Read as _, Write as _},
     process::{Command, Stdio},
@@ -15,12 +18,9 @@ use serde_json::Value;
 
 use super::{CommandFailure, parse_flags};
 use crate::{
-    ExitCode,
     jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
     limits::Budget,
-    pipe::{PipeReader, ReadOutcome},
 };
-use dekopon_process::LimitExceeded;
 
 /// env reads the host process environment and now reads the host wall clock; neither is reachable
 /// any other way in this crate, so both are excluded from the filter set.
@@ -109,7 +109,7 @@ pub(crate) fn options(arguments: &[String]) -> Result<Options, CommandFailure> {
 
 pub(crate) fn stream(
     opts: Options,
-    reader: &mut PipeReader,
+    reader: &mut PipeReader<StageObservation>,
     budget: &mut Budget,
 
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -230,7 +230,7 @@ const STDERR_BYTES: u64 = 4096;
 
 fn evaluate(
     mut opts: Options,
-    input: &mut PipeReader,
+    input: &mut PipeReader<StageObservation>,
     budget: &mut Budget,
 
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -310,7 +310,7 @@ fn evaluate(
                     stdin.flush().map_err(input_error)?;
                     return Ok(charges);
                 } else {
-                    while let ReadOutcome::Bytes(chunk) = input.read(&input_budget)? {
+                    while let ReadOutcome::Bytes(chunk) = input.read(input_budget.tree())? {
                         stdin.write_all(&chunk).map_err(input_error)?;
                         stdin.flush().map_err(input_error)?;
                         input_budget.charge_step()?;
@@ -376,7 +376,7 @@ fn input_error(error: io::Error) -> CommandFailure {
 }
 
 struct PipeSource<'a> {
-    reader: &'a mut PipeReader,
+    reader: &'a mut PipeReader<StageObservation>,
     budget: &'a mut Budget,
 
     pending: Vec<u8>,
@@ -386,7 +386,7 @@ struct PipeSource<'a> {
 }
 
 impl<'a> PipeSource<'a> {
-    fn new(reader: &'a mut PipeReader, budget: &'a mut Budget) -> Self {
+    fn new(reader: &'a mut PipeReader<StageObservation>, budget: &'a mut Budget) -> Self {
         Self {
             reader,
             budget,
@@ -405,7 +405,7 @@ impl io::Read for PipeSource<'_> {
             return Ok(0);
         }
         if self.offset == self.pending.len() {
-            match self.reader.read(self.budget) {
+            match self.reader.read(self.budget.tree()) {
                 Ok(ReadOutcome::Bytes(bytes)) => {
                     if let Err(error) = self.budget.charge_step() {
                         self.failure = Some(error);
@@ -699,7 +699,11 @@ mod tests {
 
     #[test]
     fn slurp_refuses_an_oversized_document_before_finishing_its_parse() {
-        let mut input = PipeReader::from_bytes(format!("\"{}\"", "x".repeat(100_000)).into_bytes());
+        let mut input = PipeReader::from_bytes(
+            format!("\"{}\"", "x".repeat(100_000)).into_bytes(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
         let mut budget = Budget::start(dekopon_process::Limits {
             max_value_bytes: 64,
             ..dekopon_process::Limits::default()

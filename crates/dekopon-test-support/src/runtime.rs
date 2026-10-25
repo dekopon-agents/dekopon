@@ -5,7 +5,8 @@ use std::{
 };
 
 use dekopon_agent::prompt::ScriptRuntime;
-use dekopon_shell::{ExitCode, ScriptOutcome};
+use dekopon_process::ExitCode;
+use dekopon_shell::ScriptOutcome;
 use tokio::sync::Notify;
 
 const PARK_CEILING: Duration = Duration::from_secs(30);
