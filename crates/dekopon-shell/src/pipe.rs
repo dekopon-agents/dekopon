@@ -11,7 +11,6 @@ use std::{
 };
 
 use crate::{
-    CapabilityInvoker,
     interp::telemetry::{self, StageMeter},
     limits::Budget,
 };
@@ -137,12 +136,8 @@ impl PipeReader {
         }
     }
 
-    pub(crate) fn read(
-        &mut self,
-        budget: &Budget,
-        invoker: &dyn CapabilityInvoker,
-    ) -> Result<ReadOutcome, LimitExceeded> {
-        self.read_unless(budget, invoker, &AtomicBool::new(false))
+    pub(crate) fn read(&mut self, budget: &Budget) -> Result<ReadOutcome, LimitExceeded> {
+        self.read_unless(budget, &AtomicBool::new(false))
     }
 
     /// Reads as [`Self::read`] until `stopped` is set, then reports the end without ending the
@@ -150,7 +145,7 @@ impl PipeReader {
     pub(crate) fn read_unless(
         &mut self,
         budget: &Budget,
-        invoker: &dyn CapabilityInvoker,
+
         stopped: &AtomicBool,
     ) -> Result<ReadOutcome, LimitExceeded> {
         if !self.pending.is_empty() {
@@ -172,7 +167,7 @@ impl PipeReader {
             if stopped.load(atomic::Ordering::Relaxed) {
                 return Ok(ReadOutcome::End);
             }
-            if invoker.cancelled() {
+            if budget.tree().is_cancelled() {
                 return Err(LimitExceeded::Cancelled);
             }
             budget.check_deadline()?;
@@ -226,7 +221,6 @@ impl PipeReader {
     pub(crate) fn read_line(
         &mut self,
         budget: &Budget,
-        invoker: &dyn CapabilityInvoker,
     ) -> Result<Option<ChargedBytes>, LimitExceeded> {
         let mut line = ChargedBytes::new();
         loop {
@@ -237,7 +231,7 @@ impl PipeReader {
             }
             let len = self.pending.len();
             line.extend(self.pending.drain(..), len, budget)?;
-            match self.read_more(budget, invoker)? {
+            match self.read_more(budget)? {
                 true => {}
                 false if line.bytes.is_empty() => return Ok(None),
                 false => {
@@ -247,12 +241,8 @@ impl PipeReader {
         }
     }
 
-    fn read_more(
-        &mut self,
-        budget: &Budget,
-        invoker: &dyn CapabilityInvoker,
-    ) -> Result<bool, LimitExceeded> {
-        match self.read(budget, invoker)? {
+    fn read_more(&mut self, budget: &Budget) -> Result<bool, LimitExceeded> {
+        match self.read(budget)? {
             ReadOutcome::Bytes(chunk) => {
                 self.pending.extend(chunk);
                 Ok(true)
@@ -283,23 +273,6 @@ mod tests {
     use super::*;
     use dekopon_process::Limits;
 
-    struct Idle;
-
-    impl CapabilityInvoker for Idle {
-        fn granted(&self) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn invoke(
-            &self,
-            _proposal: crate::CommandProposal,
-            _streams: crate::Streams,
-            _tree: &dekopon_process::TreeContext,
-        ) -> crate::CapabilityCallResult {
-            unreachable!("pipe tests never invoke")
-        }
-    }
-
     #[test]
     fn a_line_read_leaves_the_rest_of_the_chunk_for_the_next_reader() {
         let budget = Budget::start(Limits::default());
@@ -308,19 +281,16 @@ mod tests {
         drop(writer);
         assert_eq!(
             reader
-                .read_line(&budget, &Idle)
+                .read_line(&budget)
                 .expect("reads")
                 .map(|line| line.bytes),
             Some(b"a".to_vec())
         );
         assert_eq!(
-            reader.read(&budget, &Idle).expect("reads"),
+            reader.read(&budget).expect("reads"),
             ReadOutcome::Bytes(b"bc".to_vec())
         );
-        assert_eq!(
-            reader.read(&budget, &Idle).expect("reads"),
-            ReadOutcome::End
-        );
+        assert_eq!(reader.read(&budget).expect("reads"), ReadOutcome::End);
     }
 
     #[test]
@@ -333,7 +303,7 @@ mod tests {
         assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
         drop(writer);
         assert!(matches!(
-            reader.read_line(&budget, &Idle),
+            reader.read_line(&budget),
             Err(LimitExceeded::ValueBytes { maximum: 12 })
         ));
         assert_eq!(budget.value_bytes(), 0);
@@ -347,7 +317,7 @@ mod tests {
         });
         let (_writer, mut reader) = pipe();
         assert!(matches!(
-            reader.read(&budget, &Idle),
+            reader.read(&budget),
             Err(LimitExceeded::Deadline { .. })
         ));
     }

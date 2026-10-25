@@ -366,8 +366,8 @@ pub fn run_parsed<I: CapabilityInvoker + ?Sized>(
 }
 
 pub trait CapabilityInvoker: Send + Sync {
-    fn cancelled(&self) -> bool {
-        false
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        Vec::new()
     }
 
     fn granted(&self) -> Vec<String>;
@@ -416,7 +416,7 @@ pub trait CapabilityInvoker: Send + Sync {
         let _ = (text, eta);
     }
 
-    fn script_started(&self, _timeout: Duration) {}
+    fn script_started(&self, _tree: &mut TreeContext) {}
 
     fn script_finished(&self) {}
 
@@ -440,8 +440,8 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 }
 
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
-    fn cancelled(&self) -> bool {
-        self.as_ref().cancelled()
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        self.as_ref().cancel_signals()
     }
 
     fn granted(&self) -> Vec<String> {
@@ -480,8 +480,8 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().note(text, eta);
     }
 
-    fn script_started(&self, timeout: Duration) {
-        self.as_ref().script_started(timeout);
+    fn script_started(&self, tree: &mut TreeContext) {
+        self.as_ref().script_started(tree);
     }
 
     fn script_finished(&self) {
@@ -599,7 +599,8 @@ impl Interpreter {
             &TreeContext::new(
                 self.limits,
                 CallBudget::new(self.limits.max_capability_calls),
-            ),
+            )
+            .with_cancel(invoker.cancel_signals()),
         )
     }
 
@@ -653,7 +654,7 @@ mod tests {
         collections::BTreeMap,
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicU32, Ordering},
+            atomic::{AtomicU32, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -747,11 +748,11 @@ mod tests {
         }
     }
 
-    struct Cancellation(Arc<AtomicBool>);
+    struct Cancellation(dekopon_process::CancelSignal);
 
     impl CapabilityInvoker for Cancellation {
-        fn cancelled(&self) -> bool {
-            self.0.load(Ordering::Relaxed)
+        fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+            vec![self.0.clone()]
         }
         fn granted(&self) -> Vec<String> {
             Vec::new()
@@ -768,7 +769,8 @@ mod tests {
 
     #[test]
     fn a_cancelled_loop_stops_before_exhausting_steps() {
-        let cancelled = Arc::new(AtomicBool::new(true));
+        let (handle, cancelled) = dekopon_process::CancelSignal::pair();
+        handle.cancel();
         let limits = Limits {
             max_steps: 100_000,
             ..Limits::default()
@@ -786,12 +788,20 @@ mod tests {
     }
 
     #[test]
+    fn run_with_prev_refuses_an_already_cancelled_invoker() {
+        let (handle, signal) = dekopon_process::CancelSignal::pair();
+        handle.cancel();
+        let outcome =
+            Interpreter::new(Limits::default()).run_with_prev("echo ok", "", &Cancellation(signal));
+        assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
+    }
+
+    #[test]
     fn a_sleep_wakes_for_cancellation_without_waiting_for_the_deadline() {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let flip = Arc::clone(&cancelled);
+        let (flip, cancelled) = dekopon_process::CancelSignal::pair();
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            flip.store(true, Ordering::Relaxed);
+            flip.cancel();
         });
         let start = Instant::now();
         let outcome = Interpreter::new(Limits {
@@ -1278,12 +1288,12 @@ mod tests {
     }
 
     struct PanickingInputInvoker {
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stop: dekopon_process::CancelSignal,
     }
 
     impl CapabilityInvoker for PanickingInputInvoker {
-        fn cancelled(&self) -> bool {
-            self.stop.load(std::sync::atomic::Ordering::Relaxed)
+        fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+            vec![self.stop.clone()]
         }
 
         fn granted(&self) -> Vec<String> {
@@ -1321,12 +1331,10 @@ mod tests {
 
     #[test]
     fn panicking_provider_with_idle_inherited_stdin_releases_the_feeder() {
-        use std::sync::atomic::AtomicBool;
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (stop, stop_for_worker) = dekopon_process::CancelSignal::pair();
         let (read, _idle_writer) = std::os::unix::net::UnixStream::pair().expect("idle stdin");
         let stdin = super::ChildStdin::adopt(read).expect("adopt before peer closes");
         let (finished, result) = std::sync::mpsc::channel();
-        let stop_for_worker = std::sync::Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
             let limits = Limits::default();
             let invoker = PanickingInputInvoker {
@@ -1337,14 +1345,15 @@ mod tests {
                     "httpprobe",
                     Some(stdin),
                     &invoker,
-                    &TreeContext::new(limits, CallBudget::new(16)),
+                    &TreeContext::new(limits, CallBudget::new(16))
+                        .with_cancel(invoker.cancel_signals()),
                 )
             }))
             .is_err();
             finished.send(panicked).expect("test receives the panic");
         });
         let answer = result.recv_timeout(std::time::Duration::from_secs(3));
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.cancel();
         if answer.is_err() {
             result
                 .recv_timeout(std::time::Duration::from_secs(3))

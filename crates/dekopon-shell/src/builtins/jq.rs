@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use super::{CommandFailure, parse_flags};
 use crate::{
-    CapabilityInvoker, ExitCode,
+    ExitCode,
     jq_worker::{JQ_WORKER_MARKER, WorkerChild, executable},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
@@ -111,10 +111,10 @@ pub(crate) fn stream(
     opts: Options,
     reader: &mut PipeReader,
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
-    evaluate(opts, reader, budget, invoker, emit)
+    evaluate(opts, reader, budget, emit)
 }
 
 enum ReadOutput {
@@ -165,7 +165,7 @@ fn read_outputs(
 fn collect(
     receiver: &std::sync::mpsc::Receiver<ReadOutput>,
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     raw: bool,
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<bool, CommandFailure> {
@@ -176,7 +176,7 @@ fn collect(
             .max(Duration::from_millis(1));
         match receiver.recv_timeout(wait) {
             Ok(ReadOutput::Value(value)) => {
-                budget.charge_step_with(invoker)?;
+                budget.charge_step()?;
                 let bytes = match (raw, value) {
                     (true, Value::String(text)) => text.into_bytes(),
                     (_, value) => serde_json::to_vec(&value).map_err(|error| {
@@ -196,7 +196,7 @@ fn collect(
             }
             Ok(ReadOutput::Invalid(message)) => return Err(CommandFailure::failed(message)),
             Ok(ReadOutput::Done) => {
-                if invoker.cancelled() {
+                if budget.tree().is_cancelled() {
                     return Err(LimitExceeded::Cancelled.into());
                 }
                 budget.check_deadline()?;
@@ -206,7 +206,7 @@ fn collect(
                 return Err(CommandFailure::failed("jq: worker output reader stopped"));
             }
             Err(RecvTimeoutError::Timeout) => {
-                if invoker.cancelled() {
+                if budget.tree().is_cancelled() {
                     return Err(LimitExceeded::Cancelled.into());
                 }
                 budget.check_deadline()?;
@@ -232,7 +232,7 @@ fn evaluate(
     mut opts: Options,
     input: &mut PipeReader,
     budget: &mut Budget,
-    invoker: &dyn CapabilityInvoker,
+
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
     let (header, _header_charge) = request_header(&mut opts, budget)?;
@@ -278,7 +278,7 @@ fn evaluate(
                     let mut values = Vec::new();
                     let mut charges = Vec::new();
                     let retention = input_budget.fork();
-                    let mut source = PipeSource::new(input, &mut input_budget, invoker);
+                    let mut source = PipeSource::new(input, &mut input_budget);
                     loop {
                         let item = serde_json::Deserializer::from_reader(&mut source)
                             .into_iter::<Value>()
@@ -310,10 +310,10 @@ fn evaluate(
                     stdin.flush().map_err(input_error)?;
                     return Ok(charges);
                 } else {
-                    while let ReadOutcome::Bytes(chunk) = input.read(&input_budget, invoker)? {
+                    while let ReadOutcome::Bytes(chunk) = input.read(&input_budget)? {
                         stdin.write_all(&chunk).map_err(input_error)?;
                         stdin.flush().map_err(input_error)?;
-                        input_budget.charge_step_with(invoker)?;
+                        input_budget.charge_step()?;
                     }
                 }
                 stdin.flush().map_err(input_error)?;
@@ -339,7 +339,7 @@ fn evaluate(
                 )));
             }
         });
-        let result = collect(&receiver, budget, invoker, opts.raw, emit);
+        let result = collect(&receiver, budget, opts.raw, emit);
         drop(receiver);
         if !matches!(result, Ok(true)) {
             drop(child);
@@ -378,7 +378,7 @@ fn input_error(error: io::Error) -> CommandFailure {
 struct PipeSource<'a> {
     reader: &'a mut PipeReader,
     budget: &'a mut Budget,
-    invoker: &'a dyn CapabilityInvoker,
+
     pending: Vec<u8>,
     offset: usize,
     failure: Option<LimitExceeded>,
@@ -386,15 +386,11 @@ struct PipeSource<'a> {
 }
 
 impl<'a> PipeSource<'a> {
-    fn new(
-        reader: &'a mut PipeReader,
-        budget: &'a mut Budget,
-        invoker: &'a dyn CapabilityInvoker,
-    ) -> Self {
+    fn new(reader: &'a mut PipeReader, budget: &'a mut Budget) -> Self {
         Self {
             reader,
             budget,
-            invoker,
+
             pending: Vec::new(),
             offset: 0,
             failure: None,
@@ -409,9 +405,9 @@ impl io::Read for PipeSource<'_> {
             return Ok(0);
         }
         if self.offset == self.pending.len() {
-            match self.reader.read(self.budget, self.invoker) {
+            match self.reader.read(self.budget) {
                 Ok(ReadOutcome::Bytes(bytes)) => {
-                    if let Err(error) = self.budget.charge_step_with(self.invoker) {
+                    if let Err(error) = self.budget.charge_step() {
                         self.failure = Some(error);
                         return Err(io::Error::other("jq: input interrupted"));
                     }
@@ -708,8 +704,7 @@ mod tests {
             max_value_bytes: 64,
             ..dekopon_process::Limits::default()
         });
-        let invoker = crate::builtins::test_support::NoCapabilities;
-        let mut source = PipeSource::new(&mut input, &mut budget, &invoker);
+        let mut source = PipeSource::new(&mut input, &mut budget);
         let parsed = serde_json::from_reader::<_, Value>(&mut source);
         assert!(parsed.is_err());
         assert!(matches!(
@@ -734,16 +729,10 @@ mod tests {
         sender.send(ReadOutput::Done).unwrap();
         let mut budget = Budget::start(dekopon_process::Limits::default());
         let mut output = Vec::new();
-        collect(
-            &receiver,
-            &mut budget,
-            &crate::builtins::test_support::NoCapabilities,
-            false,
-            &mut |bytes| {
-                output.extend_from_slice(bytes);
-                Ok(true)
-            },
-        )
+        collect(&receiver, &mut budget, false, &mut |bytes| {
+            output.extend_from_slice(bytes);
+            Ok(true)
+        })
         .expect("collect output");
         assert_eq!(output, b"\"retained\"\n");
         assert_eq!(budget.value_bytes(), 0);

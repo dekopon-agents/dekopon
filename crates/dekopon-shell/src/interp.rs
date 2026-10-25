@@ -154,16 +154,15 @@ fn pump_stdin(
     reader: &mut PipeReader,
     mut socket: UnixStream,
     budget: &crate::limits::Budget,
-    invoker: &dyn CapabilityInvoker,
     finished: &AtomicBool,
 ) {
     if socket.set_write_timeout(Some(pipe::POLL)).is_err() {
         return;
     }
-    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read_unless(budget, invoker, finished) {
+    while let Ok(ReadOutcome::Bytes(chunk)) = reader.read_unless(budget, finished) {
         let mut remaining = chunk.as_slice();
         while !remaining.is_empty() {
-            if invoker.cancelled()
+            if budget.tree().is_cancelled()
                 || budget.check_deadline().is_err()
                 || finished.load(atomic::Ordering::Relaxed)
             {
@@ -189,23 +188,6 @@ mod pump_tests {
     use dekopon_process::Limits;
     use std::{sync::mpsc, time::Duration};
 
-    struct Idle;
-
-    impl CapabilityInvoker for Idle {
-        fn granted(&self) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn invoke(
-            &self,
-            _proposal: crate::CommandProposal,
-            _streams: crate::Streams,
-            _tree: &dekopon_process::TreeContext,
-        ) -> crate::CapabilityCallResult {
-            unreachable!("pump test never invokes")
-        }
-    }
-
     #[test]
     fn a_stalled_stdin_peer_releases_the_feeder_after_the_deadline() {
         let budget = crate::limits::Budget::start(Limits {
@@ -220,7 +202,6 @@ mod pump_tests {
                     &mut PipeReader::from_bytes(vec![b'x'; 1024 * 1024]),
                     socket,
                     &budget,
-                    &Idle,
                     &AtomicBool::new(false),
                 );
                 done.send(()).unwrap();
@@ -378,7 +359,8 @@ pub(crate) fn run(
         None,
         invoker,
         limits,
-        &TreeContext::new(limits, CallBudget::new(limits.max_capability_calls)),
+        &TreeContext::new(limits, CallBudget::new(limits.max_capability_calls))
+            .with_cancel(invoker.cancel_signals()),
     )
 }
 
@@ -899,7 +881,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn execute_statement(&mut self, statement: &Statement) -> Result<Flow, FatalError> {
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
         match statement {
             Statement::List(list) => {
                 let (status, flow) = self.execute_list(list)?;
@@ -966,7 +948,7 @@ impl<'a> Evaluator<'a> {
 
         for clause in &statement.clauses {
             for pattern in &clause.patterns {
-                self.budget.charge_step_with(self.invoker)?;
+                self.budget.charge_step()?;
                 let matched = match pattern {
                     CasePattern::Any => true,
                     CasePattern::Literal(word) => {
@@ -1030,7 +1012,7 @@ impl<'a> Evaluator<'a> {
 
         let mut body_status = ExitCode::SUCCESS;
         for item in items {
-            self.budget.charge_step_with(self.invoker)?;
+            self.budget.charge_step()?;
             self.assign(
                 &statement.variable,
                 CommandResult::value(Value::String(item)),
@@ -1063,7 +1045,7 @@ impl<'a> Evaluator<'a> {
     fn execute_while(&mut self, statement: &WhileLoop) -> Result<Flow, FatalError> {
         let mut body_status = ExitCode::SUCCESS;
         loop {
-            self.budget.charge_step_with(self.invoker)?;
+            self.budget.charge_step()?;
             let (status, flow) = self.tested(true, |evaluator| {
                 evaluator.execute_list(&statement.condition)
             })?;
@@ -1161,9 +1143,9 @@ impl<'a> Evaluator<'a> {
         }
 
         let line = match input {
-            StageInput::Piped(mut reader) => reader.read_line(&self.budget, self.invoker)?,
+            StageInput::Piped(mut reader) => reader.read_line(&self.budget)?,
             StageInput::Inherited => match self.stdin.last_mut() {
-                Some(reader) => reader.read_line(&self.budget, self.invoker)?,
+                Some(reader) => reader.read_line(&self.budget)?,
                 None => None,
             },
         };
@@ -1297,7 +1279,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         pipeline: &Pipeline,
     ) -> Result<(ExitCode, Option<Flow>), FatalError> {
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
         if self.reader_gone && self.captures.is_empty() {
             return Ok((self.last_status, Some(Flow::Exit(self.last_status))));
         }
@@ -1674,16 +1656,16 @@ impl<'a> Evaluator<'a> {
             let mut truncated = false;
             loop {
                 let chunk = if let Some(reader) = piped.as_mut() {
-                    reader.read(&self.budget, self.invoker)?
+                    reader.read(&self.budget)?
                 } else if let Some(reader) = self.stdin.last_mut() {
-                    reader.read(&self.budget, self.invoker)?
+                    reader.read(&self.budget)?
                 } else {
                     break;
                 };
                 let ReadOutcome::Bytes(chunk) = chunk else {
                     break;
                 };
-                self.budget.charge_step_with(self.invoker)?;
+                self.budget.charge_step()?;
                 let room = self.limits.max_output_bytes.saturating_sub(excerpt.len());
                 truncated |= chunk.len() > room;
                 excerpt.extend_from_slice(&chunk[..chunk.len().min(room)]);
@@ -1709,16 +1691,16 @@ impl<'a> Evaluator<'a> {
             };
             loop {
                 let chunk = if let Some(reader) = piped.as_mut() {
-                    reader.read(&self.budget, self.invoker)?
+                    reader.read(&self.budget)?
                 } else if let Some(reader) = self.stdin.last_mut() {
-                    reader.read(&self.budget, self.invoker)?
+                    reader.read(&self.budget)?
                 } else {
                     break;
                 };
                 let ReadOutcome::Bytes(chunk) = chunk else {
                     break;
                 };
-                self.budget.charge_step_with(self.invoker)?;
+                self.budget.charge_step()?;
                 self.append_buffer_bytes(&name, &chunk)?;
             }
             return Ok(CommandResult::status(ExitCode::SUCCESS));
@@ -1731,7 +1713,6 @@ impl<'a> Evaluator<'a> {
             output,
             captures,
             budget,
-            invoker,
             reader_gone,
             ..
         } = self;
@@ -1750,8 +1731,8 @@ impl<'a> Evaluator<'a> {
             },
         };
         let mut partial = Vec::new();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget, *invoker)? {
-            budget.charge_step_with(*invoker)?;
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+            budget.charge_step()?;
             if discard {
                 continue;
             }
@@ -1990,7 +1971,7 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
         capture_output: bool,
     ) -> Result<Executed, FatalError> {
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
 
         let argv = match self.expand_command_argv(&command.words) {
             Ok(argv) => argv,
@@ -2369,12 +2350,8 @@ impl<'a> Evaluator<'a> {
         let discard = self.output_discarded();
         let diagnostics = self.diagnostics_redirected();
         let active_buffer = self.active_buffer_name().map(str::to_owned);
-        let outcome = crate::builtins::encode::stream(
-            arguments,
-            &mut reader,
-            &mut self.budget,
-            self.invoker,
-            |chunk| {
+        let outcome =
+            crate::builtins::encode::stream(arguments, &mut reader, &mut self.budget, |chunk| {
                 if matches!(stdout_sink, Sink::Discard) {
                     return Ok(true);
                 }
@@ -2433,8 +2410,7 @@ impl<'a> Evaluator<'a> {
                     bytes.extend_from_slice(chunk);
                 }
                 Ok(true)
-            },
-        );
+            });
         let status = match outcome {
             Ok(()) => ExitCode::SUCCESS,
             Err(failure) => self.absorb(failure)?,
@@ -2615,30 +2591,16 @@ impl<'a> Evaluator<'a> {
         };
         let outcome = match parsed {
             ParsedStream::Lines(command, selection) => command
-                .run(
-                    selection,
-                    &mut reader,
-                    &mut self.budget,
-                    self.invoker,
-                    &mut emit,
-                )
+                .run(selection, &mut reader, &mut self.budget, &mut emit)
                 .map(|()| ExitCode::SUCCESS),
-            ParsedStream::Extra(command, operation) => command.run_parsed(
-                operation,
-                &mut reader,
-                &mut self.budget,
-                self.invoker,
-                &mut emit,
-            ),
-            ParsedStream::Text(command, operation) => command.run_parsed(
-                operation,
-                &mut reader,
-                &mut self.budget,
-                self.invoker,
-                &mut emit,
-            ),
+            ParsedStream::Extra(command, operation) => {
+                command.run_parsed(operation, &mut reader, &mut self.budget, &mut emit)
+            }
+            ParsedStream::Text(command, operation) => {
+                command.run_parsed(operation, &mut reader, &mut self.budget, &mut emit)
+            }
             ParsedStream::Jq(opts) => {
-                builtins::jq::stream(opts, &mut reader, &mut self.budget, self.invoker, &mut emit)
+                builtins::jq::stream(opts, &mut reader, &mut self.budget, &mut emit)
                     .map(|()| ExitCode::SUCCESS)
             }
         };
@@ -3020,7 +2982,7 @@ impl<'a> Evaluator<'a> {
             let feeder = feed.map(|(mut reader, socket, inherited)| {
                 let (feeder_budget, finished) = (&feeder_budget, &finished);
                 scope.spawn(move || {
-                    pump_stdin(&mut reader, socket, feeder_budget, invoker, finished);
+                    pump_stdin(&mut reader, socket, feeder_budget, finished);
                     inherited.then_some(reader)
                 })
             });
@@ -3221,7 +3183,7 @@ impl<'a> Evaluator<'a> {
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
         };
 
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
         let (flow, mut captured) = self.nested(|this| {
             let positional = arguments
                 .iter()
@@ -3322,11 +3284,11 @@ impl<'a> Evaluator<'a> {
         let mut status = ExitCode::SUCCESS;
         loop {
             let line = match piped.as_mut().or_else(|| self.stdin.last_mut()) {
-                Some(reader) => reader.read_line(&self.budget, self.invoker)?,
+                Some(reader) => reader.read_line(&self.budget)?,
                 None => None,
             };
             let Some(line) = line else { break };
-            self.budget.charge_step_with(self.invoker)?;
+            self.budget.charge_step()?;
             let (bytes, _charges) = line.into_parts();
             let text = match String::from_utf8(bytes) {
                 Ok(text) => text,
@@ -3695,11 +3657,11 @@ impl<'a> Evaluator<'a> {
         separated: &mut bool,
         text: &str,
     ) -> Result<(), CommandFailure> {
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
         for chunk in text.split_inclusive([' ', '\t', '\n']) {
             let field = chunk.trim_end_matches([' ', '\t', '\n']);
             if !field.is_empty() {
-                self.budget.charge_step_with(self.invoker)?;
+                self.budget.charge_step()?;
                 let bytes = (field.len() + size_of::<String>()) as u64;
                 self.expansion_charges
                     .push(self.budget.charge_value_bytes(bytes)?);
@@ -3972,7 +3934,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         expression: &Conditional,
     ) -> Result<ExitCode, CommandFailure> {
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
         match expression {
             Conditional::Test(test) => self.evaluate_conditional_test(test),
             Conditional::Not(inner) => Ok(invert(self.evaluate_conditional(inner)?)),
@@ -3988,7 +3950,7 @@ impl<'a> Evaluator<'a> {
     ) -> Result<ExitCode, CommandFailure> {
         // Each operator must consume a step before the first operand, including skipped operators.
         for _ in 2..terms.len() {
-            self.budget.charge_step_with(self.invoker)?;
+            self.budget.charge_step()?;
         }
         let mut status = ExitCode::SUCCESS;
         for term in terms {
@@ -4060,7 +4022,7 @@ impl<'a> Evaluator<'a> {
         reason = "reshaped by the unit that next rewrites this"
     )]
     fn evaluate_arithmetic(&mut self, expression: &ArithExpr) -> Result<Number, CommandFailure> {
-        self.budget.charge_step_with(self.invoker)?;
+        self.budget.charge_step()?;
         Ok(match expression.node() {
             crate::ast::ArithNode::Integer(value) => Number::Integer(*value),
             crate::ast::ArithNode::Float(value) => Number::Float(*value),

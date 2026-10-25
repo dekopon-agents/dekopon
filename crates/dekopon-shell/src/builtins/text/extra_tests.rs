@@ -1,9 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use super::extra::ExtraStream;
 use crate::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, ExitCode,
-    builtins::{CommandFailure, FatalError, test_support::NoCapabilities},
+    ExitCode,
+    builtins::{CommandFailure, FatalError},
     limits::Budget,
     pipe::{self, PipeReader, WriteOutcome},
 };
@@ -34,13 +32,7 @@ fn four_text_commands_charge_each_small_pipe_chunk() {
             ..Limits::default()
         });
         let failure = command
-            .run(
-                &arguments(command),
-                &mut reader,
-                &mut budget,
-                &NoCapabilities,
-                |_| Ok(true),
-            )
+            .run(&arguments(command), &mut reader, &mut budget, |_| Ok(true))
             .expect_err("the third small chunk exhausts the step budget");
         assert!(matches!(
             failure,
@@ -51,46 +43,20 @@ fn four_text_commands_charge_each_small_pipe_chunk() {
 
 #[test]
 fn four_text_commands_notice_cancellation_between_chunks() {
-    struct CancelAfterFirst(AtomicUsize);
-    impl CapabilityInvoker for CancelAfterFirst {
-        fn granted(&self) -> Vec<String> {
-            Vec::new()
-        }
-        fn invoke(
-            &self,
-            _: CommandProposal,
-            _streams: crate::Streams,
-            _tree: &dekopon_process::TreeContext,
-        ) -> CapabilityCallResult {
-            unreachable!()
-        }
-        fn cancelled(&self) -> bool {
-            self.0.fetch_add(1, Ordering::SeqCst) > 0
-        }
-    }
     for command in [
         ExtraStream::Cut,
         ExtraStream::Uniq,
         ExtraStream::Wc,
         ExtraStream::Sort,
     ] {
-        let mut reader = PipeReader::from_bytes(vec![b'x'; 2 * pipe::CHUNK_BYTES]);
-        let invoker = CancelAfterFirst(AtomicUsize::new(0));
-        let mut budget = Budget::start(Limits::default());
-        let failure = command
-            .run(
-                &arguments(command),
-                &mut reader,
-                &mut budget,
-                &invoker,
-                |_| Ok(true),
-            )
-            .expect_err("second read notices cancellation");
+        let failure = crate::builtins::test_support::cancel_after_first_step(|reader, budget| {
+            command.run(&arguments(command), reader, budget, |_| Ok(true))
+        })
+        .expect_err("a later chunk notices cancellation");
         assert!(matches!(
             failure,
             CommandFailure::Fatal(FatalError::Limit(LimitExceeded::Cancelled))
         ));
-        assert_eq!(invoker.0.load(Ordering::SeqCst), 2);
     }
 }
 
@@ -107,7 +73,6 @@ fn cut_selects_characters_from_a_near_limit_line_without_retaining_copies() {
         &["-c".into(), "2-3".into()],
         &mut reader,
         &mut budget,
-        &NoCapabilities,
         |part| {
             output.extend_from_slice(part);
             Ok(true)
@@ -138,7 +103,6 @@ fn streaming_cut_selects_unsorted_overlapping_fields_and_characters() {
                     .collect::<Vec<_>>(),
                 &mut reader,
                 &mut budget,
-                &NoCapabilities,
                 |part| {
                     output.extend_from_slice(part);
                     Ok(true)
@@ -160,7 +124,6 @@ fn sorted(arguments: &[&str], input: &str) -> Result<String, CommandFailure> {
             .collect::<Vec<_>>(),
         &mut reader,
         &mut budget,
-        &NoCapabilities,
         |part| {
             output.extend_from_slice(part);
             Ok(true)
@@ -219,7 +182,7 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
     });
     let mut reader = PipeReader::from_bytes(b"a\nb\n".to_vec());
     let failure = ExtraStream::Sort
-        .run(&[], &mut reader, &mut budget, &NoCapabilities, |_| Ok(true))
+        .run(&[], &mut reader, &mut budget, |_| Ok(true))
         .expect_err("two retained two-byte lines do not fit in three bytes");
     assert!(matches!(
         failure,
@@ -233,7 +196,7 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
     for _ in 0..2 {
         assert_eq!(
             ExtraStream::Sort
-                .run(&[], &mut reader, &mut budget, &NoCapabilities, |_| Ok(true))
+                .run(&[], &mut reader, &mut budget, |_| Ok(true))
                 .expect("retained bytes are refunded"),
             ExitCode::SUCCESS
         );
