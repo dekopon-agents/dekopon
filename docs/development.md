@@ -216,7 +216,8 @@ kubeconform covers the workflow mount and the `check-peers` ConfigMap. It also r
 `charts/dekopon/ci/test-private-files.py`, which requires `broker.privateFiles` to be copied into the
 broker as `0600` files the gateway never mounts and refuses an unsafe file segment. The render lane
 also runs `charts/dekopon/ci/test-live-sources.py` (using `helm` and `yq`) to check live read-only
-gateway projections, broker-only sources, and preserved broker/credential roll triggers.
+gateway projections, broker-only sources, preserved broker/credential roll triggers, and the live
+catalog mount used by config-check baselines (including catalog key projection).
 
 Pull-request caches are restore-only. The workspace-test lane uses SHA-pinned `Swatinem/rust-cache` for Cargo registry/Git dependencies and compiled dependency artifacts in its own `target/`, alongside the existing read-only sccache compiler cache. Its `workspace-tests-v1` shared key matches the dedicated test-dependencies job in `.github/workflows/cache-warm.yml`; runner, toolchain, Rust environment and manifest/lockfile hashes also qualify the cache. The action's default pruning excludes workspace crates, linked test executables and incremental artifacts; `cache-bin: false` leaves installed tools alone. Other PR lanes retain the existing registry/compiler caches. The warmer saves test dependency artifacts only on `main`, and still writes the other lanes' default-branch registry cache capped at 512 MiB plus granular sccache objects. Warmers compile but execute no tests and are not a second validation gate. The first PR introducing this key is cold until a main-branch warmer populates it; cache restore/save overhead and actual build times, not a lookup hit alone, determine whether it helps.
 

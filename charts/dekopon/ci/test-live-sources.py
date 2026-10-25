@@ -216,6 +216,35 @@ def test_config_check_mounts_gateway_candidates_as_the_deployment_does():
     assert "/check/gatewayd.d" not in init["args"][0] and "/source/skills" not in init["args"][0]
 
 
+def test_against_config_mounts_the_live_catalog_from_the_deployment_source():
+    for source in (
+        ["--set", "gateway.catalog.existingConfigMap=live-agents", "--set", "gateway.catalog.existingConfigMapKey=live.yaml", "--set", "gateway.catalog.fileName=agents.yaml"],
+        ["--set", "gateway.catalog.existingConfigMap=live-agents", "--set", "gateway.catalog.existingConfigMapKey="],
+        ["--set", "gateway.catalog.existingConfigMap=", "--set", "gateway.catalog.inline=agents: []"],
+    ):
+        for against in ("", "live-gateway"):
+            docs, _, _, deployment_volumes, _, _, _ = render(
+                "-f", str(DIRECTORY), *source,
+                "--set", "paths.catalogDir=/custom/live-catalog",
+                "--set", "configCheck.enabled=true",
+                "--set", "configCheck.gateway.configMap=candidate-gateway",
+                "--set", "configCheck.gateway.catalogConfigMap=candidate-agents",
+                "--set", "configCheck.gateway.againstConfigMap=" + against,
+            )
+            job = next(d for d in docs if d["kind"] == "Job")
+            spec = job["spec"]["template"]["spec"]
+            check = next(c for c in spec["containers"] if c["name"] == "check-gateway")
+            volumes = {v["name"]: v for v in spec["volumes"]}
+            if against:
+                assert mounts(check)["catalog"] == {
+                    "name": "catalog", "mountPath": "/custom/live-catalog", "readOnly": True,
+                }
+                assert volumes["catalog"] == deployment_volumes["catalog"]
+            else:
+                assert "catalog" not in mounts(check)
+                assert "catalog" not in volumes
+
+
 if __name__ == "__main__":
     test_live_gateway_directory_and_nested_skills()
     test_inline_gateway_source_changes_without_broker_roll()
@@ -223,3 +252,5 @@ if __name__ == "__main__":
     test_existing_gateway_secret_and_broker_restart_sources()
     test_retired_source_names_and_paths_are_not_reserved()
     test_config_check_mounts_gateway_candidates_as_the_deployment_does()
+
+    test_against_config_mounts_the_live_catalog_from_the_deployment_source()
