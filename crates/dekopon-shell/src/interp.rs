@@ -2,7 +2,7 @@
 //! script's own assignments, and reading something like an API key by name sees it as unset, not
 //! the host's real value.
 
-use dekopon_process::{LimitExceeded, Limits};
+use dekopon_process::{CallBudget, LimitExceeded, Limits, TreeContext};
 
 use std::{
     cmp::Ordering,
@@ -37,7 +37,6 @@ use crate::{
     pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome},
     value::{self, display},
 };
-use dekopon_process::{CallBudget, TreeContext};
 
 use telemetry::CommandKind;
 
