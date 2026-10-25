@@ -119,6 +119,14 @@ async fn opted_in_loads_reuse_only_matching_components() {
         .collect();
     assert_eq!(stages.len(), 1);
     assert_eq!(stages[0].field("stage"), Some("compile"));
+    BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(handle.compile_count(), 2);
+    assert_eq!(handle.hit_count(), 1);
     let invalid = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(invalid.path(), b"invalid component").unwrap();
     for _ in 0..2 {
@@ -127,7 +135,7 @@ async fn opted_in_loads_reuse_only_matching_components() {
             Err(BrokerHostError::Compile { .. })
         ));
     }
-    assert_eq!(handle.compile_count(), 3);
+    assert_eq!(handle.compile_count(), 4);
     assert_eq!(handle.hit_count(), 1);
     assert_key_separation_and_concurrent_counts();
 }
