@@ -774,23 +774,9 @@ impl Drop for Publication {
             .end
             .load(Ordering::Acquire)
             .min(self.access.next_asset_id());
-        let Retention {
-            index,
-            references,
-            publications,
-            ..
-        } = &mut *retention;
-        index.bindings.retain(|binding| {
-            binding.class == Refill::None
-                || !self.range.contains_stored(&binding.key)
-                || binding.key.id >= end
-                || references.contains(&binding.key)
-                || publications
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .any(|publication| publication.contains_stored(&binding.key))
-        });
-        if let Err(error) = retention.collect() {
+        if let Err(error) =
+            retention.finish_pending(&self.range.key.conversation.journal_stem(), end)
+        {
             tracing::warn!(%error, "gateway.asset.reclaim.failed");
         }
     }
