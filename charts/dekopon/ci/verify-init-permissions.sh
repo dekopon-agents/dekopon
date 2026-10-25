@@ -269,7 +269,8 @@ reset_mounts
 run_init "$work/init.sh"
 
 echo "==> durable asset store is writable on a local filesystem as the gateway UID"
-render_init "$work/assets-init.sh" --set gateway.journal.enabled=true --set gateway.assets.enabled=true
+# AppVersion can name a release whose image is not published until this CI passes.
+render_init "$work/assets-init.sh" --set gateway.journal.enabled=true --set gateway.assets.enabled=true --set image.tag=v0.51.0
 run_init "$work/assets-init.sh"
 gateway_image=$(python_yaml '
 import sys,yaml
