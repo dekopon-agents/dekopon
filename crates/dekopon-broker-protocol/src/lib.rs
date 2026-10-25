@@ -1650,7 +1650,10 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => {
                 match SessionRefusal::from_error(&code, &message) {
                     Ok(SessionRefusal::Other) => Err(ClientError::Remote { code, message }),
-                    Ok(refusal) => Err(ClientError::SessionRefused(refusal)),
+                    Ok(
+                        refusal @ (SessionRefusal::UnmappedSubject
+                        | SessionRefusal::AgentDenied { .. }),
+                    ) => Err(ClientError::SessionRefused(refusal)),
                     Err(source) => Err(ClientError::MalformedRefusal { source }),
                 }
             }
