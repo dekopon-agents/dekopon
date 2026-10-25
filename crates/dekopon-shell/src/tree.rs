@@ -173,7 +173,7 @@ impl TreeContext {
     }
 
     #[must_use]
-    pub(crate) fn calls(&self) -> &CallBudget {
+    pub fn calls(&self) -> &CallBudget {
         &self.calls
     }
 }

@@ -282,6 +282,80 @@ async fn a_job_outlives_its_turn_and_the_turns_script_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_turn_and_its_job_spend_one_capability_budget() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let directory = temporary();
+    let success =
+        || ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new());
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            probe_listing(),
+            upper_proposal("turn"),
+            success(),
+            probe_listing(),
+            upper_proposal("job"),
+            success(),
+            upper_proposal("past-budget"),
+            success(),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call(
+            "probe upper --text turn; { probe upper --text job; probe upper --text past-budget; } &",
+        ),
+        answer("started"),
+    ]);
+    let runner = runner(broker, Arc::clone(&models), 1);
+    let mut route = job_route(Duration::from_secs(5), Duration::from_secs(10));
+    route.limits.max_capability_calls = 2;
+    let inbound = message("spend the budget");
+    let owner = JobOwner::of(&inbound);
+    let mut notices = runner.jobs.take_notices();
+    run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    let notice = tokio::time::timeout(Duration::from_secs(10), notices.recv())
+        .await
+        .expect("job finishes")
+        .expect("job notice");
+    assert_eq!(
+        notice.text.lines().last(),
+        Some("dekopon-shell: the turn's capability-call budget of 2 is spent"),
+    );
+    let [row] = runner.jobs.list(&owner).try_into().expect("one job");
+    assert_eq!(finished(&row).1, ExitCode::SYNTAX);
+    assert_eq!(
+        attested(&mut observed),
+        (
+            vec![Trigger::Message, Trigger::Job],
+            vec![Trigger::Message, Trigger::Job],
+        )
+    );
+    let records = capture.records();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            dekopon_test_support::Record::Span {
+                name: "shell.script",
+                ..
+            }
+        ) && record.field("outcome") == Some("limit-exceeded")),
+        "{records:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
     let directory = temporary();
     let routes = job_routes(directory.path(), Some(10_000)).await;
