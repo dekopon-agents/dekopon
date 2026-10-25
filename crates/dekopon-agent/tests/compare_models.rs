@@ -187,13 +187,48 @@ async fn the_same_prompt_loop_executes_one_synthetic_tool_and_replays_each_nativ
     }
 }
 
+fn summarize_wire_images(messages: &mut Value) -> usize {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    let mut images = 0;
+    for message in messages.as_array_mut().unwrap() {
+        if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for part in parts {
+                *part = match part["type"].as_str().unwrap() {
+                    "text" => part["text"].clone(),
+                    "image_url" => {
+                        let url = part["image_url"]["url"].as_str().unwrap();
+                        let (mime, encoded) = url
+                            .strip_prefix("data:")
+                            .unwrap()
+                            .split_once(";base64,")
+                            .unwrap();
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .unwrap();
+                        images += 1;
+                        json!(format!(
+                            "[{mime}, {} bytes] sha256:{}",
+                            bytes.len(),
+                            Sha256::digest(&bytes)
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        ))
+                    }
+                    kind => panic!("unexpected wire part {kind}"),
+                };
+            }
+        }
+    }
+    images
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_definitions() {
-    use base64::Engine as _;
     use dekopon_agent::prompt::{AssetSource, FetchedAsset};
     use dekopon_model::{asset::DiskBlob, openai::OpenAiClient};
     use dekopon_test_support::{CaptureLayer, Record};
-    use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
     use tracing_subscriber::prelude::*;
 
@@ -323,36 +358,7 @@ data: [DONE]
     assert_eq!(rebuilt.len(), sent.len());
     let mut images = 0;
     for (reconstructed, mut sent) in rebuilt.into_iter().zip(sent) {
-        for message in sent["messages"].as_array_mut().unwrap() {
-            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
-                for part in parts {
-                    *part = match part["type"].as_str().unwrap() {
-                        "text" => part["text"].clone(),
-                        "image_url" => {
-                            let url = part["image_url"]["url"].as_str().unwrap();
-                            let (mime, encoded) = url
-                                .strip_prefix("data:")
-                                .unwrap()
-                                .split_once(";base64,")
-                                .unwrap();
-                            let bytes = base64::engine::general_purpose::STANDARD
-                                .decode(encoded)
-                                .unwrap();
-                            images += 1;
-                            json!(format!(
-                                "[{mime}, {} bytes] sha256:{}",
-                                bytes.len(),
-                                Sha256::digest(&bytes)
-                                    .iter()
-                                    .map(|byte| format!("{byte:02x}"))
-                                    .collect::<String>()
-                            ))
-                        }
-                        kind => panic!("unexpected wire part {kind}"),
-                    };
-                }
-            }
-        }
+        images += summarize_wire_images(&mut sent["messages"]);
         let tools: Vec<Value> = sent["tools"]
             .as_array()
             .unwrap()
