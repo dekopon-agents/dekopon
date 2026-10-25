@@ -7,10 +7,10 @@ use std::{
 use dekopon_agent::{BrokerLeg, current_trace_parent};
 use dekopon_broker_protocol::{TraceParent, Trigger};
 use dekopon_core::AgentId;
-use dekopon_process::{CancelHandle, CancelSignal};
+use dekopon_process::{CancelHandle, CancelSignal, Limits as ShellLimits, TreeContext};
 use dekopon_shell::{
-    CallBudget, ExitCode, Interpreter, JobControl, JobId, JobOutcome, JobRefusal, JobSeed,
-    JobState, JobSummary, JobWait, Limits as ShellLimits, TreeContext,
+    ExitCode, Interpreter, JobControl, JobId, JobOutcome, JobRefusal, JobSeed, JobState,
+    JobSummary, JobWait,
 };
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
@@ -626,10 +626,7 @@ impl JobContext {
 
     fn tree(&self, seed: &JobSeed) -> TreeContext {
         match self.origin {
-            Origin::Turn => TreeContext::new(
-                self.limits,
-                CallBudget::new(self.limits.max_capability_calls),
-            ),
+            Origin::Turn => TreeContext::new(self.limits, seed.tree().calls().clone()),
             Origin::Tree(_) => seed.tree().clone(),
         }
     }

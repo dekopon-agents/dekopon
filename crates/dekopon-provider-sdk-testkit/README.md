@@ -81,9 +81,9 @@ let request = output.http_request.unwrap();
 ```
 
 Input fixtures use identity encoding and broker-owned, read-only, unlinked files
-in the same per-call storage budget. Only references in the invocation JSON
-receive descriptors, in the broker's own reference order; duplicate fixture IDs,
-missing descriptors and byte limits are still checked by broker admission.
+in the same per-call storage budget. Every explicitly supplied fixture crosses once, in fixture
+order, regardless of references in the invocation JSON. Duplicate fixture IDs, missing descriptors
+and byte limits are still checked by broker admission.
 An input fixture enables temporary storage and reads, but grants no attachment,
 removal or sending. IDs and bytes are private to the call. `http_request` captures
 the complete scripted HTTPS request (absolute URI, method, headers and body),

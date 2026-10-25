@@ -3,58 +3,13 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use crate::{CallBudget, CapabilityInvoker, TreeContext};
-
-pub const DEFAULT_MAX_STEPS: u64 = 100_000;
-/// Function calls, `$( )`, `${ }` and compound commands all recurse on the native stack against
-/// this one depth; 32 keeps the deepest measured script inside a 2 MiB thread even in a debug build.
-pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 32;
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
-pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 32;
-pub const DEFAULT_MAX_VALUE_BYTES: u64 = 32 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Limits {
-    pub max_steps: u64,
-    pub max_recursion_depth: u32,
-    pub max_output_bytes: usize,
-    pub max_output_lines: usize,
-    pub timeout: Duration,
-    pub max_capability_calls: u32,
-    pub max_value_bytes: u64,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_steps: DEFAULT_MAX_STEPS,
-            max_recursion_depth: DEFAULT_MAX_RECURSION_DEPTH,
-            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-            max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
-            timeout: DEFAULT_TIMEOUT,
-            max_capability_calls: DEFAULT_MAX_CAPABILITY_CALLS,
-            max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LimitExceeded {
-    Steps { maximum: u64 },
-    RecursionDepth { maximum: u32 },
-    Deadline { timeout_ms: u128 },
-    CapabilityCalls { maximum: u32 },
-    ValueBytes { maximum: u64 },
-    Cancelled,
-}
+use crate::CapabilityInvoker;
+use dekopon_process::{CallBudget, LimitExceeded, Limits, RetainedBytes, TreeContext};
 
 #[derive(Debug)]
 pub struct Budget {
     limits: Limits,
     tree: TreeContext,
-    depth: u32,
 }
 
 impl Budget {
@@ -68,11 +23,7 @@ impl Budget {
 
     #[must_use]
     pub fn start_tree(limits: Limits, tree: TreeContext) -> Self {
-        Self {
-            limits,
-            tree,
-            depth: 0,
-        }
+        Self { limits, tree }
     }
 
     pub(crate) const fn tree(&self) -> &TreeContext {
@@ -83,7 +34,6 @@ impl Budget {
         Self {
             limits: self.limits,
             tree: self.tree.clone(),
-            depth: self.depth,
         }
     }
 
@@ -106,7 +56,7 @@ impl Budget {
         self.check_deadline()
     }
 
-    pub fn charge_value_bytes(&self, bytes: u64) -> Result<crate::RetainedBytes, LimitExceeded> {
+    pub fn charge_value_bytes(&self, bytes: u64) -> Result<RetainedBytes, LimitExceeded> {
         self.tree.retain(bytes)
     }
 
@@ -119,25 +69,15 @@ impl Budget {
         self.tree.remaining()
     }
 
-    pub fn enter_nesting(&mut self) -> Result<(), LimitExceeded> {
-        if self.depth >= self.limits.max_recursion_depth {
-            return Err(LimitExceeded::RecursionDepth {
-                maximum: self.limits.max_recursion_depth,
-            });
-        }
-        self.depth = self.depth.saturating_add(1);
-        Ok(())
-    }
-
-    pub fn leave_nesting(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
-    }
-
     /// Capability calls are budgeted independently of steps, since one script can loop to drive
     /// many calls where a single model tool call drives exactly one today, and that amplification
     /// needs its own ceiling.
     pub fn charge_capability_call(&mut self) -> Result<(), LimitExceeded> {
         self.tree.calls().charge()
+    }
+
+    pub fn refund_capability_call(&mut self) {
+        self.tree.calls().refund();
     }
 
     #[must_use]
@@ -332,7 +272,8 @@ fn clamp_line(line: &str, maximum: usize) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{Budget, LimitExceeded, Limits, OutputBuffer};
+    use super::{Budget, OutputBuffer};
+    use dekopon_process::{LimitExceeded, Limits};
 
     #[test]
     fn step_budget_trips_at_the_configured_ceiling() {
@@ -347,22 +288,6 @@ mod tests {
             budget.charge_step(),
             Err(LimitExceeded::Steps { maximum: 3 })
         );
-    }
-
-    #[test]
-    fn recursion_depth_is_capped_and_released() {
-        let mut budget = Budget::start(Limits {
-            max_recursion_depth: 2,
-            ..Limits::default()
-        });
-        assert!(budget.enter_nesting().is_ok());
-        assert!(budget.enter_nesting().is_ok());
-        assert_eq!(
-            budget.enter_nesting(),
-            Err(LimitExceeded::RecursionDepth { maximum: 2 })
-        );
-        budget.leave_nesting();
-        assert!(budget.enter_nesting().is_ok());
     }
 
     #[test]

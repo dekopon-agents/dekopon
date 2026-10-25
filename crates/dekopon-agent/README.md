@@ -6,9 +6,9 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
 - `prompt::run_prompt` — the bounded model tool loop that always offers one sandboxed
   scripting tool (`bash`) instead of one tool per capability; embedders may additionally
   supply bounded chat-asset, credential-free agent-configuration, skill-reading, and
-  improvement-suggestion tools. A model's first call to a tool that was not offered, or a
-  `bash` call without a string `command`, is answered with the tool shape as a tool result;
-  the second such call in a session ends it.
+  improvement-suggestion tools. Every call to a tool that was not offered, or `bash` call
+  without a string `command`, in the first turn with such a rejection is answered with the
+  tool shape as a tool result; one in a later turn ends the session.
 - `prompt::run_prompt_with_history` — the same loop run as the continuation of a
   `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
   there is no tokenizer here and token counts only arrive after a call has been billed.
@@ -176,8 +176,9 @@ model's capability seam.
 
 ## Prompt and host bounds
 
-The `bash` tool requires an object carrying a string `command`. The first malformed call in a session is
-answered with the expected shape; a second ends the session rather than being guessed at. Its
+The `bash` tool requires an object carrying a string `command`. Every unknown-tool or malformed
+`bash` call in the first turn with such a rejection is answered with the tool shape; one in a later
+turn ends the session. Its
 shared tool description includes a concrete `{"command":"cap --list"}` call and distinguishes shell command words from model tools; no
 per-agent system-prompt prefix supplies that example. Its result is combined script output
 followed by an `[exit code: N]` trailer. `cap --list` shows the capability identifiers the session was granted,

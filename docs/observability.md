@@ -231,7 +231,7 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (once per session, for an unknown tool or a malformed `bash` call) — never the model's own tool name or arguments |
+| `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (the first turn with a rejection, for an unknown tool or a malformed `bash` call); `warn` when `rejection.fed_back = true`, `error` when false — never the model's own tool name or arguments |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
@@ -266,6 +266,14 @@ name such as `provider.load.finished`. Both fields stay on the record for log qu
 A span's status is only what its own code sets through `otel.status_code`: an `error` field on an
 event inside the span never becomes the status or its description, and an error-level event marks
 the span `Error` without a description.
+
+## Unmapped sender notices
+
+`gateway.session.rejected` is the owner-notice audit event for a freshly broker-confirmed unmapped sender. Its typed fields are `transport` (configured transport name, string), `route` (route index, integer), `conversation.kind` and `conversation.id` (strings), `conversation.container` and `conversation.thread` (strings, empty when absent), `subject` (canonical attested platform subject, string), and `reason` (`unmapped-subject`, string). The log timestamp records when the refusal happened. The record contains no message text. It is emitted before attempting the fixed gateway reply and shares the refusal trace.
+
+Every broker-confirmed unmapped refusal emits a notice, including repeats and unrelated strangers during the reply cooldown. The incoming transport rate bounds notice volume, and the existing session gate bounds simultaneous broker/refusal work. Only replies share a gateway-wide one-per-second slot. That slot retains a timestamp, and each attempt still asks the broker afresh. There is no delayed send, identity cache or retry. A fresh process starts with an available reply slot, and the serving path never waits for a telemetry exporter.
+
+Mapped agent-permission refusals emit one structured `gateway_session_rejected` record with message `gateway.session.rejected`, carrying the same typed transport, route, conversation and subject fields listed above, and `reason=agent-denied` or `unauthorized` for an empty grant. These records contain no message text and omit the `audit.event` owner-notice selector; only unmapped strangers trigger owner notices. Other authentication failures retain their existing behavior. OpenObserve alert routing and delivery are the homelab's responsibility; the notice is best-effort telemetry, not a DM or channel post.
 
 ## The broker audit record
 
@@ -429,10 +437,11 @@ including disabled trace export, neither ID is fabricated.
 
 ## Trace context across the socket
 
-`InvocationRequest`, `DeliveredTurnRequest`, and `runCommand` each carry a mandatory W3C
+`InvocationRequest`, `DeliveredTurnRequest`, `run`, and `runCommand` each carry a mandatory W3C
 `traceParent`. The shared broker leg fills it from the span that requested the capability or ran the
-command word, and the broker opens `broker.invocation` — `broker.command_run` for a command word —
-beneath it as a remote parent, so one trace spans both processes. The trace
+command word. For `run`, the broker opens `broker.invocation` beneath that remote parent and a child
+`broker.command_run` for parsing; authorization and execution stay under the invocation. Legacy
+`runCommand` opens `broker.command_run` directly beneath the remote parent, so one trace spans both processes. The trace
 identifier inside it is the only correlation identifier the system has: every span the broker opens
 for the call and every audit record it emits sits inside that trace, and the invocation identifier
 extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
@@ -734,7 +743,7 @@ different quantities. `usage.input_tokens` rises for the same reason, and for re
 
 **The history size gets its own fields.** `gateway.session` carries `conversation.turns` and
 `conversation.bytes` — how many prior exchanges this message replayed and how many bytes they
-occupied; on `sharedConversation` the byte count includes each retained gateway-authored
+occupied; in every scope the byte count includes each retained gateway-authored
 participant label. Both are zero on a `oneShot` route and on the first message of any
 conversation, which makes "seeded or not" a filter rather than a guess.
 Every successful recall that seeds a window logs `gateway_recalled` at info with `source`
@@ -773,9 +782,9 @@ put either into the eviction record.
 
 The history itself is not a new signal. It is chat text and model output, and it goes where those
 already go: the session's first `agent.model.prompt` carries its opening message list, which on a
-seeded session includes the replayed window. Shared scope adds participant principal names to
-those prompt events, and not to spans, eviction events, or cache key events. Those labels are part
-of every shared prompt sent to the selected model provider independently of telemetry.
+seeded session includes the replayed window. In every scope, participant principal names reach
+those prompt events, and not spans, eviction events, or cache key events. Those labels are part
+of every person-originated prompt sent to the selected model provider independently of telemetry.
 
 ### Reading the prompt cache
 
@@ -837,7 +846,7 @@ migration is implemented here.
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
+| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `run` beneath `broker.invocation`, or per legacy `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `console-smoke-claim-denied`, `console-real-scope-denied`, `chat-attestation-denied`, `chat-scope-required`, `probe-write`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`, `input` and `input.bytes`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; a `failed` outcome sets the span status to `Error`, described by `error`; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
@@ -923,10 +932,11 @@ in `--oauth2-bearer '${drn:…}'`; that is a name and is recorded as one, and th
 resolved inside the broker after authorization and never reaches the guest or this span.
 
 `broker.command_run` is the command word's half of `broker.invocation`. `dekopon-brokerd` opens it
-for every `runCommand` beneath the `traceParent` the client sent, so the guest call that turns argv
-into a proposal sits inside the message's trace instead of starting its own. `outcome` is `proposed`
-when the guest returned a capability proposal, which the client then submits as an ordinary
-invocation; `rendered` when the guest answered by itself; `failed` when it declined the argv; and
+for every `run` beneath `broker.invocation`, whose remote parent is the client's `traceParent`.
+The guest call turns argv into a proposal, and the broker authorizes and executes it within the same
+invocation. Legacy `runCommand` opens the parsing span directly beneath the client's `traceParent`
+and returns the proposal for a separate `invoke`. `outcome` is `proposed`
+when the guest returned a capability proposal; `rendered` when the guest answered by itself; `failed` when it declined the argv; and
 `error` when the run did not complete — no provider declares the word, the input passed
 `maxInputBytes`, the guest trapped, or its answer did not decode — whose cause
 `command.resolve.failed` records.
@@ -996,7 +1006,7 @@ the refresh failure classes remain part of the migration contract.
 | `broker_github_app_credential_reauth_required` | error | `dekopon-brokerd` | the symbolic `credential` name and `http.response.status_code` (401) when GitHub refuses the App JWT: the App's private key or the App itself must be renewed. No JWT, key or token. |
 | `broker_github_app_credential_refresh_failed` | warn | `dekopon-brokerd` | the symbolic `credential` name and low-cardinality `category` (`transport`, `token-endpoint-unavailable`, `token-endpoint-rejected`, `token-endpoint-protocol`, `invalid-material`, `signing`). No response body, JWT, key or token. The next invocation may succeed unchanged. |
 | `gateway_reload_applied` / `broker_reload_applied` | info | `dekopon-gatewayd` / `dekopon-brokerd` | Activated `generation.digest`, `category.count` and comma-separated `categories` from changed effective sources. Broker records are emitted only after commit. A gateway repair to its existing active generation reports `category.count = 0`. These are operational records, not broker audit or a cross-process atomicity guarantee. |
-| `gateway_reload_refused` | warn | `dekopon-gatewayd` | `applied = false`, total `problems` count, and safe per-problem `categories` and one-line `error`. Validated route/model identifiers and route positions distinguish problems; unknown metering budget keys use sorted entry positions, unknown metering model references use model-list positions (and a validated agent ID when available), and unknown memory routine models use the enclosing route position, not rejected values. Failed probe records name the validated model, `probe failed` and the typed error kind (or `credential`), never the configured vendor model or vendor diagnostic bytes. Other failed validation values do not appear. Preparation/confirmation refusals name a fixed `reason`. A guest model proxy that cannot be rebuilt for changed models names `reason = "proxy-model"` and an `error` with the model and its unset or unusable credential variable, or for a `chatgptSubscription` model only the error kind, never auth-file content. No activated digest. |
+| `gateway_reload_refused` | warn | `dekopon-gatewayd` | `applied = false`, total `problems` count, and safe per-problem `categories` and one-line `error`. Validated route/model identifiers and route positions distinguish problems; unknown metering budget keys use sorted entry positions, unknown metering model references use model-list positions (and a validated agent ID when available), and unknown memory routine models use the enclosing route position, not rejected values. Failed probe records name the validated model, its routes, `probe failed`, the typed error kind (or `credential`) and the HTTP status when available, never the configured vendor model or vendor diagnostic bytes. Other failed validation values do not appear. Preparation/confirmation refusals name a fixed `reason`. A guest model proxy that cannot be rebuilt for changed models names `reason = "proxy-model"` and an `error` with the model and its unset or unusable credential variable, or for a `chatgptSubscription` model only the error kind, never auth-file content. No activated digest. |
 | `gateway_reload_monitor_failed` | warn | `dekopon-gatewayd` | Broker observation/coordination failure, distinct from an unchanged candidate or a subsequent refusal of the same raw bytes; no candidate digest or source content. |
 | `broker_reload_monitor_failed` | warn | `dekopon-brokerd` | The configured source could not be read while preparing a reload; `applied = false`, with a bounded sanitized `error` description naming the configured path, without source content or a claimed activation. |
 | `broker_reload_refused` | warn | `dekopon-brokerd` | An edited configuration or named file failed to load; last-good keeps serving: `applied = false`, total `problems` count, and safe `error` descriptions with configured file paths, validated credential names, positional identifiers for invalid names and hygiene checks. Nested error sources are not followed in these records. No file contents or credential bytes. |
@@ -1019,12 +1029,7 @@ the refresh failure classes remain part of the migration contract.
 
 Reload outcomes are emitted once per distinct settled raw candidate, identified privately by source paths and bytes, never by a published serving digest. Re-observing the same broken source does not repeat a warn; a distinct edit or repair followed by a break yields another outcome. Operational reload refusal `error` flattens aggregate validation problems before rendering at most eight individual problems of at most 512 bytes each (on UTF-8 boundaries), followed by `and N more` for omitted problems. Flattened problems use each problem's own description, never its nested source chain. An unflattened gateway problem, such as an unreadable or insecure configuration file or a fragment failure, renders its source chain of I/O, file-hygiene and fragment errors, which names paths and reasons but never file bytes. Boot and `check` have independent diagnostic rendering. Owner-configured file paths and fixed hygiene reasons remain actionable; invalid credential names, environment names, endpoint values and vendor diagnostics are not echoed.
 
-`broker_capabilities_refused` exists because an attested `capabilities` and an attested `runCommand`
-answer a refused caller with the same opaque nothing whatever went wrong — a distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and
-an unknown command word would disclose the surface the refusal withheld. The class, its determining
-policies, and the canonical subject land on the broker's own side of the socket, which is what makes
-bootstrapping an `identityMapping` for a new sender possible without reading the subject out of a
-gateway span. It marks refusals, not traffic: an honored session emits nothing.
+`broker_capabilities_refused` records the refusal class, determining policies, canonical subject, agent and attesting peer on the broker side. Session inspection returns a typed unmapped or agent-denied cause only within the peer's attestor namespaces; outside those namespaces the wire refusal remains opaque whether the subject is mapped or not. Other authentication and policy-error refusals remain opaque. A refused `runCommand` also withholds its command surface. The gateway emits its owner-notice audit record only for the typed unmapped session cause. An honored inspection emits no refusal record.
 
 A chat-scoped `invoke` and `recordDeliveredTurn` withhold the same fact for the same reason, but
 they are accounted decisions rather than unanswered inspections, so the peer receives a `Denied`
@@ -1234,7 +1239,7 @@ One generated OpenTelemetry trace links the command to spans such as:
 - `broker.invocation` and `broker.command_run`; and
 - `provider.compile`, `provider.describe`, `provider.run_command`, and `provider.invoke`.
 
-`dekopon-process` provides only the cancel latch and emits no spans. The agent drives
+`dekopon-process` owns the cancel latch and shared script-tree accounting and emits no spans. The agent drives
 each command word's broker round trip in place, retaining the calling script's W3C
 trace parent. Stop or the script deadline drops a command word in flight, after
 which the script reads `session-cancelled`. Broker component spans and their bounds are described in

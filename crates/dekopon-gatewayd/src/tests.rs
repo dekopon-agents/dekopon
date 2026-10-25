@@ -73,9 +73,8 @@ use dekopon_agent::{
 };
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
-    CommandRunOutcome, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
-    DescriptorStream, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
-    ResponseEnvelope,
+    Conversation, ConversationKind, ConversationKindMatch, ConversationMatch, DescriptorStream,
+    FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{AgentId, ExternalSubject};
@@ -241,6 +240,7 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
     .unwrap();
     let path = write_config(root.path(), &document(root.path()));
     let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
     let old_sources = gateway_sources(&active).await;
     let mut edited = document(root.path());
     edited["broker"]["serverUid"] = json!(502);
@@ -251,7 +251,7 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &old_sources)),
+        Some((&active, &old_sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_none());
@@ -272,7 +272,7 @@ async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_sna
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &old_sources)),
+        Some((&active, &old_sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_some(), "{report:?}");
@@ -297,13 +297,14 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
     }]);
     let path = write_config(root.path(), &config);
     let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
     let sources = gateway_sources(&active).await;
     let (candidate, report) = crate::load_candidate_against(
         &path,
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     let candidate = candidate.unwrap_or_else(|| panic!("active reload rejected: {report:?}"));
@@ -325,7 +326,7 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
         None,
         config::LoadMode::Boot,
         None,
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_none());
@@ -4342,7 +4343,7 @@ fn probe_listing() -> ResponseEnvelope {
     ResponseEnvelope::capabilities(
         vec![capability("cli-probe.upper")],
         vec!["probe".to_owned()],
-        BTreeMap::new(),
+        BTreeMap::from([("probe".to_owned(), "Usage: probe <COMMAND>\n".to_owned())]),
     )
 }
 
@@ -4391,7 +4392,8 @@ async fn stub_broker_assets(
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("secure stub socket");
     let (observed, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for (response, descriptors) in responses {
+        let mut responses = responses.into_iter().collect();
+        while !VecDeque::is_empty(&responses) {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
@@ -4402,6 +4404,8 @@ async fn stub_broker_assets(
             else {
                 return;
             };
+            let (response, descriptors) =
+                dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
             let _ = observed.send(request);
             use std::os::fd::AsFd;
             let passed: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
@@ -5331,7 +5335,10 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         Instant::now(),
     );
     assert_eq!(remembered.history.turns().len(), 1);
-    assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
+    assert_eq!(
+        remembered.history.turns()[0].user(),
+        "[gateway: unmapped participant]\nOK, thanks"
+    );
     assert_eq!(remembered.history.turns()[0].answer(), None);
     assert!(matches!(
         observed
@@ -5352,18 +5359,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![
-            probe_listing(),
-            ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
-                stdout: "Usage: probe <COMMAND>\n".to_owned(),
-                stderr: String::new(),
-                status: 0,
-            }),
-        ],
-    )
-    .await;
+    let (broker, mut observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
     let models = ModelScript::new([script_call("probe --help"), answer("done")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5385,18 +5381,9 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
             .request,
         BrokerRequest::Capabilities { .. }
     ));
-    let run = observed.recv().await.expect("the command run").request;
-    assert!(
-        matches!(
-            &run,
-            BrokerRequest::RunCommand { word, argv, stdin_piped: false, .. }
-                if word == "probe" && argv == &["--help".to_owned()]
-        ),
-        "{run:?}"
-    );
     assert!(
         observed.try_recv().is_err(),
-        "rendered text proposes nothing to invoke"
+        "literal help uses only the cached page"
     );
     let tool = tool_message(&models, 1);
     assert!(tool.contains("Usage: probe <COMMAND>"), "{tool}");
@@ -5477,22 +5464,11 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
     assert!(
         matches!(
             &run,
-            BrokerRequest::RunCommand { word, argv, .. }
-                if word == "probe" && argv == &["upper", "--text", "maybe"]
+            BrokerRequest::Run { word, argv, .. }
+                if word == "probe" && argv == &["upper", "--text", "maybe"].map(|text| dekopon_broker_protocol::Arg::Text(text.to_owned()))
         ),
         "{run:?}"
     );
-    assert!(matches!(
-        observed
-            .recv()
-            .await
-            .expect("capability invocation")
-            .request,
-        BrokerRequest::Invoke {
-            attestation: Some(Attestation { scope: Some(_), .. }),
-            ..
-        }
-    ));
     assert!(
         observed.try_recv().is_err(),
         "the warning is not a delivered model answer and must not be durably recorded"
@@ -6814,6 +6790,246 @@ async fn a_session_delivers_the_model_answer() {
     assert_eq!(driver.replies(), ["Done."]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let other_subject: ExternalSubject = "tel.16034700183".parse().expect("valid other subject");
+    for attempt in 0..3 {
+        let mut inbound = message("private stranger message");
+        if attempt == 2 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            inbound.subject = other_subject.clone();
+        }
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        let request = observed
+            .try_recv()
+            .expect("each attempt freshly asks the broker");
+        assert!(matches!(
+            request.request,
+            dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+        ));
+    }
+    assert!(observed.try_recv().is_err());
+    assert_eq!(
+        driver.replies(),
+        ["I only talk to the Lange family. I've let my owner know you stopped by."]
+    );
+    assert_eq!(models.requests(), 0);
+    let notices = capture.events_where(
+        "dekopon_gatewayd",
+        &[("audit.event", "gateway.session.rejected")],
+    );
+    assert_eq!(notices.len(), 3, "{}", capture.events_text());
+    for (index, notice) in notices.iter().enumerate() {
+        for (key, expected) in [
+            ("transport", "dev"),
+            ("route", "0"),
+            ("conversation.kind", "directMessage"),
+            ("conversation.container", ""),
+            ("conversation.id", "dev"),
+            ("conversation.thread", ""),
+            ("reason", "unmapped-subject"),
+        ] {
+            assert_eq!(notice.field(key), Some(expected));
+        }
+        let expected = if index == 2 {
+            other_subject.canonical()
+        } else {
+            subject().canonical()
+        };
+        assert_eq!(notice.field("subject"), Some(expected.as_str()));
+        assert!(!format!("{notice:?}").contains("private stranger message"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stranger_notice_never_caches_the_subjects_mapping() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("Welcome.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    for _ in 0..2 {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message("hello"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert!(matches!(
+            observed.try_recv().unwrap().request,
+            dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+        ));
+    }
+    assert_eq!(
+        driver.replies(),
+        [crate::session::UNMAPPED_REPLY, "Welcome."]
+    );
+    assert_eq!(models.requests(), 1);
+    assert!(observed.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_mapped_agent_denial_names_the_principal_without_an_owner_notice() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::session_refused(
+            &dekopon_broker_protocol::SessionRefusal::AgentDenied {
+                principal: "simon".parse().unwrap(),
+            },
+        )],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("private mapped message"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies(),
+        ["Sorry simon, you don't have permission for this agent."]
+    );
+    assert_eq!(models.requests(), 0);
+    assert!(matches!(
+        observed.try_recv().unwrap().request,
+        dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+    ));
+    assert!(observed.try_recv().is_err());
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.session.rejected")]
+            )
+            .is_empty()
+    );
+    let rejections =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+    assert_eq!(rejections.len(), 1, "{}", capture.events_text());
+    let rejection = &rejections[0];
+    for (key, expected) in [
+        ("transport", "dev"),
+        ("route", "0"),
+        ("conversation.kind", "directMessage"),
+        ("conversation.container", ""),
+        ("conversation.id", "dev"),
+        ("conversation.thread", ""),
+        ("reason", "agent-denied"),
+    ] {
+        assert_eq!(rejection.field(key), Some(expected));
+    }
+    let expected = subject().canonical();
+    assert_eq!(rejection.field("subject"), Some(expected.as_str()));
+    assert!(!format!("{rejection:?}").contains("private mapped message"));
+}
+
+#[tokio::test]
+async fn a_mapped_empty_grant_gets_a_named_reply_without_an_owner_notice() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::chat_capabilities(
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            Some("simon".parse().unwrap()),
+        )],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("private empty grant message"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies(),
+        ["Sorry simon, you don't have permission for this agent."]
+    );
+    assert_eq!(models.requests(), 0);
+    assert!(matches!(
+        observed.try_recv().unwrap().request,
+        dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+    ));
+    assert!(observed.try_recv().is_err());
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.session.rejected")]
+            )
+            .is_empty()
+    );
+    let rejections =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+    assert_eq!(rejections.len(), 1, "{}", capture.events_text());
+    let rejection = &rejections[0];
+    for (key, expected) in [
+        ("transport", "dev"),
+        ("route", "0"),
+        ("conversation.kind", "directMessage"),
+        ("conversation.container", ""),
+        ("conversation.id", "dev"),
+        ("conversation.thread", ""),
+        ("reason", "unauthorized"),
+    ] {
+        assert_eq!(rejection.field(key), Some(expected));
+    }
+    let expected = subject().canonical();
+    assert_eq!(rejection.field("subject"), Some(expected.as_str()));
+    assert!(!format!("{rejection:?}").contains("private empty grant message"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     let directory = temporary();
@@ -7305,7 +7521,7 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         models.prompt(0),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?")
+            ("user", "[gateway: unmapped participant]\nwhat broke?")
         ]),
         "the first message of a conversation starts clean"
     );
@@ -7313,9 +7529,12 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            ("user", "[gateway: unmapped participant]\nwhat broke?"),
             ("assistant", "Two things broke."),
-            ("user", "and the second one?"),
+            (
+                "user",
+                "[gateway: unmapped participant]\nand the second one?"
+            ),
         ]),
         "instructions first, then what the conversation remembers, then the new message"
     );
@@ -7353,7 +7572,10 @@ async fn only_an_image_restricted_reply_adapter_gets_the_assets_note_and_limits_
     let limits = "[gateway: 4 steps, 8 capability calls and 5 minutes per message.]";
     assert_eq!(
         models.prompt(0),
-        transcript(&[("system", limits), ("user", "hello")])
+        transcript(&[
+            ("system", limits),
+            ("user", "[gateway: unmapped participant]\nhello")
+        ])
     );
     assert_eq!(
         models.prompt(1),
@@ -7365,7 +7587,7 @@ async fn only_an_image_restricted_reply_adapter_gets_the_assets_note_and_limits_
                     crate::session::RESTRICTED_REPLY_ASSETS_NOTE
                 )
             ),
-            ("user", "hello")
+            ("user", "[gateway: unmapped participant]\nhello")
         ])
     );
 }
@@ -7393,9 +7615,12 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "and the second one?")
+            (
+                "user",
+                "[gateway: unmapped participant]\nand the second one?"
+            )
         ]),
-        "a oneShot route is exactly the behavior every route had before conversations existed"
+        "a oneShot route carries attribution without replaying prior exchanges"
     );
     assert_eq!(
         runner.conversations.tracked(),
@@ -7494,16 +7719,22 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[("system", &expected_instructions()), ("user", "and mine?")]),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("user", "[gateway: unmapped participant]\nand mine?")
+        ]),
         "the second sender's first message must not carry the first sender's exchange"
     );
     assert_eq!(
         models.prompt(2),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what happened to mine?"),
+            (
+                "user",
+                "[gateway: unmapped participant]\nwhat happened to mine?"
+            ),
             ("assistant", "Your deploy failed."),
-            ("user", "and now?"),
+            ("user", "[gateway: unmapped participant]\nand now?"),
         ]),
         "each sender continues their own conversation and nobody else's"
     );
@@ -7768,7 +7999,10 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[("system", &expected_instructions()), ("user", "and now?")]),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("user", "[gateway: unmapped participant]\nand now?")
+        ]),
         "a changed grant set starts with neither the old transcript nor attachment metadata"
     );
 }
@@ -7806,7 +8040,7 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
         second[1],
         (
             "user".to_owned(),
-            "what is this?\n[gateway: attached chat-asset:1 — shot.png]".to_owned()
+            "[gateway: unmapped participant]\nwhat is this?\n[gateway: attached chat-asset:1 — shot.png]".to_owned()
         ),
         "the recorded turn keeps the arrival and drops the inventory note"
     );
@@ -7814,11 +8048,9 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
         second[2],
         ("assistant".to_owned(), "A screenshot.".to_owned())
     );
-    assert!(
-        second[3]
-            .1
-            .starts_with("and now?\n\n[gateway: files in this conversation")
-    );
+    assert!(second[3].1.starts_with(
+        "[gateway: unmapped participant]\nand now?\n\n[gateway: files in this conversation"
+    ));
     assert!(second[3].1.contains("shot.png"), "{second:?}");
 }
 
@@ -7906,10 +8138,10 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "what broke?"),
+            ("user", "[gateway: unmapped participant]\nwhat broke?"),
             (
                 "user",
-                "[gateway: the previous turn stopped before answering: the model call failed (protocol). Capability calls already made were not undone.]\ntry again"
+                "[gateway: unmapped participant]\n[gateway: the previous turn stopped before answering: the model call failed (protocol). Capability calls already made were not undone.]\ntry again"
             ),
         ]),
         "an unanswered turn replays the question and nothing in the answer's place"
@@ -8928,7 +9160,10 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     )
     .await;
 
-    assert_eq!(driver.replies(), vec!["what broke?".to_owned()]);
+    assert_eq!(
+        driver.replies(),
+        vec!["[gateway: unmapped participant]\nwhat broke?".to_owned()]
+    );
     assert_eq!(
         runner.conversations.tracked(),
         1,
@@ -12579,9 +12814,15 @@ async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlis
 
     let prepared = tokio::task::spawn_blocking(move || {
         let input = json!({"images": ["chat-asset:1"]});
-        let (assets, pins) = tokio::runtime::Handle::current()
-            .block_on(inputs.prepare(&input, 4))
-            .expect("one reference");
+        let dekopon_agent::attachment::PreparedRun { assets, pins, .. } =
+            tokio::runtime::Handle::current()
+                .block_on(inputs.prepare_run(
+                    &[dekopon_shell::Arg::Asset(
+                        dekopon_core::AssetNumber::parse("chat-asset:1").unwrap(),
+                    )],
+                    4,
+                ))
+                .expect("one reference");
         assert_eq!(assets.descriptors.len(), 1);
         assert_eq!(assets.rows[0].origin, "chat");
         assert_eq!(pins[0].read().unwrap(), b"\x89PNG\r\n\x1a\nshot");
@@ -15396,18 +15637,29 @@ async fn parked_broker(
     let entered = Arc::clone(&reached);
     let released = Arc::clone(&release);
     tokio::spawn(async move {
-        for response in answer_first {
+        let mut responses = answer_first
+            .into_iter()
+            .chain([parked_answer])
+            .map(|response| (response, Vec::new()))
+            .collect();
+        while !VecDeque::is_empty(&responses) {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
             let mut stream = DescriptorStream::new(stream);
-            if stream
+            let Ok((request, inputs)) = stream
                 .read_frame::<RequestEnvelope>(FrameLimits::default())
                 .await
-                .is_err()
-            {
+            else {
                 return;
+            };
+            let (response, _) =
+                dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
+            if responses.is_empty() {
+                entered.notify_one();
+                released.notified().await;
             }
+            drop(inputs);
             if stream
                 .write_frame(&response, &[], FrameLimits::default())
                 .await
@@ -15416,29 +15668,6 @@ async fn parked_broker(
                 return;
             }
         }
-        let Ok((stream, _)) = listener.accept().await else {
-            return;
-        };
-        let mut stream = DescriptorStream::new(stream);
-        let Ok((_request, streams)) = stream
-            .read_frame::<RequestEnvelope>(FrameLimits::default())
-            .await
-        else {
-            return;
-        };
-        entered.notify_one();
-        released.notified().await;
-        // A real broker closes the provider's streams before it answers.
-        drop(streams);
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "the parked call is released only after the test has already cancelled the \
-                      session, so the client may well be gone; what the test asserts on is the \
-                      cancellation, not this write"
-        )]
-        let _ = stream
-            .write_frame(&parked_answer, &[], FrameLimits::default())
-            .await;
     });
     (
         ResolvedBroker {
@@ -16581,22 +16810,30 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 listing.request,
                 BrokerRequest::Capabilities { .. }
             ));
-            let _command = observed.recv().await.expect("command");
-            let BrokerRequest::Invoke {
+            let BrokerRequest::Run {
                 invocation,
+                word,
+                argv,
+                assets,
                 attestation: Some(claim),
                 ..
-            } = observed.recv().await.expect("proposal").request
+            } = observed.recv().await.expect("edit run").request
             else {
-                panic!("attested proposal")
+                panic!("attested run");
             };
-            assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
+            assert_eq!(word, "gpt-image");
             assert_eq!(
-                invocation.input["images"][0],
-                format!("chat-asset:{}", edit + 1)
+                assets.iter().map(|row| row.id).collect::<Vec<_>>(),
+                [u64::try_from(edit + 1).unwrap()]
             );
-            observed.recv().await.expect("send command");
-            observed.recv().await.expect("send invocation");
+            assert!(argv.contains(&dekopon_broker_protocol::Arg::Asset(
+                dekopon_broker_protocol::AssetIndex::try_from(0).unwrap()
+            )));
+            assert!(claim.binds(&invocation));
+            assert!(matches!(
+                observed.recv().await.expect("send run").request,
+                BrokerRequest::Run { .. }
+            ));
             assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
         }
@@ -17414,13 +17651,16 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     );
     assert_eq!(models.tool_names(0), models.tool_names(1));
     assert!(tool_message(&models, 1).contains("chat-asset:1"));
-    for _ in 0..4 {
+    for _ in 0..2 {
         observed.recv().await.unwrap();
     }
-    let BrokerRequest::Invoke { invocation, .. } = observed.recv().await.unwrap().request else {
-        panic!("second invocation")
+    let BrokerRequest::Run { argv, assets, .. } = observed.recv().await.unwrap().request else {
+        panic!("second run");
     };
-    assert_eq!(invocation.input["images"][0], "chat-asset:1");
+    assert_eq!(assets.iter().map(|row| row.id).collect::<Vec<_>>(), [1]);
+    assert!(argv.contains(&dekopon_broker_protocol::Arg::Asset(
+        dekopon_broker_protocol::AssetIndex::try_from(0).unwrap()
+    )));
     assert_eq!(driver.replies(), vec!["Two produced images.".to_owned()]);
 }
 
@@ -17621,12 +17861,7 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
                 .sum::<usize>(),
             1
         );
-        let expected_head = match memory.scope {
-            MemoryScope::PrivateConversation => format!("{NOTICE}\n"),
-            MemoryScope::SharedConversation => {
-                format!("[gateway: unmapped participant]\n{NOTICE}\n")
-            }
-        };
+        let expected_head = format!("[gateway: unmapped participant]\n{NOTICE}\n");
         assert!(
             current.starts_with(&expected_head),
             "authoritative attribution, complete notice, then untrusted text"
@@ -17653,6 +17888,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
+#[path = "tests/attribution.rs"]
+mod attribution;
 #[path = "tests/generation.rs"]
 mod generation;
 #[path = "tests/github_http_invocation.rs"]
@@ -17767,14 +18004,14 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         crate::follow::FollowInvoker::new(leg, Some((Arc::clone(&table), key.clone(), 0)));
     let result = tokio::task::spawn_blocking(move || {
         let (stdout, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
-        let calls = dekopon_shell::CallBudget::new(2);
+        let calls = dekopon_process::CallBudget::new(2);
         invoker.invoke(
             dekopon_shell::CommandProposal::new("dekopon-provider-follow.stay", json!({}), None),
             dekopon_shell::Streams {
                 stdin: None,
                 stdout: std::os::fd::OwnedFd::from(stdout),
             },
-            &dekopon_shell::TreeContext::new(dekopon_shell::Limits::default(), calls),
+            &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), calls),
         )
     })
     .await
@@ -17930,7 +18167,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         dekopon_broker_protocol::Trigger::Message
     );
     let unlisted = broker.request().await;
-    let BrokerRequest::RunCommand {
+    let BrokerRequest::Run {
         attestation: Some(unlisted_claim),
         word: unlisted_word,
         argv: unlisted_argv,
@@ -17945,12 +18182,17 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         dekopon_broker_protocol::Trigger::Message
     );
     assert_eq!(unlisted_word, "probe");
-    assert_eq!(unlisted_argv, ["reverse", "--text", "secret"]);
+    assert_eq!(
+        unlisted_argv,
+        ["reverse", "--text", "secret"]
+            .map(|text| dekopon_broker_protocol::Arg::Text(text.to_owned()))
+    );
     let command = broker.request().await;
-    let BrokerRequest::RunCommand {
+    let BrokerRequest::Run {
         attestation: Some(claim),
         word,
         argv,
+        invocation,
         ..
     } = command.request
     else {
@@ -17962,24 +18204,12 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         dekopon_broker_protocol::Trigger::Message
     );
     assert_eq!(word, "probe");
-    assert_eq!(argv, ["upper", "--text", "hello"]);
-    let invocation = broker.request().await;
-    let BrokerRequest::Invoke {
-        attestation: Some(claim),
-        invocation,
-        ..
-    } = invocation.request
-    else {
-        panic!("third request must invoke the named capability: {invocation:?}");
-    };
-    assert_eq!(claim.subject, inbound.subject);
     assert_eq!(
-        claim.scope.as_ref().unwrap().trigger,
-        dekopon_broker_protocol::Trigger::Message
+        argv,
+        ["upper", "--text", "hello"]
+            .map(|text| dekopon_broker_protocol::Arg::Text(text.to_owned()))
     );
-    assert!(claim.binds(&invocation.id));
-    assert_eq!(invocation.capability.to_string(), "cli-probe.upper");
-    assert_eq!(invocation.input, json!({"text": "hello"}));
+    assert!(claim.binds(&invocation));
     assert!(
         broker.recorded().is_empty(),
         "two fresh capabilities requests, one permitted invocation and no unlisted invocation"
@@ -18223,7 +18453,7 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
         dekopon_test_support::Record::Span { name: "gateway.message", .. }
         if record.field("outcome") == Some("failed"))));
     let mut requests = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..3 {
         requests.push(
             tokio::time::timeout(Duration::from_secs(3), observed.recv())
                 .await
@@ -18231,14 +18461,8 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
                 .expect("broker request is recorded"),
         );
     }
-    assert!(
-        matches!(&requests[2].request, BrokerRequest::Invoke { invocation, .. }
-        if invocation.capability.as_str() == "cli-probe.upper")
-    );
-    assert!(
-        matches!(&requests[4].request, BrokerRequest::Invoke { invocation, .. }
-        if invocation.capability.as_str() == "dekopon-provider-follow.leave")
-    );
+    assert!(matches!(&requests[1].request, BrokerRequest::Run { word, .. } if word == "probe"));
+    assert!(matches!(&requests[2].request, BrokerRequest::Run { word, .. } if word == "follow"));
     assert!(observed.try_recv().is_err());
 }
 
@@ -18352,16 +18576,9 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
             .unwrap()
             .unwrap()
             .request,
-        BrokerRequest::RunCommand { .. }
+        BrokerRequest::Run { .. }
     ));
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(3), observed.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .request,
-        BrokerRequest::Invoke { .. }
-    ));
+    assert!(observed.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -18445,10 +18662,13 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
             ("system", &expected_instructions()),
             (
                 "user",
-                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nwhat broke?"
+                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\n[gateway: unmapped participant]\nwhat broke?"
             ),
             ("assistant", "Two things broke."),
-            ("user", "and the second one?"),
+            (
+                "user",
+                "[gateway: unmapped participant]\nand the second one?"
+            ),
         ]),
     );
 }
@@ -18727,7 +18947,7 @@ async fn a_failed_history_read_still_answers_from_an_empty_window() {
         models.prompt(0),
         transcript(&[
             ("system", &expected_instructions()),
-            ("user", "read this thread")
+            ("user", "[gateway: unmapped participant]\nread this thread")
         ]),
     );
 }
@@ -18792,12 +19012,17 @@ async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
     let caught_up = &delivered[delivered.len() - 2..];
     assert_eq!(caught_up[0], ("user".to_owned(), block.to_owned()));
     assert!(
-        caught_up[1].1.starts_with("what did they post?"),
+        caught_up[1]
+            .1
+            .starts_with("[gateway: authenticated participant: xavier]\nwhat did they post?"),
         "{caught_up:?}"
     );
     let following = models.prompt(2);
     let (_, latest) = following.last().expect("the next mention");
-    assert!(latest.starts_with("anything new?"), "{latest}");
+    assert!(
+        latest.starts_with("[gateway: authenticated participant: xavier]\nanything new?"),
+        "{latest}"
+    );
     let replayed = following
         .iter()
         .map(|(_, text)| text.as_str())
@@ -18856,7 +19081,7 @@ async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
         prompt[prompt.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\nunaddressed"),
-            ("user", "next"),
+            ("user", "[gateway: authenticated participant: xavier]\nnext"),
         ])
     );
 }
@@ -19212,7 +19437,10 @@ async fn an_unaddressed_continuation_catches_up_on_what_others_posted() {
         continued[continued.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\nposted meanwhile"),
-            ("user", "and another thing"),
+            (
+                "user",
+                "[gateway: authenticated participant: xavier]\nand another thing"
+            ),
         ])
     );
 }
@@ -19251,7 +19479,7 @@ async fn a_folded_steer_is_not_replayed_by_the_next_mention() {
         prompt[prompt.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\nunaddressed"),
-            ("user", "next"),
+            ("user", "[gateway: authenticated participant: xavier]\nnext"),
         ])
     );
 }
@@ -19339,7 +19567,10 @@ async fn a_late_mention_reads_nothing_older_than_forget_after() {
         prompt[prompt.len() - 2..],
         transcript(&[
             ("user", "[gateway: chat history, from U2]\njust now"),
-            ("user", "catch me up"),
+            (
+                "user",
+                "[gateway: authenticated participant: xavier]\ncatch me up"
+            ),
         ])
     );
 }
@@ -19628,6 +19859,7 @@ fn openrouter_model(name: &str, model: &str, timeout_ms: u64) -> Value {
         "name": name,
         "model": model,
         "apiKeyEnv": PROBE_KEY_VARIABLE,
+        "modalities": ["image"],
         "timeoutMs": timeout_ms,
         "routing": { "requireParameters": true }
     })
@@ -19640,6 +19872,7 @@ fn models_fragment(models: Value) -> Value {
 struct FakeVendor {
     endpoint: String,
     asked: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Value>>>,
 }
 
 #[allow(
@@ -19656,24 +19889,45 @@ fn spawn_fake_vendor() -> FakeVendor {
     let listener = tokio::net::TcpListener::from_std(listener).expect("fake vendor adopts");
     let asked = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&asked);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
             let recorded = Arc::clone(&recorded);
+            let recorded_requests = Arc::clone(&recorded_requests);
             tokio::spawn(async move {
-                let Some((_, headers, body)) = read_http_request_parts(&mut stream).await else {
+                let Some((uri, headers, body)) = read_http_request_parts(&mut stream).await else {
                     return;
                 };
+                assert_eq!(uri, "/api/v1/chat/completions");
                 let model =
                     serde_json::from_str::<Value>(&body).expect("probe body is JSON")["model"]
                         .as_str()
                         .expect("probe names its model")
                         .to_owned();
+                let request: Value = serde_json::from_str(&body).unwrap();
+                assert_canary_request(&request, usize::from(model != "vendor/text-only"));
+                let has_image = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| {
+                        message["content"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] == "image_url")
+                        })
+                    });
+                recorded_requests.lock().push(request);
                 recorded.lock().push(model.clone());
+                if model == "vendor/deadline" {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
                 let (status, content_type, response) = if model == "vendor/refused"
                     || model == "vendor/outage"
+                    || model == "vendor/image-refused"
+                    || (model == "vendor/text-only" && has_image)
                 {
                     let authorization = headers
                         .lines()
@@ -19690,7 +19944,10 @@ fn spawn_fake_vendor() -> FakeVendor {
                     (
                         "200 OK",
                         "text/event-stream",
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_owned(),
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id": if model == "vendor/incomplete" { "" } else { "call_canary" },"type":"function","function":{"name":"canary","arguments": if model == "vendor/malformed" { "{broken" } else if model == "vendor/wrong-arguments" { "{\"unexpected\":true}" } else { "{}" }}}]},"finish_reason":"tool_calls"}]})
+                        ),
                     )
                 };
                 let head = format!(
@@ -19707,7 +19964,31 @@ fn spawn_fake_vendor() -> FakeVendor {
     FakeVendor {
         endpoint: format!("http://{address}/api/v1/chat/completions"),
         asked,
+        requests,
     }
+}
+
+fn assert_canary_request(request: &Value, expected_images: usize) {
+    assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(request["tools"][0]["function"]["name"], "canary");
+    let images = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .collect::<Vec<_>>();
+    assert_eq!(images.len(), expected_images);
+    for image in images {
+        assert!(
+            image["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+    assert_eq!(request["max_tokens"], 16);
 }
 
 async fn probed(
@@ -20941,6 +21222,10 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
     ));
 }
 
+fn active_routes(config: &crate::ResolvedConfig) -> RoutingTable {
+    RoutingTable::bind(config, &LocalCatalog::load(&config.catalog_path).unwrap()).unwrap()
+}
+
 async fn gateway_sources(config: &crate::ResolvedConfig) -> config::GatewaySources {
     let catalog = LocalCatalog::load(&config.catalog_path).unwrap();
     config::GatewaySources {
@@ -20977,6 +21262,7 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
         .push(openrouter_model("router", "vendor/kept", 5_000));
     let path = write_config(root.path(), &document);
     let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
     let sources = gateway_sources(&active).await;
     document["models"][1]["model"] = json!("vendor/refused");
     write_config(root.path(), &document);
@@ -20985,7 +21271,7 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
         None,
         config::LoadMode::Boot,
         Some((&crate::ProbeScope::Every, &environment)),
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     assert!(candidate.is_none());
@@ -21012,6 +21298,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
     let active = config::load(&live_path, crate::current_uid())
         .await
         .unwrap();
+    let active_routes = active_routes(&active);
     let sources = gateway_sources(&active).await;
     let mut candidate = document(root.path());
     for (model, status) in [("vendor/refused", 400), ("vendor/outage", 503)] {
@@ -21025,7 +21312,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
             None,
             config::LoadMode::Boot,
             Some((&crate::ProbeScope::Every, &environment)),
-            Some((&active, &sources)),
+            Some((&active, &sources, &active_routes)),
         )
         .await;
         assert!(prepared.is_none());
@@ -21049,7 +21336,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
         None,
         config::LoadMode::Boot,
         Some((&crate::ProbeScope::Every, &environment)),
-        Some((&active, &sources)),
+        Some((&active, &sources, &active_routes)),
     )
     .await;
     let prepared = prepared.expect("repair prepares a full candidate");
@@ -21350,7 +21637,7 @@ async fn the_stop_notice_reaches_the_next_turn_once() {
     let notice = "[gateway: the previous turn stopped before answering: the model call failed (deadline-exceeded). Capability calls already made were not undone.]";
     assert_eq!(
         models.prompt(1).last().unwrap().1,
-        format!("{notice}\nsecond question")
+        format!("[gateway: unmapped participant]\n{notice}\nsecond question")
     );
     assert!(
         models
@@ -21653,7 +21940,7 @@ async fn fresh_after_wall_clock(kind: ConversationKind) {
     assert_eq!(driver.replies().last().unwrap(), "fresh answer");
     let prompt = next.prompt(0);
     assert_eq!(prompt.len(), 2);
-    assert_eq!(prompt[1], ("user".to_owned(), "[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnew question".to_owned()));
+    assert_eq!(prompt[1], ("user".to_owned(), "[gateway: unmapped participant]\n[gateway: the previous turn stopped before answering: it reached its time limit. Capability calls already made were not undone.]\nnew question".to_owned()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -21771,7 +22058,10 @@ async fn a_sealed_conversation_stays_sealed_after_a_restart() {
                 assert_eq!(next.prompt(0).len(), 2);
                 assert_eq!(
                     next.prompt(0)[1],
-                    ("user".to_owned(), "after restart".to_owned())
+                    (
+                        "user".to_owned(),
+                        "[gateway: unmapped participant]\nafter restart".to_owned()
+                    )
                 );
             }
             ConversationKind::GroupDirectMessage | ConversationKind::Channel => unreachable!(),
@@ -21891,7 +22181,10 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         turn.exchanges().is_empty(),
         "the resident window excludes durable tool bytes"
     );
-    assert_eq!(turn.user(), "do the work");
+    assert_eq!(
+        turn.user(),
+        "[gateway: authenticated participant: xavier]\ndo the work"
+    );
     assert_eq!(turn.answer(), Some("done"));
     let bytes = fs::read_to_string(
         journal_dir
@@ -22001,4 +22294,296 @@ async fn a_cold_platform_recall_skips_messages_before_the_seal() {
     assert!(!recalled.contains("before the seal"));
     assert!(recalled.contains("at the seal"));
     assert!(recalled.contains("after the seal"));
+}
+
+#[tokio::test]
+async fn an_image_refusal_names_the_model_routes_and_vendor_status() {
+    canary_result("vendor/image-refused", false).await;
+}
+
+#[tokio::test]
+async fn a_malformed_canary_tool_call_refuses_the_model() {
+    canary_result("vendor/malformed", false).await;
+}
+
+#[tokio::test]
+async fn a_well_formed_canary_tool_call_passes() {
+    canary_result("vendor/accepted", true).await;
+}
+
+async fn canary_result(model: &str, passes: bool) {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([openrouter_model("router", model, 5_000)]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::Every, &vendor).await;
+    if passes {
+        assert!(report.problems.is_empty(), "{report:?}");
+    } else {
+        let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+            panic!("{report:?}")
+        };
+        assert_eq!(problem.model, "router");
+        assert_eq!(problem.routes, ["dev:reviewer"]);
+        let diagnostic = crate::gateway::reload_problem(&report.problems[0]);
+        assert!(diagnostic.contains("router"), "{diagnostic}");
+        assert!(diagnostic.contains("dev:reviewer"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(if model == "vendor/image-refused" {
+                "400"
+            } else {
+                "200"
+            }),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains(PROBE_KEY), "{diagnostic}");
+        match model {
+            "vendor/image-refused" => assert!(matches!(&problem.source,
+                crate::ProbeError::Vendor(InferenceError::Provider(failure)) if failure.status == Some(400))),
+            "vendor/malformed" | "vendor/incomplete" => assert!(matches!(
+                &problem.source,
+                crate::ProbeError::MalformedResponse(_)
+            )),
+            "vendor/wrong-arguments" => assert!(matches!(
+                &problem.source,
+                crate::ProbeError::InvalidToolCall
+            )),
+
+            _ => panic!("unexpected test model"),
+        }
+    }
+    assert_eq!(vendor.asked.lock().as_slice(), [model]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+}
+
+#[tokio::test]
+async fn rebinding_an_unchanged_model_is_probed_but_unchanged_bindings_are_not() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([
+        openrouter_model("first", "vendor/first", 5_000),
+        openrouter_model("second", "vendor/second", 5_000)
+    ]);
+    document["routes"][0]["model"] = json!("first");
+    let path = write_config(root.path(), &document);
+    let live = root.path().join("live.json");
+    fs::copy(&path, &live).unwrap();
+    let scope = crate::ProbeScope::ChangedFrom(live);
+    let report = probed(&path, &scope, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert!(vendor.requests.lock().is_empty());
+    document["routes"][0]["model"] = json!("second");
+    write_config(root.path(), &document);
+    let report = probed(&path, &scope, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/second"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+}
+
+#[tokio::test]
+async fn an_incomplete_canary_tool_call_preserves_the_protocol_cause() {
+    canary_result("vendor/incomplete", false).await;
+}
+
+#[tokio::test]
+async fn catalog_rebinding_uses_the_active_routes_and_refuses_the_reload() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: |variable| (variable == "PATH").then(|| PROBE_KEY.into()),
+    };
+    let root = temporary();
+    let catalog = root.path().join("dekopon.yaml");
+    fs::write(&catalog, catalog_text(true, Some("reasoning"))).unwrap();
+    let mut document = document(root.path());
+    let mut first = openrouter_model("first", "vendor/first", 5_000);
+    first["apiKeyEnv"] = json!("PATH");
+    first["classes"] = json!(["reasoning"]);
+    let mut second = openrouter_model("second", "vendor/image-refused", 5_000);
+    second["apiKeyEnv"] = json!("PATH");
+    second["classes"] = json!(["vision"]);
+    document["models"] = json!([first, second]);
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
+    let sources = gateway_sources(&active).await;
+    fs::write(&catalog, catalog_text(true, Some("vision"))).unwrap();
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources, &active_routes)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(problem.model, "second");
+    assert_eq!(problem.routes, ["dev:reviewer"]);
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/image-refused"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+    assert_eq!(active_routes.serving("first"), ["dev:reviewer"]);
+}
+
+#[tokio::test]
+async fn a_canary_deadline_names_the_model_and_routes() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([openrouter_model("router", "vendor/deadline", 100)]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::Every, &vendor).await;
+    let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(problem.model, "router");
+    assert_eq!(problem.routes, ["dev:reviewer"]);
+    assert!(matches!(
+        problem.source,
+        crate::ProbeError::Vendor(InferenceError::DeadlineExceeded)
+    ));
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+}
+
+#[tokio::test]
+async fn canary_arguments_must_match_the_declared_tool() {
+    canary_result("vendor/wrong-arguments", false).await;
+}
+
+#[path = "tests/lost_task.rs"]
+mod lost_task;
+
+#[tokio::test]
+async fn a_text_only_model_passes_the_tool_canary_without_an_image() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    let mut model = openrouter_model("router", "vendor/text-only", 5_000);
+    model.as_object_mut().unwrap().remove("modalities");
+    document["models"] = json!([model]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::Every, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/text-only"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 0);
+    assert_eq!(
+        vendor.requests.lock()[0]["messages"][1]["content"],
+        "Confirm this text turn by calling canary."
+    );
+}
+
+#[tokio::test]
+async fn a_candidate_catalog_override_does_not_rebind_the_against_baseline() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let candidate_catalog = root.path().join("candidate-agents.yaml");
+    fs::write(&candidate_catalog, catalog_text(true, Some("vision"))).unwrap();
+    let mut document = document(root.path());
+    let mut first = openrouter_model("first", "vendor/first", 5_000);
+    first["classes"] = json!(["reasoning"]);
+    let mut second = openrouter_model("second", "vendor/image-refused", 5_000);
+    second["classes"] = json!(["vision"]);
+    document["models"] = json!([first, second]);
+    let path = write_config(root.path(), &document);
+    let live = root.path().join("live.json");
+    fs::copy(&path, &live).unwrap();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let (_, report) = crate::load_candidate(
+        &path,
+        Some(&candidate_catalog),
+        config::LoadMode::Check,
+        Some((&crate::ProbeScope::ChangedFrom(live), &environment)),
+    )
+    .await;
+    let [crate::GatewaydError::Probe(problem)] = report.problems.as_slice() else {
+        panic!("{report:?}")
+    };
+    assert_eq!(problem.model, "second");
+    assert_eq!(problem.routes, ["dev:reviewer"]);
+    assert!(
+        matches!(&problem.source, crate::ProbeError::Vendor(InferenceError::Provider(failure)) if failure.status == Some(400))
+    );
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/image-refused"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
+}
+
+#[tokio::test]
+async fn an_unloadable_baseline_catalog_probes_even_when_candidate_routes_fail() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut document = document(root.path());
+    document["models"] = json!([openrouter_model("router", "vendor/refused", 5_000)]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    document["catalogPath"] = json!(root.path().join("missing-catalog.yaml"));
+    let live = root.path().join("live.json");
+    fs::copy(&path, &live).unwrap();
+    fs::write(&live, serde_json::to_vec(&document).unwrap()).unwrap();
+    document["catalogPath"] = json!(root.path().join("dekopon.yaml"));
+    document["routes"][0]["agent"] = json!("missing-agent");
+    write_config(root.path(), &document);
+    let report = probed(&path, &crate::ProbeScope::ChangedFrom(live), &vendor).await;
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, crate::CheckWarning::BaselineRoutes { .. }))
+    );
+    assert_eq!(report.problems.len(), 2, "{report:?}");
+    assert!(report.problems.iter().any(
+        |problem| matches!(problem, crate::GatewaydError::Route(RouteError { problems })
+        if matches!(problems.as_slice(), [RouteProblem::UnknownAgent { .. }]))
+    ));
+    assert!(report.problems.iter().any(|problem| matches!(problem, crate::GatewaydError::Probe(problem)
+        if problem.model == "router" && matches!(&problem.source,
+            crate::ProbeError::Vendor(InferenceError::Provider(failure)) if failure.status == Some(400)))));
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/refused"]);
+    assert_eq!(vendor.requests.lock().len(), 1);
+    assert_canary_request(&vendor.requests.lock()[0], 1);
 }

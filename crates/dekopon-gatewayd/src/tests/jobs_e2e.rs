@@ -48,14 +48,8 @@ async fn parked_nested_broker(
             .write_frame(&probe_listing(), &[], frame)
             .await
             .expect("surface");
-        let (mut command, request, _) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::RunCommand { .. }));
-        command
-            .write_frame(&upper_proposal("x"), &[], frame)
-            .await
-            .expect("proposal");
         let (mut parent, request, descriptors) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
+        assert!(matches!(request.request, BrokerRequest::Run { .. }));
         drop(descriptors);
         let (stdout, write) = std::os::unix::net::UnixStream::pair().expect("child stdout");
         parent
@@ -75,14 +69,8 @@ async fn parked_nested_broker(
             .await
             .expect("upcall");
         drop(write);
-        let (mut child_command, request, _) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::RunCommand { .. }));
-        child_command
-            .write_frame(&upper_proposal("y"), &[], frame)
-            .await
-            .expect("child proposal");
         let (mut child, request, mut descriptors) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
+        assert!(matches!(request.request, BrokerRequest::Run { .. }));
         descriptors.clear(); // Otherwise the fake broker holds stdout open after cancellation.
         parked.send(()).expect("test awaits parked child");
         assert!(
@@ -169,9 +157,9 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
     let owner = JobOwner::of(&inbound);
     let anchor =
         crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("anchor");
-    let limits = dekopon_shell::Limits {
+    let limits = dekopon_process::Limits {
         timeout: Duration::from_secs(30),
-        ..dekopon_shell::Limits::default()
+        ..dekopon_process::Limits::default()
     };
     let context = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor, broker, limits);
     tokio::task::spawn_blocking(move || {
@@ -217,9 +205,9 @@ async fn a_probe_tick_ends_its_nested_invoke_at_tree_deadline() {
     let leg = BrokerLeg::connect(client, Some(anchor.claim(Trigger::Probe)))
         .await
         .expect("probe leg");
-    let limits = dekopon_shell::Limits {
+    let limits = dekopon_process::Limits {
         timeout: Duration::from_secs(30),
-        ..dekopon_shell::Limits::default()
+        ..dekopon_process::Limits::default()
     };
     let probe = crate::wake::Probe::scripted_for_test("probe upper");
     let tick = tokio::task::spawn_blocking(move || probe.tick(&leg, limits));
@@ -282,6 +270,80 @@ async fn a_job_outlives_its_turn_and_the_turns_script_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_turn_and_its_job_spend_one_capability_budget() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let directory = temporary();
+    let success =
+        || ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new());
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            probe_listing(),
+            upper_proposal("turn"),
+            success(),
+            probe_listing(),
+            upper_proposal("job"),
+            success(),
+            upper_proposal("past-budget"),
+            success(),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call(
+            "probe upper --text turn; { probe upper --text job; probe upper --text past-budget; } &",
+        ),
+        answer("started"),
+    ]);
+    let runner = runner(broker, Arc::clone(&models), 1);
+    let mut route = job_route(Duration::from_secs(5), Duration::from_secs(10));
+    route.limits.max_capability_calls = 2;
+    let inbound = message("spend the budget");
+    let owner = JobOwner::of(&inbound);
+    let mut notices = runner.jobs.take_notices();
+    run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    let notice = tokio::time::timeout(Duration::from_secs(10), notices.recv())
+        .await
+        .expect("job finishes")
+        .expect("job notice");
+    assert_eq!(
+        notice.text.lines().last(),
+        Some("dekopon-shell: the turn's capability-call budget of 2 is spent"),
+    );
+    let [row] = runner.jobs.list(&owner).try_into().expect("one job");
+    assert_eq!(finished(&row).1, ExitCode::SYNTAX);
+    assert_eq!(
+        attested(&mut observed),
+        (
+            vec![Trigger::Message, Trigger::Job],
+            vec![Trigger::Message, Trigger::Job],
+        )
+    );
+    let records = capture.records();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            dekopon_test_support::Record::Span {
+                name: "shell.script",
+                ..
+            }
+        ) && record.field("outcome") == Some("limit-exceeded")),
+        "{records:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
     let directory = temporary();
     let routes = job_routes(directory.path(), Some(10_000)).await;
@@ -328,7 +390,9 @@ async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
     let prompt = models.prompt(2);
     assert!(
         prompt.iter().any(|(role, text)| role == "user"
-            && text.starts_with("[gateway: job 1 finished, exit 0, after")
+            && text.starts_with(
+                "[gateway: unmapped participant]\n[gateway: job 1 finished, exit 0, after"
+            )
             && text.contains("sleep 1 && echo finished\nfinished")),
         "{prompt:?}"
     );
@@ -707,19 +771,37 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     assert_eq!(
         window(2),
         turns(&[
-            ("user", &format!("{}person said this", label(1))),
+            (
+                "user",
+                &format!(
+                    "{}[gateway: unmapped participant]\nperson said this",
+                    label(1)
+                )
+            ),
             ("assistant", "finished"),
-            ("user", "what did I say?"),
+            ("user", "[gateway: unmapped participant]\nwhat did I say?"),
         ])
     );
     assert_eq!(
         window(3),
         turns(&[
-            ("user", &format!("{}person said this", label(1))),
+            (
+                "user",
+                &format!(
+                    "{}[gateway: unmapped participant]\nperson said this",
+                    label(1)
+                )
+            ),
             ("assistant", "finished"),
-            ("user", &format!("{}what did I say?", label(2))),
+            (
+                "user",
+                &format!(
+                    "{}[gateway: unmapped participant]\nwhat did I say?",
+                    label(2)
+                )
+            ),
             ("assistant", "remembered"),
-            ("user", "and before that?"),
+            ("user", "[gateway: unmapped participant]\nand before that?"),
         ])
     );
 }
@@ -1123,7 +1205,7 @@ impl CapabilityInvoker for ProbeInvoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
@@ -1143,11 +1225,11 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
         &inbound,
         anchor,
         broker,
-        dekopon_shell::Limits::default(),
+        dekopon_process::Limits::default(),
     )
     .for_probe();
     let outcome = tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+        dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
             .run("true &", &ProbeInvoker(context))
     })
     .await
@@ -1561,8 +1643,16 @@ fn attested(
                         scope: Some(scope), ..
                     }),
                 ..
+            }
+            | BrokerRequest::Run {
+                attestation:
+                    Some(Attestation {
+                        scope: Some(scope), ..
+                    }),
+                ..
             } => invocations.push(scope.trigger),
             BrokerRequest::Capabilities { .. }
+            | BrokerRequest::Run { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
@@ -1890,11 +1980,11 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
         &inbound,
         anchor,
         broker,
-        dekopon_shell::Limits::default(),
+        dekopon_process::Limits::default(),
     )
     .for_probe();
     let probed = tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+        dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
             .run("true & echo status=$?", &ProbeInvoker(probe))
     })
     .await
@@ -2006,9 +2096,9 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
     let jobs = Arc::new(Jobs::new(4));
     let inbound = message("deadline");
     let anchor = || crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
-    let limits = |seconds| dekopon_shell::Limits {
+    let limits = |seconds| dekopon_process::Limits {
         timeout: Duration::from_secs(seconds),
-        ..dekopon_shell::Limits::default()
+        ..dekopon_process::Limits::default()
     };
     let probe = JobContext::for_turn(
         Arc::clone(&jobs),

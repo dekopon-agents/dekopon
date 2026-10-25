@@ -3,11 +3,12 @@ use std::collections::VecDeque;
 use clap::{Arg, Command};
 
 use crate::{
-    CapabilityInvoker, RetainedBytes,
+    CapabilityInvoker,
     builtins::{CommandFailure, parse_flags, unsupported_flag},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
+use dekopon_process::RetainedBytes;
 
 #[derive(Clone, Copy)]
 pub(crate) enum LineCommand {

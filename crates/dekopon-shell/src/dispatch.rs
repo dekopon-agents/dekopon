@@ -50,7 +50,8 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
+    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter};
+    use dekopon_process::Limits;
 
     use super::{Resolution, resolve};
 
@@ -84,7 +85,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
@@ -112,7 +113,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();

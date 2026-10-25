@@ -79,7 +79,8 @@ workflows:
       requests: 2
 ```
 
-`via` names the attesting peer's principal among the candidate `identities`; `subject`, `agent`
+`via` names the attesting peer's principal, which exactly one candidate identity must have, or
+every step is refused as `grant`; `subject`, `agent`
 and `scope` form the attestation it would send, with trigger `message` and conversation
 coordinates the check fills in as canonical for the transport kind and subject. Only some of them
 are real values: the Slack container (the subject's team), a Telegram or WhatsApp direct-message id
@@ -898,9 +899,10 @@ unapproved plaintext, and plain HTTP is available only to an exact literal loopb
 with `--plaintext-loopback-registry <HOST[:PORT]>` (repeatable, `provider` subcommands only), for
 development and tests.
 
-`DEKOPON_REGISTRY_CA_BUNDLE` optionally names a PEM file of at most 64 KiB. Its roots
-are trusted beside WebPKI for every registry fetch, by every `provider` subcommand and
-by `check --provider-set`. An unusable file refuses the command.
+`DEKOPON_REGISTRY_CA_BUNDLE` optionally names a PEM file of at most 64 KiB, read under the same
+rules as the lock: owned by the broker UID with a protected parent, regular, single-link, not a
+symlink, and not group/world writable. Its roots are trusted beside WebPKI for every registry fetch,
+by every `provider` subcommand and by `check --provider-set`. An unusable file refuses the command.
 
 Fetched bytes land at:
 

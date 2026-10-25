@@ -1989,7 +1989,7 @@ where
         &self,
         context: &AuthenticatedContext,
         capability: &CapabilityId,
-    ) -> Result<AuthorizedInvocation, Refusal> {
+    ) -> Result<CapabilityDecision, Refusal> {
         // This check is the actual enforcement under Leniency::Tolerant, not just defense in
         // depth; never weaken it into an assertion or fold it into the policy decision, or an
         // unrouted but policy-anticipated capability would stop being denied.
@@ -2015,12 +2015,70 @@ where
                 ..determined_refusal(reason, decision.determining_policy_ids)
             });
         }
-        Ok(AuthorizedInvocation {
+        Ok(CapabilityDecision {
             set,
             policy_ids: decision.determining_policy_ids,
             slots,
             errors_present: decision.errors_present,
         })
+    }
+
+    #[must_use]
+    pub fn secret_use_or_default(
+        &self,
+        capability: &CapabilityId,
+        proposed: Option<SecretUseProposal>,
+    ) -> Option<SecretUseProposal> {
+        proposed.or_else(|| {
+            let default = self
+                .constraints
+                .get(capability)?
+                .default_secret_use
+                .as_ref()?;
+            Some(match default.sink {
+                DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
+                    secret: default.drn.clone(),
+                },
+            })
+        })
+    }
+
+    pub fn bind_secret_use(
+        &self,
+        context: &AuthenticatedContext,
+        capability: &CapabilityId,
+        decision: &mut CapabilityDecision,
+        secret_use: Option<&SecretUseProposal>,
+    ) -> Result<(), Refusal> {
+        let Some(secret_use) = secret_use else {
+            decision.set.constraints.secret_use = None;
+            return Ok(());
+        };
+        let Some(binding) = self.secrets.binding(capability, secret_use) else {
+            return Err(determined_refusal(
+                "secret-denied",
+                decision.policy_ids.clone(),
+            ));
+        };
+        let secret_decision =
+            self.authorize_secret_use(context, capability, &decision.set, secret_use);
+        decision.errors_present |= secret_decision.errors_present;
+        decision
+            .policy_ids
+            .extend(secret_decision.determining_policy_ids);
+        decision.policy_ids.sort();
+        decision.policy_ids.dedup();
+        if !secret_decision.allowed {
+            return Err(Refusal {
+                evaluation: Some(PolicyEvaluation {
+                    errors_present: secret_decision.errors_present,
+                    cause: None,
+                }),
+                ..determined_refusal("secret-denied", decision.policy_ids.clone())
+            });
+        }
+        decision.set.constraints.secret_use = Some(self.secrets.grant(binding));
+        Ok(())
     }
 
     fn authorize_capability(
@@ -2329,8 +2387,6 @@ where
         })
     }
 
-    /// A refused caller's answer must stay None, distinct from Some with an empty list; answering
-    /// either way with an empty list would tell an unmapped subject that it is unmapped.
     #[must_use]
     #[allow(clippy::type_complexity, reason = "see capability_view")]
     pub fn capability_surface(
@@ -2344,14 +2400,32 @@ where
         BTreeMap<String, String>,
         Option<ChatMemorySurface>,
     )> {
+        self.session_surface(peer, grant, attestation).ok()
+    }
+
+    #[allow(clippy::type_complexity, reason = "see capability_view")]
+    pub fn session_surface(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        attestation: Option<&Attestation>,
+    ) -> Result<
+        (
+            Vec<AvailableCapability>,
+            Vec<String>,
+            BTreeMap<String, String>,
+            Option<ChatMemorySurface>,
+        ),
+        Refusal,
+    > {
         let Some(claim) = attestation else {
             let (capabilities, words, help) = self.capability_view(peer);
-            return Some((capabilities, words, help, None));
+            return Ok((capabilities, words, help, None));
         };
         let (context, refusal) = self.resolve_context(peer, grant, claim);
         if let Some(refusal) = refusal {
             report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
-            return None;
+            return Err(refusal);
         }
         let (mut capabilities, mut words, mut help) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
@@ -2360,8 +2434,14 @@ where
                 CapabilityRoute::ChatMemoryRecent,
                 CapabilityRoute::ChatMemorySearch,
             ] {
-                let (capability, _) = self.constraints.routed(route)?;
-                capabilities.push(self.available_capability(capability)?);
+                let (capability, _) = self
+                    .constraints
+                    .routed(route)
+                    .ok_or_else(|| unevaluated_refusal("memory-route-unavailable"))?;
+                capabilities.push(
+                    self.available_capability(capability)
+                        .ok_or_else(|| unevaluated_refusal("memory-route-unavailable"))?,
+                );
             }
             capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
             let chat_memory_words = self.chat_memory_words();
@@ -2370,7 +2450,7 @@ where
             words.sort();
             words.dedup();
         }
-        Some((capabilities, words, help, memory))
+        Ok((capabilities, words, help, memory))
     }
 
     pub async fn invoke(
@@ -2386,9 +2466,6 @@ where
             None => (peer.clone(), None),
         };
         let chat = attestation.filter(|claim| claim.scope.is_some());
-        // The refusal class belongs to the operator, not the caller: a chat peer able to
-        // distinguish denial classes could read the subject directory and agent grants out of its
-        // own refusals, so every one collapses to the same literal.
         if chat.is_some() {
             refusal = refusal.map(|refusal| {
                 if refusal.reason == CONSOLE_REAL_SCOPE_REASON {
@@ -2519,7 +2596,11 @@ where
             return (refused(), Some(console_real_scope_refusal()));
         }
         let Some(principal) = self.identities.resolve(&claim.subject) else {
-            return (refused(), Some(unevaluated_refusal("unmapped-subject")));
+            let mut refusal = unevaluated_refusal("unmapped-subject");
+            if grant.permits(&claim.subject) {
+                refusal.session = dekopon_broker_protocol::SessionRefusal::UnmappedSubject;
+            }
+            return (refused(), Some(refusal));
         };
         let actor = Actor::Agent {
             agent: claim.agent.clone(),
@@ -2569,7 +2650,14 @@ where
         if decision.allowed {
             (context, None)
         } else {
-            (context, Some(decided_refusal(decision, "agent-denied")))
+            let named_denial = !decision.errors_present;
+            let mut refusal = decided_refusal(decision, "agent-denied");
+            if named_denial {
+                refusal.session = dekopon_broker_protocol::SessionRefusal::AgentDenied {
+                    principal: principal.clone(),
+                };
+            }
+            (context, Some(refusal))
         }
     }
 
@@ -2911,10 +2999,6 @@ where
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     async fn invoke_inner(
         &self,
         context: &AuthenticatedContext,
@@ -2959,24 +3043,9 @@ where
                     .map(ControlFlow::Break);
             }
             // Before the decision: a denial still records the defaulted secret it refused.
-            if request.secret_use.is_none()
-                && let Some(default) = self
-                    .constraints
-                    .get(&request.capability)
-                    .and_then(|set| set.default_secret_use.as_ref())
-            {
-                request.secret_use = Some(match default.sink {
-                    DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
-                        secret: default.drn.clone(),
-                    },
-                });
-            }
-            let AuthorizedInvocation {
-                mut set,
-                mut policy_ids,
-                slots,
-                errors_present,
-            } = match self.authorize_invocation(context, &request.capability) {
+            request.secret_use =
+                self.secret_use_or_default(&request.capability, request.secret_use.take());
+            let mut decision = match self.authorize_invocation(context, &request.capability) {
                 Ok(authorized) => authorized,
                 Err(refusal) => {
                     // A policy error denies exactly like a non-match; this is recorded as a flag
@@ -3011,55 +3080,38 @@ where
                         .map(ControlFlow::Break);
                 }
             };
-            authorize.record("policy.errors_present", errors_present);
-            if let Some(secret_use) = request.secret_use.as_ref() {
-                let Some(binding) = self
-                    .secrets
-                    .binding(&request.capability, secret_use)
-                    .cloned()
-                else {
-                    authorize.record("outcome", "secret-denied");
-                    return self
-                        .deny(
-                            context,
-                            &request,
-                            determined_refusal("secret-denied", policy_ids),
-                        )
-                        .await
-                        .map(ControlFlow::Break);
-                };
-                let secret_decision =
-                    self.authorize_secret_use(context, &request.capability, &set, secret_use);
-                authorize.record(
-                    "policy.errors_present",
-                    errors_present || secret_decision.errors_present,
-                );
-                policy_ids.extend(secret_decision.determining_policy_ids.clone());
-                policy_ids.sort();
-                policy_ids.dedup();
-                if !secret_decision.allowed {
-                    authorize.record("outcome", "secret-denied");
-                    if secret_decision.errors_present {
-                        tracing::warn!(
-                            event = "broker_policy_evaluation_error",
-                            invocation = %request.id,
-                            policy.target = "secret",
-                            "broker.policy.evaluation.error"
-                        );
-                    }
-                    return self
-                        .deny(
-                            context,
-                            &request,
-                            determined_refusal("secret-denied", policy_ids),
-                        )
-                        .await
-                        .map(ControlFlow::Break);
+            let bound = self.bind_secret_use(
+                context,
+                &request.capability,
+                &mut decision,
+                request.secret_use.as_ref(),
+            );
+            authorize.record("policy.errors_present", decision.errors_present);
+            if let Err(refusal) = bound {
+                authorize.record("outcome", refusal.reason);
+                if refusal
+                    .evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| evaluation.errors_present)
+                {
+                    tracing::warn!(
+                        event = "broker_policy_evaluation_error",
+                        invocation = %request.id,
+                        policy.target = "secret",
+                        "broker.policy.evaluation.error"
+                    );
                 }
-                set.constraints.secret_use = Some(self.secrets.grant(&binding));
-            } else {
-                set.constraints.secret_use = None;
+                return self
+                    .deny(context, &request, refusal)
+                    .await
+                    .map(ControlFlow::Break);
             }
+            let CapabilityDecision {
+                set,
+                policy_ids,
+                slots,
+                ..
+            } = decision;
             authorize.record("outcome", "allowed");
             Ok(ControlFlow::Continue((set, policy_ids, slots)))
         }
@@ -4292,6 +4344,7 @@ fn console_smoke_delivery(
 }
 
 pub struct Refusal {
+    pub session: dekopon_broker_protocol::SessionRefusal,
     pub reason: &'static str,
     wire: &'static str,
     pub policy_ids: Vec<String>,
@@ -4303,7 +4356,7 @@ struct PolicyEvaluation {
     cause: Option<String>,
 }
 
-pub struct AuthorizedInvocation {
+pub struct CapabilityDecision {
     pub set: ConstraintSet,
     policy_ids: Vec<String>,
     slots: ChatSlotValues,
@@ -4319,6 +4372,7 @@ impl Refusal {
 
 const fn console_real_scope_refusal() -> Refusal {
     Refusal {
+        session: dekopon_broker_protocol::SessionRefusal::Other,
         reason: CONSOLE_REAL_SCOPE_REASON,
         wire: CONSOLE_REAL_SCOPE_REFUSAL,
         policy_ids: Vec::new(),
@@ -4328,6 +4382,7 @@ const fn console_real_scope_refusal() -> Refusal {
 
 const fn unevaluated_refusal(reason: &'static str) -> Refusal {
     Refusal {
+        session: dekopon_broker_protocol::SessionRefusal::Other,
         reason,
         wire: reason,
         policy_ids: Vec::new(),
@@ -4337,6 +4392,7 @@ const fn unevaluated_refusal(reason: &'static str) -> Refusal {
 
 fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal {
     Refusal {
+        session: dekopon_broker_protocol::SessionRefusal::Other,
         reason,
         wire: reason,
         policy_ids,

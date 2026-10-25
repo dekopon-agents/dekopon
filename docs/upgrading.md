@@ -8,6 +8,32 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Image-and-tool model canary
+
+`dekopon-gatewayd check --probe [--against <live config>]` and the reload gate now send one
+capped request with one fixed tool to each changed `openrouter` model. Models declaring
+`modalities: [image]` also receive a built-in one-pixel PNG; text-only models receive a text turn.
+Exactly one well-formed call to the tool is required; no second request is made. A route
+newly binding an otherwise unchanged model also selects it for probing. An unchanged route and
+model do not select it under `--against` or reload. The `--against` baseline uses its own
+`catalogPath`; a candidate's `--catalog` override never changes the baseline binding. If the
+baseline catalog cannot load, the probe warns and checks every model.
+
+A vendor refusal, malformed tool call or deadline refuses the candidate; reload keeps the running
+configuration serving. The existing 16-output-token cap and 30-second bound (or shorter model
+`timeoutMs`) remain. Subscription, `anthropic` and `openaiCompatible` models retain their not-probed
+warnings, and plain `check` still reads no credential. No configuration migration is needed.
+Boot does not run the vendor canary; run `check --probe --against <live config>` in deployment CI
+before restarting with a candidate.
+
+## Turn-started jobs share the turn's capability-call budget
+
+A gateway binary swap requires no configuration, broker protocol or provider WIT change.
+A route's `maxCapabilityCalls` bounds the turn's scripts, nested providers, and all jobs
+it starts and their children together. Exhaustion reports the existing `CapabilityCalls`
+limit. Turn-started jobs keep their independent `jobTimeoutMs` deadline; probe- and
+job-started jobs keep sharing their starter's deadline and budgets.
+
 ## Process spans removed (0.51.0)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. `dekopon-gatewayd` no longer emits the `DEBUG` `process.run` and `process.node` spans its trace filter exported, so a saved query, dashboard or alert on them sees no spans after 0.51.0.
@@ -412,8 +438,9 @@ that `&`, `jobs`, `wait` and `kill` now exit 1 with a message naming `limits.job
 instead of being refused as unsupported shell syntax.
 
 - **`limits.jobTimeoutMs`** (per route, optional): turns on detached jobs for that route and sets
-  the deadline of each job a turn starts. A job started by a probe or by another job shares its
-  starter's deadline and budgets. Absent means jobs are off; 0 or a value too large to be a
+  the independent deadline of each job a turn starts. Every job shares its starter's
+  capability-call budget; a probe- or job-started job also shares its starter's deadline and
+  other tree budgets. Absent means jobs are off; 0 or a value too large to be a
   deadline fails boot naming the key.
 - **`sessions.maxJobs`** (optional, default 2): the most jobs running at once across the gateway,
   and the most job rows it keeps. 0 fails boot.

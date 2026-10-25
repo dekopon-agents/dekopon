@@ -1168,7 +1168,6 @@ impl BrokerWasmProvider {
             spawn::SpawnState::invoke(assets.upcalls.take(), self.runtime.limits.max_input_bytes);
         store.data_mut().assets = asset::AssetState::invoke(
             assets,
-            asset::references(input),
             constraints.asset.clone().unwrap_or_default(),
             directory,
             format!("provider:{capability}"),

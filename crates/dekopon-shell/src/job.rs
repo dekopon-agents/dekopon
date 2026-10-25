@@ -2,7 +2,8 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
-use crate::{ExitCode, TreeContext, ast::Statement, interp::JobScope};
+use crate::{ExitCode, ast::Statement, interp::JobScope};
+use dekopon_process::TreeContext;
 
 pub const JOBS_OFF: &str = "jobs are off in this chat";
 

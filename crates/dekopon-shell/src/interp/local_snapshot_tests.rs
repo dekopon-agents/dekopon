@@ -7,11 +7,12 @@ use serde_json::Value;
 
 use super::{Evaluator, Frame, ShellOptions, reduce_charged, rendered_bytes, telemetry};
 use crate::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandProposal, TreeContext,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal,
     builtins::CommandResult,
-    limits::{Budget, Limits, OutputBuffer},
+    limits::{Budget, OutputBuffer},
     pipe,
 };
+use dekopon_process::{CallBudget, Limits, TreeContext};
 
 struct NoCalls;
 
@@ -24,7 +25,7 @@ impl CapabilityInvoker for NoCalls {
         &self,
         _proposal: CommandProposal,
         _streams: crate::Streams,
-        _tree: &crate::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         crate::secret_use_unsupported()
     }
@@ -35,6 +36,7 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
     let limits = Limits::default();
     let invoker = NoCalls;
     let mut parent = Evaluator {
+        nesting: super::nesting::Nesting::root(),
         invoker: &invoker,
         budget: Budget::start_tree(limits, TreeContext::new(limits, CallBudget::new(1))),
         limits,
@@ -109,7 +111,7 @@ fn structured_capture_counts_escaped_bytes_before_reduction() {
     ];
     assert!(matches!(
         reduce_charged(&budget, captured, &mut retained),
-        Err(crate::limits::LimitExceeded::ValueBytes { maximum: 200 })
+        Err(dekopon_process::LimitExceeded::ValueBytes { maximum: 200 })
     ));
     drop(retained);
     assert_eq!(tree.value_bytes(), 0);
