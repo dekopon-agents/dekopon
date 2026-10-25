@@ -12,7 +12,7 @@ needs no published image.
 
 ## What it is
 
-One image, `ghcr.io/dekopon-agents/dekopon`, carrying both daemon binaries for `linux/amd64` and
+One image, `ghcr.io/dekopon-agents/dekopon`, carrying both daemon binaries and `dekopon-console` for `linux/amd64` and
 `linux/arm64`. It is a separate GHCR package from the published WIT interface packages
 `dekopon/provider`, `dekopon/http`, and `dekopon/storage`, which are OCI artifacts rather than images.
 
@@ -26,6 +26,7 @@ that one image with two `command`s does not.
 |---|---|
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopon-gatewayd` | Unprivileged chat gateway |
+| `/usr/local/bin/dekopon-console` | Operator console, including `--idle` for exec sessions |
 | `/opt/dekopon/providers/*.wasm` | The checked in-tree `cli-probe` and `http-probe` fixtures only |
 | `/usr/share/doc/dekopon/` | `LICENSE-APACHE`, `LICENSE-MIT` |
 
@@ -45,7 +46,7 @@ toolchain that can drift away from the one that built the archives users downloa
 
 [`../ci/stage-image-context.sh`](../ci/stage-image-context.sh) verifies before it trusts: it
 downloads each Linux archive, checks it against its published `.sha256`, runs `gh attestation
-verify --repo dekopon-agents/dekopon` on it, and only then extracts the two executables into the
+verify --repo dekopon-agents/dekopon` on it, and only then extracts the three executables into the
 build context. The workflow and a local build run that one script; the `Dockerfile` performs no
 network access at all.
 

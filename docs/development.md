@@ -45,6 +45,8 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopon-gatewayd/tests/examples.rs` |
 | Agent skill example | `examples/catalog/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/catalog/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs` |
 | Shared test scaffolding | `crates/dekopon-test-support/src/` | Not published and never a normal dependency: `provider_fixture`, the `LoopbackServer` builder, `content_length`, one `tracing` `CaptureLayer` read by field name, the socket `BrokerFixture`, `snapshot_tree`, and `shutdown_on`, reached only as a path `[dev-dependencies]` entry |
+| Console CLI, profiles and telemetry | `crates/dekopon-console/src/` | Inline tests and `crates/dekopon-console/tests/` |
+| Console session, rendering and terminal state | `crates/dekopon-tui/src/` | Inline tests and `crates/dekopon-tui/tests/`, including local broker/component integration |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
@@ -218,7 +220,7 @@ Pull-request caches are restore-only. The workspace-test lane uses SHA-pinned `S
 
 The required `test (Rust)` job now separates `Compile workspace tests` (`cargo test --no-run`) from `Run workspace tests` (library, binary and integration tests). Both run on the same runner and reuse its linked binaries; the run step still invokes Cargo for freshness checks and may rebuild if inputs change. Default example compilation remains in the compile step. Doctests run exactly once in `Test documentation`, because stable Cargo does not support combining `--doc` with `--no-run`. No test harness or parallelism setting changes.
 
-Linux releases also restore main-owned dependency caches. The `release-dependencies` matrix in `.github/workflows/cache-warm.yml` runs the exact release CLI build on native `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (ARM64): `cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd --target <TARGET>`. It installs the same pinned toolchain/target and uses the same SHA-pinned Swatinem action and `linux-release-v1-<TARGET>` shared key as `.github/workflows/release.yml`. Neither side uses a compiler wrapper; Swatinem sets `CARGO_INCREMENTAL=0` before constructing the key. The action additionally keys by host OS/architecture, Rust toolchains/environment and dependency manifests/lockfile, with a dependency-hash fallback; a cold or evicted cache remains a normal build. This is separate from the PR test cache and the stable lane's release-profile `cargo check` compiler objects.
+Linux releases also restore main-owned dependency caches. The `release-dependencies` matrix in `.github/workflows/cache-warm.yml` runs the exact release CLI build on native `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (ARM64): `cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console --target <TARGET>`. It installs the same pinned toolchain/target and uses the same SHA-pinned Swatinem action and `linux-release-v1-<TARGET>` shared key as `.github/workflows/release.yml`. Neither side uses a compiler wrapper; Swatinem sets `CARGO_INCREMENTAL=0` before constructing the key. The action additionally keys by host OS/architecture, Rust toolchains/environment and dependency manifests/lockfile, with a dependency-hash fallback; a cold or evicted cache remains a normal build. This is separate from the PR test cache and the stable lane's release-profile `cargo check` compiler objects.
 
 The release warmer runs only on `main`, on the workflow's matching pushes (including release workflow changes) or a manual dispatch against `main`. It builds binaries only to populate dependency artifacts: no tests, provider downloads, archives, attestations or publication. Only successful main builds may save. Workspace crates/final executables are pruned from the saved cache, so releases still build the tagged project and perform final linking. Linux tag jobs restore only and create no new tag-specific copies. macOS retains its existing tag-local retry cache; package/publication caches are unchanged.
 
@@ -242,7 +244,7 @@ Use an isolated checkout so selecting the optimized lock never changes the stock
 git worktree add --detach ../dekopon-wasmtime-optimization HEAD
 cd ../dekopon-wasmtime-optimization
 cp .cargo/wasmtime-optimization.lock Cargo.lock
-cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
 cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
 ```
 
@@ -320,23 +322,23 @@ This is the complete list of root-workspace commands behind the required `qualit
 cargo fmt --all --check
 # Lint every target with warnings denied.
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-# Release-profile compile of the two daemons; tag workflows perform the final linked builds.
-cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+# Release-profile compile of both daemons and console; tag workflows perform the final linked builds.
+cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
 # Unused dependencies; CI pins cargo-machete 0.9.2.
 cargo machete
-# Opposite-direction normal-dependency gates; broker-protocol is allowed in both.
+# Opposite-direction normal-dependency gates; both reject console and tui; broker-protocol is allowed in both.
 # Run in Bash; fail on Cargo errors as well as forbidden exact package names.
 (
   set -euo pipefail
   tree=$(cargo tree --locked -p dekopon-gatewayd --edges normal --prefix none)
-  if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
+  if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy|console|tui) v' <<<"$tree"; then
     printf '%s\n' "$tree" >&2
     exit 1
   fi
   # dekopon-model is absent: the broker's `kind: chatgptSubscription` credential
   # resolves through `dekopon_model::chatgpt::CredentialFile`, the one implementation of it.
   tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
-  if grep -Eq '^dekopon-(agent|shell|process|config) v' <<<"$tree"; then
+  if grep -Eq '^dekopon-(agent|shell|process|config|console|tui) v' <<<"$tree"; then
     printf '%s\n' "$tree" >&2
     exit 1
   fi
@@ -353,6 +355,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --lock
 # test (Rust): fixtures, compilation, execution using the same target/, then doctests once.
 ci/fetch-external-provider-components.sh examples/providers
 cargo test --workspace --all-features --locked --no-run
+cargo build --locked -p dekopon-brokerd
+DEKOPON_TEST_BROKERD="$PWD/target/debug/dekopon-brokerd" \
+DEKOPON_TEST_PROBE_WASM="$PWD/examples/providers/cli-probe-provider.wasm" \
+DEKOPON_TEST_ASSET_WASM="$PWD/examples/providers/http-probe-provider.wasm" \
 cargo test --workspace --all-features --locked --lib --bins --tests
 cargo test --workspace --all-features --locked --doc
 # broker-host components (Linux ARM64): on an aarch64 Linux host only, the component host's own tests.
@@ -603,7 +609,7 @@ image that matches the machine.
 
 Do not add a compile stage to the Dockerfile: the point of the image is that its binaries are the
 release's binaries, verifiable with `sha256sum` against the published archive. The workflow checks
-exactly that for all four before it pushes anything, and the staging script refuses to stage a
+exactly that for all six before it pushes anything, and the staging script refuses to stage a
 binary that needs a glibc newer than the runtime base provides.
 
 `ci/verify-image-broker.sh` starts the real broker with the baked `cli-probe` component and waits

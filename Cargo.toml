@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/dekopon-console",
+    "crates/dekopon-tui",
     "crates/dekopon-agent",
     "crates/dekopon-broker",
     "crates/dekopon-broker-host",
@@ -37,6 +39,11 @@ homepage = "https://github.com/dekopon-agents/dekopon"
 authors = ["Dekopon contributors"]
 
 [workspace.dependencies]
+dekopon-tui = { path = "crates/dekopon-tui" }
+prost = "0.14.3"
+opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 async-trait = "0.1.89"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"

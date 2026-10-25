@@ -221,7 +221,7 @@ jobs:
 
             # The claim this whole design rests on: the executable in the image is the executable
             # the release published, byte for byte.
-            for binary in dekopon-brokerd dekopon-gatewayd; do
+            for binary in dekopon-brokerd dekopon-gatewayd dekopon-console; do
               in_image=$(tar -xOf "$rootfs" "usr/local/bin/$binary" | sha256sum | cut -d' ' -f1)
               in_release=$(sha256sum "$CONTEXT/dist/$arch/$binary" | cut -d' ' -f1)
               if [ "$in_image" != "$in_release" ]; then
@@ -261,7 +261,7 @@ jobs:
           {
             echo "| checked | result |"
             echo "|---|---|"
-            echo "| binaries byte-identical to the archives | amd64 2/2, arm64 2/2 |"
+            echo "| binaries byte-identical to the archives | amd64 3/3, arm64 3/3 |"
             echo "| provider components 65532-owned, not group/world writable | both |"
             echo "| binaries executed (amd64) | 2/2; broker component load verified |"
             echo "| unpacked size | $human |"

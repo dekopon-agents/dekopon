@@ -50,6 +50,7 @@ ARG TARGETARCH
 COPY --chmod=0755 \
      dist/${TARGETARCH}/dekopon-brokerd \
      dist/${TARGETARCH}/dekopon-gatewayd \
+     dist/${TARGETARCH}/dekopon-console \
      /usr/local/bin/
 
 # Provider components come from the staging context assembled before this network-free build.

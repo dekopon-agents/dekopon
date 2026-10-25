@@ -71,4 +71,4 @@ jobs:
       - name: Test optimized broker and component host
         run: cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
       - name: Build optimized release CLIs
-        run: cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+        run: cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
