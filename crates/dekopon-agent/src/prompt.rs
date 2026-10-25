@@ -853,6 +853,7 @@ where
                 );
                 drop(model_entered);
                 if steered {
+                    transcribed = 0;
                     continue;
                 }
                 return Err(PromptError::Cancelled);

@@ -1,9 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use dekopon_agent::prompt::{
-    History, PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session,
+    AssetSource, FetchedAsset, History, PromptLimits, ScriptRuntime, SessionInputs,
+    run_prompt_session,
 };
 use dekopon_model::{
+    asset::DiskBlob,
     blocking::BlockingModel,
     codex::CodexClient,
     inference::ModelClient,
@@ -224,28 +226,28 @@ fn summarize_wire_images(messages: &mut Value) -> usize {
     images
 }
 
+struct ImageAssets;
+impl AssetSource for ImageAssets {
+    fn offers_fetch(&self) -> bool {
+        true
+    }
+    fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
+        assert_eq!(id, 1);
+        Ok(FetchedAsset {
+            name: "photo.png".into(),
+            mime: "image/png".into(),
+            data: DiskBlob::from_bytes(b"synthetic pixels").unwrap().into(),
+        })
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_definitions() {
-    use dekopon_agent::prompt::{AssetSource, FetchedAsset};
-    use dekopon_model::{asset::DiskBlob, openai::OpenAiClient};
+    use dekopon_model::openai::OpenAiClient;
     use dekopon_test_support::{CaptureLayer, Record};
     use std::collections::BTreeMap;
     use tracing_subscriber::prelude::*;
 
-    struct ImageAssets;
-    impl AssetSource for ImageAssets {
-        fn offers_fetch(&self) -> bool {
-            true
-        }
-        fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
-            assert_eq!(id, 1);
-            Ok(FetchedAsset {
-                name: "photo.png".into(),
-                mime: "image/png".into(),
-                data: DiskBlob::from_bytes(b"synthetic pixels").unwrap().into(),
-            })
-        }
-    }
     struct DescribedRuntime(SyntheticRuntime);
     impl ScriptRuntime for DescribedRuntime {
         fn capability_calls_used(&self) -> u32 {
@@ -377,4 +379,146 @@ data: [DONE]
         );
     }
     assert!(images > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steered_cancellation_repeats_the_full_prompt_with_resolved_image_digests() {
+    use dekopon_agent::prompt::{Handoff, Seal, Steer, SteerSource};
+    use dekopon_model::{
+        error::InferenceError,
+        model::{AssistantTurn, ChatModel, CompletionOptions, ModelMessage, ModelTool},
+        openai::OpenAiClient,
+        stream::TurnEvent,
+    };
+    use dekopon_test_support::{CaptureLayer, Record};
+    use std::{
+        ops::ControlFlow,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Default)]
+    struct Mailbox(Mutex<Vec<Steer>>);
+    impl SteerSource for Mailbox {
+        fn take(&self) -> Vec<Steer> {
+            std::mem::take(&mut *self.0.lock())
+        }
+        fn seal_or_take(&self) -> Handoff {
+            Handoff::Sealed(self.seal())
+        }
+        fn seal(&self) -> Seal {
+            Seal::Sealed {
+                leftover: self.0.lock().len(),
+            }
+        }
+    }
+    struct CancelBeforeImage {
+        bridge: BlockingModel,
+        cancel: tokio::sync::watch::Sender<bool>,
+        calls: AtomicUsize,
+        mailbox: Mailbox,
+    }
+    impl ChatModel for CancelBeforeImage {
+        fn complete(
+            &self,
+            messages: &[ModelMessage],
+            tools: &[ModelTool],
+            options: &CompletionOptions,
+            on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {}
+                1 => {
+                    self.mailbox
+                        .0
+                        .lock()
+                        .push(Steer::Notice("Describe the image.".into()));
+                    self.cancel.send(true).unwrap();
+                }
+                2 => self.cancel.send(false).unwrap(),
+                call => panic!("unexpected call {call}"),
+            }
+            self.bridge.complete(messages, tools, options, on_event)
+        }
+    }
+    let call = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fetch-1","type":"function","function":{"name":"fetch_chat_asset","arguments":"{\"id\":1}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+    let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"seen\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let server = LoopbackServer::sequence([response(call), response(answer)]);
+    let timeout = Duration::from_secs(5);
+    let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout)
+        .unwrap()
+        .with_streaming(true);
+    let (cancel, receiver) = tokio::sync::watch::channel(false);
+    let model = CancelBeforeImage {
+        bridge: BlockingModel::new(
+            Arc::new(ModelClient::OpenAiCompatible(client)),
+            tokio::runtime::Handle::current(),
+            receiver,
+            timeout,
+        ),
+        cancel,
+        calls: AtomicUsize::new(0),
+        mailbox: Mailbox::default(),
+    };
+    let capture = CaptureLayer::workspace();
+    let captured = capture.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard = tracing_subscriber::registry().with(captured).set_default();
+        let outcome = run_prompt_session(
+            &model,
+            &SyntheticRuntime::default(),
+            SessionInputs::new(
+                "Look at chat-asset:1",
+                PromptLimits {
+                    max_steps: 2,
+                    max_capability_calls: 1,
+                },
+            )
+            .with_assets(&ImageAssets)
+            .with_steering(&model.mailbox),
+            &mut History::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.answer, "seen");
+        assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+    })
+    .await
+    .unwrap();
+    let first = body(&server.request_text());
+    let mut resumed = body(&server.request_text());
+    server.join();
+    assert_eq!(summarize_wire_images(&mut resumed["messages"]), 1);
+    let prompts: Vec<Record> = capture
+        .records()
+        .into_iter()
+        .filter(|record| record.field("audit.event") == Some("agent.model.prompt"))
+        .collect();
+    assert_eq!(prompts.len(), 3);
+    assert_eq!(prompts[1].field("transcript.scope"), Some("delta"));
+    assert!(
+        prompts[1]
+            .field("messages")
+            .unwrap()
+            .contains("[image/png, 16 bytes]")
+    );
+    assert!(!prompts[1].field("messages").unwrap().contains("sha256:"));
+    assert_eq!(prompts[2].field("transcript.scope"), Some("full"));
+    assert_eq!(
+        serde_json::from_str::<Value>(prompts[2].field("messages").unwrap()).unwrap(),
+        resumed["messages"],
+    );
+    let definitions: Value =
+        serde_json::from_str(prompts[2].field("gen_ai.tool.definitions").unwrap()).unwrap();
+    let sent_definitions: Vec<Value> = resumed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"].clone())
+        .collect();
+    assert_eq!(definitions, json!(sent_definitions));
+    assert_eq!(first["tools"], resumed["tools"]);
 }
