@@ -8,6 +8,15 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Console joins the workspace
+
+`dekopon-console` now ships with core in release archives and both stock and memory-optimized
+Dekopon images. Point the deployment's `console.image` at `ghcr.io/dekopon-agents/dekopon` with
+the matching release tag and selected variant. Chart values and templates are unchanged.
+`brew install dekopon-agents/tap/dekopon-console` keeps its existing name; its formula now
+installs the console from the Dekopon release. The `dekopon` formula continues to own only the
+daemon executables. No configuration, CLI flag, environment key or broker frame migration is needed.
+
 ## Image-and-tool model canary
 
 `dekopon-gatewayd check --probe [--against <live config>]` and the reload gate now send one

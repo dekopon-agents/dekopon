@@ -25,7 +25,7 @@
 #   <work>/archives/        the release archives and their published .sha256 sidecars
 #   <work>/context/         the build context: Dockerfile, dist/<arch>/<binary>, providers/,
 #                           LICENSE-APACHE, LICENSE-MIT — and nothing else
-#   <work>/binaries.sha256  the four staged executables, for the byte-identity check after the
+#   <work>/binaries.sha256  the six staged executables, for the byte-identity check after the
 #                           image is built
 set -euo pipefail
 
@@ -53,7 +53,7 @@ context="$work/context"
 # a build can bake in a binary that cannot start.
 max_glibc="2.41"
 
-binaries="dekopon-brokerd dekopon-gatewayd"
+binaries="dekopon-brokerd dekopon-gatewayd dekopon-console"
 providers="cli-probe http-probe"
 
 # macOS ships shasum, Linux ships sha256sum, and their --check flags differ. Comparing the digests

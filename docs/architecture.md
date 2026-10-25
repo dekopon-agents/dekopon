@@ -12,7 +12,7 @@ dekopon-gatewayd auth chatgpt
 
 ## Current workspace ownership
 
-The workspace holds 23 crates and ships two binaries, `dekopon-gatewayd` and `dekopon-brokerd`.
+The workspace ships three binaries: `dekopon-gatewayd`, `dekopon-brokerd`, and `dekopon-console`.
 
 The gateway owns chat and model credentials, bounded agent sessions, and proposals — never a provider credential or broker authority. The broker alone authorizes provider effects, resolves destination-bound credentials (the legacy bindings [will be replaced by DRNs](design.md#legacy-credential-bindings)) or separately authorized public DRNs, and records every decision as an audit log record inside the caller's trace; losing the log exporter loses audit ([non-goals](design.md#non-goals)).
 
