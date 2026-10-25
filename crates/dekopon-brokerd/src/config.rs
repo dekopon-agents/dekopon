@@ -769,21 +769,30 @@ async fn load_directory(
     Ok((resolved, refusal))
 }
 
-pub(crate) async fn read_owner_only(
+async fn read_owner_only(
     path: &Path,
     expected_uid: u32,
     maximum: usize,
 ) -> Result<Vec<u8>, ConfigError> {
+    read_not_world_writable(path, expected_uid, maximum)
+        .await
+        .map_err(|error| trusted_read_error(path, error))
+}
+
+pub(crate) async fn read_not_world_writable(
+    path: &Path,
+    expected_uid: u32,
+    maximum: usize,
+) -> Result<Vec<u8>, FileHygieneError> {
     let owned = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum)
     })
     .await
-    .map_err(|join| ConfigError::Read {
+    .map_err(|join| FileHygieneError::Io {
         path: path.to_path_buf(),
         source: io::Error::other(join),
     })?
-    .map_err(|error| trusted_read_error(path, error))
 }
 
 #[expect(

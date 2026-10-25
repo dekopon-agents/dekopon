@@ -36,8 +36,7 @@ use dekopon_model::{
     model::{ChatModel, CompletionOptions},
     openai::OpenAiClient,
 };
-use dekopon_process::{CallBudget, Limits as ShellLimits};
-use dekopon_process::{CancelHandle, CancelSignal};
+use dekopon_process::{CallBudget, CancelHandle, CancelSignal, Limits as ShellLimits};
 use dekopon_shell::CapabilityInvoker as _;
 use futures_util::StreamExt as _;
 use thiserror::Error;

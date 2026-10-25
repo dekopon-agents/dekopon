@@ -124,9 +124,6 @@ impl LexError {
     }
 }
 
-// Counts `${ }` nesting plus the parser depth at each enclosing `$( )`, not compound commands in the same command list.
-const MAX_PARAMETER_NESTING: u32 = 32;
-
 #[derive(Clone, Copy)]
 enum Enclosure {
     Bare,
@@ -135,7 +132,7 @@ enum Enclosure {
 
 #[cfg(test)]
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source, 0).run()
+    Lexer::new(source, crate::parser::depth::test_depth()).run()
 }
 
 pub(crate) struct Lexer<'a> {
@@ -151,12 +148,11 @@ pub(crate) struct Lexer<'a> {
     token_offset: usize,
     pending_here_docs: Vec<PendingHereDoc>,
     pending_here_doc_close: Option<usize>,
-    depth: u32,
-    block_depth: u32,
+    depth: parser::depth::Depth,
 }
 
 impl<'a> Lexer<'a> {
-    pub(crate) fn new(source: &'a str, depth: u32) -> Self {
+    pub(crate) fn new(source: &'a str, depth: parser::depth::Depth) -> Self {
         Self {
             source,
             chars: source.char_indices().peekable(),
@@ -171,7 +167,6 @@ impl<'a> Lexer<'a> {
             pending_here_docs: Vec::new(),
             pending_here_doc_close: None,
             depth,
-            block_depth: 0,
         }
     }
 
@@ -183,8 +178,8 @@ impl<'a> Lexer<'a> {
         Ok(tokens)
     }
 
-    pub(crate) fn set_parser_depth(&mut self, depth: u32) {
-        self.block_depth = depth.saturating_sub(self.depth);
+    pub(crate) fn set_parser_depth(&mut self, depth: parser::depth::Depth) {
+        self.depth = depth;
     }
 
     pub(crate) fn pending_here_doc_close(&self) -> Option<usize> {
@@ -532,12 +527,7 @@ impl<'a> Lexer<'a> {
             // produce.
             body.pop();
             let parts = if specification.expand {
-                Self::interpolate_here_doc_body(
-                    &body,
-                    specification.line,
-                    self.depth,
-                    self.block_depth,
-                )?
+                Self::interpolate_here_doc_body(&body, specification.line, self.depth)?
             } else if body.is_empty() {
                 Vec::new()
             } else {
@@ -591,11 +581,9 @@ impl<'a> Lexer<'a> {
     fn interpolate_here_doc_body(
         body: &str,
         line: usize,
-        depth: u32,
-        block_depth: u32,
+        depth: parser::depth::Depth,
     ) -> Result<Vec<WordPart>, LexError> {
         let mut lexer = Lexer::new(body, depth);
-        lexer.block_depth = block_depth;
         lexer.line = line + 1;
         lexer
             .read_interpolated(None, "unterminated here-document")
@@ -630,17 +618,13 @@ impl<'a> Lexer<'a> {
                         self.line
                     };
                     return Ok(Some(WordPart::Arithmetic(
-                        parser::parse_arithmetic(&body, line, self.depth + self.block_depth)
-                            .map_err(lex_error)?,
+                        parser::parse_arithmetic(&body, line, self.depth).map_err(lex_error)?,
                     )));
                 }
                 let start = self.offset();
-                let (program, consumed) = parser::parse_substitution(
-                    &self.source[start..],
-                    self.depth + self.block_depth,
-                    self.line,
-                )
-                .map_err(lex_error)?;
+                let (program, consumed) =
+                    parser::parse_substitution(&self.source[start..], self.depth, self.line)
+                        .map_err(lex_error)?;
                 let end = start + consumed;
                 while self.chars.peek().is_some_and(|(index, _)| *index < end) {
                     if let Some((_, '\n')) = self.chars.next() {
@@ -934,14 +918,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn parameter_lexer<'b>(&self, source: &'b str, line: usize) -> Result<Lexer<'b>, LexError> {
-        if self.depth + 1 >= MAX_PARAMETER_NESTING {
-            return Err(LexError::new(
-                line,
-                format!("parameter expansions nested deeper than {MAX_PARAMETER_NESTING}"),
-            ));
-        }
-        let mut lexer = Lexer::new(source, self.depth + 1);
-        lexer.block_depth = self.block_depth;
+        let lexer = Lexer::new(source, self.depth.parameter(line)?);
         Ok(lexer)
     }
 
@@ -1331,7 +1308,7 @@ mod tests {
     #[test]
     fn a_pending_here_doc_records_a_case_pattern_close() {
         let source = "cat <<EOF; case a in a) `x`";
-        let mut lexer = super::Lexer::new(source, 0);
+        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth());
         let error = loop {
             match lexer.next_token() {
                 Ok(Some(_)) => {}
@@ -1349,7 +1326,7 @@ mod tests {
     #[test]
     fn a_pending_here_doc_records_a_function_close() {
         let source = "cat <<EOF; f() `x`";
-        let mut lexer = super::Lexer::new(source, 0);
+        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth());
         let error = loop {
             match lexer.next_token() {
                 Ok(Some(_)) => {}
@@ -1367,7 +1344,7 @@ mod tests {
     #[test]
     fn completed_here_docs_clear_a_pending_function_close() {
         let source = "cat <<EOF; cat <<'END'; f() { true; }\nhi\nEOF\nEND\n`x`";
-        let mut lexer = super::Lexer::new(source, 0);
+        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth());
         let error = loop {
             match lexer.next_token() {
                 Ok(Some(_)) => {}
@@ -1485,15 +1462,19 @@ mod tests {
     fn arithmetic_expansion_is_distinguished_from_command_substitution() {
         assert_eq!(
             single_word("$(( 1 + (2 * 3) ))"),
-            vec![WordPart::Arithmetic(crate::ast::ArithExpr::Binary(
-                crate::ast::ArithBinaryOp::Add,
-                Box::new(crate::ast::ArithExpr::Integer(1)),
-                Box::new(crate::ast::ArithExpr::Binary(
-                    crate::ast::ArithBinaryOp::Multiply,
-                    Box::new(crate::ast::ArithExpr::Integer(2)),
-                    Box::new(crate::ast::ArithExpr::Integer(3))
-                ))
-            ))]
+            vec![WordPart::Arithmetic(
+                crate::ast::ArithExpr::binary(
+                    crate::ast::ArithBinaryOp::Add,
+                    crate::ast::ArithExpr::integer(1),
+                    crate::ast::ArithExpr::binary(
+                        crate::ast::ArithBinaryOp::Multiply,
+                        crate::ast::ArithExpr::integer(2),
+                        crate::ast::ArithExpr::integer(3),
+                    )
+                    .expect("bounded product"),
+                )
+                .expect("bounded sum")
+            )]
         );
     }
 

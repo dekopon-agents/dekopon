@@ -29,9 +29,7 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
-#[cfg(unix)]
-use dekopon_process::CancelSignal;
-use dekopon_process::{CallBudget, Limits as ShellLimits, TreeContext};
+use dekopon_process::{CallBudget, CancelSignal, Limits as ShellLimits, TreeContext};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{

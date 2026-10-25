@@ -2,6 +2,8 @@
 //! script's own assignments, and reading something like an API key by name sees it as unset, not
 //! the host's real value.
 
+mod nesting;
+
 use dekopon_process::{CallBudget, LimitExceeded, Limits, TreeContext};
 
 use std::{
@@ -406,6 +408,7 @@ pub(crate) fn run_with_tree(
     let evaluator = Evaluator {
         invoker,
         budget: Budget::start_tree(limits, tree.clone()),
+        nesting: nesting::Nesting::root(),
         limits,
         output: OutputBuffer::new(&limits),
         globals: Arc::new(
@@ -456,6 +459,7 @@ pub(crate) fn run_seed(
     let mut evaluator = Evaluator {
         invoker,
         budget: Budget::start_tree(limits, tree.clone()),
+        nesting: nesting::Nesting::root(),
         limits,
         output: OutputBuffer::new(&limits),
         globals: scope.globals,
@@ -532,6 +536,7 @@ fn conclude(
 struct Evaluator<'a> {
     invoker: &'a dyn CapabilityInvoker,
     budget: Budget,
+    nesting: nesting::Nesting,
     limits: Limits,
     output: OutputBuffer,
     globals: Arc<BTreeMap<String, Value>>,
@@ -1530,6 +1535,7 @@ impl<'a> Evaluator<'a> {
         Ok(Evaluator {
             invoker: self.invoker,
             budget: self.budget.fork(),
+            nesting: self.nesting.fork(),
             limits: self.limits,
             output: OutputBuffer::new(&self.limits),
             globals: Arc::clone(&self.globals),
@@ -1801,15 +1807,9 @@ impl<'a> Evaluator<'a> {
             Command::Compound {
                 statement,
                 redirects,
-            } => match self.budget.enter_nesting() {
-                Ok(()) => {
-                    let executed =
-                        self.execute_compound_command(statement, redirects, input, capture_output);
-                    self.budget.leave_nesting();
-                    executed
-                }
-                Err(limit) => Err(limit.into()),
-            },
+            } => self.nested(|this| {
+                this.execute_compound_command(statement, redirects, input, capture_output)
+            }),
         };
         self.expansion_charges = parent;
         result
@@ -3194,60 +3194,61 @@ impl<'a> Evaluator<'a> {
         };
 
         self.budget.charge_step_with(self.invoker)?;
-        self.budget.enter_nesting()?;
-        let positional = arguments
-            .iter()
-            .map(|argument| Value::String(argument.clone()))
-            .collect::<Vec<_>>();
-        let positional_charges = positional
-            .iter()
-            .map(|argument| self.budget.charge_value_bytes(value_bytes(argument)))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.frames.push(Frame {
-            locals: BTreeMap::new(),
-            positional,
-            local_charges: BTreeMap::new(),
-            _positional_charges: positional_charges,
-        });
-        let piped = match input {
-            StageInput::Piped(reader) => {
-                self.stdin.push(reader);
-                true
+        let (flow, mut captured) = self.nested(|this| {
+            let positional = arguments
+                .iter()
+                .map(|argument| Value::String(argument.clone()))
+                .collect::<Vec<_>>();
+            let positional_charges = positional
+                .iter()
+                .map(|argument| this.budget.charge_value_bytes(value_bytes(argument)))
+                .collect::<Result<Vec<_>, _>>()?;
+            this.frames.push(Frame {
+                locals: BTreeMap::new(),
+                positional,
+                local_charges: BTreeMap::new(),
+                _positional_charges: positional_charges,
+            });
+            let piped = match input {
+                StageInput::Piped(reader) => {
+                    this.stdin.push(reader);
+                    true
+                }
+                StageInput::Inherited => false,
+            };
+            if capture_output {
+                this.captures.push(Vec::new());
             }
-            StageInput::Inherited => false,
-        };
-        if capture_output {
-            self.captures.push(Vec::new());
-        }
-        let saved_stdout = (*stdout_sink != Sink::Value)
-            .then(|| self.stdout.take())
-            .flatten();
-        let previous_discard = self.discard_capture_depth;
-        let previous_diagnostics = self.diagnostics_depth;
-        if *stdout_sink == Sink::Diagnostics {
-            self.diagnostics_depth = Some(self.captures.len());
-        }
-        match stdout_sink {
-            Sink::Discard => self.discard_capture_depth = Some(self.captures.len()),
-            Sink::Buffer { .. } | Sink::Diagnostics => self.discard_capture_depth = None,
-            Sink::Value => {}
-        }
-        let flow = self.execute_program(&body);
-        if *stdout_sink != Sink::Value {
-            self.stdout = saved_stdout;
-        }
-        self.discard_capture_depth = previous_discard;
-        self.diagnostics_depth = previous_diagnostics;
-        let mut captured = if capture_output {
-            self.captures.pop().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if piped {
-            self.stdin.pop();
-        }
-        self.frames.pop();
-        self.budget.leave_nesting();
+            let saved_stdout = (*stdout_sink != Sink::Value)
+                .then(|| this.stdout.take())
+                .flatten();
+            let previous_discard = this.discard_capture_depth;
+            let previous_diagnostics = this.diagnostics_depth;
+            if *stdout_sink == Sink::Diagnostics {
+                this.diagnostics_depth = Some(this.captures.len());
+            }
+            match stdout_sink {
+                Sink::Discard => this.discard_capture_depth = Some(this.captures.len()),
+                Sink::Buffer { .. } | Sink::Diagnostics => this.discard_capture_depth = None,
+                Sink::Value => {}
+            }
+            let flow = this.execute_program(&body);
+            if *stdout_sink != Sink::Value {
+                this.stdout = saved_stdout;
+            }
+            this.discard_capture_depth = previous_discard;
+            this.diagnostics_depth = previous_diagnostics;
+            let captured = if capture_output {
+                this.captures.pop().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if piped {
+                this.stdin.pop();
+            }
+            this.frames.pop();
+            Ok::<_, FatalError>((flow, captured))
+        })?;
 
         let mut retained = capture_charges(&mut captured);
         let value = if capture_output {
@@ -3496,10 +3497,8 @@ impl<'a> Evaluator<'a> {
                 modifier,
                 length,
             } => {
-                self.budget.enter_nesting()?;
-                let value = self.named_parameter_value(name, indices, modifier);
-                self.budget.leave_nesting();
-                let value = value?;
+                let value =
+                    self.nested(|this| this.named_parameter_value(name, indices, modifier))?;
                 if *length {
                     parameter_length(&value)
                 } else {
@@ -3683,21 +3682,32 @@ impl<'a> Evaluator<'a> {
         match expression {
             Conditional::Test(test) => self.evaluate_conditional_test(test),
             Conditional::Not(inner) => Ok(invert(self.evaluate_conditional(inner)?)),
-            Conditional::And(left, right) => {
-                let status = self.evaluate_conditional(left)?;
-                if status == ExitCode::SUCCESS {
-                    return self.evaluate_conditional(right);
-                }
-                Ok(status)
-            }
-            Conditional::Or(left, right) => {
-                let status = self.evaluate_conditional(left)?;
-                if status == ExitCode::SUCCESS {
-                    return Ok(status);
-                }
-                self.evaluate_conditional(right)
+            Conditional::And(terms) => self.evaluate_conditional_chain(terms, AndOr::And),
+            Conditional::Or(terms) => self.evaluate_conditional_chain(terms, AndOr::Or),
+        }
+    }
+
+    fn evaluate_conditional_chain(
+        &mut self,
+        terms: &[Conditional],
+        operator: AndOr,
+    ) -> Result<ExitCode, CommandFailure> {
+        // Each operator must consume a step before the first operand, including skipped operators.
+        for _ in 2..terms.len() {
+            self.budget.charge_step_with(self.invoker)?;
+        }
+        let mut status = ExitCode::SUCCESS;
+        for term in terms {
+            status = self.evaluate_conditional(term)?;
+            let stop = match operator {
+                AndOr::And => status != ExitCode::SUCCESS,
+                AndOr::Or => status == ExitCode::SUCCESS,
+            };
+            if stop {
+                break;
             }
         }
+        Ok(status)
     }
 
     fn evaluate_conditional_test(
@@ -3718,11 +3728,12 @@ impl<'a> Evaluator<'a> {
     }
 
     fn run_substitution(&mut self, program: &Program) -> Result<CommandResult, CommandFailure> {
-        self.budget.enter_nesting()?;
-        self.captures.push(Vec::new());
-        let flow = self.execute_program(program);
-        self.budget.leave_nesting();
-        let mut captured = self.captures.pop().unwrap_or_default();
+        let (flow, mut captured) = self.nested(|this| {
+            this.captures.push(Vec::new());
+            let flow = this.execute_program(program);
+            let captured = this.captures.pop().unwrap_or_default();
+            Ok::<_, CommandFailure>((flow, captured))
+        })?;
         let flow = flow.map_err(CommandFailure::Fatal)?;
 
         if let Flow::Exit(status) = flow {
@@ -3753,17 +3764,17 @@ impl<'a> Evaluator<'a> {
     )]
     fn evaluate_arithmetic(&mut self, expression: &ArithExpr) -> Result<Number, CommandFailure> {
         self.budget.charge_step_with(self.invoker)?;
-        Ok(match expression {
-            ArithExpr::Integer(value) => Number::Integer(*value),
-            ArithExpr::Float(value) => Number::Float(*value),
-            ArithExpr::Variable(name) => {
+        Ok(match expression.node() {
+            crate::ast::ArithNode::Integer(value) => Number::Integer(*value),
+            crate::ast::ArithNode::Float(value) => Number::Float(*value),
+            crate::ast::ArithNode::Variable(name) => {
                 let value = match name.parse::<usize>() {
                     Ok(position) => self.parameter_value(&Parameter::Positional(position))?,
                     Err(_) => self.lookup(name).cloned().unwrap_or(Value::Null),
                 };
                 to_number(&value)
             }
-            ArithExpr::Unary(operator, operand) => {
+            crate::ast::ArithNode::Unary(operator, operand) => {
                 let operand = self.evaluate_arithmetic(operand)?;
                 match operator {
                     ArithUnaryOp::Negate => match operand {
@@ -3773,7 +3784,7 @@ impl<'a> Evaluator<'a> {
                     ArithUnaryOp::Not => Number::Integer(i64::from(!operand.is_truthy())),
                 }
             }
-            ArithExpr::Binary(operator, left, right) => {
+            crate::ast::ArithNode::Binary(operator, left, right) => {
                 match operator {
                     ArithBinaryOp::And => {
                         let left = self.evaluate_arithmetic(left)?;
@@ -4350,3 +4361,6 @@ fn arithmetic(
         },
     })
 }
+
+#[cfg(test)]
+mod nesting_tests;
