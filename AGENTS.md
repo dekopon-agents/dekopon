@@ -303,8 +303,8 @@ must-holds, a P1 under [Proportionate remedies](#proportionate-remedies) (a proc
 whatever the path), the repository's own boundaries section, and three sections of this file:
 [Errors](#errors), [Panics](#panics) and [Boundaries that must survive](#boundaries-that-must-survive).
 `guideline` is any other rule in this section, quoted by heading. `taste` is advisory. Only an
-`introduced` or `exposed` `contract` finding makes the verdict `FIX REQUIRED`; it carries `file:line`, the concrete failure and the exact
-fix. Every other finding goes under `Follow-ups` in the report and never blocks.
+`introduced` or `exposed` `contract` finding makes the verdict `FIX REQUIRED`; it carries
+`file:line`, the concrete failure and the exact fix. Every other finding goes under `Follow-ups` in the report and never blocks.
 
 **Evidence standard.** A finding names what it saw, not what it suspects; "this could leak" is not
 a finding until the line that leaks is named. A claim in the editor's report ("mirrors
