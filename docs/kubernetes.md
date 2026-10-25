@@ -626,6 +626,9 @@ whatever the hook later says. Render a second set from the same files (a kustomi
 directory, `dekopon-check-*`), annotated as hooks of the same phase with a lower sync wave than the
 Job, so they exist before it starts. `againstConfigMap` names the live gateway ConfigMap: only a
 model absent from it or changed in it is probed, so an unchanged model costs no vendor call.
+The check also mounts the Deployment's live catalog read-only at `paths.catalogDir`, using
+`gateway.catalog.existingConfigMap` and its key projection or the chart-rendered catalog.
+The live gateway configuration must resolve its catalog at that chart-configured path.
 
 A root init container copies the broker ConfigMaps into a `0700` directory owned by `65532`, as
 `0600` regular files, because `dekopon-brokerd check` refuses the symlinks a ConfigMap mount is made
