@@ -34,7 +34,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::Instrument as _;
-use wasmtime::component::{Component, HasSelf, Linker};
+use wasmtime::component::{HasSelf, Linker};
 use wasmtime::{Engine, Store};
 
 pub mod asset;
