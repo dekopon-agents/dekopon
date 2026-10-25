@@ -619,13 +619,15 @@ exactly that for all six before it pushes anything, and the staging script refus
 binary that needs a glibc newer than the runtime base provides.
 
 `ci/verify-image-broker.sh` starts the real broker with the baked `cli-probe` component and waits
-under a deadline for its post-load socket. The workflow always runs this component-load check on
-release tags. Pull requests stage against the newest published release and check image structure
-and binary identity; they also run broker startup when that release is v0.31.0 or newer. Only PRs
-staged with an earlier, pre-stdio archive skip the incompatible component-load check, with a
-notice. A green PR staged with 0.30.0 is **not** evidence of 0.31.0 broker startup. The tag
-workflow retains the mandatory real load gate. This validates released image bytes,
-not a native build of source HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
+under a deadline for its post-load socket. Pull requests use the newest published release and
+check its source tree for `crates/dekopon-console/Cargo.toml`. If that release predates the
+workspace console, the workflow runs only the staging contract tests for image validation and
+reports the gap; it skips archive staging, image builds, binary identity verification, and
+execution checks. Once the release contains the console, PRs run those checks, including broker
+component loading. Publication always stages the archives, builds both architecture images,
+verifies all three binaries against the release archives, and runs the amd64 binaries and broker
+component-load check before pushing. These checks validate released image bytes, not a native
+build of source HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
 checked in-tree components must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
 

@@ -345,8 +345,7 @@ scope remains the boundary for every other request identity.
 
 The daemon executables own their operator commands: `dekopon-gatewayd auth chatgpt` manages the
 isolated model credential before any gateway runtime/configuration, while `dekopon-brokerd`
-owns provider lifecycle operations and the bounded authenticated health probe. These are the
-only two shipped binaries; neither provides a general runner or catalog CLI.
+owns provider lifecycle operations and the bounded authenticated health probe. These are the two daemon binaries; neither provides a general runner or catalog CLI.
 The interactive [dekopon-console](../crates/dekopon-console/README.md) ships with core in the workspace release archives and container image.
 See [`cli.md`](cli.md) for authentication syntax, formats, guards, and exit codes.
 
