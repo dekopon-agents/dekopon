@@ -200,7 +200,7 @@ The [current local process boundary](#current-local-process-boundary) applies to
 
 ## Conversation memory as a trust surface
 
-**Status: current.** A route set to `mode: persistent` implements the [Conversations](gatewayd.md#conversations) contract: a history bounded by a sliding window, an idle timeout, and a process-wide ceiling, held in the gateway process's memory and replayed into the next prompt. `scope: privateConversation` is the persistent default and isolates it by authenticated subject. `scope: sharedConversation` is an explicit audience expansion inside one exact agent/transport/conversation key. `persistent` is the route default; `memory: { mode: oneShot }` opts out of replay between sessions, while same-sender steers can still join the current session.
+**Status: current.** A route set to `mode: persistent` implements the [Conversations](gatewayd.md#conversations) contract: a history bounded by a sliding window, an idle timeout, and a process-wide ceiling, held in the gateway process's memory and replayed into the next prompt. `scope: privateConversation` is the persistent default and isolates it by authenticated subject. `scope: sharedConversation` is an explicit audience expansion inside one exact agent/transport/conversation key. In a mapped channel, shared replay belongs to its space and remains across speakers, using the space principal’s grants; everyone in the channel sees it, while threads retain separate replay windows and private routes remain per subject. `persistent` is the route default; `memory: { mode: oneShot }` opts out of replay between sessions, while same-sender steers can still join the current session.
 
 ### Containment
 
@@ -274,12 +274,14 @@ Components receive no WASI, host path, environment, socket, or
 ambient I/O: an exact JSONL or durable-files import is linked to a single-use grant bound to host
 instance, invocation, capability, provider, interface, access, configured storage scope, scope
 commitment, and limits. Private conversation scope retains the authenticated subject;
-shared-conversation scope retains transport and conversation without subject; agent scope retains
-provider and agent. An agent-scope storage constraint may name `namespace: <provider id>` in owner
+shared-conversation scope retains transport and conversation without subject; space scope retains the
+agent, configured transport, optional workspace and channel, without subject, principal or thread;
+agent scope retains provider and agent. Agent scope is refused inside a mapped channel, and space
+scope is unavailable outside one. An agent-scope storage constraint may name `namespace: <provider id>` in owner
 configuration, which then stands in for the provider, so providers naming one namespace share one
 resource per agent; no provider or input can name it, the grant still binds the invoking provider,
 and broker startup refuses the key under any other scope and refuses agent-scope sets that share a
-namespace with a different interface. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
+namespace with a different interface. Scope never bypasses per-caller Cedar authorization. Shared, space and agent scope
 use stable storage continuity so different callers' effective permissions cannot rotate a shared
 resource; private storage keeps its existing authority-bound default. HTTP and storage authority cannot coexist in one v1 capability. Description and command
 resolution receive a disabled sticky context.

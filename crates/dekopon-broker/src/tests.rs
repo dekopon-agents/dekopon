@@ -1512,7 +1512,7 @@ fn a_named_namespace_outside_agent_scope_and_every_interface_mismatch_are_refuse
             set(
                 "memory",
                 StorageInterface::Jsonl,
-                StorageScope::PrivateConversation,
+                StorageScope::Space,
                 Some("chat"),
             ),
         ),
@@ -1533,7 +1533,7 @@ fn a_named_namespace_outside_agent_scope_and_every_interface_mismatch_are_refuse
             NamespaceConflict::NotAgentScope {
                 capability: "memory.recent".parse().unwrap(),
                 namespace: "chat".parse().unwrap(),
-                scope: StorageScope::PrivateConversation,
+                scope: StorageScope::Space,
             },
             NamespaceConflict::Mismatch {
                 namespace: "turso".parse().unwrap(),

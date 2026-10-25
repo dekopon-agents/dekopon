@@ -2309,6 +2309,7 @@ mod tests {
                 attestation,
                 chat_memory: None,
                 principal: None,
+                space: None,
                 cancel: CancelSignal::never(),
                 script_cancel: parking_lot::Mutex::new(None),
                 attachments: None,

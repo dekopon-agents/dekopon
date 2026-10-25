@@ -26,6 +26,7 @@ use crate::{
 enum ConversationAudience {
     Private(ExternalSubject),
     Shared,
+    Space(Box<(dekopon_core::SpaceKey, Option<String>)>),
 }
 
 /// The transport, agent, and audience together stop two agents or installations from sharing
@@ -36,7 +37,6 @@ pub(crate) struct ConversationKey {
     transport: String,
     conversation: String,
     audience: ConversationAudience,
-    space: Option<(dekopon_core::SpaceKey, Option<String>)>,
 }
 
 impl ConversationKey {
@@ -51,7 +51,6 @@ impl ConversationKey {
             transport: transport.to_owned(),
             conversation: conversation.to_owned(),
             audience: ConversationAudience::Private(subject.clone()),
-            space: None,
         }
     }
 
@@ -61,7 +60,6 @@ impl ConversationKey {
             transport: transport.to_owned(),
             conversation: conversation.to_owned(),
             audience: ConversationAudience::Shared,
-            space: None,
         }
     }
 
@@ -70,27 +68,18 @@ impl ConversationKey {
             agent: space.agent.clone(),
             transport: String::new(),
             conversation: String::new(),
-            audience: ConversationAudience::Shared,
-            space: Some((space, thread)),
+            audience: ConversationAudience::Space(Box::new((space, thread))),
         }
     }
 
     pub(crate) fn absorb(&self, digest: &mut impl Update) {
-        if let Some((space, thread)) = &self.space {
-            digest.update(&space.encode());
-            match thread {
-                Some(thread) => {
-                    digest.update(&[1]);
-                    cache_key::absorb(digest, thread.as_bytes());
+        match &self.audience {
+            ConversationAudience::Private(_) | ConversationAudience::Shared => {
+                for part in [self.agent.as_str(), &self.transport, &self.conversation] {
+                    cache_key::absorb(digest, part.as_bytes());
                 }
-                None => digest.update(&[0]),
             }
-            digest.update(&[0]);
-            return;
-        }
-
-        for part in [self.agent.as_str(), &self.transport, &self.conversation] {
-            cache_key::absorb(digest, part.as_bytes());
+            ConversationAudience::Space(_) => {}
         }
         match &self.audience {
             ConversationAudience::Private(subject) => {
@@ -98,6 +87,18 @@ impl ConversationKey {
                 cache_key::absorb(digest, subject.canonical().as_bytes());
             }
             ConversationAudience::Shared => digest.update(&[0]),
+            ConversationAudience::Space(binding) => {
+                let (space, thread) = binding.as_ref();
+                digest.update(&space.encode());
+                match thread {
+                    Some(thread) => {
+                        digest.update(&[1]);
+                        cache_key::absorb(digest, thread.as_bytes());
+                    }
+                    None => digest.update(&[0]),
+                }
+                digest.update(&[0]);
+            }
         }
     }
 

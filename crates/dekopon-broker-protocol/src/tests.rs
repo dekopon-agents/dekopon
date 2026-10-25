@@ -2927,8 +2927,9 @@ fn a_known_refusal_with_an_invalid_principal_is_malformed() {
 
 #[test]
 fn space_grants_are_optional_and_an_empty_space_remains_present() {
-    let old = ResponseEnvelope::capabilities(Vec::new(), Vec::new(), BTreeMap::new());
+    let old = ResponseEnvelope::capabilities(Vec::new(), Vec::new(), Default::default());
     let bytes = serde_json::to_vec(&old).expect("old answer");
+    assert_eq!(bytes, br#"{"apiVersion":"dekopon.dev/broker/v1alpha2","response":{"type":"capabilities","capabilities":[],"commandWords":[]}}"#);
     assert_eq!(
         serde_json::from_slice::<ResponseEnvelope>(&bytes).expect("decode"),
         old

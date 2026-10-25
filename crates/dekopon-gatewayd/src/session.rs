@@ -1979,7 +1979,7 @@ async fn session(
         key = ConversationKey::for_space(
             dekopon_core::SpaceKey {
                 agent: route.agent.clone(),
-                transport: route.transport.clone(),
+                transport: message.transport.clone(),
                 workspace: message.conversation.container.clone(),
                 channel: message.conversation.id.clone(),
             },

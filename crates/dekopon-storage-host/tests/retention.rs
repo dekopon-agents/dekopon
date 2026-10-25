@@ -248,7 +248,7 @@ fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
                 ));
                 elsewhere.finish_read().unwrap();
             }
-            StorageScope::PrivateConversation => unreachable!(),
+            StorageScope::PrivateConversation | StorageScope::Space => unreachable!(),
         }
     }
 }

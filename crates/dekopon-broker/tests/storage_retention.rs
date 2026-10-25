@@ -26,6 +26,14 @@ async fn build_broker(
     root: &std::path::Path,
     permit_bob: bool,
 ) -> (Broker<InMemoryAuditLog>, StorageHost) {
+    build_scoped_broker(root, permit_bob, StorageScope::Agent).await
+}
+
+async fn build_scoped_broker(
+    root: &std::path::Path,
+    permit_bob: bool,
+    scope: StorageScope,
+) -> (Broker<InMemoryAuditLog>, StorageHost) {
     let storage = StorageHost::open(root, StorageLimits::default()).unwrap();
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("storage-probe-provider.wasm")],
@@ -43,12 +51,14 @@ async fn build_broker(
             "alice".parse::<PrincipalId>().unwrap(),
             "bob".parse().unwrap(),
             "gateway".parse().unwrap(),
+            "space".parse().unwrap(),
         ],
         [(capability.clone(), provider.clone())],
     )
     .unwrap();
     let policy = PolicyEngine::new(
         &format!(r#"
+@id("space") permit(principal == Dekopon::Principal::"space", action, resource);
 @id("both-can-prompt")
 permit(principal,
        action == Dekopon::Action::"agent.prompt",
@@ -87,7 +97,7 @@ when { context.via == "gateway" && context.agent == "reviewer" };
                     storage: Some(StorageConstraints {
                         interface: StorageInterface::DurableFiles,
                         access: StorageAccess::ReadWrite,
-                        scope: StorageScope::Agent,
+                        scope,
                         retention: StorageRetention::IdleTtl(Duration::from_secs(30)),
                         namespace: None,
                     }),
@@ -100,6 +110,14 @@ when { context.via == "gateway" && context.agent == "reviewer" };
         IdentityDirectory::new([
             (alice.clone(), "alice".parse().unwrap()),
             (bob.clone(), "bob".parse().unwrap()),
+            (
+                "slack.t0123abc.cspace".parse().unwrap(),
+                "space".parse().unwrap(),
+            ),
+            (
+                "slack.t0123abc.cspace2".parse().unwrap(),
+                "space".parse().unwrap(),
+            ),
         ])
         .unwrap(),
         Arc::new(InMemoryAuditLog::new(12).unwrap()),
@@ -242,4 +260,141 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
             .deleted,
         0
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audience() {
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().unwrap(),
+        Actor::Service {
+            principal: "gateway".parse().unwrap(),
+        },
+    )
+    .unwrap();
+    let grant = AttestorGrant {
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+    };
+    for scope in [StorageScope::Agent, StorageScope::Space] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap().join("storage");
+        let (broker, _) = build_scoped_broker(&root, false, scope).await;
+        for (index, (kind, channel, mapped)) in [
+            (ConversationKind::DirectMessage, "d0123abc", false),
+            (ConversationKind::Channel, "cunmapped", false),
+            (ConversationKind::Channel, "cspace", true),
+            (ConversationKind::Thread, "cspace", true),
+            (ConversationKind::Channel, "cspace2", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = InvocationRequest {
+                id: format!("scope-check-{index}").parse().unwrap(),
+                capability: "storage-probe.run".parse().unwrap(),
+                trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+                    .parse()
+                    .unwrap(),
+                input: json!({"mode":"success"}),
+                secret_use: None,
+            };
+            let claim = Attestation::for_chat(
+                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "reviewer".parse().unwrap(),
+                ChatScopeClaim {
+                    transport: "scientist-slack".parse().unwrap(),
+                    kind: ChatTransportKind::Slack,
+                    conversation: Conversation {
+                        kind,
+                        container: Some("t0123abc".to_owned()),
+                        id: channel.to_owned(),
+                        thread: Some("1712345678.000100".to_owned()),
+                    },
+                    trigger: Trigger::Message,
+                    delivery: None,
+                },
+            )
+            .bound_to(request.id.clone());
+            let allowed = match scope {
+                StorageScope::Agent => !mapped,
+                StorageScope::Space => mapped,
+                StorageScope::PrivateConversation | StorageScope::SharedConversation => {
+                    unreachable!()
+                }
+            };
+            let surface = broker
+                .session_surface(&gateway, Some(&grant), Some(&claim))
+                .unwrap_or_else(|_| panic!("session surface refused"));
+            assert_eq!(surface.0.len(), usize::from(allowed));
+            assert_eq!(
+                broker.space_grants(&gateway, Some(&grant), Some(&claim)),
+                mapped.then(|| if allowed {
+                    vec!["storage-probe.run".parse().unwrap()]
+                } else {
+                    vec![]
+                })
+            );
+            let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+            let capture = tokio::task::spawn_blocking(move || {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+                bytes
+            });
+            if mapped && scope == StorageScope::Space {
+                let mut other = claim.clone();
+                other.subject = "slack.t0123abc.u8xyz".parse().unwrap();
+                assert!(
+                    broker
+                        .session_surface(&gateway, Some(&grant), Some(&other))
+                        .unwrap_or_else(|_| panic!("surface"))
+                        .0
+                        .is_empty()
+                );
+                assert_eq!(
+                    broker.space_grants(&gateway, Some(&grant), Some(&other)),
+                    Some(vec!["storage-probe.run".parse().unwrap()])
+                );
+            }
+            let result = broker
+                .invoke(
+                    &gateway,
+                    Some(&grant),
+                    Some(&claim),
+                    request,
+                    dekopon_broker_host::asset::AssetInputs {
+                        streams: Some(dekopon_broker_host::Streams {
+                            stdin: None,
+                            stdout: host.into(),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let output = capture.await.unwrap();
+            assert_eq!(result.result.outcome == InvocationOutcome::Denied, !allowed);
+            if scope == StorageScope::Space && kind == ConversationKind::Channel && mapped {
+                assert_eq!(
+                    result.result.outcome,
+                    InvocationOutcome::Succeeded,
+                    "{result:?}"
+                );
+            }
+            if index == 0 && scope == StorageScope::Agent {
+                assert_eq!(
+                    result.result.outcome,
+                    InvocationOutcome::Succeeded,
+                    "{result:?}"
+                );
+                let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(output["shortReadBytes"], 3);
+            }
+        }
+        assert!(
+            broker
+                .session_surface(&gateway, None, None)
+                .unwrap_or_else(|_| panic!("console surface refused"))
+                .0
+                .is_empty()
+        );
+    }
 }

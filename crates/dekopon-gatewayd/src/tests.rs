@@ -22607,14 +22607,17 @@ async fn space_shared_replay_keeps_the_window_when_speakers_grants_differ() {
         let models = ModelScript::new([answer("first answer"), answer("second answer")]);
         let driver = Arc::new(RecordingDriver::default());
         let runner = runner(broker, Arc::clone(&models), 4);
-        let route = persistent_route(
+        let mut route = persistent_route(
             model_config(),
             if private { window() } else { shared_window() },
         );
-        for inbound in [
-            message_from(SUBJECT, "first question"),
-            message_from("tel.16035550100", "second question"),
-        ] {
+        route.transport = "scientist-slack".to_owned();
+        let (capture, _guard) = capture_spans();
+        let first = owned_slack_message("first question", false);
+        let mut second = owned_slack_message("second question", false);
+        second.subject = "slack.t0123abc.u8xyz".parse().expect("second speaker");
+        second.thread_continuation = None;
+        for inbound in [first, second] {
             run_session(
                 Arc::clone(&runner),
                 route.clone(),
@@ -22630,7 +22633,59 @@ async fn space_shared_replay_keeps_the_window_when_speakers_grants_differ() {
                 .any(|(_, text)| text == "first answer"),
             replays
         );
-        assert_eq!(models.cache_key(0) == models.cache_key(1), replays);
+        let grant_changes = capture.events_where(
+            "dekopon_gatewayd::conversation",
+            &[
+                ("event", "gateway_conversation_evicted"),
+                ("reason", "grant-changed"),
+            ],
+        );
+        assert_eq!(grant_changes.len(), usize::from(!space && !private));
+        assert_eq!(models.cache_key(0) == models.cache_key(1), !private);
         assert_eq!(runner.conversations.tracked(), if private { 2 } else { 1 });
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_asker_grant_does_not_evict_the_space_window() {
+    let directory = temporary();
+    let responses = [vec!["cli-probe.upper"], vec![], vec!["cli-probe.reverse"]].map(|ids| {
+        listings(1, &ids)
+            .remove(0)
+            .with_space(Some(vec!["cli-probe.upper".parse().expect("capability")]))
+    });
+    let (broker, _observed) = stub_broker(directory.path(), responses.into()).await;
+    let models = ModelScript::new([answer("retained answer"), answer("continued answer")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut route = persistent_route(model_config(), shared_window());
+    route.transport = "scientist-slack".to_owned();
+    let (capture, _guard) = capture_spans();
+    for text in ["first question", "refused question", "next question"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            owned_slack_message(text, false),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(_, text)| text == "retained answer")
+    );
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd::conversation",
+                &[
+                    ("event", "gateway_conversation_evicted"),
+                    ("reason", "grant-changed")
+                ]
+            )
+            .is_empty()
+    );
+    assert_eq!(driver.replies().len(), 3);
 }
