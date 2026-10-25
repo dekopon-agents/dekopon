@@ -471,7 +471,7 @@ impl ChatModel for ChatProviderGovernor {
         let fresh = messages.get(seen..).unwrap_or(messages);
         let estimate = Estimate::from_sizes(
             Sizes {
-                bytes: json_bytes(messages).saturating_add(json_bytes(tools)),
+                bytes: json_bytes(messages).saturating_add(serialized_bytes(tools)),
                 images: images(messages),
             },
             Some((
@@ -541,8 +541,21 @@ impl std::io::Write for ByteCount {
     }
 }
 
-/// Image and file bytes serialize as a short summary, so this counts text and structure only.
-fn json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+fn json_bytes(messages: &[ModelMessage]) -> usize {
+    let digest_bytes = messages
+        .iter()
+        .filter_map(ModelMessage::parts)
+        .flatten()
+        .filter(|part| match part {
+            ContentPart::Image { data, .. } => data.sha256().is_some(),
+            ContentPart::Text(_) | ContentPart::File { .. } => false,
+        })
+        .count()
+        .saturating_mul(72);
+    serialized_bytes(messages).saturating_sub(digest_bytes)
+}
+
+fn serialized_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     let mut count = ByteCount(0);
     match serde_json::to_writer(&mut count, value) {
         Ok(()) => count.0,
@@ -641,6 +654,33 @@ mod tests {
     }
 
     #[test]
+    fn reading_images_does_not_change_metered_json_bytes() {
+        let data: dekopon_model::asset::BlobReference =
+            dekopon_model::asset::DiskBlob::from_bytes(b"pixels")
+                .unwrap()
+                .into();
+        let image = ContentPart::Image {
+            mime: "image/png".to_owned(),
+            data: data.clone(),
+        };
+        let messages = [ModelMessage::user_with_parts(vec![
+            image.clone(),
+            image,
+            ContentPart::File {
+                name: "pixels.bin".to_owned(),
+                mime: "application/octet-stream".to_owned(),
+                data: data.clone(),
+            },
+            ContentPart::Text(format!(" sha256:{}", "0".repeat(64))),
+        ])];
+        let before = json_bytes(&messages);
+        assert_eq!(before, serialized_bytes(&messages));
+        data.read().unwrap();
+        assert_eq!(serialized_bytes(&messages), before + 2 * 72);
+        assert_eq!(json_bytes(&messages), before);
+    }
+
+    #[test]
     fn a_refused_call_never_reaches_the_inner_model() {
         let metering = metering(10);
         let inner = streaming(None);
@@ -671,7 +711,7 @@ mod tests {
         let input = Estimate::from_sizes(
             Sizes {
                 bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
-                    + json_bytes::<[ModelTool]>(&[]),
+                    + serialized_bytes::<[ModelTool]>(&[]),
                 images: 0,
             },
             None,
@@ -754,7 +794,7 @@ mod tests {
         let estimated_input = Estimate::from_sizes(
             Sizes {
                 bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
-                    + json_bytes::<[ModelTool]>(&[]),
+                    + serialized_bytes::<[ModelTool]>(&[]),
                 images: 0,
             },
             None,

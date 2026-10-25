@@ -263,7 +263,7 @@ impl BlobReference {
         });
         Ok(bytes)
     }
-    pub(crate) fn sha256(&self) -> Option<&str> {
+    pub fn sha256(&self) -> Option<&str> {
         self.sha256.get().map(String::as_str)
     }
     pub fn pin(&self) -> Result<DiskBlob, BlobError> {

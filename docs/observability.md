@@ -23,8 +23,8 @@ log exporter loses audit; that is the accepted consequence of the constitution's
 crash-durable audit ([non-goals](design.md#non-goals)).
 
 **A span is a span of time; a log is a fact that is not a duration.** A log event justifies itself
-as a payload — text too large or too unbounded for a span attribute, the model and tool transcript
-below — or as a survivor: costs, refusals, and errors, which outlive trace retention and sampling.
+as a payload — text too large or too unbounded for a span attribute — or as a survivor: costs,
+refusals, and errors, which outlive trace retention and sampling.
 An `X.started` event is neither, because the span's start time is strictly better and carries
 parent and duration besides.
 
@@ -251,10 +251,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never
-reduced to a category — because a suggestion nobody can read is not a suggestion. Unlike a model's
-own prompt and answer text, which rides the log stream only when the embedding binary opts into
-payload telemetry, this record is unconditional: offering `suggest_improvement` is itself what puts
-the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
+reduced to a category — because a suggestion nobody can read is not a suggestion. This record is
+unconditional: offering `suggest_improvement` is itself what puts the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
 the model wrote into those fields.
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
@@ -1134,7 +1132,7 @@ withholds half of it serves nobody the constitution recognizes ([goal
 | `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — argv, drained provider or buffered-builtin input when recorded, and the rendered command result |
 | `provider.run_command` | `command.arguments`, `command.stdin`, `command.output` — the argv, the piped value, and the guest's answer |
 | `http.request` | `url.full` — the destination with its path and query |
-| model/tool log events | the verbatim transcript; see below |
+| model/tool span events | the verbatim transcript; see below |
 
 The six command fields and both `input` fields cut at the same place. A value of up to 4096 bytes
 passes unchanged; a longer one is cut at the last character boundary within 4096 bytes and suffixed
@@ -1198,7 +1196,7 @@ A mounted skill takes the same route as that meta result. The listing the model 
 one-line descriptions under one sentence that says to call `read_skill` — is a system message of its own,
 placed after the standing instructions, so it rides the first turn's `full` `agent.model.prompt`.
 The skill's text does not: a `read_skill` result is appended to the conversation like any other tool
-message and reaches the log stream only inside the following turn's `agent.model.prompt` delta.
+message and reaches the message trace only inside the following turn's `agent.model.prompt` delta.
 Neither `agent.tool.script` nor `agent.tool.output` fires for a skill read; `agent.skill.read`
 records the name, the path, and the byte count.
 
