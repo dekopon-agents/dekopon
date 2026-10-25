@@ -3531,8 +3531,9 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     let (candidate, boot_report) = super::load_candidate(&path, super::Mode::Boot).await;
     assert!(boot_report.problems.is_empty(), "{boot_report:?}");
     let candidate = candidate.expect("serving conditional-write configuration");
+    assert!(report.policy_digest.is_none());
     assert_eq!(
-        report.policy_digest.as_deref(),
+        boot_report.policy_digest.as_deref(),
         Some(candidate.ready.broker.policy_digest())
     );
     assert_eq!(
