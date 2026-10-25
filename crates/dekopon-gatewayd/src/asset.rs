@@ -2510,6 +2510,43 @@ mod retention_tests {
     }
 
     #[test]
+    fn a_post_publish_io_failure_never_leaves_uncounted_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(directory.path())
+            .unwrap();
+        let access = access("late-io");
+        let id = register(&store, &access);
+        store.retention.lock().after_publish_error = Some(std::io::ErrorKind::StorageFull);
+        assert_eq!(
+            store.admit(&access, id, b"aaa"),
+            Err(BlobError::Io(std::io::ErrorKind::StorageFull))
+        );
+        assert!(matches!(
+            row_mut(&mut store.entries.lock(), &access.key, id)
+                .unwrap()
+                .state,
+            Attachment::NotStored(StoreFailure::Io)
+        ));
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("blobs"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(store.retention.lock().bytes, 3);
+        let next = register(&store, &access);
+        drop(store.admit(&access, next, b"bbb").unwrap());
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("blobs"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(store.retention.lock().bytes, 3);
+    }
+
+    #[test]
     fn lru_use_a_admit_c_evicts_b_and_listing_does_not_touch() {
         let store = store(6);
         let access = access("one");

@@ -101,6 +101,8 @@ pub(crate) struct Retention {
     index: Index,
     references: HashSet<StoredKey>,
     orphans: Vec<DiskBlob>,
+    #[cfg(test)]
+    pub(super) after_publish_error: Option<io::ErrorKind>,
 }
 
 impl Retention {
@@ -112,6 +114,8 @@ impl Retention {
             dir: None,
             references: HashSet::new(),
             orphans: Vec::new(),
+            #[cfg(test)]
+            after_publish_error: None,
             index: Index {
                 version: 2,
                 clock: 0,
@@ -497,7 +501,8 @@ impl Retention {
         if !self.resident(&digest) {
             self.reserve(asset.id, data.len())?;
             let owned = if let Some(dir) = &self.dir {
-                let mut file = tempfile::NamedTempFile::new_in(dir.join("blobs"))?;
+                let blobs = dir.join("blobs");
+                let mut file = tempfile::NamedTempFile::new_in(&blobs)?;
                 let mut offset = 0;
                 while offset < data.len() {
                     let len = buffer.len().min(data.len() - offset);
@@ -506,30 +511,40 @@ impl Retention {
                     offset += len;
                 }
                 file.as_file().sync_all()?;
-                file.persist(dir.join("blobs").join(&digest))
+                file.persist(blobs.join(&digest))
                     .map_err(|error| error.error)?;
-                File::open(dir.join("blobs"))?.sync_all()?;
-                DiskBlob::from_descriptor(
-                    File::open(dir.join("blobs").join(&digest))?.into(),
-                    data.len(),
-                )?
+                self.charge(digest.clone(), data.len(), None);
+                #[cfg(test)]
+                if let Some(kind) = self.after_publish_error.take() {
+                    return Err(BlobError::Io(kind));
+                }
+                File::open(&blobs)?.sync_all()?;
+                DiskBlob::from_descriptor(File::open(blobs.join(&digest))?.into(), data.len())?
             } else {
                 data
             };
-            self.index.clock += 1;
-            self.bytes += owned.len().max(1);
-            self.index.files.insert(
-                digest.clone(),
-                StoredFile {
-                    len: owned.len(),
-                    used: self.index.clock,
-                    resident: true,
-                    data: Some(owned),
-                },
-            );
+            if self.dir.is_none() {
+                self.charge(digest.clone(), owned.len(), Some(owned));
+            } else if let Some(file) = self.index.files.get_mut(&digest) {
+                file.data = Some(owned);
+            }
         }
         self.bind(key, asset, digest.clone())?;
         Ok(digest)
+    }
+
+    fn charge(&mut self, digest: String, len: usize, data: Option<DiskBlob>) {
+        self.index.clock += 1;
+        self.bytes += len.max(1);
+        self.index.files.insert(
+            digest,
+            StoredFile {
+                len,
+                used: self.index.clock,
+                resident: true,
+                data,
+            },
+        );
     }
 
     fn bind(
