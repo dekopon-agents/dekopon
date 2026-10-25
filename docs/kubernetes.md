@@ -650,8 +650,8 @@ essential workflows, every `*.yaml` key, passed to the broker check as `--workfl
 format is in the brokerd README. After the candidate providers and policy load, each step's argv
 runs through its provider's `run-command` and the serving broker's attestation and Cedar
 decisions, offline: no model, no HTTP request, no credential. A step is refused as `parse` when the
-argv does not propose the step's capability, as `grant` when the attestation, the capability or
-its secret use is denied, and as `budget` when it declares more `requests` than the capability's
+argv does not propose the step's capability, as `grant` when the attestation or the capability is
+denied, and as `budget` when it declares more `requests` than the capability's
 `constraints.http.maxRequests`. Each refused step is one problem,
 `would break essential workflows: <workflow>: <step>: <check>: <detail>`, and fails the hook.
 Empty, the default, runs no workflow check.

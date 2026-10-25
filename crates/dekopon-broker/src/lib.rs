@@ -2043,8 +2043,6 @@ where
         })
     }
 
-    /// The serving secret-use decision on an allowed [`CapabilityDecision`];
-    /// `dekopon-brokerd check --workflows` relies on it being the decision `invoke` makes.
     pub fn bind_secret_use(
         &self,
         context: &AuthenticatedContext,

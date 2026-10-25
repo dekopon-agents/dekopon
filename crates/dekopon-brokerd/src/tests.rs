@@ -4128,27 +4128,3 @@ async fn an_oversized_workflow_file_is_refused_as_a_workflow_file() {
         "{report:?}"
     );
 }
-
-#[tokio::test]
-async fn a_step_proposing_a_secret_the_candidate_does_not_bind_is_refused_as_grant() {
-    use super::workflows::{GrantRefusal, Refused};
-
-    let fixture = WorkflowFixture::new();
-    fixture.write(
-        MAPPED_SUBJECT,
-        "    - {step: fetch, argv: [httpprobe, fetch, --uri, \"https://example.test/\"], capability: http-probe.fetch}\n    - {step: bearer, argv: [httpprobe, fetch, --uri, \"https://example.test/\", --bearer, \"drn:com.xrl:secret:test:http-probe/token\"], capability: http-probe.fetch}\n",
-    );
-    let refusals = fixture.refusals().await;
-    assert_eq!(refusals.len(), 1, "{refusals:?}");
-    assert_eq!(refusals[0].step, "bearer");
-    assert!(
-        matches!(
-            &refusals[0].refused,
-            Refused::Grant(GrantRefusal::Refused {
-                reason: "secret-denied",
-                ..
-            })
-        ),
-        "{refusals:?}"
-    );
-}

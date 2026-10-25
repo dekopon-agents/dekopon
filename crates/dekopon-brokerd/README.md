@@ -89,9 +89,8 @@ policy pinned to one real `context.conversation.id` denies in the check though i
 `argv` is literal:
 `argv[0]` is the command word. Each step, in order, must pass `grant` (the attestation resolves as
 the serving broker resolves it, `agent.prompt` included), `parse` (the provider's `run-command`
-proposes exactly `capability`), `grant` again for that capability and for the secret use the
-proposal names or the capability defaults to (its `secret.use` policy and binding), and, when
-`requests` is set, `budget` (`constraints.http.maxRequests` is at least `requests`; a capability without
+proposes exactly `capability`), `grant` again for that capability, and, when `requests` is set,
+`budget` (`constraints.http.maxRequests` is at least `requests`; a capability without
 `constraints.http` allows none). The first failure is one problem,
 `would break essential workflows: <workflow>: <step>: <check>: <detail>`. Unknown keys, an empty
 workflow map or step list, `requests: 0` and a directory with no `*.yaml` file are refused when

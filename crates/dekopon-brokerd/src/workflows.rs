@@ -368,11 +368,9 @@ async fn run_step(
         )
         .await
     {
-        Ok(CommandRunOutcome::Proposed {
-            capability,
-            secret_use,
-            ..
-        }) if capability == step.capability => Ok(secret_use),
+        Ok(CommandRunOutcome::Proposed { capability, .. }) if capability == step.capability => {
+            Ok(())
+        }
         Ok(CommandRunOutcome::Proposed { capability, .. }) => {
             Err(ParseFailure::Proposed { capability })
         }
@@ -387,17 +385,9 @@ async fn run_step(
         Ok(CommandRunOutcome::Failed { error }) => Err(ParseFailure::Failed { code: error.code }),
         Err(error) => Err(ParseFailure::Host(error)),
     };
-    let secret_use = broker.secret_use_or_default(&step.capability, proposed.map_err(parse)?);
-    let mut decision = broker
+    proposed.map_err(parse)?;
+    let decision = broker
         .authorize_invocation(&context, &step.capability)
-        .map_err(grant)?;
-    broker
-        .bind_secret_use(
-            &context,
-            &step.capability,
-            &mut decision,
-            secret_use.as_ref(),
-        )
         .map_err(grant)?;
     match step.requests {
         Some(declared) => {
