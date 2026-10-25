@@ -97,6 +97,8 @@ pub(crate) struct Retention {
     index: Index,
     references: HashSet<StoredKey>,
     orphans: Vec<DiskBlob>,
+    starting: bool,
+    publications: Vec<Weak<PublicationRange>>,
     #[cfg(test)]
     pub(super) after_publish_error: Option<io::ErrorKind>,
 }
@@ -110,6 +112,8 @@ impl Retention {
             dir: None,
             references: HashSet::new(),
             orphans: Vec::new(),
+            starting: false,
+            publications: Vec::new(),
             #[cfg(test)]
             after_publish_error: None,
             index: Index {
@@ -135,6 +139,7 @@ impl Retention {
         }
         let mut store = Self::new(budget);
         store.dir = Some(dir.to_owned());
+        store.starting = true;
         store.index = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -155,17 +160,6 @@ impl Retention {
         if store.index.version != 2 {
             return Err(BlobError::Io(io::ErrorKind::InvalidData));
         }
-        store
-            .index
-            .bindings
-            .retain(|binding| binding.retained && binding.class == Refill::Platform);
-        let named: HashSet<_> = store
-            .index
-            .bindings
-            .iter()
-            .filter_map(|binding| binding.digest.clone())
-            .collect();
-        store.index.files.retain(|digest, _| named.contains(digest));
         for (digest, file) in &mut store.index.files {
             if digest.len() != 64
                 || !digest
@@ -186,17 +180,6 @@ impl Retention {
                 Ok(_) => file.resident = false,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => file.resident = false,
                 Err(error) => return Err(error.into()),
-            }
-        }
-        for entry in fs::read_dir(dir.join("blobs"))? {
-            let path = entry?.path();
-            let keep = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|digest| store.index.files.get(digest))
-                .is_some_and(|file| file.resident);
-            if !keep {
-                fs::remove_file(path)?;
             }
         }
         match fs::remove_file(dir.join("index.pending")) {
@@ -605,7 +588,12 @@ impl Retention {
             }
             let stored = StoredKey::of(key, &row.asset);
             if self.dir.is_none()
-                || (key.generation.is_none() && !self.references.contains(&stored))
+                || (!self.references.contains(&stored)
+                    && !self
+                        .publications
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .any(|publication| publication.contains(key, stored.id)))
                 || row
                     .asset
                     .source
@@ -690,14 +678,111 @@ impl Retention {
 
     pub(crate) fn reconcile(&mut self, references: &HashSet<StoredKey>) -> Result<(), BlobError> {
         self.references.clone_from(references);
+        let starting = self.starting;
         self.index.bindings.retain_mut(|binding| {
-            if references.contains(&binding.key) {
+            if references.contains(&binding.key) && (!starting || binding.class == Refill::Platform)
+            {
                 binding.retained = true;
                 true
             } else {
-                !binding.retained
+                !starting && !binding.retained
             }
         });
-        self.collect()
+        self.collect()?;
+        if starting {
+            // The journal must recover committed pending bindings before crash leftovers are swept.
+            if let Some(dir) = &self.dir {
+                for entry in fs::read_dir(dir.join("blobs"))? {
+                    let path = entry?.path();
+                    let keep = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|digest| self.index.files.get(digest))
+                        .is_some_and(|file| file.resident);
+                    if !keep {
+                        fs::remove_file(path)?;
+                    }
+                }
+            }
+            self.starting = false;
+        }
+        Ok(())
+    }
+}
+
+struct PublicationRange {
+    key: AssetStateKey,
+    first: u64,
+    end: AtomicU64,
+}
+
+impl PublicationRange {
+    fn contains(&self, key: &AssetStateKey, id: u64) -> bool {
+        self.key == *key && (self.first..self.end.load(Ordering::Acquire)).contains(&id)
+    }
+}
+
+pub(crate) struct Publication {
+    retention: Arc<Mutex<Retention>>,
+    access: AssetAccess,
+    range: Arc<PublicationRange>,
+}
+
+impl Publication {
+    pub(super) fn new(retention: &Arc<Mutex<Retention>>, access: &AssetAccess) -> Self {
+        let range = Arc::new(PublicationRange {
+            key: access.key.clone(),
+            first: access.next_asset_id(),
+            end: AtomicU64::new(u64::MAX),
+        });
+        retention.lock().publications.push(Arc::downgrade(&range));
+        Self {
+            retention: Arc::clone(retention),
+            access: access.clone(),
+            range,
+        }
+    }
+
+    pub(crate) fn seal(self) -> Self {
+        self.range
+            .end
+            .store(self.access.next_asset_id(), Ordering::Release);
+        self
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        let mut retention = self.retention.lock();
+        retention
+            .publications
+            .retain(|publication| !publication.ptr_eq(&Arc::downgrade(&self.range)));
+        let references = &retention.references;
+        let discard: HashSet<_> = retention
+            .index
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.class == Refill::Platform
+                    && binding.key.stem == self.range.key.conversation.journal_stem()
+                    && binding.key.grant == *self.range.key.grant
+                    && (self.range.first
+                        ..self
+                            .range
+                            .end
+                            .load(Ordering::Acquire)
+                            .min(self.access.next_asset_id()))
+                        .contains(&binding.key.id)
+                    && !references.contains(&binding.key)
+            })
+            .map(|binding| binding.key.clone())
+            .collect();
+        retention
+            .index
+            .bindings
+            .retain(|binding| !discard.contains(&binding.key));
+        if let Err(error) = retention.collect() {
+            tracing::warn!(%error, "gateway.asset.reclaim.failed");
+        }
     }
 }

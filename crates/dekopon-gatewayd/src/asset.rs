@@ -4,7 +4,7 @@
 
 mod storage;
 use storage::StoreFailure;
-pub(crate) use storage::{Retention, StoredKey};
+pub(crate) use storage::{Publication, Retention, StoredKey};
 
 use parking_lot::Mutex;
 use std::{
@@ -359,6 +359,10 @@ impl AssetStore {
         journal: &crate::memory::journal::Journal,
     ) -> Result<(), crate::memory::journal::JournalError> {
         journal.attach_assets(&self.retention)
+    }
+
+    pub(crate) fn publication(&self, access: &AssetAccess) -> Publication {
+        Publication::new(&self.retention, access)
     }
 
     pub(crate) fn report_startup(&self) -> Result<(), BlobError> {
@@ -1923,6 +1927,113 @@ mod retention_tests {
     }
 
     #[test]
+    fn restart_recovers_a_journaled_upload_before_discarding_pending_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("journal");
+        let journal = crate::memory::journal::Journal::open(
+            &journal_path,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let access = access("interrupted");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let id = register(&store, &access);
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        let inventory = store.inventory(&access);
+        let uncommitted = register(&store, &access);
+        drop(store.admit(&access, uncommitted, b"bbb").unwrap());
+        drop(store);
+        // Appending without the dead store reproduces a crash before index reconciliation.
+        journal_inventory(&journal, &access, &inventory, SystemTime::now());
+        drop(journal);
+        let journal = crate::memory::journal::Journal::open(
+            &journal_path,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let recalled = journal
+            .recall(
+                &access.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &access,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        assert_eq!(
+            store
+                .pin(&access, id, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+        assert_eq!(store.retention.lock().bytes, 3);
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn terminal_publication_reclaims_unjournaled_uploads_but_protects_live_handoffs() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 9)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let cancelled = access("cancelled");
+        let pending = store.publication(&cancelled);
+        let id = register(&store, &cancelled);
+        drop(store.admit(&cancelled, id, b"aaa").unwrap());
+        let pending = pending.seal();
+        cancelled.fence.as_ref().unwrap().deactivate();
+        store.inventory(&access("sweep"));
+        journal_inventory(&journal, &access("unrelated"), &[], SystemTime::now());
+        assert_eq!(store.retention.lock().bytes, 3);
+        drop(pending);
+        assert_eq!(store.retention.lock().bytes, 0);
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 0);
+        let committed = access("committed");
+        let pending = store.publication(&committed);
+        let id = register(&store, &committed);
+        drop(store.admit(&committed, id, b"bbb").unwrap());
+        journal_inventory(
+            &journal,
+            &committed,
+            &store.inventory(&committed),
+            SystemTime::now(),
+        );
+        drop(pending);
+        let aborted = store.publication(&committed);
+        let id = register(&store, &committed);
+        drop(store.admit(&committed, id, b"ccc").unwrap());
+        drop(aborted);
+        assert_eq!(store.retention.lock().bytes, 3);
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
+    }
+
+    #[test]
     fn restart_restores_inbound_residency_and_evicts_unrecalled_files_by_persisted_recency() {
         let directory = tempfile::tempdir().unwrap();
         let journal = crate::memory::journal::Journal::open(
@@ -2240,6 +2351,13 @@ mod retention_tests {
         let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
             .with_storage(directory.path())
             .unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        store.attach_journal(&journal).unwrap();
         assert_eq!(store.retention.lock().bytes, 0);
         assert_eq!(
             std::fs::read_dir(directory.path().join("blobs"))

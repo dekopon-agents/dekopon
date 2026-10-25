@@ -229,10 +229,13 @@ configured ChatGPT subdirectory. Neither daemon can rename the other's directory
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
 `/tmp` volume. The broker alone mounts provider storage. The broker alone mounts broker assets.
 
-Gateway `/tmp` is **disk-backed** `emptyDir`, sized by `volumeSizes.gatewayTmp` (default 320Mi).
+Gateway `/tmp` is **disk-backed** `emptyDir`, sized by `volumeSizes.gatewayTmp` (default 1152Mi).
 Existing `volumeSizes.tmp` overrides now affect only broker scratch (still tmpfs, default 16Mi);
-set `gatewayTmp` explicitly when migrating a custom scratch limit. Chat assets hold at most 256 MiB
-of live payload bytes per gateway process, independently enforced before writing. The extra space
+set `gatewayTmp` explicitly when migrating a custom scratch limit. Chat assets share a 1 GiB default retention budget. With `sessions.journal`, the required
+`sessions.assets.path` stores content-addressed inbound files and their index on the state claim;
+the journal and asset chart mounts must be enabled together. Without a journal, retained assets
+use gateway temporary disk and do not survive restart. Generated files are session-only in either
+mode. The gateway enforces the budget before admission. The extra space
 is headroom for filesystem overhead and other gateway scratch consumers, not an eviction guarantee.
 Kubernetes `emptyDir.sizeLimit` is kubelet-enforced, not a reservation or synchronous write quota;
 node ephemeral-storage pressure can still evict the pod. Outside this chart, configure the process

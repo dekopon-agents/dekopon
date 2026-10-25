@@ -288,6 +288,7 @@ pub(crate) struct PostReply {
     pub key: ConversationKey,
     pub granted: Vec<String>,
     pub access: AssetAccess,
+    pub publication: crate::asset::Publication,
     pub window: MemoryWindow,
     pub turn: ConversationTurn,
 }
@@ -340,6 +341,7 @@ async fn persist_turn(
         key,
         granted,
         access,
+        publication,
         window,
         turn,
     } = reply;
@@ -421,6 +423,7 @@ async fn persist_turn(
     let published = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = span.enter();
+            let _publication = publication;
             journal.append(
                 &stem,
                 &journal::Entry {
