@@ -167,7 +167,7 @@ impl PipeReader {
             if stopped.load(atomic::Ordering::Relaxed) {
                 return Ok(ReadOutcome::End);
             }
-            if budget.tree().cancel().is_cancelled() {
+            if budget.tree().is_cancelled() {
                 return Err(LimitExceeded::Cancelled);
             }
             budget.check_deadline()?;
@@ -273,23 +273,6 @@ mod tests {
     use super::*;
     use dekopon_process::Limits;
 
-    struct Idle;
-
-    impl CapabilityInvoker for Idle {
-        fn granted(&self) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn invoke(
-            &self,
-            _proposal: crate::CommandProposal,
-            _streams: crate::Streams,
-            _tree: &dekopon_process::TreeContext,
-        ) -> crate::CapabilityCallResult {
-            unreachable!("pipe tests never invoke")
-        }
-    }
-
     #[test]
     fn a_line_read_leaves_the_rest_of_the_chunk_for_the_next_reader() {
         let budget = Budget::start(Limits::default());
@@ -298,19 +281,16 @@ mod tests {
         drop(writer);
         assert_eq!(
             reader
-                .read_line(&budget, &Idle)
+                .read_line(&budget)
                 .expect("reads")
                 .map(|line| line.bytes),
             Some(b"a".to_vec())
         );
         assert_eq!(
-            reader.read(&budget, &Idle).expect("reads"),
+            reader.read(&budget).expect("reads"),
             ReadOutcome::Bytes(b"bc".to_vec())
         );
-        assert_eq!(
-            reader.read(&budget, &Idle).expect("reads"),
-            ReadOutcome::End
-        );
+        assert_eq!(reader.read(&budget).expect("reads"), ReadOutcome::End);
     }
 
     #[test]
@@ -323,7 +303,7 @@ mod tests {
         assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
         drop(writer);
         assert!(matches!(
-            reader.read_line(&budget, &Idle),
+            reader.read_line(&budget),
             Err(LimitExceeded::ValueBytes { maximum: 12 })
         ));
         assert_eq!(budget.value_bytes(), 0);
@@ -337,7 +317,7 @@ mod tests {
         });
         let (_writer, mut reader) = pipe();
         assert!(matches!(
-            reader.read(&budget, &Idle),
+            reader.read(&budget),
             Err(LimitExceeded::Deadline { .. })
         ));
     }

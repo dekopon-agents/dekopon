@@ -445,7 +445,7 @@ impl Builtin for Sleep {
         let requested = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX);
         let mut left = requested;
         loop {
-            if context.budget.tree().cancel().is_cancelled() {
+            if context.budget.tree().is_cancelled() {
                 return Err(LimitExceeded::Cancelled.into());
             }
             context.budget.check_deadline()?;

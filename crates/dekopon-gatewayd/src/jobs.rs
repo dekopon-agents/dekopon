@@ -632,7 +632,10 @@ impl JobContext {
     }
 
     fn run(&self, seed: JobSeed, tree: &TreeContext, signal: CancelSignal) -> Ended {
-        let tree = tree.clone().with_cancel(signal.clone());
+        let tree = tree
+            .clone()
+            .with_cancel(vec![signal.clone()])
+            .with_script_timeout(None);
         let Some(leg) = self.connect(signal) else {
             return Ended {
                 exit: ExitCode::FAILURE,

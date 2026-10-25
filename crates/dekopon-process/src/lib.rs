@@ -83,9 +83,7 @@ impl CancelSignal {
 
     #[must_use]
     pub fn never() -> Self {
-        let (sender, receiver) = watch::channel(false);
-        drop(sender);
-        Self { receiver }
+        Self::pair().1
     }
 
     #[must_use]
@@ -99,14 +97,8 @@ impl CancelSignal {
     }
 
     pub async fn cancelled(&self) {
-        let mut receiver = self.watch();
-        loop {
-            if *receiver.borrow_and_update() {
-                return;
-            }
-            if receiver.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
+        if self.watch().wait_for(|cancelled| *cancelled).await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }

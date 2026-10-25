@@ -71,7 +71,8 @@ pub struct ShellRuntime<I> {
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str) -> ScriptOutcome {
         let tree = TreeContext::new(self.limits, self.calls.clone())
-            .with_cancel(self.invoker.cancel_signal());
+            .with_cancel(self.invoker.cancel_signals())
+            .with_script_timeout(Some(self.limits.timeout));
         self.invoker.script_started(&tree);
         let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
@@ -108,11 +109,12 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         }
     }
 
-    fn cancel_signal(&self) -> CancelSignal {
-        self.broker.as_ref().map_or_else(
-            || self.direct.cancel_signal(),
-            |broker| broker.cancel_signal(),
-        )
+    fn cancel_signals(&self) -> Vec<CancelSignal> {
+        let mut signals = self.direct.cancel_signals();
+        if let Some(broker) = &self.broker {
+            signals.extend(broker.cancel_signals());
+        }
+        signals
     }
 
     fn granted(&self) -> Vec<String> {
@@ -561,8 +563,8 @@ fn snapshot(
 
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
-    fn cancel_signal(&self) -> CancelSignal {
-        self.cancel.clone()
+    fn cancel_signals(&self) -> Vec<CancelSignal> {
+        vec![self.cancel.clone()]
     }
 
     fn script_started(&self, tree: &TreeContext) {
@@ -718,7 +720,7 @@ impl CapabilityInvoker for BrokerLeg {
             report,
         } = proposal;
         let capability = capability.as_str();
-        let cancelled = self.cancel.is_cancelled() || tree.cancel().is_cancelled();
+        let cancelled = self.cancel.is_cancelled() || tree.is_cancelled();
         let calls_used = self.calls.used();
         // Checks the capability exists before reporting it on the progress surface, since reporting
         // an unvalidated identifier first would let a model put invented text on a person's chat
@@ -834,7 +836,7 @@ impl BrokerLeg {
     ) -> dekopon_shell::RunResult {
         use dekopon_broker_protocol::{RunOutcome, RunRequest};
         use dekopon_shell::{RunResult, render_command};
-        if self.cancel.is_cancelled() || tree.cancel().is_cancelled() {
+        if self.cancel.is_cancelled() || tree.is_cancelled() {
             return RunResult::Returned(CapabilityCallResult::Denied {
                 reason: "session-cancelled".to_owned(),
             });
@@ -1194,6 +1196,7 @@ impl BrokerLeg {
         }
         let (finished, outcome) = tokio::sync::oneshot::channel();
         let dispatcher = dispatcher.clone();
+        let tree = tree.clone().with_parent_cancel(self.cancel.clone());
         scope.spawn(move || {
             let outcome = tracing::dispatcher::with_default(&dispatcher, || {
                 span.in_scope(|| {
@@ -1202,7 +1205,7 @@ impl BrokerLeg {
                             &script,
                             script_stdin,
                             self,
-                            tree,
+                            &tree,
                         )
                     }))
                 })
@@ -2184,12 +2187,12 @@ mod tests {
             let directory = private_broker_directory();
             let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
             leg.command_words.insert("probe".to_owned());
-            leg.script_started(&TreeContext::new(
+            leg.script_started(&dekopon_process::TreeContext::new(
                 Limits {
                     timeout: Duration::from_secs(5),
                     ..Limits::default()
                 },
-                CallBudget::new(32),
+                dekopon_process::CallBudget::new(32),
             ));
             let run = tokio::task::spawn_blocking(move || {
                 let result = leg.run_command("probe", &["--help".to_owned()], false);

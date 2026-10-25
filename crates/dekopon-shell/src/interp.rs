@@ -162,7 +162,7 @@ fn pump_stdin(
     while let Ok(ReadOutcome::Bytes(chunk)) = reader.read_unless(budget, finished) {
         let mut remaining = chunk.as_slice();
         while !remaining.is_empty() {
-            if budget.tree().cancel().is_cancelled()
+            if budget.tree().is_cancelled()
                 || budget.check_deadline().is_err()
                 || finished.load(atomic::Ordering::Relaxed)
             {
@@ -188,23 +188,6 @@ mod pump_tests {
     use dekopon_process::Limits;
     use std::{sync::mpsc, time::Duration};
 
-    struct Idle;
-
-    impl CapabilityInvoker for Idle {
-        fn granted(&self) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn invoke(
-            &self,
-            _proposal: crate::CommandProposal,
-            _streams: crate::Streams,
-            _tree: &dekopon_process::TreeContext,
-        ) -> crate::CapabilityCallResult {
-            unreachable!("pump test never invokes")
-        }
-    }
-
     #[test]
     fn a_stalled_stdin_peer_releases_the_feeder_after_the_deadline() {
         let budget = crate::limits::Budget::start(Limits {
@@ -219,7 +202,6 @@ mod pump_tests {
                     &mut PipeReader::from_bytes(vec![b'x'; 1024 * 1024]),
                     socket,
                     &budget,
-                    &Idle,
                     &AtomicBool::new(false),
                 );
                 done.send(()).unwrap();

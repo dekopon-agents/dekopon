@@ -75,8 +75,9 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   snapshot also supplies trusted effect and risk metadata for self-inspection,
   never policy source, identity, constraints, or credentials. Each provider command word's
   `runCommand` round trip runs in place and carries the calling script span's W3C trace parent
-  exactly as an invocation does. The `dekopon-process` cancel latch ties it to the embedder's
-  Stop through `BrokerLeg::with_cancel_signal`, or the script deadline while a script runs.
+  exactly as an invocation does. The script tree carries the embedder's Stop signal
+  from `BrokerLeg::with_cancel_signal` and the script deadline; command words wait on
+  both in place, without a per-script timer task.
   Either drops a command word in flight, after which the script reads `session-cancelled`. A transport
   failure reaches the script as `CommandRun::Errored` naming its cause, and a cancelled run
   as `CommandRun::Denied { "session-cancelled" }`. The same signal read synchronously refuses a

@@ -2152,3 +2152,77 @@ fn a_start_after_the_seal_is_off_even_with_every_permit_held() {
     );
     drop(held);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stop_word_ends_a_job_and_its_child_while_killing_the_child_leaves_its_starter_running()
+{
+    for kill_inner in [false, true] {
+        let directory = temporary();
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+        let models = ModelScript::new([
+            script_call("{ sleep 3600 & sleep 3600; } &"),
+            answer("started"),
+        ]);
+        let runner = runner_with_jobs(broker, models, 1, 2);
+        let routes = job_routes(directory.path(), Some(3_600_000)).await;
+        let driver = Arc::new(RecordingDriver::default());
+        let inbound = message("start");
+        let owner = JobOwner::of(&inbound);
+        run_session(
+            Arc::clone(&runner),
+            job_route(Duration::from_secs(30), Duration::from_secs(3600)),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        until(Duration::from_secs(10), || {
+            let rows = runner.jobs.list(&owner);
+            rows.len() == 2
+                && rows
+                    .iter()
+                    .all(|row| matches!(row.state, JobState::Running { .. }))
+        })
+        .await;
+        if kill_inner {
+            runner
+                .jobs
+                .kill(&owner, JobId::new(2))
+                .expect("kill only the child");
+            until(Duration::from_secs(5), || {
+                matches!(runner.jobs.list(&owner)[1].state, JobState::Finished { .. })
+            })
+            .await;
+            assert_eq!(finished(&runner.jobs.list(&owner)[1]).0, JobOutcome::Killed);
+            assert!(matches!(
+                runner.jobs.list(&owner)[0].state,
+                JobState::Running { .. }
+            ));
+        }
+        let drivers =
+            BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+        let mut sessions = tokio::task::JoinSet::new();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &["stop".to_owned()],
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            message("stop"),
+        );
+        while sessions.join_next().await.is_some() {}
+        let rows = settled(&runner.jobs, &owner, Duration::from_secs(5)).await;
+        assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
+        assert_eq!(
+            finished(&rows[1]).0,
+            if kill_inner {
+                JobOutcome::Killed
+            } else {
+                JobOutcome::Cancelled
+            }
+        );
+    }
+}

@@ -255,10 +255,7 @@ pub(crate) fn run_test(
     arguments: &[&str],
     input: serde_json::Value,
 ) -> Result<crate::builtins::CommandResult, CommandFailure> {
-    use crate::{
-        builtins::{CommandResult, test_support::NoCapabilities},
-        value::to_lines,
-    };
+    use crate::{builtins::CommandResult, value::to_lines};
     use dekopon_process::Limits;
     let lines = to_lines(&input);
     let bytes = if lines.is_empty() {
@@ -275,16 +272,10 @@ pub(crate) fn run_test(
             .map(|arg| (*arg).to_owned())
             .collect::<Vec<_>>(),
     )?;
-    let status = command.run_parsed(
-        operation.0,
-        &mut reader,
-        &mut budget,
-        &NoCapabilities,
-        |bytes| {
-            output.extend_from_slice(bytes);
-            Ok(true)
-        },
-    )?;
+    let status = command.run_parsed(operation.0, &mut reader, &mut budget, |bytes| {
+        output.extend_from_slice(bytes);
+        Ok(true)
+    })?;
     let output = String::from_utf8(output).expect("text stream emits UTF-8");
     let mut result = if matches!(command, TextStream::Grep) && arguments.contains(&"-c") {
         CommandResult::value(serde_json::Value::from(
@@ -299,32 +290,10 @@ pub(crate) fn run_test(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::{CapabilityCallResult, CommandProposal, pipe};
+    use crate::pipe;
     use dekopon_process::{LimitExceeded, Limits};
-
-    struct Stub {
-        cancelled: bool,
-    }
-
-    impl CapabilityInvoker for Stub {
-        fn granted(&self) -> Vec<String> {
-            Vec::new()
-        }
-        fn invoke(
-            &self,
-            _: CommandProposal,
-            _streams: crate::Streams,
-            _tree: &dekopon_process::TreeContext,
-        ) -> CapabilityCallResult {
-            unreachable!()
-        }
-        fn cancelled(&self) -> bool {
-            self.cancelled
-        }
-    }
 
     #[test]
     fn case_insensitive_sed_charges_unicode_fold_before_allocation() {
@@ -336,13 +305,7 @@ mod tests {
             ..Limits::default()
         });
         let error = TextStream::Sed
-            .run(
-                &arguments,
-                &mut reader,
-                &mut budget,
-                &Stub { cancelled: false },
-                |_| Ok(true),
-            )
+            .run(&arguments, &mut reader, &mut budget, |_| Ok(true))
             .expect_err("folded scratch exceeds retention after pending input");
         assert!(matches!(
             error,
@@ -358,16 +321,10 @@ mod tests {
         });
         let mut output = Vec::new();
         let status = TextStream::Sed
-            .run(
-                &arguments,
-                &mut reader,
-                &mut budget,
-                &Stub { cancelled: false },
-                |chunk| {
-                    output.extend_from_slice(chunk);
-                    Ok(true)
-                },
-            )
+            .run(&arguments, &mut reader, &mut budget, |chunk| {
+                output.extend_from_slice(chunk);
+                Ok(true)
+            })
             .expect("pending input and folded scratch fit");
         assert_eq!(status, ExitCode::SUCCESS);
         assert_eq!(output, "İ\n".as_bytes());
@@ -375,39 +332,19 @@ mod tests {
 
     #[test]
     fn a_text_builtin_notices_cancellation_between_fixed_input_chunks() {
-        struct CancelAfterFirstChunk(AtomicUsize);
-        impl CapabilityInvoker for CancelAfterFirstChunk {
-            fn granted(&self) -> Vec<String> {
-                Vec::new()
-            }
-            fn invoke(
-                &self,
-                _: CommandProposal,
-                _streams: crate::Streams,
-                _tree: &dekopon_process::TreeContext,
-            ) -> CapabilityCallResult {
-                unreachable!()
-            }
-            fn cancelled(&self) -> bool {
-                self.0.fetch_add(1, Ordering::SeqCst) > 0
-            }
-        }
         for command in [TextStream::Grep, TextStream::Sed] {
             let args = match command {
                 TextStream::Grep => vec!["x".to_owned()],
                 TextStream::Sed => vec!["s/x/y/".to_owned()],
             };
-            let mut reader = PipeReader::from_bytes(vec![b'x'; 2 * pipe::CHUNK_BYTES]);
-            let invoker = CancelAfterFirstChunk(AtomicUsize::new(0));
-            let mut budget = Budget::start(Limits::default());
-            let error = command
-                .run(&args, &mut reader, &mut budget, &invoker, |_| Ok(true))
-                .expect_err("cancellation turns on after the first charged chunk");
+            let error = crate::builtins::test_support::cancel_after_first_step(|reader, budget| {
+                command.run(&args, reader, budget, |_| Ok(true))
+            })
+            .expect_err("a later charge notices cancellation");
             assert!(matches!(
                 error,
                 CommandFailure::Fatal(crate::builtins::FatalError::Limit(LimitExceeded::Cancelled))
             ));
-            assert_eq!(invoker.0.load(Ordering::SeqCst), 2);
         }
     }
 
@@ -423,7 +360,6 @@ mod tests {
                 &["-nB1".to_owned(), "-A1".to_owned(), "P".to_owned()],
                 &mut reader,
                 &mut budget,
-                &Stub { cancelled: false },
                 |bytes| {
                     output.extend_from_slice(bytes);
                     Ok(true)
@@ -457,7 +393,6 @@ mod tests {
                 &["-q".to_owned(), "-B2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
-                &Stub { cancelled: false },
                 |_| panic!("quiet grep must not emit context"),
             )
             .expect("quiet grep needs no retained before window");
@@ -476,7 +411,6 @@ mod tests {
                 &["-B2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
-                &Stub { cancelled: false },
                 |_| Ok(true),
             )
             .expect_err("two retained context lines exceed the budget");
@@ -503,7 +437,6 @@ mod tests {
                 &["-A2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
-                &Stub { cancelled: false },
                 |part| {
                     emitted.extend_from_slice(part);
                     Ok(true)
@@ -530,17 +463,11 @@ mod tests {
         });
         let mut total = 0;
         let status = TextStream::Sed
-            .run(
-                &[script],
-                &mut reader,
-                &mut budget,
-                &Stub { cancelled: false },
-                |bytes| {
-                    assert!(bytes.len() <= pipe::CHUNK_BYTES);
-                    total += bytes.len();
-                    Ok(true)
-                },
-            )
+            .run(&[script], &mut reader, &mut budget, |bytes| {
+                assert!(bytes.len() <= pipe::CHUNK_BYTES);
+                total += bytes.len();
+                Ok(true)
+            })
             .expect("only the pending input is retained");
         assert_eq!(status, ExitCode::SUCCESS);
         assert_eq!(total, 40 * 1024);
@@ -553,16 +480,10 @@ mod tests {
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 let mut budget = Budget::start(Limits::default());
-                TextStream::Grep.run(
-                    &["x".to_owned()],
-                    &mut reader,
-                    &mut budget,
-                    &Stub { cancelled: false },
-                    |bytes| {
-                        sent.send(bytes.to_vec()).expect("the consumer is alive");
-                        Ok(true)
-                    },
-                )
+                TextStream::Grep.run(&["x".to_owned()], &mut reader, &mut budget, |bytes| {
+                    sent.send(bytes.to_vec()).expect("the consumer is alive");
+                    Ok(true)
+                })
             });
             assert_eq!(writer.write(b"x\n"), pipe::WriteOutcome::Accepted);
             assert_eq!(
@@ -599,16 +520,10 @@ mod tests {
             });
             let mut output = Vec::new();
             let status = command
-                .run(
-                    &args,
-                    &mut reader,
-                    &mut budget,
-                    &Stub { cancelled: false },
-                    |bytes| {
-                        output.extend_from_slice(bytes);
-                        Ok(true)
-                    },
-                )
+                .run(&args, &mut reader, &mut budget, |bytes| {
+                    output.extend_from_slice(bytes);
+                    Ok(true)
+                })
                 .expect("completed lines refund their retained bytes");
             assert_eq!(status, ExitCode::SUCCESS);
             assert_eq!(output.len(), 10);
@@ -632,13 +547,7 @@ mod tests {
                 ..Limits::default()
             });
             let error = command
-                .run(
-                    &args,
-                    &mut reader,
-                    &mut budget,
-                    &Stub { cancelled: false },
-                    |_| Ok(true),
-                )
+                .run(&args, &mut reader, &mut budget, |_| Ok(true))
                 .expect_err("the third chunk exceeds the budget");
             assert!(matches!(
                 error,
@@ -648,15 +557,16 @@ mod tests {
             ));
 
             let mut reader = PipeReader::from_bytes(b"x".to_vec());
-            let mut budget = Budget::start(Limits::default());
+            let (handle, signal) = dekopon_process::CancelSignal::pair();
+            let limits = Limits::default();
+            let mut budget = Budget::start_tree(
+                limits,
+                dekopon_process::TreeContext::new(limits, dekopon_process::CallBudget::new(32))
+                    .with_cancel(vec![signal]),
+            );
+            handle.cancel();
             let error = command
-                .run(
-                    &args,
-                    &mut reader,
-                    &mut budget,
-                    &Stub { cancelled: true },
-                    |_| Ok(true),
-                )
+                .run(&args, &mut reader, &mut budget, |_| Ok(true))
                 .expect_err("cancel is checked for each chunk");
             assert!(matches!(
                 error,

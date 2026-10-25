@@ -311,8 +311,8 @@ impl<I> FollowInvoker<I> {
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
-    fn cancel_signal(&self) -> dekopon_process::CancelSignal {
-        self.inner.cancel_signal()
+    fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
+        self.inner.cancel_signals()
     }
     fn granted(&self) -> Vec<String> {
         self.inner.granted()

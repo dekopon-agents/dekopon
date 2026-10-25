@@ -541,7 +541,6 @@ fn number(line: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::test_support::NoCapabilities;
     use dekopon_process::Limits;
 
     #[test]
@@ -561,7 +560,7 @@ mod tests {
         state.run = 1;
         assert!(
             state
-                .flush_run(&mut budget, &NoCapabilities, &mut |_| Ok(true))
+                .flush_run(&mut budget, &mut |_| Ok(true))
                 .expect("run emits")
         );
         assert_eq!(state.previous.capacity(), 0);

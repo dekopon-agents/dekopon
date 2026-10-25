@@ -196,7 +196,7 @@ fn collect(
             }
             Ok(ReadOutput::Invalid(message)) => return Err(CommandFailure::failed(message)),
             Ok(ReadOutput::Done) => {
-                if budget.tree().cancel().is_cancelled() {
+                if budget.tree().is_cancelled() {
                     return Err(LimitExceeded::Cancelled.into());
                 }
                 budget.check_deadline()?;
@@ -206,7 +206,7 @@ fn collect(
                 return Err(CommandFailure::failed("jq: worker output reader stopped"));
             }
             Err(RecvTimeoutError::Timeout) => {
-                if budget.tree().cancel().is_cancelled() {
+                if budget.tree().is_cancelled() {
                     return Err(LimitExceeded::Cancelled.into());
                 }
                 budget.check_deadline()?;
@@ -704,8 +704,7 @@ mod tests {
             max_value_bytes: 64,
             ..dekopon_process::Limits::default()
         });
-        let invoker = crate::builtins::test_support::NoCapabilities;
-        let mut source = PipeSource::new(&mut input, &mut budget, &invoker);
+        let mut source = PipeSource::new(&mut input, &mut budget);
         let parsed = serde_json::from_reader::<_, Value>(&mut source);
         assert!(parsed.is_err());
         assert!(matches!(
@@ -730,16 +729,10 @@ mod tests {
         sender.send(ReadOutput::Done).unwrap();
         let mut budget = Budget::start(dekopon_process::Limits::default());
         let mut output = Vec::new();
-        collect(
-            &receiver,
-            &mut budget,
-            &crate::builtins::test_support::NoCapabilities,
-            false,
-            &mut |bytes| {
-                output.extend_from_slice(bytes);
-                Ok(true)
-            },
-        )
+        collect(&receiver, &mut budget, false, &mut |bytes| {
+            output.extend_from_slice(bytes);
+            Ok(true)
+        })
         .expect("collect output");
         assert_eq!(output, b"\"retained\"\n");
         assert_eq!(budget.value_bytes(), 0);

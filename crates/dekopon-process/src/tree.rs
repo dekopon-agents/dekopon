@@ -51,9 +51,9 @@ impl CallBudget {
 
 #[derive(Clone, Debug)]
 pub struct TreeContext {
-    cancel: CancelSignal,
+    cancel: Vec<CancelSignal>,
+    cancel_deadline: Option<tokio::time::Instant>,
     deadline: Instant,
-    timeout: Duration,
     calls: CallBudget,
     steps: Arc<AtomicU64>,
     retained: Arc<AtomicU64>,
@@ -103,9 +103,9 @@ impl TreeContext {
     pub fn new(limits: Limits, calls: CallBudget) -> Self {
         let started = Instant::now();
         Self {
-            cancel: CancelSignal::never(),
+            cancel: Vec::new(),
+            cancel_deadline: None,
             deadline: started.checked_add(limits.timeout).unwrap_or(started),
-            timeout: limits.timeout,
             calls,
             steps: Arc::new(AtomicU64::new(0)),
             retained: Arc::new(AtomicU64::new(0)),
@@ -113,17 +113,31 @@ impl TreeContext {
         }
     }
 
-    pub fn with_cancel(mut self, cancel: CancelSignal) -> Self {
+    pub fn with_cancel(mut self, cancel: Vec<CancelSignal>) -> Self {
         self.cancel = cancel;
         self
     }
 
-    pub fn cancel(&self) -> &CancelSignal {
-        &self.cancel
+    pub fn with_parent_cancel(mut self, cancel: CancelSignal) -> Self {
+        self.cancel.push(cancel);
+        self
+    }
+
+    pub fn with_script_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.cancel_deadline =
+            timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.iter().any(CancelSignal::is_cancelled)
+            || self
+                .cancel_deadline
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     }
 
     pub fn charge_step(&self) -> Result<(), LimitExceeded> {
-        if self.cancel.is_cancelled() {
+        if self.is_cancelled() {
             return Err(LimitExceeded::Cancelled);
         }
         self.steps
@@ -168,7 +182,7 @@ impl TreeContext {
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
         if Instant::now() >= self.deadline {
             Err(LimitExceeded::Deadline {
-                timeout_ms: self.timeout.as_millis(),
+                timeout_ms: self.limits.timeout.as_millis(),
             })
         } else {
             Ok(())
@@ -182,7 +196,10 @@ impl TreeContext {
 
     #[must_use]
     pub fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.cancel_deadline.map_or_else(
+            || self.deadline.saturating_duration_since(Instant::now()),
+            |deadline| deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
     }
 
     #[must_use]
