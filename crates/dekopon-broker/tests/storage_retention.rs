@@ -284,6 +284,7 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
                     id: "c0123abc".to_owned(),
                     thread: Some("1712345678.000100".to_owned()),
                 },
+                delivery: None,
                 trigger: Trigger::Job,
             },
         )
