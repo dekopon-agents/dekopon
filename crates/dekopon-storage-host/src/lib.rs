@@ -138,6 +138,7 @@ pub struct StorageGrantRequest {
     continuity_policy: ContinuityPolicy,
     authority_surface: Vec<u8>,
     shared_namespace: Option<ProviderId>,
+    space_key: Option<dekopon_core::SpaceKey>,
 }
 
 impl fmt::Debug for StorageGrantRequest {
@@ -183,12 +184,19 @@ impl StorageGrantRequest {
             continuity_policy,
             authority_surface,
             shared_namespace: None,
+            space_key: None,
         }
     }
 
     #[must_use]
     pub fn with_shared_namespace(mut self, namespace: Option<ProviderId>) -> Self {
         self.shared_namespace = namespace;
+        self
+    }
+
+    #[must_use]
+    pub fn with_space_key(mut self, key: Option<dekopon_core::SpaceKey>) -> Self {
+        self.space_key = key;
         self
     }
 
@@ -219,6 +227,16 @@ impl StorageGrantRequest {
                 self.conversation.clone(),
             ],
             StorageScope::Agent => vec!["agent-v1".to_owned(), provider, agent],
+            StorageScope::Space => vec![
+                "space-v1".to_owned(),
+                provider,
+                self.space_key.as_ref().map_or_else(String::new, |key| {
+                    key.encode()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect()
+                }),
+            ],
         }
     }
     pub(crate) fn scope(&self) -> StorageScope {
@@ -437,6 +455,14 @@ impl StorageHost {
         &self,
         request: StorageGrantRequest,
     ) -> Result<StorageGrantPreparation, StorageHostError> {
+        if request.scope == StorageScope::Space
+            && !request
+                .space_key
+                .as_ref()
+                .is_some_and(|key| key.agent == request.agent)
+        {
+            return Err(StorageHostError::InvalidArgument);
+        }
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
         Ok(StorageGrantPreparation {

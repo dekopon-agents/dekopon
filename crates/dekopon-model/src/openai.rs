@@ -586,6 +586,7 @@ impl WireToolCall {
         let function = WireFunctionCall::deserialize(function)
             .map_err(|error| secrets.decode_failure(error))?;
         let arguments = match function.arguments {
+            Value::String(arguments) if arguments.is_empty() => "{}".to_owned(),
             Value::String(arguments) => arguments,
             arguments @ Value::Object(_) => {
                 serde_json::to_string(&arguments).map_err(ProtocolFailure::Decode)?
@@ -711,7 +712,7 @@ struct StreamedCall {
     id: String,
     kind: String,
     name: String,
-    arguments: String,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -801,7 +802,7 @@ impl ChatStream {
             ChunkFunction::default()
         };
         let name = function.name.filter(|name| !name.is_empty());
-        let arguments = function.arguments.unwrap_or_default();
+        let arguments = function.arguments;
 
         let slot = match existing {
             // Ollama reports every parallel call at index 0, so a fragment naming a function when
@@ -836,7 +837,11 @@ impl ChatStream {
         }
         // llama.cpp has answered with the whole argument document in one fragment and OpenAI sends
         // it a few characters at a time; appending is the same operation for both.
-        call.arguments.push_str(&arguments);
+        if let Some(arguments) = arguments {
+            call.arguments
+                .get_or_insert_with(String::new)
+                .push_str(&arguments);
+        }
         Ok(())
     }
 
@@ -2131,6 +2136,63 @@ mod tests {
             assert_eq!(turn.content.as_deref(), Some("answer"));
             assert_eq!(turn.tool_calls.len(), 1);
             assert_eq!(turn.tool_calls[0].id.as_str(), "call");
+        }
+    }
+
+    #[test]
+    fn an_empty_tool_call_arguments_string_is_an_empty_object() {
+        let calls = json!([{"index":0,"id":"call","type":"function",
+            "function":{"name":"inspect_agent_config","arguments":""}}]);
+        let response: ChatResponse = serde_json::from_value(json!({"choices":[{
+            "finish_reason":"tool_calls","message":{"tool_calls":calls}}]}))
+        .unwrap();
+        let buffered = turn_from_response(DiagnosticSecrets::default(), response).unwrap();
+        let chunk =
+            json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+        let streamed = replay_transcript(
+            DiagnosticSecrets::default(),
+            &format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            &mut |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        for turn in [buffered, streamed] {
+            assert_eq!(turn.tool_calls.len(), 1);
+            assert_eq!(turn.tool_calls[0].function.arguments, "{}");
+        }
+    }
+
+    #[test]
+    fn streamed_tool_calls_require_an_arguments_string() {
+        for function in [
+            json!({"name":"inspect_agent_config"}),
+            json!({"name":"inspect_agent_config","arguments":null}),
+        ] {
+            let chunk = json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call","type":"function","function":function
+            }]},"finish_reason":"tool_calls"}]});
+            assert!(matches!(
+                replay_transcript(
+                    DiagnosticSecrets::default(),
+                    &format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                    &mut |_| ControlFlow::Continue(())
+                ),
+                Err(InferenceError::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn nonempty_malformed_tool_call_arguments_remain_protocol_failures() {
+        for arguments in [" ", "{", "not json", "[]", "null"] {
+            let call: WireToolCall = serde_json::from_value(json!({
+                "id":"call","type":"function",
+                "function":{"name":"inspect_agent_config","arguments":arguments}
+            }))
+            .unwrap();
+            assert!(matches!(
+                call.into_model(DiagnosticSecrets::default()),
+                Err(InferenceError::Protocol(_))
+            ));
         }
     }
 

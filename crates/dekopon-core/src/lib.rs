@@ -23,6 +23,7 @@ pub mod fragments;
 pub mod private_file;
 mod redaction;
 mod skill;
+mod space;
 mod subject;
 mod trace;
 #[cfg(unix)]
@@ -43,6 +44,7 @@ pub use skill::{
     MAX_SKILL_RESOURCE_DEPTH, MAX_SKILL_RESOURCES, MAX_SKILL_TOTAL_BYTES, SKILL_FILE_NAME, SkillId,
     SkillIdError,
 };
+pub use space::{SpaceBinding, SpaceChannel, SpaceKey, SpaceTransport, SpaceWorkspace};
 pub use subject::{ExternalSubject, PrincipalKind, SubjectError, SubjectSegment, SubjectService};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
@@ -825,5 +827,32 @@ impl AssetNumber {
 impl fmt::Display for AssetNumber {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "chat-asset:{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod space_key_tests {
+    use super::*;
+
+    #[test]
+    fn space_keys_separate_delimiters_optional_workspaces_and_agents() {
+        let key = |agent: &str, workspace: Option<&str>, channel: &str| SpaceKey {
+            agent: agent.parse().expect("agent"),
+            transport: "team-slack".to_owned().into(),
+            workspace: workspace.map(|value| value.to_owned().into()),
+            channel: channel.to_owned().into(),
+        };
+        assert_ne!(
+            key("reviewer", Some("a:b"), "c").encode(),
+            key("reviewer", Some("a"), "b:c").encode()
+        );
+        assert_ne!(
+            key("reviewer", None, "c").encode(),
+            key("reviewer", Some(""), "c").encode()
+        );
+        assert_ne!(
+            key("reviewer", None, "c").encode(),
+            key("helper", None, "c").encode()
+        );
     }
 }

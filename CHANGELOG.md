@@ -7,6 +7,37 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-10-25
+
+### Added
+
+- Mapped channels can share space-scoped provider storage across their threads.
+
+### Changed
+
+- Shared history in mapped channels persists across speakers, and agent-scoped storage is refused there.
+- Space-only grants do not reset private provider storage outside a mapped channel.
+- Sealed threads keep their existing refusal behavior when shared space memory is enabled.
+- Record space policy error IDs alongside asker policy errors.
+- Report every principal with mixed subject kinds during broker configuration validation.
+- Name an invalid Discord guild as the tenant before validating its subject.
+- Clarify session refusal disclosure, command failure records, and post-merge validation documentation.
+
+### Fixed
+
+- Mount the live gateway catalog in the chart config check so unchanged models bind their baseline.
+- Parse an empty OpenAI-compatible tool-call arguments string as an empty object.
+
+## [dekopon-chart-0.40.0] - 2026-10-25
+
+### Changed
+
+- Chart 0.40.0 targets core v0.53.0 and renders the `v0.53.0` image tag.
+
+### Fixed
+
+- Mount the live gateway catalog in the chart config check so unchanged models bind their baseline.
+
 ## [0.52.0] - 2026-10-25
 
 ### Added

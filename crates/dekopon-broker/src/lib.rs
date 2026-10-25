@@ -268,6 +268,24 @@ pub struct AuthenticatedContext {
 }
 
 impl AuthenticatedContext {
+    pub fn space_binding(&self) -> Option<dekopon_core::SpaceBinding> {
+        let principal = self.space.as_ref()?;
+        let scope = self.chat_scope()?;
+        let agent = match self.actor() {
+            Actor::Agent { agent } => agent,
+            Actor::Human { .. } | Actor::Service { .. } => return None,
+        };
+        Some(dekopon_core::SpaceBinding {
+            key: dekopon_core::SpaceKey {
+                agent: agent.clone(),
+                transport: scope.transport.to_string().into(),
+                workspace: scope.conversation.container.clone().map(Into::into),
+                channel: scope.conversation.id.clone().into(),
+            },
+            principal: principal.clone(),
+        })
+    }
+
     pub fn new(principal: PrincipalId, actor: Actor) -> Result<Self, ContextError> {
         Self::build(principal, actor, None, None, None)
     }
@@ -1197,8 +1215,6 @@ impl AttestorGrant {
         Ok(())
     }
 
-    /// Without `namespaces` an attestor may speak for exactly the mapped subjects, which the
-    /// identity directory has already resolved by the time this is asked.
     #[must_use]
     pub fn permits(&self, subject: &ExternalSubject) -> bool {
         self.namespaces.as_ref().is_none_or(|namespaces| {
@@ -2053,6 +2069,9 @@ where
         if set.constraints.storage.is_some() && context.chat_scope().is_none() {
             return Err(unevaluated_refusal("chat-scope-required"));
         }
+        if !storage_scope_permits(context, &set) {
+            return Err(unevaluated_refusal("policy-denied"));
+        }
         let slots = render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
             .map_err(unevaluated_refusal)?;
         let decision = self.authorize_capability(context, capability, &set, None);
@@ -2198,6 +2217,11 @@ where
             };
             asker.allowed &= verdict.allowed;
             asker.errors_present |= verdict.errors_present;
+            asker
+                .erroring_policy_ids
+                .extend(verdict.erroring_policy_ids);
+            asker.erroring_policy_ids.sort();
+            asker.erroring_policy_ids.dedup();
             asker.refusal = asker.refusal.take().or(verdict.refusal);
             asker.opaque_body = asker.opaque_body.or(verdict.opaque_body);
             result
@@ -2263,6 +2287,7 @@ where
             .iter()
             .filter(|(capability, set)| {
                 set.route.is_generic()
+                    && storage_scope_permits(context, set)
                     && (set.constraints.storage.is_none() || context.chat_scope().is_some())
                     && render_chat_slots(set.constraints.http.as_ref(), context.chat_scope())
                         .is_ok()
@@ -2557,6 +2582,37 @@ where
             words.dedup();
         }
         Ok((capabilities, words, help, memory))
+    }
+
+    pub fn space_grants(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        attestation: Option<&Attestation>,
+    ) -> Option<Vec<CapabilityId>> {
+        let claim = attestation?;
+        let (mut context, refusal) = self.resolve_context(peer, grant, claim);
+        if refusal.is_some() {
+            return None;
+        }
+        context.principal = context.space.as_ref()?.clone();
+        let mut capabilities = self.capabilities(&context);
+        if self.memory_surface(&context, &claim.agent).is_some() {
+            for route in [
+                CapabilityRoute::ChatMemoryRecent,
+                CapabilityRoute::ChatMemorySearch,
+            ] {
+                let (capability, _) = self.constraints.routed(route)?;
+                capabilities.push(self.available_capability(capability)?);
+            }
+        }
+        capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
+        Some(
+            capabilities
+                .into_iter()
+                .map(|available| available.capability.id)
+                .collect(),
+        )
     }
 
     pub async fn invoke(
@@ -2940,6 +2996,7 @@ where
             .iter()
             .filter(|(capability, set)| {
                 (set.route.is_generic() || effective_memory_surface)
+                    && storage_scope_permits(context, set)
                     && self
                         .authorize_capability(context, capability, set, None)
                         .allowed
@@ -3094,7 +3151,8 @@ where
             },
             authority,
         )
-        .with_shared_namespace(storage.namespace.clone());
+        .with_shared_namespace(storage.namespace.clone())
+        .with_space_key(context.space_binding().map(|binding| binding.key));
         host.prepare_grant(grant_request)
             .map(Some)
             .map_err(|source| BrokerError::Storage { source })
@@ -4318,6 +4376,7 @@ fn encode_execution_constraints(
                 StorageScope::PrivateConversation => 0,
                 StorageScope::SharedConversation => 1,
                 StorageScope::Agent => 2,
+                StorageScope::Space => 3,
             },
         );
         if let Some(namespace) = &storage.namespace {
@@ -5296,3 +5355,16 @@ impl BrokerError {
 
 #[cfg(test)]
 mod tests;
+
+fn storage_scope_permits(context: &AuthenticatedContext, set: &ConstraintSet) -> bool {
+    match set
+        .constraints
+        .storage
+        .as_ref()
+        .map(|storage| storage.scope)
+    {
+        Some(StorageScope::Space) => context.space.is_some(),
+        Some(StorageScope::Agent) => context.space.is_none(),
+        Some(StorageScope::PrivateConversation | StorageScope::SharedConversation) | None => true,
+    }
+}

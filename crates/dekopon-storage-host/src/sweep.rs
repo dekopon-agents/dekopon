@@ -147,6 +147,7 @@ fn eligible(
             &values[1]
         }
         StorageScope::Agent if values.len() == 3 && values[0] == "agent-v1" => &values[1],
+        StorageScope::Space if values.len() == 3 && values[0] == "space-v1" => &values[1],
         _ => return Err(base.corrupt("identity", "storage-resource-identity")),
     };
     let provider = provider.parse::<ProviderId>().map_err(|error| {

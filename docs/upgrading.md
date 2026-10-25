@@ -8,6 +8,14 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Space-scoped storage and the config-check catalog mount (0.53.0)
+
+No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
+
+- Upgrade `dekopon-gatewayd` no later than `dekopon-brokerd`. Inside a channel mapped to a space, the broker's `Capabilities` response carries a `space` field that an older gateway refuses. The chart runs both daemons in one pod, so a chart upgrade meets this.
+- Add a `scope: space` storage constraint only once the broker runs 0.53.0: an older broker refuses it at load. Inside a mapped channel, `scope: agent` storage is refused.
+- Chart 0.40.0's config-check hook mounts the Deployment's live catalog read-only at `paths.catalogDir` whenever `configCheck.gateway.configMap` and `configCheck.gateway.againstConfigMap` are set. The live gateway configuration must name its catalog at that path, or the baseline does not bind and every model is probed.
+
 ## Console joins the workspace (0.52.0)
 
 `dekopon-console` now ships with core in release archives and both stock and memory-optimized
