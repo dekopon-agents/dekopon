@@ -835,6 +835,30 @@ impl BrokerLeg {
             .map_or_else(|| self.cancel.clone(), |script| script.signal.clone())
     }
 
+    async fn prepare_run_assets(
+        &self,
+        argv: &[dekopon_shell::Arg],
+        sends_remaining: u8,
+    ) -> Result<attachment::PreparedRun, ChatAssetRefusal> {
+        match &self.asset_inputs {
+            Some(inputs) => inputs.prepare_run(argv, sends_remaining).await,
+            None => {
+                let (argv, ids) = attachment::run_arguments(argv)?;
+                if !ids.is_empty() {
+                    return Err(ChatAssetRefusal::UnknownAsset);
+                }
+                Ok(attachment::PreparedRun {
+                    argv,
+                    assets: dekopon_broker_protocol::InvokeAssets {
+                        sends_remaining,
+                        ..Default::default()
+                    },
+                    pins: Vec::new(),
+                })
+            }
+        }
+    }
+
     fn run_call(
         &self,
         call: dekopon_shell::RunCall,
@@ -854,39 +878,73 @@ impl BrokerLeg {
         let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let cancel = self.effective_cancel();
-        let submitted = std::thread::scope(|scope| {
-            self.runtime.block_on(async {
+        let prepared = self.runtime.block_on(async {
             tokio::select! {
-                result = async {
-                    let attachment::PreparedRun { argv, mut assets, pins: _pins } = match &self.asset_inputs {
-                        Some(inputs) => inputs.prepare_run(&call.argv, remaining).await?,
-                        None => {
-                            let (argv, ids) = attachment::run_arguments(&call.argv)?;
-                            if !ids.is_empty() { return Err(ChatAssetRefusal::UnknownAsset); }
-                            attachment::PreparedRun { argv, assets: dekopon_broker_protocol::InvokeAssets { sends_remaining: remaining, ..Default::default() }, pins: Vec::new() }
-                        }
-                    };
-                    let output = streams.stdout.try_clone().map_err(|error| ChatAssetRefusal::Storage(dekopon_model::asset::BlobError::from(error)))?;
-                    assets.streams = Some(dekopon_broker_protocol::Streams { stdin: streams.stdin, stdout: streams.stdout });
-                    let outcome = self.client.run(self.attestation.clone(), RunRequest { invocation, trace_parent: self.identifiers.trace_parent(), word: call.word, argv }, assets, async |upcall| self.answer(scope, upcall, tree, &dispatcher).await).await;
-                    Ok((outcome, output))
-                } => Some(result),
+                biased;
                 () = cancel.cancelled() => None,
                 () = tokio::time::sleep(tree.remaining()) => None,
+                result = async {
+                    let prepared = self.prepare_run_assets(&call.argv, remaining).await?;
+                    let output = streams.stdout.try_clone().map_err(|error| {
+                        ChatAssetRefusal::Storage(dekopon_model::asset::BlobError::from(error))
+                    })?;
+                    Ok::<_, ChatAssetRefusal>((prepared, output))
+                } => Some(result),
             }
-        })
+        });
+        let (
+            attachment::PreparedRun {
+                argv,
+                mut assets,
+                pins: _pins,
+            },
+            output,
+        ) = match prepared {
+            None => {
+                return RunResult::Returned(CapabilityCallResult::Denied {
+                    reason: "script-cancelled".to_owned(),
+                });
+            }
+            Some(Err(refusal)) => {
+                tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "agent.chat_asset_input.refused");
+                return RunResult::Returned(CapabilityCallResult::Denied {
+                    reason: format!(
+                        "the gateway refused this call before it reached the broker: {}",
+                        refusal.note()
+                    ),
+                });
+            }
+            Some(Ok(prepared)) => prepared,
+        };
+        if cancel.is_cancelled() || tree.remaining().is_zero() {
+            return RunResult::Returned(CapabilityCallResult::Denied {
+                reason: "script-cancelled".to_owned(),
+            });
+        }
+        assets.streams = Some(dekopon_broker_protocol::Streams {
+            stdin: streams.stdin,
+            stdout: streams.stdout,
+        });
+        let submitted = std::thread::scope(|scope| {
+            self.runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    outcome = self.client.run(
+                        self.attestation.clone(),
+                        RunRequest { invocation, trace_parent: self.identifiers.trace_parent(), word: call.word, argv },
+                        assets,
+                        async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
+                    ) => Some(outcome),
+                    () = cancel.cancelled() => None,
+                    () = tokio::time::sleep(tree.remaining()) => None,
+                }
+            })
         });
         match submitted {
             None => RunResult::Uncertain(CapabilityCallResult::Denied {
                 reason: "script-cancelled".to_owned(),
             }),
-            Some(Err(refusal)) => RunResult::Returned(CapabilityCallResult::Denied {
-                reason: format!(
-                    "the gateway refused this call before it reached the broker: {}",
-                    refusal.note()
-                ),
-            }),
-            Some(Ok((Err(error), _)))
+            Some(Err(error))
                 if !matches!(&error, ClientError::Remote { .. }) && !error.may_have_executed() =>
             {
                 RunResult::Returned(CapabilityCallResult::Failed {
@@ -894,12 +952,12 @@ impl BrokerLeg {
                     detail: None,
                 })
             }
-            Some(Ok((Err(error), _))) => RunResult::Uncertain(CapabilityCallResult::Denied {
+            Some(Err(error)) => RunResult::Uncertain(CapabilityCallResult::Denied {
                 reason: format!(
                     "the broker did not record an outcome for this invocation and it may already have taken effect; do not resubmit it ({error})"
                 ),
             }),
-            Some(Ok((Ok(response), output))) => {
+            Some(Ok(response)) => {
                 let streams = dekopon_shell::Streams {
                     stdin: None,
                     stdout: output,
@@ -1812,6 +1870,149 @@ mod tests {
                 observed.recv().await.unwrap().request,
                 BrokerRequest::Run { .. }
             ));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cancellation_during_asset_resolution_refunds_without_a_frame() {
+            use crate::attachment::{ChatAssetInputs, ChatAssetSource, ResolveFuture};
+            struct PendingAsset(Mutex<Option<oneshot::Sender<()>>>);
+            impl ChatAssetSource for PendingAsset {
+                fn resolve_input(&self, _: u64) -> ResolveFuture<'_> {
+                    let entered = self.0.lock().take().unwrap();
+                    Box::pin(async move {
+                        entered.send(()).unwrap();
+                        std::future::pending().await
+                    })
+                }
+                fn rows(&self) -> Vec<dekopon_broker_protocol::AssetRow> {
+                    Vec::new()
+                }
+            }
+            let directory = private_broker_directory();
+            let socket = directory.path().join("broker.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (entered, resolving) = oneshot::channel();
+            let (handle, signal) = CancelSignal::pair();
+            let mut leg = leg_for(&socket)
+                .with_cancel_signal(signal)
+                .with_chat_asset_inputs(ChatAssetInputs::new(Arc::new(PendingAsset(Mutex::new(
+                    Some(entered),
+                )))));
+            leg.command_words.insert("probe".to_owned());
+            let calls = dekopon_process::CallBudget::new(1);
+            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let run = tokio::task::spawn_blocking(move || {
+                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
+                    "probe chat-asset:1",
+                    &leg,
+                    &tree,
+                )
+            });
+            resolving.await.unwrap();
+            assert_eq!(calls.used(), 1);
+            handle.cancel();
+            let outcome = run.await.unwrap();
+            assert_eq!(outcome.exit_code, ExitCode::DENIED);
+            assert_eq!(calls.used(), 0);
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cancellation_after_a_run_frame_keeps_its_call_charged() {
+            let directory = private_broker_directory();
+            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
+            leg.command_words.insert("probe".to_owned());
+            let (handle, signal) = CancelSignal::pair();
+            let leg = leg.with_cancel_signal(signal);
+            let calls = dekopon_process::CallBudget::new(1);
+            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let run = tokio::task::spawn_blocking(move || {
+                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
+                    "probe upper",
+                    &leg,
+                    &tree,
+                )
+            });
+            assert!(matches!(
+                observed.recv().await.unwrap().request,
+                BrokerRequest::Run { .. }
+            ));
+            handle.cancel();
+            let outcome = run.await.unwrap();
+            assert_eq!(outcome.exit_code, ExitCode::DENIED);
+            assert_eq!(calls.used(), 1);
+            drop(release);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn pre_frame_asset_refusals_emit_one_reason_and_submit_no_frame() {
+            use crate::attachment::{
+                ChatAssetInputs, ChatAssetRefusal, ChatAssetSource, ResolveFuture,
+            };
+            use tracing_subscriber::prelude::*;
+            struct UnknownAsset;
+            impl ChatAssetSource for UnknownAsset {
+                fn resolve_input(&self, _: u64) -> ResolveFuture<'_> {
+                    Box::pin(async { Err(ChatAssetRefusal::UnknownAsset) })
+                }
+                fn rows(&self) -> Vec<dekopon_broker_protocol::AssetRow> {
+                    Vec::new()
+                }
+            }
+            for (script, refusal) in [
+                (
+                    "probe --image='data:image/png;base64,AAAA'",
+                    ChatAssetRefusal::DataUrl,
+                ),
+                ("probe chat-asset:9", ChatAssetRefusal::UnknownAsset),
+                (
+                    "probe chat-asset:1 chat-asset:2 chat-asset:3 chat-asset:4 chat-asset:5 chat-asset:6",
+                    ChatAssetRefusal::PerInvocationLimit,
+                ),
+            ] {
+                let directory = private_broker_directory();
+                let socket = directory.path().join("broker.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let mut leg = leg_for(&socket)
+                    .with_chat_asset_inputs(ChatAssetInputs::new(Arc::new(UnknownAsset)));
+                leg.command_words.insert("probe".to_owned());
+                let capture = dekopon_test_support::CaptureLayer::new();
+                let subscriber = tracing_subscriber::registry().with(capture.clone());
+                let calls = dekopon_process::CallBudget::new(1);
+                let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+                let outcome = tokio::task::spawn_blocking(move || {
+                    tracing::subscriber::with_default(subscriber, || {
+                        dekopon_shell::Interpreter::new(Limits::default())
+                            .run_with_tree(script, &leg, &tree)
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(outcome.exit_code, ExitCode::DENIED);
+                assert_eq!(calls.used(), 0);
+                let events = capture.events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.chat_asset_input.refused")],
+                );
+                assert_eq!(events.len(), 1);
+                match &events[0] {
+                    dekopon_test_support::Record::Event { target, level, .. } => {
+                        assert_eq!(target, "dekopon_agent::audit");
+                        assert_eq!(*level, "WARN");
+                    }
+                    dekopon_test_support::Record::Span { .. } => panic!("expected a refusal event"),
+                }
+                assert_eq!(events[0].field("reason"), Some(refusal.reason()));
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            }
         }
 
         fn leg_for(socket: &Path) -> BrokerLeg {

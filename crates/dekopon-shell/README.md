@@ -16,10 +16,13 @@ pub trait CapabilityInvoker: Send + Sync {
         &self,
         word: &str,
         argv: &[String],
-        stdin: Option<&str>,
+        stdin_piped: bool,
     ) -> Option<CommandRun> { /* None: no provider owns the word */ }
+    fn run(&self, call: RunCall, streams: Streams, tree: &dekopon_process::TreeContext)
+        -> RunResult;
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> { /* None */ }
-    fn invoke(&self, proposal: CommandProposal) -> CapabilityCallResult;
+    fn invoke(&self, proposal: CommandProposal, streams: Streams,
+        tree: &dekopon_process::TreeContext) -> CapabilityCallResult;
     fn script_finished(&self) { /* no-op: the script's last command has returned */ }
 }
 ```
@@ -30,7 +33,31 @@ A command word resolves in a fixed order. A word this shell refuses outright (`e
 
 ## Provider command words
 
-A loaded provider can contribute bare words — `gh pr view 12` — and each behaves like its own command-line program run through `run_command`. `<word> --help` renders on stdout at whatever status the provider chose (`0` for help, `2` for a usage error by `clap` convention), so `h=$(gh --help)` captures the page like any other value. A `CommandRun::Rendered` answer charges no capability call; its bytes are charged against the value ceiling and both streams then obey the output ceilings, and its stderr goes to the diagnostic stream, so it escapes a `$( )` capture unless the script says `2>&1`. A `CommandRun::Failed` answer is a usage error at exit `2`. A run that never reached the provider's answer is not: `CommandRun::Errored` (the broker was unreachable, the host refused the input or trapped, the task did not complete) is reported like a capability that ran and errored, at exit `1`, and `CommandRun::Denied` (the session was cancelled underneath the run) like a refused capability, at exit `126`, so the model reads them as "retry later" or "stop" rather than "fix your argv". A `CommandRun::Proposed` answer is invoked through the same budget, denial, and telemetry path as every capability call, and one naming a capability this session was not granted exits `127` naming it, because the provider proposes without knowing what was granted. The proposal's owned report follows it into `invoke`; dropping a refused proposal settles that report as failed, without a shared pending slot. A proposal may also carry `secret_use`, the typed intent to use one public DRN the provider's command named. It reaches `CapabilityInvoker::invoke` unchanged, the broker authorizes it separately as documented in [`docs/secrets.md`](../../docs/secrets.md), and an invoker with no broker behind it refuses it.
+A loaded provider can contribute bare words such as `gh pr view 12`. Normal provider dispatch uses
+`CapabilityInvoker::run` with a `RunCall` whose argv contains `Arg::Text` and `Arg::Asset` values.
+An unquoted whole `chat-asset:N` word is an attachment reference; quoted or embedded in a larger
+word it is text. The gateway resolves distinct references in first-occurrence order and sends one
+`Run` frame with their rows and descriptors, receiving one `Ran` answer. The broker parses argv
+and authorizes the resulting proposal through its existing invocation path, including separate
+`secret_use` authorization as documented in [`docs/secrets.md`](../../docs/secrets.md).
+
+The shell reserves a capability call before dispatch. `RunResult::Invoked` retains that charge;
+`RunResult::Returned` refunds it, including rendered output, parser refusal, an ungranted capability,
+an unknown word and a refusal or cancellation before submission. Cancellation after submission
+may have occurred and uncertain broker errors produce `RunResult::Uncertain` and retain the charge.
+Rendered answers preserve their status; parser refusals exit `2`, unknown and ungranted words exit
+`127`, and cancellation exits `126`. Output still obeys the value and output ceilings, with stderr
+outside a `$( )` capture unless redirected with `2>&1`.
+
+Literal `<word> --help` uses `command_word_help()` at exit `0`, without a frame or capability charge,
+so it works even on a spent budget. A cached page over 2048 bytes shows a UTF-8-safe prefix and the
+truncation marker. `h=$(gh --help)` captures that cached page like any other value.
+
+The default direct invoker retains `run_command`/`CommandRun` parsing and invokes a proposal through
+`invoke`; the legacy broker `RunCommand` parse-only operation also remains. These are separate from
+the normal gateway's single-frame path. Direct proposal reports follow the proposal into `invoke`,
+and dropping a refused proposal settles its report as failed. Invokers without a broker refuse
+secret-use proposals.
 
 A capability that ran and failed reports `<id>: failed: <classification>` at exit `1`, and when
 the broker's classification came from the provider's own typed failure its code and message follow:
@@ -210,7 +237,7 @@ inside a script; what a caller receives is the transcript a terminal would have 
 
 ## Builtins
 
-`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `head`, `tail`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::run_command` into a capability proposal that takes the ordinary budget, denial, and telemetry path, rendered text at the provider's own exit status, or a usage error (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
+`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `head`, `tail`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through typed `CapabilityInvoker::run`, with invoked, returned or uncertain results and the corresponding call-budget handling (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
 
 `head` and `tail` select lines from standard input (10 by default): `-n N`, `--lines N`, or `-N` selects a count, and `tail -n +N` starts at line N. `head -c N`/`--bytes N` selects raw bytes; zero closes input without reading. Both accept one named-buffer operand or `-` for stdin, not host files; neither accepts `-f`.
 
