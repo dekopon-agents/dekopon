@@ -488,7 +488,10 @@ impl Gateway {
                             });
                         }
                         TransportEvent::Delivery(message, ticket) => {
-                            self.dispatch_delivery(&mut sessions, *message, ticket);
+                            let received = message.receive_span.clone();
+                            received.in_scope(|| {
+                                self.dispatch_delivery(&mut sessions, *message, ticket);
+                            });
                         }
                         TransportEvent::CancelRequested(request) => {
                             if collector.cancel(&request) {

@@ -8,8 +8,11 @@ use tracing_subscriber::{Layer, layer::Context, prelude::*};
 #[derive(Clone, Default)]
 struct Admissions(Arc<Mutex<Vec<Value>>>);
 
-impl<S: tracing::Subscriber> Layer<S> for Admissions {
-    fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+impl<S> Layer<S> for Admissions
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>) {
         if event.metadata().target() != "dekopon_gatewayd::audit" {
             return;
         }
@@ -38,6 +41,11 @@ impl<S: tracing::Subscriber> Layer<S> for Admissions {
             .expect("GitHub admission has native ids");
         assert_eq!(array.name, "github.deliveries");
         fields.0.insert(array.name.into(), json!(array.values));
+        if let Some(span) = context.event_span(event) {
+            fields
+                .0
+                .insert("parent.span.id".into(), json!(span.id().into_u64()));
+        }
         self.0.lock().push(Value::Object(fields.0));
     }
 }
@@ -581,4 +589,79 @@ async fn a_closed_delivery_channel_returns_service_unavailable() {
         request.await.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dispatcher_ignored_delivery_keeps_its_receipt_trace() {
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let admissions = Admissions::default();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ignored-delivery")))
+        .with(admissions.clone())
+        .set_default();
+    let models = ModelScript::new([]);
+    let mut fixture = fixture(Arc::new(Arc::clone(&models)), 8).await;
+    let bytes = serde_json::to_vec(&body("pull_request", 7, 1)).unwrap();
+    let request = fixture.transport.request_for_test(signed(
+        &bytes,
+        b"secret",
+        "removed-route",
+        "pull_request",
+    ));
+    let (sender, receiver) = mpsc::channel(1);
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let deliver = async {
+        let event = fixture.transport.delivery_for_test().await;
+        let TransportEvent::Delivery(message, _) = &event else {
+            panic!("delivery")
+        };
+        let trace = message
+            .receive_span
+            .context()
+            .span()
+            .span_context()
+            .trace_id();
+        assert_ne!(trace, opentelemetry::trace::TraceId::INVALID);
+        let receipt = message.receive_span.id().unwrap().into_u64();
+        let doc = document(fixture._directory.path());
+        let config = resolved(fixture._directory.path(), &doc).await;
+        let routes =
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+        let gateway = Gateway::serving(
+            Arc::clone(fixture.gateway.runner_for_test()),
+            CurrentGeneration::boot(routes, Arc::default()),
+            Arc::default(),
+            Arc::new(BTreeMap::from([(
+                "github".into(),
+                fixture.transport.driver(),
+            )])),
+        );
+        sender.send(event).await.unwrap();
+        gateway
+            .serve(
+                receiver,
+                async {
+                    stopped.await.unwrap();
+                },
+                Duration::from_secs(1),
+                crate::collection::Collector::new(&[], 4),
+            )
+            .await;
+        receipt
+    };
+    let respond = async {
+        let response = request.await;
+        stop.send(()).unwrap();
+        response
+    };
+    let (receipt, response) = tokio::join!(deliver, respond);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let records = admissions.0.lock();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["outcome"], "ignored");
+    assert_eq!(records[0]["github.deliveries"], json!(["removed-route"]));
+    assert_eq!(records[0]["parent.span.id"], receipt);
 }
