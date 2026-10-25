@@ -1042,23 +1042,6 @@ impl SeenIds {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_if_absent(
-        &mut self,
-        key: &str,
-        accept: impl FnOnce() -> bool,
-    ) -> Result<bool, ()> {
-        if self.seen.contains(key) {
-            return Ok(false);
-        }
-        if !accept() {
-            return Err(());
-        }
-        let inserted = self.insert(key.to_owned());
-        debug_assert!(inserted);
-        Ok(true)
-    }
-
     pub(crate) fn insert(&mut self, key: String) -> bool {
         if !self.seen.insert(key.clone()) {
             return false;
@@ -1205,11 +1188,23 @@ mod tests {
     #[test]
     fn failed_acceptance_never_consumes_a_recent_delivery_id() {
         let mut seen = SeenIds::new(1024);
-        assert!(matches!(seen.insert_if_absent("guid", || false), Err(())));
-        assert!(matches!(seen.insert_if_absent("guid", || true), Ok(true)));
         assert!(matches!(
-            seen.insert_if_absent("guid", || panic!("duplicate must not enqueue")),
-            Ok(false)
+            seen.reserve("guid"),
+            super::github::Reservation::New
+        ));
+        assert!(matches!(
+            seen.reserve("guid"),
+            super::github::Reservation::Reserved
+        ));
+        seen.answer("guid", false);
+        assert!(matches!(
+            seen.reserve("guid"),
+            super::github::Reservation::New
+        ));
+        seen.answer("guid", true);
+        assert!(matches!(
+            seen.reserve("guid"),
+            super::github::Reservation::Committed
         ));
     }
 

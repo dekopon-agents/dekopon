@@ -619,6 +619,13 @@ fixed chat warning directs the sender to audit before retrying.
 Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopon_gatewayd::audit`, with `outcome`
 (`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
 plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
+GitHub admission records also cover `started` and `ignored`; every GitHub record carries
+`github.deliveries`, a native string array in arrival order. On a queued append it lists the whole
+tail batch so far; the last queued record names exactly that batch's deliveries. A busy record
+names the refused delivery, and a started record names the batch starting its turn.
+`outcome` and `busy.cause` (`saturated` or `same-conversation`) are low-cardinality alarm-able fields;
+`queue.depth` is numeric and alarm-able. OpenObserve or Grafana alerts can key on these fields,
+for example `outcome = busy` for the GitHub transport. This repository ships no alert rule.
 Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refused` with
 `reason = mailbox-full`. An interrupted model call records `accounting.model.turn` with
 `outcome = steered` and `gateway.progress` with `kind = steered`; its replacement prompt contains

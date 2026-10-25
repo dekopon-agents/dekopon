@@ -651,7 +651,6 @@ impl SessionGate {
                 && batch.append(incoming)
             {
                 tail.receipts.0.extend(std::mem::take(&mut receipts.0));
-                tail.message.constituents.push(message.receive_span);
                 record_admission(&tail.message, "queued", depth, None);
                 return Admit::Queued;
             }
@@ -703,9 +702,6 @@ impl SessionGate {
             record_admission(&message, MessageOutcome::Busy.label(), 0, Some("saturated"));
             return Admit::Saturated(message, receipts);
         };
-        if let MessageId::Github(_) = &message.message_id {
-            record_admission(&message, "started", 0, None);
-        }
         let running = Running::new(route, &message);
         let cancellation = running.cancellation.clone();
         entries.insert(key.clone(), Holder::Session(Box::new(running)));
@@ -1590,7 +1586,13 @@ pub(crate) fn run_session_resolving(
     (digest, ticket): (String, Option<crate::transport::github::AdmissionTicket>),
     resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<(BoundRoute, String)> + Send + 'static,
 ) -> impl std::future::Future<Output = ()> + Send {
-    let receipts = Dispositions(message.constituents.clone());
+    let receipts = match &message.message_id {
+        MessageId::Github(_) => Dispositions(vec![message.receive_span.clone()]),
+        MessageId::Native(_)
+        | MessageId::Follow(_)
+        | MessageId::Wake { .. }
+        | MessageId::Job { .. } => Dispositions(message.constituents.clone()),
+    };
     async move {
         let span = message_span(&route, &message, &receipts);
         let mut held_by = dekopon_telemetry::span_trace_context(&span);
@@ -1711,7 +1713,11 @@ async fn execute(
                 reason = "busy",
                 "gateway.session.rejected"
             );
-            if !matches!(message.message_id, MessageId::Follow(_))
+            let can_reply = match &message.message_id {
+                MessageId::Github(_) | MessageId::Follow(_) => false,
+                MessageId::Native(_) | MessageId::Wake { .. } | MessageId::Job { .. } => true,
+            };
+            if can_reply
                 && notice.is_none()
                 && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
@@ -1755,6 +1761,7 @@ async fn run_admitted(
 ) -> SessionAdmission {
     if let MessageId::Github(batch) = &message.message_id {
         message.text = batch.note(&message.subject);
+        record_admission(&message, "started", 0, None);
     }
     let cancellation = admission.cancellation();
     let Ended { outcome, journal } = session(runner, route, &message, driver, cancellation.clone())

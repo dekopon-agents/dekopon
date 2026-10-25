@@ -303,8 +303,10 @@ where
             )?;
         }
         if let Some(array) = array {
-            let name = serde_json::to_string(array.name).map_err(|_| std::fmt::Error)?;
-            let values = serde_json::to_string(&array.values).map_err(|_| std::fmt::Error)?;
+            let name =
+                serde_json::to_string(array.name).map_err(|_invalid_json| std::fmt::Error)?;
+            let values =
+                serde_json::to_string(&array.values).map_err(|_invalid_json| std::fmt::Error)?;
             write!(writer, ",{name}:{values}")?;
         }
         writeln!(writer, "}}")
@@ -808,6 +810,32 @@ mod tests {
         );
         assert_eq!(lines[queued + 1]["console.dropped.lines"], 7);
         assert_eq!(dropped.load(super::Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn console_event_arrays_are_json_arrays_without_a_trace_exporter() {
+        use tracing_subscriber::{layer::SubscriberExt as _, registry};
+        let output = Output::default();
+        let writer = output.clone();
+        let console = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .event_format(super::CorrelatedJson(
+                tracing_subscriber::fmt::format().json().flatten_event(true),
+            ))
+            .with_writer(move || writer.clone());
+        tracing::subscriber::with_default(registry().with(console), || {
+            crate::with_event_string_array("github.deliveries", &["first", "second"], || {
+                tracing::info!(outcome = "queued", "admission")
+            });
+            tracing::info!(outcome = "ignored", "next");
+        });
+        let lines = json_lines(&output);
+        assert_eq!(
+            lines[0]["github.deliveries"],
+            serde_json::json!(["first", "second"])
+        );
+        assert!(lines[1].get("github.deliveries").is_none());
     }
 
     fn wait_until_console_is_closed(state: &Mutex<super::ConsoleState>) {

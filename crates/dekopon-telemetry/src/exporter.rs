@@ -666,3 +666,58 @@ impl logs::LogProcessor for EventArrayProcessor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod event_array_tests {
+    use super::*;
+    use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, Default)]
+    struct Captured(Arc<Mutex<Vec<logs::SdkLogRecord>>>);
+    impl logs::LogProcessor for Captured {
+        fn emit(&self, record: &mut logs::SdkLogRecord, _: &opentelemetry::InstrumentationScope) {
+            self.0.lock().push(record.clone());
+        }
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(&self, _: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scoped_event_arrays_are_native_and_do_not_leak_to_the_next_record() {
+        let capture = Captured::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_log_processor(EventArrayProcessor)
+            .with_log_processor(capture.clone())
+            .build();
+        let logger = provider.logger("array-test");
+        crate::with_event_string_array("github.deliveries", &["first", "second"], || {
+            let mut record = logger.create_log_record();
+            record.add_attribute("outcome", "queued");
+            logger.emit(record);
+        });
+        logger.emit(logger.create_log_record());
+        let records = capture.0.lock();
+        let (_, value) = records[0]
+            .attributes_iter()
+            .find(|(key, _)| key.as_str() == "github.deliveries")
+            .unwrap();
+        assert_eq!(
+            value,
+            &AnyValue::ListAny(Box::new(vec![
+                AnyValue::from("first"),
+                AnyValue::from("second")
+            ]))
+        );
+        assert!(
+            !records[1]
+                .attributes_iter()
+                .any(|(key, _)| key.as_str() == "github.deliveries")
+        );
+    }
+}

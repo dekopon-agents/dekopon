@@ -81,10 +81,6 @@ impl GithubNumber {
             .map(Self)
             .ok_or(GithubNumberError)
     }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
 }
 
 impl fmt::Display for GithubNumber {
@@ -121,7 +117,12 @@ impl FromStr for GithubThread {
         {
             return Err(GithubNumberError);
         }
-        GithubNumber::new(value.parse().map_err(|_| GithubNumberError)?).map(Self::Number)
+        GithubNumber::new(
+            value
+                .parse()
+                .map_err(|_invalid_decimal| GithubNumberError)?,
+        )
+        .map(Self::Number)
     }
 }
 
@@ -270,6 +271,118 @@ impl fmt::Display for GithubId {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn every_family_keys_by_its_number_or_the_repository() {
+        use GithubEventName as E;
+        let numbered = [
+            (E::PullRequest, json!({"number":7})),
+            (E::PullRequestReview, json!({"pull_request":{"number":7}})),
+            (
+                E::PullRequestReviewComment,
+                json!({"pull_request":{"number":7}}),
+            ),
+            (
+                E::PullRequestReviewThread,
+                json!({"pull_request":{"number":7}}),
+            ),
+            (E::Issues, json!({"issue":{"number":7}})),
+            (
+                E::IssueComment,
+                json!({"issue":{"number":7,"pull_request":{}}}),
+            ),
+            (E::Discussion, json!({"discussion":{"number":7}})),
+            (E::DiscussionComment, json!({"discussion":{"number":7}})),
+            (
+                E::SubIssues,
+                json!({"repository":{"id":10},"parent_issue_repo":{"id":10},"parent_issue":{"number":7}}),
+            ),
+        ];
+        for (event, body) in numbered {
+            assert_eq!(thread(event, &body).unwrap().to_string(), "7", "{event:?}");
+        }
+        for event in [
+            E::BranchProtectionConfiguration,
+            E::BranchProtectionRule,
+            E::CodeScanningAlert,
+            E::CommitComment,
+            E::Create,
+            E::CustomPropertyValues,
+            E::Delete,
+            E::DependabotAlert,
+            E::DeployKey,
+            E::Deployment,
+            E::DeploymentProtectionRule,
+            E::DeploymentReview,
+            E::DeploymentStatus,
+            E::Fork,
+            E::Gollum,
+            E::Label,
+            E::Member,
+            E::MergeGroup,
+            E::Meta,
+            E::Milestone,
+            E::Package,
+            E::PageBuild,
+            E::ProjectCard,
+            E::ProjectColumn,
+            E::Project,
+            E::Public,
+            E::Push,
+            E::RegistryPackage,
+            E::Release,
+            E::Repository,
+            E::RepositoryAdvisory,
+            E::RepositoryDispatch,
+            E::RepositoryImport,
+            E::RepositoryRuleset,
+            E::RepositoryVulnerabilityAlert,
+            E::SecretScanningAlert,
+            E::SecretScanningAlertLocation,
+            E::SecretScanningScan,
+            E::SecurityAndAnalysis,
+            E::Star,
+            E::Status,
+            E::TeamAdd,
+            E::Watch,
+            E::WorkflowDispatch,
+            E::WorkflowJob,
+        ] {
+            assert_eq!(
+                thread(event, &json!({"number":7,"repository":{"id":10}})).unwrap(),
+                GithubThread::Repository,
+                "{event:?}"
+            );
+        }
+        for (event, key) in [
+            (E::WorkflowRun, "workflow_run"),
+            (E::CheckRun, "check_run"),
+            (E::CheckSuite, "check_suite"),
+        ] {
+            for (prs, expected) in [
+                (json!([]), "repository"),
+                (json!([{"number":7,"base":{"repo":{"id":10}}}]), "7"),
+                (
+                    json!([{"number":7,"base":{"repo":{"id":10}}},{"number":8,"base":{"repo":{"id":10}}}]),
+                    "repository",
+                ),
+                (
+                    json!([{"number":987,"base":{"repo":{"id":20}}}]),
+                    "repository",
+                ),
+            ] {
+                let body = json!({"repository":{"id":10},key:{"pull_requests":prs}});
+                let selected = thread(event, &body).unwrap();
+                assert_eq!(selected.to_string(), expected, "{event:?}");
+                assert!(!format!("{selected:?}").contains("987"));
+            }
+        }
+        let foreign_parent = json!({"repository":{"id":10},"parent_issue_repo":{"id":20},"parent_issue":{"number":987}});
+        assert_eq!(
+            thread(E::SubIssues, &foreign_parent).unwrap(),
+            GithubThread::Repository
+        );
+    }
 
     #[test]
     fn issue_dependencies_key_only_by_a_local_blocked_issue() {

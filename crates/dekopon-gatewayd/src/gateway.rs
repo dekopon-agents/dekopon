@@ -766,7 +766,22 @@ impl Gateway {
         ticket: crate::transport::github::AdmissionTicket,
     ) {
         let generation = self.active.load();
-        if generation.routes.route(&message).is_none()
+        let listed = match &message.message_id {
+            MessageId::Github(batch) => generation
+                .routes
+                .github_route(
+                    &message.transport,
+                    &message.conversation,
+                    &message.subject,
+                    batch.lead().event,
+                )
+                .is_some(),
+            MessageId::Native(_)
+            | MessageId::Follow(_)
+            | MessageId::Wake { .. }
+            | MessageId::Job { .. } => false,
+        };
+        if !listed
             || !self.drivers.contains_key(&message.transport)
             || message.addressed == Some(false)
         {

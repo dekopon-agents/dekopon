@@ -569,7 +569,7 @@ mod local_selector_tests {
             kind: ConversationKind::Thread,
             container: Some("a".into()),
             id: "a.x".into(),
-            thread: Some("delivery-guid".into()),
+            thread: Some("7".into()),
         };
         assert!(conversation.is_canonical_for(ChatTransportKind::Github, &subject));
         assert!(!conversation.is_canonical_for(

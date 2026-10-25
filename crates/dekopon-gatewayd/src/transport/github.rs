@@ -27,7 +27,6 @@ use super::{
 };
 use crate::{config::GithubEvent, gateway::CurrentGeneration};
 use dekopon_core::github::{GithubId, GithubThread, thread};
-use std::collections::VecDeque;
 
 const CALLBACK: &str = "/webhooks/github";
 const RECENT_DELIVERIES: usize = 1024;
@@ -47,11 +46,11 @@ pub(crate) struct GithubEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GithubBatch(VecDeque<GithubEntry>);
+pub(crate) struct GithubBatch(Vec<GithubEntry>);
 
 impl GithubBatch {
     pub(crate) fn new(entry: GithubEntry) -> Self {
-        Self(VecDeque::from([entry]))
+        Self(vec![entry])
     }
     pub(crate) fn lead(&self) -> &GithubEntry {
         &self.0[0]
@@ -78,14 +77,21 @@ impl GithubBatch {
                 subject.tenant().unwrap_or_default(),
                 subject.subject(),
                 entry.action.as_deref().unwrap_or("none"),
-                entry.thread,
+                match entry.thread {
+                    GithubThread::Number(number) => format!("#{number}"),
+                    GithubThread::Repository => "repository".to_owned(),
+                },
                 entry.delivery
             );
             if let Some(sha) = &entry.head_sha {
                 line.push_str(&format!(" head {sha};"));
             }
             if let Some(run) = entry.run {
-                line.push_str(&format!(" run {run}; associated PR {};", entry.thread));
+                let association = match entry.thread {
+                    GithubThread::Number(number) => format!("Some({number})"),
+                    GithubThread::Repository => "None".to_owned(),
+                };
+                line.push_str(&format!(" run {run}; associated PR {association};"));
             }
             if let Some(conclusion) = &entry.conclusion {
                 line.push_str(&format!(" conclusion {conclusion};"));
@@ -133,7 +139,13 @@ impl AdmissionTicket {
         };
         self.accepted.lock().answer(&self.delivery, commit);
         if let Some(reply) = self.reply.take() {
-            let _ = reply.send(answer);
+            reply.send(answer).unwrap_or_else(|_receiver_closed| {
+                tracing::debug!(
+                    event = "gateway_github_webhook_refused",
+                    reason = "receiver-closed",
+                    "gateway.github.webhook.refused"
+                )
+            });
         }
     }
 }
@@ -142,7 +154,13 @@ impl Drop for AdmissionTicket {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
             self.accepted.lock().answer(&self.delivery, false);
-            let _ = reply.send(Acked::Busy);
+            reply.send(Acked::Busy).unwrap_or_else(|_receiver_closed| {
+                tracing::debug!(
+                    event = "gateway_github_webhook_refused",
+                    reason = "receiver-closed",
+                    "gateway.github.webhook.refused"
+                )
+            });
         }
     }
 }
@@ -418,6 +436,7 @@ fn parse(
     let owner = field(root, "/repository/owner/login", 39)?;
     let repo = field(root, "/repository/name", 100)?;
     let subject = ExternalSubject::github(owner, repo).ok()?;
+    GithubId::new(root.pointer("/repository/id")?.as_u64()?).ok()?;
     let thread = thread(event, root).ok()?;
     let conversation = Conversation {
         kind: ConversationKind::Thread,
@@ -432,18 +451,86 @@ fn parse(
                 .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
         })
         .map(str::to_owned);
+    if matches!(event, GithubEvent::PullRequest | GithubEvent::WorkflowRun) && action.is_none() {
+        return None;
+    }
+    let sha = |path| {
+        field(root, path, 64)
+            .filter(|v| {
+                matches!(v.len(), 40 | 64)
+                    && v.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .map(str::to_owned)
+    };
     let (head_sha, run, conclusion) = match event {
-        GithubEvent::PullRequest => (
-            Some(field(root, "/pull_request/head/sha", 128)?.to_owned()),
-            None,
-            None,
-        ),
+        GithubEvent::PullRequest => (Some(sha("/pull_request/head/sha")?), None, None),
         GithubEvent::WorkflowRun => (
-            Some(field(root, "/workflow_run/head_sha", 128)?.to_owned()),
+            Some(sha("/workflow_run/head_sha")?),
             Some(GithubId::new(root.pointer("/workflow_run/id")?.as_u64()?).ok()?),
-            field(root, "/workflow_run/conclusion", 64).map(str::to_owned),
+            field(root, "/workflow_run/conclusion", 64)
+                .filter(|v| {
+                    v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+                })
+                .map(str::to_owned),
         ),
-        _ => (None, None, None),
+        GithubEvent::BranchProtectionConfiguration
+        | GithubEvent::BranchProtectionRule
+        | GithubEvent::CheckRun
+        | GithubEvent::CheckSuite
+        | GithubEvent::CodeScanningAlert
+        | GithubEvent::CommitComment
+        | GithubEvent::Create
+        | GithubEvent::CustomPropertyValues
+        | GithubEvent::Delete
+        | GithubEvent::DependabotAlert
+        | GithubEvent::DeployKey
+        | GithubEvent::Deployment
+        | GithubEvent::DeploymentProtectionRule
+        | GithubEvent::DeploymentReview
+        | GithubEvent::DeploymentStatus
+        | GithubEvent::Discussion
+        | GithubEvent::DiscussionComment
+        | GithubEvent::Fork
+        | GithubEvent::Gollum
+        | GithubEvent::IssueComment
+        | GithubEvent::IssueDependencies
+        | GithubEvent::Issues
+        | GithubEvent::Label
+        | GithubEvent::Member
+        | GithubEvent::MergeGroup
+        | GithubEvent::Meta
+        | GithubEvent::Milestone
+        | GithubEvent::Package
+        | GithubEvent::PageBuild
+        | GithubEvent::ProjectCard
+        | GithubEvent::ProjectColumn
+        | GithubEvent::Project
+        | GithubEvent::Public
+        | GithubEvent::PullRequestReview
+        | GithubEvent::PullRequestReviewComment
+        | GithubEvent::PullRequestReviewThread
+        | GithubEvent::Push
+        | GithubEvent::RegistryPackage
+        | GithubEvent::Release
+        | GithubEvent::Repository
+        | GithubEvent::RepositoryAdvisory
+        | GithubEvent::RepositoryDispatch
+        | GithubEvent::RepositoryImport
+        | GithubEvent::RepositoryRuleset
+        | GithubEvent::RepositoryVulnerabilityAlert
+        | GithubEvent::SecretScanningAlert
+        | GithubEvent::SecretScanningAlertLocation
+        | GithubEvent::SecretScanningScan
+        | GithubEvent::SecurityAndAnalysis
+        | GithubEvent::Star
+        | GithubEvent::Status
+        | GithubEvent::SubIssues
+        | GithubEvent::TeamAdd
+        | GithubEvent::Watch
+        | GithubEvent::WorkflowDispatch
+        | GithubEvent::WorkflowJob => (None, None, None),
     };
     Some((
         subject,
@@ -471,7 +558,62 @@ fn eligible(entry: &GithubEntry) -> bool {
             entry.action.as_deref() == Some("completed")
                 && matches!(entry.conclusion.as_deref(), Some("success" | "failure"))
         }
-        _ => true,
+        GithubEvent::BranchProtectionConfiguration
+        | GithubEvent::BranchProtectionRule
+        | GithubEvent::CheckRun
+        | GithubEvent::CheckSuite
+        | GithubEvent::CodeScanningAlert
+        | GithubEvent::CommitComment
+        | GithubEvent::Create
+        | GithubEvent::CustomPropertyValues
+        | GithubEvent::Delete
+        | GithubEvent::DependabotAlert
+        | GithubEvent::DeployKey
+        | GithubEvent::Deployment
+        | GithubEvent::DeploymentProtectionRule
+        | GithubEvent::DeploymentReview
+        | GithubEvent::DeploymentStatus
+        | GithubEvent::Discussion
+        | GithubEvent::DiscussionComment
+        | GithubEvent::Fork
+        | GithubEvent::Gollum
+        | GithubEvent::IssueComment
+        | GithubEvent::IssueDependencies
+        | GithubEvent::Issues
+        | GithubEvent::Label
+        | GithubEvent::Member
+        | GithubEvent::MergeGroup
+        | GithubEvent::Meta
+        | GithubEvent::Milestone
+        | GithubEvent::Package
+        | GithubEvent::PageBuild
+        | GithubEvent::ProjectCard
+        | GithubEvent::ProjectColumn
+        | GithubEvent::Project
+        | GithubEvent::Public
+        | GithubEvent::PullRequestReview
+        | GithubEvent::PullRequestReviewComment
+        | GithubEvent::PullRequestReviewThread
+        | GithubEvent::Push
+        | GithubEvent::RegistryPackage
+        | GithubEvent::Release
+        | GithubEvent::Repository
+        | GithubEvent::RepositoryAdvisory
+        | GithubEvent::RepositoryDispatch
+        | GithubEvent::RepositoryImport
+        | GithubEvent::RepositoryRuleset
+        | GithubEvent::RepositoryVulnerabilityAlert
+        | GithubEvent::SecretScanningAlert
+        | GithubEvent::SecretScanningAlertLocation
+        | GithubEvent::SecretScanningScan
+        | GithubEvent::SecurityAndAnalysis
+        | GithubEvent::Star
+        | GithubEvent::Status
+        | GithubEvent::SubIssues
+        | GithubEvent::TeamAdd
+        | GithubEvent::Watch
+        | GithubEvent::WorkflowDispatch
+        | GithubEvent::WorkflowJob => true,
     }
 }
 
@@ -486,6 +628,27 @@ pub(crate) struct GithubTransport {
 }
 
 impl GithubTransport {
+    #[cfg(test)]
+    pub(crate) fn request_for_test(
+        &self,
+        request: Request,
+    ) -> impl Future<Output = Response> + use<> {
+        let state = self.state.clone();
+        async move { receive(State(state), request).await }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_delivery_for_test(
+        &mut self,
+    ) -> Result<TransportEvent, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn delivery_for_test(&mut self) -> TransportEvent {
+        self.receiver.recv().await.expect("signed delivery")
+    }
+
     pub(crate) fn new(
         name: String,
         bind: std::net::SocketAddr,
@@ -594,7 +757,7 @@ impl ChatTransport for GithubTransport {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use serde_json::json;
@@ -615,7 +778,7 @@ mod tests {
         )
     }
 
-    fn signed(body: &[u8], secret: &[u8], guid: &str, event: &str) -> Request {
+    pub(crate) fn signed(body: &[u8], secret: &[u8], guid: &str, event: &str) -> Request {
         let digest: String = webhook::hmac_sha256(secret, body)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -629,9 +792,9 @@ mod tests {
             .expect("request")
     }
 
-    fn pr() -> Value {
-        json!({ "repository": {"owner": {"login": "Owner"}, "name": "Repo"},
-            "action": "opened", "number": 7, "pull_request": { "head": {"sha": "abc123"} } })
+    pub(crate) fn pr() -> Value {
+        json!({ "repository": {"id": 10, "owner": {"login": "Owner"}, "name": "Repo"}, "sender": {"id": 1},
+            "action": "opened", "number": 7, "pull_request": { "head": {"sha": "a".repeat(40)} } })
     }
 
     #[tokio::test]
@@ -703,55 +866,29 @@ mod tests {
 
     #[test]
     fn signed_repository_alone_selects_the_subject_and_eligible_action() {
-        let (subject, conversation, kind, text) =
-            parse(&pr(), "pull_request", "guid").expect("claim");
+        let (subject, conversation, entry) =
+            parse(&pr(), GithubEvent::PullRequest, "guid").expect("claim");
         assert_eq!(subject.canonical(), "github.owner.repo");
-        assert_eq!(conversation.key(), "owner.repo:guid");
-        assert_eq!(kind, GithubEvent::PullRequest);
-        assert!(text.expect("eligible").starts_with("[gateway: unverified"));
-        let mut other = pr();
-        other["repository"]["owner"]["login"] = json!("another");
-        assert_eq!(
-            parse(&other, "pull_request", "guid")
-                .expect("signed other repo")
-                .0
-                .canonical(),
-            "github.another.repo"
+        assert_eq!(conversation.key(), "owner.repo:7");
+        assert!(eligible(&entry));
+        assert!(
+            GithubBatch::new(entry)
+                .note(&subject)
+                .starts_with("[gateway: unverified")
         );
         let mut ignored = pr();
         ignored["action"] = json!("closed");
-        assert!(
-            parse(&ignored, "pull_request", "guid")
-                .expect("valid action")
-                .3
-                .is_none()
-        );
+        assert!(!eligible(
+            &parse(&ignored, GithubEvent::PullRequest, "guid").unwrap().2
+        ));
         ignored["repository"]["name"] = json!("dotted.repo");
-        assert!(parse(&ignored, "pull_request", "guid").is_none());
-        let run = json!({ "repository": {"owner": {"login": "Owner"}, "name": "Repo"},
-            "action": "completed", "workflow_run": {"id": 5, "head_sha": "abc", "conclusion": "failure"}});
-        assert!(
-            parse(&run, "workflow_run", "guid")
-                .expect("report-only run")
-                .3
-                .expect("eligible")
-                .contains("associated PR None")
-        );
-        let mut pending = run;
-        pending["action"] = json!("requested");
-        pending["workflow_run"]["conclusion"] = Value::Null;
-        assert!(
-            parse(&pending, "workflow_run", "guid")
-                .expect("ignored signed run")
-                .3
-                .is_none()
-        );
+        assert!(parse(&ignored, GithubEvent::PullRequest, "guid").is_none());
     }
 
     #[tokio::test]
     async fn missing_run_identity_is_malformed_even_for_an_ignored_action() {
         let (state, mut receiver) = state();
-        let mut body = json!({"repository":{"owner":{"login":"Owner"},"name":"Repo"},
+        let mut body = json!({"repository":{"id":10,"owner":{"login":"Owner"},"name":"Repo"},"sender":{"id":1},
             "action":"requested"});
         let missing = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
@@ -764,7 +901,7 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
-        body["workflow_run"] = json!({"head_sha":"abc", "conclusion":null});
+        body["workflow_run"] = json!({"head_sha":"a".repeat(40), "conclusion":null});
         let missing_id = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
             process(
@@ -788,7 +925,7 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
-        body["workflow_run"]["head_sha"] = json!("abc");
+        body["workflow_run"]["head_sha"] = json!("a".repeat(40));
         let pending = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
             process(
@@ -854,43 +991,53 @@ mod tests {
                     .count(),
             )
         };
-        for (guid, status, expected) in [
-            ("first", StatusCode::OK, (1, 1)),
-            ("first", StatusCode::OK, (1, 1)),
-            ("retry", StatusCode::SERVICE_UNAVAILABLE, (1, 1)),
-        ] {
-            assert_eq!(
-                process(
-                    &state,
-                    signed(&body, b"secret", guid, "pull_request"),
-                    &receive_span(ChatTransportKind::Github)
-                )
-                .await
-                .status(),
-                status
-            );
-            assert_eq!(
-                count(),
-                expected,
-                "only successfully accepted deliveries record identity"
-            );
-        }
-        let _accepted = receiver.try_recv().expect("free one slot");
+        let first_span = receive_span(ChatTransportKind::Github);
+        let first = process(
+            &state,
+            signed(&body, b"secret", "first", "pull_request"),
+            &first_span,
+        );
+        tokio::pin!(first);
+        let event = tokio::select! { biased; _ = &mut first => panic!("must wait for admission"), event = receiver.recv() => event.unwrap() };
+        assert_eq!(count(), (1, 1));
         assert_eq!(
             process(
                 &state,
-                signed(&body, b"secret", "retry", "pull_request"),
+                signed(&body, b"secret", "first", "pull_request"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let TransportEvent::Delivery(_, ticket) = event else {
+            panic!("delivery ticket")
+        };
+        ticket.answer(Acked::Admitted);
+        assert_eq!(first.await.status(), StatusCode::OK);
+        assert_eq!(
+            process(
+                &state,
+                signed(&body, b"secret", "first", "pull_request"),
                 &receive_span(ChatTransportKind::Github)
             )
             .await
             .status(),
             StatusCode::OK
         );
-        assert_eq!(
-            count(),
-            (2, 2),
-            "the retry records identity only after acceptance"
+        let retry_span = receive_span(ChatTransportKind::Github);
+        let retry = process(
+            &state,
+            signed(&body, b"secret", "retry", "pull_request"),
+            &retry_span,
         );
+        tokio::pin!(retry);
+        let event = tokio::select! { biased; _ = &mut retry => panic!("must wait"), event = receiver.recv() => event.unwrap() };
+        let TransportEvent::Delivery(_, ticket) = event else {
+            panic!("delivery ticket")
+        };
+        ticket.answer(Acked::Busy);
+        assert_eq!(retry.await.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
