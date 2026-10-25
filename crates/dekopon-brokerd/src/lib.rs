@@ -217,6 +217,7 @@ pub struct CheckReport {
     pub policy_digest: Option<String>,
     pub identity_digest: Option<String>,
     private_sources: Vec<PathBuf>,
+    pub peak_rss_bytes: Option<u64>,
 }
 
 /// Check reads only DRNs from the secret map; it never opens secret sources or resolves values.
@@ -225,7 +226,7 @@ pub async fn check(
     providers: Option<CheckProviders>,
     workflows: Option<&Path>,
 ) -> CheckReport {
-    load_candidate(
+    let mut report = load_candidate(
         config_path.as_ref(),
         Mode::Check {
             providers,
@@ -233,7 +234,9 @@ pub async fn check(
         },
     )
     .await
-    .1
+    .1;
+    report.peak_rss_bytes = dekopon_broker_host::peak_rss_bytes();
+    report
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -196,6 +196,10 @@ async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
     )
     .await
     .expect("cold load");
+    #[cfg(target_os = "linux")]
+    assert!(
+        matches!(recorded(&capture, "provider.compile", "peak_rss_bytes").as_slice(), [bytes] if *bytes > 0)
+    );
     assert!(recorded_value(
         &capture,
         "provider.compile",

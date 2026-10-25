@@ -3323,6 +3323,8 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
     };
     let report = check().await;
     assert!(report.problems.is_empty(), "{report:?}");
+    #[cfg(target_os = "linux")]
+    assert!(report.peak_rss_bytes.expect("process peak RSS") > 0);
     let cache = store.join("store/cwasm/v1");
     let objects = cache.join("sha256");
     let current_object = fs::read_dir(&objects)
