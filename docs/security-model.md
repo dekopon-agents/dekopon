@@ -200,7 +200,7 @@ The [current local process boundary](#current-local-process-boundary) applies to
 
 ## Conversation memory as a trust surface
 
-**Status: current.** A route set to `mode: persistent` implements the [Conversations](gatewayd.md#conversations) contract: a history bounded by a sliding window, an idle timeout, and a process-wide ceiling, held in the gateway process's memory and replayed into the next prompt. `scope: privateConversation` is the persistent default and isolates it by authenticated subject. `scope: sharedConversation` is an explicit audience expansion inside one exact agent/transport/conversation key. `persistent` is the route default; `memory: { mode: oneShot }` opts out of replay between sessions, while same-sender steers can still join the current session.
+**Status: current.** A route set to `mode: persistent` implements the [Conversations](gatewayd.md#conversations) contract: a history bounded by a sliding window, an idle timeout, and a process-wide ceiling, held in the gateway process's memory and replayed into the next prompt. `scope: privateConversation` is the persistent default and isolates it by authenticated subject. `scope: sharedConversation` is an explicit audience expansion inside one exact agent/transport/conversation key. In a mapped channel, shared replay belongs to its space and remains across speakers, using the space principal’s grants; everyone in the channel sees it, while threads retain separate replay windows and private routes remain per subject. `persistent` is the route default; `memory: { mode: oneShot }` opts out of replay between sessions, while same-sender steers can still join the current session.
 
 ### Containment
 
@@ -228,13 +228,13 @@ The transport identity determines how wide "conversation" is. Slack sharing is n
 
 Each shared user turn is prefixed by the gateway with `[gateway: authenticated participant: <principal>]`, naming the broker principal the broker maps the attested subject to in its `capabilities` answer, or `[gateway: unmapped participant]` when it names none. The subject comes from the transport envelope accepted for the fresh broker leg, not message text, and the principal name is display-only: the gateway holds no policy and decides nothing from it, and a user-authored lookalike cannot replace that first line. This gives the model provenance; it does not make the following text trustworthy, defend against prompt injection, or prove that a later participant was allowed to see the earlier content outside this configuration choice. On the local development transport, only the owner UID is authenticated and the subject is that trusted caller's declaration; the uniform wording does not claim independent service authentication of the person. Principal names are model-provider input; canonical subjects, which can be phone numbers or service user IDs, are not.
 
-The scope stops at `(agent, configured transport, transport-derived conversation identity)`. It is not global agent memory, team memory, a durable shared namespace, or automatic replay across channels, threads, transports, routes, or agents. `recall: journal` does bring the same key's window back across restarts and idle or capacity eviction, but never across a grant change. Every participant starts a fresh attested leg and must independently be authorized for the agent on each new turn; a same-sender steer does not re-check the running leg's grant. If their capability identifier sets differ, the conservative grant comparison drops the shared window rather than carrying content across those grants.
+The scope stops at `(agent, configured transport, transport-derived conversation identity)`. It is not global agent memory, team memory, a durable shared namespace, or automatic replay across channels, threads, transports, routes, or agents. `recall: journal` does bring the same key's window back across restarts and idle or capacity eviction, but never across a grant change. Every participant starts a fresh attested leg and must independently be authorized for the agent on each new turn; a same-sender steer does not re-check the running leg's grant. On unmapped shared routes, differing participants’ capability identifier sets drop the shared window. Mapped shared routes compare the space’s grants instead, keeping the window across speakers.
 
 ### The second-order case: history outliving its grant
 
 Tool output a session fetched under a broad grant is in the history. If the owner then narrows what that subject may reach, the text remains in the prompt even though the capability that produced it is gone — a quiet way for a revocation to be less complete than the owner believes.
 
-The mechanism that closes it: the granted capability set is stored with the conversation and compared against the fresh leg's grant on each new turn. Any difference drops the history and its attachment generation and starts a new conversation; an empty grant removes the entry outright and closes the same asset fence, which is the same refusal an unauthorized sender already gets, applied to what was remembered as well as to what may be done. It costs a cache miss on the first new turn after a policy change. That is the correct price: a narrowed grant is precisely the moment replaying old output is wrong.
+The mechanism that closes it: the granted capability set is stored with the conversation and compared against the fresh leg's grant on each new turn, or the space’s grant on a mapped shared route. Any difference drops the history and its attachment generation and starts a new conversation. On a mapped shared route, an empty asker grant refuses the asker and preserves the space’s shared slot. On other routes, an empty grant removes the entry outright and closes the same asset fence, applying the refusal to remembered content as well as future calls. It costs a cache miss on the first new turn after a policy change. That is the correct price: a narrowed grant is precisely the moment replaying old output is wrong.
 
 Two honest limits on that mechanism. It compares capability *identifiers*, so a policy edit that keeps the same capability list while tightening its owner-authored constraint set — a narrower allowed host, a smaller output ceiling, a different injected credential — produces an identical grant set and does not drop the history; text fetched under the older constraints may remain on disk until retention expiry, although the in-process window can evict earlier. And invalidation removes text from a future prompt, never from anywhere it was already shown: the answer that quoted it is in a chat transcript the daemon does not own, and in the operator's telemetry store.
 
@@ -274,12 +274,14 @@ Components receive no WASI, host path, environment, socket, or
 ambient I/O: an exact JSONL or durable-files import is linked to a single-use grant bound to host
 instance, invocation, capability, provider, interface, access, configured storage scope, scope
 commitment, and limits. Private conversation scope retains the authenticated subject;
-shared-conversation scope retains transport and conversation without subject; agent scope retains
-provider and agent. An agent-scope storage constraint may name `namespace: <provider id>` in owner
+shared-conversation scope retains transport and conversation without subject; space scope retains the
+agent, configured transport, optional workspace and channel, without subject, principal or thread;
+agent scope retains provider and agent. Agent scope is refused inside a mapped channel, and space
+scope is unavailable outside one. An agent-scope storage constraint may name `namespace: <provider id>` in owner
 configuration, which then stands in for the provider, so providers naming one namespace share one
 resource per agent; no provider or input can name it, the grant still binds the invoking provider,
 and broker startup refuses the key under any other scope and refuses agent-scope sets that share a
-namespace with a different interface. Scope never bypasses per-caller Cedar authorization. Shared and agent scope
+namespace with a different interface. Scope never bypasses per-caller Cedar authorization. Shared, space and agent scope
 use stable storage continuity so different callers' effective permissions cannot rotate a shared
 resource; private storage keeps its existing authority-bound default. HTTP and storage authority cannot coexist in one v1 capability. Description and command
 resolution receive a disabled sticky context.

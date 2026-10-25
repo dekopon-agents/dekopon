@@ -644,7 +644,7 @@ outside its namespaces), `unmapped-subject` (granted, but no mapping names that 
 its fixed literal), or `agent-denied` (attested and mapped, but no policy lets that principal drive that agent). Startup
 rejects duplicate mapping subjects, malformed namespaces and a principal whose subjects mix kinds.
 
-A Slack channel subject is `slack.<team>.<channel>`; a Slack id starting `c` or `g` is a space, and every other Slack id is a person. A Discord channel subject is `discord.<guild>.<channel>` (both snowflakes); `discord.<user>` remains a person. GitHub subjects are repositories, every other subject is a person, and a principal without subjects is a service. Each principal has exactly one kind, available as `principal.kind`. The broker derives a space from the attested conversation, never from message text or a gateway-supplied principal. In a mapped channel and its threads, every decision, including the session gate and capability listing, needs both the asker and the space to allow it. Direct messages and top-level group direct messages have no space. A mapped group-DM thread can downscope its asker. A space subject cannot be an attested sender.
+A Slack channel subject is `slack.<team>.<channel>`; a Slack id starting `c` or `g` is a space, and every other Slack id is a person. A Discord channel subject is `discord.<guild>.<channel>` (both snowflakes); `discord.<user>` remains a person. GitHub subjects are repositories, every other subject is a person, and a principal without subjects is a service. Each principal has exactly one kind, available as `principal.kind`. The broker derives a space from the attested conversation, never from message text or a gateway-supplied principal. In a mapped channel and its threads, every decision, including the session gate and capability listing, needs both the asker and the space to allow it. Direct messages and top-level group direct messages have no space. A mapped group-DM thread can downscope its asker. A space subject cannot be an attested sender. Mapping a channel is optional: an unmapped channel keeps the asker’s full policy, and once mapped the channel’s policy is its downscope, so an empty policy permits nothing.
 
 ### IPC directory and distinct peer UIDs
 
@@ -1057,11 +1057,11 @@ chatMemory:
   compactionThresholdBytes: 12582912
 ```
 
-Storage constraints require `scope: private-conversation|shared-conversation|agent`. Optional
+Storage constraints require `scope: private-conversation|shared-conversation|agent|space`. Optional
 `retention: {mode: keep}` defaults to Keep; `retention: {mode: idle-ttl, idleTtlMs: 86400000}`
 opts the addressed storage family into an idle TTL, and zero, overflow, unknown fields and
 conflicting retention settings for the same namespace and scope refuse startup. No existing
-chat-memory data gains a TTL by default.
+chat-memory data gains a TTL by default. `space` storage is shared across a mapped channel and all its threads, keyed by agent, configured transport, workspace and channel rather than the policy principal. It is unavailable outside a space; inside one, every `agent`-scoped storage set is refused at listing and invocation.
 
 Under `scope: agent`, optional `namespace: <provider id>` opens another provider's agent storage
 instead of the invoking provider's own, so a table one provider builds the other reads back:

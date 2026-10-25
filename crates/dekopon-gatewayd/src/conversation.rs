@@ -26,6 +26,7 @@ use crate::{
 enum ConversationAudience {
     Private(ExternalSubject),
     Shared,
+    Space(Box<(dekopon_core::SpaceKey, Option<String>)>),
 }
 
 /// The transport, agent, and audience together stop two agents or installations from sharing
@@ -62,9 +63,23 @@ impl ConversationKey {
         }
     }
 
+    pub(crate) fn for_space(space: dekopon_core::SpaceKey, thread: Option<String>) -> Self {
+        Self {
+            agent: space.agent.clone(),
+            transport: String::new(),
+            conversation: String::new(),
+            audience: ConversationAudience::Space(Box::new((space, thread))),
+        }
+    }
+
     pub(crate) fn absorb(&self, digest: &mut impl Update) {
-        for part in [self.agent.as_str(), &self.transport, &self.conversation] {
-            cache_key::absorb(digest, part.as_bytes());
+        match &self.audience {
+            ConversationAudience::Private(_) | ConversationAudience::Shared => {
+                for part in [self.agent.as_str(), &self.transport, &self.conversation] {
+                    cache_key::absorb(digest, part.as_bytes());
+                }
+            }
+            ConversationAudience::Space(_) => {}
         }
         match &self.audience {
             ConversationAudience::Private(subject) => {
@@ -72,6 +87,18 @@ impl ConversationKey {
                 cache_key::absorb(digest, subject.canonical().as_bytes());
             }
             ConversationAudience::Shared => digest.update(&[0]),
+            ConversationAudience::Space(binding) => {
+                let (space, thread) = binding.as_ref();
+                digest.update(&space.encode());
+                match thread {
+                    Some(thread) => {
+                        digest.update(&[1]);
+                        cache_key::absorb(digest, thread.as_bytes());
+                    }
+                    None => digest.update(&[0]),
+                }
+                digest.update(&[0]);
+            }
         }
     }
 
@@ -675,4 +702,32 @@ fn evicted(reason: EvictionReason) {
         reason = reason.label(),
         "gateway.conversation.evicted"
     );
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    #[test]
+    fn space_replay_stem_is_frozen_and_threads_remain_separate() {
+        let space = dekopon_core::SpaceKey {
+            agent: "reviewer".parse().expect("agent"),
+            transport: "team-slack".to_owned().into(),
+            workspace: Some("t1".to_owned().into()),
+            channel: "c1".to_owned().into(),
+        };
+        let first = ConversationKey::for_space(space.clone(), Some("thread-1".to_owned()));
+        assert_eq!(
+            first.journal_stem(),
+            "reviewer/5f6ae83559748e2d54cdf794bd028ae8e3338f30f3f0f6623ff9bd193105a2fe"
+        );
+        assert_ne!(
+            first.journal_stem(),
+            ConversationKey::for_space(space.clone(), Some("thread-2".to_owned())).journal_stem()
+        );
+        assert_ne!(
+            first.journal_stem(),
+            ConversationKey::for_space(space, None).journal_stem()
+        );
+    }
 }
