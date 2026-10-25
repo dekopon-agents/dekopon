@@ -151,7 +151,11 @@ pub fn thread(event: GithubEventName, body: &Value) -> Result<GithubThread, Gith
                 .pointer("/parent_issue_repo/id")
                 .and_then(Value::as_u64)
                 .and_then(|id| GithubNumber::new(id).ok());
-            if own_repository.is_some() && own_repository == parent_repository {
+            let local = match body.get("action").and_then(Value::as_str) {
+                Some("sub_issue_added" | "sub_issue_removed") => own_repository.is_some(),
+                _ => own_repository.is_some() && own_repository == parent_repository,
+            };
+            if local {
                 number("/parent_issue/number")
             } else {
                 Ok(GithubThread::Repository)
@@ -382,6 +386,38 @@ mod tests {
             thread(E::SubIssues, &foreign_parent).unwrap(),
             GithubThread::Repository
         );
+    }
+
+    #[test]
+    fn sub_issues_key_by_the_local_parent_for_both_payload_shapes() {
+        for action in ["sub_issue_added", "sub_issue_removed"] {
+            let body = json!({
+                "action": action, "repository": {"id": 10},
+                "parent_issue": {"number": 7},
+                "sub_issue_repo": {"id": 20}, "sub_issue": {"number": 987}
+            });
+            assert_eq!(
+                thread(GithubEventName::SubIssues, &body)
+                    .unwrap()
+                    .to_string(),
+                "7"
+            );
+        }
+        for action in ["parent_issue_added", "parent_issue_removed"] {
+            for (parent_repository, expected) in [(10, "7"), (20, "repository")] {
+                let body = json!({
+                    "action": action, "repository": {"id": 10},
+                    "parent_issue_repo": {"id": parent_repository},
+                    "parent_issue": {"number": 7}, "sub_issue": {"number": 987}
+                });
+                assert_eq!(
+                    thread(GithubEventName::SubIssues, &body)
+                        .unwrap()
+                        .to_string(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
