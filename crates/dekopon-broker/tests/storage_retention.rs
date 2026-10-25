@@ -128,141 +128,6 @@ when { context.via == "gateway" && context.agent == "reviewer" };
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().canonicalize().unwrap().join("storage");
-    let (first_broker, first_storage) = build_broker(&root, true).await;
-    let alice: ExternalSubject = "slack.t0123abc.u9xyz".parse().unwrap();
-    let bob: ExternalSubject = "slack.t0123abc.u8xyz".parse().unwrap();
-    let gateway = AuthenticatedContext::new(
-        "gateway".parse().unwrap(),
-        Actor::Service {
-            principal: "gateway".parse().unwrap(),
-        },
-    )
-    .unwrap();
-    let invoke = |index, subject| {
-        let request = InvocationRequest {
-            id: format!("storage-retention-{index}").parse().unwrap(),
-            capability: "storage-probe.run".parse().unwrap(),
-            trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
-                .parse()
-                .unwrap(),
-            input: json!({"mode":"quota-denial"}),
-            secret_use: None,
-        };
-        let claim = Attestation::for_chat(
-            subject,
-            "reviewer".parse().unwrap(),
-            ChatScopeClaim {
-                transport: "scientist-slack".parse().unwrap(),
-                kind: ChatTransportKind::Slack,
-                conversation: Conversation {
-                    kind: ConversationKind::Thread,
-                    container: Some("t0123abc".to_owned()),
-                    id: "c0123abc".to_owned(),
-                    thread: Some("1712345678.000100".to_owned()),
-                },
-                delivery: None,
-                trigger: Trigger::Message,
-            },
-        )
-        .bound_to(request.id.clone());
-        (request, claim)
-    };
-    let grant = AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
-    };
-    let (request, claim) = invoke(0, bob.clone());
-    let formerly_allowed = first_broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&claim),
-            request,
-            Default::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        formerly_allowed.result.outcome,
-        InvocationOutcome::Failed,
-        "{formerly_allowed:?}"
-    );
-    drop(first_broker);
-    drop(first_storage);
-    let (broker, storage) = build_broker(&root, false).await;
-    let (request, claim) = invoke(1, alice);
-    let admitted = broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&claim),
-            request,
-            Default::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        admitted.result.outcome,
-        InvocationOutcome::Failed,
-        "{admitted:?}"
-    );
-    let path = fs::read_dir(root.join("namespaces"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .join("last-used");
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(60)))
-        .unwrap();
-    let aged = fs::metadata(&path).unwrap().modified().unwrap();
-    let (request, claim) = invoke(2, bob);
-    let denied = broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&claim),
-            request,
-            Default::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
-    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), aged);
-    let (request, claim) = invoke(3, "slack.t0123abc.u9xyz".parse().unwrap());
-    let admitted = broker
-        .invoke(
-            &gateway,
-            Some(&grant),
-            Some(&claim),
-            request,
-            Default::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        admitted.result.outcome,
-        InvocationOutcome::Failed,
-        "{admitted:?}"
-    );
-    assert!(fs::metadata(&path).unwrap().modified().unwrap() > aged);
-    assert_eq!(broker.storage_retention_policies().len(), 1);
-    assert_eq!(
-        storage
-            .sweep(&broker.storage_retention_policies())
-            .unwrap()
-            .deleted,
-        0
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audience() {
     let gateway = AuthenticatedContext::new(
         "gateway".parse().unwrap(),
@@ -397,4 +262,139 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                 .is_empty()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let (first_broker, first_storage) = build_broker(&root, true).await;
+    let alice: ExternalSubject = "slack.t0123abc.u9xyz".parse().unwrap();
+    let bob: ExternalSubject = "slack.t0123abc.u8xyz".parse().unwrap();
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().unwrap(),
+        Actor::Service {
+            principal: "gateway".parse().unwrap(),
+        },
+    )
+    .unwrap();
+    let invoke = |index, subject| {
+        let request = InvocationRequest {
+            id: format!("storage-retention-{index}").parse().unwrap(),
+            capability: "storage-probe.run".parse().unwrap(),
+            trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+                .parse()
+                .unwrap(),
+            input: json!({"mode":"quota-denial"}),
+            secret_use: None,
+        };
+        let claim = Attestation::for_chat(
+            subject,
+            "reviewer".parse().unwrap(),
+            ChatScopeClaim {
+                transport: "scientist-slack".parse().unwrap(),
+                kind: ChatTransportKind::Slack,
+                conversation: Conversation {
+                    kind: ConversationKind::Thread,
+                    container: Some("t0123abc".to_owned()),
+                    id: "c0123abc".to_owned(),
+                    thread: Some("1712345678.000100".to_owned()),
+                },
+                delivery: None,
+                trigger: Trigger::Message,
+            },
+        )
+        .bound_to(request.id.clone());
+        (request, claim)
+    };
+    let grant = AttestorGrant {
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+    };
+    let (request, claim) = invoke(0, bob.clone());
+    let formerly_allowed = first_broker
+        .invoke(
+            &gateway,
+            Some(&grant),
+            Some(&claim),
+            request,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        formerly_allowed.result.outcome,
+        InvocationOutcome::Failed,
+        "{formerly_allowed:?}"
+    );
+    drop(first_broker);
+    drop(first_storage);
+    let (broker, storage) = build_broker(&root, false).await;
+    let (request, claim) = invoke(1, alice);
+    let admitted = broker
+        .invoke(
+            &gateway,
+            Some(&grant),
+            Some(&claim),
+            request,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.result.outcome,
+        InvocationOutcome::Failed,
+        "{admitted:?}"
+    );
+    let path = fs::read_dir(root.join("namespaces"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("last-used");
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(60)))
+        .unwrap();
+    let aged = fs::metadata(&path).unwrap().modified().unwrap();
+    let (request, claim) = invoke(2, bob);
+    let denied = broker
+        .invoke(
+            &gateway,
+            Some(&grant),
+            Some(&claim),
+            request,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), aged);
+    let (request, claim) = invoke(3, "slack.t0123abc.u9xyz".parse().unwrap());
+    let admitted = broker
+        .invoke(
+            &gateway,
+            Some(&grant),
+            Some(&claim),
+            request,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        admitted.result.outcome,
+        InvocationOutcome::Failed,
+        "{admitted:?}"
+    );
+    assert!(fs::metadata(&path).unwrap().modified().unwrap() > aged);
+    assert_eq!(broker.storage_retention_policies().len(), 1);
+    assert_eq!(
+        storage
+            .sweep(&broker.storage_retention_policies())
+            .unwrap()
+            .deleted,
+        0
+    );
 }
