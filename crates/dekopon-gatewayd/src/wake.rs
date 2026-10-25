@@ -11,8 +11,9 @@ use dekopon_broker_protocol::{
     Attestation, ChatScopeClaim, ChatTransportKind, Conversation, TraceParent, Trigger,
 };
 use dekopon_core::{AgentId, ExternalSubject, TransportId};
+use dekopon_process::ExitCode;
 use dekopon_process::Limits as ShellLimits;
-use dekopon_shell::{CapabilityInvoker, ExitCode, Interpreter, ScriptOutcome};
+use dekopon_shell::{CapabilityInvoker, Interpreter, ScriptOutcome};
 
 use crate::{
     config::{ResolvedBroker, WakeBounds},
@@ -95,7 +96,7 @@ impl Anchor {
 
     pub(crate) fn job_inbound(
         &self,
-        id: dekopon_shell::JobId,
+        id: dekopon_process::JobId,
         text: String,
         job: Option<TraceParent>,
     ) -> InboundMessage {

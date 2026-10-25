@@ -35,10 +35,10 @@ use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, SecretUseProposal,
 };
-use dekopon_process::{CallBudget, Limits, TreeContext};
+use dekopon_process::{CallBudget, ExitCode, JobId, JobSummary, JobWait, Limits, TreeContext};
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, ExitCode, Interpreter, JobControl,
-    JobId, JobRefusal, JobSeed, JobSummary, JobWait, Streams,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, Interpreter, JobControl, JobRefusal,
+    JobSeed, Streams,
 };
 use dekopon_test_support::{provider_fixture, shutdown_on};
 use serde_json::{Value, json};

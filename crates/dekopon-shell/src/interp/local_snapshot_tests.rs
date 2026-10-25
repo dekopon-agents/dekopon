@@ -1,3 +1,4 @@
+use dekopon_process::{CallBudget, Limits, TreeContext};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -12,7 +13,6 @@ use crate::{
     limits::{Budget, OutputBuffer},
     pipe,
 };
-use dekopon_process::{CallBudget, Limits, TreeContext};
 
 struct NoCalls;
 
@@ -71,11 +71,16 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
         testing_status: 0,
         stderr_capture: Vec::new(),
         counters: telemetry::ScriptCounters::default(),
-        last_status: crate::ExitCode::SUCCESS,
-        last_substitution_status: crate::ExitCode::SUCCESS,
+        last_status: dekopon_process::ExitCode::SUCCESS,
+        last_substitution_status: dekopon_process::ExitCode::SUCCESS,
         jobs: crate::job::ScriptJobs::default(),
     };
-    let (writer, _reader) = pipe::pipe();
+    let (writer, _reader) = pipe::pipe(
+        None,
+        None,
+        crate::interp::telemetry::stage_read,
+        crate::interp::telemetry::stage_write,
+    );
     let mut snapshot = parent.snapshot(writer).expect("snapshot");
     assert!(Arc::ptr_eq(&parent.globals, &snapshot.globals));
     let saved = snapshot.save_variable("n");

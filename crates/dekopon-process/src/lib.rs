@@ -103,5 +103,11 @@ impl CancelSignal {
     }
 }
 
+mod exit;
+mod job;
+pub mod pipe;
+pub use exit::ExitCode;
+pub use job::{JOBS_OFF, JobId, JobOutcome, JobState, JobSummary, JobWait};
+
 #[cfg(test)]
 mod tests;

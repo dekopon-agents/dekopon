@@ -1049,7 +1049,7 @@ mod tests {
     use super::*;
     use dekopon_model::model::{ModelFunctionCall, ModelToolCall};
     use dekopon_model_token_governor::ModelUsage;
-    use dekopon_shell::ExitCode;
+    use dekopon_process::ExitCode;
     use dekopon_test_support::LoopbackServer;
 
     fn parse(arguments: &[&str]) -> Result<Arguments, EvalError> {

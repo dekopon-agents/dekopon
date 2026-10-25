@@ -1,7 +1,7 @@
+use dekopon_process::{ExitCode, LimitExceeded};
 use serde_json::Value;
 
-use crate::{CapabilityInvoker, ExitCode, limits::Budget};
-use dekopon_process::LimitExceeded;
+use crate::{CapabilityInvoker, limits::Budget};
 
 pub(crate) mod cap;
 pub(crate) mod encode;
@@ -98,7 +98,7 @@ pub(crate) enum FatalError {
 pub(crate) struct BuiltinContext<'a> {
     pub invoker: &'a dyn CapabilityInvoker,
     pub budget: &'a mut Budget,
-    pub started_jobs: &'a [crate::JobId],
+    pub started_jobs: &'a [dekopon_process::JobId],
 }
 
 pub(crate) trait Builtin {
@@ -323,7 +323,7 @@ mod clap_spike {
         assert!(matches!(
             failure,
             CommandFailure::Status {
-                status: crate::ExitCode::SYNTAX,
+                status: dekopon_process::ExitCode::SYNTAX,
                 ..
             }
         ));
@@ -332,15 +332,27 @@ mod clap_spike {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use crate::interp::telemetry::StageObservation;
     pub(crate) fn cancel_after_first_step<T>(
-        run: impl FnOnce(&mut crate::pipe::PipeReader, &mut crate::limits::Budget) -> T,
+        run: impl FnOnce(
+            &mut dekopon_process::pipe::PipeReader<StageObservation>,
+            &mut crate::limits::Budget,
+        ) -> T,
     ) -> T {
         use dekopon_process::{CallBudget, CancelSignal, Limits, TreeContext};
         let (handle, signal) = CancelSignal::pair();
         let limits = Limits::default();
         let tree = TreeContext::new(limits, CallBudget::new(32)).with_cancel(vec![signal]);
-        let (mut writer, mut reader) = crate::pipe::pipe();
-        assert_eq!(writer.write(b"x\n"), crate::pipe::WriteOutcome::Accepted);
+        let (mut writer, mut reader) = dekopon_process::pipe::pipe(
+            None,
+            None,
+            crate::interp::telemetry::stage_read,
+            crate::interp::telemetry::stage_write,
+        );
+        assert_eq!(
+            writer.write(b"x\n"),
+            dekopon_process::pipe::WriteOutcome::Accepted
+        );
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 while tree.steps() == 0 {
@@ -427,7 +439,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter};
+    use crate::{CapabilityCallResult, CapabilityInvoker, Interpreter};
+    use dekopon_process::ExitCode;
     use dekopon_process::Limits;
 
     use super::{lookup, names, test_support::NoCapabilities, xargs};

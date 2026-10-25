@@ -108,14 +108,12 @@ impl GrepConfig {
 
 #[cfg(test)]
 mod tests {
+    use dekopon_process::ExitCode;
     use serde_json::{Value, json};
 
-    use crate::{
-        ExitCode,
-        builtins::{
-            CommandResult,
-            text::stream::{TextStream, run_test},
-        },
+    use crate::builtins::{
+        CommandResult,
+        text::stream::{TextStream, run_test},
     };
 
     fn grep(arguments: &[&str], input: Value) -> CommandResult {

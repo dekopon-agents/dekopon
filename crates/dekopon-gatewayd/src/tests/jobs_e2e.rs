@@ -1,10 +1,8 @@
 use super::*;
 use crate::jobs::{JobContext, JobOwner, Jobs};
 use dekopon_broker_protocol::Trigger;
-use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, ExitCode, JobId, JobOutcome, JobState, JobSummary,
-    JobWait,
-};
+use dekopon_process::{ExitCode, JobId, JobOutcome, JobState, JobSummary, JobWait};
+use dekopon_shell::{CapabilityCallResult, CapabilityInvoker};
 
 // One fake broker conversation for a job or watch tick. The child Invoke is kept
 // unanswered so only the shared tree deadline can end it.
@@ -1772,7 +1770,7 @@ async fn a_watch_on_a_route_without_a_job_deadline_starts_no_job_in_baseline_or_
     let inbound = super::wakes::slack_message("watch it");
     let route = routes.route(&inbound).cloned().expect("routed");
     let receipt = tool_output_of(&runner, &models, route, inbound.clone()).await;
-    assert!(receipt.contains(dekopon_shell::JOBS_OFF), "{receipt}");
+    assert!(receipt.contains(dekopon_process::JOBS_OFF), "{receipt}");
     assert!(receipt.contains("started=1"), "{receipt}");
     tick_once(&runner, &routes, &store).await;
     assert!(runner.jobs.list(&JobOwner::of(&inbound)).is_empty());
@@ -1973,7 +1971,7 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
     assert_eq!(outcome, crate::ServeOutcome::Shutdown);
     assert_eq!(driver.replies(), ["drained"]);
     let output = tool_message(&models, 1);
-    assert!(output.contains(dekopon_shell::JOBS_OFF), "{output}");
+    assert!(output.contains(dekopon_process::JOBS_OFF), "{output}");
     assert!(output.contains("status=1"), "{output}");
     let owner = JobOwner::of(&message("late"));
     assert!(runner.jobs.list(&owner).is_empty());
@@ -1996,7 +1994,7 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
     .expect("the probe script joins");
     assert_eq!(
         probed.output,
-        format!("{}\nstatus=1", dekopon_shell::JOBS_OFF)
+        format!("{}\nstatus=1", dekopon_process::JOBS_OFF)
     );
     assert!(runner.jobs.list(&owner).is_empty());
     assert_eq!(runner.jobs.free_permits(), 2);

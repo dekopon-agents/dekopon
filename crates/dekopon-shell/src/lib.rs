@@ -131,6 +131,8 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
+use crate::interp::telemetry::StageObservation;
+use dekopon_process::{CallBudget, ExitCode, Limits, TreeContext, pipe};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde_json::Value;
@@ -140,20 +142,15 @@ mod builtins;
 mod dispatch;
 mod interp;
 mod job;
-pub use job::{
-    JOBS_OFF, JobControl, JobId, JobOutcome, JobRefusal, JobSeed, JobState, JobSummary, JobWait,
-};
+pub use job::{JobControl, JobRefusal, JobSeed};
 mod jq_worker;
 mod lexer;
 pub use jq_worker::{run_jq_worker_if_requested, set_jq_worker_executable};
 pub mod limits;
 mod parser;
-mod pipe;
 mod proposal;
 pub use proposal::{CommandProposal, CommandReport, CommandReportOutcome};
 pub mod value;
-
-use dekopon_process::{CallBudget, Limits, TreeContext};
 
 use dekopon_core::{ProviderFailureDetail, SecretUseProposal};
 
@@ -431,57 +428,17 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ExitCode(u8);
-
-impl ExitCode {
-    pub const SUCCESS: Self = Self(0);
-    pub const FAILURE: Self = Self(1);
-    pub const SYNTAX: Self = Self(2);
-    pub const TIMEOUT: Self = Self(124);
-    pub const CANCELLED: Self = Self(130);
-    pub const DENIED: Self = Self(126);
-    pub const NOT_FOUND: Self = Self(127);
-
-    #[must_use]
-    pub fn from_script_exit(status: i64) -> Self {
-        Self(u8::try_from(status.rem_euclid(256)).unwrap_or(0))
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn from_capability_result(result: &CapabilityCallResult) -> Self {
+impl From<&CapabilityCallResult> for ExitCode {
+    fn from(result: &CapabilityCallResult) -> Self {
         match result {
             CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_) => {
                 Self::SUCCESS
             }
-            CapabilityCallResult::Exited { status, .. } => Self(status.get()),
+            CapabilityCallResult::Exited { status, .. } => Self::from(status.get()),
             CapabilityCallResult::Failed { .. } => Self::FAILURE,
             CapabilityCallResult::Denied { .. } => Self::DENIED,
             CapabilityCallResult::NotFound => Self::NOT_FOUND,
         }
-    }
-}
-
-impl From<ExitCode> for u8 {
-    fn from(code: ExitCode) -> Self {
-        code.0
-    }
-}
-
-impl From<u8> for ExitCode {
-    fn from(code: u8) -> Self {
-        Self(code)
-    }
-}
-
-impl std::fmt::Display for ExitCode {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
     }
 }
 
@@ -495,13 +452,13 @@ pub struct ScriptOutcome {
 }
 
 #[derive(Debug)]
-pub struct ChildStdin(pipe::PipeReader);
+pub struct ChildStdin(pipe::PipeReader<StageObservation>);
 
 impl ChildStdin {
     /// Adopt the socket before anything writes to its peer: macOS refuses the read timeout on a
     /// socket whose peer has already closed.
     pub fn adopt(socket: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
-        pipe::PipeReader::from_socket(socket).map(Self)
+        pipe::PipeReader::from_socket(socket, None, crate::interp::telemetry::stage_read).map(Self)
     }
 }
 
@@ -1466,24 +1423,24 @@ mod tests {
     #[test]
     fn capability_results_map_onto_distinct_codes() {
         assert_eq!(
-            ExitCode::from_capability_result(&CapabilityCallResult::Succeeded),
+            ExitCode::from(&CapabilityCallResult::Succeeded),
             ExitCode::SUCCESS
         );
         assert_eq!(
-            ExitCode::from_capability_result(&CapabilityCallResult::Failed {
+            ExitCode::from(&CapabilityCallResult::Failed {
                 error: "boom".to_owned(),
                 detail: None
             }),
             ExitCode::FAILURE
         );
         assert_eq!(
-            ExitCode::from_capability_result(&CapabilityCallResult::Denied {
+            ExitCode::from(&CapabilityCallResult::Denied {
                 reason: "policy".to_owned()
             }),
             ExitCode::DENIED
         );
         assert_eq!(
-            ExitCode::from_capability_result(&CapabilityCallResult::NotFound),
+            ExitCode::from(&CapabilityCallResult::NotFound),
             ExitCode::NOT_FOUND
         );
     }

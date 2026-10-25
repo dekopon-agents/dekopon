@@ -151,7 +151,10 @@ pub(crate) fn record_stage_command(span: &tracing::Span) {
     });
 }
 
-pub(crate) fn stage_read(bytes: usize, owner: Option<&Arc<StageMeter>>) {
+pub(crate) type StageObservation = Option<Arc<StageMeter>>;
+
+pub(crate) fn stage_read(bytes: usize, owner: &StageObservation) {
+    let owner = owner.as_ref();
     if let Some(owner) = owner {
         owner.input.fetch_add(bytes as u64, Ordering::Relaxed);
     }
@@ -165,10 +168,11 @@ pub(crate) fn stage_read(bytes: usize, owner: Option<&Arc<StageMeter>>) {
 }
 
 pub(crate) fn stage_terminal_write(bytes: usize, terminal: bool) {
-    stage_write(bytes * usize::from(terminal), true, None);
+    stage_write(bytes * usize::from(terminal), true, &None);
 }
 
-pub(crate) fn stage_write(bytes: usize, accepted: bool, owner: Option<&Arc<StageMeter>>) {
+pub(crate) fn stage_write(bytes: usize, accepted: bool, owner: &StageObservation) {
+    let owner = owner.as_ref();
     let record = |meter: &StageMeter| {
         if accepted {
             meter.output.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -192,8 +196,8 @@ pub(crate) fn stage_write(bytes: usize, accepted: bool, owner: Option<&Arc<Stage
     });
 }
 
-use crate::{ExitCode, builtins::FatalError, dispatch::Resolution, value::display};
-use dekopon_process::LimitExceeded;
+use crate::{builtins::FatalError, dispatch::Resolution, value::display};
+use dekopon_process::{ExitCode, LimitExceeded};
 
 pub(crate) const SCRIPT_SPAN: &str = "shell.script";
 

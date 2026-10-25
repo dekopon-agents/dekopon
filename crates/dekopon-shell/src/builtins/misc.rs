@@ -1,10 +1,9 @@
+use dekopon_process::{ExitCode, LimitExceeded};
 use std::{thread, time::Duration};
 
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
-use crate::ExitCode;
-use dekopon_process::LimitExceeded;
 
 const ECHO_HELP: &str = "-n -e -E";
 
@@ -489,13 +488,14 @@ impl Builtin for Cat {
 
 #[cfg(test)]
 mod tests {
+    use dekopon_process::ExitCode;
     use parking_lot::Mutex;
     use std::{sync::Arc, time::Duration};
 
     use serde_json::{Value, json};
 
     use crate::{
-        CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter,
+        CapabilityCallResult, CapabilityInvoker, Interpreter,
         builtins::{
             CommandFailure,
             test_support::{run_builtin, run_builtin_with, run_builtin_with_invoker},

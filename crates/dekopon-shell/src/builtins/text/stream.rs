@@ -1,5 +1,5 @@
+use crate::interp::telemetry::StageObservation;
 use crate::{
-    ExitCode,
     builtins::{
         CommandFailure,
         text::{
@@ -8,9 +8,9 @@ use crate::{
         },
     },
     limits::Budget,
-    pipe::{PipeReader, ReadOutcome},
 };
-use dekopon_process::RetainedBytes;
+use dekopon_process::pipe::{PipeReader, ReadOutcome};
+use dekopon_process::{ExitCode, RetainedBytes};
 
 #[derive(Clone, Copy)]
 pub(crate) enum TextStream {
@@ -66,7 +66,7 @@ impl TextStream {
     pub(crate) fn run(
         self,
         arguments: &[String],
-        reader: &mut PipeReader,
+        reader: &mut PipeReader<StageObservation>,
         budget: &mut Budget,
 
         emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -77,7 +77,7 @@ impl TextStream {
     pub(crate) fn run_parsed(
         self,
         operation: Operation,
-        reader: &mut PipeReader,
+        reader: &mut PipeReader<StageObservation>,
         budget: &mut Budget,
 
         mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
@@ -85,7 +85,7 @@ impl TextStream {
         let mut pending = Vec::new();
         let mut charges: Vec<RetainedBytes> = Vec::new();
         let mut progress = LineProgress::default();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget)? {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
             budget.charge_step()?;
             let mut rest = chunk.as_slice();
             while !rest.is_empty() {
@@ -263,7 +263,7 @@ pub(crate) fn run_test(
     } else {
         format!("{}\n", lines.join("\n")).into_bytes()
     };
-    let mut reader = PipeReader::from_bytes(bytes);
+    let mut reader = PipeReader::from_bytes(bytes, None, crate::interp::telemetry::stage_read);
     let mut budget = Budget::start(Limits::default());
     let mut output = Vec::new();
     let operation = command.parse(
@@ -299,7 +299,8 @@ mod tests {
     fn case_insensitive_sed_charges_unicode_fold_before_allocation() {
         let arguments = ["s/i/y/i".to_owned()];
         let input = "İ\n".as_bytes().to_vec();
-        let mut reader = PipeReader::from_bytes(input.clone());
+        let mut reader =
+            PipeReader::from_bytes(input.clone(), None, crate::interp::telemetry::stage_read);
         let mut budget = Budget::start(Limits {
             max_value_bytes: 5,
             ..Limits::default()
@@ -314,7 +315,7 @@ mod tests {
             ))
         ));
 
-        let mut reader = PipeReader::from_bytes(input);
+        let mut reader = PipeReader::from_bytes(input, None, crate::interp::telemetry::stage_read);
         let mut budget = Budget::start(Limits {
             max_value_bytes: 6,
             ..Limits::default()
@@ -352,7 +353,7 @@ mod tests {
     fn context_across_chunks_emits_one_numbered_unterminated_tail() {
         let mut input = b"x\n".repeat(pipe::CHUNK_BYTES / 2 - 1);
         input.extend_from_slice(b"P\nx\nP\ntail");
-        let mut reader = PipeReader::from_bytes(input);
+        let mut reader = PipeReader::from_bytes(input, None, crate::interp::telemetry::stage_read);
         let mut budget = Budget::start(Limits::default());
         let mut output = Vec::new();
         let status = TextStream::Grep
@@ -383,7 +384,11 @@ mod tests {
 
     #[test]
     fn quiet_grep_does_not_retain_before_context() {
-        let mut reader = PipeReader::from_bytes(b"abc\nabc\nmatch\n".to_vec());
+        let mut reader = PipeReader::from_bytes(
+            b"abc\nabc\nmatch\n".to_vec(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
         let mut budget = Budget::start(Limits {
             max_value_bytes: 7,
             ..Limits::default()
@@ -401,7 +406,11 @@ mod tests {
 
     #[test]
     fn grep_before_window_retains_charges() {
-        let mut reader = PipeReader::from_bytes(b"abc\nabc\nabc\nmatch\n".to_vec());
+        let mut reader = PipeReader::from_bytes(
+            b"abc\nabc\nabc\nmatch\n".to_vec(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
         let mut budget = Budget::start(Limits {
             max_value_bytes: 7,
             ..Limits::default()
@@ -426,7 +435,7 @@ mod tests {
     fn grep_after_context_emits_before_exhausting_the_next_chunk_step() {
         let mut bytes = b"match\nctx\n".to_vec();
         bytes.extend(std::iter::repeat_n(b'x', 2 * pipe::CHUNK_BYTES));
-        let mut reader = PipeReader::from_bytes(bytes);
+        let mut reader = PipeReader::from_bytes(bytes, None, crate::interp::telemetry::stage_read);
         let mut budget = Budget::start(Limits {
             max_steps: 3,
             ..Limits::default()
@@ -456,7 +465,11 @@ mod tests {
     fn repeated_replacements_emit_bounded_chunks_without_retaining_output() {
         let replacement = "y".repeat(8 * 1024);
         let script = format!("s/x/{replacement}/g");
-        let mut reader = PipeReader::from_bytes(b"xxxxx".to_vec());
+        let mut reader = PipeReader::from_bytes(
+            b"xxxxx".to_vec(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
         let mut budget = Budget::start(Limits {
             max_value_bytes: 9 * 1024,
             ..Limits::default()
@@ -475,7 +488,12 @@ mod tests {
 
     #[test]
     fn a_matching_line_is_emitted_before_stdin_closes() {
-        let (mut writer, mut reader) = pipe::pipe();
+        let (mut writer, mut reader) = pipe::pipe(
+            None,
+            None,
+            crate::interp::telemetry::stage_read,
+            crate::interp::telemetry::stage_write,
+        );
         let (sent, received) = std::sync::mpsc::sync_channel(1);
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
@@ -513,7 +531,11 @@ mod tests {
                 TextStream::Grep => vec!["x".to_owned()],
                 TextStream::Sed => vec!["s/x/y/".to_owned()],
             };
-            let mut reader = PipeReader::from_bytes(b"x\nx\nx\nx\nx\n".to_vec());
+            let mut reader = PipeReader::from_bytes(
+                b"x\nx\nx\nx\nx\n".to_vec(),
+                None,
+                crate::interp::telemetry::stage_read,
+            );
             let mut budget = Budget::start(Limits {
                 max_value_bytes: 3,
                 ..Limits::default()
@@ -537,7 +559,12 @@ mod tests {
                 TextStream::Grep => vec!["x".to_owned()],
                 TextStream::Sed => vec!["s/x/y/".to_owned()],
             };
-            let (mut writer, mut reader) = pipe::pipe();
+            let (mut writer, mut reader) = pipe::pipe(
+                None,
+                None,
+                crate::interp::telemetry::stage_read,
+                crate::interp::telemetry::stage_write,
+            );
             for _ in 0..5 {
                 assert_eq!(writer.write(b"x"), pipe::WriteOutcome::Accepted);
             }
@@ -556,7 +583,8 @@ mod tests {
                 }))
             ));
 
-            let mut reader = PipeReader::from_bytes(b"x".to_vec());
+            let mut reader =
+                PipeReader::from_bytes(b"x".to_vec(), None, crate::interp::telemetry::stage_read);
             let (handle, signal) = dekopon_process::CancelSignal::pair();
             let limits = Limits::default();
             let mut budget = Budget::start_tree(

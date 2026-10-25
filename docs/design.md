@@ -133,6 +133,9 @@ The broker owns the only authority transition in this flow. The authenticated re
 
 ## Component boundaries
 
+Bounded pipes, job vocabulary and exit codes live in `dekopon-process`; job control
+and stage telemetry remain in `dekopon-shell`.
+
 | Component | Authority and responsibility | Status |
 |---|---|---|
 | `dekopon-core` | Validated identifiers and dependency-light domain types, including the `SkillId` name grammar | **Current** |
