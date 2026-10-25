@@ -567,3 +567,18 @@ async fn a_batch_stops_at_sixteen_and_never_crosses_an_actor_boundary() {
         assert_eq!(note.matches("[gateway: unverified").count(), count);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_delivery_channel_returns_service_unavailable() {
+    let fixture = fixture(Arc::new(ModelScript::forbidden()), 8).await;
+    let bytes = serde_json::to_vec(&body("issue_comment", 7, 1)).unwrap();
+    let request =
+        fixture
+            .transport
+            .request_for_test(signed(&bytes, b"secret", "closed", "issue_comment"));
+    drop(fixture.transport);
+    assert_eq!(
+        request.await.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}

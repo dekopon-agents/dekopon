@@ -375,7 +375,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         constituents: Vec::new(),
         folded: Vec::new(),
     };
-    let receiver = {
+    let (permit, ticket, receiver) = {
         let mut accepted = state.accepted.lock();
         match accepted.reserve(&delivery) {
             Reservation::Committed => return webhook::content_free(StatusCode::OK),
@@ -394,11 +394,12 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
             accepted: Arc::clone(&state.accepted),
             reply: Some(reply),
         };
-        receipt.record("message.id", &delivery);
-        record_conversation(&receipt, &message.conversation);
-        permit.send(TransportEvent::Delivery(Box::new(message), ticket));
-        receiver
+        (permit, ticket, receiver)
     };
+    receipt.record("message.id", &delivery);
+    record_conversation(&receipt, &message.conversation);
+    // A closed receiver can drop the ticket synchronously, and its Drop reacquires accepted.
+    permit.send(TransportEvent::Delivery(Box::new(message), ticket));
     match tokio::time::timeout(webhook::WEBHOOK_REQUEST_TIMEOUT, receiver).await {
         Ok(Ok(Acked::Admitted | Acked::Queued | Acked::Ignored)) => {
             webhook::content_free(StatusCode::OK)

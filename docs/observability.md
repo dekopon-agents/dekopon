@@ -1173,7 +1173,9 @@ is no blind span ([storage telemetry and audit](#storage-telemetry-and-audit)).
 
 ## Model and tool transcript
 
-The gateway's OTLP log filter is `job=debug,meter=info`. The `agent.model.prompt`,
+The gateway's OTLP log filter is `job=debug,meter=info`; audit events carrying a scoped native
+array, including GitHub `gateway.admission` records, also reach the log exporter. Exporter
+diagnostics remain excluded. The `agent.model.prompt`,
 `agent.model.answer` and `agent.tool.*` events therefore reach OpenObserve as span events in the
 traces stream, rather than log records. Reconstruct the transcript from those events within the
 message trace.

@@ -415,7 +415,7 @@ impl Install {
         let logger_provider = logs.map(|logs| {
             layers.push(
                 OpenTelemetryTracingBridge::new(&logs.provider)
-                    .with_filter(otlp_filter(&logs.filter))
+                    .with_filter(log_filter(&logs.filter))
                     .boxed(),
             );
             logs.provider
@@ -529,6 +529,22 @@ pub enum InstallError {
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct ShutdownError(String);
+
+fn log_filter<S>(directive: &str) -> impl tracing_subscriber::layer::Filter<S> + use<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use tracing_subscriber::filter::{FilterExt as _, dynamic_filter_fn};
+    otlp_filter(directive)
+        .or(dynamic_filter_fn(|metadata, _| {
+            metadata.is_event()
+                && metadata.fields().field("audit.event").is_some()
+                && opentelemetry::Context::current()
+                    .get::<crate::EventStringArray>()
+                    .is_some()
+        }))
+        .and(EnvFilter::new(format!("trace,{EXPORTER_DIAGNOSTICS_OFF}")))
+}
 
 fn trace_layer<S>(
     tracer: opentelemetry_sdk::trace::Tracer,
@@ -975,6 +991,24 @@ mod tests {
         fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
             self.0.lock().push(event.metadata().target().to_owned());
         }
+    }
+
+    #[test]
+    fn native_array_audits_pass_the_log_filter_without_exporting_other_payloads() {
+        let recorded = RecordTargets::default();
+        let subscriber = registry().with(
+            recorded
+                .clone()
+                .with_filter(super::log_filter("job=debug,meter=info")),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "dekopon_gatewayd::audit", {audit.event = "gateway.message.received"}, "inbound");
+            crate::with_event_string_array("github.deliveries", &["first"], || {
+                tracing::info!(target: "dekopon_gatewayd::audit", {audit.event = "gateway.admission"}, "admission");
+                tracing::error!(target: "opentelemetry", {audit.event = "gateway.admission"}, "must not reexport");
+            });
+        });
+        assert_eq!(*recorded.0.lock(), vec!["dekopon_gatewayd::audit"]);
     }
 
     #[test]
