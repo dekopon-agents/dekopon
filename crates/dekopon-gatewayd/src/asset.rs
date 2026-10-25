@@ -374,7 +374,7 @@ impl AssetStore {
         for (key, entry) in entries.iter_mut() {
             for row in &mut entry.assets {
                 if let Attachment::Resident(digest) = &row.state
-                    && !retention.resident(digest)
+                    && !retention.is_bound(key, &row.asset, digest)
                 {
                     row.state = Attachment::Evicted;
                     retention.tombstone((key.clone(), row.asset.id));
@@ -965,6 +965,7 @@ impl AssetStore {
         access
             .with_active(|key| {
                 let mut entries = self.entries.lock();
+                Self::refresh_states(&mut entries, &mut self.retention.lock());
                 let row = row_mut(&mut entries, key, id).ok_or(AssetFailure::Unknown)?;
                 let ticket = |attempt| Ticket {
                     store: Arc::downgrade(self),
@@ -2033,7 +2034,7 @@ mod retention_tests {
 
     #[test]
     fn store_modes_and_index_and_traces_exclude_bearer_sources() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use tracing_subscriber::prelude::*;
         let capture = dekopon_test_support::CaptureLayer::workspace();
         let _guard = tracing_subscriber::registry()
@@ -2041,6 +2042,8 @@ mod retention_tests {
             .set_default();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("assets");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
             .with_storage(&path)
             .unwrap();
@@ -2059,6 +2062,7 @@ mod retention_tests {
                 std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
                 0o700
             );
+            assert_eq!(std::fs::metadata(dir).unwrap().uid(), crate::current_uid());
         }
         let blob = std::fs::read_dir(path.join("blobs"))
             .unwrap()
@@ -2202,6 +2206,109 @@ mod retention_tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn journal_deletion_unlinks_a_pinned_file_but_keeps_its_bytes_charged_until_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let access = access("pinned");
+        let id = register(&store, &access);
+        let pin = store.admit(&access, id, b"aaa").unwrap();
+        journal_inventory(
+            &journal,
+            &access,
+            &store.inventory(&access),
+            SystemTime::now(),
+        );
+        journal_inventory(
+            &journal,
+            &access,
+            &[],
+            SystemTime::now() + Duration::from_secs(7200),
+        );
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 0);
+        assert_eq!(
+            store.pin(&access, id, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        assert_eq!(pin.read().unwrap(), b"aaa");
+        assert_eq!(store.retention.lock().bytes, 3);
+        let next = register(&store, &access);
+        assert_eq!(store.admit(&access, next, b"bbb"), Err(BlobError::Capacity));
+        assert!(matches!(
+            row_mut(&mut store.entries.lock(), &access.key, next)
+                .unwrap()
+                .state,
+            Attachment::NotStored(StoreFailure::AllPinned)
+        ));
+        drop(pin);
+        store.retention.lock().sweep();
+        assert_eq!(store.retention.lock().bytes, 0);
+    }
+
+    #[test]
+    fn keeping_a_pin_never_changes_persisted_recency() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let access = access("keep");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let first = register(&store, &access);
+        drop(store.admit(&access, first, b"aaa").unwrap());
+        let second = register(&store, &access);
+        drop(store.admit(&access, second, b"bbb").unwrap());
+        drop(store.pin(&access, first, Recency::Keep).unwrap());
+        journal_inventory(
+            &journal,
+            &access,
+            &store.inventory(&access),
+            SystemTime::now(),
+        );
+        drop(store);
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let recalled = journal
+            .recall(
+                &access.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &access,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        let incoming = register(&store, &access);
+        drop(store.admit(&access, incoming, b"ccc").unwrap());
+        assert_eq!(
+            store.pin(&access, first, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        assert!(store.pin(&access, second, Recency::Keep).unwrap().is_some());
     }
 
     #[test]

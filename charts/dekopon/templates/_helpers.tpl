@@ -560,7 +560,7 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $subdir)) (eq $subdir ".") (eq $subdir "..") -}}
 {{- $problems = append $problems "gateway.assets.subdir must be one non-dot path segment" -}}
 {{- end -}}
-{{- $taken := dict "gateway.journal.subdir" .Values.gateway.journal.subdir "gateway.wakes.subdir" .Values.gateway.wakes.subdir "gateway.chatgpt.subdir" .Values.gateway.chatgpt.subdir "broker.chatgpt.subdir" .Values.broker.chatgpt.subdir "broker.providerSet.subdir" .Values.broker.providerSet.subdir "broker.oauth2Records.subdir" .Values.broker.oauth2Records.subdir -}}
+{{- $taken := dict "broker config-check directory" "config-check" "gateway.journal.subdir" .Values.gateway.journal.subdir "gateway.wakes.subdir" .Values.gateway.wakes.subdir "gateway.chatgpt.subdir" .Values.gateway.chatgpt.subdir "broker.chatgpt.subdir" .Values.broker.chatgpt.subdir "broker.providerSet.subdir" .Values.broker.providerSet.subdir "broker.oauth2Records.subdir" .Values.broker.oauth2Records.subdir -}}
 {{- range $name, $other := $taken -}}
 {{- if eq $subdir $other -}}
 {{- $problems = append $problems (printf "gateway.assets.subdir clashes with %s" $name) -}}

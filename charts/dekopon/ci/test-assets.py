@@ -30,7 +30,7 @@ def test_invalid_assets_settings_refuse_with_their_cause() -> None:
         (("gateway.journal.enabled=true",), "must be enabled together"),
         (("gateway.assets.enabled=true",), "must be enabled together"),
         *(((("gateway.journal.enabled=true", "gateway.assets.enabled=true", f"gateway.assets.subdir={subdir}")), "gateway.assets.subdir clashes")
-          for subdir in ("gateway-journal", "gateway-wakes", "broker-chatgpt", "broker-oauth2-records", "providers", "chatgpt")),
+          for subdir in ("gateway-journal", "gateway-wakes", "broker-chatgpt", "broker-oauth2-records", "providers", "chatgpt", "config-check")),
         (("gateway.journal.enabled=true", "gateway.assets.enabled=true", "gateway.assets.mountPath=/var/lib/../assets"), "must be a canonical absolute path"),
         *(((("gateway.journal.enabled=true", "gateway.assets.enabled=true", f"gateway.assets.mountPath={path}")), "must not equal, contain or be inside")
           for path in ("/var/lib/dekopon-gatewayd/journal", "/var/lib/dekopon-gatewayd/journal/assets", "/var/lib/dekopon-gatewayd")),

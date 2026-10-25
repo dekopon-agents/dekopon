@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -93,6 +93,7 @@ pub(crate) struct Retention {
     dir: Option<PathBuf>,
     index: Index,
     references: HashSet<StoredKey>,
+    orphans: Vec<DiskBlob>,
 }
 
 impl Retention {
@@ -103,6 +104,7 @@ impl Retention {
             released: VecDeque::new(),
             dir: None,
             references: HashSet::new(),
+            orphans: Vec::new(),
             index: Index {
                 version: 1,
                 clock: 0,
@@ -117,11 +119,29 @@ impl Retention {
             .recursive(true)
             .mode(0o700)
             .create(dir.join("blobs"))?;
+        for directory in [dir.to_owned(), dir.join("blobs")] {
+            let metadata = fs::symlink_metadata(&directory)?;
+            if !metadata.is_dir() || metadata.uid() != crate::current_uid() {
+                return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
+            }
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
         let mut store = Self::new(budget);
         store.dir = Some(dir.to_owned());
-        store.index = match File::open(dir.join("index.json")) {
-            Ok(file) => serde_json::from_reader(file)
-                .map_err(|_decode| BlobError::Io(io::ErrorKind::InvalidData))?,
+        store.index = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join("index.json"))
+        {
+            Ok(file) => {
+                if file.metadata()?.uid() != crate::current_uid() {
+                    return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
+                }
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                serde_json::from_reader(file).map_err(|error: serde_json::Error| {
+                    BlobError::Io(error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData))
+                })?
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => store.index,
             Err(error) => return Err(error.into()),
         };
@@ -191,9 +211,16 @@ impl Retention {
                 .write(true)
                 .create(true)
                 .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
                 .mode(0o600)
                 .open(dir.join("index.pending"))?;
-            serde_json::to_writer(&mut file, &self.index).map_err(io::Error::other)?;
+            if file.metadata()?.uid() != crate::current_uid() {
+                return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
+            }
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            serde_json::to_writer(&mut file, &self.index).map_err(|error| {
+                BlobError::Io(error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData))
+            })?;
             file.sync_all()?;
             fs::rename(dir.join("index.pending"), dir.join("index.json"))?;
             File::open(dir)?.sync_all()?;
@@ -262,6 +289,29 @@ impl Retention {
         if error == BlobError::Disabled {
             return Attachment::Registered;
         }
+        match error {
+            BlobError::Io(_)
+            | BlobError::LengthChanged
+            | BlobError::Unknown
+            | BlobError::Reclaimed
+            | BlobError::Unauthorized => {
+                tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.retention_miss",
+                    asset.id = asset.id, asset.bytes = asset.size.unwrap_or_default(), asset.budget = self.budget,
+                    reason = "storage", error = %error }, "gateway.asset.retention_miss");
+            }
+            BlobError::TooLarge
+                if asset.size.unwrap_or_default() <= self.budget as u64
+                    && asset.size.unwrap_or_default()
+                        <= dekopon_model::asset::MAX_STORED_ATTACHMENT_BYTES as u64 =>
+            {
+                self.miss(
+                    asset.id,
+                    asset.size.unwrap_or_default() as usize,
+                    "oversized",
+                );
+            }
+            BlobError::TooLarge | BlobError::Disabled | BlobError::Capacity => (),
+        }
         let reason = self.failure(asset.size.unwrap_or_default() as usize, error);
         let key = StoredKey::of(key, asset);
         self.index.bindings.retain(|binding| binding.key != key);
@@ -276,6 +326,16 @@ impl Retention {
             tracing::warn!(%error, "gateway.asset.reclaim.failed");
         }
         Attachment::NotStored(reason)
+    }
+
+    pub(super) fn is_bound(&self, key: &AssetStateKey, asset: &AssetRef, digest: &str) -> bool {
+        let key = StoredKey::of(key, asset);
+        self.resident(digest)
+            && self
+                .index
+                .bindings
+                .iter()
+                .any(|binding| binding.key == key && binding.digest.as_deref() == Some(digest))
     }
 
     pub(super) fn pin(&mut self, digest: &str, recency: Recency) -> Result<DiskBlob, BlobError> {
@@ -365,6 +425,7 @@ impl Retention {
         if let Some(data) = &file.data {
             data.reclaim()?;
         }
+        file.data = None;
         if let Some(dir) = &self.dir {
             match fs::remove_file(dir.join("blobs").join(digest)) {
                 Ok(()) => (),
@@ -385,6 +446,7 @@ impl Retention {
             .values()
             .filter(|file| file.resident)
             .count()
+            + self.orphans.len()
     }
 
     pub(super) fn store_bytes(
@@ -549,18 +611,44 @@ impl Retention {
             .cloned()
             .collect();
         for digest in gone {
-            match self.evict_digest(&digest) {
-                Ok(()) => {
-                    self.index.files.remove(&digest);
+            let pinned = self
+                .index
+                .files
+                .get(&digest)
+                .and_then(|file| file.data.as_ref())
+                .is_some_and(DiskBlob::is_pinned);
+            if pinned {
+                if let Some(dir) = &self.dir {
+                    match fs::remove_file(dir.join("blobs").join(&digest)) {
+                        Ok(()) => (),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                        Err(error) => return Err(error.into()),
+                    }
                 }
-                Err(BlobError::Capacity) => (),
-                Err(error) => return Err(error),
+                if let Some(file) = self.index.files.remove(&digest)
+                    && let Some(data) = file.data
+                {
+                    self.orphans.push(data);
+                }
+            } else {
+                self.evict_digest(&digest)?;
+                self.index.files.remove(&digest);
             }
         }
         self.persist()
     }
 
     pub(super) fn sweep(&mut self) {
+        for data in std::mem::take(&mut self.orphans) {
+            match data.reclaim() {
+                Ok(()) => self.bytes -= data.len().max(1),
+                Err(BlobError::Capacity) => self.orphans.push(data),
+                Err(error) => {
+                    tracing::warn!(%error, "gateway.asset.reclaim.failed");
+                    self.orphans.push(data);
+                }
+            }
+        }
         if let Err(error) = self.collect() {
             tracing::warn!(%error, "gateway.asset.reclaim.failed");
         }

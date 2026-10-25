@@ -100,14 +100,15 @@ assert all(m["mountPath"]!=records["mountPath"] and m.get("subPath")!=records["s
            for m in gateway["volumeMounts"]), gateway["volumeMounts"]
 for m in broker_state:
     assert claim_views.get(m.get("subPath"))==m["mountPath"], m
+gateway_claim_views={"chatgpt":"/var/lib/dekopon/chatgpt", "gateway-journal":"/var/lib/dekopon-gatewayd/journal", "gateway-assets":"/var/lib/dekopon-gatewayd/assets", "gateway-wakes":"/var/lib/dekopon-gatewayd/wakes"}
 for m in gateway_state:
-    assert m.get("subPath")=="chatgpt" and m["mountPath"]=="/var/lib/dekopon/chatgpt", m
+    assert gateway_claim_views.get(m.get("subPath"))==m["mountPath"], m
 assert "config" not in gm and "gateway-config" not in bm
 assert "tmp" not in gm and "gateway-tmp" not in bm
 volumes={v["name"]:v for v in pod["volumes"]}
-assert volumes["gateway-tmp"]["emptyDir"]=={"sizeLimit":"320Mi"}
+assert volumes["gateway-tmp"]["emptyDir"]=={"sizeLimit":"1152Mi"}
 assert volumes["tmp"]["emptyDir"]=={"medium":"Memory", "sizeLimit":"16Mi"}
-assert volumes["broker-assets"]["emptyDir"]=={"sizeLimit":"320Mi"}
+assert volumes["broker-assets"]["emptyDir"]=={"sizeLimit":"1152Mi"}
 assert "broker-assets" not in gm
 assert bm["broker-assets"]["mountPath"]=="/var/lib/dekopon-assets"
 assert "config-source" not in gm and "config-source" not in bm
@@ -226,7 +227,7 @@ assert_eq() {
   fi
 }
 
-for suffix in src etc gateway-etc run state storage assets; do
+for suffix in src etc gateway-etc run state storage assets asset-probe; do
   v="$resource-$suffix"
   if docker volume inspect "$v" >/dev/null 2>&1; then
     echo "refusing preexisting test volume $v" >&2
@@ -270,18 +271,24 @@ run_init "$work/init.sh"
 echo "==> durable asset store is writable on a local filesystem as the gateway UID"
 render_init "$work/assets-init.sh" --set gateway.journal.enabled=true --set gateway.assets.enabled=true
 run_init "$work/assets-init.sh"
-python_yaml '
+gateway_image=$(python_yaml '
 import sys,yaml
 docs=list(yaml.safe_load_all(sys.stdin))
 pod=next(d for d in docs if d and d["kind"]=="Deployment")["spec"]["template"]["spec"]
 gateway=next(c for c in pod["containers"] if c["name"]=="gateway")
 assert gateway["securityContext"]["runAsUser"]==65533
 assert {"name":"state","mountPath":"/var/lib/dekopon-gatewayd/assets","subPath":"gateway-assets"} in gateway["volumeMounts"]
-' "$work/render.yaml"
+print(gateway["image"])
+' "$work/render.yaml")
+docker run --rm --platform "$platform" -v "${resource}-asset-probe":/probe "$busybox" \
+  sh -ec 'cp /bin/busybox /probe/busybox; chmod 0755 /probe /probe/busybox'
 docker run --rm --platform "$platform" --user 65533:65533 --cap-drop=ALL \
   --security-opt=no-new-privileges --read-only \
   --mount "type=volume,src=${resource}-state,dst=/var/lib/dekopon-gatewayd/assets,volume-subpath=gateway-assets" \
-  "$busybox" sh -ec 'umask 077; printf writable > /var/lib/dekopon-gatewayd/assets/witness; test "$(cat /var/lib/dekopon-gatewayd/assets/witness)" = writable; test "$(stat -c %a /var/lib/dekopon-gatewayd/assets)" = 700'
+  --mount "type=volume,src=${resource}-asset-probe,dst=/probe,readonly" \
+  --entrypoint /probe/busybox "$gateway_image" sh -ec 'umask 077; printf writable > /var/lib/dekopon-gatewayd/assets/witness; test "$(/probe/busybox cat /var/lib/dekopon-gatewayd/assets/witness)" = writable; test "$(/probe/busybox stat -c %a /var/lib/dekopon-gatewayd/assets)" = 700'
+
+echo "PASS the rendered gateway writes the durable asset store as UID 65533"
 
 echo "==> (b) in-place restart: the emptyDirs still hold the previous run's 0700 directories"
 run_init "$work/init.sh"
