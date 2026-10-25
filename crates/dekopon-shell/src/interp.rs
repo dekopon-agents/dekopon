@@ -2024,8 +2024,10 @@ impl<'a> Evaluator<'a> {
         let start = self.expansion_charges.len();
         let input = match &command.here_doc {
             None => input,
-            Some(body) => match self.expand_quoted(&body.parts) {
-                Ok(text) => {
+            Some(body) => match self.expand_preserved_fields(&body.parts, ExpansionOutput::Unsplit)
+            {
+                Ok(fields) => {
+                    let text = fields.join(" ");
                     here_doc_charges = self.expansion_charges.split_off(start);
                     match self.budget.charge_value_bytes(text.len() as u64) {
                         Ok(charge) => here_doc_charges.push(charge),
@@ -3878,7 +3880,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
             Modifier::StripPrefix(pattern) => {
-                let pattern = self.literal_pattern(pattern)?;
+                let pattern = self.literal_pattern(pattern, output)?;
                 let text = display(&value);
                 Value::String(
                     text.strip_prefix(&pattern)
@@ -3886,7 +3888,7 @@ impl<'a> Evaluator<'a> {
                 )
             }
             Modifier::StripSuffix(pattern) => {
-                let pattern = self.literal_pattern(pattern)?;
+                let pattern = self.literal_pattern(pattern, output)?;
                 let text = display(&value);
                 Value::String(
                     text.strip_suffix(&pattern)
@@ -3898,8 +3900,10 @@ impl<'a> Evaluator<'a> {
                 pattern,
                 replacement,
             } => {
-                let pattern = self.literal_pattern(pattern)?;
-                let replacement = self.expand_quoted(&replacement.parts)?;
+                let pattern = self.literal_pattern(pattern, output)?;
+                let replacement = self
+                    .expand_preserved_fields(&replacement.parts, output)?
+                    .join(" ");
                 let text = display(&value);
                 if pattern.is_empty() {
                     return Err(CommandFailure::usage(format!(
@@ -3941,11 +3945,17 @@ impl<'a> Evaluator<'a> {
         Ok((value, bound))
     }
 
-    fn literal_pattern(&mut self, pattern: &Pattern) -> Result<String, CommandFailure> {
+    fn literal_pattern(
+        &mut self,
+        pattern: &Pattern,
+        output: ExpansionOutput,
+    ) -> Result<String, CommandFailure> {
         match pattern {
-            Pattern::Literal(word) => self.expand_quoted(&word.parts),
+            Pattern::Literal(word) => {
+                Ok(self.expand_preserved_fields(&word.parts, output)?.join(" "))
+            }
             Pattern::Expanded(word) => {
-                let text = self.expand_quoted(&word.parts)?;
+                let text = self.expand_preserved_fields(&word.parts, output)?.join(" ");
                 if let Some(character) = pattern_metacharacter(&text) {
                     return Err(CommandFailure::usage(expanded_pattern(character)));
                 }

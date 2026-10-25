@@ -4001,3 +4001,35 @@ fn unquoted_selected_words_preserve_substitution_newlines_in_conditionals() {
         assert_eq!(output(script), "matched", "{script}");
     }
 }
+
+#[test]
+fn here_document_selected_words_preserve_substitution_newlines() {
+    assert_eq!(
+        output("cat <<EOF\n${missing:-pre$(printf 'a\\nb')post}\nEOF"),
+        "prea\nbpost"
+    );
+}
+
+#[test]
+fn replacement_text_preserves_nested_default_substitution_newlines() {
+    assert_eq!(
+        output(r#"v=z; x=${v/z/${missing:-pre$(printf 'a\nb')post}}; printf '<%s>' "$x""#),
+        "<prea\nbpost>"
+    );
+}
+
+#[test]
+fn prefix_and_suffix_patterns_preserve_nested_default_substitution_newlines() {
+    for (script, expected) in [
+        (
+            r#"v=$(printf 'prea\nbpost'); x=${v#${missing:-pre$(printf 'a\nb')}}; printf '<%s>' "$x""#,
+            "<post>",
+        ),
+        (
+            r#"v=$(printf 'prea\nbpost'); x=${v%${missing:-$(printf 'a\nb')post}}; printf '<%s>' "$x""#,
+            "<pre>",
+        ),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
