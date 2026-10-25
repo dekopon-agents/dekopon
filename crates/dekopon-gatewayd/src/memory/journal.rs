@@ -587,7 +587,6 @@ impl Journal {
                 .inventory
                 .iter()
                 .filter_map(|asset| {
-                    // Generated outputs live in the broker's spool and do not outlive their session.
                     let source = asset
                         .source
                         .as_ref()

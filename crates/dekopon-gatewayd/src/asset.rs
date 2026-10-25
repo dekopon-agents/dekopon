@@ -264,7 +264,6 @@ struct Row {
     state: Attachment,
 }
 
-/// A row that leaves the table is Gone: its id survives only as a bounded release tombstone.
 enum Attachment {
     Registered,
     Downloading(Downloading),
