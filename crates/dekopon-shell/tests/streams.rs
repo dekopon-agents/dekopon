@@ -7,9 +7,9 @@ use std::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
+use dekopon_process::Limits;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter, Limits,
-    Streams,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter, Streams,
 };
 
 const BROKEN_PIPE: NonZeroU8 = NonZeroU8::new(141).expect("nonzero");
@@ -45,7 +45,7 @@ impl CapabilityInvoker for Processes {
         &self,
         proposal: CommandProposal,
         streams: Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         self.seen.lock().push((
             proposal.capability.clone(),

@@ -4,6 +4,8 @@
 
 mod nesting;
 
+use dekopon_process::{CallBudget, LimitExceeded, Limits, TreeContext};
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -19,8 +21,8 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, JOBS_OFF, JobSeed,
-    ScriptOutcome, TreeContext,
+    CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, JOBS_OFF, JobSeed,
+    ScriptOutcome,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
         CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
@@ -32,7 +34,7 @@ use crate::{
     },
     dispatch::{self, Resolution},
     job::ScriptJobs,
-    limits::{Budget, LimitExceeded, Limits, OutputBuffer},
+    limits::{Budget, OutputBuffer},
     parser::{expanded_pattern, parse, pattern_metacharacter},
     pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome},
     value::{self, display},
@@ -185,7 +187,7 @@ fn pump_stdin(
 #[cfg(test)]
 mod pump_tests {
     use super::*;
-    use crate::limits::Limits;
+    use dekopon_process::Limits;
     use std::{sync::mpsc, time::Duration};
 
     struct Idle;
@@ -199,7 +201,7 @@ mod pump_tests {
             &self,
             _proposal: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> crate::CapabilityCallResult {
             unreachable!("pump test never invokes")
         }
@@ -267,7 +269,7 @@ struct StageOutcome {
 enum Stage<'scope> {
     Running {
         handle: ScopedJoinHandle<'scope, StageOutcome>,
-        _stack: crate::RetainedBytes,
+        _stack: dekopon_process::RetainedBytes,
     },
     Refused {
         message: String,
@@ -355,14 +357,14 @@ impl StderrCapture {
 struct Frame {
     locals: BTreeMap<String, Value>,
     positional: Vec<Value>,
-    local_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
-    _positional_charges: Vec<crate::RetainedBytes>,
+    local_charges: BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
+    _positional_charges: Vec<dekopon_process::RetainedBytes>,
 }
 
 struct SavedVariable {
     name: String,
     value: Option<Value>,
-    charge: Option<Vec<crate::RetainedBytes>>,
+    charge: Option<Vec<dekopon_process::RetainedBytes>>,
 }
 
 pub(crate) fn run(
@@ -538,8 +540,8 @@ struct Evaluator<'a> {
     limits: Limits,
     output: OutputBuffer,
     globals: Arc<BTreeMap<String, Value>>,
-    global_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
-    buffer_charges: BTreeMap<String, Vec<crate::RetainedBytes>>,
+    global_charges: BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
+    buffer_charges: BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
     frames: Vec<Frame>,
     functions: BTreeMap<String, Arc<Program>>,
     function_names: BTreeSet<String>,
@@ -548,13 +550,13 @@ struct Evaluator<'a> {
     active_buffer: Option<(String, usize)>,
     discard_capture_depth: Option<usize>,
     diagnostics_depth: Option<usize>,
-    expansion_charges: Vec<crate::RetainedBytes>,
+    expansion_charges: Vec<dekopon_process::RetainedBytes>,
     script_stdin: bool,
     stdin: Vec<PipeReader>,
     stdout: Option<PipeWriter>,
     reader_gone: bool,
     stdout_redirected: bool,
-    shared_charges: Vec<crate::RetainedBytes>,
+    shared_charges: Vec<dekopon_process::RetainedBytes>,
     options: ShellOptions,
     testing_status: u32,
     stderr_capture: Vec<StderrCapture>,
@@ -2214,7 +2216,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         name: &str,
         bytes: &[u8],
-        charges: Vec<crate::RetainedBytes>,
+        charges: Vec<dekopon_process::RetainedBytes>,
     ) -> Result<(), LimitExceeded> {
         append_charged_buffer(
             &self.budget,
@@ -2423,7 +2425,7 @@ impl<'a> Evaluator<'a> {
         command: &str,
         operand: Option<&str>,
         input: StageInput,
-    ) -> Result<(PipeReader, Option<crate::RetainedBytes>), CommandFailure> {
+    ) -> Result<(PipeReader, Option<dekopon_process::RetainedBytes>), CommandFailure> {
         if let Some(name) = operand.filter(|name| *name != "-") {
             if name == DEV_NULL {
                 return Ok((PipeReader::default(), None));
@@ -2613,7 +2615,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         sink: &Sink,
         bytes: Vec<u8>,
-        charges: Vec<crate::RetainedBytes>,
+        charges: Vec<dekopon_process::RetainedBytes>,
         status: ExitCode,
     ) -> Result<Executed, FatalError> {
         if bytes.is_empty() {
@@ -3905,8 +3907,8 @@ fn append_stream_buffer(
 
 struct BufferStorage<'a> {
     buffers: &'a mut Arc<BTreeMap<String, Vec<u8>>>,
-    charges: &'a mut BTreeMap<String, Vec<crate::RetainedBytes>>,
-    shared_charges: &'a mut Vec<crate::RetainedBytes>,
+    charges: &'a mut BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
+    shared_charges: &'a mut Vec<dekopon_process::RetainedBytes>,
 }
 
 fn append_charged_buffer(
@@ -3914,7 +3916,7 @@ fn append_charged_buffer(
     storage: BufferStorage<'_>,
     name: &str,
     bytes: &[u8],
-    charges: Vec<crate::RetainedBytes>,
+    charges: Vec<dekopon_process::RetainedBytes>,
 ) -> Result<(), LimitExceeded> {
     if Arc::strong_count(storage.buffers) > 1 {
         let length: u64 = storage
@@ -3951,9 +3953,12 @@ fn stream_help(command: StreamCommand) -> CommandResult {
 fn retain_value(
     budget: &Budget,
     value: &Value,
-    charges: &mut Vec<crate::RetainedBytes>,
+    charges: &mut Vec<dekopon_process::RetainedBytes>,
 ) -> Result<(), LimitExceeded> {
-    let charged: u64 = charges.iter().map(crate::RetainedBytes::bytes).sum();
+    let charged: u64 = charges
+        .iter()
+        .map(dekopon_process::RetainedBytes::bytes)
+        .sum();
     let needed = value_bytes(value);
     if needed > charged {
         charges.push(budget.charge_value_bytes(needed - charged)?);
@@ -3969,7 +3974,7 @@ fn retain_value(
     Ok(())
 }
 
-fn capture_charges(captured: &mut [CommandResult]) -> Vec<crate::RetainedBytes> {
+fn capture_charges(captured: &mut [CommandResult]) -> Vec<dekopon_process::RetainedBytes> {
     captured
         .iter_mut()
         .flat_map(|result| std::mem::take(&mut result.retained))
@@ -4051,7 +4056,7 @@ fn rendered_bytes(value: &Value, maximum: u64) -> Result<u64, LimitExceeded> {
 fn reduce_charged(
     budget: &Budget,
     captured: Vec<CommandResult>,
-    retained: &mut Vec<crate::RetainedBytes>,
+    retained: &mut Vec<dekopon_process::RetainedBytes>,
 ) -> Result<Value, LimitExceeded> {
     if captured.len() > 1 {
         let maximum = budget.max_value_bytes();

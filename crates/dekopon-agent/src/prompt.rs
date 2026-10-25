@@ -52,7 +52,7 @@ pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 
-const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
+const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
 /// context-length rejection instead of an answer.
 const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. If you can \
@@ -1196,8 +1196,8 @@ where
                 let output = &outcome.output;
                 let cut = output.floor_char_boundary(
                     result_max_bytes
-                        .unwrap_or(dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES)
-                        .min(dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES)
+                        .unwrap_or(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES)
+                        .min(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES)
                         .min(output.len()),
                 );
                 exchanges.push(Exchange {
@@ -3988,7 +3988,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             _streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             panic!(
                 "a refused construct must never reach {}",
@@ -4123,7 +4123,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
@@ -4214,9 +4214,9 @@ mod tests {
             json!(["broken.thing", "locked.door", "posts.get"])
         );
 
-        let truncated = dekopon_shell::Interpreter::new(dekopon_shell::Limits {
+        let truncated = dekopon_shell::Interpreter::new(dekopon_process::Limits {
             max_output_lines: 4,
-            ..dekopon_shell::Limits::default()
+            ..dekopon_process::Limits::default()
         })
         .run(
             "for i in 1 2 3 4 5 6 7 8 9 10; do echo $i; done",

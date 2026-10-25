@@ -7,10 +7,10 @@ use std::{
 use dekopon_agent::{BrokerLeg, current_trace_parent};
 use dekopon_broker_protocol::{TraceParent, Trigger};
 use dekopon_core::AgentId;
-use dekopon_process::{CancelHandle, CancelSignal};
+use dekopon_process::{CancelHandle, CancelSignal, Limits as ShellLimits, TreeContext};
 use dekopon_shell::{
     ExitCode, Interpreter, JobControl, JobId, JobOutcome, JobRefusal, JobSeed, JobState,
-    JobSummary, JobWait, Limits as ShellLimits, TreeContext,
+    JobSummary, JobWait,
 };
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};

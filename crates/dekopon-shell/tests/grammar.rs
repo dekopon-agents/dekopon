@@ -3,10 +3,11 @@ use std::{sync::mpsc, time::Duration};
 
 use serde_json::{Value, json};
 
+use dekopon_process::{CallBudget, Limits, TreeContext};
 use dekopon_shell::{
-    CallBudget, CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
-    ExitCode, Interpreter, JOBS_OFF, JobControl, JobId, JobRefusal, JobSeed, JobSummary, JobWait,
-    Limits, ScriptOutcome, TreeContext,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+    Interpreter, JOBS_OFF, JobControl, JobId, JobRefusal, JobSeed, JobSummary, JobWait,
+    ScriptOutcome,
 };
 
 const PROBE: &str = "probe";
@@ -113,7 +114,7 @@ impl CapabilityInvoker for Fixture {
         &self,
         proposal: dekopon_shell::CommandProposal,
         mut streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         let capability = proposal.capability;
         let mut input = proposal.input;
@@ -2705,7 +2706,7 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             &self,
             proposal: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let input = proposal.input;
             std::thread::sleep(Duration::from_millis(20));
@@ -3292,7 +3293,7 @@ impl CapabilityInvoker for OrderedFixture {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
-        tree: &dekopon_shell::TreeContext,
+        tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         self.fixture.invoke(proposal, streams, tree)
     }
@@ -3358,7 +3359,7 @@ impl CapabilityInvoker for StdinFixture {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
-        tree: &dekopon_shell::TreeContext,
+        tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         self.fixture.invoke(proposal, streams, tree)
     }
@@ -3555,7 +3556,7 @@ impl CapabilityInvoker for WithJobs {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
-        tree: &dekopon_shell::TreeContext,
+        tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         self.fixture.invoke(proposal, streams, tree)
     }
@@ -3678,7 +3679,7 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
             &self,
             _: dekopon_shell::CommandProposal,
             _streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }

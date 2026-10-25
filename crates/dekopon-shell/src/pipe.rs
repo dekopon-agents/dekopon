@@ -11,11 +11,11 @@ use std::{
 };
 
 use crate::{
-    CapabilityInvoker, RetainedBytes,
+    CapabilityInvoker,
     interp::telemetry::{self, StageMeter},
     limits::Budget,
-    limits::LimitExceeded,
 };
+use dekopon_process::{LimitExceeded, RetainedBytes};
 
 pub(crate) struct ChargedBytes {
     pub(crate) bytes: Vec<u8>,
@@ -281,7 +281,7 @@ pub(crate) fn pipe() -> (PipeWriter, PipeReader) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::limits::Limits;
+    use dekopon_process::Limits;
 
     struct Idle;
 
@@ -294,7 +294,7 @@ mod tests {
             &self,
             _proposal: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> crate::CapabilityCallResult {
             unreachable!("pipe tests never invoke")
         }

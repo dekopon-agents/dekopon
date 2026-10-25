@@ -9,9 +9,10 @@ use std::{
 };
 
 use dekopon_broker_protocol::ConversationMatch;
+use dekopon_process::TreeContext;
 use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, CommandRun,
-    JobControl, Streams, TreeContext,
+    JobControl, Streams,
 };
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -551,8 +552,8 @@ mod tests {
     ) -> CapabilityCallResult {
         let (output, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
         let tree = TreeContext::new(
-            dekopon_shell::Limits::default(),
-            dekopon_shell::CallBudget::new(2),
+            dekopon_process::Limits::default(),
+            dekopon_process::CallBudget::new(2),
         );
         invoker.invoke(
             CommandProposal {

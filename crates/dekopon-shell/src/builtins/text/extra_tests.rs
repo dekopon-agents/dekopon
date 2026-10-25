@@ -4,9 +4,10 @@ use super::extra::ExtraStream;
 use crate::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, ExitCode,
     builtins::{CommandFailure, FatalError, test_support::NoCapabilities},
-    limits::{Budget, LimitExceeded, Limits},
+    limits::Budget,
     pipe::{self, PipeReader, WriteOutcome},
 };
+use dekopon_process::{LimitExceeded, Limits};
 
 fn arguments(command: ExtraStream) -> Vec<String> {
     match command {
@@ -59,7 +60,7 @@ fn four_text_commands_notice_cancellation_between_chunks() {
             &self,
             _: CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             unreachable!()
         }

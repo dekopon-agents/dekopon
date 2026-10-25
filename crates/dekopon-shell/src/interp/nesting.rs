@@ -1,5 +1,5 @@
 use super::Evaluator;
-use crate::limits::LimitExceeded;
+use dekopon_process::LimitExceeded;
 
 pub(super) struct Nesting(u32);
 

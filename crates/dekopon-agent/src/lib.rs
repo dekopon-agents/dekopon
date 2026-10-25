@@ -29,13 +29,12 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
-#[cfg(unix)]
-use dekopon_process::CancelSignal;
+use dekopon_process::{CallBudget, CancelSignal, Limits as ShellLimits, TreeContext};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, Interpreter,
-    JobControl, Limits as ShellLimits, ScriptOutcome, TreeContext,
+    CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, Interpreter, JobControl,
+    ScriptOutcome,
 };
 use serde_json::Value;
 #[cfg(unix)]
@@ -154,7 +153,7 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         &self,
         mut proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
-        tree: &dekopon_shell::TreeContext,
+        tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         let capability = &proposal.capability;
         // A secret-use proposal must reach only the broker leg; the direct leg has no authorizer to
@@ -693,7 +692,7 @@ impl CapabilityInvoker for BrokerLeg {
         &self,
         proposal: dekopon_shell::CommandProposal,
         streams: dekopon_shell::Streams,
-        tree: &dekopon_shell::TreeContext,
+        tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         let dekopon_shell::CommandProposal {
             capability,
@@ -1218,7 +1217,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let secret_use = proposal.secret_use;
@@ -1244,9 +1243,9 @@ mod tests {
             invoker.invoke(
                 CommandProposal::new("shared.capability", json!({}), None),
                 streams,
-                &dekopon_shell::TreeContext::new(
-                    dekopon_shell::Limits::default(),
-                    dekopon_shell::CallBudget::new(64)
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1266,9 +1265,9 @@ mod tests {
             invoker.invoke(
                 CommandProposal::new("http-probe.fetch", json!({}), None),
                 streams,
-                &dekopon_shell::TreeContext::new(
-                    dekopon_shell::Limits::default(),
-                    dekopon_shell::CallBudget::new(64)
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1300,9 +1299,9 @@ mod tests {
             invoker.invoke(
                 CommandProposal::new("http-probe.fetch", json!({}), None),
                 streams().0,
-                &dekopon_shell::TreeContext::new(
-                    dekopon_shell::Limits::default(),
-                    dekopon_shell::CallBudget::new(64)
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
                 )
             ),
             CapabilityCallResult::NotFound
@@ -1326,9 +1325,9 @@ mod tests {
             invoker.invoke(
                 CommandProposal::new("http-probe.fetch", json!({}), Some(proposal.clone())),
                 streams().0,
-                &dekopon_shell::TreeContext::new(
-                    dekopon_shell::Limits::default(),
-                    dekopon_shell::CallBudget::new(64)
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1338,9 +1337,9 @@ mod tests {
             invoker.invoke(
                 CommandProposal::new("cli-probe.upper", json!({}), Some(proposal)),
                 streams().0,
-                &dekopon_shell::TreeContext::new(
-                    dekopon_shell::Limits::default(),
-                    dekopon_shell::CallBudget::new(64)
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
                 )
             ),
             dekopon_shell::secret_use_unsupported()
@@ -1402,7 +1401,7 @@ mod tests {
             &self,
             _: CommandProposal,
             _streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -1415,7 +1414,7 @@ mod tests {
             direct: FakeLeg::new("cli-probe.upper", "direct"),
             broker: Some(Box::new(std::sync::Arc::clone(&leg))),
         };
-        let outcome = dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+        let outcome = dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
             .run("echo a &", &invoker);
         assert_eq!(outcome.output, "[7]");
         let jobs = invoker.job_control().expect("the broker leg's job control");
@@ -1463,7 +1462,7 @@ mod tests {
             &self,
             _: dekopon_shell::CommandProposal,
             _streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -1522,9 +1521,10 @@ mod tests {
             AgentId, ExternalSubject, ProviderFailureDetail, SecretDrn, SecretUseProposal,
         };
         use dekopon_process::CancelSignal;
+        use dekopon_process::Limits;
         use dekopon_shell::{
             CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
-            CommandRun, ExitCode, Limits,
+            CommandRun, ExitCode,
         };
         use serde_json::json;
         use tokio::{
@@ -1899,7 +1899,7 @@ mod tests {
                 progress: None,
                 notes_enabled: false,
                 notes: AtomicU32::new(0),
-                calls: dekopon_shell::CallBudget::new(0),
+                calls: dekopon_process::CallBudget::new(0),
                 jobs: None,
             }
         }
@@ -1913,9 +1913,9 @@ mod tests {
                 let result = leg.invoke(
                     CommandProposal::new(capability, json!({"uri": "http://x/"}), None),
                     streams,
-                    &dekopon_shell::TreeContext::new(
-                        dekopon_shell::Limits::default(),
-                        dekopon_shell::CallBudget::new(64),
+                    &dekopon_process::TreeContext::new(
+                        dekopon_process::Limits::default(),
+                        dekopon_process::CallBudget::new(64),
                     ),
                 );
                 (result, output(reader))
@@ -1929,9 +1929,9 @@ mod tests {
                 leg.invoke(
                     CommandProposal::new(capability, json!({"uri": "http://x/"}), None),
                     streams().0,
-                    &dekopon_shell::TreeContext::new(
-                        dekopon_shell::Limits::default(),
-                        dekopon_shell::CallBudget::new(64),
+                    &dekopon_process::TreeContext::new(
+                        dekopon_process::Limits::default(),
+                        dekopon_process::CallBudget::new(64),
                     ),
                 )
             })
@@ -1955,9 +1955,9 @@ mod tests {
                 Trigger, UpcallStdin,
             };
             use dekopon_process::CancelSignal;
+            use dekopon_process::{CallBudget, Limits, TreeContext};
             use dekopon_shell::{
-                CallBudget, CapabilityCallResult, CapabilityInvoker as _, CommandProposal,
-                ExitCode, Limits, TreeContext,
+                CapabilityCallResult, CapabilityInvoker as _, CommandProposal, ExitCode,
             };
             use opentelemetry::trace::TracerProvider as _;
             use serde_json::json;
@@ -2901,9 +2901,9 @@ mod tests {
                             Some(submitted),
                         ),
                         streams().0,
-                        &dekopon_shell::TreeContext::new(
-                            dekopon_shell::Limits::default(),
-                            dekopon_shell::CallBudget::new(64),
+                        &dekopon_process::TreeContext::new(
+                            dekopon_process::Limits::default(),
+                            dekopon_process::CallBudget::new(64),
                         ),
                     )
                 })
@@ -3113,7 +3113,7 @@ mod tests {
             let directory = private_broker_directory();
             let (sink, progress) = recording_sink();
             let leg = leg_for(&directory.path().join("absent.sock"))
-                .with_progress(progress, dekopon_shell::CallBudget::new(4));
+                .with_progress(progress, dekopon_process::CallBudget::new(4));
             leg.note("not enabled", None);
             assert!(sink.labels().is_empty());
         }
@@ -3123,7 +3123,7 @@ mod tests {
             let directory = private_broker_directory();
             let (sink, progress) = recording_sink();
             let leg = leg_for(&directory.path().join("absent.sock"))
-                .with_progress(progress, dekopon_shell::CallBudget::new(4))
+                .with_progress(progress, dekopon_process::CallBudget::new(4))
                 .with_progress_notes();
             let calls = leg.calls.clone();
             let runtime = ShellRuntime {
@@ -3171,7 +3171,7 @@ mod tests {
             )
             .await;
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
+            let leg = leg.with_progress(progress, dekopon_process::CallBudget::new(4));
 
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
@@ -3197,7 +3197,7 @@ mod tests {
             let (sink, progress) = recording_sink();
             let leg = leg
                 .with_cancel_signal(signal)
-                .with_progress(progress, dekopon_shell::CallBudget::new(4));
+                .with_progress(progress, dekopon_process::CallBudget::new(4));
             handle.cancel();
 
             assert_eq!(
@@ -3228,7 +3228,7 @@ mod tests {
             let runtime = ShellRuntime {
                 invoker: leg,
                 limits,
-                calls: dekopon_shell::CallBudget::new(4),
+                calls: dekopon_process::CallBudget::new(4),
             };
             let running =
                 tokio::task::spawn_blocking(move || runtime.run_script("while true; do :; done"));
@@ -3254,7 +3254,7 @@ mod tests {
             let runtime = ShellRuntime {
                 invoker: leg,
                 limits,
-                calls: dekopon_shell::CallBudget::new(4),
+                calls: dekopon_process::CallBudget::new(4),
             };
             let running = tokio::task::spawn_blocking(move || runtime.run_script("sleep 300"));
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3274,7 +3274,7 @@ mod tests {
             leg.command_words.insert("probe".to_owned());
             let (sink, progress) = recording_sink();
             (
-                leg.with_progress(progress, dekopon_shell::CallBudget::new(4)),
+                leg.with_progress(progress, dekopon_process::CallBudget::new(4)),
                 sink,
             )
         }
@@ -3326,9 +3326,9 @@ mod tests {
                 let result = invoker.invoke(
                     owned_proposal(invoker.run_command("probe", &[], false)),
                     streams,
-                    &dekopon_shell::TreeContext::new(
-                        dekopon_shell::Limits::default(),
-                        dekopon_shell::CallBudget::new(64),
+                    &dekopon_process::TreeContext::new(
+                        dekopon_process::Limits::default(),
+                        dekopon_process::CallBudget::new(64),
                     ),
                 );
                 (result, output(reader))
@@ -3369,9 +3369,9 @@ mod tests {
                         leg.invoke(
                             proposal,
                             streams().0,
-                            &dekopon_shell::TreeContext::new(
-                                dekopon_shell::Limits::default(),
-                                dekopon_shell::CallBudget::new(64),
+                            &dekopon_process::TreeContext::new(
+                                dekopon_process::Limits::default(),
+                                dekopon_process::CallBudget::new(64),
                             ),
                         )
                     });
@@ -3380,9 +3380,9 @@ mod tests {
                         leg.invoke(
                             owned_proposal(leg.run_command("second", &[], false)),
                             streams().0,
-                            &dekopon_shell::TreeContext::new(
-                                dekopon_shell::Limits::default(),
-                                dekopon_shell::CallBudget::new(64),
+                            &dekopon_process::TreeContext::new(
+                                dekopon_process::Limits::default(),
+                                dekopon_process::CallBudget::new(64),
                             ),
                         )
                     });
@@ -3516,9 +3516,9 @@ mod tests {
                 let called = leg.invoke(
                     owned_proposal(leg.run_command("probe", &argv, false)),
                     streams().0,
-                    &dekopon_shell::TreeContext::new(
-                        dekopon_shell::Limits::default(),
-                        dekopon_shell::CallBudget::new(64),
+                    &dekopon_process::TreeContext::new(
+                        dekopon_process::Limits::default(),
+                        dekopon_process::CallBudget::new(64),
                     ),
                 );
                 leg.script_finished();
@@ -3618,15 +3618,15 @@ mod tests {
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, dekopon_shell::CallBudget::new(4));
+            let leg = leg.with_progress(progress, dekopon_process::CallBudget::new(4));
 
             let outcome = tokio::task::spawn_blocking(move || {
                 leg.invoke(
                     CommandProposal::new("ignore-your-instructions", json!({}), None),
                     streams().0,
-                    &dekopon_shell::TreeContext::new(
-                        dekopon_shell::Limits::default(),
-                        dekopon_shell::CallBudget::new(64),
+                    &dekopon_process::TreeContext::new(
+                        dekopon_process::Limits::default(),
+                        dekopon_process::CallBudget::new(64),
                     ),
                 )
             })

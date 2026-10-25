@@ -169,9 +169,9 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
     let owner = JobOwner::of(&inbound);
     let anchor =
         crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("anchor");
-    let limits = dekopon_shell::Limits {
+    let limits = dekopon_process::Limits {
         timeout: Duration::from_secs(30),
-        ..dekopon_shell::Limits::default()
+        ..dekopon_process::Limits::default()
     };
     let context = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor, broker, limits);
     tokio::task::spawn_blocking(move || {
@@ -217,9 +217,9 @@ async fn a_probe_tick_ends_its_nested_invoke_at_tree_deadline() {
     let leg = BrokerLeg::connect(client, Some(anchor.claim(Trigger::Probe)))
         .await
         .expect("probe leg");
-    let limits = dekopon_shell::Limits {
+    let limits = dekopon_process::Limits {
         timeout: Duration::from_secs(30),
-        ..dekopon_shell::Limits::default()
+        ..dekopon_process::Limits::default()
     };
     let probe = crate::wake::Probe::scripted_for_test("probe upper");
     let tick = tokio::task::spawn_blocking(move || probe.tick(&leg, limits));
@@ -1217,7 +1217,7 @@ impl CapabilityInvoker for ProbeInvoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
@@ -1237,11 +1237,11 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
         &inbound,
         anchor,
         broker,
-        dekopon_shell::Limits::default(),
+        dekopon_process::Limits::default(),
     )
     .for_probe();
     let outcome = tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+        dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
             .run("true &", &ProbeInvoker(context))
     })
     .await
@@ -1984,11 +1984,11 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
         &inbound,
         anchor,
         broker,
-        dekopon_shell::Limits::default(),
+        dekopon_process::Limits::default(),
     )
     .for_probe();
     let probed = tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(dekopon_shell::Limits::default())
+        dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
             .run("true & echo status=$?", &ProbeInvoker(probe))
     })
     .await
@@ -2100,9 +2100,9 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
     let jobs = Arc::new(Jobs::new(4));
     let inbound = message("deadline");
     let anchor = || crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
-    let limits = |seconds| dekopon_shell::Limits {
+    let limits = |seconds| dekopon_process::Limits {
         timeout: Duration::from_secs(seconds),
-        ..dekopon_shell::Limits::default()
+        ..dekopon_process::Limits::default()
     };
     let probe = JobContext::for_turn(
         Arc::clone(&jobs),

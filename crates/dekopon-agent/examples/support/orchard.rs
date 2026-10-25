@@ -2,8 +2,9 @@
 // instructions is the only thing that keeps the agent out of it.
 
 use dekopon_core::ProviderFailureDetail;
+use dekopon_process::TreeContext;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Streams, TreeContext,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Streams,
 };
 use serde_json::{Value, json};
 use std::{

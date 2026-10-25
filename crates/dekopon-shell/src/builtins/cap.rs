@@ -70,9 +70,9 @@ mod tests {
 
     use crate::{
         CapabilityCallResult, CapabilityDescription, CapabilityInvoker, ExitCode, Interpreter,
-        Limits,
         builtins::{CommandFailure, test_support::run_builtin_with_invoker},
     };
+    use dekopon_process::Limits;
 
     use super::Cap;
 
@@ -97,7 +97,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();
