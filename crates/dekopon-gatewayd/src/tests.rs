@@ -22268,6 +22268,52 @@ async fn append_failure_preserves_the_delivered_reply_without_a_journal_record()
     assert_eq!(failed[0].field("reason"), Some("io"));
 }
 
+#[tokio::test]
+async fn post_commit_maintenance_failure_does_not_report_an_append_failure() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("delivered")]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    runner
+        .assets
+        .attach_journal(runner.journal.as_ref().unwrap())
+        .unwrap();
+    let malformed = journal_dir.path().join(format!(
+        "{}.jsonl",
+        private_conversation_key("dev", "malformed", SUBJECT).journal_stem()
+    ));
+    fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+    fs::write(malformed, b"{broken\n").unwrap();
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let inbound = message("question");
+    let stem = private_conversation_key("dev", &inbound.conversation.key(), SUBJECT).journal_stem();
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["delivered"]);
+    assert!(journal_dir.path().join(format!("{stem}.jsonl")).is_file());
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_journal_append_failed")]
+            )
+            .is_empty()
+    );
+    assert!(
+        capture
+            .events_text()
+            .contains("gateway.asset.reclaim.failed")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_chat() {
     let (capture, _guard) = capture_spans();

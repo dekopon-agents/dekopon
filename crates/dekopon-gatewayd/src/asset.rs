@@ -2031,7 +2031,7 @@ mod retention_tests {
     fn durable_window() -> crate::config::MemoryWindow {
         crate::config::MemoryWindow {
             scope: crate::config::MemoryScope::PrivateConversation,
-            one_shot_idle: Duration::from_secs(3600),
+            idle_timeout: Duration::from_secs(3600),
             limits: dekopon_agent::prompt::HistoryLimits {
                 max_turns: 8,
                 max_bytes: 65536,
