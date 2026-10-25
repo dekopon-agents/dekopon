@@ -5084,7 +5084,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_tool_is_answered_once_and_the_second_ends_the_session() {
+    fn an_unknown_tool_gets_feedback_only_in_the_first_bad_turn() {
         let model = ScriptedModel::new([
             tool_call("call-1", "echo_echo", json!({})),
             tool_call("call-2", "echo_echo", json!({})),
@@ -5153,7 +5153,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bash_call_without_a_string_command_is_answered_once_then_ends_the_session() {
+    fn a_bash_call_without_a_string_command_gets_feedback_only_in_the_first_bad_turn() {
         for arguments in [r#"{"script":"echo hi"}"#, r#"{"command":42}"#, "{}"] {
             let bad = |id: &str| {
                 AssistantTurn::new(
@@ -5377,7 +5377,7 @@ mod tests {
     }
 
     #[test]
-    fn arguments_that_are_not_a_json_object_are_answered_once_then_refused() {
+    fn non_object_bash_arguments_get_feedback_only_in_the_first_bad_turn() {
         let bad = |id: &str| {
             AssistantTurn::new(
                 None,
