@@ -3976,3 +3976,28 @@ fn repeated_blank_expansions_exhaust_the_step_budget() {
         "{outcome:?}"
     );
 }
+
+#[test]
+fn unquoted_selected_words_preserve_substitution_newlines_in_assignments() {
+    for script in [
+        r#"x=${missing:-pre$(printf 'a\nb')post}; printf '<%s>' "$x""#,
+        r#"f() { local x=${missing:-pre$(printf 'a\nb')post}; printf '<%s>' "$x"; }; f"#,
+        r#": ${x:=pre$(printf 'a\nb')post}; printf '<%s>' "$x""#,
+        r#"x=${missing:-${also_missing:-pre$(printf 'a\nb')post}}; printf '<%s>' "$x""#,
+        r#"set=1; x=${set:+pre$(printf 'a\nb')post}; printf '<%s>' "$x""#,
+    ] {
+        assert_eq!(output(script), "<prea\nbpost>", "{script}");
+    }
+}
+
+#[test]
+fn unquoted_selected_words_preserve_substitution_newlines_in_conditionals() {
+    for script in [
+        r#"expected=$(printf 'prea\nbpost'); case ${missing:-pre$(printf 'a\nb')post} in "$expected") echo matched;; *) echo failed;; esac"#,
+        r#"expected=$(printf 'prea\nbpost'); case $expected in ${missing:-pre$(printf 'a\nb')post}) echo matched;; *) echo failed;; esac"#,
+        r#"expected=$(printf 'prea\nbpost'); if [[ ${missing:-pre$(printf 'a\nb')post} == "$expected" ]]; then echo matched; else echo failed; fi"#,
+        r#"expected=$(printf 'prea\nbpost'); if [[ "$expected" == ${missing:-pre$(printf 'a\nb')post} ]]; then echo matched; else echo failed; fi"#,
+    ] {
+        assert_eq!(output(script), "matched", "{script}");
+    }
+}

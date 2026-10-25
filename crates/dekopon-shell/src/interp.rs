@@ -952,7 +952,9 @@ impl<'a> Evaluator<'a> {
     }
 
     fn execute_case(&mut self, statement: &CaseStatement) -> Result<Flow, FatalError> {
-        let subject = match self.expand_quoted_fields(&statement.subject.parts) {
+        let subject = match self
+            .expand_preserved_fields(&statement.subject.parts, ExpansionOutput::Unsplit)
+        {
             Ok(expanded) => expanded.join(" "),
             Err(failure) => {
                 let status = self.absorb(failure)?;
@@ -966,16 +968,20 @@ impl<'a> Evaluator<'a> {
                 self.budget.charge_step_with(self.invoker)?;
                 let matched = match pattern {
                     CasePattern::Any => true,
-                    CasePattern::Literal(word) => match self.expand_quoted_fields(&word.parts) {
-                        Ok(expanded) => expanded.join(" ") == subject,
-                        Err(failure) => {
-                            let status = self.absorb(failure)?;
-                            self.last_status = status;
-                            return Ok(Flow::Normal);
+                    CasePattern::Literal(word) => {
+                        match self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit) {
+                            Ok(expanded) => expanded.join(" ") == subject,
+                            Err(failure) => {
+                                let status = self.absorb(failure)?;
+                                self.last_status = status;
+                                return Ok(Flow::Normal);
+                            }
                         }
-                    },
+                    }
                     CasePattern::Expanded(word) => {
-                        let expanded = match self.expand_quoted_fields(&word.parts) {
+                        let expanded = match self
+                            .expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)
+                        {
                             Ok(expanded) => expanded.join(" "),
                             Err(failure) => {
                                 let status = self.absorb(failure)?;
@@ -3391,24 +3397,33 @@ impl<'a> Evaluator<'a> {
         }
         let start = self.expansion_charges.len();
         let value = match word.parts.as_slice() {
-            [WordPart::Parameter(parameter)] => self.parameter_value(parameter)?,
-            _ => Value::String(self.expand_quoted(&word.parts)?),
+            [WordPart::Parameter(parameter)] => {
+                self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?
+            }
+            _ => Value::String(
+                self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)?
+                    .join(" "),
+            ),
         };
         let mut result = CommandResult::value(value);
         result.retained = self.expansion_charges.split_off(start);
         Ok(result)
     }
 
-    fn expansion_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
+    fn expansion_value(
+        &mut self,
+        word: &Word,
+        output: ExpansionOutput,
+    ) -> Result<Value, CommandFailure> {
         match word.parts.as_slice() {
-            [WordPart::Parameter(_)] | [WordPart::CommandSubstitution(_)] => {
+            [WordPart::Parameter(parameter)] => self.parameter_value_with(parameter, output),
+            [WordPart::CommandSubstitution(_)] => {
                 let result = self.assignment_value(word)?;
                 self.expansion_charges.extend(result.retained);
                 Ok(result.value)
             }
             _ => Ok(Value::String(
-                self.expand_word_with(word, ExpansionOutput::Legacy)?
-                    .join(" "),
+                self.expand_word_with(word, output)?.join(" "),
             )),
         }
     }
@@ -3470,7 +3485,7 @@ impl<'a> Evaluator<'a> {
             }
             WordPart::Parameter(parameter) => match output {
                 ExpansionOutput::Legacy | ExpansionOutput::Unsplit => {
-                    let value = self.parameter_value(parameter)?;
+                    let value = self.parameter_value_with(parameter, output)?;
                     append_unsplit_value(fields, separated, &value);
                     value
                 }
@@ -3547,6 +3562,7 @@ impl<'a> Evaluator<'a> {
                     indices,
                     modifier,
                     Some(FieldExpansion { fields, separated }),
+                    ExpansionOutput::Unsplit,
                 )
             }),
             Parameter::AllPositional => {
@@ -3574,10 +3590,11 @@ impl<'a> Evaluator<'a> {
         &mut self,
         word: &Word,
         split: Option<FieldExpansion<'_>>,
+        output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         match split {
             Some(split) => self.expand_replacement(word, split.fields, split.separated),
-            None => self.expansion_value(word),
+            None => self.expansion_value(word, output),
         }
     }
 
@@ -3692,11 +3709,19 @@ impl<'a> Evaluator<'a> {
         Ok(self.expand_quoted_fields(parts)?.join(" "))
     }
 
+    fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
+        self.expand_preserved_fields(parts, ExpansionOutput::Legacy)
+    }
+
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
+    fn expand_preserved_fields(
+        &mut self,
+        parts: &[WordPart],
+        output: ExpansionOutput,
+    ) -> Result<Vec<String>, CommandFailure> {
         let mut fields = vec![String::new()];
         for part in parts {
             match part {
@@ -3712,7 +3737,7 @@ impl<'a> Evaluator<'a> {
                     append(&mut fields, &render_number(number));
                 }
                 WordPart::Parameter(parameter) if splits_inside_quotes(parameter) => {
-                    let value = self.parameter_value(parameter)?;
+                    let value = self.parameter_value_with(parameter, output)?;
                     let elements = match value {
                         Value::Array(items) => items,
                         Value::Null => Vec::new(),
@@ -3729,7 +3754,7 @@ impl<'a> Evaluator<'a> {
                     fields.extend(elements);
                 }
                 WordPart::Parameter(parameter) => {
-                    let value = self.parameter_value(parameter)?;
+                    let value = self.parameter_value_with(parameter, output)?;
                     append(&mut fields, &quoted_text(&value));
                 }
                 WordPart::CommandSubstitution(program) => {
@@ -3743,6 +3768,14 @@ impl<'a> Evaluator<'a> {
     }
 
     fn parameter_value(&mut self, parameter: &Parameter) -> Result<Value, CommandFailure> {
+        self.parameter_value_with(parameter, ExpansionOutput::Legacy)
+    }
+
+    fn parameter_value_with(
+        &mut self,
+        parameter: &Parameter,
+        output: ExpansionOutput,
+    ) -> Result<Value, CommandFailure> {
         Ok(match parameter {
             Parameter::Named {
                 name,
@@ -3750,8 +3783,9 @@ impl<'a> Evaluator<'a> {
                 modifier,
                 length,
             } => {
-                let value =
-                    self.nested(|this| this.named_parameter_value(name, indices, modifier, None))?;
+                let value = self.nested(|this| {
+                    this.named_parameter_value(name, indices, modifier, None, output)
+                })?;
                 if *length {
                     parameter_length(&value)
                 } else {
@@ -3787,6 +3821,7 @@ impl<'a> Evaluator<'a> {
         indices: &[Index],
         modifier: &Modifier,
         mut split: Option<FieldExpansion<'_>>,
+        output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         let (value, bound) = self.select_parameter(name, indices)?;
         if self.options.nounset && !bound && *modifier == Modifier::None {
@@ -3805,7 +3840,7 @@ impl<'a> Evaluator<'a> {
             Modifier::None => value,
             Modifier::Default { colon, word } => {
                 if absent(*colon) {
-                    self.expand_selected_word(word, split.take())?
+                    self.expand_selected_word(word, split.take(), output)?
                 } else {
                     value
                 }
@@ -3819,7 +3854,7 @@ impl<'a> Evaluator<'a> {
                         "${{{name}[...]:=word}} cannot assign through an index; assign to {name} itself"
                     )));
                 }
-                let substitute = self.expand_selected_word(word, None)?;
+                let substitute = self.expand_selected_word(word, None, output)?;
                 self.assign(name, CommandResult::value(substitute.clone()))?;
                 substitute
             }
@@ -3839,7 +3874,7 @@ impl<'a> Evaluator<'a> {
                 if absent(*colon) {
                     Value::Null
                 } else {
-                    self.expand_selected_word(word, split.take())?
+                    self.expand_selected_word(word, split.take(), output)?
                 }
             }
             Modifier::StripPrefix(pattern) => {
@@ -3961,7 +3996,10 @@ impl<'a> Evaluator<'a> {
     ) -> Result<ExitCode, CommandFailure> {
         let mut operands = Vec::with_capacity(test.words.len());
         for word in &test.words {
-            operands.push(self.expand_quoted(&word.parts)?);
+            operands.push(
+                self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)?
+                    .join(" "),
+            );
         }
         if test.check_right_pattern
             && let [_, _, right] = operands.as_slice()
