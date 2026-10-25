@@ -1,0 +1,46 @@
+[package]
+name = "dekopon-tui"
+description = "Terminal console for driving Dekopon agents against a running local broker"
+version.workspace = true
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["agents", "tui", "console", "capabilities", "security"]
+categories = ["command-line-utilities"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+crossterm.workspace = true
+dekopon-agent.workspace = true
+dekopon-broker-protocol.workspace = true
+dekopon-core.workspace = true
+dekopon-model.workspace = true
+dekopon-model-token-governor.workspace = true
+dekopon-protocol.workspace = true
+dekopon-process.workspace = true
+dekopon-shell.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+parking_lot.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+dekopon-config.workspace = true
+tokio = { workspace = true, features = ["io-std", "signal"] }
+tracing.workspace = true
+
+[dev-dependencies]
+dekopon-telemetry = { workspace = true, features = ["exporter"] }
+opentelemetry-proto.workspace = true
+prost.workspace = true
+tempfile.workspace = true
+# Same WAT parser/version as core v0.33.0's brokerd spawn test fixture.
+wat = "=1.259.0"
+
+[lints]
+workspace = true

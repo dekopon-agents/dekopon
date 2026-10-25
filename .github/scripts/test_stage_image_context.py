@@ -23,7 +23,7 @@ class StageImageContextTests(unittest.TestCase):
                     name = f"{prefix}-0.34.0-{target}"
                     archive = releases / f"{name}.tar.gz"
                     with tarfile.open(archive, "w:gz") as output:
-                        for binary in ("dekopon-brokerd", "dekopon-gatewayd"):
+                        for binary in ("dekopon-brokerd", "dekopon-gatewayd", "dekopon-console"):
                             data = f"{variant}:{target}:{binary}".encode()
                             member = tarfile.TarInfo(f"{name}/{binary}")
                             member.size = len(data)
@@ -61,7 +61,11 @@ else:
                         arguments.append(variant)
                     subprocess.run(arguments, env=env, check=True, capture_output=True, text=True)
                     self.assertEqual(len(verified.read_text().splitlines()), 2)
-                    for binary in (work / "context/dist").glob("*/*"):
+                    staged = work / "context/dist"
+                    for arch in ("amd64", "arm64"):
+                        self.assertEqual({p.name for p in (staged / arch).iterdir()},
+                                         {"dekopon-brokerd", "dekopon-gatewayd", "dekopon-console"})
+                    for binary in staged.glob("*/*"):
                         self.assertTrue(binary.read_text().startswith(f"{variant}:"))
                     subprocess.run(["sha256sum", "--check", str(work / "binaries.sha256")],
                                    cwd=work / "context", check=True, capture_output=True)
