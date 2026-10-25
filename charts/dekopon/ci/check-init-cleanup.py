@@ -74,6 +74,6 @@ for mode, expected_status in (("failure", 42), ("term", 143), ("preexisting", 1)
             assert len(remaining) == 1 and remaining[0].read_text() == "preexisting-sentinel"
             assert "refusing preexisting test volume" in result.stderr
         else:
-            assert len(created) == (7 if mode == "success" else 1), calls
+            assert len(created) == (8 if mode == "success" else 1), calls
             assert not remaining, (mode, remaining)
         print(f"PASS init cleanup {mode}: exit={expected_status}, allocated={len(created)}, removed={len(removed)}")

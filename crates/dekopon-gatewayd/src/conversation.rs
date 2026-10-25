@@ -467,7 +467,9 @@ impl ConversationStore {
         if !state.slots.contains_key(key) {
             state.capacity_retired.remove(key);
             let generation = allocate_generation(&mut state);
-            let asset_fence = Arc::new(AssetFence::new());
+            let asset_fence = Arc::new(
+                AssetFence::new().with_grant(crate::memory::journal::grant_digest(granted)),
+            );
             let cache_key = self.cache_keys.for_conversation(key);
             let live = recalled
                 .map(|history| Conversation::new(history, &self.headroom, cache_key.clone(), now));

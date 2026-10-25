@@ -204,11 +204,35 @@ where
         &config.metering,
         dekopon_model_token_governor::Metering::system_clock(),
     ));
-    let assets = Arc::new(AssetStore::with_retention(
-        config.sessions.max_conversations,
-        ONE_SHOT_ASSET_IDLE,
-        config.sessions.asset_retention_bytes,
-    ));
+    let assets_path = config.assets.clone();
+    let conversations = config.sessions.max_conversations;
+    let budget = config.sessions.asset_retention_bytes;
+    let journal_assets = journal.clone();
+    let assets = tokio::task::spawn_blocking(move || {
+        let store = AssetStore::with_retention(conversations, ONE_SHOT_ASSET_IDLE, budget);
+        let store = match assets_path {
+            Some(path) => store
+                .with_storage(&path)
+                .map_err(|error| GatewaydError::AssetStore { error })?,
+            None => store,
+        };
+        if let Some(journal) = journal_assets {
+            store
+                .attach_journal(&journal)
+                .map_err(|error| GatewaydError::Journal {
+                    kind: match error {
+                        journal::JournalError::Io { kind } => kind,
+                        journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
+                    },
+                })?;
+        }
+        store
+            .report_startup()
+            .map_err(|error| GatewaydError::AssetStore { error })?;
+        Ok::<_, GatewaydError>(Arc::new(store))
+    })
+    .await
+    .map_err(GatewaydError::TransportTask)??;
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -1129,6 +1153,10 @@ fn build_transport(
 
 #[derive(Debug, Error)]
 pub enum GatewaydError {
+    #[error("could not open the attachment store: {error}")]
+    AssetStore {
+        error: dekopon_model::asset::BlobError,
+    },
     #[error("gateway configuration is invalid")]
     Config(#[from] ConfigError),
     #[error("gateway agent catalog is unavailable or invalid")]

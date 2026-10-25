@@ -234,7 +234,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
-| `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
+| `gateway.asset.store_started` | `dekopon-gatewayd` | once after durable store startup has reconciled journal references: `asset.store.path`, filesystem `asset.store.free_bytes`, and configured `asset.store.budget_bytes`; the pin reverts when free bytes are below the budget |
+| `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`), plus sanitized storage error cause when applicable; no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
 | `agent.skill.read` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
@@ -396,7 +397,11 @@ supplied, so an export failure can never be re-exported through the exporter tha
 
 ### Daemon exit and shutdown records
 
-Both daemons report the same two facts on the way out, in the same shape:
+Both daemons report terminal failures and telemetry shutdown failures. The broker writes its
+`broker_exit` JSON diagnostic directly to stderr before stopping the runtime, independently of
+`RUST_LOG` and the best-effort stdout queue. This terminal diagnostic is not offered to OTLP;
+serving records keep their nonblocking stdout and exporter paths. Telemetry shutdown uses only
+the time remaining on the broker's shared shutdown deadline and is skipped once it expires.
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|

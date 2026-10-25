@@ -288,6 +288,7 @@ pub(crate) struct PostReply {
     pub key: ConversationKey,
     pub granted: Vec<String>,
     pub access: AssetAccess,
+    pub publication: Option<crate::asset::Publication>,
     pub window: MemoryWindow,
     pub turn: ConversationTurn,
 }
@@ -323,11 +324,14 @@ pub(crate) async fn persist(
     runner: &SessionRunner,
     route: &BoundRoute,
     cancellation: &SessionCancellation,
-    reply: PostReply,
+    mut reply: PostReply,
 ) {
-    persist_turn(runner, route, cancellation, reply)
+    let mut publication = reply.publication.take();
+    persist_turn(runner, route, cancellation, reply, &mut publication)
         .instrument(tracing::info_span!("memory.persist"))
         .await;
+    drop(publication);
+    runner.assets.finish_publications().await;
 }
 
 async fn persist_turn(
@@ -335,11 +339,13 @@ async fn persist_turn(
     route: &BoundRoute,
     cancellation: &SessionCancellation,
     reply: PostReply,
+    publication: &mut Option<crate::asset::Publication>,
 ) {
     let PostReply {
         key,
         granted,
         access,
+        publication: _,
         window,
         turn,
     } = reply;
@@ -356,10 +362,27 @@ async fn persist_turn(
     let cancel = cancellation.model_watch();
     let stem = key.journal_stem();
     let grant = journal::grant_digest(&granted);
-    let inventory = runner.assets.inventory(&access);
     let next_asset_id = access.next_asset_id();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
+    let store = Arc::clone(&runner.assets);
+    let inventory_access = access.clone();
+    let inventory_subscriber = subscriber.clone();
+    let inventory_span = span.clone();
+    let inventory = match tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&inventory_subscriber, || {
+            let _entered = inventory_span.enter();
+            store.inventory(&inventory_access)
+        })
+    })
+    .await
+    {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            tracing::warn!(%error, "gateway.asset.reclaim.failed");
+            return;
+        }
+    };
     let include_chat = window.recall == crate::config::RecallSource::Journal;
     let generation_policy = policy.clone();
     let generation_turn = turn.clone();
@@ -418,10 +441,11 @@ async fn persist_turn(
         );
         return;
     }
+    let publication = publication.take();
     let published = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = span.enter();
-            journal.append(
+            let result = journal.append(
                 &stem,
                 &journal::Entry {
                     at: SystemTime::now(),
@@ -432,7 +456,11 @@ async fn persist_turn(
                     prepared: prepared.as_ref(),
                 },
                 window,
-            )
+            );
+            if let Some(publication) = publication {
+                publication.finish_blocking();
+            }
+            result
         })
     })
     .await;

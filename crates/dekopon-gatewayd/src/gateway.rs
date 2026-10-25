@@ -896,6 +896,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
         | GatewaydError::TransportConnect { .. }
         | GatewaydError::TransportTask(_)
         | GatewaydError::TransportsLost
+        | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
@@ -954,6 +955,7 @@ pub(crate) fn reload_problem(problem: &GatewaydError) -> String {
         | GatewaydError::TransportConnect { .. }
         | GatewaydError::TransportTask(_)
         | GatewaydError::TransportsLost
+        | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
@@ -980,6 +982,7 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
         | GatewaydError::TransportConnect { .. }
         | GatewaydError::TransportTask(_)
         | GatewaydError::TransportsLost
+        | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
