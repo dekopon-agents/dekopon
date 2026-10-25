@@ -799,6 +799,18 @@ impl AssetRef {
             && (images_supported || !is_image(&self.mime))
     }
 
+    pub fn unreadable_reason(&self, images_supported: bool) -> &'static str {
+        if self.source.is_none() {
+            "the gateway cannot see this file at all"
+        } else if !is_readable(&self.mime) {
+            "not a type the gateway can show you"
+        } else if is_image(&self.mime) && !images_supported {
+            "this agent's model cannot be shown images"
+        } else {
+            "unavailable"
+        }
+    }
+
     fn row(&self, bytes: Option<u64>) -> AssetRow {
         AssetRow {
             id: self.id,
