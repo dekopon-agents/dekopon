@@ -3309,8 +3309,13 @@ mod driver_tests {
                 );
                 let registered =
                     store.assets_for(&key, ingress.assets.clone(), std::time::Instant::now());
-                let note =
-                    crate::asset::reference_note(&registered, true).expect("unavailable file note");
+                let note = crate::asset::reference_note(
+                    &registered,
+                    true,
+                    crate::asset::TextReader::AssetCat,
+                    crate::transport::MAX_INBOUND_TEXT_BYTES,
+                )
+                .text;
                 let prompt = format!("{}\n\n{note}", ingress.text);
                 assert_eq!(
                     prompt

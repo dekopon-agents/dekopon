@@ -12620,7 +12620,7 @@ fn the_asset_store_debug_view_exposes_only_counts() {
 }
 
 #[test]
-fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
+fn every_reachable_line_names_its_number() {
     let store = asset_store();
     let now = Instant::now();
     let registered = store.assets_for(
@@ -12637,14 +12637,20 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
         ],
         now,
     );
-    let note = asset::reference_note(&registered, true).expect("a note for three files");
+    let note = asset::reference_note(
+        &registered,
+        true,
+        crate::asset::TextReader::AssetCat,
+        crate::transport::MAX_INBOUND_TEXT_BYTES,
+    )
+    .text;
 
     assert!(
         note.contains("chat-asset:1 — shot.png (image/png, 2 KB)"),
         "{note}"
     );
     assert!(note.contains("clip.mov"), "{note}");
-    assert!(!note.contains("chat-asset:2"), "{note}");
+    assert!(note.contains("chat-asset:2"), "{note}");
     assert!(
         note.contains("the gateway cannot see this file at all"),
         "{note}"
@@ -12654,17 +12660,23 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
 }
 
 #[test]
-fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
+fn a_model_that_cannot_be_shown_images_still_gets_its_number() {
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 2048)],
         Instant::now(),
     );
-    let note = asset::reference_note(&registered, false).expect("a note");
+    let note = asset::reference_note(
+        &registered,
+        false,
+        crate::asset::TextReader::AssetCat,
+        crate::transport::MAX_INBOUND_TEXT_BYTES,
+    )
+    .text;
 
     assert!(!fetchable(&registered, false));
-    assert!(!note.contains("chat-asset:"), "{note}");
+    assert!(note.contains("chat-asset:"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
@@ -12746,7 +12758,13 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
         vec![pending("shot.png", "image/png", 2048)],
         now,
     );
-    let note = asset::reference_note(&registered, true).expect("a note");
+    let note = asset::reference_note(
+        &registered,
+        true,
+        crate::asset::TextReader::AssetCat,
+        crate::transport::MAX_INBOUND_TEXT_BYTES,
+    )
+    .text;
 
     assert!(note.contains("chat-asset:1 — recipe.pdf"), "{note}");
     assert!(note.contains("chat-asset:2 — shot.png"), "{note}");
@@ -14074,30 +14092,42 @@ fn a_document_does_not_need_the_image_modality() {
         ],
         Instant::now(),
     );
-    let note = asset::reference_note(&registered, false).expect("a note");
+    let note = asset::reference_note(
+        &registered,
+        false,
+        crate::asset::TextReader::AssetCat,
+        crate::transport::MAX_INBOUND_TEXT_BYTES,
+    )
+    .text;
 
     assert!(
         fetchable(&registered, false),
         "the document is still fetchable"
     );
     assert!(note.contains("chat-asset:1 — spec.pdf"), "{note}");
-    assert!(!note.contains("chat-asset:2"), "{note}");
+    assert!(note.contains("chat-asset:2"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
 }
 
 #[test]
-fn an_unsupported_media_type_is_named_but_never_numbered() {
+fn an_unsupported_media_type_is_numbered_for_commands() {
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("clip.mp4", "video/mp4", 1024)],
         Instant::now(),
     );
-    let note = asset::reference_note(&registered, true).expect("a note");
+    let note = asset::reference_note(
+        &registered,
+        true,
+        crate::asset::TextReader::AssetCat,
+        crate::transport::MAX_INBOUND_TEXT_BYTES,
+    )
+    .text;
 
     assert!(!fetchable(&registered, true));
     assert!(note.contains("clip.mp4"), "{note}");
-    assert!(!note.contains("chat-asset:"), "{note}");
+    assert!(note.contains("chat-asset:"), "{note}");
     assert!(!note.contains("fetch_chat_asset"), "{note}");
 }
 
@@ -22591,6 +22621,35 @@ async fn an_unloadable_baseline_catalog_probes_even_when_candidate_routes_fail()
     assert_eq!(vendor.asked.lock().as_slice(), ["vendor/refused"]);
     assert_eq!(vendor.requests.lock().len(), 1);
     assert_canary_request(&vendor.requests.lock()[0], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recalled_conversation_numbers_every_attachment() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("I can see the inventory.")]);
+    let mut earlier = past("0000000001", "U1", SUBJECT, "forty files");
+    earlier.assets = (1..=40)
+        .map(|id| pending(&format!("history-{id}.png"), "image/png", 12))
+        .collect();
+    let driver = HistoryDriver::new(Ok(vec![earlier]));
+    let runner = runner(broker, Arc::clone(&models), 4);
+    run_session(
+        runner,
+        persistent_route(model_config(), recall_window(RecallSource::Platform)),
+        message("list the files"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    let prompt = models.prompt(0);
+    let newest = &prompt.last().unwrap().1;
+    for id in 1..=40 {
+        assert!(
+            newest.contains(&format!("chat-asset:{id} — history-{id}.png")),
+            "{newest}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

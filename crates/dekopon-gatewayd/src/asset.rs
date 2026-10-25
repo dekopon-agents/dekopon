@@ -33,7 +33,7 @@ pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
 
 use crate::{conversation::ConversationKey, transport::AssetFetcher};
 
-pub(crate) const MAX_ASSETS_PER_CONVERSATION: usize = dekopon_broker_protocol::MAX_ASSET_ROWS;
+pub(crate) const MAX_ASSETS_PER_MESSAGE: usize = 32;
 
 /// Debug omits the source field because Slack private URLs and Discord signed CDN URLs function as
 /// bearer capabilities, not safe-to-log metadata.
@@ -221,7 +221,7 @@ impl AssetAccess {
 
 pub(crate) struct AssetStore {
     conversations: usize,
-    idle_timeout: Duration,
+    one_shot_idle: Duration,
     entries: Mutex<HashMap<AssetStateKey, ConversationAssets>>,
     retention: Mutex<Retention>,
     downloads: Downloads,
@@ -313,18 +313,18 @@ fn row_mut<'a>(
 
 impl AssetStore {
     #[cfg(test)]
-    pub fn new(conversations: usize, idle_timeout: Duration) -> Self {
+    pub fn new(conversations: usize, one_shot_idle: Duration) -> Self {
         Self::with_retention(
             conversations,
-            idle_timeout,
+            one_shot_idle,
             crate::config::DEFAULT_ASSET_RETENTION_BYTES,
         )
     }
 
-    pub fn with_retention(conversations: usize, idle_timeout: Duration, budget: usize) -> Self {
+    pub fn with_retention(conversations: usize, one_shot_idle: Duration, budget: usize) -> Self {
         Self {
             conversations,
-            idle_timeout,
+            one_shot_idle,
             entries: Mutex::new(HashMap::new()),
             retention: Mutex::new(Retention::new(budget)),
             downloads: Downloads {
@@ -361,7 +361,7 @@ impl AssetStore {
             .with_active(|state_key| {
                 let mut entries = self.entries.lock();
                 let mut retention = self.retention.lock();
-                Self::expire(&mut entries, &mut retention, self.idle_timeout, now);
+                Self::expire(&mut entries, &mut retention, self.one_shot_idle, now);
                 let mut arrived = Vec::with_capacity(arriving.len());
                 if !arriving.is_empty() {
                     let entry = entries
@@ -385,7 +385,6 @@ impl AssetStore {
                             state: Attachment::Registered,
                         });
                     }
-                    Self::trim(entry, &mut retention, state_key);
                     Self::enforce_ceiling(&mut entries, &mut retention, self.conversations);
                 }
 
@@ -415,7 +414,7 @@ impl AssetStore {
         access.with_active(|state_key| {
             let mut entries = self.entries.lock();
             let mut retention = self.retention.lock();
-            Self::expire(&mut entries, &mut retention, self.idle_timeout, now);
+            Self::expire(&mut entries, &mut retention, self.one_shot_idle, now);
             let entry = entries
                 .entry(state_key.clone())
                 .or_insert_with(|| ConversationAssets::new(access.weak_fence(), now));
@@ -436,7 +435,6 @@ impl AssetStore {
                     state: Attachment::Registered,
                 }));
             entry.assets.sort_by_key(|row| row.asset.id);
-            Self::trim(entry, &mut retention, state_key);
             Self::enforce_ceiling(&mut entries, &mut retention, self.conversations);
         });
     }
@@ -457,7 +455,7 @@ impl AssetStore {
                 Self::expire(
                     &mut entries,
                     &mut self.retention.lock(),
-                    self.idle_timeout,
+                    self.one_shot_idle,
                     now,
                 );
                 let entry = entries.get_mut(state_key)?;
@@ -474,15 +472,12 @@ impl AssetStore {
     fn expire(
         entries: &mut HashMap<AssetStateKey, ConversationAssets>,
         retention: &mut Retention,
-        idle_timeout: Duration,
+        one_shot_idle: Duration,
         now: Instant,
     ) {
-        let expired = entries.extract_if(|_, entry| {
-            let active = entry
-                .fence
-                .as_ref()
-                .is_none_or(|fence| fence.upgrade().is_some_and(|fence| fence.is_active()));
-            !active || now.saturating_duration_since(entry.touched) >= idle_timeout
+        let expired = entries.extract_if(|_, entry| match &entry.fence {
+            Some(fence) => !fence.upgrade().is_some_and(|fence| fence.is_active()),
+            None => now.saturating_duration_since(entry.touched) >= one_shot_idle,
         });
         for (key, entry) in expired {
             retention.release_all(&key, entry.assets);
@@ -506,14 +501,6 @@ impl AssetStore {
                 retention.release_all(&oldest, entry.assets);
             }
         }
-    }
-
-    fn trim(entry: &mut ConversationAssets, retention: &mut Retention, key: &AssetStateKey) {
-        let excess = entry
-            .assets
-            .len()
-            .saturating_sub(MAX_ASSETS_PER_CONVERSATION);
-        retention.release_all(key, entry.assets.drain(..excess));
     }
 }
 
@@ -552,6 +539,21 @@ pub(crate) struct RecalledAsset {
 
 const READABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
+// Mirrors dekopon-provider-asset v0.3.0 operations::cat (a1da68db:183-190).
+fn cat_reads(content_type: &str) -> bool {
+    let Ok(parsed) = content_type.parse::<mime::Mime>() else {
+        return false;
+    };
+    parsed.type_() == mime::TEXT
+        || (parsed.type_() == mime::APPLICATION
+            && (matches!(
+                parsed.subtype().as_str(),
+                "json" | "xml" | "javascript" | "x-www-form-urlencoded"
+            ) || parsed
+                .suffix()
+                .is_some_and(|suffix| matches!(suffix.as_str(), "json" | "xml"))))
+}
+
 const READABLE_DOCUMENT_TYPES: [&str; 13] = [
     "application/pdf",
     "text/plain",
@@ -589,39 +591,210 @@ pub(crate) fn arrival_markers(registered: &Registered) -> String {
         .collect()
 }
 
-pub(crate) fn reference_note(registered: &Registered, images_supported: bool) -> Option<String> {
-    if registered.inventory.is_empty() {
-        return None;
+#[derive(Clone, Copy)]
+pub(crate) enum TextReader {
+    AssetCat,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoteLine {
+    Shown,
+    Cat,
+    ImagesOff,
+    CommandOnly,
+    Invisible,
+}
+
+pub(crate) struct InventoryNote {
+    pub text: String,
+    pub listed: usize,
+    pub omitted: usize,
+    pub bytes: usize,
+}
+
+impl NoteLine {
+    fn for_asset(asset: &AssetRef, images_supported: bool, reader: TextReader) -> Self {
+        if asset.source.is_none() {
+            Self::Invisible
+        } else if is_image(&asset.mime) && !images_supported {
+            Self::ImagesOff
+        } else if is_readable(&asset.mime) {
+            Self::Shown
+        } else if cat_reads(&asset.mime) {
+            match reader {
+                TextReader::AssetCat => Self::Cat,
+                TextReader::Absent => Self::CommandOnly,
+            }
+        } else {
+            Self::CommandOnly
+        }
     }
-    let mut note = String::from("[gateway: files in this conversation");
-    let mut any_fetchable = false;
-    for asset in &registered.inventory {
-        let size = asset
-            .size
-            .map_or_else(|| "size unknown".to_owned(), kibibytes);
-        let name = &asset.name;
-        let mime = &asset.mime;
-        let arrived = if registered.arrived.contains(&asset.id) {
+
+    fn is_shown(self) -> bool {
+        match self {
+            Self::Shown => true,
+            Self::Cat | Self::ImagesOff | Self::CommandOnly | Self::Invisible => false,
+        }
+    }
+
+    fn render(self, asset: &AssetRef, arrived: bool) -> String {
+        let AssetRef {
+            id,
+            name,
+            mime,
+            size,
+            ..
+        } = asset;
+        let size = size.map_or_else(|| "size unknown".to_owned(), kibibytes);
+        let arrived = if arrived {
             " — attached to this message"
         } else {
             ""
         };
-        if asset.is_fetchable(images_supported) {
-            any_fetchable = true;
-            note.push_str(&format!(
-                "\n  chat-asset:{} — {name} ({mime}, {size}){arrived}",
-                asset.id
-            ));
-        } else {
-            let why = asset.unreadable_reason(images_supported);
-            note.push_str(&format!("\n  {name} ({mime}, {size}) — {why}{arrived}"));
+        match self {
+            Self::Shown => format!("\n  chat-asset:{id} — {name} ({mime}, {size}){arrived}"),
+            Self::Cat => format!(
+                "\n  chat-asset:{id} — {name} ({mime}, {size}) — read with `asset cat chat-asset:{id}`{arrived}"
+            ),
+            Self::ImagesOff => format!(
+                "\n  chat-asset:{id} — {name} ({mime}, {size}) — this agent's model cannot be shown images{arrived}"
+            ),
+            Self::CommandOnly => format!(
+                "\n  chat-asset:{id} — {name} ({mime}, {size}) — not readable here; a command can take it as chat-asset:{id}{arrived}"
+            ),
+            Self::Invisible => format!(
+                "\n  {name} ({mime}, {size}) — the gateway cannot see this file at all{arrived}"
+            ),
         }
     }
-    if any_fetchable {
-        note.push_str("\n  Call fetch_chat_asset with the number to look at one.");
+}
+
+const NOTE_HEADER: &str = "[gateway: files in this conversation";
+const NOTE_FOOTER: &str =
+    "\n  Call fetch_chat_asset with the number to look at an image or document.";
+
+pub(crate) fn reference_note(
+    registered: &Registered,
+    images_supported: bool,
+    reader: TextReader,
+    budget: usize,
+) -> InventoryNote {
+    let mut inventory = registered.inventory.iter().collect::<Vec<_>>();
+    inventory.sort_unstable_by_key(|asset| std::cmp::Reverse(asset.id));
+    let omission = |listed: usize| match (inventory.last(), inventory.get(listed)) {
+        (Some(first), Some(last)) => format!(
+            "\n  {} older files, chat-asset:{} to chat-asset:{}, are not listed for space; each number still works.",
+            inventory.len() - listed,
+            first.id,
+            last.id
+        ),
+        _ => String::new(),
+    };
+    let mut full = if inventory.is_empty() {
+        String::new()
+    } else {
+        NOTE_HEADER.to_owned()
+    };
+    let mut full_shown = false;
+    let mut complete = true;
+    for asset in &inventory {
+        let kind = NoteLine::for_asset(asset, images_supported, reader);
+        let line = kind.render(asset, registered.arrived.contains(&asset.id));
+        full_shown |= kind.is_shown();
+        if full.len() + line.len() + 1 + if full_shown { NOTE_FOOTER.len() } else { 0 } > budget {
+            complete = false;
+            break;
+        }
+        full.push_str(&line);
     }
-    note.push(']');
-    Some(note)
+    if complete {
+        if !inventory.is_empty() {
+            if full_shown {
+                full.push_str(NOTE_FOOTER);
+            }
+            full.push(']');
+        }
+        return InventoryNote {
+            bytes: full.len(),
+            text: full,
+            listed: inventory.len(),
+            omitted: 0,
+        };
+    }
+    let framed = NOTE_HEADER.len() + 1 + omission(0).len() <= budget;
+    let fit = |framed: bool| {
+        let mut text = if framed && !inventory.is_empty() {
+            NOTE_HEADER.to_owned()
+        } else {
+            String::new()
+        };
+        let mut listed = 0;
+        let mut shown = false;
+        for asset in &inventory {
+            let arrived = registered.arrived.contains(&asset.id);
+            if !framed && !arrived {
+                break;
+            }
+            let kind = NoteLine::for_asset(asset, images_supported, reader);
+            let line = kind.render(asset, arrived);
+            let next_shown = shown || kind.is_shown();
+            let footer = if framed && next_shown {
+                NOTE_FOOTER.len()
+            } else {
+                0
+            };
+            let close = usize::from(framed);
+            if text.len() + line.len() + omission(listed + 1).len() + footer + close > budget {
+                break;
+            }
+            text.push_str(&line);
+            listed += 1;
+            shown = next_shown;
+        }
+        let omitted = inventory.len() - listed;
+        let omitted_line = omission(listed);
+        if text.len()
+            + omitted_line.len()
+            + usize::from(framed)
+            + if framed && shown {
+                NOTE_FOOTER.len()
+            } else {
+                0
+            }
+            > budget
+        {
+            text.clear();
+            listed = 0;
+        } else if !inventory.is_empty() {
+            text.push_str(&omitted_line);
+            if framed {
+                if shown {
+                    text.push_str(NOTE_FOOTER);
+                }
+                text.push(']');
+            }
+        }
+        let omitted = if text.is_empty() {
+            inventory.len()
+        } else {
+            omitted
+        };
+        InventoryNote {
+            bytes: text.len(),
+            text,
+            listed,
+            omitted,
+        }
+    };
+    let note = fit(framed);
+    if framed && note.listed == 0 {
+        let arrivals = fit(false);
+        if arrivals.listed > 0 {
+            return arrivals;
+        }
+    }
+    note
 }
 
 impl AssetRef {
@@ -1038,7 +1211,7 @@ impl AssetStore {
                 Self::expire(
                     &mut entries,
                     &mut retention,
-                    self.idle_timeout,
+                    self.one_shot_idle,
                     Instant::now(),
                 );
                 let row = row_mut(&mut entries, key, ticket.id).ok_or(AssetFailure::Unknown)?;
@@ -1241,7 +1414,7 @@ impl AssetStore {
                 Self::expire(
                     &mut entries,
                     &mut retention,
-                    self.idle_timeout,
+                    self.one_shot_idle,
                     Instant::now(),
                 );
                 let Some(row) = row_mut(&mut entries, key, id) else {
@@ -1289,7 +1462,7 @@ impl AssetStore {
                 Self::expire(
                     &mut entries,
                     &mut retention,
-                    self.idle_timeout,
+                    self.one_shot_idle,
                     Instant::now(),
                 );
                 Self::admit_locked(&mut entries, &mut retention, key, id, bytes)
@@ -1440,7 +1613,6 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 },
                 state: Attachment::Resident(resident),
             });
-            AssetStore::trim(entry, &mut retention, key);
             AssetStore::enforce_ceiling(&mut entries, &mut retention, self.store.conversations);
             if let Some(detected) = detected && detected != metadata.content_type {
                 let label: String = metadata.content_type.chars().filter(|c| !c.is_control()).take(128).collect();
@@ -1566,6 +1738,10 @@ fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str
 }
 
 #[cfg(test)]
+#[path = "tests/asset_note.rs"]
+mod note_tests;
+
+#[cfg(test)]
 #[path = "tests/asset_resolve.rs"]
 mod resolve_tests;
 
@@ -1580,14 +1756,6 @@ mod retention_tests {
             .iter()
             .map(|asset| asset.row(asset.size))
             .collect()
-    }
-
-    #[test]
-    fn row_limit_matches_the_protocol_contract() {
-        assert_eq!(
-            MAX_ASSETS_PER_CONVERSATION,
-            dekopon_broker_protocol::MAX_ASSET_ROWS
-        );
     }
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1944,6 +2112,58 @@ mod retention_tests {
     }
 
     #[test]
+    fn a_forty_attachment_conversation_keeps_every_number() {
+        let store = store(1024);
+        let access = access("forty");
+        for _ in 0..40 {
+            register(&store, &access);
+        }
+        assert_eq!(store.get_access(&access, 1, Instant::now()).unwrap().id, 1);
+        assert_eq!(store.get_inventory(&access).len(), 40);
+    }
+
+    #[test]
+    fn a_live_generation_inventory_outlives_an_hour_of_idleness() {
+        let store = AssetStore::new(8, crate::ONE_SHOT_ASSET_IDLE);
+        let access = access("live");
+        let id = register(&store, &access);
+        let later = Instant::now() + Duration::from_secs(7200);
+        assert_eq!(
+            store
+                .assets_for_access(&access, vec![], later)
+                .inventory
+                .len(),
+            1
+        );
+        assert_eq!(store.get_access(&access, id, later).unwrap().id, id);
+    }
+
+    #[test]
+    fn a_one_shot_inventory_still_expires_when_idle() {
+        let store = AssetStore::new(8, crate::ONE_SHOT_ASSET_IDLE);
+        let access = AssetAccess::one_shot(access("one-shot").key.conversation);
+        let id = register(&store, &access);
+        let later = Instant::now() + crate::ONE_SHOT_ASSET_IDLE;
+        assert!(
+            store
+                .assets_for_access(&access, vec![], later)
+                .inventory
+                .is_empty()
+        );
+        assert!(store.get_access(&access, id, later).is_none());
+    }
+
+    #[test]
+    fn a_retired_generation_still_prunes_its_inventory() {
+        let store = store(1024);
+        let retired = access("retired");
+        register(&store, &retired);
+        retired.fence.as_ref().unwrap().deactivate();
+        register(&store, &access("replacement"));
+        assert!(!store.entries.lock().contains_key(&retired.key));
+    }
+
+    #[test]
     fn lru_use_a_admit_c_evicts_b_and_listing_does_not_touch() {
         let store = store(6);
         let access = access("one");
@@ -1962,81 +2182,6 @@ mod retention_tests {
         );
         assert!(store.pin(&access, c, Recency::Keep).unwrap().is_some());
         assert_eq!(store.retention.lock().bytes, 6);
-    }
-
-    #[test]
-    fn chat_table_eviction_reclaims_unpinned_residency_but_preserves_delivery_pins() {
-        for pinned in [false, true] {
-            let store = store(1024);
-            let access = access("one");
-            let first = register(&store, &access);
-            let data = store.admit(&access, first, b"aaa").unwrap();
-            let pin = if pinned {
-                Some(data)
-            } else {
-                drop(data);
-                None
-            };
-            for _ in 1..MAX_ASSETS_PER_CONVERSATION {
-                register(&store, &access);
-            }
-            assert_eq!(
-                store.get_inventory(&access).len(),
-                MAX_ASSETS_PER_CONVERSATION
-            );
-            assert_eq!(store.retention.lock().bytes, 3);
-            register(&store, &access);
-            assert_eq!(
-                store.get_inventory(&access).len(),
-                MAX_ASSETS_PER_CONVERSATION
-            );
-            assert!(store.get_access(&access, first, Instant::now()).is_none());
-            assert_eq!(residents(&store), usize::from(pinned));
-            assert_eq!(store.retention.lock().bytes, if pinned { 3 } else { 0 });
-            if let Some(pin) = pin {
-                assert_eq!(pin.read().unwrap(), b"aaa");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn generated_table_eviction_reclaims_unpinned_residency_but_preserves_delivery_pins() {
-        for pinned in [false, true] {
-            let store = store(1024);
-            let access = access("one");
-            let session = session(Arc::clone(&store), access.clone());
-            let mut first = None;
-            let mut pin = None;
-            for _ in 0..MAX_ASSETS_PER_CONVERSATION {
-                let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
-                let id = session
-                    .register(fd, &metadata, "asset.attach", "invocation")
-                    .unwrap();
-                if first.is_none() {
-                    first = Some(id);
-                    if pinned {
-                        pin = store.pin(&access, id, Recency::Keep).unwrap();
-                    }
-                }
-            }
-            assert_eq!(residents(&store), MAX_ASSETS_PER_CONVERSATION);
-            let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
-            session
-                .register(fd, &metadata, "asset.attach", "invocation")
-                .unwrap();
-            assert_eq!(inventory_rows(&session).len(), MAX_ASSETS_PER_CONVERSATION);
-            assert!(
-                store
-                    .get_access(&access, first.unwrap(), Instant::now())
-                    .is_none()
-            );
-            let expected = MAX_ASSETS_PER_CONVERSATION + usize::from(pinned);
-            assert_eq!(residents(&store), expected);
-            assert_eq!(store.retention.lock().bytes, 3 * expected);
-            if let Some(pin) = pin {
-                assert_eq!(pin.read().unwrap(), b"abc");
-            }
-        }
     }
 
     #[test]
@@ -2210,7 +2355,13 @@ mod retention_tests {
                 .collect(),
             Instant::now(),
         );
-        let note = reference_note(&registered, true).unwrap();
+        let note = reference_note(
+            &registered,
+            true,
+            crate::asset::TextReader::AssetCat,
+            crate::transport::MAX_INBOUND_TEXT_BYTES,
+        )
+        .text;
         assert!(note.contains("input-0.png (image/png, size unknown)"));
         assert!(note.contains("input-1.png (image/png, 0 B)"));
         assert!(note.contains("input-2.png (image/png, 2 KB)"));
