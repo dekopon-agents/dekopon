@@ -846,9 +846,9 @@ migration is implemented here.
 
 | Span | Crate | Fields |
 |---|---|---|
-| `provider.precompile` | `dekopon-brokerd` | `providers`, `compiled`, `repaired`, `removed_files`, `removed_bytes`, and `error` on failure; one offline command span, including lock acquisition, source checks, compilation and pruning, emitted only where a subscriber collects it |
+| `provider.precompile` | `dekopon-brokerd` | `providers`, `compiled`, `repaired`, `removed_files`, `removed_bytes`, `peak_rss_bytes` (process peak RSS so far in bytes, Linux VmHWM; unrecorded where unavailable), and `error` on failure; one offline command span, including lock acquisition, source checks, compilation and pruning, emitted only where a subscriber collects it |
 | `provider.registry_load` | `dekopon-broker-host` | `providers`, `mmap`, `elapsed_us`, `outcome` (`succeeded`/`failed`); one root for complete registry startup, including engine creation and descriptions |
-| `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
+| `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`, `peak_rss_bytes` (process peak RSS so far in bytes, Linux VmHWM; unrecorded where unavailable); one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
 | `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `run` beneath `broker.invocation`, or per legacy `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
@@ -901,6 +901,7 @@ RAM. Boot hashing touches every selected byte; clean mapped pages remain reclaim
 Each loaded-provider event also carries provider ID, source digest prefix/size, capability and
 command-word counts, and `command_export`. Offline `provider sync` publishes cached components; `provider precompile` verifies or repairs
 locked sources before pruning and records one `provider.precompile` span where a subscriber collects it.
+The `precompile` and `check --output=json` reports include `peakRssBytes`: process peak RSS so far (Linux VmHWM); null where unavailable. This is the whole process high-water mark, not a per-component increment or a cgroup figure. `check` reads it after provider-set sync and precompile finish.
 Under the chart the init container's record is its `--output=json` report on stdout plus the `warn`
 repair lines on stderr. The `compiled` count
 includes repairs; removed counts advance with each successful unlink, even if a later prune fails.

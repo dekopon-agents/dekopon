@@ -492,6 +492,8 @@ struct CheckOutput {
     ok: bool,
     problems: Vec<String>,
     warnings: Vec<String>,
+    #[serde(rename = "peakRssBytes")]
+    peak_rss_bytes: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -514,6 +516,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
             .map(|problem| error_chain(problem))
             .collect(),
         warnings: report.warnings.iter().map(ToString::to_string).collect(),
+        peak_rss_bytes: report.peak_rss_bytes,
     };
     render(check.output, &output, || {
         let lines = output
@@ -705,6 +708,25 @@ mod tests {
             clap::error::ErrorKind::MissingRequiredArgument
         );
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_output_serializes_peak_rss_as_number_or_null() {
+        for peak in [Some(1234_u64), None] {
+            let output = super::CheckOutput {
+                ok: true,
+                problems: Vec::new(),
+                warnings: Vec::new(),
+                peak_rss_bytes: peak,
+            };
+            assert_eq!(
+                serde_json::to_value(output).expect("JSON output"),
+                serde_json::json!({
+                    "ok": true, "problems": [], "warnings": [], "peakRssBytes": peak
+                })
+            );
+        }
     }
 
     #[test]
