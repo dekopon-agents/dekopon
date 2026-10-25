@@ -38,6 +38,7 @@ pub(super) fn write_owner_only(path: &Path, contents: &[u8]) {
 }
 
 pub(super) fn write_config(path: &Path, document: &serde_json::Value) {
+    dekopon_broker_host::enable_test_component_memoization();
     write_owner_only(
         path,
         &serde_json::to_vec(document).expect("config serializes"),
@@ -395,6 +396,14 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
         config::ConfigError::DuplicateSubjects { subjects }
             if subjects == ["discord.1", "slack.t0123abc.u9xyz"]
     ));
+
+    let mut mixed = document.clone();
+    mixed["principals"] =
+        json!({"cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "slack.t0123abc.c0123abc"]}});
+    write_config(&path, &mixed);
+    assert!(
+        matches!(config::load(&path, uid).await, Err(config::ConfigError::MixedSubjectKinds { principal }) if principal.as_str() == "cpetersen")
+    );
 
     for namespaces in [
         json!(["sms"]),
@@ -1213,6 +1222,7 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
 
 #[tokio::test]
 async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
+    dekopon_broker_host::enable_test_component_memoization();
     use std::sync::Arc;
 
     use dekopon_broker::{
@@ -1948,12 +1958,33 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
             owner.prepare(&old_digest, uid).await,
             (next_digest.clone(), GenerationOutcome::Prepared)
         );
+        assert!(
+            capture
+                .events_where(
+                    "dekopon_broker::audit",
+                    &[("audit.event", "broker.policy.loaded")]
+                )
+                .is_empty()
+        );
         assert_eq!(owner.commit(&next_digest, uid), GenerationOutcome::Applied);
         assert_eq!(owner.active().digest, next_digest);
         assert_ne!(owner.active().ready.broker.policy_digest(), old_policy);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
+    let loaded = capture.events_where(
+        "dekopon_broker::audit",
+        &[("audit.event", "broker.policy.loaded")],
+    );
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded[0].field("policy.digest"),
+        Some(owner.active().ready.broker.policy_digest())
+    );
+    assert_eq!(
+        loaded[0].field("identity.digest"),
+        Some(owner.active().ready.identity_digest.as_str())
+    );
     let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
     assert_eq!(applied.len(), 1);
     assert_eq!(
@@ -3034,7 +3065,91 @@ async fn changed_storage_refuses_without_creating_the_candidate_root() {
 }
 
 #[tokio::test]
-async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
+async fn check_distinguishes_an_unreadable_secret_map_from_an_unset_key() {
+    let mut fixture = ResidentFixture::boot().await;
+    let secret = "drn:com.xrl:secret:test:api/token";
+    write_owner_only(&fixture.cedar, format!(
+        r#"{POLICIES}
+        @id("checkout-secret") permit(principal, action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"{secret}");"#
+    ).as_bytes());
+    let identity_digest = fixture.active.ready.identity_digest.clone();
+    drop(fixture.active);
+    for map in [Some("chart-mounted-secrets.yaml"), None] {
+        match map {
+            Some(path) => fixture.document["secretMapPath"] = json!(path),
+            None => {
+                fixture
+                    .document
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("secretMapPath");
+            }
+        }
+        write_config(&fixture.path, &fixture.document);
+        let report = super::check(&fixture.path, None, None).await;
+        assert!(report.policy_digest.is_none());
+        assert_eq!(
+            report.identity_digest.as_deref(),
+            Some(identity_digest.as_str())
+        );
+        match map {
+            Some(_) => {
+                assert!(report.problems.is_empty(), "{report:?}");
+                assert!(report.warnings.iter().any(|warning| matches!(warning,
+                    super::StartupWarning::SecretRequired { policy, secret: required }
+                        if policy == "checkout-secret" && required == secret)));
+            }
+            None => {
+                let boot_report = super::load_candidate(&fixture.path, super::Mode::Boot)
+                    .await
+                    .1;
+                for report in [report, boot_report] {
+                    assert!(
+                        matches!(report.problems.as_slice(),
+                        [super::BrokerdError::Policy { source: dekopon_broker::PolicyBuildError::UnknownSecret { policy, secret: unknown } }]
+                            if policy == "checkout-secret" && unknown == secret),
+                        "{report:?}"
+                    );
+                    assert!(!report.warnings.iter().any(|warning| matches!(
+                        warning,
+                        super::StartupWarning::SecretRequired { .. }
+                    )));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_policy() {
+    let fixture = ResidentFixture::boot_with(|root, document| {
+        document["secretMapPath"] = json!("bindings.yaml");
+        document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+            "allowedHosts": ["api.example.test"], "allowedMethods": ["GET"],
+            "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+        });
+        write_owner_only(&root.join("token"), b"private-map-equality-fixture");
+        write_owner_only(&root.join("bindings.yaml"), format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [api.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            root.join("token").display()
+        ).as_bytes());
+    }).await;
+    let reads = super::private_read_witness::TrackedRead::new(&fixture.root.path().join("token"));
+    let report = super::check(&fixture.path, None, None).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(
+        report.policy_digest.as_deref(),
+        Some(fixture.active.ready.broker.policy_digest())
+    );
+    assert_eq!(
+        report.identity_digest.as_deref(),
+        Some(fixture.active.ready.identity_digest.as_str())
+    );
+    assert_eq!(reads.count(), 0, "check never opens the secret source");
+}
+
+#[tokio::test]
+async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -3057,7 +3172,10 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     document["secretMapPath"] = json!("bad-secrets.yaml");
     write_config(&path, &document);
     let checked = super::check(&path, None, None).await;
-    assert!(checked.problems.is_empty(), "{checked:?}");
+    assert!(
+        matches!(checked.problems.as_slice(), [BrokerdError::Secrets(_)]),
+        "{checked:?}"
+    );
     for report in [
         super::load_candidate(&path, Mode::Boot).await.1,
         super::load_candidate(&path, Mode::Reload(&active)).await.1,
@@ -3266,6 +3384,8 @@ async fn check_passes_the_conditional_write_example_in_place() {
         None,
     )
     .await;
+    assert!(report.policy_digest.is_some());
+    assert!(report.identity_digest.is_some());
     assert!(
         report.problems.is_empty(),
         "{:?}",
@@ -3402,6 +3522,7 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     .expect("example decodes");
     let socket = directory.path().join("run/broker.sock");
     let credentials = directory.path().join("broker-credentials.yaml");
+    document["identities"][0]["uid"] = json!(current_uid());
     document["socketPath"] = json!(socket);
     document["credentialsPath"] = json!(credentials);
     document["providers"] =
@@ -3425,6 +3546,24 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     )));
     assert!(!socket.parent().expect("socket parent").exists());
     assert!(!credentials.exists());
+    fs::create_dir(socket.parent().expect("socket parent")).expect("private socket parent");
+    fs::set_permissions(
+        socket.parent().expect("socket parent"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("restrict socket parent");
+    write_owner_only(&credentials, b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: api-token\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.com]\n    secret: conditional-write-fixture-only\n");
+    let (candidate, boot_report) = super::load_candidate(&path, super::Mode::Boot).await;
+    assert!(boot_report.problems.is_empty(), "{boot_report:?}");
+    let candidate = candidate.expect("serving conditional-write configuration");
+    assert_eq!(
+        report.policy_digest.as_deref(),
+        Some(candidate.ready.broker.policy_digest())
+    );
+    assert_eq!(
+        report.identity_digest.as_deref(),
+        Some(candidate.ready.identity_digest.as_str())
+    );
 }
 
 pub(super) struct ManagedBroker {

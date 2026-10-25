@@ -317,6 +317,7 @@ pub(crate) async fn run(
                     file.scope.conversation,
                     &file.subject,
                 ),
+                delivery: None,
                 trigger: Trigger::Message,
             }),
             invocation: None,

@@ -145,6 +145,7 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
                     id: "c0123abc".to_owned(),
                     thread: Some("1712345678.000100".to_owned()),
                 },
+                delivery: None,
                 trigger: Trigger::Message,
             },
         )

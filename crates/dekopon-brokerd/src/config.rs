@@ -1165,6 +1165,18 @@ async fn resolve(
             subjects: duplicate_subjects.into_iter().collect(),
         });
     }
+    for (principal, entry) in &config.principals {
+        let kinds = entry
+            .subjects
+            .iter()
+            .map(ExternalSubject::kind)
+            .collect::<BTreeSet<_>>();
+        if kinds.len() > 1 {
+            return Err(ConfigError::MixedSubjectKinds {
+                principal: principal.clone(),
+            });
+        }
+    }
     if config.server_limits.max_connections == 0
         || config.server_limits.max_connections > HARD_MAX_CONNECTIONS
         || config.server_limits.shutdown_grace_ms == 0
@@ -1455,6 +1467,8 @@ pub enum ConfigError {
     },
     #[error("subjects mapped to more than one principal: {subjects:?}")]
     DuplicateSubjects { subjects: Vec<String> },
+    #[error("principal {principal} has subjects of different kinds")]
+    MixedSubjectKinds { principal: PrincipalId },
     #[error("server limits must be positive and within hard ceilings")]
     InvalidServerLimits,
     #[error("invalid broker frame limits")]

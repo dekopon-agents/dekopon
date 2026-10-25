@@ -3023,6 +3023,7 @@ fn chat_claim_for(
             transport,
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
+            delivery: None,
             trigger: message.message_id.trigger(),
         },
     ))

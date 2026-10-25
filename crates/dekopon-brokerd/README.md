@@ -42,15 +42,21 @@ loading, Cedar policy against the declared world, capability blocks, constraint 
 loaded manifests, frame and memory ceilings — through the function boot uses, and stops before
 binding anything. Every stage whose inputs loaded runs, and one that could not (providers when the
 provider set failed to resolve, say) is a warning naming it. It prints every problem and warning
-at once, one per line or as `{ "ok", "problems", "warnings" }`, and exits 0
+at once, one per line or as `{ "ok", "problems", "warnings", "policyDigest", "identityDigest" }`. When the policy stage succeeds, it prints `identity.digest` as a tab-separated line before `ok`, and also prints `policy.digest` when the secret-name catalogue is known, and exits 0
 with no problems, 1 with problems and 2 on a usage error. Configuration files may be the invoking
 user's own 0644 files, as in a Git checkout; symlinks and group/world-writable files are still
 refused. Runtime paths are not required to exist and are never touched: the socket and its parent,
-`credentialsPath`, `secretMapPath`, `assets.rootPath`, `storage.rootPath` (a throwaway directory
-stands in for it), `providerSet.lockPath`/`storePath` and `http.extraCABundles`. Secrets are not
-read: each credential a capability can select and each secret a policy names is reported as a
-warning naming what boot will require, and credential destination coverage and the secret map are
-not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
+`credentialsPath`, `assets.rootPath`, `storage.rootPath` (a throwaway directory
+stands in for it), `providerSet.lockPath`/`storePath` and `http.extraCABundles`. `check` reads only
+the DRNs from `secretMapPath` when readable, with the same private-file hygiene and byte bound as
+boot, so both policy builds use the complete secret-name catalogue and report the same policy
+digest. An unset `secretMapPath` means an empty catalogue, just as at boot: check reports both
+digests and refuses policies naming secrets. When a configured map is absent or unreadable, check admits policy-named secrets with
+`SecretRequired` warnings and omits `policy.digest`; `identity.digest` is still reported and the
+missing map is not a problem. A readable malformed map is a problem. Secret sources and values
+are never read or resolved. Each credential a capability can select is reported
+as a warning naming what boot will require; credential destination coverage, secret source
+descriptors and bindings are not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
 (its lock and blobs, kept between checks), which fetches from the registry; a configuration naming
 provider paths loads them directly. `check` publishes validated managed components into its own
 `--store` cwasm cache through sync, then prunes that cache to the current engine and the listed providers,
@@ -636,7 +642,9 @@ against the gateway's own principal, with reason `attestation-denied` (no grant,
 outside its namespaces), `unmapped-subject` (granted, but no mapping names that subject),
 `console-smoke-claim-denied` (a chat claim on the reserved `console-smoke` transport that is not
 its fixed literal), or `agent-denied` (attested and mapped, but no policy lets that principal drive that agent). Startup
-rejects duplicate mapping subjects and malformed namespaces.
+rejects duplicate mapping subjects, malformed namespaces and a principal whose subjects mix kinds.
+
+A Slack channel subject is `slack.<team>.<channel>`; a Slack id starting `c` or `g` is a space, and every other Slack id is a person. A Discord channel subject is `discord.<guild>.<channel>` (both snowflakes); `discord.<user>` remains a person. GitHub subjects are repositories, every other subject is a person, and a principal without subjects is a service. Each principal has exactly one kind, available as `principal.kind`. The broker derives a space from the attested conversation, never from message text or a gateway-supplied principal. In a mapped channel and its threads, every decision, including the session gate and capability listing, needs both the asker and the space to allow it. Direct messages and top-level group direct messages have no space. A mapped group-DM thread can downscope its asker. A space subject cannot be an attested sender.
 
 ### IPC directory and distinct peer UIDs
 
@@ -761,7 +769,7 @@ that can never match.
 
 | Cedar name | Comes from |
 | --- | --- |
-| `Dekopon::Principal::"…"` | an `identities` entry or a `principals` key |
+| `Dekopon::Principal::"…"` | an `identities` entry or a `principals` key; required String `kind` (`person`, `space`, `repository`, `service`) |
 | `Dekopon::Group::"…"` | a `principals.<id>.groups` entry; a group nobody belongs to refuses startup |
 | `Dekopon::Provider::"…"` | a loaded provider manifest |
 | `Dekopon::Action::"…"` | a loaded capability, or the fixed `agent.prompt` |

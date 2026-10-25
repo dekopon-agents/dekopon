@@ -483,7 +483,12 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
 
 #[cfg(unix)]
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CheckOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_digest: Option<String>,
     ok: bool,
     problems: Vec<String>,
     warnings: Vec<String>,
@@ -500,6 +505,8 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
         });
     let report = dekopon_brokerd::check(&check.config, providers, check.workflows.as_deref()).await;
     let output = CheckOutput {
+        policy_digest: report.policy_digest,
+        identity_digest: report.identity_digest,
         ok: report.problems.is_empty(),
         problems: report
             .problems
@@ -518,6 +525,18 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
                     .warnings
                     .iter()
                     .map(|warning| format!("warning\t{warning}")),
+            )
+            .chain(
+                output
+                    .policy_digest
+                    .as_ref()
+                    .map(|digest| format!("policy.digest\t{digest}")),
+            )
+            .chain(
+                output
+                    .identity_digest
+                    .as_ref()
+                    .map(|digest| format!("identity.digest\t{digest}")),
             )
             .chain(output.ok.then(|| "ok".to_owned()))
             .collect::<Vec<_>>();

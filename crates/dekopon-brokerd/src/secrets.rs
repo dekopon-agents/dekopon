@@ -64,6 +64,18 @@ enum SecretMapApiVersion {
     V1Alpha1,
 }
 
+#[derive(Deserialize)]
+struct SecretNames {
+    #[serde(rename = "apiVersion")]
+    _api_version: SecretMapApiVersion,
+    secrets: Vec<SecretName>,
+}
+
+#[derive(Deserialize)]
+struct SecretName {
+    drn: SecretDrn,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SecretMapFile {
@@ -1483,19 +1495,33 @@ pub(crate) async fn load_with_bytes(
     path: &Path,
     expected_uid: u32,
 ) -> Result<(SecretCatalog, Vec<u8>, ScheduledCatalog), SecretMapError> {
+    let (file, bytes) = read_map::<SecretMapFile>(path, expected_uid).await?;
+    let (catalog, scheduled) = validate_map(file, path, expected_uid).await?;
+    Ok((catalog, bytes, scheduled))
+}
+
+pub(crate) async fn load_names(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<Vec<SecretDrn>, SecretMapError> {
+    let (file, _) = read_map::<SecretNames>(path, expected_uid).await?;
+    Ok(file.secrets.into_iter().map(|entry| entry.drn).collect())
+}
+
+async fn read_map<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(T, Vec<u8>), SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
         .map_err(|source| SecretMapError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-    let file = serde_yaml::from_slice::<SecretMapFile>(&bytes).map_err(|source| {
-        SecretMapError::Decode {
-            diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
-        }
+    let file = serde_yaml::from_slice::<T>(&bytes).map_err(|source| SecretMapError::Decode {
+        diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
     })?;
-    let (catalog, scheduled) = validate_map(file, path, expected_uid).await?;
-    Ok((catalog, bytes, scheduled))
+    Ok((file, bytes))
 }
 
 #[expect(
