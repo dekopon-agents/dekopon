@@ -2052,9 +2052,9 @@ fn space_storage_separates_channels_and_shares_threads_across_speakers() {
                 )
                 .with_space_key(Some(dekopon_core::SpaceKey {
                     agent: "reviewer".parse().expect("agent"),
-                    transport: transport.to_owned(),
-                    workspace: Some("workspace".to_owned()),
-                    channel: channel.to_owned(),
+                    transport: transport.to_owned().into(),
+                    workspace: Some("workspace".to_owned().into()),
+                    channel: channel.to_owned().into(),
                 }))
             };
             let subjects = if transport == "slack" {

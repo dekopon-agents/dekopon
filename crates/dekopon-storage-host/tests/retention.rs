@@ -699,9 +699,9 @@ fn idle_space_storage_is_swept_with_its_configured_retention() {
         )
         .with_space_key(Some(dekopon_core::SpaceKey {
             agent: "reviewer".parse().unwrap(),
-            transport: "scientist-slack".to_owned(),
-            workspace: Some("t0123abc".to_owned()),
-            channel: "c0123abc".to_owned(),
+            transport: "scientist-slack".to_owned().into(),
+            workspace: Some("t0123abc".to_owned().into()),
+            channel: "c0123abc".to_owned().into(),
         }))
     };
     let token = host.prepare_grant(make()).unwrap().namespace().to_owned();
@@ -709,6 +709,56 @@ fn idle_space_storage_is_swept_with_its_configured_retention() {
         .unwrap()
         .commit()
         .unwrap();
+    old_marker(&base(&root, &token).join("last-used"));
+    let policies = BTreeMap::from([(
+        ("storage-probe".parse().unwrap(), StorageScope::Space),
+        StorageRetention::IdleTtl(Duration::from_secs(30)),
+    )]);
+    assert_eq!(host.sweep(&policies).unwrap().deleted, 1);
+}
+
+#[test]
+fn a_long_space_identity_can_be_reopened_read_and_swept() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let agent = "a".repeat(253);
+    let transport = "t".repeat(253);
+    let make = || {
+        request_at(
+            StorageScope::Space,
+            "slack.t0123abc.u9xyz",
+            &agent,
+            "storage-probe",
+            "slack",
+            &transport,
+            "thread-1",
+            b"same",
+        )
+        .with_space_key(Some(dekopon_core::SpaceKey {
+            agent: agent.parse().unwrap(),
+            transport: transport.clone().into(),
+            workspace: Some("t0123abc".to_owned().into()),
+            channel: "cspace".to_owned().into(),
+        }))
+    };
+    let token = {
+        let host = StorageHost::open(&root, StorageLimits::default()).unwrap();
+        let prepared = host.prepare_grant(make()).unwrap();
+        let token = prepared.namespace().to_owned();
+        let mut writer = host.begin(prepared.materialize().unwrap()).unwrap();
+        writer
+            .jsonl_append("rows.jsonl", 0, br#"{"space":true}"#)
+            .unwrap();
+        writer.commit().unwrap();
+        token
+    };
+    let host = StorageHost::open(&root, StorageLimits::default()).unwrap();
+    let mut reader = host.begin(host.grant(make()).unwrap()).unwrap();
+    assert_eq!(
+        reader.jsonl_read_chunk("rows.jsonl", 0, 64).unwrap().bytes,
+        b"{\"space\":true}\n"
+    );
+    reader.finish_read().unwrap();
     old_marker(&base(&root, &token).join("last-used"));
     let policies = BTreeMap::from([(
         ("storage-probe".parse().unwrap(), StorageScope::Space),

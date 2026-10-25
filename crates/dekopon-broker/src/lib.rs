@@ -278,9 +278,9 @@ impl AuthenticatedContext {
         Some(dekopon_core::SpaceBinding {
             key: dekopon_core::SpaceKey {
                 agent: agent.clone(),
-                transport: scope.transport.to_string(),
-                workspace: scope.conversation.container.clone(),
-                channel: scope.conversation.id.clone(),
+                transport: scope.transport.to_string().into(),
+                workspace: scope.conversation.container.clone().map(Into::into),
+                channel: scope.conversation.id.clone().into(),
             },
             principal: principal.clone(),
         })

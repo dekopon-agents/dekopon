@@ -1244,7 +1244,8 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         .parse::<CapabilityId>()
         .expect("valid capability fixture");
     let world = PolicyWorld::new(
-        ["gateway", "cpetersen"].map(|name| name.parse::<PrincipalId>().expect("valid principal")),
+        ["gateway", "cpetersen", "space"]
+            .map(|name| name.parse::<PrincipalId>().expect("valid principal")),
         [(
             capability.clone(),
             "cli-probe".parse().expect("valid provider fixture"),
@@ -1267,14 +1268,26 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let broker = Broker::new(
         registry,
         "broker-test".parse().expect("valid broker principal"),
-        PolicyEngine::new(POLICIES, &world).expect("fixture policy validates"),
+        PolicyEngine::new(
+            &format!(
+                "{POLICIES}\n@id(\"space\") permit(principal == Dekopon::Principal::\"space\", action, resource);"
+            ),
+            &world,
+        )
+        .expect("fixture policy validates"),
         catalog,
         CredentialStore::empty(),
-        IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
-            "cpetersen".parse::<PrincipalId>().expect("valid principal"),
-        )])
-        .expect("one mapping builds a directory"),
+        IdentityDirectory::new([
+            (
+                "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                "cpetersen".parse::<PrincipalId>().expect("valid principal"),
+            ),
+            (
+                "slack.t0123abc.cspace".parse().expect("space subject"),
+                "space".parse().expect("space principal"),
+            ),
+        ])
+        .expect("mappings build a directory"),
         Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
         BrokerLimits::default(),
     )
@@ -1308,35 +1321,67 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         !capabilities.is_empty(),
         "the ceiling must see what policy grants an attested principal"
     );
-    assert!(
-        broker
-            .capability_surface(
-                &gateway,
-                Some(&dekopon_broker::AttestorGrant {
-                    namespaces: Some(vec!["slack.t0123abc".to_owned()]),
-                }),
-                Some(&Attestation::for_subject(
-                    "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
-                    "chat-agent".parse::<AgentId>().expect("valid agent"),
-                )),
-            )
-            .expect("the mapped subject is attestable")
-            .0
-            .len()
-            <= capabilities.len(),
-        "the ceiling must bound what a real session receives"
+    let claim = Attestation::for_chat(
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "chat-agent".parse::<AgentId>().expect("agent"),
+        dekopon_broker_protocol::ChatScopeClaim {
+            transport: "scientist-slack".parse().expect("transport"),
+            kind: dekopon_broker_protocol::ChatTransportKind::Slack,
+            conversation: dekopon_broker_protocol::Conversation {
+                kind: dekopon_broker_protocol::ConversationKind::Channel,
+                container: Some("t0123abc".to_owned()),
+                id: "cspace".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
+            trigger: dekopon_broker_protocol::Trigger::Message,
+            delivery: None,
+        },
     );
+    let attestor = dekopon_broker::AttestorGrant {
+        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+    };
+    let (actual, actual_words, actual_help, memory) = broker
+        .session_surface(&gateway, Some(&attestor), Some(&claim))
+        .unwrap_or_else(|_| panic!("mapped channel surface"));
+    assert_eq!(actual.len(), capabilities.len());
+    let ids: Vec<_> = capabilities
+        .iter()
+        .map(|available| available.capability.id.clone())
+        .collect();
+    let actual_space = broker
+        .space_grants(&gateway, Some(&attestor), Some(&claim))
+        .expect("mapped channel grants");
+    assert_eq!(actual_space, ids);
+    let actual_response = ResponseEnvelope::chat_capabilities(
+        actual,
+        actual_words,
+        actual_help,
+        memory,
+        broker.display_principal(&claim.subject),
+    )
+    .with_space(Some(actual_space));
+    let actual_bytes = serde_json::to_vec(&actual_response)
+        .expect("mapped response")
+        .len();
 
-    let ceiling_bytes = serde_json::to_vec(&ResponseEnvelope::chat_capabilities(
-        capabilities,
-        words,
-        command_word_help,
-        broker.chat_memory_ceiling(),
-        broker.principal_ceiling(),
-    ))
+    let ceiling_bytes = serde_json::to_vec(
+        &ResponseEnvelope::chat_capabilities(
+            capabilities,
+            words,
+            command_word_help,
+            broker.chat_memory_ceiling(),
+            broker.principal_ceiling(),
+        )
+        .with_space(Some(ids)),
+    )
     .expect("ceiling response encodes")
     .len();
     assert!(ceiling_bytes > peer_bytes);
+    assert!(ceiling_bytes >= actual_bytes);
+    assert!(matches!(
+        validate_capability_responses(&broker, &identities, actual_bytes - 1),
+        Err(BrokerdError::CapabilityCeilingTooLarge { .. })
+    ));
 
     let error = validate_capability_responses(&broker, &identities, peer_bytes)
         .expect_err("a frame that cannot carry a session's answer must refuse to start");

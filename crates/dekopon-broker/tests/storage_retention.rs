@@ -109,6 +109,8 @@ when { context.via == "gateway" && context.agent == "reviewer" };
         CredentialStore::empty(),
         IdentityDirectory::new([
             (alice.clone(), "alice".parse().unwrap()),
+            ("discord.123".parse().unwrap(), "alice".parse().unwrap()),
+            ("discord.456.789".parse().unwrap(), "space".parse().unwrap()),
             (bob.clone(), "bob".parse().unwrap()),
             (
                 "slack.t0123abc.cspace".parse().unwrap(),
@@ -512,4 +514,61 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
             assert_eq!(rows[0].field("effect"), Some("LocalWrite"));
         }
     }
+}
+
+#[tokio::test]
+async fn a_discord_thread_claim_derives_its_parent_channels_space_key() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let (broker, _) = build_scoped_broker(&root, false, StorageScope::Space).await;
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().unwrap(),
+        Actor::Service {
+            principal: "gateway".parse().unwrap(),
+        },
+    )
+    .unwrap();
+    let grant = AttestorGrant {
+        namespaces: Some(vec!["discord".to_owned()]),
+    };
+    let claim = |kind, thread| {
+        Attestation::for_chat(
+            "discord.123".parse().unwrap(),
+            "reviewer".parse().unwrap(),
+            ChatScopeClaim {
+                transport: "scientist-discord".parse().unwrap(),
+                kind: ChatTransportKind::Discord,
+                conversation: Conversation {
+                    kind,
+                    container: Some("456".to_owned()),
+                    id: "789".to_owned(),
+                    thread,
+                },
+                trigger: Trigger::Message,
+                delivery: None,
+            },
+        )
+    };
+    let mut keys = Vec::new();
+    for claim in [
+        claim(ConversationKind::Channel, None),
+        claim(ConversationKind::Thread, Some("101112".to_owned())),
+    ] {
+        let (context, refusal) = broker.resolve_context(&gateway, Some(&grant), &claim);
+        assert!(refusal.is_none());
+        let binding = context.space_binding().expect("mapped parent channel");
+        assert_eq!(binding.principal.as_str(), "space");
+        keys.push(binding.key.encode());
+    }
+    assert_eq!(keys[0], keys[1]);
+    assert_eq!(
+        keys[0],
+        dekopon_core::SpaceKey {
+            agent: "reviewer".parse().unwrap(),
+            transport: "scientist-discord".to_owned().into(),
+            workspace: Some("456".to_owned().into()),
+            channel: "789".to_owned().into(),
+        }
+        .encode()
+    );
 }

@@ -1273,8 +1273,14 @@ pub struct ResponseEnvelope {
 impl ResponseEnvelope {
     #[must_use]
     pub fn with_space(mut self, grants: Option<Vec<CapabilityId>>) -> Self {
-        if let BrokerResponse::Capabilities { space, .. } = &mut self.response {
-            *space = grants;
+        match &mut self.response {
+            BrokerResponse::Capabilities { space, .. } => *space = grants,
+            BrokerResponse::Ran { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Error { .. }
+            | BrokerResponse::Generation { .. } => {}
         }
         self
     }

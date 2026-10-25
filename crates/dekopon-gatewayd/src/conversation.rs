@@ -712,9 +712,9 @@ mod space_tests {
     fn space_replay_stem_is_frozen_and_threads_remain_separate() {
         let space = dekopon_core::SpaceKey {
             agent: "reviewer".parse().expect("agent"),
-            transport: "team-slack".to_owned(),
-            workspace: Some("t1".to_owned()),
-            channel: "c1".to_owned(),
+            transport: "team-slack".to_owned().into(),
+            workspace: Some("t1".to_owned().into()),
+            channel: "c1".to_owned().into(),
         };
         let first = ConversationKey::for_space(space.clone(), Some("thread-1".to_owned()));
         assert_eq!(
