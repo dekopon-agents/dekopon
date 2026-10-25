@@ -45,11 +45,11 @@ pub(crate) struct StoredKey {
 }
 
 impl StoredKey {
-    pub(crate) fn new(stem: String, id: u64, at_ms: u64, grant: String) -> Self {
+    pub(crate) fn new(stem: String, id: u64, arrived: Duration, grant: String) -> Self {
         Self {
             stem,
             id,
-            at_ms,
+            at_ms: arrived.as_millis() as u64,
             grant,
         }
     }
@@ -57,11 +57,7 @@ impl StoredKey {
         Self::new(
             key.conversation.journal_stem(),
             asset.id,
-            asset
-                .arrived
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            asset.arrived.duration_since(UNIX_EPOCH).unwrap_or_default(),
             key.grant.as_ref().clone(),
         )
     }
@@ -209,11 +205,17 @@ impl Retention {
             Err(error) => return Err(error.into()),
         }
         store.persist()?;
-        let stats = rustix::fs::statvfs(dir).map_err(io::Error::from)?;
-        tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.store_started",
-            asset.store.path = %dir.display(), asset.store.free_bytes = stats.f_bavail.saturating_mul(stats.f_frsize),
-            asset.store.budget_bytes = budget }, "gateway.asset.store_started");
         Ok(store)
+    }
+
+    pub(super) fn report_startup(&self) -> Result<(), BlobError> {
+        if let Some(dir) = &self.dir {
+            let stats = rustix::fs::statvfs(dir).map_err(io::Error::from)?;
+            tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.store_started",
+                asset.store.path = %dir.display(), asset.store.free_bytes = stats.f_bavail.saturating_mul(stats.f_frsize),
+                asset.store.budget_bytes = self.budget }, "gateway.asset.store_started");
+        }
+        Ok(())
     }
 
     fn persist(&self) -> Result<(), BlobError> {

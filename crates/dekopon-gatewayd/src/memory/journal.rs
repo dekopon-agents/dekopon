@@ -261,7 +261,7 @@ impl Journal {
                         references.insert(crate::asset::StoredKey::new(
                             stem.clone(),
                             asset.id,
-                            asset.at_ms,
+                            Duration::from_millis(asset.at_ms),
                             line.grant.clone(),
                         ));
                     }

@@ -226,6 +226,9 @@ where
                     },
                 })?;
         }
+        store
+            .report_startup()
+            .map_err(|error| GatewaydError::AssetStore { error })?;
         Ok::<_, GatewaydError>(Arc::new(store))
     })
     .await

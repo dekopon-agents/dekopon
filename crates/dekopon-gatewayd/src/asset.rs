@@ -361,6 +361,10 @@ impl AssetStore {
         journal.attach_assets(&self.retention)
     }
 
+    pub(crate) fn report_startup(&self) -> Result<(), BlobError> {
+        self.retention.lock().report_startup()
+    }
+
     pub async fn shutdown(&self) {
         let mut tasks = std::mem::take(&mut *self.downloads.tasks.lock());
         tasks.shutdown().await;
@@ -2095,6 +2099,24 @@ mod retention_tests {
                 0o600
             );
         }
+        store.report_startup().unwrap();
+        let started = capture.events_where(
+            "dekopon_gatewayd::audit",
+            &[("audit.event", "gateway.asset.store_started")],
+        );
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].field("asset.store.path"),
+            Some(path.display().to_string().as_str())
+        );
+        assert_eq!(started[0].field("asset.store.budget_bytes"), Some("6"));
+        assert!(
+            started[0]
+                .field("asset.store.free_bytes")
+                .unwrap()
+                .parse::<u64>()
+                .is_ok()
+        );
         let index = std::fs::read_to_string(path.join("index.json")).unwrap();
         for text in [index, capture.events_text(), capture.spans_text()] {
             assert!(!text.contains("F15-secret-id"));
