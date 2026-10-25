@@ -635,7 +635,14 @@ mod tests {
                     assert!(!streams.unwrap().stdin);
                     Some((ResponseEnvelope::error("denied", "fixture refusal"), vec![]))
                 }
-                other => panic!("unexpected frame: {other:?}"),
+                other @ (BrokerRequest::Run { .. }
+                | BrokerRequest::RunCommand { .. }
+                | BrokerRequest::RecordDeliveredTurn { .. }
+                | BrokerRequest::UpcallResult { .. }
+                | BrokerRequest::PrepareGeneration { .. }
+                | BrokerRequest::CommitGeneration { .. }
+                | BrokerRequest::AbortGeneration { .. }
+                | BrokerRequest::ObserveGeneration) => panic!("unexpected frame: {other:?}"),
             }
             },
         );
