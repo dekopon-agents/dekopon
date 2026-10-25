@@ -935,7 +935,7 @@ async fn journal_less_persistent_memory_warns_once_and_has_no_durable_policy() {
 async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_binding() {
     let directory = temporary();
     let mut input = document(directory.path());
-    input["sessions"] = json!({"journal": {"path": "journal"}, "memory": {
+    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}, "memory": {
         "agents": {"reviewer": {"routine": "prefix", "policy": {
             "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
             "routines": [{"id": "prefix", "kind": "prefix", "maxBytes": 1024}],
@@ -1078,7 +1078,7 @@ async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
 async fn a_decider_selection_requires_its_provider_profile_and_label_safe_routine_ids() {
     let directory = temporary();
     let mut input = document(directory.path());
-    input["sessions"] = json!({"journal": {"path": "journal"}});
+    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
     input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
         "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
         "routines": [{"id": "original", "kind": "original"}, {"id": "head_1.k-b", "kind": "prefix", "maxBytes": 512}],
@@ -2404,7 +2404,7 @@ async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
 async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_path() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["sessions"] = json!({"journal": {"path": "journal"}});
+    document["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
     document["routes"][0]["memory"] = json!({"mode": "persistent", "forgetAfterMs": 86_400_000});
     let resolved = load(directory.path(), &document)
         .await
@@ -2528,7 +2528,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |problem| matches!(problem, ConfigProblem::ForgetAfterWithoutRecall { .. }),
         ),
         (
-            json!({"/sessions": {"journal": {"path": "journal"}},
+            json!({"/sessions": {"journal": {"path": "journal"}, "assets": {"path": "assets"}},
             "/routes/0/memory": {"mode": "persistent", "forgetAfterMs": 0}}),
             |problem| matches!(problem, ConfigProblem::InvalidMemoryBounds { .. }),
         ),
@@ -9331,7 +9331,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
     document["routes"][0]["transport"] = json!("discord");
     document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
     document["routes"][0]["follow"] = json!(true);
-    document["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    document["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});
     let config = resolved(directory.path(), &document).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let route = &config.routes[0];
@@ -9490,7 +9490,7 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     config["routes"][0]["transport"] = json!("discord");
     config["routes"][0]["conversation"] = json!({"kind": ["channel"]});
     config["routes"][0]["follow"] = json!(true);
-    config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});
     let config = resolved(directory.path(), &config).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let journal = Arc::new(
@@ -12376,7 +12376,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
 }
 
 #[test]
-fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
+fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
     let conversations = ConversationStore::new(2);
     let store = AssetStore::new(1, Duration::from_secs(3_600));
     let allowed = granted(&["cli-probe.upper"]);
@@ -12436,10 +12436,11 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     assert!(
         store
             .get_access(&resumed.assets, 1, now + Duration::from_secs(2))
-            .is_none(),
-        "the removed reference stays unavailable rather than aliasing the new file"
+            .is_some(),
+        "admitting another conversation preserves the original reference"
     );
-    assert_eq!(replacement.inventory[0].name, "later.png");
+    assert_eq!(replacement.inventory[0].name, "original.png");
+    assert_eq!(replacement.inventory[1].name, "later.png");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -17611,10 +17612,10 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
 #[test]
 fn asset_retention_config_default_custom_zero_and_invalid_values() {
     let defaults: config::SessionsConfig = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(defaults.asset_retention_bytes, 268_435_456);
+    assert_eq!(defaults.asset_retention_bytes, 1_073_741_824);
     assert_eq!(
         config::SessionsConfig::default().asset_retention_bytes,
-        268_435_456
+        1_073_741_824
     );
     for bytes in [0, 1024, 536_870_912] {
         let custom: config::SessionsConfig =
@@ -22129,6 +22130,103 @@ async fn a_journal_less_session_offers_no_memory_tools() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_first_journaled_turn_reclaims_its_downloaded_upload() {
+    struct Upload;
+    impl AssetFetcher for Upload {
+        fn fetch(
+            &self,
+            _: &AssetSourceRef,
+            _: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            Box::pin(async { Ok(b"\x89PNG\r\n\x1a\nupload".to_vec()) })
+        }
+    }
+    let directory = temporary();
+    let journal_dir = temporary();
+    let asset_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = BlockedModel::new("cancelled answer");
+    let mut runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let store = Arc::new(asset_store().with_storage(asset_dir.path()).unwrap());
+    store
+        .attach_journal(runner.journal.as_ref().unwrap())
+        .unwrap();
+    Arc::get_mut(&mut runner).unwrap().assets = Arc::clone(&store);
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let mut inbound = message("cancel this upload");
+    inbound.assets = vec![pending("cancelled.png", "image/png", 14)];
+    let key = private_conversation_key("dev", &inbound.conversation.key(), SUBJECT);
+    let driver = Arc::new(RecordingDriver::default());
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_entered().await;
+    let seed = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window(),
+        None,
+        Instant::now(),
+    );
+    assert!(!seed.created);
+    let access = seed.assets.clone();
+    drop(seed.lease);
+    let assets = SessionAssets::new(
+        Arc::clone(&store),
+        access,
+        Some(Arc::new(Upload)),
+        tokio::runtime::Handle::current(),
+        true,
+    );
+    tokio::task::spawn_blocking(move || assets.fetch(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(asset_dir.path().join("blobs"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        runner
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
+        CancelOutcome::Cancelled
+    );
+    model.release();
+    session.await.unwrap();
+    assert_eq!(
+        fs::read_dir(asset_dir.path().join("blobs"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(asset_dir.path().join("index.json")).unwrap()).unwrap();
+    assert!(index["bindings"].as_array().unwrap().is_empty());
+    assert!(
+        runner
+            .journal
+            .as_ref()
+            .unwrap()
+            .recall(
+                &key.journal_stem(),
+                &crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+                recall_window(RecallSource::Journal),
+                SystemTime::now()
+            )
+            .unwrap()
+            .assets
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn append_failure_preserves_the_delivered_reply_without_a_journal_record() {
     let (capture, _guard) = capture_spans();
@@ -22168,6 +22266,52 @@ async fn append_failure_preserves_the_delivered_reply_without_a_journal_record()
     );
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].field("reason"), Some("io"));
+}
+
+#[tokio::test]
+async fn post_commit_maintenance_failure_does_not_report_an_append_failure() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("delivered")]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    runner
+        .assets
+        .attach_journal(runner.journal.as_ref().unwrap())
+        .unwrap();
+    let malformed = journal_dir.path().join(format!(
+        "{}.jsonl",
+        private_conversation_key("dev", "malformed", SUBJECT).journal_stem()
+    ));
+    fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+    fs::write(malformed, b"{broken\n").unwrap();
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let inbound = message("question");
+    let stem = private_conversation_key("dev", &inbound.conversation.key(), SUBJECT).journal_stem();
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["delivered"]);
+    assert!(journal_dir.path().join(format!("{stem}.jsonl")).is_file());
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_journal_append_failed")]
+            )
+            .is_empty()
+    );
+    assert!(
+        capture
+            .events_text()
+            .contains("gateway.asset.reclaim.failed")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

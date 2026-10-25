@@ -283,6 +283,17 @@ spec:
                 rc=1
               fi
 {{- end }}
+{{- if include "dekopon.assetsEnabled" . }}
+
+              [ -d "{{ include "dekopon.assetsDir" . }}" ] || mkdir -p "{{ include "dekopon.assetsDir" . }}"
+              chown "$gateway_uid:$gateway_gid" "{{ include "dekopon.assetsDir" . }}"
+              chmod 0700 "{{ include "dekopon.assetsDir" . }}"
+              got=$(stat -c '%u:%a:%F' "{{ include "dekopon.assetsDir" . }}")
+              if [ "$got" != "$gateway_uid:700:directory" ]; then
+                echo "{{ include "dekopon.assetsDir" . }}: got $got, want $gateway_uid:700:directory" >&2
+                rc=1
+              fi
+{{- end }}
 {{- if include "dekopon.wakesEnabled" . }}
 
               [ -d "{{ include "dekopon.wakesDir" . }}" ] || mkdir -p "{{ include "dekopon.wakesDir" . }}"
@@ -475,6 +486,11 @@ spec:
             - name: state
               mountPath: {{ .Values.gateway.journal.mountPath }}
               subPath: {{ .Values.gateway.journal.subdir }}
+{{- end }}
+{{- if include "dekopon.assetsEnabled" . }}
+            - name: state
+              mountPath: {{ .Values.gateway.assets.mountPath }}
+              subPath: {{ .Values.gateway.assets.subdir }}
 {{- end }}
 {{- if include "dekopon.wakesEnabled" . }}
             - name: state
