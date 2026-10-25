@@ -6815,12 +6815,15 @@ async fn a_session_delivers_the_model_answer() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_unmapped_sender_gets_one_friendly_reply_and_one_content_free_notice() {
+async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
             ResponseEnvelope::session_refused(
                 &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
             ),
@@ -6833,11 +6836,17 @@ async fn an_unmapped_sender_gets_one_friendly_reply_and_one_content_free_notice(
     let models = ModelScript::forbidden();
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
-    for _ in 0..2 {
+    let other_subject: ExternalSubject = "tel.16034700183".parse().expect("valid other subject");
+    for attempt in 0..3 {
+        let mut inbound = message("private stranger message");
+        if attempt == 2 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            inbound.subject = other_subject.clone();
+        }
         run_session(
             Arc::clone(&runner),
             route(model_config()),
-            message("private stranger message"),
+            inbound,
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
@@ -6859,22 +6868,27 @@ async fn an_unmapped_sender_gets_one_friendly_reply_and_one_content_free_notice(
         "dekopon_gatewayd",
         &[("audit.event", "gateway.session.rejected")],
     );
-    assert_eq!(notices.len(), 1, "{}", capture.events_text());
-    let notice = &notices[0];
-    for (key, expected) in [
-        ("transport", "dev"),
-        ("route", "0"),
-        ("conversation.kind", "directMessage"),
-        ("conversation.container", ""),
-        ("conversation.id", "dev"),
-        ("conversation.thread", ""),
-        ("reason", "unmapped-subject"),
-    ] {
-        assert_eq!(notice.field(key), Some(expected));
+    assert_eq!(notices.len(), 3, "{}", capture.events_text());
+    for (index, notice) in notices.iter().enumerate() {
+        for (key, expected) in [
+            ("transport", "dev"),
+            ("route", "0"),
+            ("conversation.kind", "directMessage"),
+            ("conversation.container", ""),
+            ("conversation.id", "dev"),
+            ("conversation.thread", ""),
+            ("reason", "unmapped-subject"),
+        ] {
+            assert_eq!(notice.field(key), Some(expected));
+        }
+        let expected = if index == 2 {
+            other_subject.canonical()
+        } else {
+            subject().canonical()
+        };
+        assert_eq!(notice.field("subject"), Some(expected.as_str()));
+        assert!(!format!("{notice:?}").contains("private stranger message"));
     }
-    let expected = subject().canonical();
-    assert_eq!(notice.field("subject"), Some(expected.as_str()));
-    assert!(!format!("{notice:?}").contains("private stranger message"));
 }
 
 #[tokio::test(start_paused = true)]

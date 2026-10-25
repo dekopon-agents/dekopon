@@ -2539,7 +2539,9 @@ where
         }
         let Some(principal) = self.identities.resolve(&claim.subject) else {
             let mut refusal = unevaluated_refusal("unmapped-subject");
-            refusal.session = dekopon_broker_protocol::SessionRefusal::UnmappedSubject;
+            if grant.permits(&claim.subject) {
+                refusal.session = dekopon_broker_protocol::SessionRefusal::UnmappedSubject;
+            }
             return (refused(), Some(refusal));
         };
         let actor = Actor::Agent {

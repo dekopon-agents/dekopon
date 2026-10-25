@@ -465,7 +465,7 @@ pub(crate) const MAX_INTERRUPTS: u8 = 8;
 
 #[derive(Clone)]
 pub(crate) struct SessionGate {
-    stranger_notice: Arc<Mutex<Option<tokio::time::Instant>>>,
+    stranger_reply: Arc<Mutex<Option<tokio::time::Instant>>>,
     permits: Arc<Semaphore>,
     refusals: Arc<Semaphore>,
     in_flight: Arc<Mutex<BTreeMap<AdmissionKey, Holder>>>,
@@ -597,8 +597,8 @@ fn record_admission(
 }
 
 impl SessionGate {
-    fn stranger_notice(&self) -> bool {
-        let mut last = self.stranger_notice.lock();
+    fn stranger_reply(&self) -> bool {
+        let mut last = self.stranger_reply.lock();
         let now = tokio::time::Instant::now();
         if last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1)) {
             return false;
@@ -609,7 +609,7 @@ impl SessionGate {
 
     pub fn new(max_concurrent: usize) -> Self {
         Self {
-            stranger_notice: Arc::default(),
+            stranger_reply: Arc::default(),
             permits: Arc::new(Semaphore::new(max_concurrent)),
             refusals: Arc::new(Semaphore::new(max_concurrent)),
             in_flight: Arc::default(),
@@ -1918,9 +1918,6 @@ async fn session(
             revoke_thread_ownership(runner, message);
             let reply = match refusal {
                 SessionRefusal::UnmappedSubject => {
-                    if !runner.gate.stranger_notice() {
-                        return MessageOutcome::Unauthorized.into();
-                    }
                     tracing::info!(
                         audit.event = "gateway.session.rejected",
                         event = "gateway_session_rejected",
@@ -1939,6 +1936,9 @@ async fn session(
                         reason = "unmapped-subject",
                         "gateway.session.rejected"
                     );
+                    if !runner.gate.stranger_reply() {
+                        return MessageOutcome::Unauthorized.into();
+                    }
                     UNMAPPED_REPLY.to_owned()
                 }
                 SessionRefusal::AgentDenied { principal } => {
@@ -3256,13 +3256,13 @@ mod model_factory_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn stranger_notices_share_one_global_slot_and_expire_without_a_backlog() {
+    async fn stranger_replies_share_one_global_slot_and_expire_without_a_backlog() {
         let gate = SessionGate::new(4);
-        assert!(gate.stranger_notice());
-        assert!(!gate.clone().stranger_notice());
+        assert!(gate.stranger_reply());
+        assert!(!gate.clone().stranger_reply());
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(gate.clone().stranger_notice());
-        assert!(!gate.stranger_notice());
+        assert!(gate.clone().stranger_reply());
+        assert!(!gate.stranger_reply());
     }
 
     #[test]

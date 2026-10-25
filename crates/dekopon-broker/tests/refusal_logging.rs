@@ -1,6 +1,3 @@
-//! Refused capability and command lookups return the same opaque error regardless of cause, so an
-//! unauthorized gateway can't learn whether a subject is mapped.
-
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -377,4 +374,37 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
         !allowed.contains("broker_capabilities_refused"),
         "{allowed}"
     );
+}
+
+#[tokio::test]
+async fn out_of_namespace_subjects_keep_the_same_opaque_refusal_whether_mapped_or_not() {
+    let (broker, _) = broker().await;
+    let outside = AttestorGrant {
+        namespaces: Some(vec!["slack.tother".to_owned()]),
+    };
+    for canonical in [MAPPED_SUBJECT, UNMAPPED_SUBJECT] {
+        let refusal = broker
+            .session_surface(
+                &gateway(),
+                Some(&outside),
+                Some(&Attestation::for_subject(
+                    subject(canonical),
+                    agent("some-agent"),
+                )),
+            )
+            .expect_err("out-of-namespace inspection is refused");
+        assert!(matches!(
+            refusal.session,
+            dekopon_broker_protocol::SessionRefusal::Other
+        ));
+        let response = dekopon_broker_protocol::ResponseEnvelope::session_refused(&refusal.session);
+        let expected = dekopon_broker_protocol::ResponseEnvelope::error(
+            dekopon_broker_protocol::ERROR_UNAUTHENTICATED,
+            "attestation refused: no attestor authority for this subject",
+        );
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
 }

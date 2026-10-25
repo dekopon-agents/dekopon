@@ -174,7 +174,11 @@ capabilities before connecting transports. Unknown operation tags fail strict de
 `invalid-request`; no compatibility sink accepts them. The broker's `--http-bind` argument and chart
 `broker.httpBind` value are refused, including an empty chart value.
 
-For the session-refusal extension, upgrade the gateway before the broker. Verified against deployed core v0.51.0 (release commit `03dc3303e712d897f5f1f8b33906c396c8756d4b`): its `Error` variant accepts arbitrary string `code` and `message` values but rejects additional fields. This extension uses that existing shape. An old gateway accepts a new code as a remote error and gives its generic failure reply before any model or capability call; a new gateway with an old broker keeps the old unauthorized refusal. Neither combination grants authority. After both upgrades, the new gateway reads the typed session causes. Unknown future codes remain tolerated remote errors. Start the broker first at runtime as above; gateway-first here is the binary upgrade order, not process startup order.
+For the session-refusal extension, upgrade the chart's shared core image atomically: both daemons use the same image and the Deployment uses `Recreate`, so there is no gateway-first binary rollout or mixed daemon pair in that deployment. Retain broker-first runtime startup. The broker writes the causes; the gateway/protocol client reads them.
+
+Verified against deployed core v0.51.0 (release commit `03dc3303e712d897f5f1f8b33906c396c8756d4b`): its `Error` variant accepts arbitrary string `code` and `message` values but rejects additional fields. This extension uses that existing shape. For independently installed binaries, an old gateway accepts a new code as a remote error and gives its generic failure reply before any model or capability call; a new gateway with an old broker preserves opaque authentication refusals, while attributed empty grants receive the named reply. Neither combination grants authority. Unknown future codes remain tolerated remote errors.
+
+The separate `dekopon-console` consumer pins broker-protocol `=0.49.1`. Its decoder accepts the new codes as ordinary remote errors; its TUI's `session_refusal` adds the broker-log guidance only for `unauthenticated`, so typed refusals show the generic error without that guidance or the gateway's friendly rendering. This is degraded text, not authority: the turn still stops before inference. No console upgrade is required for safe atomic core deployment; friendly console rendering is a separate follow-up.
 
 ## Failure codes
 
