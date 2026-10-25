@@ -262,6 +262,7 @@ impl Journal {
                             stem.clone(),
                             asset.id,
                             asset.at_ms,
+                            line.grant.clone(),
                         ));
                     }
                     Ok(())
@@ -859,7 +860,7 @@ struct AssetSync<'a>(&'a Journal);
 impl Drop for AssetSync<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.0.sync_assets() {
-            tracing::warn!(reason = error.label(), %error, "gateway.asset.journal_sync.failed");
+            tracing::warn!(reason = error.label(), %error, "gateway.asset.reclaim.failed");
         }
     }
 }

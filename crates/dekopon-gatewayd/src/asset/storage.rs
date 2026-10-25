@@ -41,11 +41,17 @@ pub(crate) struct StoredKey {
     stem: String,
     id: u64,
     at_ms: u64,
+    grant: String,
 }
 
 impl StoredKey {
-    pub(crate) fn new(stem: String, id: u64, at_ms: u64) -> Self {
-        Self { stem, id, at_ms }
+    pub(crate) fn new(stem: String, id: u64, at_ms: u64, grant: String) -> Self {
+        Self {
+            stem,
+            id,
+            at_ms,
+            grant,
+        }
     }
     fn of(key: &AssetStateKey, asset: &AssetRef) -> Self {
         Self::new(
@@ -56,6 +62,7 @@ impl StoredKey {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            key.grant.as_ref().clone(),
         )
     }
 }
@@ -106,7 +113,7 @@ impl Retention {
             references: HashSet::new(),
             orphans: Vec::new(),
             index: Index {
-                version: 1,
+                version: 2,
                 clock: 0,
                 bindings: Vec::new(),
                 files: HashMap::new(),
@@ -145,7 +152,7 @@ impl Retention {
             Err(error) if error.kind() == io::ErrorKind::NotFound => store.index,
             Err(error) => return Err(error.into()),
         };
-        if store.index.version != 1 {
+        if store.index.version != 2 {
             return Err(BlobError::Io(io::ErrorKind::InvalidData));
         }
         store

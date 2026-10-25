@@ -3302,7 +3302,10 @@ mod tests {
                 },
             ),
         ] {
-            let error = resolved(&format!("{TAIL}\nsessions: {{{sessions}}}\n")).unwrap_err();
+            let error = resolved(&format!(
+                "{TAIL}\nsessions: {{{sessions}, maxConcurrent: 0}}\n"
+            ))
+            .unwrap_err();
             let ConfigError::Invalid { problems, .. } = error else {
                 panic!("typed validation expected");
             };
@@ -3318,7 +3321,10 @@ mod tests {
             "{TAIL}\nsessions: {{journal: {{path: journal}}, assets: {{path: assets}}}}\n"
         ))
         .unwrap();
-        assert_eq!(config.assets.unwrap(), std::path::Path::new("/tmp/assets"));
+        assert_eq!(
+            config.assets.unwrap(),
+            std::fs::canonicalize("/tmp").unwrap().join("assets")
+        );
         assert_eq!(config.sessions.asset_retention_bytes, 1_073_741_824);
     }
 

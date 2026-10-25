@@ -124,6 +124,7 @@ pub(crate) struct AssetFence {
     gate: Mutex<()>,
     active: AtomicBool,
     next_asset_id: AtomicU64,
+    grant: Arc<String>,
 }
 
 impl AssetFence {
@@ -132,7 +133,13 @@ impl AssetFence {
             gate: Mutex::new(()),
             active: AtomicBool::new(true),
             next_asset_id: AtomicU64::new(1),
+            grant: Arc::new(String::new()),
         }
+    }
+
+    pub(crate) fn with_grant(mut self, grant: String) -> Self {
+        self.grant = Arc::new(grant);
+        self
     }
 
     pub fn deactivate(&self) {
@@ -151,6 +158,7 @@ impl AssetFence {
 struct AssetStateKey {
     conversation: ConversationKey,
     generation: Option<u64>,
+    grant: Arc<String>,
 }
 
 #[derive(Clone)]
@@ -165,6 +173,7 @@ impl AssetAccess {
             key: AssetStateKey {
                 conversation,
                 generation: None,
+                grant: Arc::new(String::new()),
             },
             fence: None,
         }
@@ -179,6 +188,7 @@ impl AssetAccess {
             key: AssetStateKey {
                 conversation,
                 generation: Some(generation),
+                grant: Arc::clone(&fence.grant),
             },
             fence: Some(fence),
         }
@@ -1489,7 +1499,7 @@ mod retention_tests {
                 &"tel.15550000001".parse().unwrap(),
             ),
             1,
-            Arc::new(AssetFence::new()),
+            Arc::new(AssetFence::new().with_grant("grant".into())),
         )
     }
     fn register(store: &AssetStore, access: &AssetAccess) -> u64 {
@@ -1844,7 +1854,7 @@ mod retention_tests {
                 &access.key.conversation.journal_stem(),
                 &crate::memory::journal::Entry {
                     at,
-                    grant: "grant",
+                    grant: &access.key.grant,
                     turn: &dekopon_agent::prompt::ConversationTurn::completed("file", "seen"),
                     inventory,
                     next_asset_id: access.next_asset_id(),
@@ -2004,7 +2014,8 @@ mod retention_tests {
             .unwrap();
         store.attach_journal(&journal).unwrap();
         let first = access("first");
-        let second = AssetAccess::one_shot(access("second").key.conversation);
+        let mut second = AssetAccess::one_shot(access("second").key.conversation);
+        second.key.grant = Arc::new("grant".into());
         let now = SystemTime::now();
         for access in [&first, &second] {
             let id = register(&store, access);
@@ -2340,6 +2351,76 @@ mod retention_tests {
         assert!(store.get_access(&access, first, Instant::now()).is_none());
         assert_eq!(store.retention.lock().bytes, 3);
         assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn identical_numbers_and_arrival_times_under_different_grants_never_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&directory.path().join("assets"))
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let first = access("same-conversation");
+        let second = AssetAccess::persistent(
+            first.key.conversation.clone(),
+            2,
+            Arc::new(AssetFence::new().with_grant("other-grant".into())),
+        );
+        let old = register(&store, &first);
+        let new = register(&store, &second);
+        assert_eq!(old, new);
+        let at = store
+            .get_access(&first, old, Instant::now())
+            .unwrap()
+            .arrived;
+        row_mut(&mut store.entries.lock(), &second.key, new)
+            .unwrap()
+            .asset
+            .arrived = at;
+        drop(store.admit(&first, old, b"old").unwrap());
+        journal_inventory(
+            &journal,
+            &first,
+            &store.inventory(&first),
+            SystemTime::now(),
+        );
+        drop(store.admit(&second, new, b"new").unwrap());
+        journal_inventory(
+            &journal,
+            &second,
+            &store.inventory(&second),
+            SystemTime::now(),
+        );
+        assert_eq!(
+            store
+                .pin(&first, old, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            store
+                .pin(&second, new, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(store.retention.lock().bytes, 6);
+        first.fence.as_ref().unwrap().deactivate();
+        assert_eq!(
+            store.pin(&first, old, Recency::Keep),
+            Err(BlobError::Unauthorized)
+        );
     }
 
     #[test]
