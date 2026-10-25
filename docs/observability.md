@@ -264,6 +264,14 @@ A span's status is only what its own code sets through `otel.status_code`: an `e
 event inside the span never becomes the status or its description, and an error-level event marks
 the span `Error` without a description.
 
+## Unmapped sender notices
+
+`gateway.session.rejected` is the owner-notice audit event for a freshly broker-confirmed unmapped sender. Its typed fields are `transport` (configured transport name, string), `route` (route index, integer), `conversation.kind` and `conversation.id` (strings), `conversation.container` and `conversation.thread` (strings, empty when absent), `subject` (canonical attested platform subject, string), and `reason` (`unmapped-subject`, string). The log timestamp records when the refusal happened. The record contains no message text. It is emitted before attempting the fixed gateway reply and shares the refusal trace.
+
+The gateway admits at most one stranger reply/notice pair per second across all transports and subjects. Further unmapped attempts inside the interval remain denied without another reply or notice; another stranger can therefore be silent during the cooldown. Only a timestamp is retained, and each attempt still asks the broker afresh. There is no delayed send, identity cache or retry. A fresh process starts with an available slot. The existing session gate bounds simultaneous broker/refusal work, and the serving path never waits for a telemetry exporter.
+
+Mapped agent-permission refusals retain an operational `gateway_session_rejected` record (`reason=agent-denied`, or `unauthorized` for an empty grant), without this `audit.event` owner-notice selector. Other authentication failures retain their existing behavior. OpenObserve alert routing and delivery are the homelab's responsibility; the notice is best-effort telemetry, not a DM or channel post.
+
 ## The broker audit record
 
 Every broker decision is one structured log record, emitted from inside the span that made it and

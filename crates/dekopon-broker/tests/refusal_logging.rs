@@ -281,18 +281,28 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     .enumerate()
     {
         captured.clear();
-        assert!(
-            broker
-                .capability_surface(
-                    &gateway(),
-                    attestor.as_ref(),
-                    Some(&Attestation::for_subject(
-                        subject(canonical),
-                        agent(agent_id)
-                    )),
-                )
-                .is_none()
-        );
+        let refusal = broker
+            .session_surface(
+                &gateway(),
+                attestor.as_ref(),
+                Some(&Attestation::for_subject(
+                    subject(canonical),
+                    agent(agent_id),
+                )),
+            )
+            .expect_err("inspection is refused");
+        match &refusal.session {
+            dekopon_broker_protocol::SessionRefusal::UnmappedSubject => {
+                assert_eq!(reason, "unmapped-subject")
+            }
+            dekopon_broker_protocol::SessionRefusal::AgentDenied { principal } => {
+                assert_eq!(reason, "agent-denied");
+                assert_eq!(principal.as_str(), "cpetersen");
+            }
+            dekopon_broker_protocol::SessionRefusal::Other => {
+                assert!(reason != "unmapped-subject" && reason != "agent-denied")
+            }
+        }
         let inspection = captured.take_events();
         for expected in [
             "broker_capabilities_refused",

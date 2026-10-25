@@ -61,6 +61,28 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub const ERROR_UNAUTHENTICATED: &str = "unauthenticated";
+const ERROR_UNMAPPED_SUBJECT: &str = "unmapped-subject";
+const ERROR_AGENT_DENIED: &str = "agent-denied";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionRefusal {
+    UnmappedSubject,
+    AgentDenied { principal: PrincipalId },
+    Other,
+}
+
+impl SessionRefusal {
+    pub fn from_error(code: &str, message: &str) -> Result<Self, dekopon_core::IdentifierError> {
+        match code {
+            ERROR_UNMAPPED_SUBJECT => Ok(Self::UnmappedSubject),
+            ERROR_AGENT_DENIED => message
+                .parse()
+                .map(|principal| Self::AgentDenied { principal }),
+            _ => Ok(Self::Other),
+        }
+    }
+}
+
 pub const ERROR_INVALID_REQUEST: &str = "invalid-request";
 /// Nothing executed for this failure, so the same work may safely be resubmitted under a fresh
 /// invocation identifier.
@@ -1185,6 +1207,22 @@ impl ResponseEnvelope {
     }
 
     #[must_use]
+    pub fn session_refused(refusal: &SessionRefusal) -> Self {
+        match refusal {
+            SessionRefusal::UnmappedSubject => {
+                Self::error(ERROR_UNMAPPED_SUBJECT, "subject is not mapped")
+            }
+            SessionRefusal::AgentDenied { principal } => {
+                Self::error(ERROR_AGENT_DENIED, principal.as_str())
+            }
+            SessionRefusal::Other => Self::error(
+                ERROR_UNAUTHENTICATED,
+                "attestation refused: no attestor authority for this subject",
+            ),
+        }
+    }
+
+    #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
@@ -1588,8 +1626,6 @@ impl BrokerClient {
         self
     }
 
-    /// The three refusal causes are deliberately indistinguishable, so a refused caller cannot
-    /// learn whether the subject exists.
     pub async fn session_surface(
         &self,
         attestation: Option<Attestation>,
@@ -1611,7 +1647,13 @@ impl BrokerClient {
                 chat_memory,
                 principal,
             }),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message } => {
+                match SessionRefusal::from_error(&code, &message) {
+                    Ok(SessionRefusal::Other) => Err(ClientError::Remote { code, message }),
+                    Ok(refusal) => Err(ClientError::SessionRefused(refusal)),
+                    Err(source) => Err(ClientError::MalformedRefusal { source }),
+                }
+            }
             BrokerResponse::CommandRun { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::Upcall { .. }
@@ -2082,6 +2124,13 @@ pub enum ClientError {
         phase: ExchangePhase,
         #[source]
         source: ProtocolError,
+    },
+    #[error("broker refused the session: {0:?}")]
+    SessionRefused(SessionRefusal),
+    #[error("broker session refusal has an invalid principal")]
+    MalformedRefusal {
+        #[source]
+        source: dekopon_core::IdentifierError,
     },
     #[error("broker returned {code}: {message}")]
     Remote { code: String, message: String },

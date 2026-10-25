@@ -1332,10 +1332,18 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
             .session_surface(Some(github_claim(repo, guid)))
             .await
             .expect_err("the mapped second principal has no agent.prompt grant");
-        assert!(
-            matches!(denied, ClientError::Remote { code, .. } if code == ERROR_UNAUTHENTICATED)
-        );
+        assert!(matches!(denied, ClientError::SessionRefused(
+            dekopon_broker_protocol::SessionRefusal::AgentDenied { principal }
+        ) if principal.as_str() == "other-principal"));
     }
+    let unmapped = client
+        .session_surface(Some(github_claim("unknown", "three")))
+        .await
+        .expect_err("unmapped repo has no principal");
+    assert!(matches!(
+        unmapped,
+        ClientError::SessionRefused(dekopon_broker_protocol::SessionRefusal::UnmappedSubject)
+    ));
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
 }

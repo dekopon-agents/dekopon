@@ -2864,3 +2864,38 @@ async fn a_failure_after_the_connect_is_never_retried() {
         "a sent request is never retried on a fresh connection"
     );
 }
+
+#[test]
+fn the_v051_error_shape_tolerates_an_unknown_refusal_cause() {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", deny_unknown_fields, rename_all = "camelCase")]
+    enum OldResponse {
+        Error { code: String, message: String },
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct OldEnvelope {
+        api_version: String,
+        response: OldResponse,
+    }
+    for code in ["unmapped-subject", "agent-denied", "future-refusal-cause"] {
+        let frame = serde_json::to_value(ResponseEnvelope::error(code, "simon")).unwrap();
+        let old: OldEnvelope = serde_json::from_value(frame).unwrap();
+        assert_eq!(old.api_version, PROTOCOL_VERSION);
+        let OldResponse::Error {
+            code: decoded,
+            message,
+        } = old.response;
+        assert_eq!(decoded, code);
+        assert_eq!(message, "simon");
+    }
+    assert_eq!(
+        super::SessionRefusal::from_error("future-refusal-cause", "anything").unwrap(),
+        super::SessionRefusal::Other
+    );
+}
+
+#[test]
+fn a_known_refusal_with_an_invalid_principal_is_malformed() {
+    assert!(super::SessionRefusal::from_error("agent-denied", "not a principal").is_err());
+}

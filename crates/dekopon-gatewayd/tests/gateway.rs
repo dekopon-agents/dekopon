@@ -1146,7 +1146,10 @@ async fn an_unmapped_subject_is_refused_before_a_model_is_ever_asked() {
     let reply = tokio::task::spawn_blocking(move || ask(&socket, UNMAPPED_SUBJECT, "say hi"))
         .await
         .expect("the request completes");
-    assert_eq!(reply, "You're not authorized to use this agent.");
+    assert_eq!(
+        reply,
+        "I only talk to the Lange family. I've let my owner know you stopped by."
+    );
     assert_eq!(
         fixture.model_requests.load(Ordering::SeqCst),
         0,
