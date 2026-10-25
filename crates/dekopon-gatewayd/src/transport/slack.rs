@@ -2609,10 +2609,13 @@ mod driver_tests {
             keep_alive: KeepAlive::default(),
             templates,
         });
-        let mut target = target();
-        if let LivenessTarget::Slack { message_ts: ts, .. } = &mut target {
-            *ts = message_ts.to_owned();
-        }
+        let target = LivenessTarget::Slack {
+            channel_id: CHANNEL.to_owned(),
+            thread_ts: INBOUND_TS.to_owned(),
+            message_ts: message_ts.to_owned(),
+            initiator_user_id: USER.to_owned(),
+            conversation_id: CONVERSATION.to_owned(),
+        };
         ProgressInputs {
             driver: Arc::clone(&transport.replier) as Arc<dyn ChatDriver>,
             target: Some(target),
