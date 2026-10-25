@@ -284,10 +284,10 @@ impl FromStr for ExternalSubject {
         let tenant = tenant
             .map(|tenant| require_canonical_segment(service, SubjectSegment::Tenant, tenant))
             .transpose()?;
-        if service == SubjectService::Discord {
-            if let Some(tenant) = &tenant {
-                numeric_segment(tenant, "tenant")?;
-            }
+        if service == SubjectService::Discord
+            && let Some(tenant) = &tenant
+        {
+            numeric_segment(tenant, "tenant")?;
         }
         let subject = require_canonical_segment(service, SubjectSegment::Subject, subject)?;
         let numeric = match service {
