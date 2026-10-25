@@ -17643,14 +17643,7 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
                 .sum::<usize>(),
             1
         );
-        let expected_head = match memory.scope {
-            MemoryScope::PrivateConversation => {
-                format!("[gateway: unmapped participant]\n{NOTICE}\n")
-            }
-            MemoryScope::SharedConversation => {
-                format!("[gateway: unmapped participant]\n{NOTICE}\n")
-            }
-        };
+        let expected_head = format!("[gateway: unmapped participant]\n{NOTICE}\n");
         assert!(
             current.starts_with(&expected_head),
             "authoritative attribution, complete notice, then untrusted text"

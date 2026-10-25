@@ -122,9 +122,10 @@ An unmapped Discord sender is refused before any model call.
 A persistent route is `privateConversation` when `scope` is omitted. Under
 `scope: sharedConversation` on a guild-channel route, Discord's conversation identity is the
 **whole channel** (a native thread is its own channel): every independently authorized participant
-there receives prior turns and attachment references from that window, and each canonical Discord
-subject identifier reaches the model provider. This example does not enable that audience
-expansion.
+there receives prior turns and attachment references from that window. Every person-originated
+turn, in every scope, carries a gateway-authored participant label naming the sender's broker
+principal or saying `unmapped participant`. That label reaches the model provider. This example
+does not enable shared history's audience expansion.
 
 ## Photos and files
 
