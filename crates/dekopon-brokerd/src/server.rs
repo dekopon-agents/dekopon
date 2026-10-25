@@ -713,7 +713,8 @@ where
                 Ok(CommandRunOutcome::Failed { error }) => {
                     return answer_run(&mut stream, limits, RunOutcome::Refused { error }).await;
                 }
-                Err(dekopon_broker_host::BrokerHostError::UnknownCommandWord { .. }) => {
+                Err(error @ dekopon_broker_host::BrokerHostError::UnknownCommandWord { .. }) => {
+                    command_span.in_scope(|| report_command_run_failure(&word, &error));
                     return answer_run(&mut stream, limits, RunOutcome::NotFound).await;
                 }
                 Err(error) => {

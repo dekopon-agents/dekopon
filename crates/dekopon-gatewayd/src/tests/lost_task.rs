@@ -9,14 +9,18 @@ async fn cold_asset_broker(
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let (observed, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for response in responses {
+        let mut responses = responses
+            .into_iter()
+            .map(|reply| (reply, Vec::new()))
+            .collect();
+        while !VecDeque::is_empty(&responses) {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = DescriptorStream::new(stream);
             let (request, inputs) = stream
                 .read_frame::<RequestEnvelope>(FrameLimits::default())
                 .await
                 .unwrap();
-            if let BrokerRequest::Invoke { assets, .. } = &request.request {
+            if let BrokerRequest::Run { assets, .. } = &request.request {
                 assert_eq!(assets.len(), 1);
                 let descriptor = inputs.into_iter().next().expect("the input descriptor");
                 let mut bytes = Vec::new();
@@ -24,6 +28,9 @@ async fn cold_asset_broker(
                     .unwrap();
                 assert_eq!(bytes, b"pixels");
             }
+            let (response, descriptors) =
+                dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
+            assert!(descriptors.is_empty());
             observed.send(request).unwrap();
             stream
                 .write_frame(&response, &[], FrameLimits::default())
@@ -134,19 +141,24 @@ async fn cold_asset_turn(command: Option<&str>) {
     ));
     match command {
         Some(command) => {
-            let BrokerRequest::RunCommand { word, argv, .. } =
-                observed.recv().await.unwrap().request
-            else {
-                panic!("the script must run the command");
-            };
-            assert_eq!([vec![word], argv].concat().join(" "), command);
-            let BrokerRequest::Invoke {
-                invocation, assets, ..
+            let BrokerRequest::Run {
+                word, argv, assets, ..
             } = observed.recv().await.unwrap().request
             else {
-                panic!("the cold input must reach the provider invocation");
+                panic!("the script must run the command with its cold input");
             };
-            assert_eq!(invocation.input, json!({"image": "chat-asset:1"}));
+            let argv = argv
+                .into_iter()
+                .map(|arg| match arg {
+                    dekopon_broker_protocol::Arg::Text(text) => text,
+                    dekopon_broker_protocol::Arg::Asset(index) => {
+                        format!("chat-asset:{}", assets[usize::from(index.get())].id)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let (expected_word, expected_argv) = command.split_once(' ').unwrap();
+            assert_eq!(word, expected_word);
+            assert_eq!(argv.join(" "), expected_argv);
             assert_eq!(assets.len(), 1);
             assert_eq!(assets[0].id, 1);
             assert_eq!(assets[0].bytes, Some(6));
