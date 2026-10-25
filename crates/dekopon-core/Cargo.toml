@@ -19,6 +19,7 @@ native = ["dep:base64"]
 [dependencies]
 base64 = { workspace = true, optional = true }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 # The `accept()` classification is a table of Unix `errno` values; no other platform has one, and a
@@ -28,7 +29,6 @@ libc.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -16,22 +16,136 @@ use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::Instrument as _;
 
 use super::{
     ChatDriver, ChatTransport, InboundMessage, MessageId, OutboundReply, ReplyTarget, SeenIds,
-    TransportError, TransportEvent, TransportIdentity, bound_inbound, receive_span,
-    record_conversation,
+    TransportError, TransportEvent, TransportIdentity, receive_span, record_conversation,
     webhook::{self, VerifyFailure},
     whatsapp::WhatsappTransport,
 };
 use crate::{config::GithubEvent, gateway::CurrentGeneration};
+use dekopon_core::github::{GithubNumber, GithubThread, thread};
+use std::collections::VecDeque;
 
 const CALLBACK: &str = "/webhooks/github";
 const RECENT_DELIVERIES: usize = 1024;
 const QUEUE: usize = 64;
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GithubEntry {
+    pub delivery: String,
+    pub event: GithubEvent,
+    pub action: Option<String>,
+    pub actor: GithubNumber,
+    pub thread: GithubThread,
+    pub head_sha: Option<String>,
+    pub run: Option<GithubNumber>,
+    pub conclusion: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GithubBatch(VecDeque<GithubEntry>);
+
+impl GithubBatch {
+    pub(crate) fn new(entry: GithubEntry) -> Self {
+        Self(VecDeque::from([entry]))
+    }
+    pub(crate) fn lead(&self) -> &GithubEntry {
+        &self.0[0]
+    }
+    pub(crate) fn deliveries(&self) -> Vec<&str> {
+        self.0.iter().map(|e| e.delivery.as_str()).collect()
+    }
+    pub(crate) fn append(&mut self, other: &mut Self) -> bool {
+        if self.0.len() + other.0.len() > 16 || self.lead().actor != other.lead().actor {
+            return false;
+        }
+        self.0.append(&mut other.0);
+        true
+    }
+    pub(crate) fn note(&self, subject: &ExternalSubject) -> String {
+        let mut lines = Vec::with_capacity(self.0.len() + 1);
+        for entry in &self.0 {
+            let event = serde_json::to_value(entry.event)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let mut line = format!(
+                "[gateway: unverified GitHub {event} claim] repository {}/{}; action {}; {}; delivery {}.",
+                subject.tenant().unwrap_or_default(),
+                subject.subject(),
+                entry.action.as_deref().unwrap_or("none"),
+                entry.thread,
+                entry.delivery
+            );
+            if let Some(sha) = &entry.head_sha {
+                line.push_str(&format!(" head {sha};"));
+            }
+            if let Some(run) = entry.run {
+                line.push_str(&format!(" run {run}; associated PR {};", entry.thread));
+            }
+            if let Some(conclusion) = &entry.conclusion {
+                line.push_str(&format!(" conclusion {conclusion};"));
+            }
+            lines.push(line);
+        }
+        lines.push("Read current checks and head through a broker-granted capability before acting. No associated PR means report only.".to_owned());
+        lines.join("\n")
+    }
+}
+
+pub(super) enum Reservation {
+    New,
+    Reserved,
+    Committed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Acked {
+    Admitted,
+    Queued,
+    Ignored,
+    Busy,
+}
+
+pub(crate) struct AdmissionTicket {
+    delivery: String,
+    accepted: Arc<Mutex<SeenIds>>,
+    reply: Option<oneshot::Sender<Acked>>,
+}
+
+impl std::fmt::Debug for AdmissionTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionTicket")
+            .field("delivery", &self.delivery)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdmissionTicket {
+    pub(crate) fn answer(mut self, answer: Acked) {
+        let commit = match answer {
+            Acked::Admitted | Acked::Queued | Acked::Ignored => true,
+            Acked::Busy => false,
+        };
+        self.accepted.lock().answer(&self.delivery, commit);
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(answer);
+        }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            self.accepted.lock().answer(&self.delivery, false);
+            let _ = reply.send(Acked::Busy);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Refusal {
@@ -96,7 +210,7 @@ struct StateData {
     name: String,
     secret: Arc<Redacted<Vec<u8>>>,
     generation: CurrentGeneration,
-    sender: mpsc::Sender<InboundMessage>,
+    sender: mpsc::Sender<TransportEvent>,
     // Serializes the acceptance decision with the only in-process dedupe owner.
     accepted: Arc<Mutex<SeenIds>>,
     refusals: Arc<Mutex<RefusalLog>>,
@@ -174,28 +288,63 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     let Ok(root) = serde_json::from_slice::<Value>(&body) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
-    let Some((subject, conversation, event_kind, text)) = parse(&root, &event, &delivery) else {
+    let event_kind = match serde_json::from_value::<GithubEvent>(Value::String(event.clone())) {
+        Ok(event) => event,
+        Err(_) => {
+            let reason = if matches!(
+                event.as_str(),
+                "ping"
+                    | "installation"
+                    | "installation_repositories"
+                    | "installation_target"
+                    | "github_app_authorization"
+                    | "marketplace_purchase"
+                    | "organization"
+                    | "org_block"
+                    | "membership"
+                    | "team"
+                    | "sponsorship"
+                    | "personal_access_token_request"
+                    | "security_advisory"
+                    | "custom_property"
+                    | "projects_v2"
+                    | "projects_v2_item"
+                    | "projects_v2_status_update"
+            ) {
+                "no-repository"
+            } else {
+                "unknown-event"
+            };
+            ignored(state, &delivery, reason);
+            return webhook::content_free(StatusCode::OK);
+        }
+    };
+    if !root.get("repository").is_some_and(Value::is_object) {
+        ignored(state, &delivery, "no-repository");
+        return webhook::content_free(StatusCode::OK);
+    }
+    let Some((subject, conversation, entry)) = parse(&root, event_kind, &delivery) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
     if !state
         .generation
         .admits_github(&state.name, &conversation, &subject, event_kind)
     {
-        tracing::debug!(event = "gateway_github_ignored", "gateway.github.ignored");
+        ignored(state, &delivery, "not-listed");
         return webhook::content_free(StatusCode::OK);
     }
-    let Some(text) = text else {
-        tracing::debug!(event = "gateway_github_ignored", "gateway.github.ignored");
+    if !eligible(&entry) {
+        ignored(state, &delivery, "action-filtered");
         return webhook::content_free(StatusCode::OK);
-    };
+    }
     let receipt = received.in_scope(|| receive_span(ChatTransportKind::Github));
     let message = InboundMessage {
         transport: state.name.clone(),
         transport_kind: ChatTransportKind::Github,
         subject,
         conversation,
-        message_id: MessageId::Native(delivery.clone()),
-        text: bound_inbound(&text),
+        message_id: MessageId::Github(Box::new(GithubBatch::new(entry))),
+        text: String::new(),
         assets: Vec::new(),
         asset_overflow: false,
         addressed: Some(true),
@@ -208,28 +357,50 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         constituents: Vec::new(),
         folded: Vec::new(),
     };
-    let mut accepted = state.accepted.lock();
-    // Reserve under the dedupe lock before recording identity: a full queue cannot consume a GUID.
-    match accepted.insert_if_absent(&delivery, || {
+    let receiver = {
+        let mut accepted = state.accepted.lock();
+        match accepted.reserve(&delivery) {
+            Reservation::Committed => return webhook::content_free(StatusCode::OK),
+            Reservation::Reserved => {
+                return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Reservation::New => {}
+        }
         let Ok(permit) = state.sender.try_reserve() else {
-            return false;
+            accepted.answer(&delivery, false);
+            return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let (reply, receiver) = oneshot::channel();
+        let ticket = AdmissionTicket {
+            delivery: delivery.clone(),
+            accepted: Arc::clone(&state.accepted),
+            reply: Some(reply),
         };
         receipt.record("message.id", &delivery);
         record_conversation(&receipt, &message.conversation);
-        permit.send(message);
-        true
-    }) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::debug!(
-                event = "gateway_github_duplicate",
-                "gateway.github.duplicate"
-            );
-            return webhook::content_free(StatusCode::OK);
+        permit.send(TransportEvent::Delivery(Box::new(message), ticket));
+        receiver
+    };
+    match tokio::time::timeout(webhook::WEBHOOK_REQUEST_TIMEOUT, receiver).await {
+        Ok(Ok(Acked::Admitted | Acked::Queued | Acked::Ignored)) => {
+            webhook::content_free(StatusCode::OK)
         }
-        Err(()) => return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE),
+        Ok(Ok(Acked::Busy) | Err(_)) => {
+            refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE)
+        }
+        Err(_) => refuse(state, Refusal::Timeout, StatusCode::SERVICE_UNAVAILABLE),
     }
-    webhook::content_free(StatusCode::OK)
+}
+
+fn ignored(state: &StateData, delivery: &str, reason: &str) {
+    tracing::debug!(
+        event = "gateway_github_ignored",
+        reason,
+        "gateway.github.ignored"
+    );
+    tracing::info!(target: "dekopon_gatewayd::audit", audit.event = "gateway.admission",
+        outcome = "ignored", transport = %state.name, github.deliveries = &[delivery],
+        queue.depth = 0, "gateway.admission");
 }
 
 fn field<'a>(root: &'a Value, path: &str, max: usize) -> Option<&'a str> {
@@ -240,66 +411,74 @@ fn field<'a>(root: &'a Value, path: &str, max: usize) -> Option<&'a str> {
 
 fn parse(
     root: &Value,
-    event: &str,
+    event: GithubEvent,
     delivery: &str,
-) -> Option<(ExternalSubject, Conversation, GithubEvent, Option<String>)> {
+) -> Option<(ExternalSubject, Conversation, GithubEntry)> {
     let owner = field(root, "/repository/owner/login", 39)?;
     let repo = field(root, "/repository/name", 100)?;
     let subject = ExternalSubject::github(owner, repo).ok()?;
-    let owner = subject.tenant()?;
+    let thread = thread(event, root).ok()?;
     let conversation = Conversation {
         kind: ConversationKind::Thread,
-        container: Some(owner.to_owned()),
-        id: format!("{owner}.{}", subject.subject()),
-        thread: Some(delivery.to_owned()),
+        container: Some(subject.tenant()?.to_owned()),
+        id: format!("{}.{}", subject.tenant()?, subject.subject()),
+        thread: Some(thread.to_string()),
     };
-    if !conversation.is_canonical_for(ChatTransportKind::Github, &subject) {
-        return None;
+    let actor = GithubNumber::new(root.pointer("/sender/id")?.as_u64()?).ok()?;
+    let action = field(root, "/action", 64)
+        .filter(|v| {
+            v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        })
+        .map(str::to_owned);
+    let (head_sha, run, conclusion) = match event {
+        GithubEvent::PullRequest => (
+            Some(field(root, "/pull_request/head/sha", 128)?.to_owned()),
+            None,
+            None,
+        ),
+        GithubEvent::WorkflowRun => (
+            Some(field(root, "/workflow_run/head_sha", 128)?.to_owned()),
+            Some(GithubNumber::new(root.pointer("/workflow_run/id")?.as_u64()?).ok()?),
+            field(root, "/workflow_run/conclusion", 64).map(str::to_owned),
+        ),
+        _ => (None, None, None),
+    };
+    Some((
+        subject,
+        conversation,
+        GithubEntry {
+            delivery: delivery.to_owned(),
+            event,
+            action,
+            actor,
+            thread,
+            head_sha,
+            run,
+            conclusion,
+        },
+    ))
+}
+
+fn eligible(entry: &GithubEntry) -> bool {
+    match entry.event {
+        GithubEvent::PullRequest => matches!(
+            entry.action.as_deref(),
+            Some("opened" | "reopened" | "synchronize")
+        ),
+        GithubEvent::WorkflowRun => {
+            entry.action.as_deref() == Some("completed")
+                && matches!(entry.conclusion.as_deref(), Some("success" | "failure"))
+        }
+        _ => true,
     }
-    let (kind, text) = match event {
-        "pull_request" => {
-            let action = field(root, "/action", 64)?;
-            let number = root
-                .pointer("/number")
-                .and_then(Value::as_u64)
-                .filter(|n| *n > 0)?;
-            let sha = field(root, "/pull_request/head/sha", 128)?;
-            let text = matches!(action, "opened" | "reopened" | "synchronize")
-                .then(|| format!("[gateway: unverified GitHub pull_request claim] repository {owner}/{}; action {action}; PR #{number}; head {sha}; delivery {delivery}. Read current checks and head through a broker-granted capability before acting.", subject.subject()));
-            (GithubEvent::PullRequest, text)
-        }
-        "workflow_run" => {
-            let action = field(root, "/action", 64)?;
-            let run = root
-                .pointer("/workflow_run/id")
-                .and_then(Value::as_u64)
-                .filter(|n| *n > 0)?;
-            let sha = field(root, "/workflow_run/head_sha", 128)?;
-            if action != "completed" {
-                return Some((subject, conversation, GithubEvent::WorkflowRun, None));
-            }
-            let conclusion = field(root, "/workflow_run/conclusion", 64)?;
-            let association = root
-                .pointer("/workflow_run/pull_requests")
-                .and_then(Value::as_array)
-                .and_then(|prs| prs.first())
-                .and_then(|pr| pr.get("number"))
-                .and_then(Value::as_u64)
-                .filter(|n| *n > 0);
-            let text = matches!(conclusion, "success" | "failure")
-                .then(|| format!("[gateway: unverified GitHub workflow_run claim] repository {owner}/{}; run {run}; head {sha}; conclusion {conclusion}; associated PR {association:?}; delivery {delivery}. No associated PR means report only; read current checks through a broker-granted capability before acting.", subject.subject()));
-            (GithubEvent::WorkflowRun, text)
-        }
-        _ => return Some((subject, conversation, GithubEvent::PullRequest, None)),
-    };
-    Some((subject, conversation, kind, text))
 }
 
 pub(crate) struct GithubTransport {
     name: String,
     bind: std::net::SocketAddr,
     state: StateData,
-    receiver: mpsc::Receiver<InboundMessage>,
+    receiver: mpsc::Receiver<TransportEvent>,
     whatsapp: Option<WhatsappTransport>,
     pending_sibling_connect: bool,
     server: tokio::task::JoinSet<()>,
@@ -386,12 +565,12 @@ impl ChatTransport for GithubTransport {
             if let Some(whatsapp) = &mut self.whatsapp {
                 tokio::select! {
                     event = whatsapp.shared_next() => event,
-                    message = self.receiver.recv() => message.map(|m| TransportEvent::Message(Box::new(m))).ok_or(TransportError::Closed),
+                    message = self.receiver.recv() => message.ok_or(TransportError::Closed),
                     _ = self.server.join_next() => Err(TransportError::Closed),
                 }
             } else {
                 tokio::select! {
-                    message = self.receiver.recv() => message.map(|m| TransportEvent::Message(Box::new(m))).ok_or(TransportError::Closed),
+                    message = self.receiver.recv() => message.ok_or(TransportError::Closed),
                     _ = self.server.join_next() => Err(TransportError::Closed),
                 }
             }
@@ -419,7 +598,7 @@ mod tests {
     use axum::body::Body;
     use serde_json::json;
 
-    fn state() -> (StateData, mpsc::Receiver<InboundMessage>) {
+    fn state() -> (StateData, mpsc::Receiver<TransportEvent>) {
         let (sender, receiver) = mpsc::channel(1);
         (
             StateData {

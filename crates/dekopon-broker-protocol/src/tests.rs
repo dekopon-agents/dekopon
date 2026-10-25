@@ -2924,3 +2924,29 @@ fn the_v051_error_shape_tolerates_an_unknown_refusal_cause() {
 fn a_known_refusal_with_an_invalid_principal_is_malformed() {
     assert!(super::SessionRefusal::from_error("agent-denied", "not a principal").is_err());
 }
+
+#[test]
+fn a_github_thread_is_a_number_or_the_repository() {
+    let subject = dekopon_core::ExternalSubject::github("owner", "repo").unwrap();
+    for (thread, allowed) in [
+        ("72d3162e-cc78-11e3-81ab-4c9367dc0958", false),
+        ("07", false),
+        ("0", false),
+        ("9223372036854775808", false),
+        ("7", true),
+        ("9223372036854775807", true),
+        ("repository", true),
+    ] {
+        let scope = conversation(
+            ConversationKind::Thread,
+            Some("owner"),
+            "owner.repo",
+            Some(thread),
+        );
+        assert_eq!(
+            scope.is_canonical_for(ChatTransportKind::Github, &subject),
+            allowed,
+            "{thread}"
+        );
+    }
+}

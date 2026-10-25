@@ -169,7 +169,9 @@ impl Conversation {
                             subject.tenant().unwrap_or_default(),
                             subject.subject()
                         )
-                    && thread.is_some_and(lowercase_scope_value)
+                    && thread.is_some_and(|value| {
+                        value.parse::<dekopon_core::github::GithubThread>().is_ok()
+                    })
             }
             ChatTransportKind::Local => {
                 container.is_none_or(lowercase_scope_value)

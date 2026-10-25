@@ -487,6 +487,9 @@ impl Gateway {
                                 );
                             });
                         }
+                        TransportEvent::Delivery(message, ticket) => {
+                            self.dispatch_delivery(&mut sessions, *message, ticket);
+                        }
                         TransportEvent::CancelRequested(request) => {
                             if collector.cancel(&request) {
                                 tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via), "gateway.input.stop.requested");
@@ -756,11 +759,39 @@ impl Gateway {
         }
     }
 
+    pub(crate) fn dispatch_delivery(
+        &self,
+        sessions: &mut JoinSet<()>,
+        message: InboundMessage,
+        ticket: crate::transport::github::AdmissionTicket,
+    ) {
+        let generation = self.active.load();
+        if generation.routes.route(&message).is_none()
+            || !self.drivers.contains_key(&message.transport)
+            || message.addressed == Some(false)
+        {
+            session::record_admission(&message, "ignored", 0, None);
+            ticket.answer(crate::transport::github::Acked::Ignored);
+            return;
+        }
+        self.start_session_with_ticket(sessions, &generation, message, Some(ticket));
+    }
+
     fn start_session(
         &self,
         sessions: &mut JoinSet<()>,
         generation: &ServingGeneration,
         message: InboundMessage,
+    ) {
+        self.start_session_with_ticket(sessions, generation, message, None);
+    }
+
+    fn start_session_with_ticket(
+        &self,
+        sessions: &mut JoinSet<()>,
+        generation: &ServingGeneration,
+        message: InboundMessage,
+        ticket: Option<crate::transport::github::AdmissionTicket>,
     ) {
         let Some(route) = generation.routes.route(&message) else {
             collection::disposition(&message.receive_span, "route-lost");
@@ -783,7 +814,7 @@ impl Gateway {
             route.clone(),
             message,
             driver,
-            generation._digest.clone(),
+            (generation._digest.clone(), ticket),
             move |message, queued| {
                 let generation = active.load();
                 let route = generation.routes.route(message)?;

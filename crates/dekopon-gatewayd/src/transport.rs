@@ -79,6 +79,7 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
+    Github(Box<github::GithubBatch>),
     Follow(String),
     Wake {
         id: WakeId,
@@ -93,7 +94,7 @@ pub(crate) enum MessageId {
 impl MessageId {
     pub(crate) const fn trigger(&self) -> Trigger {
         match self {
-            Self::Native(_) | Self::Follow(_) => Trigger::Message,
+            Self::Native(_) | Self::Follow(_) | Self::Github(_) => Trigger::Message,
             Self::Wake { .. } => Trigger::Wake,
             Self::Job { .. } => Trigger::Job,
         }
@@ -104,6 +105,7 @@ impl fmt::Display for MessageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Native(id) | Self::Follow(id) => formatter.write_str(id),
+            Self::Github(batch) => formatter.write_str(&batch.lead().delivery),
             Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
             Self::Job { id, .. } => write!(formatter, "job-{id}"),
         }
@@ -137,13 +139,14 @@ pub(crate) fn record_conversation(span: &tracing::Span, conversation: &Conversat
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum TransportEvent {
     Connected {
         name: String,
         identity: TransportIdentity,
     },
     Message(Box<InboundMessage>),
+    Delivery(Box<InboundMessage>, github::AdmissionTicket),
     CancelRequested(CancelRequest),
 }
 
@@ -1008,6 +1011,7 @@ pub(crate) fn retry_after_from_body(body: &Value, max: Duration) -> Option<Retry
 pub(crate) struct SeenIds {
     order: VecDeque<String>,
     seen: HashSet<String>,
+    reserved: HashSet<String>,
     capacity: usize,
 }
 
@@ -1016,7 +1020,25 @@ impl SeenIds {
         Self {
             order: VecDeque::with_capacity(capacity),
             seen: HashSet::with_capacity(capacity),
+            reserved: HashSet::new(),
             capacity,
+        }
+    }
+
+    pub(super) fn reserve(&mut self, key: &str) -> github::Reservation {
+        if self.seen.contains(key) {
+            return github::Reservation::Committed;
+        }
+        if !self.reserved.insert(key.to_owned()) {
+            return github::Reservation::Reserved;
+        }
+        github::Reservation::New
+    }
+
+    pub(super) fn answer(&mut self, key: &str, commit: bool) {
+        self.reserved.remove(key);
+        if commit {
+            self.insert(key.to_owned());
         }
     }
 
