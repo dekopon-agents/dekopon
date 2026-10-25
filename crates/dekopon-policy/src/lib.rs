@@ -106,8 +106,8 @@ use cedar_policy::{
 };
 use dekopon_capability::EffectKind;
 use dekopon_core::{
-    AgentId, CapabilityId, GroupId, IdentifierError, PrincipalId, ProviderId, RiskLevel, SecretDrn,
-    SecretSinkKind,
+    AgentId, CapabilityId, ExternalSubject, GroupId, IdentifierError, PrincipalId, PrincipalKind,
+    ProviderId, RiskLevel, SecretDrn, SecretSinkKind,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -137,6 +137,7 @@ const DIGEST_DOMAIN: &[u8] = b"dekopon-policy-v1\0";
 pub struct PolicyWorld {
     principals: BTreeSet<PrincipalId>,
     memberships: BTreeMap<PrincipalId, BTreeSet<GroupId>>,
+    subjects: BTreeMap<ExternalSubject, PrincipalId>,
     providers: BTreeSet<ProviderId>,
     capabilities: BTreeMap<CapabilityId, ProviderId>,
     read_only: BTreeSet<CapabilityId>,
@@ -270,10 +271,58 @@ impl PolicyWorld {
         world
     }
 
+    #[must_use]
+    pub fn with_subjects(
+        mut self,
+        subjects: impl IntoIterator<Item = (ExternalSubject, PrincipalId)>,
+    ) -> Self {
+        self.subjects.extend(subjects);
+        self
+    }
+
+    #[must_use]
+    pub fn principal_kind(&self, principal: &PrincipalId) -> PrincipalKind {
+        self.subjects
+            .iter()
+            .find_map(|(subject, mapped)| (mapped == principal).then(|| subject.kind()))
+            .unwrap_or(PrincipalKind::Service)
+    }
+
+    #[must_use]
+    pub fn identity_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"dekopon-identity-v1\0");
+        hasher.update(b"subjects\0");
+        for (subject, principal) in &self.subjects {
+            hasher.update(subject.canonical().as_bytes());
+            hasher.update([0]);
+            hasher.update(principal.as_str().as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(b"memberships\0");
+        for principal in &self.principals {
+            hasher.update(b"principal\0");
+            hasher.update(principal.as_str().as_bytes());
+            hasher.update([0]);
+            for group in self.memberships.get(principal).into_iter().flatten() {
+                hasher.update(b"group\0");
+                hasher.update(group.as_str().as_bytes());
+                hasher.update([0]);
+            }
+        }
+        finish_digest(hasher)
+    }
+
     fn schema_json(&self) -> serde_json::Value {
         // Every routing attribute must be declared optional in the schema, or Cedar's strict
         // validator rejects any policy referencing an absent one.
-        const ROUTING: [&str; 4] = ["subject", "transportKind", "transport", "trigger"];
+        const ROUTING: [&str; 5] = [
+            "subject",
+            "transportKind",
+            "transport",
+            "trigger",
+            "startedBy",
+        ];
         let mut routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
             (
                 name.to_owned(),
@@ -360,7 +409,7 @@ impl PolicyWorld {
         let mut entity_types = serde_json::Map::from_iter([
             (
                 "Principal".to_owned(),
-                json!({ "memberOfTypes": ["Group"], "shape": { "type": "Record", "attributes": {} } }),
+                json!({ "memberOfTypes": ["Group"], "shape": { "type": "Record", "attributes": { "kind": { "type": "String" } } } }),
             ),
             ("Group".to_owned(), entity_shape.clone()),
             ("Provider".to_owned(), entity_shape.clone()),
@@ -430,6 +479,7 @@ pub struct PolicyContext {
     pub transport_kind: Option<String>,
     pub transport: Option<String>,
     pub trigger: Option<String>,
+    pub started_by: Option<String>,
     pub conversation: Option<PolicyConversation>,
 }
 
@@ -776,6 +826,7 @@ impl PolicyEngine {
             ("transportKind", context.transport_kind),
             ("transport", context.transport),
             ("trigger", context.trigger),
+            ("startedBy", context.started_by),
         ] {
             if let Some(value) = value {
                 pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));
@@ -1099,10 +1150,23 @@ fn build_entities(world: &PolicyWorld, schema: &Schema) -> Result<Entities, Poli
             .flatten()
             .map(|group| entity_uid(&group_type, group.as_str()))
             .collect::<HashSet<_>>();
-        entities.push(Entity::new_no_attrs(
-            entity_uid(&principal_type, principal.as_str()),
-            parents,
-        ));
+        entities.push(
+            Entity::new(
+                entity_uid(&principal_type, principal.as_str()),
+                [(
+                    "kind".to_owned(),
+                    RestrictedExpression::new_string(
+                        world.principal_kind(principal).as_str().to_owned(),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                parents,
+            )
+            .map_err(|source| PolicyBuildError::Entities {
+                message: source.to_string(),
+            })?,
+        );
     }
     for group in world.groups() {
         entities.push(Entity::new_no_attrs(
@@ -1181,6 +1245,8 @@ fn policy_digest(
     for principal in &world.principals {
         hasher.update(format!("{PRINCIPAL_TYPE}::{:?}", principal.as_str()).as_bytes());
         hasher.update([0]);
+        hasher.update(world.principal_kind(principal).as_str().as_bytes());
+        hasher.update([0]);
         for group in world.memberships.get(principal).into_iter().flatten() {
             hasher.update(format!("in {GROUP_TYPE}::{:?}", group.as_str()).as_bytes());
             hasher.update([0]);
@@ -1231,6 +1297,10 @@ fn policy_digest(
         hasher.update([0]);
     }
 
+    Ok(finish_digest(hasher))
+}
+
+fn finish_digest(hasher: Sha256) -> String {
     let mut hex = String::with_capacity(64 + 7);
     hex.push_str("sha256:");
     for byte in hasher.finalize() {
@@ -1238,7 +1308,7 @@ fn policy_digest(
         hex.push(char::from(HEX[usize::from(byte >> 4)]));
         hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    Ok(hex)
+    hex
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

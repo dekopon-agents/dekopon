@@ -615,6 +615,18 @@ impl BufferedHttpClient {
             return Err(echoed());
         }
         self.evidence[index].response_bytes = response_bytes;
+        self.evidence[index].upstream_request_id = response
+            .headers()
+            .get("x-github-request-id")
+            .and_then(|value| {
+                let bytes = value.as_bytes();
+                (1..=64)
+                    .contains(&bytes.len())
+                    .then_some(bytes)
+                    .filter(|bytes| bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)))
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(str::to_owned)
+            });
         Ok(Head {
             status,
             headers: head.headers,

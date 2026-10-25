@@ -137,6 +137,7 @@ async fn a_job_leg_authorization_records_its_trigger() {
             id: "c0123abc".to_owned(),
             thread: None,
         },
+        delivery: None,
         trigger: Trigger::Job,
     };
     let context = AuthenticatedContext::attested_chat(

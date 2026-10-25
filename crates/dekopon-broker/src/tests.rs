@@ -181,6 +181,12 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
     AuditEvent::Decision {
+        authority: Box::new(super::DecisionAuthority {
+            principal_kind: dekopon_core::PrincipalKind::Service,
+            started_by: None,
+            chat: None,
+            space: None,
+        }),
         invocation: invocation
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
@@ -1290,6 +1296,7 @@ fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
                     id: id.to_owned(),
                     thread: thread.map(str::to_owned),
                 },
+                delivery: None,
                 trigger: Trigger::Message,
             }
         };

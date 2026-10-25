@@ -6,7 +6,6 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-// The sole exception is cwasm::deserialize, after trusted-artifact verification.
 #![deny(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
@@ -35,7 +34,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::Instrument as _;
-use wasmtime::component::{Component, HasSelf, Linker};
+use wasmtime::component::{HasSelf, Linker};
 use wasmtime::{Engine, Store};
 
 pub mod asset;
@@ -51,6 +50,7 @@ pub mod skills;
 mod spawn;
 mod stdio;
 mod storage;
+mod test_component_memo;
 use clock::ClockState;
 pub use dekopon_broker_protocol::{Streams, UpcallStdin, UpcallStreams};
 pub use dekopon_http_host::{HttpRequestFacts, RequestAuthorizer};
@@ -67,6 +67,7 @@ pub use stdio::{
     MAX_READ_BYTES, MAX_STDERR_BYTES, STDERR_TRUNCATION_MARKER, StdioAdmissionError, StdioTrap,
     ZERO_FAILURE_STATUS_NOTE,
 };
+pub use test_component_memo::{TestComponentMemoization, enable_test_component_memoization};
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -705,7 +706,12 @@ fn prepare_component(
                 })?,
         },
         None => cwasm::stage("compile", artifact.bytes, || {
-            Component::new(&runtime.engine, &bytes)
+            test_component_memo::compile(
+                &runtime.engine,
+                &runtime.engine_key,
+                &artifact.sha256,
+                &bytes,
+            )
         })
         .map_err(|error| BrokerHostError::Compile {
             path: source.clone(),
