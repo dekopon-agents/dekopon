@@ -252,8 +252,8 @@ pub enum Modifier {
 pub enum Conditional {
     Test(ConditionalTest),
     Not(Box<Conditional>),
-    And(Box<Conditional>, Box<Conditional>),
-    Or(Box<Conditional>, Box<Conditional>),
+    And(Vec<Conditional>),
+    Or(Vec<Conditional>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

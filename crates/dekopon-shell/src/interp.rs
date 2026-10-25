@@ -3680,21 +3680,32 @@ impl<'a> Evaluator<'a> {
         match expression {
             Conditional::Test(test) => self.evaluate_conditional_test(test),
             Conditional::Not(inner) => Ok(invert(self.evaluate_conditional(inner)?)),
-            Conditional::And(left, right) => {
-                let status = self.evaluate_conditional(left)?;
-                if status == ExitCode::SUCCESS {
-                    return self.evaluate_conditional(right);
-                }
-                Ok(status)
-            }
-            Conditional::Or(left, right) => {
-                let status = self.evaluate_conditional(left)?;
-                if status == ExitCode::SUCCESS {
-                    return Ok(status);
-                }
-                self.evaluate_conditional(right)
+            Conditional::And(terms) => self.evaluate_conditional_chain(terms, AndOr::And),
+            Conditional::Or(terms) => self.evaluate_conditional_chain(terms, AndOr::Or),
+        }
+    }
+
+    fn evaluate_conditional_chain(
+        &mut self,
+        terms: &[Conditional],
+        operator: AndOr,
+    ) -> Result<ExitCode, CommandFailure> {
+        // Each operator must consume a step before the first operand, including skipped operators.
+        for _ in 2..terms.len() {
+            self.budget.charge_step_with(self.invoker)?;
+        }
+        let mut status = ExitCode::SUCCESS;
+        for term in terms {
+            status = self.evaluate_conditional(term)?;
+            let stop = match operator {
+                AndOr::And => status != ExitCode::SUCCESS,
+                AndOr::Or => status == ExitCode::SUCCESS,
+            };
+            if stop {
+                break;
             }
         }
+        Ok(status)
     }
 
     fn evaluate_conditional_test(
