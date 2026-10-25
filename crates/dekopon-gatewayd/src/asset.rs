@@ -383,11 +383,23 @@ impl AssetStore {
     ) {
         for (key, entry) in entries.iter_mut() {
             for row in &mut entry.assets {
-                if let Attachment::Resident(digest) = &row.state
-                    && !retention.is_bound(key, &row.asset, digest)
-                {
-                    row.state = Attachment::Evicted;
-                    retention.tombstone((key.clone(), row.asset.id));
+                match &row.state {
+                    Attachment::Resident(digest) => {
+                        if !retention.is_bound(key, &row.asset, digest) {
+                            row.state = Attachment::Evicted;
+                            retention.tombstone((key.clone(), row.asset.id));
+                        }
+                    }
+                    Attachment::Evicted => match retention.lookup(key, &row.asset) {
+                        state @ Attachment::Resident(_) => row.state = state,
+                        Attachment::Registered
+                        | Attachment::Downloading(_)
+                        | Attachment::Evicted
+                        | Attachment::NotStored(_) => (),
+                    },
+                    Attachment::Registered
+                    | Attachment::Downloading(_)
+                    | Attachment::NotStored(_) => (),
                 }
             }
         }
@@ -1195,6 +1207,10 @@ impl AssetStore {
                         BlobError::Unknown
                     });
                 };
+                if retention.budget == 0 {
+                    retention.miss(id, row.asset.size.unwrap_or_default() as usize, "disabled");
+                    return Err(BlobError::Disabled);
+                }
                 match &mut row.state {
                     Attachment::Resident(digest) => retention.pin(digest, recency).map(Some),
                     Attachment::Registered | Attachment::Downloading(_) => Ok(None),
@@ -1370,34 +1386,27 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             .unwrap_or(Err(BlobError::Unauthorized))
     }
     fn send(&self, id: u64) -> Result<Option<GeneratedImage>, BlobError> {
-        self.access
+        let asset = self
+            .access
             .with_active(|key| {
                 let mut entries = self.store.entries.lock();
                 let row = row_mut(&mut entries, key, id).ok_or(BlobError::Unknown)?;
                 if row.asset.sent {
                     return Ok(None);
                 }
-                // Mark an asset sent once, even if its retained file becomes unavailable; never
-                // retry the send implicitly.
                 row.asset.sent = true;
-                let data = match &row.state {
-                    Attachment::Resident(digest) => {
-                        self.store.retention.lock().pin(digest, Recency::Touch)?
-                    }
-                    Attachment::Registered
-                    | Attachment::Downloading(_)
-                    | Attachment::Evicted
-                    | Attachment::NotStored(_) => {
-                        return Err(BlobError::Reclaimed);
-                    }
-                };
-                Ok(Some(GeneratedImage::new(
-                    data,
-                    row.asset.mime.clone(),
-                    row.asset.encoding,
-                )))
+                Ok(Some((row.asset.mime.clone(), row.asset.encoding)))
             })
-            .unwrap_or(Err(BlobError::Unauthorized))
+            .unwrap_or(Err(BlobError::Unauthorized))?;
+        asset
+            .map(|(mime, encoding)| {
+                let data = self
+                    .store
+                    .pin(&self.access, id, Recency::Touch)?
+                    .ok_or(BlobError::Reclaimed)?;
+                Ok(GeneratedImage::new(data, mime, encoding))
+            })
+            .transpose()
     }
     fn delivery_failed(&self) {
         self.access.with_active(|key| {
@@ -2420,6 +2429,84 @@ mod retention_tests {
         assert_eq!(
             store.pin(&first, old, Recency::Keep),
             Err(BlobError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn a_shared_digest_becoming_resident_restores_each_retained_binding() {
+        let store = store(3);
+        let first = access("first");
+        let second = access("second");
+        let a = register(&store, &first);
+        let b = register(&store, &second);
+        drop(store.admit(&first, a, b"aaa").unwrap());
+        drop(store.admit(&second, b, b"aaa").unwrap());
+        let pressure = register(&store, &first);
+        drop(store.admit(&first, pressure, b"bbb").unwrap());
+        assert_eq!(
+            store.pin(&second, b, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        let incoming = register(&store, &first);
+        drop(store.admit(&first, incoming, b"aaa").unwrap());
+        assert_eq!(
+            store
+                .pin(&second, b, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+        assert_eq!(store.retention.lock().bytes, 3);
+    }
+
+    #[test]
+    fn a_zero_budget_never_reads_a_restored_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let access = access("disabled");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let id = register(&store, &access);
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        journal_inventory(
+            &journal,
+            &access,
+            &store.inventory(&access),
+            SystemTime::now(),
+        );
+        drop(store);
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 0)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let recalled = journal
+            .recall(
+                &access.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &access,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        assert!(!store.retains());
+        assert_eq!(
+            store.pin(&access, id, Recency::Keep),
+            Err(BlobError::Disabled)
         );
     }
 
