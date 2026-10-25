@@ -6,9 +6,7 @@ use crate::config::{
 use dekopon_agent::prompt::{ConversationTurn, History, Representation};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
 use dekopon_process::TreeContext;
-use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ExitCode, Streams,
-};
+use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandProposal, ExitCode, Streams};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -89,13 +87,28 @@ impl<I: CapabilityInvoker> CapabilityInvoker for Decider<'_, I> {
     fn has_command_word(&self, word: &str) -> bool {
         word == "memory_decide"
     }
-    fn run_command(&self, word: &str, _argv: &[String], _stdin_piped: bool) -> Option<CommandRun> {
-        (word == "memory_decide").then(|| CommandRun::Proposed {
-            capability: self.capability.to_owned(),
-            input: self.input.clone(),
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: Streams,
+        tree: &TreeContext,
+    ) -> dekopon_shell::RunResult {
+        if call.word != "memory_decide" {
+            return dekopon_shell::render_run(call, None, streams);
+        }
+        let capability = self.capability.to_owned();
+        let input = self.input.clone();
+        let result = self.inner.invoke(
+            CommandProposal::new(capability.clone(), input.clone(), None),
+            streams,
+            tree,
+        );
+        dekopon_shell::RunResult::Invoked {
+            capability,
+            input,
             secret_use: None,
-            report: None,
-        })
+            result,
+        }
     }
     fn invoke(
         &self,
@@ -557,5 +570,114 @@ impl Journal {
             );
         }
         Ok(fitted.history)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dekopon_agent::{
+        BrokerLeg,
+        attachment::{
+            ChatAssetInputs, ChatAssetRefusal, ChatAssetSource, ResolveFuture, ResolvedInput,
+        },
+    };
+    use dekopon_broker_protocol::{
+        AssetEncoding, AssetRow, BrokerClient, BrokerRequest, FrameLimits, ResponseEnvelope,
+    };
+    use dekopon_model::asset::DiskBlob;
+    use std::{os::unix::fs::PermissionsExt as _, sync::Arc};
+
+    struct Source(Vec<DiskBlob>);
+    impl ChatAssetSource for Source {
+        fn resolve_input(&self, id: u64) -> ResolveFuture<'_> {
+            Box::pin(async move {
+                let blob = self
+                    .0
+                    .get(usize::try_from(id).unwrap().wrapping_sub(1))
+                    .ok_or(ChatAssetRefusal::UnknownAsset)?
+                    .clone();
+                Ok(ResolvedInput {
+                    row: AssetRow {
+                        id,
+                        content_type: "text/plain".into(),
+                        encoding: AssetEncoding::Identity,
+                        bytes: Some(blob.len() as u64),
+                        origin: "inbound".into(),
+                        sent: false,
+                    },
+                    blob,
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decider_invoke_carries_no_rows_with_forty_attachments() {
+        let source = Arc::new(Source(
+            (0..40)
+                .map(|_| DiskBlob::from_bytes(b"file").unwrap())
+                .collect(),
+        ));
+        for id in 1..=40 {
+            assert_eq!(source.resolve_input(id).await.unwrap().row.id, id);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut broker = dekopon_test_support::BrokerFixture::scripted(
+            directory.path(),
+            |request, descriptors| {
+                match &request.request {
+                BrokerRequest::Capabilities { .. } => Some((ResponseEnvelope::capabilities(vec![serde_json::from_value(json!({"provider":"memory", "capability":{"id":"memory.choose", "description":"choose", "effect":"read-only", "risk":"Low", "inputSchema":{"type":"object"}}})).unwrap()], vec![], BTreeMap::new()), vec![])),
+                BrokerRequest::Invoke { assets, streams, .. } => {
+                    assert!(assets.is_empty());
+                    assert_eq!(descriptors.len(), 1);
+                    assert!(!streams.unwrap().stdin);
+                    Some((ResponseEnvelope::error("denied", "fixture refusal"), vec![]))
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+            },
+        );
+        let client = BrokerClient::new(
+            broker.socket(),
+            crate::current_uid(),
+            FrameLimits::default(),
+        )
+        .unwrap();
+        let leg = BrokerLeg::connect(client, None)
+            .await
+            .unwrap()
+            .with_chat_asset_inputs(ChatAssetInputs::new(source));
+        tokio::task::spawn_blocking(move || {
+            let decider = Decider {
+                inner: &leg,
+                capability: "memory.choose",
+                input: json!({"labels":["a","b"]}),
+            };
+            let (writer, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            let result = decider.run(
+                dekopon_shell::RunCall {
+                    word: "memory_decide".into(),
+                    argv: vec![],
+                },
+                Streams {
+                    stdin: None,
+                    stdout: writer.into(),
+                },
+                &TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(1),
+                ),
+            );
+            assert!(matches!(result, dekopon_shell::RunResult::Invoked { .. }));
+        })
+        .await
+        .unwrap();
+        let _capabilities = broker.request().await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::Invoke { .. }
+        ));
     }
 }

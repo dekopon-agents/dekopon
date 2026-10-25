@@ -481,8 +481,8 @@ and descriptor. Pins last until the response or cancellation. Data URLs in argv,
 value after the first `=`, are refused before submission. The broker parses the command word and
 authorizes its proposal through the existing subject, Cedar, grants, secret-use and HTTP checks.
 An unquoted literal `<word> --help` uses the cached page without a frame or capability-call charge.
-The legacy `RunCommand` operation remains for old consoles; `Invoke` carries metadata but no asset
-input descriptors, so an unrebuilt console can run plain commands but cannot hand files to them.
+The legacy `RunCommand` operation remains for old clients. Gateway-built proposals use `Invoke`
+with no inventory rows or asset input descriptors; old clients can still send metadata rows.
 
 A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded

@@ -585,7 +585,19 @@ async fn producer_events(
     if let Some(word) = command {
         let word = word.to_owned();
         tokio::task::spawn_blocking(move || {
-            assert!(leg.run_command(&word, &[], false).is_some());
+            let (writer, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            let tree = dekopon_process::TreeContext::new(
+                dekopon_process::Limits::default(),
+                dekopon_process::CallBudget::new(1),
+            );
+            let _result = leg.run(
+                dekopon_shell::RunCall { word, argv: vec![] },
+                dekopon_shell::Streams {
+                    stdin: None,
+                    stdout: writer.into(),
+                },
+                &tree,
+            );
         })
         .await
         .unwrap();

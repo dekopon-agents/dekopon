@@ -74,18 +74,15 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   honors only under an owner-configured attestor grant. Its fresh capability
   snapshot also supplies trusted effect and risk metadata for self-inspection,
   never policy source, identity, constraints, or credentials. Each provider command word's
-  `runCommand` round trip runs in place and carries the calling script span's W3C trace parent
+  `Run` round trip runs in place and carries the calling script span's W3C trace parent
   exactly as an invocation does. The script tree carries the embedder's Stop signal
   from `BrokerLeg::with_cancel_signal` and the script deadline; command words wait on
   both in place, without a per-script timer task.
   Either drops a command word in flight, after which the script reads `session-cancelled`. A transport
-  failure reaches the script as `CommandRun::Errored` naming its cause, and a cancelled run
-  as `CommandRun::Denied { "session-cancelled" }`. The same signal read synchronously refuses a
-  capability call the script starts *after* the Stop, with the same reason and before any proposal
-  exists; that is a cooperative boundary rather than a refusal decision, which stays the broker's.
-- `command_run_from_outcome` — the one mapping from a provider's `CommandRunOutcome` onto the
-  shell's `CommandRun`, carrying any secret use the provider's proposal names through to the
-  broker-only invocation path.
+  failure after submission reaches the script as `RunResult::Uncertain`, naming its cause without
+  refunding the call. Cancellation before submission returns `session-cancelled` and refunds it.
+  The same signal read synchronously refuses a capability call the script starts after Stop;
+  that is a cooperative boundary rather than a refusal decision, which stays the broker's.
 - `IdSequence` — one session's W3C trace and the collision-free invocation identifiers that
   extend it, adopted from the exporting span or minted when the process exports nothing, as
   described in
