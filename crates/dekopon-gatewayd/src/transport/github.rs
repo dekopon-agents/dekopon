@@ -400,14 +400,13 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     record_conversation(&receipt, &message.conversation);
     // A closed receiver can drop the ticket synchronously, and its Drop reacquires accepted.
     permit.send(TransportEvent::Delivery(Box::new(message), ticket));
-    match tokio::time::timeout(webhook::WEBHOOK_REQUEST_TIMEOUT, receiver).await {
-        Ok(Ok(Acked::Admitted | Acked::Queued | Acked::Ignored)) => {
+    match receiver.await {
+        Ok(Acked::Admitted | Acked::Queued | Acked::Ignored) => {
             webhook::content_free(StatusCode::OK)
         }
-        Ok(Ok(Acked::Busy) | Err(_)) => {
+        Ok(Acked::Busy) | Err(_) => {
             refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE)
         }
-        Err(_) => refuse(state, Refusal::Timeout, StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
@@ -779,6 +778,32 @@ pub(crate) mod tests {
         )
     }
 
+    async fn routed_state() -> (StateData, mpsc::Receiver<TransportEvent>) {
+        let directory = crate::tests::temporary();
+        std::fs::write(
+            directory.path().join("dekopon.yaml"),
+            crate::tests::catalog_text(true, Some("reasoning")),
+        )
+        .expect("catalog");
+        let mut doc = crate::tests::document(directory.path());
+        doc["transports"][0] = json!({"kind":"githubWebhook", "name":"github",
+            "bind":"127.0.0.1:9080", "secretEnv":"PATH"});
+        doc["routes"][0]["transport"] = json!("github");
+        doc["routes"][0]["memory"] = json!({"mode":"oneShot"});
+        doc["routes"][0]["conversation"] = json!({"kind":["thread"],
+            "container":"owner", "ids":["owner.repo"]});
+        doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+        let resolved = crate::tests::load(directory.path(), &doc)
+            .await
+            .expect("config");
+        let catalog = dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml"))
+            .expect("catalog");
+        let routes = crate::routes::RoutingTable::bind(&resolved, &catalog).expect("route");
+        let (mut state, receiver) = state();
+        state.generation = CurrentGeneration::boot(Arc::new(routes), Arc::default());
+        (state, receiver)
+    }
+
     pub(crate) fn signed(body: &[u8], secret: &[u8], guid: &str, event: &str) -> Request {
         let digest: String = webhook::hmac_sha256(secret, body)
             .iter()
@@ -796,6 +821,69 @@ pub(crate) mod tests {
     pub(crate) fn pr() -> Value {
         json!({ "repository": {"id": 10, "owner": {"login": "Owner"}, "name": "Repo"}, "sender": {"id": 1},
             "action": "opened", "number": 7, "pull_request": { "head": {"sha": "a".repeat(40)} } })
+    }
+
+    #[tokio::test]
+    async fn delayed_headers_still_receive_503_when_admission_times_out() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (state, mut receiver) = routed_state().await;
+        let (capture, _guard) = crate::tests::capture_spans();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        let address = probe.local_addr().expect("address");
+        drop(probe);
+        let router = Router::new()
+            .route(CALLBACK, post(receive))
+            .with_state(state);
+        let mut server = tokio::task::JoinSet::new();
+        webhook::listen(address, router, "github".into(), &mut server)
+            .await
+            .expect("listen");
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let body = serde_json::to_vec(&pr()).expect("body");
+        let request = signed(&body, b"secret", "delayed-headers", "pull_request");
+        let mut headers = format!(
+            "POST {CALLBACK} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in request.headers() {
+            headers.push_str(&format!("{name}: {}\r\n", value.to_str().expect("header")));
+        }
+        headers.push_str("\r\n");
+        socket.write_all(headers.as_bytes()).await.expect("headers");
+        socket.write_all(&body).await.expect("body");
+        let TransportEvent::Delivery(_, ticket) = receiver.recv().await.expect("delivery") else {
+            panic!("admission ticket")
+        };
+        let mut response = String::new();
+        tokio::time::timeout(
+            webhook::WEBHOOK_REQUEST_TIMEOUT + Duration::from_secs(2),
+            socket.read_to_string(&mut response),
+        )
+        .await
+        .expect("bounded response")
+        .expect("read response");
+        assert_eq!(
+            response.lines().next(),
+            Some("HTTP/1.1 503 Service Unavailable")
+        );
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[
+                        ("event", "gateway_github_webhook_refused"),
+                        ("reason", "timeout")
+                    ]
+                )
+                .len(),
+            1
+        );
+        ticket.answer(Acked::Admitted);
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -947,28 +1035,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn duplicate_and_queue_full_never_record_unaccepted_identity() {
         use dekopon_test_support::Record;
-        let directory = crate::tests::temporary();
-        std::fs::write(
-            directory.path().join("dekopon.yaml"),
-            crate::tests::catalog_text(true, Some("reasoning")),
-        )
-        .expect("catalog");
-        let mut doc = crate::tests::document(directory.path());
-        doc["transports"][0] = json!({"kind":"githubWebhook", "name":"github",
-            "bind":"127.0.0.1:9080", "secretEnv":"PATH"});
-        doc["routes"][0]["transport"] = json!("github");
-        doc["routes"][0]["memory"] = json!({"mode":"oneShot"});
-        doc["routes"][0]["conversation"] = json!({"kind":["thread"],
-            "container":"owner", "ids":["owner.repo"]});
-        doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
-        let resolved = crate::tests::load(directory.path(), &doc)
-            .await
-            .expect("config");
-        let catalog = dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml"))
-            .expect("catalog");
-        let routes = crate::routes::RoutingTable::bind(&resolved, &catalog).expect("route");
-        let (mut state, _unused) = state();
-        state.generation = CurrentGeneration::boot(Arc::new(routes), Arc::default());
+        let (mut state, _unused) = routed_state().await;
         let (sender, mut receiver) = mpsc::channel(1);
         state.sender = sender;
         let (capture, _guard) = crate::tests::capture_spans();

@@ -91,7 +91,11 @@ pub(super) async fn listen(
                                       connection ended, by deadline or by hanging up; the \
                                       router already recorded whatever it answered"
                         )]
-                        let _ = tokio::time::timeout(WEBHOOK_REQUEST_TIMEOUT, connection).await;
+                        let _ = tokio::time::timeout(
+                            WEBHOOK_REQUEST_TIMEOUT + Duration::from_secs(1),
+                            connection,
+                        )
+                        .await;
                     });
                 }
                 Some(_) = connections.join_next(), if !connections.is_empty() => {}
