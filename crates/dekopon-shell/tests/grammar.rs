@@ -3815,7 +3815,7 @@ fn selected_modifier_words_preserve_their_quote_protection_and_assign_once() {
         output(
             r#"f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f ${x:-" a b "}; f ${x:-a\ b}; f ${x:=' a b '}; f ${x:+" c d "}; echo "[$x]"; f ${missing:-${also_missing:-" n o "}}; produce() { echo evaluated >&2; printf ' e f '; }; f ${y:=$(produce)}; echo "[$y]""#
         ),
-        "1\n< a b >\n1\n<a b>\n1\n< a b >\n1\n< c d >\n[ a b ]\n1\n< n o >\nevaluated\n2\n<e>\n<f>\n[ e f ]"
+        "1\n< a b >\n1\n<a b>\n2\n<a>\n<b>\n1\n< c d >\n[ a b ]\n1\n< n o >\nevaluated\n2\n<e>\n<f>\n[ e f ]"
     );
 }
 
@@ -3892,4 +3892,25 @@ fn local_array_expansions_keep_their_existing_element_words() {
         output(r#"v=$(printf '["a b","c d"]' | jq '.'); f() { local x=$v; echo "<$x>"; }; f"#),
         "<a b>"
     );
+}
+
+#[test]
+fn unquoted_all_positionals_split_each_parameter_independently() {
+    for expansion in ["$@", "${@}"] {
+        let script = format!(
+            r#"f() {{ echo $#; for word in "$@"; do echo "<$word>"; done; }}; g() {{ f {expansion}; f "{expansion}"; }}; g 'a b' c"#
+        );
+        assert_eq!(
+            output(&script),
+            "3\n<a>\n<b>\n<c>\n2\n<a b>\n<c>",
+            "{expansion}"
+        );
+    }
+}
+
+#[test]
+fn separator_only_expansions_do_not_spend_steps_per_byte() {
+    let script = format!("v='{}'; : $v", " ".repeat(131_072));
+    let outcome = run(&script);
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
 }

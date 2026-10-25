@@ -3534,26 +3534,42 @@ impl<'a> Evaluator<'a> {
         fields: &mut Vec<String>,
         separated: &mut bool,
     ) -> Result<Value, CommandFailure> {
-        if let Parameter::Named {
-            name,
-            indices,
-            modifier,
-            length: false,
-        } = parameter
-        {
-            self.budget.enter_nesting()?;
-            let result = self.named_parameter_value(
+        match parameter {
+            Parameter::Named {
                 name,
                 indices,
                 modifier,
-                Some(FieldExpansion { fields, separated }),
-            );
-            self.budget.leave_nesting();
-            return result;
+                length: false,
+            } => {
+                self.budget.enter_nesting()?;
+                let result = self.named_parameter_value(
+                    name,
+                    indices,
+                    modifier,
+                    Some(FieldExpansion { fields, separated }),
+                );
+                self.budget.leave_nesting();
+                result
+            }
+            Parameter::AllPositional => {
+                let values = self.positional().to_vec();
+                for (index, value) in values.iter().enumerate() {
+                    *separated |= index > 0;
+                    self.split_expansion(fields, separated, value)?;
+                }
+                Ok(Value::Array(values))
+            }
+            Parameter::Named { length: true, .. }
+            | Parameter::Positional(_)
+            | Parameter::AllPositionalJoined
+            | Parameter::PositionalCount
+            | Parameter::LastStatus
+            | Parameter::LastJob => {
+                let value = self.parameter_value(parameter)?;
+                self.split_expansion(fields, separated, &value)?;
+                Ok(value)
+            }
         }
-        let value = self.parameter_value(parameter)?;
-        self.split_expansion(fields, separated, &value)?;
-        Ok(value)
     }
 
     fn expand_selected_word(
@@ -3660,9 +3676,9 @@ impl<'a> Evaluator<'a> {
         text: &str,
     ) -> Result<(), CommandFailure> {
         for chunk in text.split_inclusive([' ', '\t', '\n']) {
-            self.budget.charge_step_with(self.invoker)?;
             let field = chunk.trim_end_matches([' ', '\t', '\n']);
             if !field.is_empty() {
+                self.budget.charge_step_with(self.invoker)?;
                 let bytes = (field.len() + size_of::<String>()) as u64;
                 self.expansion_charges
                     .push(self.budget.charge_value_bytes(bytes)?);
@@ -3806,7 +3822,7 @@ impl<'a> Evaluator<'a> {
                         "${{{name}[...]:=word}} cannot assign through an index; assign to {name} itself"
                     )));
                 }
-                let substitute = self.expand_selected_word(word, split.take())?;
+                let substitute = self.expand_selected_word(word, None)?;
                 self.assign(name, CommandResult::value(substitute.clone()))?;
                 substitute
             }
