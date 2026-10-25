@@ -8,6 +8,14 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Attachment inventory without a per-conversation cap (0.54.0)
+
+No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
+
+- A live conversation generation no longer drops attachments past 32 entries or after idle expiry. The `sessions.assetRetentionBytes` disk LRU is the only bound on retained bytes; one-shot inventories keep their one-hour idle bound.
+- The gateway sends no metadata rows on `Invoke`. A 0.54.0 broker still accepts them from older clients.
+- Rust callers: `dekopon_shell::run_parsed` and `dekopon_agent::command_run_from_outcome` are removed.
+
 ## Space-scoped storage and the config-check catalog mount (0.53.0)
 
 No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
