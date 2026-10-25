@@ -264,6 +264,14 @@ A span's status is only what its own code sets through `otel.status_code`: an `e
 event inside the span never becomes the status or its description, and an error-level event marks
 the span `Error` without a description.
 
+## Unmapped sender notices
+
+`gateway.session.rejected` is the owner-notice audit event for a freshly broker-confirmed unmapped sender. Its typed fields are `transport` (configured transport name, string), `route` (route index, integer), `conversation.kind` and `conversation.id` (strings), `conversation.container` and `conversation.thread` (strings, empty when absent), `subject` (canonical attested platform subject, string), and `reason` (`unmapped-subject`, string). The log timestamp records when the refusal happened. The record contains no message text. It is emitted before attempting the fixed gateway reply and shares the refusal trace.
+
+Every broker-confirmed unmapped refusal emits a notice, including repeats and unrelated strangers during the reply cooldown. The incoming transport rate bounds notice volume, and the existing session gate bounds simultaneous broker/refusal work. Only replies share a gateway-wide one-per-second slot. That slot retains a timestamp, and each attempt still asks the broker afresh. There is no delayed send, identity cache or retry. A fresh process starts with an available reply slot, and the serving path never waits for a telemetry exporter.
+
+Mapped agent-permission refusals emit one structured `gateway_session_rejected` record with message `gateway.session.rejected`, carrying the same typed transport, route, conversation and subject fields listed above, and `reason=agent-denied` or `unauthorized` for an empty grant. These records contain no message text and omit the `audit.event` owner-notice selector; only unmapped strangers trigger owner notices. Other authentication failures retain their existing behavior. OpenObserve alert routing and delivery are the homelab's responsibility; the notice is best-effort telemetry, not a DM or channel post.
+
 ## The broker audit record
 
 Every broker decision is one structured log record, emitted from inside the span that made it and
@@ -1016,12 +1024,7 @@ the refresh failure classes remain part of the migration contract.
 
 Reload outcomes are emitted once per distinct settled raw candidate, identified privately by source paths and bytes, never by a published serving digest. Re-observing the same broken source does not repeat a warn; a distinct edit or repair followed by a break yields another outcome. Operational reload refusal `error` flattens aggregate validation problems before rendering at most eight individual problems of at most 512 bytes each (on UTF-8 boundaries), followed by `and N more` for omitted problems. Flattened problems use each problem's own description, never its nested source chain. An unflattened gateway problem, such as an unreadable or insecure configuration file or a fragment failure, renders its source chain of I/O, file-hygiene and fragment errors, which names paths and reasons but never file bytes. Boot and `check` have independent diagnostic rendering. Owner-configured file paths and fixed hygiene reasons remain actionable; invalid credential names, environment names, endpoint values and vendor diagnostics are not echoed.
 
-`broker_capabilities_refused` exists because an attested `capabilities` and an attested `runCommand`
-answer a refused caller with the same opaque nothing whatever went wrong — a distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and
-an unknown command word would disclose the surface the refusal withheld. The class, its determining
-policies, and the canonical subject land on the broker's own side of the socket, which is what makes
-bootstrapping an `identityMapping` for a new sender possible without reading the subject out of a
-gateway span. It marks refusals, not traffic: an honored session emits nothing.
+`broker_capabilities_refused` records the refusal class, determining policies, canonical subject, agent and attesting peer on the broker side. Session inspection returns a typed unmapped or agent-denied cause only within the peer's attestor namespaces; outside those namespaces the wire refusal remains opaque whether the subject is mapped or not. Other authentication and policy-error refusals remain opaque. A refused `runCommand` also withholds its command surface. The gateway emits its owner-notice audit record only for the typed unmapped session cause. An honored inspection emits no refusal record.
 
 A chat-scoped `invoke` and `recordDeliveredTurn` withhold the same fact for the same reason, but
 they are accounted decisions rather than unanswered inspections, so the peer receives a `Denied`

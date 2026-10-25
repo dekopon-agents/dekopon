@@ -564,8 +564,8 @@ where
             if !claim_is_valid(attestation.as_ref(), None) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            match broker.capability_surface(context, peer.attestor.as_ref(), attestation.as_ref()) {
-                Some((capabilities, command_words, command_word_help, chat_memory)) => {
+            match broker.session_surface(context, peer.attestor.as_ref(), attestation.as_ref()) {
+                Ok((capabilities, command_words, command_word_help, chat_memory)) => {
                     ResponseEnvelope::chat_capabilities(
                         capabilities,
                         command_words,
@@ -576,19 +576,17 @@ where
                             .and_then(|claim| broker.display_principal(&claim.subject)),
                     )
                 }
-                None if attestation
-                    .as_ref()
-                    .is_some_and(|claim| broker.console_real_scope_refused(context, claim)) =>
+                Err(_)
+                    if attestation
+                        .as_ref()
+                        .is_some_and(|claim| broker.console_real_scope_refused(context, claim)) =>
                 {
                     ResponseEnvelope::error(
                         ERROR_UNAUTHENTICATED,
                         dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL,
                     )
                 }
-                None => ResponseEnvelope::error(
-                    ERROR_UNAUTHENTICATED,
-                    "attestation refused: no attestor authority for this subject",
-                ),
+                Err(refusal) => ResponseEnvelope::session_refused(&refusal.session),
             }
         }
         BrokerRequest::RunCommand {

@@ -2387,8 +2387,6 @@ where
         })
     }
 
-    /// A refused caller's answer must stay None, distinct from Some with an empty list; answering
-    /// either way with an empty list would tell an unmapped subject that it is unmapped.
     #[must_use]
     #[allow(clippy::type_complexity, reason = "see capability_view")]
     pub fn capability_surface(
@@ -2402,14 +2400,32 @@ where
         BTreeMap<String, String>,
         Option<ChatMemorySurface>,
     )> {
+        self.session_surface(peer, grant, attestation).ok()
+    }
+
+    #[allow(clippy::type_complexity, reason = "see capability_view")]
+    pub fn session_surface(
+        &self,
+        peer: &AuthenticatedContext,
+        grant: Option<&AttestorGrant>,
+        attestation: Option<&Attestation>,
+    ) -> Result<
+        (
+            Vec<AvailableCapability>,
+            Vec<String>,
+            BTreeMap<String, String>,
+            Option<ChatMemorySurface>,
+        ),
+        Refusal,
+    > {
         let Some(claim) = attestation else {
             let (capabilities, words, help) = self.capability_view(peer);
-            return Some((capabilities, words, help, None));
+            return Ok((capabilities, words, help, None));
         };
         let (context, refusal) = self.resolve_context(peer, grant, claim);
         if let Some(refusal) = refusal {
             report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
-            return None;
+            return Err(refusal);
         }
         let (mut capabilities, mut words, mut help) = self.capability_view(&context);
         let memory = self.memory_surface(&context, &claim.agent);
@@ -2418,8 +2434,14 @@ where
                 CapabilityRoute::ChatMemoryRecent,
                 CapabilityRoute::ChatMemorySearch,
             ] {
-                let (capability, _) = self.constraints.routed(route)?;
-                capabilities.push(self.available_capability(capability)?);
+                let (capability, _) = self
+                    .constraints
+                    .routed(route)
+                    .ok_or_else(|| unevaluated_refusal("memory-route-unavailable"))?;
+                capabilities.push(
+                    self.available_capability(capability)
+                        .ok_or_else(|| unevaluated_refusal("memory-route-unavailable"))?,
+                );
             }
             capabilities.sort_by(|left, right| left.capability.id.cmp(&right.capability.id));
             let chat_memory_words = self.chat_memory_words();
@@ -2428,7 +2450,7 @@ where
             words.sort();
             words.dedup();
         }
-        Some((capabilities, words, help, memory))
+        Ok((capabilities, words, help, memory))
     }
 
     pub async fn invoke(
@@ -2444,9 +2466,6 @@ where
             None => (peer.clone(), None),
         };
         let chat = attestation.filter(|claim| claim.scope.is_some());
-        // The refusal class belongs to the operator, not the caller: a chat peer able to
-        // distinguish denial classes could read the subject directory and agent grants out of its
-        // own refusals, so every one collapses to the same literal.
         if chat.is_some() {
             refusal = refusal.map(|refusal| {
                 if refusal.reason == CONSOLE_REAL_SCOPE_REASON {
@@ -2577,7 +2596,11 @@ where
             return (refused(), Some(console_real_scope_refusal()));
         }
         let Some(principal) = self.identities.resolve(&claim.subject) else {
-            return (refused(), Some(unevaluated_refusal("unmapped-subject")));
+            let mut refusal = unevaluated_refusal("unmapped-subject");
+            if grant.permits(&claim.subject) {
+                refusal.session = dekopon_broker_protocol::SessionRefusal::UnmappedSubject;
+            }
+            return (refused(), Some(refusal));
         };
         let actor = Actor::Agent {
             agent: claim.agent.clone(),
@@ -2627,7 +2650,14 @@ where
         if decision.allowed {
             (context, None)
         } else {
-            (context, Some(decided_refusal(decision, "agent-denied")))
+            let named_denial = !decision.errors_present;
+            let mut refusal = decided_refusal(decision, "agent-denied");
+            if named_denial {
+                refusal.session = dekopon_broker_protocol::SessionRefusal::AgentDenied {
+                    principal: principal.clone(),
+                };
+            }
+            (context, Some(refusal))
         }
     }
 
@@ -4314,6 +4344,7 @@ fn console_smoke_delivery(
 }
 
 pub struct Refusal {
+    pub session: dekopon_broker_protocol::SessionRefusal,
     pub reason: &'static str,
     wire: &'static str,
     pub policy_ids: Vec<String>,
@@ -4341,6 +4372,7 @@ impl Refusal {
 
 const fn console_real_scope_refusal() -> Refusal {
     Refusal {
+        session: dekopon_broker_protocol::SessionRefusal::Other,
         reason: CONSOLE_REAL_SCOPE_REASON,
         wire: CONSOLE_REAL_SCOPE_REFUSAL,
         policy_ids: Vec::new(),
@@ -4350,6 +4382,7 @@ const fn console_real_scope_refusal() -> Refusal {
 
 const fn unevaluated_refusal(reason: &'static str) -> Refusal {
     Refusal {
+        session: dekopon_broker_protocol::SessionRefusal::Other,
         reason,
         wire: reason,
         policy_ids: Vec::new(),
@@ -4359,6 +4392,7 @@ const fn unevaluated_refusal(reason: &'static str) -> Refusal {
 
 fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal {
     Refusal {
+        session: dekopon_broker_protocol::SessionRefusal::Other,
         reason,
         wire: reason,
         policy_ids,
