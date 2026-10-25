@@ -252,8 +252,8 @@ pub enum Modifier {
 pub enum Conditional {
     Test(ConditionalTest),
     Not(Box<Conditional>),
-    And(Box<Conditional>, Box<Conditional>),
-    Or(Box<Conditional>, Box<Conditional>),
+    And(Vec<Conditional>),
+    Or(Vec<Conditional>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,7 +271,66 @@ pub enum Pattern {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum ArithExpr {
+pub struct ArithExpr {
+    node: ArithNode,
+    height: Height,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Height(u32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ArithTooDeep;
+
+impl ArithExpr {
+    pub(crate) fn integer(value: i64) -> Self {
+        Self {
+            node: ArithNode::Integer(value),
+            height: Height(0),
+        }
+    }
+    pub(crate) fn float(value: f64) -> Self {
+        Self {
+            node: ArithNode::Float(value),
+            height: Height(0),
+        }
+    }
+    pub(crate) fn variable(value: String) -> Self {
+        Self {
+            node: ArithNode::Variable(value),
+            height: Height(0),
+        }
+    }
+    pub(crate) fn unary(op: ArithUnaryOp, operand: Self) -> Result<Self, ArithTooDeep> {
+        let height = operand.height.next()?;
+        Ok(Self {
+            node: ArithNode::Unary(op, Box::new(operand)),
+            height,
+        })
+    }
+    pub(crate) fn binary(op: ArithBinaryOp, left: Self, right: Self) -> Result<Self, ArithTooDeep> {
+        let height = Height(left.height.0.max(right.height.0)).next()?;
+        Ok(Self {
+            node: ArithNode::Binary(op, Box::new(left), Box::new(right)),
+            height,
+        })
+    }
+    pub(crate) fn node(&self) -> &ArithNode {
+        &self.node
+    }
+}
+
+impl Height {
+    fn next(self) -> Result<Self, ArithTooDeep> {
+        if self.0 >= 64 {
+            return Err(ArithTooDeep);
+        }
+        Ok(Self(self.0 + 1))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ArithNode {
     Integer(i64),
     Float(f64),
     Variable(String),

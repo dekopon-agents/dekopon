@@ -983,6 +983,7 @@ async fn resolve_provider_set(
         },
         plaintext_loopback_registries: Vec::new(),
     })
+    .await
     .map_err(BrokerdError::ProviderSet)?;
     manager.sync().await.map_err(BrokerdError::ProviderSet)?;
     manager

@@ -3914,3 +3914,48 @@ fn separator_only_expansions_do_not_spend_steps_per_byte() {
     let outcome = run(&script);
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
 }
+
+#[test]
+fn conditional_chains_build_evaluate_and_drop_on_a_two_mib_stack() {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                for (terms, separator, expected) in [
+                    (vec!["-n a"; 10_000], " && ", 0),
+                    (vec!["-z a"; 10_000], " || ", 1),
+                    (vec!["-z a || -n a && -n a"; 10_000], " || ", 0),
+                    (vec!["-n a && -z a"; 10_000], " || ", 1),
+                ] {
+                    let script = format!("[[ {} ]]", terms.join(separator));
+                    let outcome = run(&script);
+                    assert_eq!(outcome.exit_code.get(), expected, "{}", outcome.output);
+                }
+                for script in [
+                    format!("[[ {} && ]]", vec!["-n a"; 10_000].join(" && ")),
+                    format!("[[ {} || ]]", vec!["-n a"; 10_000].join(" || ")),
+                ] {
+                    assert_eq!(run(&script).exit_code, ExitCode::SYNTAX);
+                }
+            })
+            .expect("spawn conditional thread")
+            .join()
+            .expect("join conditional thread");
+    });
+}
+
+#[test]
+fn conditional_chains_preserve_precedence_short_circuiting_and_steps() {
+    for (script, expected, steps) in [
+        ("[[ -n a || -z a && -z a ]]", 0, 5),
+        ("[[ -z a && -n a || -n a ]]", 0, 7),
+        ("[[ -z a && -n a && -n a ]]", 1, 6),
+        ("[[ -n a || -n a || -n a ]]", 0, 6),
+        ("[[ -n a || 1 -eq invalid ]]", 0, 5),
+        ("[[ -z a && 1 -eq invalid ]]", 1, 5),
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code.get(), expected, "{script}");
+        assert_eq!(outcome.steps, steps, "{script}");
+    }
+}

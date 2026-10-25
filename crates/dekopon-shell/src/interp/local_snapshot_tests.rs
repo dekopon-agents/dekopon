@@ -35,6 +35,7 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
     let limits = Limits::default();
     let invoker = NoCalls;
     let mut parent = Evaluator {
+        nesting: super::nesting::Nesting::root(),
         invoker: &invoker,
         budget: Budget::start_tree(limits, TreeContext::new(limits, CallBudget::new(1))),
         limits,
