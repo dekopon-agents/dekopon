@@ -1,8 +1,9 @@
 use super::{Evaluator, ShellOptions, telemetry};
 use crate::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandProposal, TreeContext,
-    limits::{Budget, Limits, OutputBuffer},
+    CapabilityCallResult, CapabilityInvoker, CommandProposal,
+    limits::{Budget, OutputBuffer},
 };
+use dekopon_process::{CallBudget, Limits, TreeContext};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -18,7 +19,7 @@ impl CapabilityInvoker for NoCalls {
         &self,
         _proposal: CommandProposal,
         _streams: crate::Streams,
-        _tree: &crate::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         crate::secret_use_unsupported()
     }
@@ -70,7 +71,9 @@ fn chain(n: usize, open: &str, close: &str) -> String {
 
 fn assert_recursion_refusal(error: super::FatalError) {
     match error {
-        super::FatalError::Limit(crate::limits::LimitExceeded::RecursionDepth { maximum: 32 }) => {}
+        super::FatalError::Limit(dekopon_process::LimitExceeded::RecursionDepth {
+            maximum: 32,
+        }) => {}
         other @ (super::FatalError::Limit(_)
         | super::FatalError::Unsupported(_)
         | super::FatalError::Assertion(_)) => {
@@ -92,8 +95,9 @@ fn runtime_paths_preserve_their_measured_ceilings() {
             .execute_program(&program)
             .expect_err("one past ceiling");
         assert_recursion_refusal(error);
-        let error =
-            super::FatalError::Limit(crate::limits::LimitExceeded::RecursionDepth { maximum: 32 });
+        let error = super::FatalError::Limit(dekopon_process::LimitExceeded::RecursionDepth {
+            maximum: 32,
+        });
         assert_eq!(evaluator.report_fatal(&error), crate::ExitCode::SYNTAX);
         assert_eq!(
             evaluator.output.render(),
@@ -137,7 +141,7 @@ fn nested_errors_refund_depth_and_pipeline_stages_inherit_it() {
     assert!(matches!(
         refused,
         Err(super::FatalError::Limit(
-            crate::limits::LimitExceeded::RecursionDepth { maximum: 2 }
+            dekopon_process::LimitExceeded::RecursionDepth { maximum: 2 }
         ))
     ));
     evaluator
@@ -151,7 +155,7 @@ fn nested_errors_refund_depth_and_pipeline_stages_inherit_it() {
                 assert!(matches!(
                     child.nested(|_| Ok::<_, super::FatalError>(())),
                     Err(super::FatalError::Limit(
-                        crate::limits::LimitExceeded::RecursionDepth { maximum: 2 }
+                        dekopon_process::LimitExceeded::RecursionDepth { maximum: 2 }
                     ))
                 ));
                 Ok::<_, super::FatalError>(())
@@ -180,7 +184,7 @@ fn refused_substitution_keeps_its_enclosing_capture() {
         .expect_err("admission refused");
     match error {
         super::CommandFailure::Fatal(super::FatalError::Limit(
-            crate::limits::LimitExceeded::RecursionDepth { maximum: 0 },
+            dekopon_process::LimitExceeded::RecursionDepth { maximum: 0 },
         )) => {}
         super::CommandFailure::Fatal(_) | super::CommandFailure::Status { .. } => {
             panic!("unexpected error: {error:?}")

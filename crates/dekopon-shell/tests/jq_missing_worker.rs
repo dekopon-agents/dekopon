@@ -1,4 +1,5 @@
-use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter, Limits};
+use dekopon_process::Limits;
+use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter};
 
 struct Invoker;
 impl CapabilityInvoker for Invoker {
@@ -9,7 +10,7 @@ impl CapabilityInvoker for Invoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }

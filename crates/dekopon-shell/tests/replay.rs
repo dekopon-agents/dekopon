@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
 
+use dekopon_process::Limits;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter, Limits,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter,
 };
 use serde_json::{Value, json};
 
@@ -19,6 +20,10 @@ impl CapabilityInvoker for Replay {
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    fn command_word_help(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([("python".to_owned(), "ok\n".to_owned())])
     }
 
     fn has_command_word(&self, word: &str) -> bool {
@@ -50,7 +55,7 @@ impl CapabilityInvoker for Replay {
         &self,
         proposal: CommandProposal,
         mut streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         if let Some(stdin) = streams.stdin.take() {
             let mut text = String::new();
@@ -129,10 +134,7 @@ fn nestedset_and_gylmar() -> [Recipe; 5] {
         Recipe {
             name: "R5 ville python help and code",
             script: "python --help; python -c 'result = 1'",
-            calls: vec![
-                call("python", &["--help"], None),
-                call("python", &["-c", "result = 1"], None),
-            ],
+            calls: vec![call("python", &["-c", "result = 1"], None)],
             output: "ok\nok",
         },
     ]

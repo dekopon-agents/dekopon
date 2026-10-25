@@ -3,11 +3,12 @@ use std::cmp::Ordering;
 use clap::{Arg, ArgAction, Command};
 
 use crate::{
-    CapabilityInvoker, ExitCode, RetainedBytes,
+    CapabilityInvoker, ExitCode,
     builtins::{CommandFailure, parse_flags},
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
+use dekopon_process::RetainedBytes;
 
 use super::cut::Selection;
 
@@ -555,7 +556,8 @@ fn number(line: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{builtins::test_support::NoCapabilities, limits::Limits};
+    use crate::builtins::test_support::NoCapabilities;
+    use dekopon_process::Limits;
 
     #[test]
     fn completed_uniq_run_drops_its_allocation_before_refunding() {

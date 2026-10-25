@@ -25,7 +25,7 @@ use dekopon_broker_protocol::{
     Attestation, ChatScopeClaim, ClientError, ConversationKind, DeliveredAnswer,
     DeliveredTurnRequest, DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT,
     ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
-    InvocationOutcome, InvocationResult,
+    InvocationOutcome, InvocationResult, SessionRefusal,
 };
 use dekopon_core::{ExternalSubject, PrincipalId};
 use dekopon_model::error::InferenceError;
@@ -36,8 +36,8 @@ use dekopon_model::{
     model::{ChatModel, CompletionOptions},
     openai::OpenAiClient,
 };
-use dekopon_process::{CancelHandle, CancelSignal};
-use dekopon_shell::{CallBudget, CapabilityInvoker as _, Limits as ShellLimits};
+use dekopon_process::{CallBudget, CancelHandle, CancelSignal, Limits as ShellLimits};
+use dekopon_shell::CapabilityInvoker as _;
 use futures_util::StreamExt as _;
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -66,6 +66,9 @@ use crate::{
     },
     wake::{Anchor, SessionWakes},
 };
+
+pub(crate) const UNMAPPED_REPLY: &str =
+    "I only talk to the Lange family. I've let my owner know you stopped by.";
 
 pub(crate) const UNAUTHORIZED_REPLY: &str = "You're not authorized to use this agent.";
 pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
@@ -462,6 +465,7 @@ pub(crate) const MAX_INTERRUPTS: u8 = 8;
 
 #[derive(Clone)]
 pub(crate) struct SessionGate {
+    stranger_reply: Arc<Mutex<Option<tokio::time::Instant>>>,
     permits: Arc<Semaphore>,
     refusals: Arc<Semaphore>,
     in_flight: Arc<Mutex<BTreeMap<AdmissionKey, Holder>>>,
@@ -593,8 +597,19 @@ fn record_admission(
 }
 
 impl SessionGate {
+    fn stranger_reply(&self) -> bool {
+        let mut last = self.stranger_reply.lock();
+        let now = tokio::time::Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1)) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
     pub fn new(max_concurrent: usize) -> Self {
         Self {
+            stranger_reply: Arc::default(),
             permits: Arc::new(Semaphore::new(max_concurrent)),
             refusals: Arc::new(Semaphore::new(max_concurrent)),
             in_flight: Arc::default(),
@@ -1670,6 +1685,10 @@ async fn execute(
     }
 }
 
+fn permission_reply(principal: &PrincipalId) -> String {
+    format!("Sorry {principal}, you don't have permission for this agent.")
+}
+
 async fn acknowledge_steer(
     driver: &dyn ChatDriver,
     target: Option<&crate::transport::LivenessTarget>,
@@ -1890,6 +1909,69 @@ async fn session(
     }
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
+        Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::SessionRefused(
+            refusal,
+        )))) => {
+            revoke_thread_ownership(runner, message);
+            let reply = match refusal {
+                SessionRefusal::UnmappedSubject => {
+                    tracing::info!(
+                        audit.event = "gateway.session.rejected",
+                        event = "gateway_session_rejected",
+                        transport = message.transport.as_str(),
+                        route = route.route_index,
+                        conversation.kind = message.conversation.kind.as_str(),
+                        conversation.container = message
+                            .conversation
+                            .container
+                            .as_deref()
+                            .unwrap_or_default(),
+                        conversation.id = message.conversation.id.as_str(),
+                        conversation.thread =
+                            message.conversation.thread.as_deref().unwrap_or_default(),
+                        subject = message.subject.canonical(),
+                        reason = "unmapped-subject",
+                        "gateway.session.rejected"
+                    );
+                    if !runner.gate.stranger_reply() {
+                        return MessageOutcome::Unauthorized.into();
+                    }
+                    UNMAPPED_REPLY.to_owned()
+                }
+                SessionRefusal::AgentDenied { principal } => {
+                    tracing::info!(
+                        event = "gateway_session_rejected",
+                        transport = message.transport.as_str(),
+                        route = route.route_index,
+                        conversation.kind = message.conversation.kind.as_str(),
+                        conversation.container = message
+                            .conversation
+                            .container
+                            .as_deref()
+                            .unwrap_or_default(),
+                        conversation.id = message.conversation.id.as_str(),
+                        conversation.thread =
+                            message.conversation.thread.as_deref().unwrap_or_default(),
+                        subject = message.subject.canonical(),
+                        reason = "agent-denied",
+                        "gateway.session.rejected"
+                    );
+                    permission_reply(&principal)
+                }
+                SessionRefusal::Other => {
+                    tracing::info!(
+                        event = "gateway_session_rejected",
+                        reason = "attestation-refused",
+                        "gateway.session.rejected"
+                    );
+                    UNAUTHORIZED_REPLY.to_owned()
+                }
+            };
+            if !is_follow && answer(driver, message, &reply).await {
+                reply_delivered(MessageOutcome::Unauthorized);
+            }
+            return MessageOutcome::Unauthorized.into();
+        }
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
             code, ..
         }))) if code == ERROR_UNAUTHENTICATED => {
@@ -1929,10 +2011,24 @@ async fn session(
             .remove(&key, EvictionReason::GrantChanged);
         tracing::info!(
             event = "gateway_session_rejected",
+            transport = message.transport.as_str(),
+            route = route.route_index,
+            conversation.kind = message.conversation.kind.as_str(),
+            conversation.container = message
+                .conversation
+                .container
+                .as_deref()
+                .unwrap_or_default(),
+            conversation.id = message.conversation.id.as_str(),
+            conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
+            subject = message.subject.canonical(),
             reason = "unauthorized",
             "gateway.session.rejected"
         );
-        if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
+        let reply = leg
+            .principal()
+            .map_or_else(|| UNAUTHORIZED_REPLY.to_owned(), permission_reply);
+        if !is_follow && answer(driver, message, &reply).await {
             reply_delivered(MessageOutcome::Unauthorized);
         }
         return MessageOutcome::Unauthorized.into();
@@ -3173,6 +3269,16 @@ impl SessionError {
 #[cfg(test)]
 mod model_factory_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stranger_replies_share_one_global_slot_and_expire_without_a_backlog() {
+        let gate = SessionGate::new(4);
+        assert!(gate.stranger_reply());
+        assert!(!gate.clone().stranger_reply());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(gate.clone().stranger_reply());
+        assert!(!gate.stranger_reply());
+    }
 
     #[test]
     fn the_real_factory_constructs_openrouter_and_preserves_its_authored_controls() {

@@ -62,8 +62,9 @@
 //! use std::io::Write;
 //!
 //! use dekopon_shell::{
-//!     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits, Streams,
+//!     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Streams,
 //! };
+//! use dekopon_process::Limits;
 //! use serde_json::json;
 //!
 //! /// One provider word, `probe`, whose `upper --text <s>` proposes `cli-probe.upper`.
@@ -106,7 +107,7 @@
 //!         &self,
 //!         proposal: dekopon_shell::CommandProposal,
 //!         streams: Streams,
-//!         _tree: &dekopon_shell::TreeContext,
+//!         _tree: &dekopon_process::TreeContext,
 //!     ) -> CapabilityCallResult {
 //!         let dekopon_shell::CommandProposal { capability, input, secret_use, .. } = proposal;
 //!         if secret_use.is_some() {
@@ -161,15 +162,9 @@ mod parser;
 mod pipe;
 mod proposal;
 pub use proposal::{CommandProposal, CommandReport, CommandReportOutcome};
-mod tree;
-pub use tree::{CallBudget, RetainedBytes, TreeContext};
 pub mod value;
 
-pub use limits::{
-    DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS, DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT,
-    Limits,
-};
+use dekopon_process::{CallBudget, Limits, TreeContext};
 
 use dekopon_core::{ProviderFailureDetail, SecretUseProposal};
 
@@ -257,6 +252,119 @@ pub enum CommandRun {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Arg {
+    Text(String),
+    Asset(dekopon_core::AssetNumber),
+}
+
+impl std::fmt::Display for Arg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => formatter.write_str(text),
+            Self::Asset(number) => number.fmt(formatter),
+        }
+    }
+}
+
+pub struct RunCall {
+    pub word: String,
+    pub argv: Vec<Arg>,
+}
+
+pub enum RunResult {
+    Invoked {
+        capability: String,
+        input: Value,
+        secret_use: Option<SecretUseProposal>,
+        result: CapabilityCallResult,
+    },
+    Returned(CapabilityCallResult),
+    Uncertain(CapabilityCallResult),
+}
+
+pub fn render_command(streams: Streams, stdout: &str, stderr: String, status: u8) -> RunResult {
+    use std::io::Write as _;
+    let mut output = std::os::unix::net::UnixStream::from(streams.stdout);
+    if let Err(error) = output.write_all(stdout.as_bytes()) {
+        tracing::warn!(
+            event = "shell_command_stdout_failed",
+            error.kind = ?error.kind(),
+            errno = error.raw_os_error(),
+            "shell.command_stdout.failed"
+        );
+        return RunResult::Returned(CapabilityCallResult::Failed {
+            error: "command stdout could not be written".to_owned(),
+            detail: None,
+        });
+    }
+    RunResult::Returned(match std::num::NonZeroU8::new(status) {
+        Some(status) => CapabilityCallResult::Exited { status, stderr },
+        None if stderr.is_empty() => CapabilityCallResult::Succeeded,
+        None => CapabilityCallResult::SucceededWithStderr(stderr),
+    })
+}
+
+pub fn run_parsed<I: CapabilityInvoker + ?Sized>(
+    invoker: &I,
+    call: RunCall,
+    parsed: Option<CommandRun>,
+    streams: Streams,
+    tree: &TreeContext,
+) -> RunResult {
+    match parsed {
+        Some(CommandRun::Proposed {
+            capability,
+            input,
+            secret_use,
+            report,
+        }) => {
+            if !invoker.is_granted(&capability) {
+                return render_command(
+                    streams,
+                    "",
+                    format!(
+                        "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                        call.word, capability
+                    ),
+                    127,
+                );
+            }
+            let mut proposal =
+                CommandProposal::new(capability.clone(), input.clone(), secret_use.clone());
+            proposal.report = report;
+            let result = invoker.invoke(proposal, streams, tree);
+            RunResult::Invoked {
+                capability,
+                input,
+                secret_use,
+                result,
+            }
+        }
+        Some(CommandRun::Rendered {
+            stdout,
+            stderr,
+            status,
+        }) => render_command(streams, &stdout, stderr, status),
+        Some(CommandRun::Failed { message }) => render_command(streams, "", message, 2),
+        Some(CommandRun::Errored { message }) => {
+            RunResult::Returned(CapabilityCallResult::Failed {
+                error: message,
+                detail: None,
+            })
+        }
+        Some(CommandRun::Denied { reason }) => {
+            RunResult::Returned(CapabilityCallResult::Denied { reason })
+        }
+        None => render_command(
+            streams,
+            "",
+            format!("dekopon-shell: {}: command not found\n", call.word),
+            127,
+        ),
+    }
+}
+
 pub trait CapabilityInvoker: Send + Sync {
     fn cancelled(&self) -> bool {
         false
@@ -287,6 +395,16 @@ pub trait CapabilityInvoker: Send + Sync {
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         let _ = (word, argv, stdin_piped);
         None
+    }
+
+    fn run(&self, call: RunCall, streams: Streams, tree: &TreeContext) -> RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let parsed = self.run_command(&call.word, &argv, streams.stdin.is_some());
+        run_parsed(self, call, parsed, streams, tree)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -348,6 +466,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.as_ref().run_command(word, argv, stdin_piped)
+    }
+
+    fn run(&self, call: RunCall, streams: Streams, tree: &TreeContext) -> RunResult {
+        self.as_ref().run(call, streams, tree)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -540,9 +662,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CallBudget, CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
-        ExitCode, Interpreter, Limits, TreeContext,
+        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+        Interpreter,
     };
+    use dekopon_process::{CallBudget, Limits, TreeContext};
 
     #[derive(Default)]
     struct RecordingInvoker {
@@ -611,7 +734,7 @@ mod tests {
             &self,
             proposal: super::CommandProposal,
             streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let input = proposal.input;
             let secret_use = proposal.secret_use;
@@ -637,7 +760,7 @@ mod tests {
             &self,
             _: super::CommandProposal,
             _streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -655,7 +778,7 @@ mod tests {
         assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
         assert_eq!(
             super::interp::telemetry::fatal_outcome(&super::builtins::FatalError::Limit(
-                super::limits::LimitExceeded::Cancelled
+                dekopon_process::LimitExceeded::Cancelled
             )),
             "cancelled"
         );
@@ -906,7 +1029,10 @@ mod tests {
             shared.invoke(
                 super::CommandProposal::new("http-probe.fetch", json!({"url": "https://x"}), None),
                 streams().0,
-                &crate::TreeContext::new(crate::Limits::default(), crate::CallBudget::new(64))
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
+                )
             ),
             CapabilityCallResult::Succeeded
         );
@@ -914,7 +1040,10 @@ mod tests {
             shared.invoke(
                 super::CommandProposal::new("http-probe.fetch", json!({}), Some(proposal())),
                 streams().0,
-                &crate::TreeContext::new(crate::Limits::default(), crate::CallBudget::new(64))
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
+                )
             ),
             CapabilityCallResult::Succeeded
         );
@@ -1002,7 +1131,7 @@ mod tests {
             &self,
             proposal: super::CommandProposal,
             streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
@@ -1068,7 +1197,7 @@ mod tests {
             &self,
             _proposal: super::CommandProposal,
             streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             if self.read {
                 let Some(fd) = streams.stdin else {
@@ -1184,7 +1313,7 @@ mod tests {
             &self,
             _proposal: super::CommandProposal,
             _streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             panic!("the provider panicked with idle inherited stdin")
         }
@@ -1269,3 +1398,6 @@ mod tests {
         assert_eq!(ExitCode::from_script_exit(-1).get(), 255);
     }
 }
+
+#[cfg(test)]
+mod asset_tests;

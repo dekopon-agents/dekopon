@@ -152,7 +152,7 @@ impl Pattern {
         &self,
         line: &str,
         budget: &crate::limits::Budget,
-    ) -> Result<bool, crate::limits::LimitExceeded> {
+    ) -> Result<bool, dekopon_process::LimitExceeded> {
         let (needle, anchored_start, anchored_end, ignore_case) = match self {
             Self::Extended(regex) => return Ok(regex.is_match(line)),
             Self::Literal {
@@ -185,7 +185,7 @@ impl Pattern {
     fn matches(&self, line: &str) -> bool {
         self.matches_charged(
             line,
-            &crate::limits::Budget::start(crate::limits::Limits::default()),
+            &crate::limits::Budget::start(dekopon_process::Limits::default()),
         )
         .expect("test pattern fits the default retention budget")
     }

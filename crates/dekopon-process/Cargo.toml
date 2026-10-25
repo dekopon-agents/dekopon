@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-process"
-description = "Latched cancellation signals for Dekopon frontends"
+description = "Cancellation and shared script-tree accounting for Dekopon frontends"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/dekopon-process"
 readme = "README.md"
-keywords = ["async", "cancellation", "tokio"]
+keywords = ["async", "cancellation", "limits", "tokio"]
 categories = ["asynchronous"]
 include = ["src/**", "README.md", "Cargo.toml"]
 

@@ -52,6 +52,8 @@ A model or repository document cannot self-assert a trusted `Actor`. For the loc
 
 Attested proposals are the one sanctioned indirection, and they are narrow. A peer whose owner-configured identity carries an `attestor` grant may attach a typed `Attestation` naming a canonical external subject (`slack.t0123abc.u9xyz`, `slack.<team>.<channel>`, `discord.123456789012345678`, `discord.<guild>.<channel>`, `whatsapp.16034700182`, `tel.16034700182`, `github.owner.repo`) alongside its proposal. A channel subject maps a space, which the broker derives from the attested conversation and which narrows every decision in its channel and threads by requiring both principals to allow. Chat subjects carry names verified by their chat service; a GitHub repo subject is derived only after the gateway verifies the webhook's raw-body HMAC, not from a purported sender, header or repository text before verification. The gateway mounts GitHub only with a nonblank HMAC secret; configuration alone authenticates nobody. For a GitHub delivery, the signed repository owner/name is authenticated ingress identity, but its run status, PR association and head are still unverified claims for the agent to check through its own broker-granted read. The subject is transport routing metadata, not a principal and not authority: the broker — never the peer — resolves it through owner-controlled `principals`, and an unmapped subject resolves to nothing rather than minting a principal on demand. The grant's optional `namespaces` bound which subjects a peer may speak for, matched on segment boundaries so `slack.t0123abc` cannot reach workspace `t0123abcx`; without them it speaks for exactly the mapped subjects. A refused attestation is an audited denial under the peer's own principal with a stable reason (`attestation-denied`, `unmapped-subject`), never a silent error, so a compromised or misconfigured gateway leaves a decision trail. The resulting context is bound to a `via` naming the attestor and an `agent`, and policy sees both as required `context.via` and `context.agent`. A direct peer carries neither, so no policy can grant it a capability; every capability runs inside an attested agent session. Driving an agent at all is a separate `agent.prompt` statement, so a mapped subject with no such grant is refused (`agent-denied`) before any capability is considered. Each routed GitHub owner/repo needs an explicit owner-mapped principal, an `agent.prompt` grant and separately scoped read/write grants; optional agent-owned notes require their own `turso.exec` grant.
 
+Session-surface refusals disclose the broker's typed `unmapped-subject` or `agent-denied` cause for friendly gateway replies only for subjects permitted by the peer's attestor namespaces; outside them, mapped and unmapped subjects receive the same opaque refusal. The latter includes only the mapped principal ID as display data, never a credential, policy ID or policy evaluation detail. Policy evaluation errors and other authentication failures remain generic. This display distinction grants no authority and changes no authorization decision. Invocation refusals retain their existing opacity.
+
 A chat scope also states what started the turn: `trigger` is `message` for a person's message or a verified repository delivery, `wake` for a session a scheduled wake started, `job` for a detached job or its notice turn, and `probe` for a watch's unattended check. Policy sees it as `context.trigger`. A wake reuses the subject and conversation of the authenticated message that scheduled it, so it can never speak as anyone else or anywhere else, and every wake session is authorized afresh. A job under trigger `job` may write only when the broker explicitly authorizes its narrow write capability. A job started by a probe retains trigger `probe`: its leg is refused every capability whose effect is not read-only (`probe-write`) before policy is consulted. A probe's job may look, never act.
 
 ## Current local process boundary
@@ -297,7 +299,9 @@ chat invocation may reach the two retrieval routes but never the record route.
 
 Command words are the only way a script reaches a provider: a capability identifier used as a word
 is `command not found`, and `cap` lists and describes grants without invoking anything. A provider
-command word is ungated. `runCommand` carries no capability to decide on, so the broker runs the declaring component's argv handling — a
+command word is ungated. Normal dispatch sends one typed `Run` frame and receives `Ran`;
+the retained `runCommand` operation is the legacy parse-only path. Neither grants authority, so the
+broker runs the declaring component's argv handling — a
 pure, import-free guest call under the ordinary fuel and wall-clock bounds — before any
 authorization, and authorizes only the proposal that comes back, on exactly the path a direct
 `invoke` takes. Text the guest renders itself (a help page, a usage error) is provider-authored,
@@ -307,10 +311,11 @@ provider speaking to the model, with the trust its manifest and schemas already 
 of checks is what keeps the reservation above meaningful: a refused attestation and a reserved
 word are both answered as an unknown word before the guest is instantiated, so a reserved provider
 renders not even its help page, and a proposal that lands on a chat-memory route is refused after
-the run whatever word produced it. The piped value is bounded by the client's frame ceiling before
-it leaves the process and by the host's `maxInputBytes` before a store exists; the broker reports
-the second only in its own `command.resolve.failed` record, and the caller sees the opaque
-`provider-error` reply. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#command-execution-refusals)
+the run whatever word produced it. Argv is bounded by the client's frame ceiling before it leaves
+the process and by the host's `maxInputBytes` before a store exists. Host failures retain their
+cause in `command.resolve.failed`. Legacy `runCommand` host failures return the opaque
+`provider-error` reply; normal `Run` parser refusals return `Ran` with `RunOutcome::Refused`,
+before invocation authorization begins. Unknown words return `NotFound`. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#command-execution-refusals)
 carries the wire detail. The same provider-authored `--help` text is also rendered once per
 provider at broker load — one render maps to every command word that provider declares, since
 `runCommand` takes no word — and baked into the bash tool description once per page with every word it serves named, so a reachable word's help

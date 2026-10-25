@@ -3,7 +3,8 @@ use std::{thread, time::Duration};
 use serde_json::Value;
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
-use crate::{ExitCode, limits::LimitExceeded};
+use crate::ExitCode;
+use dekopon_process::LimitExceeded;
 
 const ECHO_HELP: &str = "-n -e -E";
 
@@ -499,8 +500,8 @@ mod tests {
             CommandFailure,
             test_support::{run_builtin, run_builtin_with, run_builtin_with_invoker},
         },
-        limits::Limits,
     };
+    use dekopon_process::Limits;
 
     use super::{Cat, Echo, False, Printf, Progress, Sleep, Test, TestBracket, True};
 
@@ -516,7 +517,7 @@ mod tests {
             &self,
             _: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             panic!("progress must not invoke a capability")
         }

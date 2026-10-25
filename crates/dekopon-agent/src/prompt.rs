@@ -52,7 +52,7 @@ pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 
-const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
+const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
 /// context-length rejection instead of an answer.
 const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. If you can \
@@ -1196,8 +1196,8 @@ where
                 let output = &outcome.output;
                 let cut = output.floor_char_boundary(
                     result_max_bytes
-                        .unwrap_or(dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES)
-                        .min(dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES)
+                        .unwrap_or(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES)
+                        .min(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES)
                         .min(output.len()),
                 );
                 exchanges.push(Exchange {
@@ -1741,7 +1741,9 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
         Value::Number(number) => number.as_u64(),
         Value::String(text) => {
             let text = text.trim();
-            dekopon_core::chat_asset_marker(text).or_else(|| text.parse().ok())
+            dekopon_core::AssetNumber::parse(text)
+                .map(dekopon_core::AssetNumber::get)
+                .or_else(|| text.parse().ok())
         }
         _ => None,
     });
@@ -1802,6 +1804,9 @@ only when the next step needs a result you do not have yet.
 - Provider command words are programs inside the script, like `gh pr view 12`; their `--help` \
 pages are below, or run `<word> --help`. `cap --list` prints the granted capability IDs. A \
 refusal is a fact to report: nothing escalates past the grants.
+- Files: write `chat-asset:N` as its own unquoted word to hand that file to a command, as in \
+`asset cat chat-asset:3 | head`. Quoted, or inside a larger word, it is plain text. Builtins never \
+read files.
 - Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist; \
 patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
 loudly and by name: `eval`, backticks, subshells, and `<<<` are errors.
@@ -3988,7 +3993,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             _streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             panic!(
                 "a refused construct must never reach {}",
@@ -4083,6 +4088,10 @@ mod tests {
             vec!["probe".to_owned()]
         }
 
+        fn command_word_help(&self) -> BTreeMap<String, String> {
+            BTreeMap::from([("probe".to_owned(), "Usage: probe <COMMAND>".to_owned())])
+        }
+
         fn run_command(
             &self,
             word: &str,
@@ -4123,7 +4132,7 @@ mod tests {
             &self,
             proposal: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
@@ -4214,9 +4223,9 @@ mod tests {
             json!(["broken.thing", "locked.door", "posts.get"])
         );
 
-        let truncated = dekopon_shell::Interpreter::new(dekopon_shell::Limits {
+        let truncated = dekopon_shell::Interpreter::new(dekopon_process::Limits {
             max_output_lines: 4,
-            ..dekopon_shell::Limits::default()
+            ..dekopon_process::Limits::default()
         })
         .run(
             "for i in 1 2 3 4 5 6 7 8 9 10; do echo $i; done",

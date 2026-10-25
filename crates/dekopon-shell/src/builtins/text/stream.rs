@@ -1,5 +1,5 @@
 use crate::{
-    CapabilityInvoker, ExitCode, RetainedBytes,
+    CapabilityInvoker, ExitCode,
     builtins::{
         CommandFailure,
         text::{
@@ -10,6 +10,7 @@ use crate::{
     limits::Budget,
     pipe::{PipeReader, ReadOutcome},
 };
+use dekopon_process::RetainedBytes;
 
 #[derive(Clone, Copy)]
 pub(crate) enum TextStream {
@@ -268,9 +269,9 @@ pub(crate) fn run_test(
 ) -> Result<crate::builtins::CommandResult, CommandFailure> {
     use crate::{
         builtins::{CommandResult, test_support::NoCapabilities},
-        limits::Limits,
         value::to_lines,
     };
+    use dekopon_process::Limits;
     let lines = to_lines(&input);
     let bytes = if lines.is_empty() {
         Vec::new()
@@ -313,11 +314,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::{
-        CapabilityCallResult, CommandProposal,
-        limits::{LimitExceeded, Limits},
-        pipe,
-    };
+    use crate::{CapabilityCallResult, CommandProposal, pipe};
+    use dekopon_process::{LimitExceeded, Limits};
 
     struct Stub {
         cancelled: bool,
@@ -331,7 +329,7 @@ mod tests {
             &self,
             _: CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             unreachable!()
         }
@@ -398,7 +396,7 @@ mod tests {
                 &self,
                 _: CommandProposal,
                 _streams: crate::Streams,
-                _tree: &crate::TreeContext,
+                _tree: &dekopon_process::TreeContext,
             ) -> CapabilityCallResult {
                 unreachable!()
             }

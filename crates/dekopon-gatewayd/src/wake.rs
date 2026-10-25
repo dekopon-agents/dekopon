@@ -11,9 +11,8 @@ use dekopon_broker_protocol::{
     Attestation, ChatScopeClaim, ChatTransportKind, Conversation, TraceParent, Trigger,
 };
 use dekopon_core::{AgentId, ExternalSubject, TransportId};
-use dekopon_shell::{
-    CapabilityInvoker, ExitCode, Interpreter, Limits as ShellLimits, ScriptOutcome,
-};
+use dekopon_process::Limits as ShellLimits;
+use dekopon_shell::{CapabilityInvoker, ExitCode, Interpreter, ScriptOutcome};
 
 use crate::{
     config::{ResolvedBroker, WakeBounds},

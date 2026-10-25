@@ -186,6 +186,7 @@ impl Word {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WordPart {
+    Asset(dekopon_core::AssetNumber),
     /// Unquoted literal text. `*`, `?`, `[`, `{`, and `~` are ordinary characters here.
     Literal(String),
     SingleQuoted(String),
