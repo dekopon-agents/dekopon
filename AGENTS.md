@@ -41,6 +41,8 @@ The model proposes; a separate broker authorizes and executes provider effects.
   [release procedure](README.md#maintainer-release-process), not memory.
 - Inside an approved execution contract, merge, tag, release and deploy without waiting when the
   diff does what the plan said. The fresh adversarial review of the merged head is the review.
+  A coordinator-launched Astra review satisfies it, since each runs in a new thread; warm Claude
+  review rounds are an additional check where the gate requires one.
 - Stop for the owner when the work leaves the plan: a change it did not name, a change to a contract
   it froze, a result that surprises its reviewer, a new credential, a protection change.
 
@@ -297,10 +299,11 @@ never relaxed; the final PR reviewer has a different job and does not repeat it.
 origin: `introduced` (this change wrote it), `exposed` (an existing defect this change makes
 reachable or worse) or `inherited` (existing and untouched). `contract` covers WIT, wire frames,
 config keys and values, chart values and mounts, a deletion, a proof-gate invariant, the brief's
-must-holds, and three sections of this file: [Errors](#errors), [Panics](#panics) and
-[Boundaries that must survive](#boundaries-that-must-survive). `guideline` is any other rule in this
-section, quoted by heading. `taste` is advisory. Only an `introduced` or `exposed` `contract`
-finding makes the verdict `FIX REQUIRED`; it carries `file:line`, the concrete failure and the exact
+must-holds, a P1 under [Proportionate remedies](#proportionate-remedies) (a process-killing input,
+whatever the path), the repository's own boundaries section, and three sections of this file:
+[Errors](#errors), [Panics](#panics) and [Boundaries that must survive](#boundaries-that-must-survive).
+`guideline` is any other rule in this section, quoted by heading. `taste` is advisory. Only an
+`introduced` or `exposed` `contract` finding makes the verdict `FIX REQUIRED`; it carries `file:line`, the concrete failure and the exact
 fix. Every other finding goes under `Follow-ups` in the report and never blocks.
 
 **Evidence standard.** A finding names what it saw, not what it suspects; "this could leak" is not
