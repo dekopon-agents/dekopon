@@ -2916,7 +2916,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         assert_eq!(
             actor,
             &Some(Actor::Service {
-                principal: crate::principal("gateway")
+                principal: self::principal("gateway")
             })
         );
         assert!(
@@ -3993,4 +3993,97 @@ async fn a_spaces_request_forbid_stops_http_before_the_network() {
     );
     assert!(audit.records().iter().any(|event| matches!(event, AuditEvent::Decision { decision_point, allowed: false, policy_ids, .. } if decision_point == "http.request" && policy_ids == &["both".to_owned()])));
     assert!(server.recorded().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_only_policy_error_records_its_id() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider");
+    let server =
+        LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let mappings = [
+        (subject(SLACK_SUBJECT), principal("caller")),
+        (subject("slack.t0123abc.c0123abc"), principal("space")),
+    ];
+    let world = PolicyWorld::new(
+        [principal("caller"), principal("space")],
+        [(
+            "http-probe.fetch".parse().expect("capability"),
+            "http-probe".parse().expect("provider"),
+        )],
+    )
+    .expect("world")
+    .with_subjects(mappings.clone());
+    let policy = r#"@id("both") permit(principal, action, resource);
+        @id("space-error") forbid(principal == Dekopon::Principal::"space", action == Dekopon::Action::"http-probe.fetch", resource) when { context has request } when { 9223372036854775807 + 1 > 0 };"#;
+    let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        PolicyEngine::new(policy, &world).expect("policy"),
+        catalog([(
+            "http-probe.fetch",
+            set("http-probe", loopback_constraints(server.authority())),
+        )]),
+        CredentialStore::empty(),
+        IdentityDirectory::new(mappings).expect("directory"),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker");
+    let claim = Attestation::for_chat(
+        subject(SLACK_SUBJECT),
+        agent("provider-test"),
+        dekopon_broker::ChatScopeClaim {
+            transport: "slack".parse().expect("transport"),
+            kind: dekopon_broker::ChatTransportKind::Slack,
+            conversation: dekopon_broker::Conversation {
+                kind: dekopon_broker::ConversationKind::Channel,
+                container: Some("t0123abc".into()),
+                id: "c0123abc".into(),
+                thread: Some("1712345678.000100".into()),
+            },
+            trigger: dekopon_broker::Trigger::Message,
+            delivery: None,
+        },
+    );
+    let request = request(
+        "space-request",
+        "http-probe.fetch",
+        json!({"uri": format!("http://{}/reply", server.authority()), "method": "GET"}),
+    );
+    let (host, _stdout) = std::os::unix::net::UnixStream::pair().expect("stdout");
+    broker
+        .invoke(
+            &service_context(GATEWAY),
+            Some(&AttestorGrant { namespaces: None }),
+            Some(&claim.bound_to(request.id.clone())),
+            request,
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("accounted invocation");
+    let error_ids = audit
+        .records()
+        .into_iter()
+        .filter_map(|event| match event {
+            AuditEvent::Decision {
+                decision_point,
+                policy_error_ids,
+                ..
+            } if decision_point == "http.request" => Some(policy_error_ids),
+            AuditEvent::Decision { .. } | AuditEvent::Execution { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(error_ids, [vec!["space-error".to_owned()]]);
 }

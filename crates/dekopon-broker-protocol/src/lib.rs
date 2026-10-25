@@ -771,6 +771,7 @@ pub struct SessionSurface {
     pub command_word_help: BTreeMap<String, String>,
     pub chat_memory: Option<ChatMemorySurface>,
     pub principal: Option<PrincipalId>,
+    pub space: Option<Vec<CapabilityId>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -931,12 +932,15 @@ impl BrokerRequest {
                 }
                 let mut named = [false; MAX_ASSET_DESCRIPTORS];
                 for argument in argv {
-                    if let Arg::Asset(index) = argument {
-                        let index = usize::from(index.0);
-                        if index >= assets.len() {
-                            return Err(ProtocolError::UnknownAssetIndex);
+                    match argument {
+                        Arg::Text(_) => {}
+                        Arg::Asset(index) => {
+                            let index = usize::from(index.0);
+                            if index >= assets.len() {
+                                return Err(ProtocolError::UnknownAssetIndex);
+                            }
+                            named[index] = true;
                         }
-                        named[index] = true;
                     }
                 }
                 let mut ids = std::collections::BTreeSet::new();
@@ -1271,6 +1275,20 @@ pub struct ResponseEnvelope {
 
 impl ResponseEnvelope {
     #[must_use]
+    pub fn with_space(mut self, grants: Option<Vec<CapabilityId>>) -> Self {
+        match &mut self.response {
+            BrokerResponse::Capabilities { space, .. } => *space = grants,
+            BrokerResponse::Ran { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Error { .. }
+            | BrokerResponse::Generation { .. } => {}
+        }
+        self
+    }
+
+    #[must_use]
     pub const fn capabilities(
         capabilities: Vec<AvailableCapability>,
         command_words: Vec<String>,
@@ -1284,6 +1302,7 @@ impl ResponseEnvelope {
                 command_word_help,
                 chat_memory: None,
                 principal: None,
+                space: None,
             },
         }
     }
@@ -1304,6 +1323,7 @@ impl ResponseEnvelope {
                 command_word_help,
                 chat_memory,
                 principal,
+                space: None,
             },
         }
     }
@@ -1378,6 +1398,8 @@ pub enum BrokerResponse {
         chat_memory: Option<ChatMemorySurface>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<PrincipalId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Vec<CapabilityId>>,
     },
     Invocation {
         result: InvocationResult,
@@ -1777,12 +1799,14 @@ impl BrokerClient {
                 command_word_help,
                 chat_memory,
                 principal,
+                space,
             } => Ok(SessionSurface {
                 capabilities,
                 command_words,
                 command_word_help,
                 chat_memory,
                 principal,
+                space,
             }),
             BrokerResponse::Error { code, message } => {
                 match SessionRefusal::from_error(&code, &message) {

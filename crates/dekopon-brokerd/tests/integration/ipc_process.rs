@@ -393,7 +393,11 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let run_client = |role: &str, uid: u32, pin: u32, socket: &Path| {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", "ipc_process_boundary", "--nocapture"])
+            .args([
+                "--exact",
+                "ipc_process::ipc_process_boundary",
+                "--nocapture",
+            ])
             .env("DEKOPON_IPC_TEST_ROLE", role)
             .env("DEKOPON_IPC_TEST_SOCKET", socket)
             .env("DEKOPON_IPC_TEST_SERVER_UID", pin.to_string())

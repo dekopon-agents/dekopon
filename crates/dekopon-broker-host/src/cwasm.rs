@@ -451,10 +451,7 @@ fn publish(path: &Path, bytes: &[u8]) -> wasmtime::Result<()> {
     Ok(())
 }
 
-#[allow(
-    unsafe_code,
-    reason = "Wasmtime's trusted-file deserializer; the only unsafe call in the broker host"
-)]
+#[allow(unsafe_code, reason = "Wasmtime's trusted-file deserializer")]
 fn deserialize(engine: &Engine, path: &Path) -> wasmtime::Result<Component> {
     // SAFETY: publishers produce cache objects with Engine::precompile_component. Hits have a
     // verified hash and a trusted local index binding them to source/engine identity. The

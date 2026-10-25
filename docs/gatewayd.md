@@ -932,7 +932,7 @@ Every kind but `directMessage` — a group DM and a thread included — initiall
 
 A route matching every channel widens no authority whatsoever, and an operator reading "available in all channels" must not read it as "available to everyone". Every session opens an attested broker leg naming the sender's canonical subject; the broker maps that subject to a principal, requires policy permitting `agent.prompt` for it, and refuses an unmapped sender before any model call is made. A catch-all route changes *where* the mapped people can reach the bot. It does not change who they are, and somebody the owner never mapped gets the same refusal in a catch-all channel that they would have got in a named one.
 
-Nor do two people in one channel share a conversation **by default**. A persistent route whose scope is omitted or `privateConversation` keys history per authenticated subject, so the bot remembers each person separately. An operator can explicitly choose `sharedConversation`; that changes prompt audience, not authority, and carries the warnings in [Scope selects the replay audience](#scope-selects-the-replay-audience). A catch-all channel does not imply that choice.
+Nor do two people in one channel share a conversation **by default**. A persistent route whose scope is omitted or `privateConversation` keys history per authenticated subject, so the bot remembers each person separately. An operator can explicitly choose `sharedConversation`; that changes prompt audience, not authority, and carries the warnings in [Scope selects the replay audience](#scope-selects-the-replay-audience). A catch-all channel does not imply that choice. On a shared route in a mapped channel, history is keyed by the channel’s space and thread, and the space’s granted capability identifiers keep that history across speakers.
 
 ## Liveness, progress, and stopping a run
 
@@ -1177,7 +1177,7 @@ whole gateway through the same bounded drain as shutdown, but with a nonzero exi
 
 **Status: Current.** History is a trust surface rather than a feature flag; [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) states the surface it accepts.
 
-A `persistent` route keeps a bounded history and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. The history is private per authenticated subject by default; `scope: sharedConversation` shares it among authenticated participants in one exact routed conversation. `persistent` with the default window is the route default; `memory: { mode: oneShot }` opts out.
+A `persistent` route keeps a bounded history and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. The history is private per authenticated subject by default; `scope: sharedConversation` shares it among authenticated participants in one exact routed conversation. In a mapped channel it uses the channel’s space key, with separate windows per thread, and the space principal’s grants gate replay and journal recall across speakers. The grant comparison below uses those space grants on mapped shared routes; an asker with no grants is refused without evicting the shared window. Private routes keep their per-subject keys and grants. `persistent` with the default window is the route default; `memory: { mode: oneShot }` opts out.
 
 ### The history lives in the gateway
 
