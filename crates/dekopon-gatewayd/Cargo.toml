@@ -45,6 +45,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-tungstenite.workspace = true
@@ -63,7 +64,6 @@ tracing-opentelemetry.workspace = true
 dekopon-test-support = { path = "../dekopon-test-support", features = ["agent-runtime"] }
 dekopon-brokerd.workspace = true
 dekopon-storage-host.workspace = true
-tempfile.workspace = true
 # The paused clock the progress-policy tests drive: keep-alive ticks, coalescing windows, and a
 # wall-clock budget are all minutes long, and waiting them out is not a test suite.
 tokio = { workspace = true, features = ["test-util"] }

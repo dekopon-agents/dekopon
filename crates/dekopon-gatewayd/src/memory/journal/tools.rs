@@ -121,7 +121,7 @@ impl<'a> JournalMemoryTools<'a> {
 impl MemoryTools for JournalMemoryTools<'_> {
     fn read(&self, record_id: u64, representation_id: &str, range: Option<(u64, u64)>) -> String {
         let _lock = self.journal.lock.lock();
-        let _assets = super::AssetSync(&self.journal);
+        let _assets = super::AssetSync(self.journal);
         let line = match self.lookup(record_id) {
             Ok(line) => line,
             Err(JournalError::Io {
@@ -189,7 +189,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
     }
     fn set_pin(&self, record_id: u64, representation_id: &str) -> String {
         let _lock = self.journal.lock.lock();
-        let _assets = super::AssetSync(&self.journal);
+        let _assets = super::AssetSync(self.journal);
         let line = match self.lookup(record_id) {
             Ok(line) => line,
             Err(JournalError::Io {
@@ -226,7 +226,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
     }
     fn clear_pin(&self, record_id: Option<u64>) -> String {
         let _lock = self.journal.lock.lock();
-        let _assets = super::AssetSync(&self.journal);
+        let _assets = super::AssetSync(self.journal);
         match self.mutate(|line| {
             if !self.eligible(line) {
                 return false;

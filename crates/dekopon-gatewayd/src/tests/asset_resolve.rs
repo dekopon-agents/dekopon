@@ -120,7 +120,10 @@ fn downloading(store: &AssetStore) -> usize {
         .flat_map(|entry| &entry.assets)
         .filter(|row| match row.state {
             Attachment::Downloading(_) => true,
-            Attachment::Registered | Attachment::Resident(_) | Attachment::Evicted => false,
+            Attachment::Registered
+            | Attachment::Resident(_)
+            | Attachment::Evicted
+            | Attachment::NotStored(_) => false,
         })
         .count()
 }
@@ -188,7 +191,7 @@ async fn a_cold_asset_resolves_from_a_scoped_thread_outside_the_runtime() {
     .await
     .unwrap();
     assert_eq!(gate.fetches(), 2);
-    assert_idle(&store, 12).await;
+    assert_idle(&store, 6).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -311,7 +314,7 @@ async fn a_cancel_racing_a_completion_never_publishes_twice_or_strands_a_downloa
         assert_eq!(resolved.row.bytes, Some(4));
         assert!((1..=2).contains(&(gate.fetches() - before)));
     }
-    assert_idle(&store, 32 * 4).await;
+    assert_idle(&store, 4).await;
 }
 
 #[tokio::test]

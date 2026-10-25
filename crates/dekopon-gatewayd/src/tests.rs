@@ -935,7 +935,7 @@ async fn journal_less_persistent_memory_warns_once_and_has_no_durable_policy() {
 async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_binding() {
     let directory = temporary();
     let mut input = document(directory.path());
-    input["sessions"] = json!({"journal": {"path": "journal"}, "memory": {
+    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}, "memory": {
         "agents": {"reviewer": {"routine": "prefix", "policy": {
             "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
             "routines": [{"id": "prefix", "kind": "prefix", "maxBytes": 1024}],
@@ -1078,7 +1078,7 @@ async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
 async fn a_decider_selection_requires_its_provider_profile_and_label_safe_routine_ids() {
     let directory = temporary();
     let mut input = document(directory.path());
-    input["sessions"] = json!({"journal": {"path": "journal"}});
+    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
     input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
         "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
         "routines": [{"id": "original", "kind": "original"}, {"id": "head_1.k-b", "kind": "prefix", "maxBytes": 512}],
@@ -2404,7 +2404,7 @@ async fn a_discord_transport_defaults_to_reply_only_at_its_pinned_endpoint() {
 async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_path() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["sessions"] = json!({"journal": {"path": "journal"}});
+    document["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
     document["routes"][0]["memory"] = json!({"mode": "persistent", "forgetAfterMs": 86_400_000});
     let resolved = load(directory.path(), &document)
         .await
@@ -2528,7 +2528,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |problem| matches!(problem, ConfigProblem::ForgetAfterWithoutRecall { .. }),
         ),
         (
-            json!({"/sessions": {"journal": {"path": "journal"}},
+            json!({"/sessions": {"journal": {"path": "journal"}, "assets": {"path": "assets"}},
             "/routes/0/memory": {"mode": "persistent", "forgetAfterMs": 0}}),
             |problem| matches!(problem, ConfigProblem::InvalidMemoryBounds { .. }),
         ),
@@ -9331,7 +9331,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
     document["routes"][0]["transport"] = json!("discord");
     document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
     document["routes"][0]["follow"] = json!(true);
-    document["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    document["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});
     let config = resolved(directory.path(), &document).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let route = &config.routes[0];
@@ -9490,7 +9490,7 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     config["routes"][0]["transport"] = json!("discord");
     config["routes"][0]["conversation"] = json!({"kind": ["channel"]});
     config["routes"][0]["follow"] = json!(true);
-    config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}});
+    config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});
     let config = resolved(directory.path(), &config).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let journal = Arc::new(
@@ -12376,7 +12376,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
 }
 
 #[test]
-fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
+fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
     let conversations = ConversationStore::new(2);
     let store = AssetStore::new(1, Duration::from_secs(3_600));
     let allowed = granted(&["cli-probe.upper"]);
@@ -12436,10 +12436,11 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     assert!(
         store
             .get_access(&resumed.assets, 1, now + Duration::from_secs(2))
-            .is_none(),
-        "the removed reference stays unavailable rather than aliasing the new file"
+            .is_some(),
+        "admitting another conversation preserves the original reference"
     );
-    assert_eq!(replacement.inventory[0].name, "later.png");
+    assert_eq!(replacement.inventory[0].name, "original.png");
+    assert_eq!(replacement.inventory[1].name, "later.png");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -17581,10 +17582,10 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
 #[test]
 fn asset_retention_config_default_custom_zero_and_invalid_values() {
     let defaults: config::SessionsConfig = serde_json::from_value(json!({})).unwrap();
-    assert_eq!(defaults.asset_retention_bytes, 268_435_456);
+    assert_eq!(defaults.asset_retention_bytes, 1_073_741_824);
     assert_eq!(
         config::SessionsConfig::default().asset_retention_bytes,
-        268_435_456
+        1_073_741_824
     );
     for bytes in [0, 1024, 536_870_912] {
         let custom: config::SessionsConfig =

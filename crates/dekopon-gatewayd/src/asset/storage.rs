@@ -27,13 +27,13 @@ impl Refill {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub(super) enum StoreFailure {
     BudgetTooSmall,
     StoredTooLarge,
     DecodedTooLarge,
     AllPinned,
-    Io(io::ErrorKind),
+    Io,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -63,7 +63,8 @@ impl StoredKey {
 #[derive(Deserialize, Serialize)]
 struct Binding {
     key: StoredKey,
-    digest: String,
+    digest: Option<String>,
+    failure: Option<StoreFailure>,
     class: Refill,
     retained: bool,
 }
@@ -120,7 +121,7 @@ impl Retention {
         store.dir = Some(dir.to_owned());
         store.index = match File::open(dir.join("index.json")) {
             Ok(file) => serde_json::from_reader(file)
-                .map_err(|_| BlobError::Io(io::ErrorKind::InvalidData))?,
+                .map_err(|_decode| BlobError::Io(io::ErrorKind::InvalidData))?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => store.index,
             Err(error) => return Err(error.into()),
         };
@@ -135,7 +136,7 @@ impl Retention {
             .index
             .bindings
             .iter()
-            .map(|binding| binding.digest.clone())
+            .filter_map(|binding| binding.digest.clone())
             .collect();
         store.index.files.retain(|digest, _| named.contains(digest));
         for (digest, file) in &mut store.index.files {
@@ -225,22 +226,56 @@ impl Retention {
             }
             BlobError::TooLarge => StoreFailure::DecodedTooLarge,
             BlobError::Capacity => StoreFailure::AllPinned,
-            BlobError::Io(kind) => StoreFailure::Io(kind),
-            BlobError::LengthChanged => StoreFailure::Io(io::ErrorKind::InvalidData),
+            BlobError::Io(_) => StoreFailure::Io,
+            BlobError::LengthChanged => StoreFailure::Io,
             BlobError::Disabled
             | BlobError::Unknown
             | BlobError::Reclaimed
-            | BlobError::Unauthorized => StoreFailure::Io(io::ErrorKind::Other),
+            | BlobError::Unauthorized => StoreFailure::Io,
         }
     }
 
-    pub(super) fn lookup(&self, key: &AssetStateKey, asset: &AssetRef) -> Option<String> {
+    pub(super) fn lookup(&self, key: &AssetStateKey, asset: &AssetRef) -> Attachment {
         let key = StoredKey::of(key, asset);
-        self.index
+        let Some(binding) = self
+            .index
             .bindings
             .iter()
             .find(|binding| binding.key == key)
-            .map(|binding| binding.digest.clone())
+        else {
+            return Attachment::Registered;
+        };
+        match (&binding.digest, binding.failure) {
+            (_, Some(reason)) => Attachment::NotStored(reason),
+            (Some(digest), None) if self.resident(digest) => Attachment::Resident(digest.clone()),
+            (Some(_), None) => Attachment::Evicted,
+            (None, None) => Attachment::Registered,
+        }
+    }
+
+    pub(super) fn record_failure(
+        &mut self,
+        key: &AssetStateKey,
+        asset: &AssetRef,
+        error: BlobError,
+    ) -> Attachment {
+        if error == BlobError::Disabled {
+            return Attachment::Registered;
+        }
+        let reason = self.failure(asset.size.unwrap_or_default() as usize, error);
+        let key = StoredKey::of(key, asset);
+        self.index.bindings.retain(|binding| binding.key != key);
+        self.index.bindings.push(Binding {
+            retained: self.references.contains(&key),
+            key,
+            digest: None,
+            failure: Some(reason),
+            class: asset.source.as_ref().map_or(Refill::Platform, Refill::of),
+        });
+        if let Err(error) = self.persist() {
+            tracing::warn!(%error, "gateway.asset.reclaim.failed");
+        }
+        Attachment::NotStored(reason)
     }
 
     pub(super) fn pin(&mut self, digest: &str, recency: Recency) -> Result<DiskBlob, BlobError> {
@@ -297,7 +332,7 @@ impl Retention {
                     .index
                     .bindings
                     .iter()
-                    .filter(|binding| binding.digest == *digest)
+                    .filter(|binding| binding.digest.as_ref() == Some(digest))
                     .map(|binding| binding.class)
                     .max()
                     .unwrap_or(Refill::Platform);
@@ -343,6 +378,33 @@ impl Retention {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn resident_files(&self) -> usize {
+        self.index
+            .files
+            .values()
+            .filter(|file| file.resident)
+            .count()
+    }
+
+    pub(super) fn store_bytes(
+        &mut self,
+        key: &AssetStateKey,
+        asset: &AssetRef,
+        bytes: &[u8],
+    ) -> Result<String, BlobError> {
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if self.resident(&digest) {
+            self.bind(key, asset, digest.clone())?;
+            return Ok(digest);
+        }
+        self.reserve(asset.id, bytes.len())?;
+        self.store(key, asset, DiskBlob::from_bytes(bytes)?)
+    }
+
     pub(super) fn store(
         &mut self,
         key: &AssetStateKey,
@@ -366,11 +428,7 @@ impl Retention {
         if !self.resident(&digest) {
             self.reserve(asset.id, data.len())?;
             let owned = if let Some(dir) = &self.dir {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(dir.join("blobs").join(format!("{digest}.pending")))?;
+                let mut file = tempfile::NamedTempFile::new_in(dir.join("blobs"))?;
                 let mut offset = 0;
                 while offset < data.len() {
                     let len = buffer.len().min(data.len() - offset);
@@ -378,11 +436,9 @@ impl Retention {
                     file.write_all(&buffer[..len])?;
                     offset += len;
                 }
-                file.sync_all()?;
-                fs::rename(
-                    dir.join("blobs").join(format!("{digest}.pending")),
-                    dir.join("blobs").join(&digest),
-                )?;
+                file.as_file().sync_all()?;
+                file.persist(dir.join("blobs").join(&digest))
+                    .map_err(|error| error.error)?;
                 File::open(dir.join("blobs"))?.sync_all()?;
                 DiskBlob::from_descriptor(
                     File::open(dir.join("blobs").join(&digest))?.into(),
@@ -403,32 +459,45 @@ impl Retention {
                 },
             );
         }
+        self.bind(key, asset, digest.clone())?;
+        Ok(digest)
+    }
+
+    fn bind(
+        &mut self,
+        key: &AssetStateKey,
+        asset: &AssetRef,
+        digest: String,
+    ) -> Result<(), BlobError> {
+        self.index.clock += 1;
+        if let Some(file) = self.index.files.get_mut(&digest) {
+            file.used = self.index.clock;
+        }
         let stored_key = StoredKey::of(key, asset);
         let class = asset.source.as_ref().map_or(Refill::Platform, Refill::of);
-        if !self
-            .index
+        self.index
             .bindings
-            .iter()
-            .any(|binding| binding.key == stored_key)
+            .retain(|binding| binding.key != stored_key);
         {
             self.index.bindings.push(Binding {
                 key: stored_key.clone(),
-                digest: digest.clone(),
+                digest: Some(digest.clone()),
+                failure: None,
                 class,
                 retained: self.references.contains(&stored_key),
             });
         }
-        self.persist()?;
-        Ok(digest)
+        self.persist()
     }
 
-    fn tombstone(&mut self, key: RetentionKey) {
+    pub(super) fn tombstone(&mut self, key: RetentionKey) {
         self.released.push_back(key);
         while self.released.len() > MAX_RELEASE_TOMBSTONES {
             self.released.pop_front();
         }
     }
 
+    #[cfg(test)]
     pub(super) fn evict(&mut self, key: RetentionKey, row: &mut Row) -> Result<(), BlobError> {
         if let Attachment::Resident(digest) = &row.state {
             self.evict_digest(digest)?;
@@ -449,6 +518,7 @@ impl Retention {
                 | Attachment::NotStored(_) => (),
             }
             if self.dir.is_none()
+                || key.generation.is_none()
                 || row
                     .asset
                     .source
@@ -469,7 +539,7 @@ impl Retention {
             .index
             .bindings
             .iter()
-            .map(|binding| binding.digest.clone())
+            .filter_map(|binding| binding.digest.clone())
             .collect();
         let gone: Vec<_> = self
             .index
@@ -494,6 +564,16 @@ impl Retention {
         if let Err(error) = self.collect() {
             tracing::warn!(%error, "gateway.asset.reclaim.failed");
         }
+    }
+
+    pub(crate) fn finish_pending(&mut self, stem: &str, next_id: u64) -> Result<(), BlobError> {
+        self.index.bindings.retain(|binding| {
+            binding.retained
+                || binding.class == Refill::None
+                || binding.key.stem != stem
+                || binding.key.id >= next_id
+        });
+        self.collect()
     }
 
     pub(crate) fn reconcile(&mut self, references: &HashSet<StoredKey>) -> Result<(), BlobError> {

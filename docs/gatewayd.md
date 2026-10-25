@@ -210,9 +210,11 @@ sessions:
   maxJobs: 2                                  # optional, default 2; 0 refused
   replyOnBusy: true                           # default true; saturation or a full mailbox only
   maxConversations: 1024                      # optional, default 1024 tracked
-  assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
+  assetRetentionBytes: 1073741824             # optional, shared disk budget; 0 disables assets
   journal:                                    # optional; absent, no conversation text is written to disk
     path: /var/lib/dekopon-gatewayd/journal           # relative paths resolve against this file; file sweep uses the longer of memory retention and journal-route forgetAfterMs
+  assets:                                     # required with journal; refused without it
+    path: /var/lib/dekopon-gatewayd/assets      # separate directory; relative paths resolve against this file
   wakes:                                      # optional; absent, no route may schedule a wake
     path: /var/lib/dekopon-gatewayd/wakes.jsonl       # relative paths resolve against this file
     maxPerSubject: 20                         # optional, default 20 pending wakes per person
@@ -506,7 +508,7 @@ adds one bounded gateway notice to the next turn. An output retention refusal na
 without suggesting a repeat of an already-executed paid capability.
 
 Limits are **8 MiB decoded per asset, five distinct references / attached outputs and 40 MiB decoded
-per invocation**, 32 table entries per conversation and the configurable 256 MiB default disk LRU.
+per invocation**, 32 table entries per conversation and the configurable 1 GiB default disk budget.
 An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
 Disk retention and broker in-flight spool budgets account for actual stored bytes.
 These limits are separate from model-facing fetch limits. Listing metadata does not update LRU
@@ -704,21 +706,29 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   the same inventory with capability/invocation provenance. A bounded typed-output note names each
   retained reference; same-session and later-turn edits can address it without carrying bytes in
   the shell, prompt transcript or history. Retention and delivery are separate acts.
-- **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **268435456**
-  (256 MiB) across all conversations and generated/inbound assets in this gateway process. **Zero
-  disables retention**: newly fetched/generated assets cannot be retained or delivered; text remains
-  usable. It is never an unlimited setting. The shared 8 MiB per-file and transport/proposal limits
-  remain independent safety limits, not competing retention caches. Empty files charge one byte.
-  Configure disk-backed temporary storage with sufficient capacity separately from this logical budget.
-- **Use means consumption.** Successful scoped resolution for model inclusion or provider submission
-  refreshes recency; inventory listing and history reference replay do not. Least-recently-used
-  unpinned files are reclaimed before admission. Individually oversized assets are refused without
-  evicting useful entries; insufficient unpinned space refuses clearly. Active provider requests and
-  outbound delivery hold temporary pins charged to the same budget. Model messages hold weak
-  references, never residency ownership. Retired/expired inventories are pruned lazily, at the next
-  store call; a dropped row reclaims its unpinned file in the same step, and a pinned one at the
-  first admission after its pins finish. Unlink failures retain accounting rather than pretending
-  disk space was freed.
+- **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **1073741824**
+  (1 GiB), shared across conversations and generated/inbound files. Zero disables assets and removes
+  `fetch_chat_asset`; it is never unlimited. Content-identical stored representations share one file
+  and one charge. Empty files charge one byte. The 8 MiB decoded per-file and 40 MiB per-request
+  limits remain independent safety limits.
+- **History owns durable bytes.** With `sessions.journal`, `sessions.assets.path` is required and
+  stores SHA-256-named files plus a restartable index. `assets: null` means absent; `{}`, an empty
+  path and an unresolvable path refuse configuration. The assets directory must neither equal,
+  contain nor sit inside the journal directory, including resolved aliases. Relative paths resolve
+  against the configuration file. Uploaded files already downloaded for use become resident again
+  when their conversation is recalled after restart, without another download. Arrival alone never
+  downloads. Generated outputs are session-only, share this budget while live, and are not restored.
+- **Use means consumption.** Successful scoped consumption refreshes persisted recency; listing,
+  replay and `pin(Recency::Keep)` do not. Admission evicts unpinned re-downloadable inbound files
+  first, then generated files, least recently used within each class. Unloaded conversations count
+  toward the budget and supply eviction candidates after restart. An oversized file or insufficient
+  unpinned capacity evicts nothing. Failed storage preserves a not-stored reference; attaching an
+  output does not fail because its bytes could not be stored. Failure surfaces when it is used.
+- **Journal retention owns deletion.** Sweep, record compaction, forget and seal retention release
+  references; the last retained record naming a digest releases its file and index bindings. Shared
+  digests survive while any conversation still names them. The count cap, idle expiry and generation
+  retirement release in-memory rows and pins without deleting journal-owned bytes. Fence-less
+  inventories still expire when idle. The conversation ceiling no longer evicts asset inventories.
 - **One download per attachment.** A cold attachment downloads in a store-owned task, at most two
   at a time, under the 60-second fetch deadline. Model fetches and provider inputs that ask for the
   same attachment share that download; when the last of them is cancelled, so is the download, and
@@ -731,11 +741,11 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
   IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
   to avoid reuse after independent inventory expiry.
-- **Private scratch, not persistence.** The gateway creates 0700 directories and 0600 files beneath
-  the process temporary directory. No model/provider path is accepted or serialized; reads use the
-  original descriptor. No startup recovery, external cache or restart persistence is provided.
-  Cleanup failures emit bounded diagnostics; abrupt process death can leave scratch until the
-  temporary volume is removed.
+- **Gateway-private storage.** Store files are 0600 inside 0700 directories owned by the gateway
+  UID. The index contains digest, row identity, origin class, state and recency, never attachment
+  sources or platform locators. Locators remain in the journal. Reads stay session-bound and the
+  broker receives descriptors, never a store path. Without a journal, attachments continue to use
+  process-lifetime private temporary files; no durable assets directory may be configured.
 - **Storage failures are not successful empty images.** Capacity exhaustion, OS IO categories
   (including disk-full), and changed/truncated length are sanitized failures, never paths or bytes.
   An unlinked file still reads through its original descriptor while a lease owns it. No storage
@@ -749,7 +759,7 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   in place. An unpolled transport future or runtime shutdown before queued work starts can still
   drop leases on the calling thread; this is not a general asynchronous cleanup service.
 - **Disk backing is an operator requirement.** The chart uses disk-backed gateway `/tmp`, separately
-  sized by `volumeSizes.gatewayTmp`; broker scratch stays tmpfs. Other installations must provide
+  sized by `volumeSizes.gatewayTmp`, and mounts durable assets on the state claim when enabled; broker scratch stays tmpfs. Other installations must provide
   a disk-backed temporary directory, not a memory-backed `emptyDir` or `TMPDIR`. Existing deployed
   manifests and overrides need separate rollout verification. This removes retained bulk bytes,
   not all peak allocations: bounded downloads/decodes, textual conversion, base64/JSON request

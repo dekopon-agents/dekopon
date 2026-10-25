@@ -367,6 +367,22 @@ impl AssetStore {
         self.assets_for_access(&AssetAccess::one_shot(conversation.clone()), arriving, now)
     }
 
+    fn refresh_states(
+        entries: &mut HashMap<AssetStateKey, ConversationAssets>,
+        retention: &mut Retention,
+    ) {
+        for (key, entry) in entries.iter_mut() {
+            for row in &mut entry.assets {
+                if let Attachment::Resident(digest) = &row.state
+                    && !retention.resident(digest)
+                {
+                    row.state = Attachment::Evicted;
+                    retention.tombstone((key.clone(), row.asset.id));
+                }
+            }
+        }
+    }
+
     pub fn assets_for_access(
         &self,
         access: &AssetAccess,
@@ -378,6 +394,7 @@ impl AssetStore {
                 let mut entries = self.entries.lock();
                 let mut retention = self.retention.lock();
                 Self::expire(&mut entries, &mut retention, self.idle_timeout, now);
+                Self::refresh_states(&mut entries, &mut retention);
                 let mut arrived = Vec::with_capacity(arriving.len());
                 if !arriving.is_empty() {
                     let entry = entries
@@ -431,6 +448,7 @@ impl AssetStore {
             let mut entries = self.entries.lock();
             let mut retention = self.retention.lock();
             Self::expire(&mut entries, &mut retention, self.idle_timeout, now);
+            Self::refresh_states(&mut entries, &mut retention);
             let entry = entries
                 .entry(state_key.clone())
                 .or_insert_with(|| ConversationAssets::new(access.weak_fence(), now));
@@ -446,16 +464,7 @@ impl AssetStore {
                     encoding: AssetEncoding::Identity,
                     sent: false,
                 };
-                let state =
-                    retention
-                        .lookup(state_key, &asset)
-                        .map_or(Attachment::Registered, |digest| {
-                            if retention.resident(&digest) {
-                                Attachment::Resident(digest)
-                            } else {
-                                Attachment::Evicted
-                            }
-                        });
+                let state = retention.lookup(state_key, &asset);
                 Row { asset, state }
             }));
             entry.assets.sort_by_key(|row| row.asset.id);
@@ -1165,6 +1174,7 @@ impl AssetStore {
                     self.idle_timeout,
                     Instant::now(),
                 );
+                Self::refresh_states(&mut entries, &mut retention);
                 let Some(row) = row_mut(&mut entries, key, id) else {
                     let reclaimed = retention.released.contains(&(key.clone(), id));
                     retention.miss(id, 0, if reclaimed { "reclaimed" } else { "unknown" });
@@ -1177,7 +1187,22 @@ impl AssetStore {
                 match &mut row.state {
                     Attachment::Resident(digest) => retention.pin(digest, recency).map(Some),
                     Attachment::Registered | Attachment::Downloading(_) => Ok(None),
-                    Attachment::Evicted | Attachment::NotStored(_) => {
+                    Attachment::NotStored(reason) => {
+                        let error = match reason {
+                            StoreFailure::BudgetTooSmall
+                            | StoreFailure::StoredTooLarge
+                            | StoreFailure::DecodedTooLarge
+                            | StoreFailure::AllPinned
+                            | StoreFailure::Io => BlobError::Reclaimed,
+                        };
+                        retention.miss(
+                            id,
+                            row.asset.size.unwrap_or_default() as usize,
+                            "reclaimed",
+                        );
+                        Err(error)
+                    }
+                    Attachment::Evicted => {
                         retention.miss(
                             id,
                             row.asset.size.unwrap_or_default() as usize,
@@ -1232,16 +1257,17 @@ impl AssetStore {
         } else {
             retention
                 .check_size(id, bytes.len())
-                .and_then(|()| DiskBlob::from_bytes(bytes))
-                .and_then(|data| retention.store(key, &row.asset, data))
+                .and_then(|()| retention.store_bytes(key, &row.asset, bytes))
         };
         match result {
             Ok(digest) => {
                 row.state = Attachment::Resident(digest.clone());
+                Self::refresh_states(entries, retention);
                 retention.pin(&digest, Recency::Keep)
             }
             Err(error) => {
-                row.state = Attachment::NotStored(retention.failure(bytes.len(), error));
+                row.state = retention.record_failure(key, &row.asset, error);
+                Self::refresh_states(entries, retention);
                 Err(error)
             }
         }
@@ -1303,12 +1329,13 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             });
             let state = match result {
                 Ok(digest) => Attachment::Resident(digest),
-                Err(error) => Attachment::NotStored(retention.failure(len, error)),
+                Err(error) => retention.record_failure(key, &asset, error),
             };
             let entry = entries.entry(key.clone()).or_insert_with(|| ConversationAssets::new(self.access.weak_fence(), now));
             entry.touched = now;
             entry.assets.push(Row { asset, state });
             AssetStore::trim(entry, &mut retention, key);
+            AssetStore::refresh_states(&mut entries, &mut retention);
             Ok(id)
         }).unwrap_or(Err(BlobError::Unauthorized))
     }
@@ -1326,7 +1353,6 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                     return Err(BlobError::Unauthorized);
                 }
                 let mut retention = self.store.retention.lock();
-                retention.evict((key.clone(), id), &mut entry.assets[index])?;
                 retention.release_all(key, [entry.assets.remove(index)]);
                 Ok(())
             })
@@ -1487,19 +1513,7 @@ mod retention_tests {
             .map(|resolved| resolved.blob)
     }
     fn residents(store: &AssetStore) -> usize {
-        let entries = store.entries.lock();
-        let resident = entries
-            .values()
-            .flat_map(|entry| &entry.assets)
-            .filter(|row| match row.state {
-                Attachment::Resident(_) => true,
-                Attachment::Registered
-                | Attachment::Downloading(_)
-                | Attachment::Evicted
-                | Attachment::NotStored(_) => false,
-            })
-            .count();
-        resident
+        store.retention.lock().resident_files()
     }
     fn reclaim(store: &AssetStore, access: &AssetAccess, id: u64) {
         let mut entries = store.entries.lock();
@@ -1805,6 +1819,391 @@ mod retention_tests {
         .unwrap();
     }
 
+    fn durable_window() -> crate::config::MemoryWindow {
+        crate::config::MemoryWindow {
+            scope: crate::config::MemoryScope::PrivateConversation,
+            idle_timeout: Duration::from_secs(3600),
+            limits: dekopon_agent::prompt::HistoryLimits {
+                max_turns: 8,
+                max_bytes: 65536,
+            },
+            recall: crate::config::RecallSource::Journal,
+            forget_after: Duration::from_secs(3600),
+        }
+    }
+
+    fn journal_inventory(
+        journal: &crate::memory::journal::Journal,
+        access: &AssetAccess,
+        inventory: &[AssetRef],
+        at: SystemTime,
+    ) {
+        journal
+            .append(
+                &access.key.conversation.journal_stem(),
+                &crate::memory::journal::Entry {
+                    at,
+                    grant: "grant",
+                    turn: &dekopon_agent::prompt::ConversationTurn::completed("file", "seen"),
+                    inventory,
+                    next_asset_id: access.next_asset_id(),
+                    prepared: None,
+                },
+                durable_window(),
+            )
+            .unwrap();
+    }
+
+    fn generated_row(store: &AssetStore, access: &AssetAccess) -> u64 {
+        let id = register(store, access);
+        row_mut(&mut store.entries.lock(), &access.key, id)
+            .unwrap()
+            .asset
+            .source = Some(AssetSourceRef::Generated {
+            capability: "asset.attach".into(),
+            invocation: "invocation".into(),
+        });
+        id
+    }
+
+    #[test]
+    fn a_full_budget_evicts_the_oldest_inbound_file_before_any_generated_file() {
+        let store = store(9);
+        let access = access("ordering");
+        let generated = generated_row(&store, &access);
+        drop(store.admit(&access, generated, b"gen").unwrap());
+        let oldest = register(&store, &access);
+        drop(store.admit(&access, oldest, b"old").unwrap());
+        let newest = register(&store, &access);
+        drop(store.admit(&access, newest, b"new").unwrap());
+        let incoming = register(&store, &access);
+        drop(store.admit(&access, incoming, b"inc").unwrap());
+        assert_eq!(
+            store.pin(&access, oldest, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        assert!(
+            store
+                .pin(&access, generated, Recency::Keep)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.pin(&access, newest, Recency::Keep).unwrap().is_some());
+        let pinned = store.pin(&access, newest, Recency::Keep).unwrap();
+        let next = register(&store, &access);
+        drop(store.admit(&access, next, b"nxt").unwrap());
+        assert_eq!(
+            store.pin(&access, incoming, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        assert_eq!(pinned.unwrap().read().unwrap(), b"new");
+    }
+
+    #[test]
+    fn restart_restores_inbound_residency_and_evicts_unrecalled_files_by_persisted_recency() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let first = access("first");
+        let second = access("second");
+        let path = directory.path().join("assets");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let a = register(&store, &first);
+        drop(store.admit(&first, a, b"aaa").unwrap());
+        journal_inventory(
+            &journal,
+            &first,
+            &store.inventory(&first),
+            SystemTime::now(),
+        );
+        let b = register(&store, &second);
+        drop(store.admit(&second, b, b"bbb").unwrap());
+        journal_inventory(
+            &journal,
+            &second,
+            &store.inventory(&second),
+            SystemTime::now(),
+        );
+        drop(store.pin(&first, a, Recency::Touch).unwrap());
+        drop(store);
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let recalled = journal
+            .recall(
+                &first.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &first,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        assert_eq!(
+            store
+                .pin(&first, a, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+        let c = register(&store, &first);
+        drop(store.admit(&first, c, b"ccc").unwrap());
+        assert_eq!(store.retention.lock().bytes, 6);
+        let recalled = journal
+            .recall(
+                &second.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &second,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        assert_eq!(
+            store.pin(&second, b, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        assert!(matches!(
+            row_mut(&mut store.entries.lock(), &second.key, b)
+                .unwrap()
+                .state,
+            Attachment::Evicted
+        ));
+    }
+
+    #[test]
+    fn journal_deletion_counts_shared_digests_and_memory_expiry_keeps_named_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let store = AssetStore::with_retention(1, Duration::from_secs(3600), 6)
+            .with_storage(&directory.path().join("assets"))
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let first = access("first");
+        let second = access("second");
+        let now = SystemTime::now();
+        for access in [&first, &second] {
+            let id = register(&store, access);
+            drop(store.admit(access, id, b"aaa").unwrap());
+            journal_inventory(&journal, access, &store.inventory(access), now);
+        }
+        assert_eq!(store.retention.lock().bytes, 3);
+        AssetStore::expire(
+            &mut store.entries.lock(),
+            &mut store.retention.lock(),
+            Duration::ZERO,
+            Instant::now(),
+        );
+        assert_eq!(store.retention.lock().bytes, 3);
+        let later = now + Duration::from_secs(7200);
+        journal_inventory(&journal, &first, &[], later);
+        assert_eq!(store.retention.lock().bytes, 3);
+        journal_inventory(&journal, &second, &[], later);
+        assert_eq!(store.retention.lock().bytes, 0);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("assets/blobs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn store_modes_and_index_and_traces_exclude_bearer_sources() {
+        use std::os::unix::fs::PermissionsExt;
+        use tracing_subscriber::prelude::*;
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("assets");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 6)
+            .with_storage(&path)
+            .unwrap();
+        let access = access("private");
+        let id = register(&store, &access);
+        row_mut(&mut store.entries.lock(), &access.key, id)
+            .unwrap()
+            .asset
+            .source = Some(AssetSourceRef::Slack {
+            file_id: "F15-secret-id".into(),
+            url: "https://files.slack.com/F15-bearer".into(),
+        });
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        for dir in [&path, &path.join("blobs")] {
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let blob = std::fs::read_dir(path.join("blobs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        for file in [&blob, &path.join("index.json")] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let index = std::fs::read_to_string(path.join("index.json")).unwrap();
+        for text in [index, capture.events_text(), capture.spans_text()] {
+            assert!(!text.contains("F15-secret-id"));
+            assert!(!text.contains("F15-bearer"));
+            assert!(!text.contains("files.slack.com"));
+        }
+    }
+
+    #[test]
+    fn a_pending_file_survives_unrelated_journal_work_and_a_retired_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(&directory.path().join("assets"))
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let first = access("pending");
+        let id = register(&store, &first);
+        drop(store.admit(&first, id, b"aaa").unwrap());
+        journal_inventory(&journal, &access("unrelated"), &[], SystemTime::now());
+        assert_eq!(
+            store
+                .pin(&first, id, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+        journal_inventory(
+            &journal,
+            &first,
+            &store.inventory(&first),
+            SystemTime::now(),
+        );
+        first.fence.as_ref().unwrap().deactivate();
+        store.inventory(&access("sweep"));
+        assert_eq!(
+            store.pin(&first, id, Recency::Keep),
+            Err(BlobError::Unauthorized)
+        );
+        assert_eq!(store.retention.lock().bytes, 3);
+        journal_inventory(
+            &journal,
+            &first,
+            &[],
+            SystemTime::now() + Duration::from_secs(7200),
+        );
+        assert_eq!(store.retention.lock().bytes, 0);
+    }
+
+    #[test]
+    fn not_stored_reasons_survive_restart_and_crash_leftovers_are_swept() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = crate::memory::journal::Journal::open(
+            &directory.path().join("journal"),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let path = directory.path().join("assets");
+        let access = access("oversized");
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 2)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let id = register(&store, &access);
+        assert_eq!(store.admit(&access, id, b"aaa"), Err(BlobError::TooLarge));
+        journal_inventory(
+            &journal,
+            &access,
+            &store.inventory(&access),
+            SystemTime::now(),
+        );
+        drop(store);
+        std::fs::write(path.join("blobs").join("ab".repeat(32)), b"orphan").unwrap();
+        std::fs::write(path.join("blobs/staging"), b"interrupted write").unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 2)
+            .with_storage(&path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let recalled = journal
+            .recall(
+                &access.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &access,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        assert!(matches!(
+            row_mut(&mut store.entries.lock(), &access.key, id)
+                .unwrap()
+                .state,
+            Attachment::NotStored(StoreFailure::BudgetTooSmall)
+        ));
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn generated_files_are_not_restored_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(directory.path())
+            .unwrap();
+        let access = access("generated");
+        let id = generated_row(&store, &access);
+        drop(store.admit(&access, id, b"gen").unwrap());
+        assert_eq!(store.retention.lock().bytes, 3);
+        drop(store);
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(directory.path())
+            .unwrap();
+        assert_eq!(store.retention.lock().bytes, 0);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("blobs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn lru_use_a_admit_c_evicts_b_and_listing_does_not_touch() {
         let store = store(6);
@@ -1881,7 +2280,7 @@ mod retention_tests {
                     }
                 }
             }
-            assert_eq!(residents(&store), MAX_ASSETS_PER_CONVERSATION);
+            assert_eq!(residents(&store), 1);
             let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
             session
                 .register(fd, &metadata, "asset.attach", "invocation")
@@ -1892,9 +2291,8 @@ mod retention_tests {
                     .get_access(&access, first.unwrap(), Instant::now())
                     .is_none()
             );
-            let expected = MAX_ASSETS_PER_CONVERSATION + usize::from(pinned);
-            assert_eq!(residents(&store), expected);
-            assert_eq!(store.retention.lock().bytes, 3 * expected);
+            assert_eq!(residents(&store), 1);
+            assert_eq!(store.retention.lock().bytes, 3);
             if let Some(pin) = pin {
                 assert_eq!(pin.read().unwrap(), b"abc");
             }
@@ -1957,16 +2355,16 @@ mod retention_tests {
 
     #[test]
     fn tombstones_are_bounded_and_evicted_ids_never_redownload() {
-        let store = store(1);
+        let store = store(8);
         let access = access("one");
         for _ in 0..MAX_RELEASE_TOMBSTONES + 5 {
             let id = register(&store, &access);
-            drop(store.admit(&access, id, b"x").unwrap());
+            drop(store.admit(&access, id, &id.to_be_bytes()).unwrap());
         }
         assert_eq!(residents(&store), 1);
         let cache = store.retention.lock();
         assert_eq!(cache.released.len(), MAX_RELEASE_TOMBSTONES);
-        assert_eq!(cache.bytes, 1);
+        assert_eq!(cache.bytes, 8);
     }
 
     #[test]
@@ -2239,7 +2637,9 @@ mod retention_tests {
             let _guard = tracing_subscriber::registry()
                 .with(capture.clone())
                 .set_default();
-            let pin = store.admit(&access, pinned_id, PNG).unwrap();
+            let pin = store
+                .admit(&access, pinned_id, &vec![0; PNG.len()])
+                .unwrap();
             let is_write = |record: &dekopon_test_support::Record| {
                 matches!(record,
                 dekopon_test_support::Record::Span { name: "asset.spool", .. }
@@ -2261,7 +2661,7 @@ mod retention_tests {
                 "PNG validation must not spool before budget admission"
             );
             assert_eq!(store.retention.lock().bytes, PNG.len());
-            assert_eq!(pin.read().unwrap(), PNG);
+            assert_eq!(pin.read().unwrap(), vec![0; PNG.len()]);
             assert!(
                 session
                     .fetch(id)
@@ -2513,7 +2913,7 @@ mod retention_tests {
         assert_eq!(session.remove(id), Err(BlobError::Unauthorized));
     }
     #[tokio::test]
-    async fn pathless_removal_closes_residency_and_disabled_intake_publishes_no_id() {
+    async fn pathless_removal_closes_residency_and_disabled_intake_keeps_a_reference() {
         let store = store(3);
         let access = access("one");
         let session = session(Arc::clone(&store), access.clone());
@@ -2533,11 +2933,11 @@ mod retention_tests {
             true,
         );
         let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
-        assert_eq!(
-            disabled_session.register(fd, &metadata, "asset.attach", "invocation"),
-            Err(BlobError::Disabled)
-        );
-        assert!(disabled.get_inventory(&access).is_empty());
+        let id = disabled_session
+            .register(fd, &metadata, "asset.attach", "invocation")
+            .unwrap();
+        assert_eq!(disabled.get_inventory(&access)[0].id, id);
+        assert_eq!(disabled.retention.lock().bytes, 0);
     }
     #[tokio::test]
     async fn encoded_intake_and_reference_budget_use_decoded_limits() {
@@ -2554,7 +2954,7 @@ mod retention_tests {
                 .unwrap();
             references.push(format!("chat-asset:{id}"));
         }
-        assert_eq!(store.retention.lock().bytes, 5 * encoded.len());
+        assert_eq!(store.retention.lock().bytes, encoded.len());
         let inputs = ChatAssetInputs::new(Arc::<SessionAssets>::clone(&session));
         let argv = references
             .iter()
@@ -2574,11 +2974,15 @@ mod retention_tests {
                 AssetEncoding::Base64 => STANDARD.encode(vec![0; raw.len() + 1]).into_bytes(),
             };
             let (fd, metadata) = received(&bytes, "image/png", encoding);
-            assert_eq!(
-                session.register(fd, &metadata, "image.edit", "overflow"),
-                Err(BlobError::TooLarge)
-            );
-            assert_eq!(session.rows().len(), 5);
+            let id = session
+                .register(fd, &metadata, "image.edit", "overflow")
+                .unwrap();
+            assert!(matches!(
+                row_mut(&mut store.entries.lock(), &session.access.key, id)
+                    .unwrap()
+                    .state,
+                Attachment::NotStored(_)
+            ));
         }
     }
 

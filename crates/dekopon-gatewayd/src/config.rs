@@ -3263,6 +3263,66 @@ mod tests {
          \x20   classes: [reasoning]\n";
 
     #[test]
+    fn durable_assets_require_a_journal_and_a_separate_resolvable_path() {
+        use super::ConfigProblem;
+        for (sessions, expected) in [
+            ("journal: {path: journal}", ConfigProblem::AssetsRequired),
+            (
+                "journal: {path: journal}, assets: null",
+                ConfigProblem::AssetsRequired,
+            ),
+            (
+                "assets: {path: assets}",
+                ConfigProblem::AssetsWithoutJournal,
+            ),
+            (
+                "journal: {path: journal}, assets: {}",
+                ConfigProblem::AssetsPathRequired,
+            ),
+            (
+                "journal: {path: journal}, assets: {path: ''}",
+                ConfigProblem::AssetsPathRequired,
+            ),
+            (
+                "journal: {path: journal}, assets: {path: journal}",
+                ConfigProblem::AssetsPathEqualsJournal,
+            ),
+            (
+                "journal: {path: journal}, assets: {path: journal/assets}",
+                ConfigProblem::AssetsPathInsideJournal,
+            ),
+            (
+                "journal: {path: journal/records}, assets: {path: journal}",
+                ConfigProblem::AssetsPathContainsJournal,
+            ),
+            (
+                "journal: {path: journal}, assets: {path: /dev/null/assets}",
+                ConfigProblem::AssetsPathUnresolved {
+                    kind: std::io::ErrorKind::NotADirectory,
+                },
+            ),
+        ] {
+            let error = resolved(&format!("{TAIL}\nsessions: {{{sessions}}}\n")).unwrap_err();
+            let ConfigError::Invalid { problems, .. } = error else {
+                panic!("typed validation expected");
+            };
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| std::mem::discriminant(problem)
+                        == std::mem::discriminant(&expected)),
+                "{sessions}: {problems:?}"
+            );
+        }
+        let config = resolved(&format!(
+            "{TAIL}\nsessions: {{journal: {{path: journal}}, assets: {{path: assets}}}}\n"
+        ))
+        .unwrap();
+        assert_eq!(config.assets.unwrap(), std::path::Path::new("/tmp/assets"));
+        assert_eq!(config.sessions.asset_retention_bytes, 1_073_741_824);
+    }
+
+    #[test]
     fn only_the_gatewayd_api_version_decodes() {
         let valid = format!("{PREAMBLE}{TAIL}");
         assert!(super::decode(valid.as_bytes()).is_ok());

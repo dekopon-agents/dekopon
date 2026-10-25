@@ -13,3 +13,20 @@ Read the [Kubernetes installation and operations guide](https://github.com/dekop
 for installation, configuration, credential and storage handling, versioning, and chart publishing.
 
 This pointer is included in the chart archive so `helm show readme` can locate the canonical guide.
+
+### Durable gateway attachments
+
+Enable `gateway.journal.enabled` and `gateway.assets.enabled` together. Set gateway configuration
+`sessions.assets.path` to `gateway.assets.mountPath` (default `/var/lib/dekopon-gatewayd/assets`),
+beside `sessions.journal.path`. The asset directory is a separate gateway-owned subtree of the state
+claim; its default subdirectory is `gateway-assets`. Overlapping journal/store paths and clashing
+state subdirectories refuse rendering. The key and gateway image must roll out together: older
+gateways refuse `sessions.assets`, and the new gateway requires it when the journal is configured.
+The pin reverts as a whole; an older gateway ignores the asset directory.
+
+The default attachment budget is 1 GiB. With a journal, retained uploads live on the state claim;
+without a journal they remain in gateway temporary storage. Gateway temporary and broker output
+volumes retain their own sizing limits and must accommodate the configured budget and staging.
+`ci/test-assets.py` checks render-time refusals and mounts. `ci/verify-init-permissions.sh` also
+runs the rendered init command and writes to the mounted asset subtree as the gateway UID on a
+Docker local filesystem volume, modelling the claim's `local-path` backing.

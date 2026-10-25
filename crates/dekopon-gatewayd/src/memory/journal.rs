@@ -205,6 +205,31 @@ impl Journal {
         self.sync_assets()
     }
 
+    fn finish_pending_assets(&self, stem: &str, next_id: u64) -> Result<(), JournalError> {
+        self.sync_assets()?;
+        if let Some(assets) = self
+            .assets
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            assets
+                .lock()
+                .finish_pending(stem, next_id)
+                .map_err(|error| match error {
+                    dekopon_model::asset::BlobError::Io(kind) => JournalError::Io { kind },
+                    dekopon_model::asset::BlobError::TooLarge
+                    | dekopon_model::asset::BlobError::Disabled
+                    | dekopon_model::asset::BlobError::Capacity
+                    | dekopon_model::asset::BlobError::Unknown
+                    | dekopon_model::asset::BlobError::Reclaimed
+                    | dekopon_model::asset::BlobError::Unauthorized
+                    | dekopon_model::asset::BlobError::LengthChanged => JournalError::Corrupt,
+                })?;
+        }
+        Ok(())
+    }
+
     fn sync_assets(&self) -> Result<(), JournalError> {
         let Some(assets) = self
             .assets
@@ -227,7 +252,7 @@ impl Journal {
                 }
                 let stem = path
                     .strip_prefix(&self.dir)
-                    .map_err(|_| JournalError::Corrupt)?
+                    .map_err(|_outside| JournalError::Corrupt)?
                     .with_extension("")
                     .to_string_lossy()
                     .into_owned();
@@ -628,6 +653,7 @@ impl Journal {
                 "gateway.memory.retention.failed"
             );
         }
+        self.finish_pending_assets(stem, entry.next_asset_id)?;
         Ok(())
     }
 
