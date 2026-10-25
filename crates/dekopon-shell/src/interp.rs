@@ -1300,15 +1300,12 @@ impl<'a> Evaluator<'a> {
             let mut running = Vec::with_capacity(producers.len());
             for (index, command) in producers.iter().enumerate() {
                 let (writer, reader) = pipe::pipe(
-                    None,
-                    None,
+                    Some(Arc::clone(&meters[index + 1])),
+                    Some(Arc::clone(&meters[index])),
                     crate::interp::telemetry::stage_read,
                     crate::interp::telemetry::stage_write,
                 );
-                let stage_input = std::mem::replace(
-                    &mut input,
-                    StageInput::Piped(reader.with_context(Some(Arc::clone(&meters[index + 1])))),
-                );
+                let stage_input = std::mem::replace(&mut input, StageInput::Piped(reader));
                 running.push(self.spawn_stage(
                     scope,
                     StageSetup {
@@ -1320,7 +1317,7 @@ impl<'a> Evaluator<'a> {
                     },
                     command,
                     stage_input,
-                    writer.with_context(Some(Arc::clone(&meters[index]))),
+                    writer,
                 ));
             }
             if !producers.is_empty() {

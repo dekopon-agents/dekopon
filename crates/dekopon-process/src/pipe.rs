@@ -67,11 +67,6 @@ pub struct PipeWriter<C = ()> {
 }
 
 impl<C> PipeWriter<C> {
-    pub fn with_context(mut self, context: C) -> Self {
-        self.context = context;
-        self
-    }
-
     pub fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
         for chunk in bytes.chunks(CHUNK_BYTES) {
             if self.sender.send(chunk.to_vec()).is_err() {
@@ -107,11 +102,6 @@ impl<C: Default> Default for PipeReader<C> {
 }
 
 impl<C> PipeReader<C> {
-    pub fn with_context(mut self, context: C) -> Self {
-        self.context = context;
-        self
-    }
-
     /// Reads a provider's stdout; dropping the reader closes the socket, so the provider's next
     /// write finds its reader gone.
     pub fn from_socket(
