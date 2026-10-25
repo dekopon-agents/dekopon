@@ -639,7 +639,22 @@ where
             if !claim_is_valid(attestation.as_ref(), Some(&invocation)) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            let span = tracing::info_span!("broker.invocation", invocation = %invocation, capability = tracing::field::Empty);
+            let span = match attestation.as_ref() {
+                Some(claim) => tracing::info_span!(
+                    "broker.invocation",
+                    invocation = %invocation,
+                    capability = tracing::field::Empty,
+                    trace = %trace_parent.trace(),
+                    subject = %claim.subject,
+                    agent = %claim.agent,
+                ),
+                None => tracing::info_span!(
+                    "broker.invocation",
+                    invocation = %invocation,
+                    capability = tracing::field::Empty,
+                    trace = %trace_parent.trace(),
+                ),
+            };
             adopt_trace_parent(&span, trace_parent);
             let command_span = tracing::info_span!(parent: &span, "broker.command_run", word = %word, outcome = tracing::field::Empty, otel.status_code = tracing::field::Empty);
             let argv = argv
@@ -664,15 +679,21 @@ where
                 )
                 .instrument(command_span.clone())
                 .await;
+            match &parsed {
+                Ok(outcome) => {
+                    command_span.record("outcome", command_run_outcome(outcome));
+                }
+                Err(_) => {
+                    command_span.record("outcome", "error");
+                    command_span.record("otel.status_code", "error");
+                }
+            }
             let (capability, input, secret_use) = match parsed {
                 Ok(CommandRunOutcome::Proposed {
                     capability,
                     input,
                     secret_use,
-                }) => {
-                    command_span.record("outcome", "proposed");
-                    (capability, input, secret_use)
-                }
+                }) => (capability, input, secret_use),
                 Ok(CommandRunOutcome::Rendered {
                     stdout,
                     stderr,

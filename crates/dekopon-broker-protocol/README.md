@@ -2,11 +2,11 @@
 
 Versioned, length-delimited local broker messages and an unprivileged Unix-socket client.
 
-There is one operation per verb — `capabilities`, `runCommand`, `invoke`, and
+There is one operation per verb — `capabilities`, `runCommand`, `run`, `invoke`, and
 `recordDeliveredTurn`. Whether a caller speaks as its own authenticated peer, on behalf of an external
 subject, or inside a bounded chat scope is one optional `Attestation` field on the operation rather
 than an operation of its own; `scope` distinguishes a chat claim from a subject-only one, and
-`invocation` binds a claim to the proposal it accompanies on exactly the two operations that carry
+`invocation` binds a claim to the proposal it accompanies on exactly the three operations that carry
 one.
 
 The authority-bearing half of the wire carries only capability inspection requests and untrusted

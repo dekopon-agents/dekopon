@@ -99,19 +99,82 @@ fn a_usage_error_refunds_its_call() {
 
 #[test]
 fn concurrent_stages_cannot_overrun_the_call_budget() {
+    #[derive(Default)]
+    struct Probe {
+        runs: Arc<Mutex<usize>>,
+        job: Mutex<Option<std::thread::JoinHandle<ExitCode>>>,
+        started: std::sync::atomic::AtomicBool,
+    }
+    impl JobControl for Probe {
+        fn start(&self, seed: JobSeed) -> Result<JobId, JobRefusal> {
+            assert!(!self.started.swap(true, std::sync::atomic::Ordering::SeqCst));
+            let probe = Probe {
+                runs: Arc::clone(&self.runs),
+                job: Mutex::new(None),
+                started: std::sync::atomic::AtomicBool::new(false),
+            };
+            let tree = seed.tree().clone();
+            *self.job.lock() = Some(std::thread::spawn(move || {
+                Interpreter::new(Limits::default())
+                    .run_seed(seed, &probe, &tree)
+                    .exit_code
+            }));
+            Ok(JobId::new(1))
+        }
+        fn list(&self) -> Vec<JobSummary> {
+            Vec::new()
+        }
+        fn wait(&self, ids: &[JobId], _: &dyn Fn() -> bool) -> Vec<Result<JobWait, JobRefusal>> {
+            assert_eq!(ids, [JobId::new(1)]);
+            let job = self.job.lock().take().unwrap();
+            vec![Ok(JobWait::Exited(job.join().unwrap()))]
+        }
+        fn kill(&self, _: JobId) -> Result<(), JobRefusal> {
+            panic!("this script waits for its job")
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            if let Some(job) = self.job.get_mut().take() {
+                job.join().unwrap();
+            }
+        }
+    }
+    impl CapabilityInvoker for Probe {
+        fn job_control(&self) -> Option<&dyn JobControl> {
+            Some(self)
+        }
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn command_words(&self) -> Vec<String> {
+            vec!["probe".to_owned()]
+        }
+        fn run(&self, call: RunCall, streams: Streams, _: &TreeContext) -> RunResult {
+            assert_eq!(call.word, "probe");
+            *self.runs.lock() += 1;
+            drop(streams);
+            RunResult::Invoked {
+                capability: "probe".to_owned(),
+                input: Value::Null,
+                secret_use: None,
+                result: CapabilityCallResult::Succeeded,
+            }
+        }
+        fn invoke(&self, _: CommandProposal, _: Streams, _: &TreeContext) -> CapabilityCallResult {
+            panic!("Run owns dispatch")
+        }
+    }
+    let probe = Probe::default();
     let calls = CallBudget::new(1);
-    std::thread::scope(|scope| {
-        let handles = (0..16)
-            .map(|_| scope.spawn(|| calls.charge().is_ok()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .filter(|admitted| *admitted)
-                .count(),
-            1
-        );
-    });
+    let tree = TreeContext::new(Limits::default(), calls.clone());
+    Interpreter::new(Limits::default()).run_with_tree("probe & probe; wait", &probe, &tree);
+    let unfinished = probe.job.lock().take();
+    if let Some(job) = unfinished {
+        job.join().unwrap();
+    }
+    assert!(probe.started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(probe.job.lock().is_none());
+    assert_eq!(*probe.runs.lock(), 1);
     assert_eq!(calls.used(), 1);
 }
