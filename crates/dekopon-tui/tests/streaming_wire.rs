@@ -8,13 +8,11 @@
 )]
 
 use dekopon_broker_protocol::{
-    AssetEncoding, BrokerClient, BrokerResponse, CommandRunOutcome, DescriptorStream, FrameLimits,
-    NewAsset, ProtocolVersion, ResponseEnvelope, RunOutcome,
+    AssetEncoding, BrokerClient, BrokerResponse, DescriptorStream, FrameLimits, NewAsset,
+    ProtocolVersion, ResponseEnvelope, RunOutcome,
 };
 use dekopon_core::SecretUseProposal;
-use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker as _, CommandProposal, CommandRun, Streams,
-};
+use dekopon_shell::{CapabilityCallResult, CapabilityInvoker as _, CommandProposal, Streams};
 use dekopon_tui::{
     record::{CallOutcome, RecordingInvoker, Sequence, SessionEvent},
     session::{LegHandle, assets::ConsoleAssets, open_agent, open_agent_with_assets},
@@ -233,7 +231,7 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
     };
     let expected_secret = secret.clone();
     let server = tokio::spawn(async move {
-        for operation in ["capabilities", "runCommand", "invoke"] {
+        for operation in ["capabilities", "run"] {
             let (stream, _) = listener.accept().await.unwrap();
             let mut wire = DescriptorStream::new(stream);
             let (frame, mut descriptors) = wire
@@ -251,25 +249,9 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
                         "provider": "probe", "capability": { "id": "probe.upper", "description": "stream probe", "effect": "read-only", "risk": "Low", "inputSchema": {"type":"object"} }
                     })).unwrap()], vec!["probe".into()], [("probe".into(), "probe upper".into())].into())
                 }
-                "runCommand" => {
-                    assert!(descriptors.is_empty());
-                    assert_eq!(request["stdinPiped"], true);
-                    assert!(
-                        request.get("stdin").is_none(),
-                        "only pipe presence belongs on the wire"
-                    );
-                    ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
-                        capability: "probe.upper".parse().unwrap(),
-                        input: json!({"mode":"upper"}),
-                        secret_use: Some(expected_secret.clone()),
-                    })
-                }
-                "invoke" => {
-                    assert_eq!(
-                        request["invocation"]["secretUse"],
-                        serde_json::to_value(&expected_secret).unwrap()
-                    );
-                    assert_eq!(request["invocation"]["input"], json!({"mode":"upper"}));
+                "run" => {
+                    assert_eq!(request["word"], "probe");
+                    assert_eq!(request["argv"], json!([{"text":"upper"}]));
                     assert_eq!(request["streams"], json!({"stdin":true}));
                     assert_eq!(descriptors.len(), 2);
                     let streams = dekopon_broker_protocol::Streams::split_from(
@@ -290,11 +272,16 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
                     })
                     .await
                     .unwrap();
-                    ResponseEnvelope::invocation(serde_json::from_value(json!({
-                        "invocation": request["invocation"]["id"],
-                        "decision": {"decisionId":"wire-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-                        "outcome":"Failed", "exitStatus":141
-                    })).unwrap(), vec![], vec![], vec![])
+                    ResponseEnvelope { api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2, response: dekopon_broker_protocol::BrokerResponse::Ran { outcome: dekopon_broker_protocol::RunOutcome::Invoked {
+                        capability: "probe.upper".parse().unwrap(),
+                        input: json!({"mode":"upper"}),
+                        secret_use: Some(expected_secret.clone()),
+                        result: serde_json::from_value(json!({
+                            "invocation": request["invocation"],
+                            "decision": {"decisionId":"wire-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                            "outcome":"Failed", "exitStatus":141
+                        })).unwrap(), attached: vec![], removed: vec![], sent: vec![],
+                    } } }
                 }
                 _ => unreachable!(),
             };
@@ -321,15 +308,12 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
     tokio::task::spawn_blocking(move || {
         let invoker = RecordingInvoker::new(LegHandle(Arc::new(leg)), events, Sequence::default());
         assert_eq!(invoker.command_word_help()["probe"], "probe upper");
-        let Some(CommandRun::Proposed { capability, input, secret_use, report }) = invoker.run_command("probe", &["upper".into()], true) else { panic!("expected proposal") };
-        assert_eq!(secret_use, Some(secret));
-        assert!(report.is_some());
         let (stdin, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"hello from stdin\n").unwrap();
         drop(writer);
         let (stdout, mut reader) = UnixStream::pair().unwrap();
-        let result = invoker.invoke(CommandProposal { capability, input, secret_use, report }, Streams { stdin: Some(stdin.into()), stdout: stdout.into() }, &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), dekopon_process::CallBudget::new(4)));
-        assert!(matches!(result, CapabilityCallResult::Exited { status, ref stderr } if status.get() == 141 && stderr.is_empty()));
+        let result = invoker.run(dekopon_shell::RunCall { word: "probe".into(), argv: vec![dekopon_shell::Arg::Text("upper".into())] }, Streams { stdin: Some(stdin.into()), stdout: stdout.into() }, &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), dekopon_process::CallBudget::new(4)));
+        assert!(matches!(result, dekopon_shell::RunResult::Invoked { secret_use: Some(ref received), result: CapabilityCallResult::Exited { status, ref stderr }, .. } if *received == secret && status.get() == 141 && stderr.is_empty()));
         let mut output = String::new();
         reader.read_to_string(&mut output).unwrap();
         assert_eq!(output, "HELLO FROM STDIN\n", "observation must not consume provider stdout");

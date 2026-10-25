@@ -26,6 +26,36 @@ struct Probe {
     cancelled: AtomicBool,
 }
 
+impl Probe {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        if word != "probe" {
+            return None;
+        }
+        let command = argv.first()?.as_str();
+        assert_eq!(
+            stdin_piped,
+            command == "consume",
+            "pipe presence is forwarded, not buffered input"
+        );
+        let reports = std::sync::Arc::clone(&self.reports);
+        Some(Ok(dekopon_shell::CommandProposal {
+            capability: format!("probe.{command}"),
+            input: json!({"command": command}),
+            secret_use: None,
+            report: Some(CommandReport::new(move |outcome| {
+                if matches!(outcome, CommandReportOutcome::Succeeded) {
+                    reports.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+        }))
+    }
+}
+
 impl CapabilityInvoker for Probe {
     fn granted(&self) -> Vec<String> {
         vec!["probe.produce".into(), "probe.consume".into()]
@@ -46,27 +76,44 @@ impl CapabilityInvoker for Probe {
     fn script_finished(&self) {
         self.finishes.fetch_add(1, Ordering::SeqCst);
     }
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        if word != "probe" {
-            return None;
-        }
-        let command = argv.first()?.as_str();
-        assert_eq!(
-            stdin_piped,
-            command == "consume",
-            "pipe presence is forwarded, not buffered input"
-        );
-        let reports = std::sync::Arc::clone(&self.reports);
-        Some(CommandRun::Proposed {
-            capability: format!("probe.{command}"),
-            input: json!({"command": command}),
-            secret_use: None,
-            report: Some(CommandReport::new(move |outcome| {
-                if matches!(outcome, CommandReportOutcome::Succeeded) {
-                    reports.fetch_add(1, Ordering::SeqCst);
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
                 }
-            })),
-        })
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
     fn invoke(
         &self,

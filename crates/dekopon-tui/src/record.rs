@@ -29,8 +29,8 @@ use dekopon_agent::{
 };
 use dekopon_model_token_governor::ModelUsage;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, CommandRun,
-    JobControl, ScriptOutcome, Streams,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, JobControl,
+    ScriptOutcome, Streams,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -255,10 +255,6 @@ impl<I: CapabilityInvoker> CapabilityInvoker for RecordingInvoker<I> {
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         self.inner.describe(capability)
-    }
-
-    fn run_command(&self, word: &str, argv: &[String], stdin: bool) -> Option<CommandRun> {
-        self.inner.run_command(word, argv, stdin)
     }
 
     fn script_finished(&self) {

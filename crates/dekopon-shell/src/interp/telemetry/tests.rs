@@ -18,12 +18,46 @@ use serde_json::json;
 
 struct Fixture;
 
-fn proposal(capability: &str) -> CommandRun {
-    CommandRun::Proposed {
+fn proposal(capability: &str) -> Result<crate::CommandProposal, CommandRun> {
+    Ok(crate::CommandProposal {
         capability: capability.into(),
         input: json!({}),
         secret_use: None,
         report: None,
+    })
+}
+
+impl Fixture {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        _stdin_piped: bool,
+    ) -> Option<Result<crate::CommandProposal, CommandRun>> {
+        if word != "probe" {
+            return None;
+        }
+        let args = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(match args.as_slice() {
+            ["upper", "--text", text] => Ok(crate::CommandProposal {
+                capability: "cli-probe.upper".into(),
+                input: json!({"text": text}),
+                secret_use: None,
+                report: None,
+            }),
+            ["upper", "-"] => Ok(crate::CommandProposal {
+                capability: "cli-probe.upper".into(),
+                input: json!({"text": null}),
+                secret_use: None,
+                report: None,
+            }),
+            ["broken"] => proposal("provider.broken"),
+            ["denied"] => proposal("policy.denied"),
+            ["ungranted"] => proposal("nothing.granted"),
+            _ => Err(CommandRun::Failed {
+                message: "unknown probe command".into(),
+            }),
+        })
     }
 }
 
@@ -40,31 +74,44 @@ impl CapabilityInvoker for Fixture {
         vec!["probe".into()]
     }
 
-    fn run_command(&self, word: &str, argv: &[String], _stdin_piped: bool) -> Option<CommandRun> {
-        if word != "probe" {
-            return None;
+    fn run(
+        &self,
+        call: crate::RunCall,
+        streams: crate::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> crate::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return crate::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                crate::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => crate::render_run(call, Some(rendered), streams),
+            None => crate::render_run(call, None, streams),
         }
-        let args = argv.iter().map(String::as_str).collect::<Vec<_>>();
-        Some(match args.as_slice() {
-            ["upper", "--text", text] => CommandRun::Proposed {
-                capability: "cli-probe.upper".into(),
-                input: json!({"text": text}),
-                secret_use: None,
-                report: None,
-            },
-            ["upper", "-"] => CommandRun::Proposed {
-                capability: "cli-probe.upper".into(),
-                input: json!({"text": null}),
-                secret_use: None,
-                report: None,
-            },
-            ["broken"] => proposal("provider.broken"),
-            ["denied"] => proposal("policy.denied"),
-            ["ungranted"] => proposal("nothing.granted"),
-            _ => CommandRun::Failed {
-                message: "unknown probe command".into(),
-            },
-        })
     }
 
     fn invoke(
