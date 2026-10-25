@@ -1,5 +1,68 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn an_unchanged_configuration_emits_no_indicator_records_on_reload_ticks() {
+    use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
+    use dekopon_test_support::BrokerFixture;
+
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    let path = write_config(root.path(), &config);
+    let (capture, _guard) = capture_spans();
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let expected = candidate
+        .config
+        .routes
+        .iter()
+        .map(|route| route.indicators.len())
+        .sum::<usize>();
+    assert!(expected > 0);
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        (0..3).map(|_| ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }),
+    );
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap();
+    let records = || {
+        capture.events_where(
+            "dekopon_gatewayd",
+            &[("event", "gateway_indicators_effective")],
+        )
+    };
+    assert_eq!(records().len(), expected);
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.reset();
+    for _ in 0..3 {
+        tick.tick().await;
+        gateway.reconcile().await;
+        assert!(matches!(
+            broker.request().await.request,
+            BrokerRequest::PrepareGeneration { .. }
+        ));
+        assert_eq!(records().len(), expected);
+    }
+}
+
 #[tokio::test]
 async fn session_spans_keep_the_generation_activated_for_each_turn() {
     use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
@@ -13,6 +76,10 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
     .unwrap();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
+    config["routes"][0]["conversation"]["kind"] = json!(["directMessage", "groupDirectMessage"]);
+    let mut channel_route = config["routes"][0].clone();
+    channel_route["conversation"]["kind"] = json!(["channel", "thread"]);
+    config["routes"].as_array_mut().unwrap().push(channel_route);
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let mut broker = BrokerFixture::answering(
@@ -34,6 +101,12 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
         ],
     )
     .await;
+    let expected_indicators = candidate
+        .config
+        .routes
+        .iter()
+        .map(|route| route.indicators.len())
+        .sum::<usize>();
     let runner = runner(
         session_broker,
         ModelScript::new([answer("old"), answer("new")]),
@@ -58,12 +131,25 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
     gateway.start_with_generation_for_test(&mut sessions, &old_generation, message("old"));
     sessions.join_next().await.unwrap().unwrap();
     config["routes"][0]["steering"] = json!("boundary");
+    for route in config["routes"].as_array_mut().unwrap() {
+        route["indicators"] = json!({"mode": "off"});
+    }
     write_config(root.path(), &config);
     gateway.reconcile().await;
     assert!(matches!(
         broker.request().await.request,
         BrokerRequest::PrepareGeneration { .. }
     ));
+    let indicators = capture.events_where(
+        "dekopon_gatewayd",
+        &[("event", "gateway_indicators_effective")],
+    );
+    assert_eq!(indicators.len(), expected_indicators);
+    assert!(
+        indicators
+            .iter()
+            .all(|record| record.field("mode") == Some("Off"))
+    );
     let new_digest = gateway.digest_for_test();
     assert_ne!(old_digest, new_digest);
     let new_generation = gateway.generation_for_test();
@@ -163,6 +249,14 @@ async fn unsafe_reload_refusal_and_monitor_failure_are_not_activation() {
             )
             .len(),
         1
+    );
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_indicators_effective")]
+            )
+            .is_empty()
     );
 }
 
