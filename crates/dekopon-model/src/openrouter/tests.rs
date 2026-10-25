@@ -1205,3 +1205,14 @@ async fn unrecognized_delta_keys_are_named_on_the_span_never_valued() {
     assert!(!trace.text().contains("synthetic-key"));
     trace.assert_exchange("openrouter", "chat-completions");
 }
+
+#[tokio::test]
+async fn router_span_tool_options_equal_the_sent_body() {
+    let server = MockServer::start(vec![MockResponse::sse(ANSWER)]);
+    let client = client(&server, Settings::default());
+    let (result, span) = crate::trace_capture::exported_model_span(generate(&client, &[])).await;
+    result.unwrap();
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    crate::trace_capture::assert_tool_options(&span, &request_json(&requests[0]));
+}
