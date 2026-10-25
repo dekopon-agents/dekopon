@@ -48,14 +48,8 @@ async fn parked_nested_broker(
             .write_frame(&probe_listing(), &[], frame)
             .await
             .expect("surface");
-        let (mut command, request, _) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::RunCommand { .. }));
-        command
-            .write_frame(&upper_proposal("x"), &[], frame)
-            .await
-            .expect("proposal");
         let (mut parent, request, descriptors) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
+        assert!(matches!(request.request, BrokerRequest::Run { .. }));
         drop(descriptors);
         let (stdout, write) = std::os::unix::net::UnixStream::pair().expect("child stdout");
         parent
@@ -75,14 +69,8 @@ async fn parked_nested_broker(
             .await
             .expect("upcall");
         drop(write);
-        let (mut child_command, request, _) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::RunCommand { .. }));
-        child_command
-            .write_frame(&upper_proposal("y"), &[], frame)
-            .await
-            .expect("child proposal");
         let (mut child, request, mut descriptors) = next(&listener, frame).await;
-        assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
+        assert!(matches!(request.request, BrokerRequest::Run { .. }));
         descriptors.clear(); // Otherwise the fake broker holds stdout open after cancellation.
         parked.send(()).expect("test awaits parked child");
         assert!(
@@ -1561,8 +1549,16 @@ fn attested(
                         scope: Some(scope), ..
                     }),
                 ..
+            }
+            | BrokerRequest::Run {
+                attestation:
+                    Some(Attestation {
+                        scope: Some(scope), ..
+                    }),
+                ..
             } => invocations.push(scope.trigger),
             BrokerRequest::Capabilities { .. }
+            | BrokerRequest::Run { .. }
             | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }

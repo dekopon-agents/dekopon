@@ -33,6 +33,10 @@ impl CallBudget {
         self.maximum
     }
 
+    pub(crate) fn refund(&self) {
+        self.used.fetch_sub(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn charge(&self) -> Result<(), LimitExceeded> {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {

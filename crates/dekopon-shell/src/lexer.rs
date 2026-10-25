@@ -278,7 +278,12 @@ impl<'a> Lexer<'a> {
             return;
         }
         self.flush_literal();
-        let parts = std::mem::take(&mut self.parts);
+        let mut parts = std::mem::take(&mut self.parts);
+        if let [WordPart::Literal(text)] = parts.as_slice()
+            && let Some(number) = dekopon_core::AssetNumber::parse(text)
+        {
+            parts = vec![WordPart::Asset(number)];
+        }
         let line = self.word_line;
         self.word_started = false;
         self.tokens.push_back(Token {
@@ -1251,6 +1256,95 @@ mod tests {
             TokenKind::Word(word) => word.parts,
             other => panic!("expected a word, found {other}"),
         }
+    }
+
+    #[test]
+    fn an_unquoted_whole_word_is_an_asset_part() {
+        assert_eq!(
+            single_word("chat-asset:3"),
+            [WordPart::Asset(
+                dekopon_core::AssetNumber::parse("chat-asset:3").unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_quoted_reference_is_literal_text() {
+        assert_eq!(
+            single_word("'chat-asset:3'"),
+            [WordPart::SingleQuoted("chat-asset:3".to_owned())]
+        );
+        assert_eq!(
+            single_word("\"chat-asset:3\""),
+            [WordPart::DoubleQuoted(vec![WordPart::Literal(
+                "chat-asset:3".to_owned()
+            )])]
+        );
+    }
+
+    #[test]
+    fn an_escaped_reference_is_literal_text() {
+        assert_eq!(
+            single_word(r"chat\-asset:3"),
+            [
+                WordPart::Literal("chat".to_owned()),
+                WordPart::SingleQuoted("-".to_owned()),
+                WordPart::Literal("asset:3".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_number_is_literal_text() {
+        for text in [
+            "chat-asset:03",
+            "chat-asset:0",
+            "chat-asset:18446744073709551616",
+            "chat-asset:",
+        ] {
+            assert_eq!(single_word(text), [WordPart::Literal(text.to_owned())]);
+        }
+    }
+
+    #[test]
+    fn a_reference_inside_a_larger_word_is_literal_text() {
+        for text in [
+            "chat-asset:3x",
+            "xchat-asset:3",
+            "--image=chat-asset:3",
+            "x=chat-asset:3",
+        ] {
+            assert_eq!(single_word(text), [WordPart::Literal(text.to_owned())]);
+        }
+        assert!(matches!(
+            single_word("chat-asset:$n").as_slice(),
+            [WordPart::Literal(_), WordPart::Parameter(_)]
+        ));
+    }
+
+    #[test]
+    fn a_reference_in_a_substitution_lexes_inside_it() {
+        use crate::ast::{Command, Statement};
+        let parts = single_word("$(echo chat-asset:3)");
+        let [WordPart::CommandSubstitution(program)] = parts.as_slice() else {
+            panic!("substitution");
+        };
+        let Statement::List(list) = &program.statements[0] else {
+            panic!("list");
+        };
+        let Command::Simple(command) = &list.first.commands[0] else {
+            panic!("simple command");
+        };
+        assert!(matches!(
+            command.words[1].parts.as_slice(),
+            [WordPart::Asset(_)]
+        ));
+    }
+
+    #[test]
+    fn a_here_document_body_is_literal_text() {
+        let tokens = kinds("cat <<EOF\nchat-asset:3\nEOF\n");
+        assert!(tokens.iter().any(|token| matches!(token, TokenKind::HereDoc(Word { parts }) if parts == &[WordPart::Literal("chat-asset:3".to_owned())])));
     }
 
     #[test]

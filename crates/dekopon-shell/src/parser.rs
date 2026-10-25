@@ -1106,7 +1106,7 @@ pub(crate) fn expanded_pattern(character: char) -> String {
 fn word_is_constant(word: &Word) -> bool {
     fn parts_are_constant(parts: &[WordPart]) -> bool {
         parts.iter().all(|part| match part {
-            WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
+            WordPart::Asset(_) | WordPart::Literal(_) | WordPart::SingleQuoted(_) => true,
             WordPart::DoubleQuoted(inner) => parts_are_constant(inner),
             WordPart::Parameter(_) | WordPart::CommandSubstitution(_) | WordPart::Arithmetic(_) => {
                 false

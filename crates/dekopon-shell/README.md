@@ -53,6 +53,12 @@ Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `
 
 "Rejected loudly" reaches inside `case` too. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
 
+An unquoted whole word `chat-asset:N`, with a nonzero canonical decimal number fitting `u64`, is
+a typed attachment reference only in a provider command's argv. It is never field-split or
+joined. Quoting, escaping, larger words, assignments and variable expansion produce ordinary
+text. Builtins refuse attachment operands with an `asset cat` pipeline suggestion. Provider
+`--help` as the sole literal unquoted argument uses the cached page without spending a call.
+
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing to reject *against*; an unquoted expansion holding a JSON array is what produces multiple words here. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
 ## `read`

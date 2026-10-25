@@ -1685,14 +1685,21 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     assert_eq!(&bytes, b"asset probe");
     assert!(file.write_at(b"x", 0).is_err());
     assert_eq!(fs::read_dir(&assets_root).unwrap().count(), 0);
-    let mut invocation = request("send-asset");
-    invocation.capability = capability.clone();
-    invocation.input = json!({"assetMode": "send", "reference": "chat-asset:1"});
     let (streams, sent_stdout) = stdio(None);
     let sent = client
-        .invoke(
+        .run(
             Some(session()),
-            invocation,
+            dekopon_broker_protocol::RunRequest {
+                invocation: "send-asset".parse().unwrap(),
+                trace_parent: TRACE_PARENT.parse().unwrap(),
+                word: "httpprobe".to_owned(),
+                argv: vec![
+                    dekopon_broker_protocol::Arg::Text("asset-send".to_owned()),
+                    dekopon_broker_protocol::Arg::Asset(
+                        dekopon_broker_protocol::AssetIndex::try_from(0).unwrap(),
+                    ),
+                ],
+            },
             InvokeAssets {
                 rows: vec![AssetRow {
                     id: 1,
@@ -1710,9 +1717,17 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
         )
         .await
         .unwrap();
-    assert_eq!(sent.result.outcome, InvocationOutcome::Succeeded);
+    let dekopon_broker_protocol::RunOutcome::Invoked {
+        result,
+        sent: sent_ids,
+        ..
+    } = sent.outcome
+    else {
+        panic!("send invoked");
+    };
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
     assert!(!sent_stdout.join().unwrap().is_empty());
-    assert_eq!(sent.sent, vec![1]);
+    assert_eq!(sent_ids, vec![1]);
     assert!(sent.descriptors.is_empty());
     assert_eq!(audit.records().len(), 4);
 
@@ -2404,4 +2419,355 @@ async fn a_connection_outliving_the_shutdown_deadline_fails_the_drain_at_that_de
     let fixed = deadline.get().expect("admission close fixed the deadline");
     assert!(tokio::time::Instant::now() >= fixed);
     drop(idle);
+}
+
+struct RunHarness {
+    client: BrokerClient,
+    audit: Arc<InMemoryAuditLog>,
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), ServerError>>,
+    _directory: tempfile::TempDir,
+}
+
+impl RunHarness {
+    async fn start(principal: &str) -> Self {
+        Self::start_for(principal, false).await
+    }
+
+    async fn start_for(principal: &str, memory_route: bool) -> Self {
+        let uid = current_uid();
+        let directory = private_directory();
+        let socket = directory.path().join("run.sock");
+        let listener = bind_fixture(&socket);
+        let (broker, audit) = if memory_route {
+            let registry = BrokerProviderRegistry::load_with_storage(
+                [provider_fixture("cli-probe-provider.wasm")],
+                BrokerHostLimits::default(),
+                Some(
+                    dekopon_storage_host::StorageHost::open(
+                        directory.path().join("memory-storage"),
+                        dekopon_storage_host::StorageLimits::default(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut set = probe_constraint_set();
+            set.route = CapabilityRoute::ChatMemoryRecent;
+            set.constraints.storage = Some(dekopon_capability::StorageConstraints {
+                interface: dekopon_capability::StorageInterface::Jsonl,
+                access: dekopon_capability::StorageAccess::ReadOnly,
+                scope: dekopon_capability::StorageScope::PrivateConversation,
+                namespace: None,
+                retention: Default::default(),
+            });
+            let audit = Arc::new(InMemoryAuditLog::new(8).unwrap());
+            let broker = Broker::new(
+                registry,
+                "broker-test".parse().unwrap(),
+                probe_engine(POLICY, ["caller", "cpetersen"]),
+                ConstraintCatalog::new([("cli-probe.upper".parse().unwrap(), set)]).unwrap(),
+                CredentialStore::empty(),
+                identities(),
+                Arc::clone(&audit),
+                BrokerLimits::default(),
+            )
+            .unwrap();
+            (Arc::new(broker), audit)
+        } else {
+            broker().await
+        };
+        let peers = BTreeMap::from([(
+            uid,
+            MappedPeer {
+                context: context(principal),
+                attestor: Some(attestor_grant()),
+            },
+        )]);
+        let limits = server_limits();
+        let server = BrokerServer::new(broker, peers, limits).unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
+        Self {
+            client: BrokerClient::new(&socket, uid, limits.frame).unwrap(),
+            audit,
+            stop,
+            task,
+            _directory: directory,
+        }
+    }
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap().unwrap();
+    }
+}
+
+struct SingleRun {
+    outcome: dekopon_broker_protocol::RunOutcome,
+    output: Vec<u8>,
+    audits: usize,
+}
+
+async fn single_run(
+    word: &str,
+    argv: Vec<dekopon_broker_protocol::Arg>,
+    mut assets: dekopon_broker_protocol::InvokeAssets,
+) -> SingleRun {
+    let harness = RunHarness::start("caller").await;
+    let (stdout, mut reader) = UnixStream::pair().unwrap();
+    assets.streams = Some(dekopon_broker_protocol::Streams {
+        stdin: None,
+        stdout: stdout.into_std().unwrap().into(),
+    });
+    let response = harness
+        .client
+        .run(
+            Some(session()),
+            dekopon_broker_protocol::RunRequest {
+                invocation: "single-run".parse().unwrap(),
+                trace_parent: TRACE_PARENT.parse().unwrap(),
+                word: word.to_owned(),
+                argv,
+            },
+            assets,
+            async |_| panic!("probe cannot upcall"),
+        )
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output).await.unwrap();
+    let audits = harness.audit.records().len();
+    harness.stop().await;
+    SingleRun {
+        outcome: response.outcome,
+        output,
+        audits,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_guest_parses_argv_with_references_as_text() {
+    use dekopon_broker_protocol::{
+        Arg, AssetEncoding, AssetIndex, AssetRow, InvokeAssets, RunOutcome,
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let assets = InvokeAssets {
+        rows: vec![AssetRow {
+            id: 7,
+            content_type: "image/png".to_owned(),
+            encoding: AssetEncoding::Identity,
+            bytes: Some(0),
+            origin: "chat".to_owned(),
+            sent: false,
+        }],
+        descriptors: vec![fs::File::open(file.path()).unwrap().into()],
+        ..Default::default()
+    };
+    let SingleRun {
+        outcome,
+        output,
+        audits,
+    } = single_run(
+        "probe",
+        vec![
+            Arg::Text("upper".to_owned()),
+            Arg::Text("--text".to_owned()),
+            Arg::Asset(AssetIndex::try_from(0).unwrap()),
+        ],
+        assets,
+    )
+    .await;
+    let RunOutcome::Invoked {
+        capability,
+        input,
+        secret_use,
+        result,
+        ..
+    } = outcome
+    else {
+        panic!("invoked");
+    };
+    assert_eq!(capability.as_str(), "cli-probe.upper");
+    assert_eq!(input["text"], "chat-asset:7");
+    assert!(secret_use.is_none());
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        json!({"text":"CHAT-ASSET:7"})
+    );
+    assert_eq!(audits, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ungranted_proposal_answers_not_granted() {
+    use dekopon_broker_protocol::{Arg, RunOutcome};
+    let SingleRun {
+        outcome,
+        output,
+        audits,
+    } = single_run(
+        "probe",
+        vec![
+            Arg::Text("count".to_owned()),
+            Arg::Text("--text".to_owned()),
+            Arg::Text("hello".to_owned()),
+        ],
+        Default::default(),
+    )
+    .await;
+    let RunOutcome::NotGranted { capability } = outcome else {
+        panic!("not granted");
+    };
+    assert_eq!(capability.as_str(), "cli-probe.count");
+    assert!(output.is_empty());
+    assert_eq!(audits, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_word_answers_not_found() {
+    use dekopon_broker_protocol::RunOutcome;
+    let SingleRun {
+        outcome,
+        output,
+        audits,
+    } = single_run("memory", Vec::new(), Default::default()).await;
+    assert!(matches!(outcome, RunOutcome::NotFound));
+    assert!(output.is_empty());
+    assert_eq!(audits, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invoke_with_a_whole_table_and_no_descriptors_still_runs() {
+    use dekopon_broker_protocol::{AssetEncoding, AssetRow};
+    let harness = RunHarness::start("caller").await;
+    let (mut assets, output) = stdio(None);
+    assets.rows = (1..=32)
+        .map(|id| AssetRow {
+            id,
+            content_type: "image/png".to_owned(),
+            encoding: AssetEncoding::Identity,
+            bytes: None,
+            origin: "chat".to_owned(),
+            sent: false,
+        })
+        .collect();
+    assert!(assets.descriptors.is_empty());
+    let response = harness
+        .client
+        .invoke(
+            Some(session()),
+            request("whole-table"),
+            assets,
+            async |_| panic!("probe cannot upcall"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.join().unwrap()).unwrap(),
+        json!({"text":"HELLO THROUGH BROKER"})
+    );
+    assert_eq!(harness.audit.records().len(), 2);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_console_scope_refusal_answers_before_the_guest_parses() {
+    use dekopon_broker_protocol::{Arg, RunOutcome, RunRequest};
+    let harness = RunHarness::start("dekopon-console").await;
+    let claim = Attestation::for_chat(
+        subject(),
+        agent("chat-agent"),
+        ChatScopeClaim {
+            transport: "scientist-slack".parse().unwrap(),
+            kind: ChatTransportKind::Slack,
+            conversation: Conversation {
+                kind: ConversationKind::Thread,
+                container: Some("t0123abc".to_owned()),
+                id: "c0123abc".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
+            trigger: Trigger::Message,
+        },
+    );
+    let (assets, output) = stdio(None);
+    let response = harness
+        .client
+        .run(
+            Some(claim),
+            RunRequest {
+                invocation: "console-run".parse().unwrap(),
+                trace_parent: TRACE_PARENT.parse().unwrap(),
+                word: "probe".to_owned(),
+                argv: vec![Arg::Text("--not-valid-in-the-guest".to_owned())],
+            },
+            assets,
+            async |_| panic!("must not invoke"),
+        )
+        .await
+        .unwrap();
+    let RunOutcome::Rendered {
+        stdout,
+        stderr,
+        status,
+    } = response.outcome
+    else {
+        panic!("console refusal is rendered");
+    };
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        format!("{}\n", dekopon_broker::CONSOLE_REAL_SCOPE_REFUSAL)
+    );
+    assert!(output.join().unwrap().is_empty());
+    assert!(harness.audit.records().is_empty());
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_word_refused_by_a_gate_is_not_found_and_refunded() {
+    struct Memory(BrokerLeg);
+    impl CapabilityInvoker for Memory {
+        fn granted(&self) -> Vec<String> {
+            self.0.granted()
+        }
+        fn command_words(&self) -> Vec<String> {
+            vec!["probe".to_owned()]
+        }
+        fn run(
+            &self,
+            call: dekopon_shell::RunCall,
+            streams: Streams,
+            tree: &TreeContext,
+        ) -> dekopon_shell::RunResult {
+            self.0.run(call, streams, tree)
+        }
+        fn invoke(&self, _: CommandProposal, _: Streams, _: &TreeContext) -> CapabilityCallResult {
+            panic!("Run owns dispatch")
+        }
+    }
+    let harness = RunHarness::start_for("caller", true).await;
+    let invoker = Memory(
+        BrokerLeg::connect(harness.client.clone(), Some(session()))
+            .await
+            .unwrap(),
+    );
+    let calls = CallBudget::new(1);
+    let tree = TreeContext::new(Limits::default(), calls.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        Interpreter::new(Limits::default()).run_with_tree(
+            "probe --not-valid-in-the-guest",
+            &invoker,
+            &tree,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
+    assert!(outcome.output.contains("command not found"));
+    assert_eq!(calls.used(), 0);
+    assert!(harness.audit.records().is_empty());
+    harness.stop().await;
 }

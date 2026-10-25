@@ -257,6 +257,113 @@ pub enum CommandRun {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Arg {
+    Text(String),
+    Asset(dekopon_core::AssetNumber),
+}
+
+impl std::fmt::Display for Arg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => formatter.write_str(text),
+            Self::Asset(number) => number.fmt(formatter),
+        }
+    }
+}
+
+pub struct RunCall {
+    pub word: String,
+    pub argv: Vec<Arg>,
+}
+
+pub enum RunResult {
+    Invoked {
+        capability: String,
+        input: Value,
+        secret_use: Option<SecretUseProposal>,
+        result: CapabilityCallResult,
+    },
+    Returned(CapabilityCallResult),
+    Uncertain(CapabilityCallResult),
+}
+
+pub fn render_command(streams: Streams, stdout: &str, stderr: String, status: u8) -> RunResult {
+    use std::io::Write as _;
+    let mut output = std::os::unix::net::UnixStream::from(streams.stdout);
+    if output.write_all(stdout.as_bytes()).is_err() {
+        return RunResult::Returned(CapabilityCallResult::Failed {
+            error: "command stdout could not be written".to_owned(),
+            detail: None,
+        });
+    }
+    RunResult::Returned(match std::num::NonZeroU8::new(status) {
+        Some(status) => CapabilityCallResult::Exited { status, stderr },
+        None if stderr.is_empty() => CapabilityCallResult::Succeeded,
+        None => CapabilityCallResult::SucceededWithStderr(stderr),
+    })
+}
+
+pub fn run_parsed<I: CapabilityInvoker + ?Sized>(
+    invoker: &I,
+    call: RunCall,
+    parsed: Option<CommandRun>,
+    streams: Streams,
+    tree: &TreeContext,
+) -> RunResult {
+    match parsed {
+        Some(CommandRun::Proposed {
+            capability,
+            input,
+            secret_use,
+            report,
+        }) => {
+            if !invoker.is_granted(&capability) {
+                return render_command(
+                    streams,
+                    "",
+                    format!(
+                        "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                        call.word, capability
+                    ),
+                    127,
+                );
+            }
+            let mut proposal =
+                CommandProposal::new(capability.clone(), input.clone(), secret_use.clone());
+            proposal.report = report;
+            let result = invoker.invoke(proposal, streams, tree);
+            RunResult::Invoked {
+                capability,
+                input,
+                secret_use,
+                result,
+            }
+        }
+        Some(CommandRun::Rendered {
+            stdout,
+            stderr,
+            status,
+        }) => render_command(streams, &stdout, stderr, status),
+        Some(CommandRun::Failed { message }) => render_command(streams, "", message, 2),
+        Some(CommandRun::Errored { message }) => {
+            RunResult::Returned(CapabilityCallResult::Failed {
+                error: message,
+                detail: None,
+            })
+        }
+        Some(CommandRun::Denied { reason }) => {
+            RunResult::Returned(CapabilityCallResult::Denied { reason })
+        }
+        None => render_command(
+            streams,
+            "",
+            format!("dekopon-shell: {}: command not found\n", call.word),
+            127,
+        ),
+    }
+}
+
 pub trait CapabilityInvoker: Send + Sync {
     fn cancelled(&self) -> bool {
         false
@@ -287,6 +394,16 @@ pub trait CapabilityInvoker: Send + Sync {
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         let _ = (word, argv, stdin_piped);
         None
+    }
+
+    fn run(&self, call: RunCall, streams: Streams, tree: &TreeContext) -> RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let parsed = self.run_command(&call.word, &argv, streams.stdin.is_some());
+        run_parsed(self, call, parsed, streams, tree)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -348,6 +465,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.as_ref().run_command(word, argv, stdin_piped)
+    }
+
+    fn run(&self, call: RunCall, streams: Streams, tree: &TreeContext) -> RunResult {
+        self.as_ref().run(call, streams, tree)
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
@@ -1269,3 +1390,6 @@ mod tests {
         assert_eq!(ExitCode::from_script_exit(-1).get(), 255);
     }
 }
+
+#[cfg(test)]
+mod asset_tests;

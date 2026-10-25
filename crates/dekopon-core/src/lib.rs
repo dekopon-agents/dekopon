@@ -804,14 +804,26 @@ mod command_word_tests {
     }
 }
 
-#[must_use]
-pub fn chat_asset_marker(text: &str) -> Option<u64> {
-    let digits = text.strip_prefix("chat-asset:")?;
-    if digits.is_empty()
-        || digits.starts_with('0')
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AssetNumber(std::num::NonZeroU64);
+
+impl AssetNumber {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
     }
-    digits.parse().ok()
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let digits = text.strip_prefix("chat-asset:")?;
+        if digits.starts_with('0') || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok().map(Self)
+    }
+}
+
+impl fmt::Display for AssetNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "chat-asset:{}", self.0)
+    }
 }

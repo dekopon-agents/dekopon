@@ -17,7 +17,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, JOBS_OFF, JobSeed,
+    CallBudget, CapabilityCallResult, CapabilityInvoker, ExitCode, JOBS_OFF, JobSeed,
     ScriptOutcome, TreeContext,
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
@@ -1948,7 +1948,13 @@ impl<'a> Evaluator<'a> {
         let mut argv = Vec::new();
         for word in &command.words {
             match self.expand_word(word) {
-                Ok(expanded) => argv.extend(expanded),
+                Ok(expanded) => {
+                    if let [WordPart::Asset(number)] = word.parts.as_slice() {
+                        argv.push(crate::Arg::Asset(*number));
+                    } else {
+                        argv.extend(expanded.into_iter().map(crate::Arg::Text));
+                    }
+                }
                 Err(failure) => {
                     let status = self.absorb(failure)?;
                     return Ok(Executed::Result(CommandResult::status(status)));
@@ -2231,12 +2237,14 @@ impl<'a> Evaluator<'a> {
 
     fn run_argv(
         &mut self,
-        argv: &[String],
+        argv: &[crate::Arg],
         input: StageInput,
         capture_output: bool,
         literal_help: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
+        let typed_arguments = &argv[1..];
+        let argv = argv.iter().map(ToString::to_string).collect::<Vec<_>>();
         let command = argv[0].as_str();
         let arguments = &argv[1..];
 
@@ -2258,6 +2266,7 @@ impl<'a> Evaluator<'a> {
             command,
             arguments,
             resolution,
+            typed_arguments,
             input,
             capture_output,
             literal_help,
@@ -2425,6 +2434,7 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
     ) -> Result<(PipeReader, Option<crate::RetainedBytes>), CommandFailure> {
         if let Some(name) = operand.filter(|name| *name != "-") {
+            check_buffer_operand(command, name)?;
             if name == DEV_NULL {
                 return Ok((PipeReader::default(), None));
             }
@@ -2667,6 +2677,10 @@ impl<'a> Evaluator<'a> {
                 )))?;
                 return Ok(Executed::Result(CommandResult::status(status)));
             }
+            if let Err(failure) = check_buffer_operand("cat", name) {
+                let status = self.absorb(failure)?;
+                return Ok(Executed::Result(CommandResult::status(status)));
+            }
             if name == DEV_NULL {
                 continue;
             }
@@ -2800,6 +2814,7 @@ impl<'a> Evaluator<'a> {
         command: &str,
         arguments: &[String],
         resolution: Option<Resolution>,
+        typed_arguments: &[crate::Arg],
         input: StageInput,
         capture_output: bool,
         literal_help: bool,
@@ -2870,61 +2885,21 @@ impl<'a> Evaluator<'a> {
                 self.run_xargs(arguments, input, stdout_sink)
             }
             Resolution::ProviderCommand => {
-                let stdin_piped = match input {
-                    StageInput::Piped(_) => true,
-                    StageInput::Inherited => self.provider_reads_script_stdin(),
-                };
-                self.budget.check_deadline()?;
-                let run = self.invoker.run_command(command, arguments, stdin_piped);
-                self.budget.check_deadline()?;
-                let proposal = match run {
-                    Some(CommandRun::Proposed {
-                        capability,
-                        input,
-                        secret_use,
-                        report,
-                    }) => {
-                        let mut proposal =
-                            crate::CommandProposal::new(capability, input, secret_use);
-                        proposal.report = report;
-                        proposal
+                if literal_help {
+                    if let Some(page) = self.invoker.command_word_help().get(command) {
+                        return self.emit_rendered(page.clone(), String::new(), 0);
                     }
-                    Some(CommandRun::Failed { message }) => {
-                        let status = self.absorb(CommandFailure::usage(message))?;
-                        return Ok(Executed::Result(CommandResult::status(status)));
-                    }
-                    Some(CommandRun::Errored { message }) => {
-                        let status = self.absorb(CommandFailure::failed(format!(
-                            "{command}: failed: {message}"
-                        )))?;
-                        return Ok(Executed::Result(CommandResult::status(status)));
-                    }
-                    Some(CommandRun::Denied { reason }) => {
-                        let status = self.absorb(CommandFailure::Status {
-                            message: format!("{command}: denied: {reason}"),
-                            status: ExitCode::DENIED,
-                        })?;
-                        return Ok(Executed::Result(CommandResult::status(status)));
-                    }
-                    Some(CommandRun::Rendered {
-                        stdout,
-                        stderr,
-                        status,
-                    }) => return self.emit_rendered(stdout, stderr, status),
-                    None => {
-                        self.write_line(&format!("dekopon-shell: {command}: command not found"));
-                        return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
-                    }
-                };
-                if !self.invoker.is_granted(&proposal.capability) {
-                    self.write_line(&format!(
-                        "dekopon-shell: {command}: requires capability {}, which is not \
-                         granted in this session",
-                        proposal.capability
-                    ));
-                    return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
+                    return self.emit_rendered(
+                        String::new(),
+                        format!("{command}: help is unavailable\n"),
+                        2,
+                    );
                 }
-                match self.run_provider(proposal, input, capture_output, stdout_sink) {
+                let call = crate::RunCall {
+                    word: command.to_owned(),
+                    argv: typed_arguments.to_vec(),
+                };
+                match self.run_provider(call, input, capture_output, stdout_sink) {
                     Ok(result) => Ok(Executed::Result(result)),
                     Err(failure) => {
                         let status = self.absorb(failure)?;
@@ -2946,14 +2921,13 @@ impl<'a> Evaluator<'a> {
     /// provider left unread stays there for the next command.
     fn run_provider(
         &mut self,
-        proposal: crate::CommandProposal,
+        call: crate::RunCall,
         input: StageInput,
         capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
-        self.budget.charge_capability_call()?;
         self.budget.check_deadline()?;
-        let capability = proposal.capability.clone();
+        let mut capability = call.word.clone();
         let unopened = |_error: std::io::Error| {
             CommandFailure::failed(format!(
                 "{capability}: failed: its standard streams could not be opened"
@@ -2990,6 +2964,7 @@ impl<'a> Evaluator<'a> {
             stdin: provider_stdin,
             stdout: OwnedFd::from(provider_stdout),
         };
+        self.budget.charge_capability_call()?;
         let invoker = self.invoker;
         let tree = self.budget.tree().clone();
         let feeder_budget = self.budget.fork();
@@ -2999,7 +2974,7 @@ impl<'a> Evaluator<'a> {
         let (result, copied, unread) = thread::scope(|scope| {
             let call = scope.spawn(|| {
                 tracing::dispatcher::with_default(&dispatcher, || {
-                    span.in_scope(|| invoker.invoke(proposal, streams, &tree))
+                    span.in_scope(|| invoker.run(call, streams, &tree))
                 })
             });
             let feeder = feed.map(|(mut reader, socket, inherited)| {
@@ -3024,6 +2999,21 @@ impl<'a> Evaluator<'a> {
         if let (Some(slot), Some(reader)) = (self.stdin.last_mut(), unread) {
             *slot = reader;
         }
+        let result = match result {
+            crate::RunResult::Invoked {
+                capability: reported,
+                result,
+                ..
+            } => {
+                capability = reported;
+                result
+            }
+            crate::RunResult::Uncertain(result) => result,
+            crate::RunResult::Returned(result) => {
+                self.budget.refund_capability_call();
+                result
+            }
+        };
         self.budget.check_deadline()?;
         let mut copied = copied?;
         let status = ExitCode::from_capability_result(&result);
@@ -3316,7 +3306,10 @@ impl<'a> Evaluator<'a> {
             let invocation = template.expand(&text);
             {
                 match self.run_argv(
-                    &invocation,
+                    &invocation
+                        .into_iter()
+                        .map(crate::Arg::Text)
+                        .collect::<Vec<_>>(),
                     StageInput::Piped(PipeReader::default()),
                     false,
                     false,
@@ -3382,6 +3375,10 @@ impl<'a> Evaluator<'a> {
 
         for part in &word.parts {
             match part {
+                WordPart::Asset(number) => {
+                    append(&mut fields, &number.to_string());
+                    produced = true;
+                }
                 WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
                     append(&mut fields, text);
                     produced = true;
@@ -3444,6 +3441,7 @@ impl<'a> Evaluator<'a> {
         let mut fields = vec![String::new()];
         for part in parts {
             match part {
+                WordPart::Asset(number) => append(&mut fields, &number.to_string()),
                 WordPart::Literal(literal) | WordPart::SingleQuoted(literal) => {
                     append(&mut fields, literal);
                 }
@@ -4097,6 +4095,15 @@ fn value_bytes(value: &Value) -> u64 {
                 .map(|(key, field)| key.len() as u64 + value_bytes(field))
                 .sum(),
         }
+}
+
+fn check_buffer_operand(command: &str, name: &str) -> Result<(), CommandFailure> {
+    if dekopon_core::AssetNumber::parse(name).is_some() {
+        return Err(CommandFailure::failed(format!(
+            "{command}: {name} is an attachment, not a buffer; read it with `asset cat {name} | {command}`"
+        )));
+    }
+    Ok(())
 }
 
 #[allow(

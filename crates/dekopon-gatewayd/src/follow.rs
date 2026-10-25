@@ -328,6 +328,38 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
     fn has_command_word(&self, word: &str) -> bool {
         self.inner.has_command_word(word)
     }
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: Streams,
+        tree: &TreeContext,
+    ) -> dekopon_shell::RunResult {
+        use dekopon_shell::RunResult;
+        if call.word == "follow" && self.ticket.is_none() {
+            return RunResult::Returned(CapabilityCallResult::Failed {
+                error: "follow is not enabled on this route".to_owned(),
+                detail: None,
+            });
+        }
+        match self.inner.run(call, streams, tree) {
+            RunResult::Invoked {
+                capability,
+                input,
+                secret_use,
+                result,
+            } => {
+                let result = self.mark(&capability, &input, secret_use.as_ref(), result);
+                RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            RunResult::Returned(result) => RunResult::Returned(result),
+            RunResult::Uncertain(result) => RunResult::Uncertain(result),
+        }
+    }
     fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
         self.inner.run_command(word, argv, stdin_piped)
     }
@@ -359,19 +391,28 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
                 detail: None,
             };
         }
-        let stay = proposal.capability == "dekopon-provider-follow.stay"
-            && proposal.secret_use.is_none()
-            && proposal
-                .input
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty);
-        let leave = proposal.capability == "dekopon-provider-follow.leave"
-            && proposal.secret_use.is_none()
-            && proposal
-                .input
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty);
+        let capability = proposal.capability.clone();
+        let input = proposal.input.clone();
+        let secret_use = proposal.secret_use.clone();
         let result = self.inner.invoke(proposal, streams, tree);
+        self.mark(&capability, &input, secret_use.as_ref(), result)
+    }
+}
+
+impl<I: CapabilityInvoker> FollowInvoker<I> {
+    fn mark(
+        &self,
+        capability: &str,
+        input: &serde_json::Value,
+        secret_use: Option<&dekopon_core::SecretUseProposal>,
+        result: CapabilityCallResult,
+    ) -> CapabilityCallResult {
+        let stay = capability == "dekopon-provider-follow.stay"
+            && secret_use.is_none()
+            && input.as_object().is_some_and(serde_json::Map::is_empty);
+        let leave = capability == "dekopon-provider-follow.leave"
+            && secret_use.is_none()
+            && input.as_object().is_some_and(serde_json::Map::is_empty);
         if leave
             && matches!(
                 result,
@@ -525,6 +566,139 @@ mod tests {
                     0
                 );
             }
+        }
+    }
+
+    struct RunLeg {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        input: serde_json::Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+        result: CapabilityCallResult,
+    }
+
+    impl CapabilityInvoker for RunLeg {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn run(
+            &self,
+            _: dekopon_shell::RunCall,
+            _: Streams,
+            _: &TreeContext,
+        ) -> dekopon_shell::RunResult {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            dekopon_shell::RunResult::Invoked {
+                capability: "dekopon-provider-follow.stay".to_owned(),
+                input: self.input.clone(),
+                secret_use: self.secret_use.clone(),
+                result: self.result.clone(),
+            }
+        }
+        fn invoke(&self, _: CommandProposal, _: Streams, _: &TreeContext) -> CapabilityCallResult {
+            panic!("Run owns dispatch")
+        }
+    }
+
+    fn run_word<I: CapabilityInvoker>(invoker: &I, word: &str) -> dekopon_shell::RunResult {
+        let (output, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        invoker.run(
+            dekopon_shell::RunCall {
+                word: word.to_owned(),
+                argv: Vec::new(),
+            },
+            Streams {
+                stdin: None,
+                stdout: OwnedFd::from(output),
+            },
+            &TreeContext::new(
+                dekopon_shell::Limits::default(),
+                dekopon_shell::CallBudget::new(1),
+            ),
+        )
+    }
+
+    #[test]
+    fn follow_without_a_ticket_refuses_before_any_frame() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let invoker = FollowInvoker::new(
+            RunLeg {
+                calls: Arc::clone(&calls),
+                input: json!({}),
+                secret_use: None,
+                result: CapabilityCallResult::Succeeded,
+            },
+            None,
+        );
+        assert!(matches!(
+            run_word(&invoker, "follow"),
+            dekopon_shell::RunResult::Returned(CapabilityCallResult::Failed { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn follow_marks_stay_from_the_reported_proposal() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open(
+                directory.path(),
+                Duration::from_secs(604800),
+                Duration::from_secs(604800),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(FollowTable::load(journal).unwrap());
+        let secret = dekopon_core::SecretUseProposal::HttpBasic {
+            secret: "drn:com.xrl:secret:prod:api/token".parse().unwrap(),
+            username: "deploy".to_owned(),
+        };
+        for (index, (input, secret_use, result, expected)) in [
+            (
+                json!({"forged":true}),
+                None,
+                CapabilityCallResult::Succeeded,
+                false,
+            ),
+            (
+                json!({}),
+                Some(secret),
+                CapabilityCallResult::Succeeded,
+                false,
+            ),
+            (
+                json!({}),
+                None,
+                CapabilityCallResult::Denied {
+                    reason: "policy".to_owned(),
+                },
+                false,
+            ),
+            (json!({}), None, CapabilityCallResult::Succeeded, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("{index:064x}");
+            let invoker = FollowInvoker::new(
+                RunLeg {
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    input,
+                    secret_use,
+                    result,
+                },
+                Some((Arc::clone(&table), key.clone(), 0)),
+            );
+            assert!(matches!(
+                run_word(&invoker, "another-word"),
+                dekopon_shell::RunResult::Invoked { .. }
+            ));
+            assert_eq!(
+                matches!(
+                    table.ticket(&key, SystemTime::now()),
+                    FollowTicket::Active { .. }
+                ),
+                expected
+            );
         }
     }
 

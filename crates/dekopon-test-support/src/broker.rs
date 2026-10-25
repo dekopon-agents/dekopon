@@ -27,9 +27,12 @@ impl BrokerFixture {
         directory: &Path,
         responses: impl IntoIterator<Item = ResponseEnvelope>,
     ) -> Self {
-        let mut responses = responses.into_iter().collect::<VecDeque<_>>();
-        Self::scripted(directory, move |_, _| {
-            responses.pop_front().map(|response| (response, Vec::new()))
+        let mut responses = responses
+            .into_iter()
+            .map(|response| (response, Vec::new()))
+            .collect::<VecDeque<_>>();
+        Self::scripted(directory, move |request, _| {
+            next_broker_reply(request, &mut responses)
         })
     }
 
@@ -98,6 +101,100 @@ impl Drop for BrokerFixture {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+pub fn next_broker_reply(
+    request: &RequestEnvelope,
+    responses: &mut VecDeque<Reply>,
+) -> Option<Reply> {
+    use dekopon_broker_protocol::{
+        BrokerRequest, BrokerResponse, CommandRunOutcome, ProtocolVersion, RunOutcome,
+    };
+    let (response, descriptors) = responses.pop_front()?;
+    if !matches!(&request.request, BrokerRequest::Run { .. }) {
+        return Some((response, descriptors));
+    }
+    let outcome = match response.response {
+        BrokerResponse::CommandRun {
+            result:
+                CommandRunOutcome::Rendered {
+                    stdout,
+                    stderr,
+                    status,
+                },
+        } => RunOutcome::Rendered {
+            stdout,
+            stderr,
+            status,
+        },
+        BrokerResponse::CommandRun {
+            result: CommandRunOutcome::Failed { error },
+        } => RunOutcome::Refused { error },
+        BrokerResponse::CommandRun {
+            result:
+                CommandRunOutcome::Proposed {
+                    capability,
+                    input,
+                    secret_use,
+                },
+        } => {
+            if responses.front().is_some_and(|(reply, _)| {
+                matches!(&reply.response, BrokerResponse::Invocation { .. })
+            }) {
+                let (response, descriptors) = responses
+                    .pop_front()
+                    .expect("the scripted invocation follows its proposal");
+                let BrokerResponse::Invocation {
+                    result,
+                    attached,
+                    removed,
+                    sent,
+                } = response.response
+                else {
+                    unreachable!();
+                };
+                return Some((
+                    ResponseEnvelope {
+                        api_version: ProtocolVersion::V1Alpha2,
+                        response: BrokerResponse::Ran {
+                            outcome: RunOutcome::Invoked {
+                                capability,
+                                input,
+                                secret_use,
+                                result,
+                                attached,
+                                removed,
+                                sent,
+                            },
+                        },
+                    },
+                    descriptors,
+                ));
+            }
+            RunOutcome::NotGranted { capability }
+        }
+        other @ (BrokerResponse::Ran { .. }
+        | BrokerResponse::Capabilities { .. }
+        | BrokerResponse::Invocation { .. }
+        | BrokerResponse::Upcall { .. }
+        | BrokerResponse::Error { .. }
+        | BrokerResponse::Generation { .. }) => {
+            return Some((
+                ResponseEnvelope {
+                    api_version: response.api_version,
+                    response: other,
+                },
+                descriptors,
+            ));
+        }
+    };
+    Some((
+        ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Ran { outcome },
+        },
+        descriptors,
+    ))
 }
 
 #[cfg(test)]

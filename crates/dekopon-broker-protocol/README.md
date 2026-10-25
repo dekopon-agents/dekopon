@@ -18,20 +18,24 @@ sink intent; possession grants nothing, and providers never receive it. A broker
 `AuthenticatedContext` from operating-system peer credentials and trusted workload mapping, then
 separately authorize and bind any DRN use.
 
-`RunCommand` (`runCommand`) is the one authority-bearing operation that is not gated on the caller's
-grants. It runs one provider-declared shell command word, its arguments, and the optional value the
-script piped into it (`stdin`) through the declaring component's pure, import-free, fuel- and
-timeout-bounded `run-command` export, and answers with the guest's own `CommandRunOutcome`: a
-proposal to submit, text the guest rendered together with the exit status it chose, or a decline
-carrying the guest's stable code and message. A proposal is authorized on exactly the path every
-other proposal takes, so a caller who runs a word they may not use receives a denial one step later
-having learned nothing they could not learn by naming the capability directly; rendered text
-authorizes nothing. The piped value is bounded twice: by the frame ceiling on the client, where an
-oversized value fails in the request phase before a byte is written, and by the broker host's input
-bound before a store exists. A guest failure is the stable `provider-error` code with an opaque
-message. Like an invocation, the frame carries a mandatory, well-formed `traceParent`; the broker's
-`broker.command_run` span adopts it, so the word and its answer sit in the same trace as the
-proposal that follows.
+`Run` (`run`) carries one provider command word, typed argv (`text` or an asset index), an
+invocation ID, `traceParent`, at most five named `AssetRow` entries, `sendsRemaining` and stream
+shape. Indices follow first occurrence and repeated arguments share a row and descriptor. Rows
+carry no source locator. Validation rejects unknown indices, unnamed rows, duplicate row IDs and
+more than five rows before any descriptor is consumed. Descriptor order is one per row, optional
+stdin, then stdout.
+
+The broker validates the invocation-bound attestation, substitutes asset indices with reference
+text for the guest's parser, preserves context and memory-route gates, and invokes the resulting
+proposal through its existing authorization path. `Ran` distinguishes rendered text, a parser
+refusal, a missing word, an ungranted capability and an invoked proposal with its result and asset
+effects. The `broker.command_run` span is a child of `broker.invocation`. A returned transport
+error after submission can mean effects already happened and must not trigger a retry.
+
+`RunCommand` (`runCommand`) remains the legacy parse-only operation. It grants no authority and
+carries no descriptors. `Invoke` remains for gateway-built proposals such as the memory Decider;
+it retains its metadata-table shape, with no input asset descriptors. An unrebuilt console's plain
+commands still run through `RunCommand` plus `Invoke`; its attachment inputs are refused.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660` sockets, and
 inspect the parent directory in both cases: it must be a server-owned, non-symlink directory,
@@ -55,14 +59,12 @@ Linux receives descriptors with `MSG_CMSG_CLOEXEC`; macOS immediately sets `FD_C
 exposing them. Rejected frames close their received descriptors. Each client operation uses a fresh
 Unix connection and validates the exact protocol version and response variant.
 
-`Invoke` carries at most 32 typed `AssetRow` metadata rows and `sendsRemaining`, with read-only
-input descriptors in reference order; `RunCommand` carries neither. `Invocation` returns typed
-`attached`, `removed`, and `sent` fields. Each attached output's `descriptor` equals its position,
-and the output count must exactly match the received descriptor count. Typed request/response
-callers reject descriptors on other variants; the generic frame codec does not inspect metadata.
-`BrokerClient::invoke` accepts `InvokeAssets` and an async child-upcall handler and returns `AssetInvocationOutcome`, preserving
-`ClientError` and its execution-phase distinction. Metadata and descriptor possession grant no
-provider authority.
+`Ran` with an invoked outcome and legacy `Invocation` return typed `attached`, `removed`, and
+`sent` fields. Each attached output's `descriptor` equals its position, and the output count must
+exactly match the received descriptor count. Other outcomes carry no descriptors. Both
+`BrokerClient::run` and `BrokerClient::invoke` accept an async child-upcall handler, preserve
+`ClientError` execution-phase distinctions, and retain response descriptors. Metadata and
+descriptor possession grant no provider authority.
 
 `Upcall` is a broker response within an invocation, carrying the parent invocation ID,
 script, optional `traceParent`, and stdin kind (`none`, `inherit`, or `reader`). Its
