@@ -459,6 +459,13 @@ gateway:
     subdir: gateway-journal
     mountPath: /var/lib/dekopon-gatewayd/journal
 
+  # Durable attachments share the state claim with the journal. Enable both together and set
+  # gateway config sessions.assets.path to this mountPath.
+  assets:
+    enabled: false
+    subdir: gateway-assets
+    mountPath: /var/lib/dekopon-gatewayd/assets
+
   # The gateway's wake store (dekopon-gatewayd `sessions.wakes.path`), a directory on the state claim
   # beside the journal and never inside it: the journal adopts every *.jsonl in its directory.
   # Point `sessions.wakes.path` at a file under mountPath, such as <mountPath>/wakes.jsonl.
@@ -600,19 +607,19 @@ brokerAssets:
   maxInFlightBytes: 67108864
 
 # Config, runtime and broker tmp remain memory-backed. Gateway scratch is disk-backed;
-# its 256 MiB live attachment allowance is independent of kubelet enforcement of this sizeLimit.
+# its 1 GiB live attachment allowance is independent of kubelet enforcement of this sizeLimit.
 volumeSizes:
   config: 8Mi
   runtime: 1Mi
   tmp: 16Mi
   consoleTmp: 16Mi
-  # Size for the default gateway sessions.assetRetentionBytes (256 MiB) plus temporary overhead.
+  # Size for the default gateway sessions.assetRetentionBytes (1 GiB) without a journal plus temporary overhead.
   # If increasing the typed gateway config budget, increase this disk volume independently.
-  gatewayTmp: 320Mi
-  # Size for gateway sessions.assetRetentionBytes (256 MiB) plus brokerAssets.maxInFlightBytes
+  gatewayTmp: 1152Mi
+  # Size for gateway sessions.assetRetentionBytes (1 GiB) plus brokerAssets.maxInFlightBytes
   # (64 MiB): unlinked outputs remain on this disk volume until the gateway closes them.
   # If increasing either budget, increase this disk volume independently.
-  brokerAssets: 320Mi
+  brokerAssets: 1152Mi
 
 # ---------------------------------------------------------------------------------------------
 # Termination

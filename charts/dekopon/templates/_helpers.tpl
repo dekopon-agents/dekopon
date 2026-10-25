@@ -151,6 +151,14 @@ than configured: an emptyDir here would turn seed-once into seed-per-reschedule.
 {{- printf "%s/%s" .Values.paths.stateDir .Values.gateway.journal.subdir -}}
 {{- end -}}
 
+{{- define "dekopon.assetsEnabled" -}}
+{{- if and .Values.gateway.enabled .Values.gateway.assets.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{- define "dekopon.assetsDir" -}}
+{{- printf "%s/%s" .Values.paths.stateDir .Values.gateway.assets.subdir -}}
+{{- end -}}
+
 {{- define "dekopon.wakesEnabled" -}}
 {{- if and .Values.gateway.enabled .Values.gateway.wakes.enabled -}}true{{- end -}}
 {{- end -}}
@@ -537,6 +545,37 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- end -}}
 {{- if $problems -}}
 {{- fail (printf "broker.chatgpt is misconfigured: %s" (join "; " $problems)) -}}
+{{- end -}}
+{{- end -}}
+
+{{- if ne .Values.gateway.journal.enabled .Values.gateway.assets.enabled -}}
+{{- fail "gateway.journal.enabled and gateway.assets.enabled must be enabled together" -}}
+{{- end -}}
+{{- if and .Values.gateway.assets.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.assets.enabled has no effect without gateway.enabled" -}}
+{{- end -}}
+{{- if include "dekopon.assetsEnabled" . -}}
+{{- $problems := list -}}
+{{- $subdir := .Values.gateway.assets.subdir -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $subdir)) (eq $subdir ".") (eq $subdir "..") -}}
+{{- $problems = append $problems "gateway.assets.subdir must be one non-dot path segment" -}}
+{{- end -}}
+{{- $taken := dict "gateway.journal.subdir" .Values.gateway.journal.subdir "gateway.wakes.subdir" .Values.gateway.wakes.subdir "gateway.chatgpt.subdir" .Values.gateway.chatgpt.subdir "broker.chatgpt.subdir" .Values.broker.chatgpt.subdir "broker.providerSet.subdir" .Values.broker.providerSet.subdir "broker.oauth2Records.subdir" .Values.broker.oauth2Records.subdir -}}
+{{- range $name, $other := $taken -}}
+{{- if eq $subdir $other -}}
+{{- $problems = append $problems (printf "gateway.assets.subdir clashes with %s" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $mount := .Values.gateway.assets.mountPath -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $mount)) (ne (clean $mount) $mount) -}}
+{{- $problems = append $problems "gateway.assets.mountPath must be a canonical absolute path" -}}
+{{- end -}}
+{{- $journal := .Values.gateway.journal.mountPath -}}
+{{- if or (eq $mount $journal) (hasPrefix (printf "%s/" $journal) $mount) (hasPrefix (printf "%s/" $mount) $journal) -}}
+{{- $problems = append $problems "gateway.assets.mountPath must not equal, contain or be inside gateway.journal.mountPath" -}}
+{{- end -}}
+{{- if $problems -}}
+{{- fail (printf "gateway.assets is misconfigured: %s" (join "; " $problems)) -}}
 {{- end -}}
 {{- end -}}
 

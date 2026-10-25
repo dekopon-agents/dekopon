@@ -140,6 +140,7 @@ pub(crate) struct Journal {
     retention: Duration,
     seal_retention: Duration,
     lock: Mutex<()>,
+    assets: Mutex<Option<std::sync::Weak<Mutex<crate::asset::Retention>>>>,
 }
 
 impl Journal {
@@ -188,14 +189,78 @@ impl Journal {
             retention,
             seal_retention,
             lock: Mutex::new(()),
+            assets: Mutex::new(None),
         };
         journal.reset_invalid_files()?;
         journal.expire(now)?;
         Ok(journal)
     }
 
+    pub(crate) fn attach_assets(
+        &self,
+        assets: &std::sync::Arc<Mutex<crate::asset::Retention>>,
+    ) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        *self.assets.lock() = Some(std::sync::Arc::downgrade(assets));
+        self.sync_assets()
+    }
+
+    fn sync_assets(&self) -> Result<(), JournalError> {
+        let Some(assets) = self
+            .assets
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return Ok(());
+        };
+        let mut references = HashSet::new();
+        for agent in fs::read_dir(&self.dir)? {
+            let agent = agent?.path();
+            if !is_agent_directory(&agent) {
+                continue;
+            }
+            for entry in fs::read_dir(&agent)? {
+                let path = entry?.path();
+                if !is_journal_file(&path) {
+                    continue;
+                }
+                let stem = path
+                    .strip_prefix(&self.dir)
+                    .map_err(|_| JournalError::Corrupt)?
+                    .with_extension("")
+                    .to_string_lossy()
+                    .into_owned();
+                validated_lines(&path, |line| {
+                    for asset in line.assets {
+                        references.insert(crate::asset::StoredKey::new(
+                            stem.clone(),
+                            asset.id,
+                            asset.at_ms,
+                        ));
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        assets
+            .lock()
+            .reconcile(&references)
+            .map_err(|error| match error {
+                dekopon_model::asset::BlobError::Io(kind) => JournalError::Io { kind },
+                dekopon_model::asset::BlobError::TooLarge
+                | dekopon_model::asset::BlobError::Disabled
+                | dekopon_model::asset::BlobError::Capacity
+                | dekopon_model::asset::BlobError::Unknown
+                | dekopon_model::asset::BlobError::Reclaimed
+                | dekopon_model::asset::BlobError::Unauthorized
+                | dekopon_model::asset::BlobError::LengthChanged => JournalError::Corrupt,
+            })
+    }
+
     pub fn seal(&self, stem: &str, at: SystemTime) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -212,6 +277,7 @@ impl Journal {
         forget_after: Duration,
     ) -> Result<Option<SealedConversation>, JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         self.read_seal(stem, forget_after)
     }
 
@@ -221,6 +287,7 @@ impl Journal {
 
     pub(crate) fn write_follow(&self, key: &str, marker: FollowMarker) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -234,6 +301,7 @@ impl Journal {
 
     pub(crate) fn remove_follow(&self, key: &str) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         match fs::remove_file(self.follow_path(key)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -246,6 +314,7 @@ impl Journal {
         limit: usize,
     ) -> Result<Vec<(String, FollowMarker)>, JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         let mut markers = BTreeMap::new();
         let mut overflow = 0usize;
         for entry in fs::read_dir(&self.dir)? {
@@ -382,6 +451,7 @@ impl Journal {
         now: SystemTime,
     ) -> Result<Recalled, JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         self.sweep(now, false)?;
         let seal_ms = self
             .read_seal(stem, window.forget_after)?
@@ -444,6 +514,7 @@ impl Journal {
         _window: MemoryWindow,
     ) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         let path = self.path(stem);
         let next_record_id = match Backward::open(&path).and_then(|mut lines| lines.next_line()) {
             Ok(last) => last.map_or(1, |last| last.next_record_id),
@@ -562,6 +633,7 @@ impl Journal {
 
     pub(crate) fn enforce_caps(&self) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
         for entry in fs::read_dir(&self.dir)? {
             let path = entry?.path();
             if is_agent_directory(&path)
@@ -754,6 +826,15 @@ impl Journal {
             }
         }
         Ok(())
+    }
+}
+
+struct AssetSync<'a>(&'a Journal);
+impl Drop for AssetSync<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.sync_assets() {
+            tracing::warn!(reason = error.label(), %error, "gateway.asset.journal_sync.failed");
+        }
     }
 }
 

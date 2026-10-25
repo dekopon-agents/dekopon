@@ -412,6 +412,7 @@ impl Journal {
     ) -> Result<(), JournalError> {
         let horizon = self.horizon(input);
         let _lock = self.lock.lock();
+        let _assets = super::AssetSync(self);
         let path = self.path(input.stem);
         let mut lines = match Backward::open(&path) {
             Ok(lines) => lines,

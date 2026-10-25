@@ -907,6 +907,13 @@ pub struct JournalConfig {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssetsConfig {
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedJournal {
     pub dir: PathBuf,
@@ -932,6 +939,8 @@ pub struct SessionsConfig {
     #[serde(default)]
     pub journal: Option<JournalConfig>,
     #[serde(default)]
+    pub assets: Option<AssetsConfig>,
+    #[serde(default)]
     pub memory: MemorySettings,
     #[serde(default)]
     pub wakes: Option<WakesConfig>,
@@ -947,13 +956,14 @@ impl Default for SessionsConfig {
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
             max_jobs: DEFAULT_MAX_JOBS,
             journal: None,
+            assets: None,
             memory: MemorySettings::default(),
             wakes: None,
         }
     }
 }
 
-pub(crate) const DEFAULT_ASSET_RETENTION_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const DEFAULT_ASSET_RETENTION_BYTES: usize = 1024 * 1024 * 1024;
 const fn default_asset_retention_bytes() -> usize {
     DEFAULT_ASSET_RETENTION_BYTES
 }
@@ -1017,6 +1027,7 @@ pub struct ResolvedConfig {
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
     pub journal: Option<ResolvedJournal>,
+    pub assets: Option<PathBuf>,
     pub memory: ResolvedSettings,
     pub wakes: Option<ResolvedWakes>,
     pub shutdown_grace: Duration,
@@ -2507,6 +2518,7 @@ pub(crate) fn resolve(
                     config.sessions.memory.retention.max_age_ms.get(),
                 )),
         });
+    let assets = resolve_assets(&config.sessions, &resolve_path, &mut problems);
     let shutdown_grace = match config.shutdown_grace_ms {
         Some(0) => {
             problems.push(ConfigProblem::InvalidSessionLimits);
@@ -2585,6 +2597,7 @@ pub(crate) fn resolve(
                 stop_words,
                 sessions: config.sessions,
                 journal,
+                assets,
                 memory: memory_settings.expect("memory settings validated before resolution"),
                 wakes,
                 shutdown_grace,
@@ -2898,8 +2911,89 @@ pub enum ConfigError {
     },
 }
 
+fn resolve_assets(
+    sessions: &SessionsConfig,
+    resolve_path: &impl Fn(PathBuf) -> PathBuf,
+    problems: &mut Vec<ConfigProblem>,
+) -> Option<PathBuf> {
+    let assets = match (&sessions.journal, &sessions.assets) {
+        (Some(_), None) => {
+            problems.push(ConfigProblem::AssetsRequired);
+            return None;
+        }
+        (None, Some(_)) => {
+            problems.push(ConfigProblem::AssetsWithoutJournal);
+            return None;
+        }
+        (None, None) => return None,
+        (Some(_), Some(assets)) => assets,
+    };
+    let Some(path) = assets
+        .path
+        .as_ref()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        problems.push(ConfigProblem::AssetsPathRequired);
+        return None;
+    };
+    let dir = match resolve_directory(&resolve_path(path.clone())) {
+        Ok(dir) => dir,
+        Err(error) => {
+            problems.push(ConfigProblem::AssetsPathUnresolved { kind: error.kind() });
+            return None;
+        }
+    };
+    if let Some(journal) = &sessions.journal {
+        match resolve_directory(&resolve_path(journal.path.clone())) {
+            Ok(journal) => {
+                if dir == journal {
+                    problems.push(ConfigProblem::AssetsPathEqualsJournal);
+                } else if dir.starts_with(&journal) {
+                    problems.push(ConfigProblem::AssetsPathInsideJournal);
+                } else if journal.starts_with(&dir) {
+                    problems.push(ConfigProblem::AssetsPathContainsJournal);
+                }
+            }
+            Err(error) => problems.push(ConfigProblem::AssetsPathUnresolved { kind: error.kind() }),
+        }
+    }
+    Some(dir)
+}
+
+fn resolve_directory(path: &Path) -> io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) if path.is_dir() => Ok(path),
+        Ok(_) => Err(io::Error::from(io::ErrorKind::NotADirectory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let parent = resolve_directory(parent)?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            Ok(parent.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    #[error("sessions.assets.path is required with sessions.journal")]
+    AssetsRequired,
+    #[error("sessions.assets requires sessions.journal")]
+    AssetsWithoutJournal,
+    #[error("sessions.assets.path must be a nonempty path")]
+    AssetsPathRequired,
+    #[error("sessions.assets.path could not resolve ({kind:?})")]
+    AssetsPathUnresolved { kind: io::ErrorKind },
+    #[error("sessions.assets.path equals the journal directory")]
+    AssetsPathEqualsJournal,
+    #[error("sessions.assets.path is inside the journal directory")]
+    AssetsPathInsideJournal,
+    #[error("sessions.assets.path contains the journal directory")]
+    AssetsPathContainsJournal,
     #[error("memory policy for route {route:?}: {problem}")]
     MemoryPolicy {
         route: Option<usize>,
@@ -3498,7 +3592,7 @@ routes:
         assert!(
             matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(|p| matches!(p, super::ConfigProblem::FollowWithoutJournal { route: 0 })))
         );
-        let with_journal = "sessions:\n  journal: { path: journal }\n";
+        let with_journal = "sessions:\n  journal: { path: journal }\n  assets: { path: assets }\n";
         let config = resolved(&format!("{with_journal}{discord}{route}")).unwrap();
         assert!(config.routes[0].follow);
         let disabled = route.replace("follow: true", "follow: null");

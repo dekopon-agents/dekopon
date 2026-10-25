@@ -267,6 +267,22 @@ echo "==> (a) cold start"
 reset_mounts
 run_init "$work/init.sh"
 
+echo "==> durable asset store is writable on a local filesystem as the gateway UID"
+render_init "$work/assets-init.sh" --set gateway.journal.enabled=true --set gateway.assets.enabled=true
+run_init "$work/assets-init.sh"
+python_yaml '
+import sys,yaml
+docs=list(yaml.safe_load_all(sys.stdin))
+pod=next(d for d in docs if d and d["kind"]=="Deployment")["spec"]["template"]["spec"]
+gateway=next(c for c in pod["containers"] if c["name"]=="gateway")
+assert gateway["securityContext"]["runAsUser"]==65533
+assert {"name":"state","mountPath":"/var/lib/dekopon-gatewayd/assets","subPath":"gateway-assets"} in gateway["volumeMounts"]
+' "$work/render.yaml"
+docker run --rm --platform "$platform" --user 65533:65533 --cap-drop=ALL \
+  --security-opt=no-new-privileges --read-only \
+  --mount "type=volume,src=${resource}-state,dst=/var/lib/dekopon-gatewayd/assets,volume-subpath=gateway-assets" \
+  "$busybox" sh -ec 'umask 077; printf writable > /var/lib/dekopon-gatewayd/assets/witness; test "$(cat /var/lib/dekopon-gatewayd/assets/witness)" = writable; test "$(stat -c %a /var/lib/dekopon-gatewayd/assets)" = 700'
+
 echo "==> (b) in-place restart: the emptyDirs still hold the previous run's 0700 directories"
 run_init "$work/init.sh"
 root_perms=$(docker run --rm --platform "$platform" -v "${resource}-assets":/s "$busybox" \
