@@ -1,4 +1,10 @@
 use std::sync::Arc;
+
+pub(crate) mod depth;
+mod nested;
+
+use depth::Depth;
+use nested::Construct;
 use thiserror::Error;
 
 use crate::{
@@ -73,10 +79,10 @@ impl ParseError {
 }
 
 pub fn parse(source: &str) -> Result<Program, ParseError> {
-    parse_nested(source, 0)
+    depth::parse(source)
 }
 
-fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
+fn parse_nested(source: &str, depth: Depth) -> Result<Program, ParseError> {
     let mut parser = Parser::new(source, depth);
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
@@ -93,18 +99,16 @@ fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
 
 pub(crate) fn parse_substitution(
     source: &str,
-    depth: u32,
+    depth: Depth,
     line: usize,
 ) -> Result<(Program, usize), ParseError> {
-    if depth >= MAX_NESTING_DEPTH {
-        return Err(too_deep(line, "command substitution `$( ... )`"));
-    }
-    let mut parser = Parser::new(source, depth + 1);
+    let depth = depth.substitution(line)?;
+    let mut parser = Parser::new(source, depth);
     parser.substitution = true;
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
         if let Some(close) = parser.lexer.pending_here_doc_close() {
-            parse_nested(&source[..close + 1], depth + 1)?;
+            parse_nested(&source[..close + 1], depth)?;
         }
         return Err(error.into());
     }
@@ -118,7 +122,7 @@ pub(crate) fn parse_substitution(
         TokenKind::RightParen => {
             if parser.lexer.offset() != end {
                 // Reparse the bounded prefix to preserve the here-document's delimiter-specific refusal.
-                return parse_nested(&source[..end], depth + 1).and(Err(ParseError::syntax(
+                return parse_nested(&source[..end], depth).and(Err(ParseError::syntax(
                     token_line,
                     "unterminated here-document",
                 )));
@@ -188,14 +192,14 @@ struct Parser<'a> {
     source: &'a str,
     tokens: Vec<Token>,
     position: usize,
-    depth: u32,
+    depth: Depth,
     lexer: Lexer<'a>,
     lex_error: Option<LexError>,
     substitution: bool,
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, depth: u32) -> Self {
+    fn new(source: &'a str, depth: Depth) -> Self {
         Self {
             source,
             tokens: Vec::new(),
@@ -205,18 +209,6 @@ impl<'a> Parser<'a> {
             lex_error: None,
             substitution: false,
         }
-    }
-
-    fn enter(&mut self, construct: &str) -> Result<(), ParseError> {
-        if self.depth >= MAX_NESTING_DEPTH {
-            return Err(too_deep(self.line(), construct));
-        }
-        self.depth += 1;
-        Ok(())
-    }
-
-    fn leave(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
     }
 
     fn token_at(&mut self, position: usize) -> Option<&Token> {
@@ -298,10 +290,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_program(&mut self, terminators: &[&str]) -> Result<Program, ParseError> {
-        self.enter("a command block")?;
-        let program = self.parse_program_body(terminators);
-        self.leave();
-        program
+        self.parse_program_body(terminators)
     }
 
     fn parse_program_body(&mut self, terminators: &[&str]) -> Result<Program, ParseError> {
@@ -462,7 +451,7 @@ impl<'a> Parser<'a> {
             ));
         }
         self.position += 1;
-        let body = self.parse_program(&[])?;
+        let body = self.nest(Construct::Function)?.parse_function_body()?;
         if !matches!(self.peek_kind(), Some(TokenKind::RightBrace)) {
             let line = self.line();
             return Err(ParseError::syntax(
@@ -472,45 +461,6 @@ impl<'a> Parser<'a> {
         }
         self.position += 1;
         Ok(Some(FunctionDefinition { name, body }))
-    }
-
-    fn parse_if(&mut self) -> Result<IfStatement, ParseError> {
-        self.expect_reserved("if", "an `if` statement")?;
-        self.enter("an `if` statement")?;
-        let mut branches = Vec::new();
-        let condition = self.parse_and_or_list()?;
-        self.leave();
-        self.skip_separators();
-        self.expect_reserved("then", "an `if` statement")?;
-        let body = self.parse_program(&["elif", "else", "fi"])?;
-        branches.push((condition, body));
-
-        let mut otherwise = None;
-        loop {
-            match self.peek_reserved() {
-                Some("elif") => {
-                    self.position += 1;
-                    self.enter("an `elif` branch")?;
-                    let condition = self.parse_and_or_list()?;
-                    self.leave();
-                    self.skip_separators();
-                    self.expect_reserved("then", "an `elif` branch")?;
-                    let body = self.parse_program(&["elif", "else", "fi"])?;
-                    branches.push((condition, body));
-                }
-                Some("else") => {
-                    self.position += 1;
-                    otherwise = Some(self.parse_program(&["fi"])?);
-                    break;
-                }
-                _ => break,
-            }
-        }
-        self.expect_reserved("fi", "an `if` statement")?;
-        Ok(IfStatement {
-            branches,
-            otherwise,
-        })
     }
 
     fn parse_for(&mut self) -> Result<ForLoop, ParseError> {
@@ -551,13 +501,7 @@ impl<'a> Parser<'a> {
 
         self.skip_separators();
         self.expect_reserved("do", "a `for` loop")?;
-        let body = self.parse_program(&["done"])?;
-        self.expect_reserved("done", "a `for` loop")?;
-        Ok(ForLoop {
-            variable,
-            words,
-            body,
-        })
+        self.nest(Construct::For)?.parse_for_body(variable, words)
     }
 
     fn parse_case(&mut self) -> Result<CaseStatement, ParseError> {
@@ -613,17 +557,7 @@ impl<'a> Parser<'a> {
         }
         self.position += 1;
 
-        let body = self.parse_program(&["esac"])?;
-        if matches!(self.peek_kind(), Some(TokenKind::DoubleSemicolon)) {
-            self.position += 1;
-        } else if self.peek_reserved() != Some("esac") {
-            let line = self.line();
-            return Err(ParseError::syntax(
-                line,
-                "expected `;;` to end a `case` clause",
-            ));
-        }
-        Ok(CaseClause { patterns, body })
+        self.nest(Construct::Case)?.parse_case_body(patterns)
     }
 
     fn parse_case_pattern(&mut self) -> Result<CasePattern, ParseError> {
@@ -657,27 +591,6 @@ impl<'a> Parser<'a> {
         Ok(CasePattern::Expanded(word))
     }
 
-    fn parse_while(&mut self, until: bool) -> Result<WhileLoop, ParseError> {
-        let (keyword, context) = if until {
-            ("until", "an `until` loop")
-        } else {
-            ("while", "a `while` loop")
-        };
-        self.expect_reserved(keyword, context)?;
-        self.enter(context)?;
-        let condition = self.parse_and_or_list()?;
-        self.leave();
-        self.skip_separators();
-        self.expect_reserved("do", context)?;
-        let body = self.parse_program(&["done"])?;
-        self.expect_reserved("done", context)?;
-        Ok(WhileLoop {
-            condition,
-            body,
-            until,
-        })
-    }
-
     fn parse_and_or_list(&mut self) -> Result<AndOrList, ParseError> {
         let first = self.parse_pipeline()?;
         let mut rest = Vec::new();
@@ -707,21 +620,25 @@ impl<'a> Parser<'a> {
 
     fn parse_command(&mut self) -> Result<Command, ParseError> {
         let compound = match self.peek_reserved() {
-            Some("if") => Some(Statement::If(self.parse_if()?)),
+            Some("if") => Some(Statement::If(self.nest(Construct::If)?.parse_if()?)),
             Some("for") => Some(Statement::For(self.parse_for()?)),
-            Some("while") => Some(Statement::While(self.parse_while(false)?)),
-            Some("until") => Some(Statement::While(self.parse_while(true)?)),
+            Some("while") => Some(Statement::While(
+                self.nest(Construct::While)?.parse_while(false)?,
+            )),
+            Some("until") => Some(Statement::While(
+                self.nest(Construct::Until)?.parse_while(true)?,
+            )),
             Some("case") => Some(Statement::Case(self.parse_case()?)),
             _ => None,
         };
         let compound = match compound {
             Some(statement) => Some(statement),
-            None if self.peek_literal_word("[[") => {
-                Some(Statement::Conditional(self.parse_conditional()?))
-            }
-            None if matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) => {
-                Some(Statement::Group(self.parse_group()?))
-            }
+            None if self.peek_literal_word("[[") => Some(Statement::Conditional(
+                self.nest(Construct::Conditional)?.parse_conditional()?,
+            )),
+            None if matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) => Some(
+                Statement::Group(self.nest(Construct::Group)?.parse_group()?),
+            ),
             None => None,
         };
         let Some(statement) = compound else {
@@ -737,25 +654,6 @@ impl<'a> Parser<'a> {
 
     fn peek_literal_word(&mut self, expected: &str) -> bool {
         matches!(self.peek_kind(), Some(TokenKind::Word(word)) if word.as_literal() == Some(expected))
-    }
-
-    fn parse_conditional(&mut self) -> Result<Conditional, ParseError> {
-        let line = self.line();
-        self.position += 1;
-        self.enter("a `[[ ... ]]` conditional")?;
-        let expression = self.parse_conditional_or()?;
-        self.leave();
-        if !self.peek_literal_word("]]") {
-            let found = self
-                .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
-                line,
-                format!("expected `]]` to close a `[[ ... ]]` conditional, found {found}"),
-            ));
-        }
-        self.position += 1;
-        Ok(expression)
     }
 
     fn parse_conditional_or(&mut self) -> Result<Conditional, ParseError> {
@@ -780,26 +678,10 @@ impl<'a> Parser<'a> {
 
     fn parse_conditional_unary(&mut self) -> Result<Conditional, ParseError> {
         if self.peek_literal_word("!") {
-            self.position += 1;
-            self.enter("a `!` inside `[[ ... ]]`")?;
-            let inner = self.parse_conditional_unary()?;
-            self.leave();
-            return Ok(Conditional::Not(Box::new(inner)));
+            return self.nest(Construct::TestNot)?.parse_test_not();
         }
         if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
-            let line = self.line();
-            self.position += 1;
-            self.enter("a group inside `[[ ... ]]`")?;
-            let inner = self.parse_conditional_or()?;
-            self.leave();
-            if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
-                return Err(ParseError::syntax(
-                    line,
-                    "expected `)` to close a group inside `[[ ... ]]`",
-                ));
-            }
-            self.position += 1;
-            return Ok(inner);
+            return self.nest(Construct::TestGroup)?.parse_test_group();
         }
         self.parse_conditional_test()
     }
@@ -877,28 +759,6 @@ impl<'a> Parser<'a> {
             words,
             check_right_pattern,
         }))
-    }
-
-    fn parse_group(&mut self) -> Result<Program, ParseError> {
-        let line = self.line();
-        self.position += 1;
-        self.enter("a `{ ...; }` group")?;
-        let body = self.parse_program(&["}"])?;
-        self.leave();
-        if !matches!(self.peek_kind(), Some(TokenKind::RightBrace)) {
-            return Err(ParseError::syntax(
-                line,
-                "expected `}` to close a `{ ...; }` group",
-            ));
-        }
-        self.position += 1;
-        if body.statements.is_empty() {
-            return Err(ParseError::syntax(
-                line,
-                "an empty `{ }` group runs nothing; remove it or put a command in it",
-            ));
-        }
-        Ok(body)
     }
 
     fn parse_redirects(&mut self) -> Result<Vec<Redirect>, ParseError> {
@@ -1335,13 +1195,13 @@ struct ArithParser {
     tokens: Vec<ArithToken>,
     position: usize,
     line: usize,
-    depth: u32,
+    depth: Depth,
 }
 
 pub(crate) fn parse_arithmetic(
     source: &str,
     line: usize,
-    depth: u32,
+    depth: Depth,
 ) -> Result<ArithExpr, ParseError> {
     let tokens = tokenize_arithmetic(source, line)?;
     if tokens.is_empty() {
@@ -1353,7 +1213,7 @@ pub(crate) fn parse_arithmetic(
         line,
         depth,
     };
-    let (expression, _) = parser.parse_or()?;
+    let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
         return Err(ParseError::syntax(
             line,
@@ -1379,46 +1239,43 @@ impl ArithParser {
         false
     }
 
-    fn deeper(&self, height: u32) -> Result<u32, ParseError> {
-        if height >= MAX_NESTING_DEPTH {
-            return Err(ParseError::syntax(
-                self.line,
-                format!(
-                    "an arithmetic expansion may nest at most {MAX_NESTING_DEPTH} operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments"
-                ),
-            ));
-        }
-        Ok(height + 1)
+    fn arithmetic_too_deep(&self, _error: crate::ast::ArithTooDeep) -> ParseError {
+        ParseError::syntax(
+            self.line,
+            format!(
+                "an arithmetic expansion may nest at most {MAX_NESTING_DEPTH} operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments"
+            ),
+        )
     }
 
     fn parse_binary_level(
         &mut self,
         operators: &[(&str, ArithBinaryOp)],
-        next: fn(&mut Self) -> Result<(ArithExpr, u32), ParseError>,
-    ) -> Result<(ArithExpr, u32), ParseError> {
-        let (mut left, mut height) = next(self)?;
+        next: fn(&mut Self) -> Result<ArithExpr, ParseError>,
+    ) -> Result<ArithExpr, ParseError> {
+        let mut left = next(self)?;
         while let Some(symbol) = self.peek_symbol() {
             let Some((_, operator)) = operators.iter().find(|(text, _)| *text == symbol) else {
                 break;
             };
             let operator = *operator;
             self.position += 1;
-            let (right, right_height) = next(self)?;
-            height = self.deeper(height.max(right_height))?;
-            left = ArithExpr::Binary(operator, Box::new(left), Box::new(right));
+            let right = next(self)?;
+            left = ArithExpr::binary(operator, left, right)
+                .map_err(|error| self.arithmetic_too_deep(error))?;
         }
-        Ok((left, height))
+        Ok(left)
     }
 
-    fn parse_or(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_or(&mut self) -> Result<ArithExpr, ParseError> {
         self.parse_binary_level(&[("||", ArithBinaryOp::Or)], Self::parse_and)
     }
 
-    fn parse_and(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_and(&mut self) -> Result<ArithExpr, ParseError> {
         self.parse_binary_level(&[("&&", ArithBinaryOp::And)], Self::parse_equality)
     }
 
-    fn parse_equality(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_equality(&mut self) -> Result<ArithExpr, ParseError> {
         self.parse_binary_level(
             &[
                 ("==", ArithBinaryOp::Equal),
@@ -1428,7 +1285,7 @@ impl ArithParser {
         )
     }
 
-    fn parse_relational(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_relational(&mut self) -> Result<ArithExpr, ParseError> {
         self.parse_binary_level(
             &[
                 ("<=", ArithBinaryOp::LessOrEqual),
@@ -1440,14 +1297,14 @@ impl ArithParser {
         )
     }
 
-    fn parse_additive(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_additive(&mut self) -> Result<ArithExpr, ParseError> {
         self.parse_binary_level(
             &[("+", ArithBinaryOp::Add), ("-", ArithBinaryOp::Subtract)],
             Self::parse_multiplicative,
         )
     }
 
-    fn parse_multiplicative(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_multiplicative(&mut self) -> Result<ArithExpr, ParseError> {
         self.parse_binary_level(
             &[
                 ("*", ArithBinaryOp::Multiply),
@@ -1458,7 +1315,7 @@ impl ArithParser {
         )
     }
 
-    fn parse_unary(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_unary(&mut self) -> Result<ArithExpr, ParseError> {
         let mut operators = Vec::new();
         loop {
             if self.eat_symbol("-") {
@@ -1469,38 +1326,32 @@ impl ArithParser {
                 break;
             }
         }
-        let (mut operand, mut height) = self.parse_primary()?;
+        let mut operand = self.parse_primary()?;
         for operator in operators.into_iter().rev() {
-            height = self.deeper(height)?;
-            operand = ArithExpr::Unary(operator, Box::new(operand));
+            operand = ArithExpr::unary(operator, operand)
+                .map_err(|error| self.arithmetic_too_deep(error))?;
         }
-        Ok((operand, height))
+        Ok(operand)
     }
 
-    fn parse_primary(&mut self) -> Result<(ArithExpr, u32), ParseError> {
+    fn parse_primary(&mut self) -> Result<ArithExpr, ParseError> {
         let line = self.line;
         match self.tokens.get(self.position).cloned() {
             Some(ArithToken::Integer(value)) => {
                 self.position += 1;
-                Ok((ArithExpr::Integer(value), 0))
+                Ok(ArithExpr::integer(value))
             }
             Some(ArithToken::Float(value)) => {
                 self.position += 1;
-                Ok((ArithExpr::Float(value), 0))
+                Ok(ArithExpr::float(value))
             }
             Some(ArithToken::Name(name)) => {
                 self.position += 1;
-                Ok((ArithExpr::Variable(name), 0))
+                Ok(ArithExpr::variable(name))
             }
             Some(ArithToken::Symbol("(")) => {
-                if self.depth >= MAX_NESTING_DEPTH {
-                    return Err(too_deep(line, "an arithmetic expansion"));
-                }
                 self.position += 1;
-                self.depth += 1;
-                let inner = self.parse_or();
-                self.depth -= 1;
-                let inner = inner?;
+                let inner = self.group()?.parse_or()?;
                 if !self.eat_symbol(")") {
                     return Err(ParseError::syntax(
                         line,
@@ -1837,13 +1688,14 @@ mod tests {
         let WordPart::Arithmetic(expression) = &command.words[1].parts[0] else {
             panic!("expected arithmetic");
         };
-        let ArithExpr::Binary(ArithBinaryOp::Add, left, right) = expression else {
+        let crate::ast::ArithNode::Binary(ArithBinaryOp::Add, left, right) = expression.node()
+        else {
             panic!("expected addition at the root, found {expression:?}");
         };
-        assert_eq!(**left, ArithExpr::Integer(1));
+        assert_eq!(**left, ArithExpr::integer(1));
         assert!(matches!(
-            **right,
-            ArithExpr::Binary(ArithBinaryOp::Multiply, _, _)
+            right.node(),
+            crate::ast::ArithNode::Binary(ArithBinaryOp::Multiply, _, _)
         ));
     }
 
@@ -2022,3 +1874,7 @@ mod tests {
         assert!(syntax_error("f() { echo hi").contains("expected `}`"));
     }
 }
+
+#[cfg(test)]
+#[path = "nesting_tests.rs"]
+mod nesting_tests;
