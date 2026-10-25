@@ -690,8 +690,8 @@ typed Slack error category: `missing_scope` (the bot needs `reactions:write`) or
 `not_allowed_token_type` (the installation supplied the wrong token type). This warning is emitted
 once per transport instance, disables later working and seen reaction calls, and never fails the
 answer. Correct the Slack app's scopes or token outside the gateway and restart it to reset the
-breaker. Historical reaction warnings omitted the category, so their counts alone cannot
-distinguish these causes. The status surfaces still carry `transport=slack`. `gateway_session_stop_requested` carries the transport and
+breaker. The status surfaces still carry `transport=slack`.
+`gateway_session_stop_requested` carries the transport and
 `via` (`native-stop`, `button`, `stop-reply`, `wall-clock`); `gateway_session_stop_ignored` carries
 the transport and `reason` (`no-session`, `other-subject`, `already-ended`). Three transport-side
 records sit beside those. `gateway_cancel_ack_failed` (debug, Discord) and
