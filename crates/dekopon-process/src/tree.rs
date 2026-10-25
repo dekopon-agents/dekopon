@@ -1,4 +1,5 @@
 use std::{
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -7,6 +8,7 @@ use std::{
 };
 
 use crate::{CancelSignal, LimitExceeded, Limits};
+use tokio::time::Sleep;
 
 #[derive(Clone, Debug)]
 pub struct CallBudget {
@@ -52,7 +54,7 @@ impl CallBudget {
 #[derive(Clone, Debug)]
 pub struct TreeContext {
     cancel: Vec<CancelSignal>,
-    cancel_deadline: Option<tokio::time::Instant>,
+    cancel_deadline: Option<Arc<Pin<Box<Sleep>>>>,
     deadline: Instant,
     calls: CallBudget,
     steps: Arc<AtomicU64>,
@@ -123,9 +125,8 @@ impl TreeContext {
         self
     }
 
-    pub fn with_script_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.cancel_deadline =
-            timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
+    pub fn with_script_timer(mut self, timer: Option<Pin<Box<Sleep>>>) -> Self {
+        self.cancel_deadline = timer.map(Arc::new);
         self
     }
 
@@ -133,7 +134,8 @@ impl TreeContext {
         self.cancel.iter().any(CancelSignal::is_cancelled)
             || self
                 .cancel_deadline
-                .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                .as_ref()
+                .is_some_and(|timer| timer.is_elapsed())
     }
 
     pub fn charge_step(&self) -> Result<(), LimitExceeded> {
@@ -196,9 +198,13 @@ impl TreeContext {
 
     #[must_use]
     pub fn remaining(&self) -> Duration {
-        self.cancel_deadline.map_or_else(
+        self.cancel_deadline.as_ref().map_or_else(
             || self.deadline.saturating_duration_since(Instant::now()),
-            |deadline| deadline.saturating_duration_since(tokio::time::Instant::now()),
+            |timer| {
+                timer
+                    .deadline()
+                    .saturating_duration_since(tokio::time::Instant::now())
+            },
         )
     }
 

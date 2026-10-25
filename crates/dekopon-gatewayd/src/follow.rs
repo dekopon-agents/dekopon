@@ -370,7 +370,7 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
     fn note(&self, text: &str, eta: Option<Duration>) {
         self.inner.note(text, eta);
     }
-    fn script_started(&self, tree: &TreeContext) {
+    fn script_started(&self, tree: &mut TreeContext) {
         self.inner.script_started(tree);
     }
     fn script_finished(&self) {

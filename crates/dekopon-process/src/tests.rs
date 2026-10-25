@@ -75,7 +75,7 @@ async fn script_deadline_cancellation_does_not_change_a_jobs_deadline_error() {
     let job = script
         .clone()
         .with_cancel(vec![CancelSignal::never()])
-        .with_script_timeout(None);
+        .with_script_timer(None);
     tokio::time::advance(limits.timeout).await;
     assert_eq!(script.charge_step(), Err(LimitExceeded::Cancelled));
     assert!(!job.is_cancelled());

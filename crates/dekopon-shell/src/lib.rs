@@ -416,7 +416,7 @@ pub trait CapabilityInvoker: Send + Sync {
         let _ = (text, eta);
     }
 
-    fn script_started(&self, _tree: &TreeContext) {}
+    fn script_started(&self, _tree: &mut TreeContext) {}
 
     fn script_finished(&self) {}
 
@@ -480,7 +480,7 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().note(text, eta);
     }
 
-    fn script_started(&self, tree: &TreeContext) {
+    fn script_started(&self, tree: &mut TreeContext) {
         self.as_ref().script_started(tree);
     }
 

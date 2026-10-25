@@ -70,10 +70,9 @@ pub struct ShellRuntime<I> {
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str) -> ScriptOutcome {
-        let tree = TreeContext::new(self.limits, self.calls.clone())
-            .with_cancel(self.invoker.cancel_signals())
-            .with_script_timeout(Some(self.limits.timeout));
-        self.invoker.script_started(&tree);
+        let mut tree = TreeContext::new(self.limits, self.calls.clone())
+            .with_cancel(self.invoker.cancel_signals());
+        self.invoker.script_started(&mut tree);
         let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
         // Call script_finished before returning the outcome, or the next turn's progress event
         // reports out of order.
@@ -102,7 +101,7 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
-    fn script_started(&self, tree: &TreeContext) {
+    fn script_started(&self, tree: &mut TreeContext) {
         self.direct.script_started(tree);
         if let Some(broker) = &self.broker {
             broker.script_started(tree);
@@ -567,7 +566,14 @@ impl CapabilityInvoker for BrokerLeg {
         vec![self.cancel.clone()]
     }
 
-    fn script_started(&self, tree: &TreeContext) {
+    fn script_started(&self, tree: &mut TreeContext) {
+        let _entered = self.runtime.enter();
+        let mut timer = Box::pin(tokio::time::sleep(tree.remaining()));
+        let _polled = std::future::Future::poll(
+            timer.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        );
+        *tree = tree.clone().with_script_timer(Some(timer));
         *self.script_tree.lock() = Some(tree.clone());
     }
 
@@ -2187,7 +2193,7 @@ mod tests {
             let directory = private_broker_directory();
             let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
             leg.command_words.insert("probe".to_owned());
-            leg.script_started(&dekopon_process::TreeContext::new(
+            leg.script_started(&mut dekopon_process::TreeContext::new(
                 Limits {
                     timeout: Duration::from_secs(5),
                     ..Limits::default()

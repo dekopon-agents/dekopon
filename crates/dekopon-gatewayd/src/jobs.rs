@@ -635,7 +635,7 @@ impl JobContext {
         let tree = tree
             .clone()
             .with_cancel(vec![signal.clone()])
-            .with_script_timeout(None);
+            .with_script_timer(None);
         let Some(leg) = self.connect(signal) else {
             return Ended {
                 exit: ExitCode::FAILURE,

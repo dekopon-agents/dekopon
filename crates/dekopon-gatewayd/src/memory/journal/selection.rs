@@ -80,7 +80,7 @@ impl<I: CapabilityInvoker> CapabilityInvoker for Decider<'_, I> {
     fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
         self.inner.cancel_signals()
     }
-    fn script_started(&self, tree: &dekopon_process::TreeContext) {
+    fn script_started(&self, tree: &mut dekopon_process::TreeContext) {
         self.inner.script_started(tree);
     }
     fn script_finished(&self) {
