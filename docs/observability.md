@@ -396,7 +396,11 @@ supplied, so an export failure can never be re-exported through the exporter tha
 
 ### Daemon exit and shutdown records
 
-Both daemons report the same two facts on the way out, in the same shape:
+Both daemons report terminal failures and telemetry shutdown failures. The broker writes its
+`broker_exit` JSON diagnostic directly to stderr before stopping the runtime, independently of
+`RUST_LOG` and the best-effort stdout queue. This terminal diagnostic is not offered to OTLP;
+serving records keep their nonblocking stdout and exporter paths. Telemetry shutdown uses only
+the time remaining on the broker's shared shutdown deadline and is skipped once it expires.
 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|

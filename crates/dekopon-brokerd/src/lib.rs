@@ -130,6 +130,7 @@ where
     let mut lock_stop = None;
     let stop = async {
         lock_stop = stopped(shutdown, provider_lock.as_ref(), uid, lock_poll).await;
+        deadline.start(limits.shutdown_grace);
         // Unlinking at admission close sends a new connect to NotFound, which clients retry,
         // instead of into a listener that will never accept it.
         if let Err(error) = socket_guard.cleanup() {

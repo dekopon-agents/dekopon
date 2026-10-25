@@ -1,4 +1,12 @@
 #![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
+
+#[path = "../../src/observed.rs"]
+mod observed;
 
 use std::{
     fs,
@@ -113,8 +121,146 @@ async fn sigterm_unlinks_admission_and_exits_zero() {
     assert!(!socket.exists(), "admission socket was removed on shutdown");
 }
 
-#[tokio::test]
-async fn an_over_deadline_connection_makes_the_broker_process_exit_nonzero() {
+#[test]
+fn an_over_deadline_connection_makes_the_broker_process_exit_nonzero() {
+    const ROLE: &str = "DEKOPON_SHUTDOWN_PROCESS_CHILD";
+    if std::env::var_os(ROLE).is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let code = observed::finish(runtime, over_deadline_child());
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
+    let mut child = Process(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ipc_process::an_over_deadline_connection_makes_the_broker_process_exit_nonzero",
+                "--nocapture",
+            ])
+            .env(ROLE, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let until = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < until, "process bounded shutdown");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut diagnostic = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut diagnostic)
+        .unwrap();
+    assert!(!status.success(), "deadline exit: {diagnostic}");
+    assert!(
+        diagnostic.contains("broker connections did not finish within the shutdown grace period"),
+        "nonzero exit is the broker's deadline refusal: {diagnostic}"
+    );
+}
+
+#[test]
+fn unavailable_stderr_preserves_the_broker_failure_exit_within_the_deadline() {
+    use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    const ROLE: &str = "DEKOPON_UNAVAILABLE_STDERR_CHILD";
+    const GRACE: Duration = Duration::from_secs(5);
+    if std::env::var_os(ROLE).is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let code = observed::finish(runtime, async {
+            let deadline = dekopon_brokerd::ShutdownDeadline::default();
+            deadline.start(GRACE);
+            tokio::time::advance(GRACE).await;
+            observed::observed(
+                Install::new(Console {
+                    format: ConsoleFormat::Json,
+                    writer: ConsoleWriter::Stdout,
+                    filter: ConsoleFilter::Directive("info".into()),
+                }),
+                async { Err::<(), _>(dekopon_brokerd::ServerError::ShutdownTimeout) },
+                Some(deadline),
+            )
+            .await
+        });
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
+    let (reader, writer) = std::io::pipe().unwrap();
+    let flags = fcntl_getfl(&writer).unwrap();
+    fcntl_setfl(&writer, flags | OFlags::NONBLOCK).unwrap();
+    let mut fill = &[0; 4096][..];
+    loop {
+        match rustix::io::write(&writer, fill) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::AGAIN) if fill.len() > 1 => fill = &fill[..1],
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(error) => panic!("fill stderr pipe: {error}"),
+        }
+    }
+    fcntl_setfl(&writer, flags).unwrap();
+    for reader in [Some(reader), None] {
+        let until = Instant::now() + GRACE;
+        let mut child = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ipc_process::unavailable_stderr_preserves_the_broker_failure_exit_within_the_deadline",
+                    "--nocapture",
+                ])
+                .env(ROLE, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(writer.try_clone().unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < until,
+                "stderr must not extend the shutdown deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "stderr availability must preserve the failure exit"
+        );
+        drop(reader);
+    }
+}
+
+async fn over_deadline_child() -> std::process::ExitCode {
+    use dekopon_broker_protocol::{BrokerResponse, ResponseEnvelope, read_frame};
+    use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};
+    use dekopon_test_support::shutdown_on;
+    use tokio::io::AsyncWriteExt as _;
+
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("broker.sock");
@@ -125,88 +271,66 @@ async fn an_over_deadline_connection_makes_the_broker_process_exit_nonzero() {
         "socketPath": socket,
         "providers": [provider],
         "identities": [{"uid": dekopon_brokerd::current_uid(), "principal": "caller", "actor": {"type": "service", "principal": "caller"}}],
-        "serverLimits": {"shutdownGraceMs": 1100, "ioTimeoutMs": 500},
+        "serverLimits": {"maxConnections": 1, "shutdownGraceMs": 1100, "ioTimeoutMs": 500},
         "hostLimits": {"maxTimeoutMs": 100}
     })).unwrap()).unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut child = Process(
-        Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"))
-            .args(["--config", config.to_str().unwrap()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let until = Instant::now() + Duration::from_secs(30);
-    let mut stream = loop {
-        match tokio::net::UnixStream::connect(&socket).await {
-            Ok(stream) => break stream,
-            Err(_) => {
-                assert!(
-                    child.0.try_wait().unwrap().is_none(),
-                    "broker failed to start"
-                );
-                assert!(Instant::now() < until, "broker readiness deadline");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::pause();
+    let (clock_stop, mut clock_stopped) = tokio::sync::oneshot::channel();
+    // A runnable task prevents Tokio's idle clock advance while readiness depends on real I/O.
+    let clock = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut clock_stopped => break,
+                () = tokio::task::yield_now() => {}
             }
         }
-    };
-    use tokio::io::AsyncWriteExt as _;
-    stream.write_all(&[0]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &child.0.id().to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let until = Instant::now() + Duration::from_millis(300);
-    while socket.exists() {
-        assert!(Instant::now() < until, "the drain did not start");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // Freeze after admission closes so monotonic shutdown time passes while the connection cannot read.
-    assert!(
-        Command::new("kill")
-            .args(["-STOP", &child.0.id().to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(
-        Command::new("kill")
-            .args(["-CONT", &child.0.id().to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let until = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
+    });
+    let deadline = dekopon_brokerd::ShutdownDeadline::default();
+    let install = Install::new(Console {
+        format: ConsoleFormat::Json,
+        writer: ConsoleWriter::Stdout,
+        filter: ConsoleFilter::Directive("info".into()),
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(observed::observed(
+        install,
+        dekopon_brokerd::run(config, shutdown_on(stopped), deadline.clone()),
+        Some(deadline.clone()),
+    ));
+    let mut stream = loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await {
+            break stream;
         }
-        assert!(Instant::now() < until, "process bounded shutdown");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!server.is_finished(), "broker failed before readiness");
+        tokio::task::yield_now().await;
     };
-    assert!(
-        !status.success(),
-        "a connection beyond the shutdown deadline must abort"
-    );
-    let mut output = String::new();
-    child
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut output)
+    stream.write_all(&[0]).await.unwrap();
+    let mut probe = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let response = read_frame::<_, ResponseEnvelope>(&mut probe, FrameLimits::default())
+        .await
         .unwrap();
     assert!(
-        output.contains("broker connections did not finish within the shutdown grace period"),
-        "nonzero exit is the broker's deadline refusal: {output}"
+        matches!(
+            response.response,
+            BrokerResponse::Error { code, .. } if code == dekopon_broker_protocol::ERROR_CAPACITY_EXHAUSTED
+        ),
+        "the partial-frame connection owns the only admission permit"
     );
+    stop.send(()).unwrap();
+    while socket.exists() {
+        assert!(!server.is_finished(), "broker exited before unlink");
+        tokio::task::yield_now().await;
+    }
+    let fixed = deadline
+        .get()
+        .expect("unlink follows shutdown deadline start");
+    tokio::time::advance(fixed - tokio::time::Instant::now()).await;
+    let code = server.await.unwrap();
+    clock_stop.send(()).unwrap();
+    clock.await.unwrap();
     drop(stream);
+    code
 }
 
 fn owned(path: &Path, uid: u32, gid: u32, mode: u32, root: bool) {
