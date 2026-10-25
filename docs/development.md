@@ -259,14 +259,15 @@ Return to the untouched checkout for stock builds and publication. If working in
 optimized checkout, restore its tracked `Cargo.lock` and omit `--config` to return to stock.
 `.github/workflows/wasmtime-optimization.yml` runs the optimized test and release build above.
 The RPi runs the optimized ARM64 image, so CI runs it on native `ubuntu-24.04-arm` for every Rust
-pull request. Pushes to `main` that touch Rust inputs and manual dispatch run both lanes; a pull
-request that changes the overlay, its lock or that workflow also runs native `ubuntu-24.04`.
+pull request. Pushes to `main` that touch Rust inputs and manual dispatch run both lanes; native
+`ubuntu-24.04` runs after merge or on manual dispatch.
 x86-64 is a supported, tested architecture for this build; its lane runs beside ARM64, never
 behind it. Neither lane is a required check, so fork availability does not block the normal
 validation path. Main-branch runs save each architecture's `wasmtime-optimization-v1` dependency
 cache that pull requests restore, and a newer merge queues behind a running main-branch run
 instead of cancelling it, so both caches stay current. Changing the pin requires regenerating
-`.cargo/wasmtime-optimization.lock` with Cargo in an isolated checkout and passing both lanes.
+`.cargo/wasmtime-optimization.lock` with Cargo in an isolated checkout and passing both lanes,
+with x86-64 passing after merge or through a manual dispatch on the branch.
 Never copy the optimized lock into a release-publication checkout. The independent existing
 `tracing-core` patch still applies to workspace builds; this option does not remove that exception.
 
