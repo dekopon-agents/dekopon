@@ -670,7 +670,9 @@ both checks by hand on the rendered candidate first.
 ## Operator console
 
 `console.enabled` adds a third container that runs `dekopon-console --idle` as UID 65535 from
-`console.image`. It mounts the runtime directory and the gateway catalog read-only and a small
+`console.image`, which the deployment must point at the Dekopon image
+`ghcr.io/dekopon-agents/dekopon` at the matching release (including the memory-optimized variant
+when selected). The image includes the console on PATH. It mounts the runtime directory and the gateway catalog read-only and a small
 memory `/tmp`; it reaches the broker only through IPC group 65534 and gets no model, provider or
 gateway credential. Exec starts a fresh process configured by the container environment:
 

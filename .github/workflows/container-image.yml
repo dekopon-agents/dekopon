@@ -1,8 +1,8 @@
-# Publishes ghcr.io/dekopon-agents/dekopon: one image, both daemon binaries, linux/amd64 and
+# Publishes ghcr.io/dekopon-agents/dekopon: one image, both daemon binaries and the console, linux/amd64 and
 # linux/arm64.
 #
 # The image is assembled from the release archives, not compiled here. `release.yml` already
-# builds, checksums, and provenance-attests the two executables for both Linux targets, so this
+# builds, checksums, and provenance-attests the three executables for both Linux targets, so this
 # workflow verifies those archives and copies their contents into an image. Recompiling would
 # produce a second set of binaries nobody has verified, from a toolchain that can drift, and would
 # cost a native build matrix to arrive somewhere less trustworthy than the artifacts users already
@@ -160,7 +160,29 @@ jobs:
       - name: Check image scripts
         run: shellcheck ci/stage-image-context.sh "$RUNNER_TEMP/verify-image-broker.sh"
 
+      - name: Check published console availability
+        id: availability
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          PUBLISH: ${{ steps.plan.outputs.push }}
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISH" = true ]; then
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/trees/$TAG?recursive=1" > "$RUNNER_TEMP/release-tree.json"
+            supported=$(python3 -c 'import json, sys; tree = json.load(open(sys.argv[1])); assert not tree.get("truncated"), "release tree is truncated"; print("true" if any(p["path"] == "crates/dekopon-console/Cargo.toml" for p in tree["tree"]) else "false")' "$RUNNER_TEMP/release-tree.json")
+            echo "supported=$supported" >> "$GITHUB_OUTPUT"
+            if [ "$supported" = false ]; then
+              python3 .github/scripts/test_stage_image_context.py
+              echo "::notice::Published $TAG predates the workspace console; staging contract tests passed. Full image validation resumes with the first release containing the console."
+            fi
+          fi
+
       - name: Stage the build context
+        if: steps.availability.outputs.supported == 'true'
         id: stage
         shell: bash
         env:
@@ -188,9 +210,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
+        if: steps.availability.outputs.supported == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build and load both platforms
+        if: steps.availability.outputs.supported == 'true'
         shell: bash
         env:
           CONTEXT: ${{ steps.stage.outputs.context }}
@@ -205,6 +229,7 @@ jobs:
           done
 
       - name: Verify the image against the published archives
+        if: steps.availability.outputs.supported == 'true'
         shell: bash
         env:
           CONTEXT: ${{ steps.stage.outputs.context }}
@@ -221,7 +246,7 @@ jobs:
 
             # The claim this whole design rests on: the executable in the image is the executable
             # the release published, byte for byte.
-            for binary in dekopon-brokerd dekopon-gatewayd; do
+            for binary in dekopon-brokerd dekopon-gatewayd dekopon-console; do
               in_image=$(tar -xOf "$rootfs" "usr/local/bin/$binary" | sha256sum | cut -d' ' -f1)
               in_release=$(sha256sum "$CONTEXT/dist/$arch/$binary" | cut -d' ' -f1)
               if [ "$in_image" != "$in_release" ]; then
@@ -255,15 +280,16 @@ jobs:
           docker run --rm dekopon-proof:amd64 dekopon-gatewayd --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopon-gatewayd --version
+          docker run --rm --user 65535:65535 dekopon-proof:amd64 dekopon-console --version
           "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
           bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')
           human=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
           {
             echo "| checked | result |"
             echo "|---|---|"
-            echo "| binaries byte-identical to the archives | amd64 2/2, arm64 2/2 |"
+            echo "| binaries byte-identical to the archives | amd64 3/3, arm64 3/3 |"
             echo "| provider components 65532-owned, not group/world writable | both |"
-            echo "| binaries executed (amd64) | 2/2; broker component load verified |"
+            echo "| binaries executed (amd64) | 3/3; broker component load verified |"
             echo "| unpacked size | $human |"
           } >> "$GITHUB_STEP_SUMMARY"
 
