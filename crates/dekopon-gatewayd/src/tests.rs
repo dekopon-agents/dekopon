@@ -22226,3 +22226,6 @@ async fn a_canary_deadline_names_the_model_and_routes() {
 async fn canary_arguments_must_match_the_declared_tool() {
     canary_result("vendor/wrong-arguments", false).await;
 }
+
+#[path = "tests/lost_task.rs"]
+mod lost_task;

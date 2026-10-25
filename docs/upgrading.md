@@ -23,6 +23,14 @@ warnings, and plain `check` still reads no credential. No configuration migratio
 Boot does not run the vendor canary; run `check --probe --against <live config>` in deployment CI
 before restarting with a candidate.
 
+## Turn-started jobs share the turn's capability-call budget
+
+A gateway binary swap requires no configuration, broker protocol or provider WIT change.
+A route's `maxCapabilityCalls` bounds the turn's scripts, nested providers, and all jobs
+it starts and their children together. Exhaustion reports the existing `CapabilityCalls`
+limit. Turn-started jobs keep their independent `jobTimeoutMs` deadline; probe- and
+job-started jobs keep sharing their starter's deadline and budgets.
+
 ## Process spans removed (0.51.0)
 
 A binary swap: no configuration change, no migration and no provider WIT or SDK re-pin. `dekopon-gatewayd` no longer emits the `DEBUG` `process.run` and `process.node` spans its trace filter exported, so a saved query, dashboard or alert on them sees no spans after 0.51.0.
@@ -427,8 +435,9 @@ that `&`, `jobs`, `wait` and `kill` now exit 1 with a message naming `limits.job
 instead of being refused as unsupported shell syntax.
 
 - **`limits.jobTimeoutMs`** (per route, optional): turns on detached jobs for that route and sets
-  the deadline of each job a turn starts. A job started by a probe or by another job shares its
-  starter's deadline and budgets. Absent means jobs are off; 0 or a value too large to be a
+  the independent deadline of each job a turn starts. Every job shares its starter's
+  capability-call budget; a probe- or job-started job also shares its starter's deadline and
+  other tree budgets. Absent means jobs are off; 0 or a value too large to be a
   deadline fails boot naming the key.
 - **`sessions.maxJobs`** (optional, default 2): the most jobs running at once across the gateway,
   and the most job rows it keeps. 0 fails boot.
