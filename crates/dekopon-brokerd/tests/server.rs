@@ -178,6 +178,7 @@ fn request(id: &str) -> InvocationRequest {
 }
 
 fn write_owner_only(path: &Path, contents: &[u8]) {
+    dekopon_broker_host::enable_test_component_memoization();
     fs::write(path, contents).expect("write fixture");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
 }
@@ -217,6 +218,7 @@ async fn broker_over_mapped<'a, A: AuditLog>(
     mappings: IdentityDirectory,
     principals: impl IntoIterator<Item = &'a str>,
 ) -> Arc<Broker<A>> {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -920,6 +922,7 @@ async fn a_panicking_connection_leaves_the_broker_serving_the_next() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_hangup_during_parked_invoke_still_audits_and_closes_streams() {
+    dekopon_broker_host::enable_test_component_memoization();
     let component = parked_component::component();
     let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
         .await
@@ -1585,6 +1588,7 @@ async fn a_non_invoke_frame_with_descriptors_is_refused_without_a_broker_decisio
 #[tokio::test(flavor = "multi_thread")]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_with_ordinary_audit() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_broker_protocol::{AssetEncoding, AssetRow, InvokeAssets};
     use dekopon_capability::AssetConstraints;
     use dekopon_http_host::asset::AssetDirectory;
@@ -1803,6 +1807,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capability_the_owner_did_not_list_gets_no_constraint_set() {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -1885,6 +1890,7 @@ impl SpawnBroker {
     }
 
     async fn start_for(max_connections: usize, script: &str) -> Self {
+        dekopon_broker_host::enable_test_component_memoization();
         let component = if script == spawn_component::SCRIPT {
             spawn_component::component()
         } else {
@@ -2444,6 +2450,7 @@ impl RunHarness {
     }
 
     async fn start_for(principal: &str, memory_route: bool) -> Self {
+        dekopon_broker_host::enable_test_component_memoization();
         let uid = current_uid();
         let directory = private_directory();
         let socket = directory.path().join("run.sock");
