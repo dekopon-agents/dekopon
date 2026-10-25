@@ -2220,9 +2220,21 @@ async fn session_turn(
                 let span = tracing::Span::current();
                 span.record("conversation.recalled_turns", history.len());
                 span.record("conversation.carried_assets", recalled_assets.len());
-                runner
-                    .assets
-                    .restore(&assets, recalled_assets, next_asset_id, Instant::now());
+                let store = Arc::clone(&runner.assets);
+                let access = assets.clone();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let restore_span = span.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&subscriber, || {
+                        let _entered = restore_span.enter();
+                        store.restore(&access, recalled_assets, next_asset_id, Instant::now());
+                    });
+                })
+                .await
+                {
+                    tracing::error!(event = "gateway_session_failed", category = "asset-task", %error, "gateway.session.failed");
+                    return MessageOutcome::Failed.into();
+                }
             }
             (history, cache_key, Some(lease), assets, delta)
         }
@@ -2278,16 +2290,32 @@ async fn session_turn(
     .join("\n\n");
     let images_supported = route.model.accepts_images();
     *publication = runner.assets.publication(&asset_access);
-    let delta = delta
-        .and_then(|delta| delta.block(&runner.assets, &asset_access))
-        .map(ConversationTurn::unanswered);
+    let store = Arc::clone(&runner.assets);
+    let access = asset_access.clone();
+    let arriving = message.assets.clone();
+    let asset_subscriber = tracing::dispatcher::get_default(Clone::clone);
+    let asset_span = tracing::Span::current();
+    let (delta, registered) = match tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&asset_subscriber, || {
+            let _entered = asset_span.enter();
+            let delta = delta
+                .and_then(|delta| delta.block(&store, &access))
+                .map(ConversationTurn::unanswered);
+            let registered = store.assets_for_access(&access, arriving, Instant::now());
+            (delta, registered)
+        })
+    })
+    .await
+    {
+        Ok(registered) => registered,
+        Err(error) => {
+            tracing::error!(event = "gateway_session_failed", category = "asset-task", %error, "gateway.session.failed");
+            return MessageOutcome::Failed.into();
+        }
+    };
     if let Some(delta) = &delta {
         seeded.record(delta.clone());
     }
-    let registered =
-        runner
-            .assets
-            .assets_for_access(&asset_access, message.assets.clone(), Instant::now());
     let text_reader = if leg.is_granted("asset.cat") {
         asset::TextReader::AssetCat
     } else {

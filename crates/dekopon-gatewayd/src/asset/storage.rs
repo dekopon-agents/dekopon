@@ -89,12 +89,26 @@ struct Index {
     files: HashMap<String, StoredFile>,
 }
 
+struct IndexDigest(Sha256);
+
+impl Write for IndexDigest {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) struct Retention {
     pub(super) budget: usize,
     pub(super) bytes: usize,
     pub(super) released: VecDeque<RetentionKey>,
     dir: Option<PathBuf>,
     index: Index,
+    persisted: Option<[u8; 32]>,
     references: HashSet<StoredKey>,
     orphans: Vec<DiskBlob>,
     starting: bool,
@@ -110,6 +124,7 @@ impl Retention {
             bytes: 0,
             released: VecDeque::new(),
             dir: None,
+            persisted: None,
             references: HashSet::new(),
             orphans: Vec::new(),
             starting: false,
@@ -140,12 +155,14 @@ impl Retention {
         let mut store = Self::new(budget);
         store.dir = Some(dir.to_owned());
         store.starting = true;
+        let mut loaded = false;
         store.index = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir.join("index.json"))
         {
             Ok(file) => {
+                loaded = true;
                 if file.metadata()?.uid() != crate::current_uid() {
                     return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
                 }
@@ -159,6 +176,9 @@ impl Retention {
         };
         if store.index.version != 2 {
             return Err(BlobError::Io(io::ErrorKind::InvalidData));
+        }
+        if loaded {
+            store.persisted = Some(store.index_digest()?);
         }
         for (digest, file) in &mut store.index.files {
             if digest.len() != 64
@@ -201,8 +221,20 @@ impl Retention {
         Ok(())
     }
 
-    fn persist(&self) -> Result<(), BlobError> {
+    fn index_digest(&self) -> Result<[u8; 32], BlobError> {
+        let mut digest = IndexDigest(Sha256::new());
+        serde_json::to_writer(&mut digest, &self.index).map_err(|error| {
+            BlobError::Io(error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData))
+        })?;
+        Ok(digest.0.finalize().into())
+    }
+
+    fn persist(&mut self) -> Result<(), BlobError> {
         if let Some(dir) = &self.dir {
+            let digest = self.index_digest()?;
+            if self.persisted == Some(digest) {
+                return Ok(());
+            }
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -220,6 +252,7 @@ impl Retention {
             file.sync_all()?;
             fs::rename(dir.join("index.pending"), dir.join("index.json"))?;
             File::open(dir)?.sync_all()?;
+            self.persisted = Some(digest);
         }
         Ok(())
     }

@@ -650,26 +650,37 @@ impl Journal {
                 )
             }));
         }
-        drop(file);
-        let horizon = millis(entry.at).saturating_sub(duration_millis(self.age_for(stem)));
-        match sweep_file(&path, horizon) {
-            Err(JournalError::Corrupt) => {
-                remove(&path);
-                return Err(JournalError::Corrupt);
-            }
-            result => result?,
-        };
-        if let Some(agent) = agent
-            && self.enforce_agent_cap(agent, Some(&path))?
-        {
-            tracing::warn!(
-                event = "gateway_memory_retention_failed",
-                reason = "agent-byte-cap",
-                encoded_bytes = encoded.len(),
-                "gateway.memory.retention.failed"
-            );
+        file.sync_all()?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
         }
-        self.finish_pending_assets(stem, entry.next_asset_id)?;
+        File::open(&self.dir)?.sync_all()?;
+        drop(file);
+        let maintained = (|| -> Result<(), JournalError> {
+            let horizon = millis(entry.at).saturating_sub(duration_millis(self.age_for(stem)));
+            match sweep_file(&path, horizon) {
+                Err(JournalError::Corrupt) => {
+                    remove(&path);
+                    return Err(JournalError::Corrupt);
+                }
+                result => result?,
+            };
+            if let Some(agent) = agent
+                && self.enforce_agent_cap(agent, Some(&path))?
+            {
+                tracing::warn!(
+                    event = "gateway_memory_retention_failed",
+                    reason = "agent-byte-cap",
+                    encoded_bytes = encoded.len(),
+                    "gateway.memory.retention.failed"
+                );
+            }
+            self.finish_pending_assets(stem, entry.next_asset_id)?;
+            Ok(())
+        })();
+        if let Err(error) = maintained {
+            tracing::warn!(reason = error.label(), %error, "gateway.asset.reclaim.failed");
+        }
         Ok(())
     }
 

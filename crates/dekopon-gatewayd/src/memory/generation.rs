@@ -362,10 +362,27 @@ async fn persist_turn(
     let cancel = cancellation.model_watch();
     let stem = key.journal_stem();
     let grant = journal::grant_digest(&granted);
-    let inventory = runner.assets.inventory(&access);
     let next_asset_id = access.next_asset_id();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
+    let store = Arc::clone(&runner.assets);
+    let inventory_access = access.clone();
+    let inventory_subscriber = subscriber.clone();
+    let inventory_span = span.clone();
+    let inventory = match tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&inventory_subscriber, || {
+            let _entered = inventory_span.enter();
+            store.inventory(&inventory_access)
+        })
+    })
+    .await
+    {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            tracing::warn!(%error, "gateway.asset.reclaim.failed");
+            return;
+        }
+    };
     let include_chat = window.recall == crate::config::RecallSource::Journal;
     let generation_policy = policy.clone();
     let generation_turn = turn.clone();

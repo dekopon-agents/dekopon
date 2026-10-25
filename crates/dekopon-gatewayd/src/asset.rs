@@ -2171,7 +2171,40 @@ mod retention_tests {
     }
 
     #[test]
+    fn unchanged_index_state_does_not_replace_the_file_but_recency_does() {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(directory.path())
+            .unwrap();
+        let access = access("unchanged-index");
+        let id = register(&store, &access);
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        let index = std::fs::File::open(directory.path().join("index.json")).unwrap();
+        let before = index.metadata().unwrap().ino();
+        store.retention.lock().sweep();
+        assert_eq!(
+            std::fs::metadata(directory.path().join("index.json"))
+                .unwrap()
+                .ino(),
+            before
+        );
+        drop(store.pin(&access, id, Recency::Touch).unwrap());
+        assert_ne!(
+            std::fs::metadata(directory.path().join("index.json"))
+                .unwrap()
+                .ino(),
+            before
+        );
+    }
+
+    #[test]
     fn a_written_upload_survives_failed_reconciliation_cleanup_and_restart() {
+        use tracing_subscriber::prelude::*;
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
         let directory = tempfile::tempdir().unwrap();
         let journal_path = directory.path().join("journal");
         let asset_path = directory.path().join("assets");
@@ -2208,8 +2241,18 @@ mod retention_tests {
                 },
                 durable_window(),
             ),
-            Err(crate::memory::journal::JournalError::Corrupt)
+            Ok(())
         ));
+        assert!(
+            capture
+                .events_text()
+                .contains("gateway.asset.reclaim.failed")
+        );
+        assert!(
+            !capture
+                .events_text()
+                .contains("gateway_journal_append_failed")
+        );
         pending.finish_blocking();
         assert_eq!(
             store
