@@ -60,16 +60,20 @@ fn distinguishes_the_rule_that_fired() {
 
 #[test]
 fn redacts_a_secret_key_holding_a_non_string() {
-    let redacted = redact(&json!({"secret": 12_345_678_901_234_567_890_u64}));
-
-    assert_eq!(redacted.redactions.len(), 1);
-    assert!(redacted.value["secret"].is_string());
-    assert!(
-        !redacted.value["secret"]
+    for value in [
+        json!(12_345_678_901_234_567_890_u64),
+        json!(["opaque-sentinel"]),
+        json!({"value": "opaque-sentinel"}),
+    ] {
+        let redacted = redact(&json!({"secret": value}));
+        assert_eq!(redacted.redactions.len(), 1);
+        assert_eq!(redacted.redactions[0].reason, RedactionReason::Key);
+        let hidden = redacted.value["secret"]
             .as_str()
-            .unwrap_or_default()
-            .contains("12345")
-    );
+            .expect("secret value is replaced");
+        assert!(!hidden.contains("12345"));
+        assert!(!hidden.contains("opaque-sentinel"));
+    }
 }
 
 #[test]
