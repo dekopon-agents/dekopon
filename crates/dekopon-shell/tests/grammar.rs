@@ -3706,6 +3706,20 @@ fn substitution_and_parameter_words_match_bash() {
         ("echo \"[${x:-a\nb}]\"", "[a\nb]"),
         (r#"x=v; echo "[${x:+  a  b  }]""#, "[  a  b  ]"),
         (r#"echo "[${x:=  a  b  }]" "[$x]""#, "[  a  b  ] [  a  b  ]"),
+        (r#"echo "[${x:-'a'}]""#, "['a']"),
+        (r#"echo "[${x:-"a"}]""#, "[a]"),
+        (r#"echo "[${x:-'}'}]""#, "['}']"),
+        (r#"y=v; echo "[${x:-'$y'}]""#, "['v']"),
+        (r#"echo "[${x:-'a\'}]""#, r"['a\']"),
+        (r#"x=v; echo "[${x:+'a'}]""#, "['a']"),
+        (r#"echo "[${x:='a'}]" "[$x]""#, "['a'] ['a']"),
+        (r#"echo "[${x:-${x:-'a'}}]""#, "['a']"),
+        (r#"echo "[${x:-a\"b}]""#, r#"[a"b]"#),
+        (r#"echo "[${x:-a\b}]""#, r"[a\b]"),
+        (r#"echo "[${x:-\'a\'}]""#, r"[\'a\']"),
+        (r#"echo "[${x:-a\}b}]""#, "[a}b]"),
+        (r#"x=ab; echo "[${x#'a'}]""#, "[b]"),
+        ("cat <<EOF\n[${x:-'a'}] [${x:-a\\b}]\nEOF\n", r"['a'] [a\b]"),
     ];
     let actual = cases
         .iter()
