@@ -399,6 +399,11 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
     y.conversation.id = "other".to_owned();
     let route = job_route(Duration::from_secs(5), Duration::from_secs(30));
     tool_output_of(&runner, &models, route.clone(), x.clone()).await;
+    let anchor = crate::wake::Anchor::for_job(&x, &route.agent).unwrap();
+    let (held, signal) = runner
+        .jobs
+        .admit(owner.clone(), anchor, None, Arc::from("sleep 30"))
+        .unwrap();
     let output = tool_output_of(&runner, &models, route, y.clone()).await;
     assert_eq!(output.lines().next(), Some("rows=0"));
     assert!(output.lines().any(|line| line == "waited=1"), "{output}");
@@ -418,12 +423,11 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
             inbound.clone(),
         );
         if inbound.conversation.id == y_id {
-            assert!(matches!(
-                runner.jobs.list(&owner)[0].state,
-                JobState::Running { .. }
-            ));
+            assert!(!signal.is_cancelled());
         }
     }
+    assert!(signal.is_cancelled());
+    drop(held);
     let rows = settled(&runner.jobs, &owner, Duration::from_secs(3)).await;
     assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
     assert!(notices.try_recv().is_err());
