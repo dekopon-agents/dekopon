@@ -7,8 +7,8 @@ use std::{
 use dekopon_agent::{BrokerLeg, current_trace_parent};
 use dekopon_broker_protocol::{TraceParent, Trigger};
 use dekopon_core::AgentId;
-use dekopon_process::{CallBudget, Limits as ShellLimits, TreeContext};
 use dekopon_process::{CancelHandle, CancelSignal};
+use dekopon_process::{Limits as ShellLimits, TreeContext};
 use dekopon_shell::{
     ExitCode, Interpreter, JobControl, JobId, JobOutcome, JobRefusal, JobSeed, JobState,
     JobSummary, JobWait,
@@ -627,10 +627,7 @@ impl JobContext {
 
     fn tree(&self, seed: &JobSeed) -> TreeContext {
         match self.origin {
-            Origin::Turn => TreeContext::new(
-                self.limits,
-                CallBudget::new(self.limits.max_capability_calls),
-            ),
+            Origin::Turn => TreeContext::new(self.limits, seed.tree().calls().clone()),
             Origin::Tree(_) => seed.tree().clone(),
         }
     }

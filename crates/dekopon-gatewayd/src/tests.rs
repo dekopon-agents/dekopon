@@ -22002,3 +22002,6 @@ async fn a_cold_platform_recall_skips_messages_before_the_seal() {
     assert!(recalled.contains("at the seal"));
     assert!(recalled.contains("after the seal"));
 }
+
+#[path = "tests/lost_task.rs"]
+mod lost_task;
