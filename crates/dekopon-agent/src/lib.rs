@@ -357,6 +357,7 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     chat_memory: Option<ChatMemorySurface>,
     principal: Option<PrincipalId>,
+    space: Option<Vec<dekopon_core::CapabilityId>>,
     cancel: CancelSignal,
     script_cancel: parking_lot::Mutex<Option<ScriptCancellation>>,
     attachments: Option<Arc<ReplyAttachments>>,
@@ -389,6 +390,7 @@ impl BrokerLeg {
             command_word_help,
             chat_memory,
             principal,
+            space,
         } = surface;
         let (capabilities, effective_capabilities) = snapshot(available)?;
         Ok(Self {
@@ -402,6 +404,7 @@ impl BrokerLeg {
             attestation,
             chat_memory,
             principal,
+            space,
             cancel: CancelSignal::never(),
             script_cancel: parking_lot::Mutex::new(None),
             attachments: None,
@@ -465,6 +468,11 @@ impl BrokerLeg {
     #[must_use]
     pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
         self.chat_memory.as_ref()
+    }
+
+    #[must_use]
+    pub fn space_grants(&self) -> Option<&[dekopon_core::CapabilityId]> {
+        self.space.as_deref()
     }
 
     #[must_use]

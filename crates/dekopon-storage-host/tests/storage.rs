@@ -2026,3 +2026,103 @@ fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
     }
     held.finish_read().expect("held transaction finishes");
 }
+
+#[test]
+fn space_storage_separates_channels_and_shares_threads_across_speakers() {
+    for interface in [StorageInterface::Jsonl, StorageInterface::DurableFiles] {
+        for transport in ["slack", "discord"] {
+            let (_temporary, root) = fixture();
+            let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+            let scoped = |channel: &str, thread: &str, subject: &str| {
+                StorageGrantRequest::new(
+                    "space-storage".parse().expect("invocation"),
+                    "storage-probe.run".parse().expect("capability"),
+                    "storage-probe".parse().expect("provider"),
+                    interface,
+                    StorageAccess::ReadWrite,
+                    StorageScope::Space,
+                    "reviewer".parse().expect("agent"),
+                    subject.parse().expect("subject"),
+                    transport,
+                    transport,
+                    channel,
+                    thread,
+                    ContinuityPolicy::Stable,
+                    subject.as_bytes().to_vec(),
+                )
+                .with_space_key(Some(dekopon_core::SpaceKey {
+                    agent: "reviewer".parse().expect("agent"),
+                    transport: transport.to_owned(),
+                    workspace: Some("workspace".to_owned()),
+                    channel: channel.to_owned(),
+                }))
+            };
+            let subjects = if transport == "slack" {
+                ["slack.t0123abc.u9xyz", "slack.t0123abc.u8xyz"]
+            } else {
+                ["discord.123", "discord.124"]
+            };
+            let first = host
+                .prepare_grant(scoped("channel-a", "thread-1", subjects[0]))
+                .expect("first");
+            let namespace = first.namespace().to_owned();
+            let mut writer = host
+                .begin(first.materialize().expect("grant"))
+                .expect("writer");
+            match interface {
+                StorageInterface::Jsonl => {
+                    writer
+                        .jsonl_append("rows.jsonl", 0, br#"{"space":true}"#)
+                        .expect("append");
+                }
+                StorageInterface::DurableFiles => {
+                    let handle = writer
+                        .vfs_open(
+                            "shared.db",
+                            OpenOptions {
+                                read: true,
+                                write: true,
+                                create: true,
+                                ..OpenOptions::default()
+                            },
+                        )
+                        .expect("open");
+                    writer.vfs_write_at(handle, 0, b"space").expect("write");
+                    writer.vfs_close(handle).expect("close");
+                }
+            }
+            writer.commit().expect("commit");
+            for (channel, thread, same) in [
+                ("channel-a", "", true),
+                ("channel-a", "thread-2", true),
+                ("channel-b", "thread-1", false),
+            ] {
+                let next = host
+                    .prepare_grant(scoped(channel, thread, subjects[1]))
+                    .expect("second");
+                assert_eq!(next.namespace() == namespace, same);
+                let mut reader = host
+                    .begin(next.materialize().expect("grant"))
+                    .expect("reader");
+                match interface {
+                    StorageInterface::Jsonl => {
+                        let contents = reader.jsonl_read_chunk("rows.jsonl", 0, 64);
+                        if same {
+                            assert_eq!(contents.expect("shared row").bytes, b"{\"space\":true}\n");
+                        } else {
+                            assert!(matches!(contents, Err(StorageHostError::NotFound)));
+                        }
+                    }
+                    StorageInterface::DurableFiles => {
+                        assert_eq!(reader.vfs_stat("shared.db").expect("stat").is_some(), same);
+                    }
+                }
+                reader.finish_read().expect("finish");
+            }
+            assert_eq!(
+                generations(&root.join("namespaces").join(&namespace)).len(),
+                1
+            );
+        }
+    }
+}

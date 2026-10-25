@@ -682,3 +682,37 @@ fn partial_sweep_preserves_metadata_and_releases_quota() {
         .unwrap();
     }
 }
+
+#[test]
+fn idle_space_storage_is_swept_with_its_configured_retention() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let host = StorageHost::open(&root, StorageLimits::default()).unwrap();
+    let make = || {
+        request(
+            StorageScope::Space,
+            "slack.t0123abc.u9xyz",
+            "reviewer",
+            "storage-probe",
+            "thread-1",
+            b"same",
+        )
+        .with_space_key(Some(dekopon_core::SpaceKey {
+            agent: "reviewer".parse().unwrap(),
+            transport: "scientist-slack".to_owned(),
+            workspace: Some("t0123abc".to_owned()),
+            channel: "c0123abc".to_owned(),
+        }))
+    };
+    let token = host.prepare_grant(make()).unwrap().namespace().to_owned();
+    host.begin(host.grant(make()).unwrap())
+        .unwrap()
+        .commit()
+        .unwrap();
+    old_marker(&base(&root, &token).join("last-used"));
+    let policies = BTreeMap::from([(
+        ("storage-probe".parse().unwrap(), StorageScope::Space),
+        StorageRetention::IdleTtl(Duration::from_secs(30)),
+    )]);
+    assert_eq!(host.sweep(&policies).unwrap().deleted, 1);
+}

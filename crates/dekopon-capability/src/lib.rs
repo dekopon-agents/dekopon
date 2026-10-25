@@ -504,6 +504,7 @@ pub enum StorageScope {
     PrivateConversation,
     SharedConversation,
     Agent,
+    Space,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

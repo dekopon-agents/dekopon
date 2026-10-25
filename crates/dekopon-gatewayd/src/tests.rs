@@ -22590,3 +22590,47 @@ async fn an_unloadable_baseline_catalog_probes_even_when_candidate_routes_fail()
     assert_eq!(vendor.requests.lock().len(), 1);
     assert_canary_request(&vendor.requests.lock()[0], 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn space_shared_replay_keeps_the_window_when_speakers_grants_differ() {
+    for (space, private, replays) in [
+        (true, false, true),
+        (false, false, false),
+        (true, true, false),
+    ] {
+        let directory = temporary();
+        let responses = ["cli-probe.upper", "cli-probe.reverse"].map(|id| {
+            let response = listings(1, &[id]).remove(0);
+            response.with_space(space.then(|| vec!["cli-probe.upper".parse().expect("capability")]))
+        });
+        let (broker, _observed) = stub_broker(directory.path(), responses.into()).await;
+        let models = ModelScript::new([answer("first answer"), answer("second answer")]);
+        let driver = Arc::new(RecordingDriver::default());
+        let runner = runner(broker, Arc::clone(&models), 4);
+        let route = persistent_route(
+            model_config(),
+            if private { window() } else { shared_window() },
+        );
+        for inbound in [
+            message_from(SUBJECT, "first question"),
+            message_from("tel.16035550100", "second question"),
+        ] {
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                inbound,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            )
+            .await;
+        }
+        assert_eq!(
+            models
+                .prompt(1)
+                .iter()
+                .any(|(_, text)| text == "first answer"),
+            replays
+        );
+        assert_eq!(models.cache_key(0) == models.cache_key(1), replays);
+        assert_eq!(runner.conversations.tracked(), if private { 2 } else { 1 });
+    }
+}

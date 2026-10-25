@@ -36,6 +36,7 @@ pub(crate) struct ConversationKey {
     transport: String,
     conversation: String,
     audience: ConversationAudience,
+    space: Option<(dekopon_core::SpaceKey, Option<String>)>,
 }
 
 impl ConversationKey {
@@ -50,6 +51,7 @@ impl ConversationKey {
             transport: transport.to_owned(),
             conversation: conversation.to_owned(),
             audience: ConversationAudience::Private(subject.clone()),
+            space: None,
         }
     }
 
@@ -59,10 +61,34 @@ impl ConversationKey {
             transport: transport.to_owned(),
             conversation: conversation.to_owned(),
             audience: ConversationAudience::Shared,
+            space: None,
+        }
+    }
+
+    pub(crate) fn for_space(space: dekopon_core::SpaceKey, thread: Option<String>) -> Self {
+        Self {
+            agent: space.agent.clone(),
+            transport: String::new(),
+            conversation: String::new(),
+            audience: ConversationAudience::Shared,
+            space: Some((space, thread)),
         }
     }
 
     pub(crate) fn absorb(&self, digest: &mut impl Update) {
+        if let Some((space, thread)) = &self.space {
+            digest.update(&space.encode());
+            match thread {
+                Some(thread) => {
+                    digest.update(&[1]);
+                    cache_key::absorb(digest, thread.as_bytes());
+                }
+                None => digest.update(&[0]),
+            }
+            digest.update(&[0]);
+            return;
+        }
+
         for part in [self.agent.as_str(), &self.transport, &self.conversation] {
             cache_key::absorb(digest, part.as_bytes());
         }
@@ -675,4 +701,32 @@ fn evicted(reason: EvictionReason) {
         reason = reason.label(),
         "gateway.conversation.evicted"
     );
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    #[test]
+    fn space_replay_stem_is_frozen_and_threads_remain_separate() {
+        let space = dekopon_core::SpaceKey {
+            agent: "reviewer".parse().expect("agent"),
+            transport: "team-slack".to_owned(),
+            workspace: Some("t1".to_owned()),
+            channel: "c1".to_owned(),
+        };
+        let first = ConversationKey::for_space(space.clone(), Some("thread-1".to_owned()));
+        assert_eq!(
+            first.journal_stem(),
+            "reviewer/5f6ae83559748e2d54cdf794bd028ae8e3338f30f3f0f6623ff9bd193105a2fe"
+        );
+        assert_ne!(
+            first.journal_stem(),
+            ConversationKey::for_space(space.clone(), Some("thread-2".to_owned())).journal_stem()
+        );
+        assert_ne!(
+            first.journal_stem(),
+            ConversationKey::for_space(space, None).journal_stem()
+        );
+    }
 }
