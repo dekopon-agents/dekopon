@@ -3063,7 +3063,35 @@ async fn changed_storage_refuses_without_creating_the_candidate_root() {
 }
 
 #[tokio::test]
-async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
+async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_policy() {
+    let fixture = ResidentFixture::boot_with(|root, document| {
+        document["secretMapPath"] = json!("bindings.yaml");
+        document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+            "allowedHosts": ["api.example.test"], "allowedMethods": ["GET"],
+            "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+        });
+        write_owner_only(&root.join("token"), b"private-map-equality-fixture");
+        write_owner_only(&root.join("bindings.yaml"), format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [api.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            root.join("token").display()
+        ).as_bytes());
+    }).await;
+    let reads = super::private_read_witness::TrackedRead::new(&fixture.root.path().join("token"));
+    let report = super::check(&fixture.path, None, None).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(
+        report.policy_digest.as_deref(),
+        Some(fixture.active.ready.broker.policy_digest())
+    );
+    assert_eq!(
+        report.identity_digest.as_deref(),
+        Some(fixture.active.ready.identity_digest.as_str())
+    );
+    assert_eq!(reads.count(), 0, "check never opens the secret source");
+}
+
+#[tokio::test]
+async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -3086,7 +3114,10 @@ async fn check_omits_private_sources_but_boot_and_reload_validate_them() {
     document["secretMapPath"] = json!("bad-secrets.yaml");
     write_config(&path, &document);
     let checked = super::check(&path, None, None).await;
-    assert!(checked.problems.is_empty(), "{checked:?}");
+    assert!(
+        matches!(checked.problems.as_slice(), [BrokerdError::Secrets(_)]),
+        "{checked:?}"
+    );
     for report in [
         super::load_candidate(&path, Mode::Boot).await.1,
         super::load_candidate(&path, Mode::Reload(&active)).await.1,

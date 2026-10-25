@@ -46,11 +46,13 @@ at once, one per line or as `{ "ok", "problems", "warnings", "policyDigest", "id
 with no problems, 1 with problems and 2 on a usage error. Configuration files may be the invoking
 user's own 0644 files, as in a Git checkout; symlinks and group/world-writable files are still
 refused. Runtime paths are not required to exist and are never touched: the socket and its parent,
-`credentialsPath`, `secretMapPath`, `assets.rootPath`, `storage.rootPath` (a throwaway directory
-stands in for it), `providerSet.lockPath`/`storePath` and `http.extraCABundles`. Secrets are not
-read: each credential a capability can select and each secret a policy names is reported as a
-warning naming what boot will require, and credential destination coverage and the secret map are
-not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
+`credentialsPath`, `assets.rootPath`, `storage.rootPath` (a throwaway directory
+stands in for it), `providerSet.lockPath`/`storePath` and `http.extraCABundles`. `check` reads only
+the DRNs from `secretMapPath`, with the same private-file hygiene and byte bound as boot, so both
+policy builds use the complete secret-name catalogue and report the same policy digest. Secret
+sources and values are never read or resolved. Each credential a capability can select is reported
+as a warning naming what boot will require; credential destination coverage, secret source
+descriptors and bindings are not proved. A `providerSet` is resolved from `--provider-set` into the private `--store` directory
 (its lock and blobs, kept between checks), which fetches from the registry; a configuration naming
 provider paths loads them directly. `check` publishes validated managed components into its own
 `--store` cwasm cache through sync, then prunes that cache to the current engine and the listed providers,
