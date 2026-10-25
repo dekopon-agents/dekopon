@@ -854,7 +854,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
     }
 }
 
-fn reload_problem(problem: &GatewaydError) -> String {
+pub(crate) fn reload_problem(problem: &GatewaydError) -> String {
     match problem {
         GatewaydError::Config(
             error @ (config::ConfigError::Decode { .. }
@@ -865,14 +865,37 @@ fn reload_problem(problem: &GatewaydError) -> String {
             "proxy model {model:?} credential could not be opened ({})",
             source.kind().as_str()
         ),
-        GatewaydError::Probe(probe) => format!(
-            "model {} probe failed ({})",
-            probe.model,
-            match &probe.source {
-                crate::probe::ProbeError::Credential(_) => "credential",
-                crate::probe::ProbeError::Vendor(error) => error.kind().as_str(),
-            }
-        ),
+        GatewaydError::Probe(probe) => {
+            use dekopon_model::error::{AuthError, InferenceError, RateLimitError};
+            let (kind, status) = match &probe.source {
+                crate::ProbeError::Credential(_) => ("credential", None),
+                crate::ProbeError::InvalidToolCall | crate::ProbeError::MalformedResponse(_) => {
+                    ("protocol", Some(200))
+                }
+                crate::ProbeError::Vendor(error) => {
+                    let status = match error {
+                        InferenceError::Provider(failure)
+                        | InferenceError::Authentication(AuthError::Provider(failure))
+                        | InferenceError::RateLimited(RateLimitError(failure)) => failure.status,
+                        InferenceError::InvalidRequest(_)
+                        | InferenceError::Transport(_)
+                        | InferenceError::Protocol(_)
+                        | InferenceError::Attachment(_)
+                        | InferenceError::Authentication(AuthError::Credential(_))
+                        | InferenceError::DeadlineExceeded
+                        | InferenceError::Cancelled
+                        | InferenceError::OverBudget(_) => None,
+                    };
+                    (error.kind().as_str(), status)
+                }
+            };
+            let status = status.map_or_else(String::new, |status| format!("; HTTP {status}"));
+            format!(
+                "model {} probe failed ({kind}{status}), routes {}",
+                probe.model,
+                probe.routes.join(", ")
+            )
+        }
         GatewaydError::Config(_)
         | GatewaydError::Route(_)
         | GatewaydError::Startup { .. }
@@ -933,7 +956,7 @@ impl ReloadState {
             None,
             config::LoadMode::Boot,
             None,
-            Some((&self.config, &self.sources)),
+            Some((&self.config, &self.sources, &self.active.load_full().routes)),
         )
         .await;
         let Some(candidate) = candidate else {

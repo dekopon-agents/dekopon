@@ -62,8 +62,9 @@
 //! use std::io::Write;
 //!
 //! use dekopon_shell::{
-//!     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits, Streams,
+//!     CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Streams,
 //! };
+//! use dekopon_process::Limits;
 //! use serde_json::json;
 //!
 //! /// One provider word, `probe`, whose `upper --text <s>` proposes `cli-probe.upper`.
@@ -106,7 +107,7 @@
 //!         &self,
 //!         proposal: dekopon_shell::CommandProposal,
 //!         streams: Streams,
-//!         _tree: &dekopon_shell::TreeContext,
+//!         _tree: &dekopon_process::TreeContext,
 //!     ) -> CapabilityCallResult {
 //!         let dekopon_shell::CommandProposal { capability, input, secret_use, .. } = proposal;
 //!         if secret_use.is_some() {
@@ -161,15 +162,9 @@ mod parser;
 mod pipe;
 mod proposal;
 pub use proposal::{CommandProposal, CommandReport, CommandReportOutcome};
-mod tree;
-pub use tree::{CallBudget, RetainedBytes, TreeContext};
 pub mod value;
 
-pub use limits::{
-    DEFAULT_MAX_CAPABILITY_CALLS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS, DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT,
-    Limits,
-};
+use dekopon_process::{CallBudget, Limits, TreeContext};
 
 use dekopon_core::{ProviderFailureDetail, SecretUseProposal};
 
@@ -667,9 +662,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CallBudget, CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
-        ExitCode, Interpreter, Limits, TreeContext,
+        CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+        Interpreter,
     };
+    use dekopon_process::{CallBudget, Limits, TreeContext};
 
     #[derive(Default)]
     struct RecordingInvoker {
@@ -738,7 +734,7 @@ mod tests {
             &self,
             proposal: super::CommandProposal,
             streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let input = proposal.input;
             let secret_use = proposal.secret_use;
@@ -764,7 +760,7 @@ mod tests {
             &self,
             _: super::CommandProposal,
             _streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -782,7 +778,7 @@ mod tests {
         assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
         assert_eq!(
             super::interp::telemetry::fatal_outcome(&super::builtins::FatalError::Limit(
-                super::limits::LimitExceeded::Cancelled
+                dekopon_process::LimitExceeded::Cancelled
             )),
             "cancelled"
         );
@@ -1033,7 +1029,10 @@ mod tests {
             shared.invoke(
                 super::CommandProposal::new("http-probe.fetch", json!({"url": "https://x"}), None),
                 streams().0,
-                &crate::TreeContext::new(crate::Limits::default(), crate::CallBudget::new(64))
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
+                )
             ),
             CapabilityCallResult::Succeeded
         );
@@ -1041,7 +1040,10 @@ mod tests {
             shared.invoke(
                 super::CommandProposal::new("http-probe.fetch", json!({}), Some(proposal())),
                 streams().0,
-                &crate::TreeContext::new(crate::Limits::default(), crate::CallBudget::new(64))
+                &dekopon_process::TreeContext::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_process::CallBudget::new(64)
+                )
             ),
             CapabilityCallResult::Succeeded
         );
@@ -1129,7 +1131,7 @@ mod tests {
             &self,
             proposal: super::CommandProposal,
             streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             let capability = proposal.capability;
             let input = proposal.input;
@@ -1195,7 +1197,7 @@ mod tests {
             &self,
             _proposal: super::CommandProposal,
             streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             if self.read {
                 let Some(fd) = streams.stdin else {
@@ -1311,7 +1313,7 @@ mod tests {
             &self,
             _proposal: super::CommandProposal,
             _streams: super::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             panic!("the provider panicked with idle inherited stdin")
         }

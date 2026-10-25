@@ -192,9 +192,8 @@ pub(crate) fn stage_write(bytes: usize, accepted: bool, owner: Option<&Arc<Stage
     });
 }
 
-use crate::{
-    ExitCode, builtins::FatalError, dispatch::Resolution, limits::LimitExceeded, value::display,
-};
+use crate::{ExitCode, builtins::FatalError, dispatch::Resolution, value::display};
+use dekopon_process::LimitExceeded;
 
 pub(crate) const SCRIPT_SPAN: &str = "shell.script";
 

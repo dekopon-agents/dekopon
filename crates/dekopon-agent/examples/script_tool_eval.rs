@@ -25,9 +25,9 @@ use dekopon_model::{
         settings::{Routing, Settings},
     },
 };
+use dekopon_process::{CallBudget, Limits, TreeContext};
 use dekopon_shell::{
-    CallBudget, CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Limits,
-    ScriptOutcome, Streams, TreeContext,
+    CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ScriptOutcome, Streams,
 };
 use parking_lot::Mutex;
 use score::{Attempt, Expected, Problem, Rules, ScriptView};

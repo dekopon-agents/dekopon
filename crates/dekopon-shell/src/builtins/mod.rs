@@ -1,9 +1,7 @@
 use serde_json::Value;
 
-use crate::{
-    CapabilityInvoker, ExitCode,
-    limits::{Budget, LimitExceeded},
-};
+use crate::{CapabilityInvoker, ExitCode, limits::Budget};
+use dekopon_process::LimitExceeded;
 
 pub(crate) mod cap;
 pub(crate) mod encode;
@@ -18,7 +16,7 @@ pub(crate) struct CommandResult {
     pub value: Value,
     pub status: ExitCode,
     pub suppress_newline: bool,
-    pub retained: Vec<crate::RetainedBytes>,
+    pub retained: Vec<dekopon_process::RetainedBytes>,
 }
 
 impl CommandResult {
@@ -337,10 +335,8 @@ pub(crate) mod test_support {
 
     use serde_json::Value;
 
-    use crate::{
-        CapabilityCallResult, CapabilityInvoker,
-        limits::{Budget, Limits},
-    };
+    use crate::{CapabilityCallResult, CapabilityInvoker, limits::Budget};
+    use dekopon_process::Limits;
 
     use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
 
@@ -355,7 +351,7 @@ pub(crate) mod test_support {
             &self,
             _: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
@@ -410,7 +406,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
+    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter};
+    use dekopon_process::Limits;
 
     use super::{lookup, names, test_support::NoCapabilities, xargs};
 
@@ -510,7 +507,7 @@ mod tests {
             &self,
             proposal: crate::CommandProposal,
             _streams: crate::Streams,
-            _tree: &crate::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             if proposal.secret_use.is_some() {
                 return crate::secret_use_unsupported();

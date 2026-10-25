@@ -6,7 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter, Limits};
+use dekopon_process::Limits;
+use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter};
 use serde_json::{Value, json};
 
 struct Invoker;
@@ -18,7 +19,7 @@ impl CapabilityInvoker for Invoker {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }
@@ -200,7 +201,7 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
             &self,
             _: dekopon_shell::CommandProposal,
             streams: dekopon_shell::Streams,
-            _tree: &dekopon_shell::TreeContext,
+            _tree: &dekopon_process::TreeContext,
         ) -> CapabilityCallResult {
             self.release
                 .lock()
@@ -474,7 +475,7 @@ impl CapabilityInvoker for Cancelled {
         &self,
         _: dekopon_shell::CommandProposal,
         _streams: dekopon_shell::Streams,
-        _tree: &dekopon_shell::TreeContext,
+        _tree: &dekopon_process::TreeContext,
     ) -> CapabilityCallResult {
         CapabilityCallResult::NotFound
     }

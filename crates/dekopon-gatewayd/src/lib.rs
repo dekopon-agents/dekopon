@@ -421,6 +421,11 @@ pub struct CheckReport {
 
 #[derive(Debug, Error)]
 pub enum CheckWarning {
+    #[error("baseline routes did not bind, so every model is probed")]
+    BaselineRoutes {
+        #[source]
+        source: Box<GatewaydError>,
+    },
     #[error("transport {transport} reads {variable} from the environment at boot")]
     TransportCredential { transport: String, variable: String },
     #[error("model {model} reads {variable} from the environment at boot")]
@@ -498,7 +503,7 @@ pub(crate) async fn load_candidate_against(
     catalog_path: Option<&Path>,
     mode: config::LoadMode,
     probe: Option<(&ProbeScope, &probe::Vendor)>,
-    active: Option<(&ResolvedConfig, &config::GatewaySources)>,
+    active: Option<(&ResolvedConfig, &config::GatewaySources, &RoutingTable)>,
 ) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let before_config = config::source_snapshot(config_path, None, current_uid()).await;
@@ -575,7 +580,7 @@ pub(crate) async fn load_candidate_against(
                 config,
                 routes.as_ref(),
                 scope,
-                active.map(|(config, _)| config.models.as_slice()),
+                active.map(|(config, _, routes)| (config, routes)),
                 vendor,
                 &mut report,
             )
@@ -595,7 +600,7 @@ pub(crate) async fn load_candidate_against(
                         config: after,
                         catalog: catalog_after,
                     };
-                    let changes = active.map(|(_, old)| old.changes(&sources)).transpose();
+                    let changes = active.map(|(_, old, _)| old.changes(&sources)).transpose();
                     match changes {
                         Ok(Some(changes)) if !changes.restart_required.is_empty() => {
                             report.problems.push(
@@ -747,16 +752,16 @@ fn spawn_tick(
     };
     let limits = routes
         .route_for_anchor(tick.anchor())
-        .map(|route| dekopon_shell::Limits {
+        .map(|route| dekopon_process::Limits {
             max_capability_calls: route.limits.max_capability_calls,
             timeout: route.script_timeout,
-            ..dekopon_shell::Limits::default()
+            ..dekopon_process::Limits::default()
         });
     let job_limits = routes.route_for_anchor(tick.anchor()).and_then(|route| {
-        route.job_timeout.map(|timeout| dekopon_shell::Limits {
+        route.job_timeout.map(|timeout| dekopon_process::Limits {
             max_capability_calls: route.limits.max_capability_calls,
             timeout,
-            ..dekopon_shell::Limits::default()
+            ..dekopon_process::Limits::default()
         })
     });
     let jobs = Arc::clone(&runner.jobs);
