@@ -92,7 +92,10 @@ async fn parked_nested_broker(
     )
 }
 
-fn job_route(script_timeout: Duration, job_timeout: Duration) -> crate::routes::BoundRoute {
+pub(super) fn job_route(
+    script_timeout: Duration,
+    job_timeout: Duration,
+) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         script_timeout,
         job_timeout: Some(job_timeout),
@@ -100,7 +103,7 @@ fn job_route(script_timeout: Duration, job_timeout: Duration) -> crate::routes::
     }
 }
 
-fn runner_with_jobs(
+pub(super) fn runner_with_jobs(
     broker: ResolvedBroker,
     models: Arc<ModelScript>,
     max_concurrent: usize,
@@ -112,7 +115,7 @@ fn runner_with_jobs(
     Arc::new(runner)
 }
 
-async fn settled(jobs: &Jobs, owner: &JobOwner, within: Duration) -> Vec<JobSummary> {
+pub(super) async fn settled(jobs: &Jobs, owner: &JobOwner, within: Duration) -> Vec<JobSummary> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         let rows = jobs.list(owner);
@@ -126,14 +129,16 @@ async fn settled(jobs: &Jobs, owner: &JobOwner, within: Duration) -> Vec<JobSumm
     }
 }
 
-fn finished(row: &JobSummary) -> (JobOutcome, ExitCode) {
+pub(super) fn finished(row: &JobSummary) -> (JobOutcome, ExitCode) {
     match row.state {
         JobState::Finished { outcome, exit, .. } => (outcome, exit),
         JobState::Running { .. } => panic!("job {} is still running", row.id),
     }
 }
 
-fn job_triggers(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> Vec<Trigger> {
+pub(super) fn job_triggers(
+    observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>,
+) -> Vec<Trigger> {
     let mut triggers = Vec::new();
     while let Ok(request) = observed.try_recv() {
         if let BrokerRequest::Capabilities {
@@ -1243,7 +1248,7 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
     assert_eq!(job_triggers(&mut observed), [Trigger::Probe]);
 }
 
-fn subject_named(name: &str) -> ExternalSubject {
+pub(super) fn subject_named(name: &str) -> ExternalSubject {
     let number = if name == "a" {
         "16030000001"
     } else {
@@ -1265,7 +1270,7 @@ fn admitted(
         .map(|(run, _signal)| run)
 }
 
-fn owned_by(subject_text: &str) -> JobOwner {
+pub(super) fn owned_by(subject_text: &str) -> JobOwner {
     let mut inbound = message(subject_text);
     inbound.subject = subject_named(subject_text);
     JobOwner::of(&inbound)
@@ -1404,7 +1409,7 @@ fn a_finished_job_keeps_its_row_while_a_wait_is_reading_it() {
     });
 }
 
-async fn until(within: Duration, mut reached: impl FnMut() -> bool) {
+pub(super) async fn until(within: Duration, mut reached: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + within;
     while !reached() {
         assert!(
@@ -1415,7 +1420,7 @@ async fn until(within: Duration, mut reached: impl FnMut() -> bool) {
     }
 }
 
-fn from(subject_text: &str, text: &str) -> InboundMessage {
+pub(super) fn from(subject_text: &str, text: &str) -> InboundMessage {
     let mut inbound = message(text);
     inbound.subject = subject_named(subject_text);
     inbound
@@ -1426,7 +1431,7 @@ fn running(rows: &[JobSummary]) -> bool {
         .any(|row| matches!(row.state, JobState::Running { .. }))
 }
 
-async fn job_routes(directory: &Path, job_timeout_ms: Option<u64>) -> Arc<RoutingTable> {
+pub(super) async fn job_routes(directory: &Path, job_timeout_ms: Option<u64>) -> Arc<RoutingTable> {
     let mut document = document(directory);
     if let Some(milliseconds) = job_timeout_ms {
         document["routes"][0]["limits"] = json!({ "jobTimeoutMs": milliseconds });
@@ -1437,7 +1442,7 @@ async fn job_routes(directory: &Path, job_timeout_ms: Option<u64>) -> Arc<Routin
     Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"))
 }
 
-async fn tool_output_of(
+pub(super) async fn tool_output_of(
     runner: &Arc<SessionRunner>,
     models: &Arc<ModelScript>,
     route: crate::routes::BoundRoute,
@@ -1625,7 +1630,7 @@ fn denied_probe_write() -> ResponseEnvelope {
     )
 }
 
-fn attested(
+pub(super) fn attested(
     observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>,
 ) -> (Vec<Trigger>, Vec<Trigger>) {
     let (mut surfaces, mut invocations) = (Vec::new(), Vec::new());
@@ -2151,4 +2156,78 @@ fn a_start_after_the_seal_is_off_even_with_every_permit_held() {
         Some(dekopon_shell::JobRefusal::Off)
     );
     drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stop_word_ends_a_job_and_its_child_while_killing_the_child_leaves_its_starter_running()
+{
+    for kill_inner in [false, true] {
+        let directory = temporary();
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+        let models = ModelScript::new([
+            script_call("{ sleep 3600 & sleep 3600; } &"),
+            answer("started"),
+        ]);
+        let runner = runner_with_jobs(broker, models, 1, 2);
+        let routes = job_routes(directory.path(), Some(3_600_000)).await;
+        let driver = Arc::new(RecordingDriver::default());
+        let inbound = message("start");
+        let owner = JobOwner::of(&inbound);
+        run_session(
+            Arc::clone(&runner),
+            job_route(Duration::from_secs(30), Duration::from_secs(3600)),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        until(Duration::from_secs(10), || {
+            let rows = runner.jobs.list(&owner);
+            rows.len() == 2
+                && rows
+                    .iter()
+                    .all(|row| matches!(row.state, JobState::Running { .. }))
+        })
+        .await;
+        if kill_inner {
+            runner
+                .jobs
+                .kill(&owner, JobId::new(2))
+                .expect("kill only the child");
+            until(Duration::from_secs(5), || {
+                matches!(runner.jobs.list(&owner)[1].state, JobState::Finished { .. })
+            })
+            .await;
+            assert_eq!(finished(&runner.jobs.list(&owner)[1]).0, JobOutcome::Killed);
+            assert!(matches!(
+                runner.jobs.list(&owner)[0].state,
+                JobState::Running { .. }
+            ));
+        }
+        let drivers =
+            BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+        let mut sessions = tokio::task::JoinSet::new();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &["stop".to_owned()],
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            message("stop"),
+        );
+        while sessions.join_next().await.is_some() {}
+        let rows = settled(&runner.jobs, &owner, Duration::from_secs(5)).await;
+        assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
+        assert_eq!(
+            finished(&rows[1]).0,
+            if kill_inner {
+                JobOutcome::Killed
+            } else {
+                JobOutcome::Cancelled
+            }
+        );
+    }
 }

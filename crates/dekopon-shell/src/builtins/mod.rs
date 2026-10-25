@@ -332,6 +332,27 @@ mod clap_spike {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    pub(crate) fn cancel_after_first_step<T>(
+        run: impl FnOnce(&mut crate::pipe::PipeReader, &mut crate::limits::Budget) -> T,
+    ) -> T {
+        use dekopon_process::{CallBudget, CancelSignal, Limits, TreeContext};
+        let (handle, signal) = CancelSignal::pair();
+        let limits = Limits::default();
+        let tree = TreeContext::new(limits, CallBudget::new(32)).with_cancel(vec![signal]);
+        let (mut writer, mut reader) = crate::pipe::pipe();
+        assert_eq!(writer.write(b"x\n"), crate::pipe::WriteOutcome::Accepted);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while tree.steps() == 0 {
+                    std::thread::yield_now();
+                }
+                handle.cancel();
+                let _outcome = writer.write(b"x\n");
+            });
+            let mut budget = crate::limits::Budget::start_tree(limits, tree.clone());
+            run(&mut reader, &mut budget)
+        })
+    }
 
     use serde_json::Value;
 

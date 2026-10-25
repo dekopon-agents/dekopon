@@ -3,7 +3,6 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use crate::CapabilityInvoker;
 use dekopon_process::{CallBudget, LimitExceeded, Limits, RetainedBytes, TreeContext};
 
 #[derive(Debug)]
@@ -34,17 +33,6 @@ impl Budget {
         Self {
             limits: self.limits,
             tree: self.tree.clone(),
-        }
-    }
-
-    pub fn charge_step_with(
-        &mut self,
-        invoker: &dyn CapabilityInvoker,
-    ) -> Result<(), LimitExceeded> {
-        if invoker.cancelled() {
-            Err(LimitExceeded::Cancelled)
-        } else {
-            self.charge_step()
         }
     }
 
@@ -97,7 +85,7 @@ impl Budget {
 
     #[must_use]
     pub fn max_value_bytes(&self) -> u64 {
-        self.tree.max_value_bytes()
+        self.tree.limits().max_value_bytes
     }
 }
 
