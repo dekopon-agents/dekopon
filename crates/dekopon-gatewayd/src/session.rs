@@ -578,22 +578,37 @@ impl MessageOutcome {
     }
 }
 
-fn record_admission(
+pub(crate) fn record_admission(
     message: &InboundMessage,
-    outcome: MessageOutcome,
+    outcome: &str,
     depth: usize,
     cause: Option<&str>,
 ) {
     if let Some(cause) = cause {
         tracing::Span::current().record("busy.cause", cause);
     }
-    tracing::info!(
-        target: "dekopon_gatewayd::audit",
-        { audit.event = "gateway.admission", outcome = outcome.label(), busy.cause = cause,
-          transport = %message.transport, conversation.id = %message.conversation.key(),
-          queue.depth = depth },
-        "gateway.admission"
-    );
+    let deliveries = match &message.message_id {
+        MessageId::Github(batch) => Some(batch.deliveries()),
+        MessageId::Native(_)
+        | MessageId::Follow(_)
+        | MessageId::Wake { .. }
+        | MessageId::Job { .. } => None,
+    };
+    let emit = || {
+        tracing::info!(
+            target: "dekopon_gatewayd::audit",
+            { audit.event = "gateway.admission", outcome, busy.cause = cause,
+              transport = %message.transport, conversation.id = %message.conversation.key(),
+              queue.depth = depth },
+            "gateway.admission"
+        )
+    };
+    match deliveries {
+        Some(deliveries) => {
+            dekopon_telemetry::with_event_string_array("github.deliveries", &deliveries, emit)
+        }
+        None => emit(),
+    }
 }
 
 impl SessionGate {
@@ -619,21 +634,30 @@ impl SessionGate {
     pub(crate) fn admit(
         &self,
         route: &BoundRoute,
-        message: InboundMessage,
-        receipts: Dispositions,
+        mut message: InboundMessage,
+        mut receipts: Dispositions,
     ) -> Admit {
         let key = (message.transport.clone(), message.conversation.key());
         let mut entries = self.in_flight.lock();
         if let Some(holder) = entries.get_mut(&key) {
             let Holder::Session(running) = holder else {
-                record_admission(&message, MessageOutcome::Busy, 0, Some("saturated"));
+                record_admission(&message, MessageOutcome::Busy.label(), 0, Some("saturated"));
                 return Admit::Saturated(message, receipts);
             };
             let depth = running.steers.len() + running.follow_ups.len();
+            if let MessageId::Github(incoming) = &mut message.message_id
+                && let Some(tail) = running.follow_ups.back_mut()
+                && let MessageId::Github(batch) = &mut tail.message.message_id
+                && batch.append(incoming)
+            {
+                tail.receipts.0.extend(std::mem::take(&mut receipts.0));
+                record_admission(&tail.message, "queued", depth, None);
+                return Admit::Queued;
+            }
             if depth == MAILBOX_CAPACITY {
                 record_admission(
                     &message,
-                    MessageOutcome::Busy,
+                    MessageOutcome::Busy.label(),
                     depth,
                     Some("same-conversation"),
                 );
@@ -647,15 +671,15 @@ impl SessionGate {
             if message.subject == running.subject
                 && match message.message_id {
                     MessageId::Native(_) | MessageId::Job { .. } => true,
-                    MessageId::Wake { .. } | MessageId::Follow(_) => false,
+                    MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => false,
                 }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
                 let interrupts = match message.message_id {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
-                    MessageId::Job { .. } | MessageId::Follow(_) => false,
+                    MessageId::Github(_) | MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
-                record_admission(&message, MessageOutcome::Steered, depth + 1, None);
+                record_admission(&message, MessageOutcome::Steered.label(), depth + 1, None);
                 running.steers.push_back(message);
                 if running.steering == Steering::Abort
                     && interrupts
@@ -666,7 +690,7 @@ impl SessionGate {
                 }
                 return Admit::Steered(receipts);
             }
-            record_admission(&message, MessageOutcome::Queued, depth + 1, None);
+            record_admission(&message, MessageOutcome::Queued.label(), depth + 1, None);
             running.follow_ups.push_back(FollowUp {
                 route: route.clone(),
                 message,
@@ -675,7 +699,7 @@ impl SessionGate {
             return Admit::Queued;
         }
         let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-            record_admission(&message, MessageOutcome::Busy, 0, Some("saturated"));
+            record_admission(&message, MessageOutcome::Busy.label(), 0, Some("saturated"));
             return Admit::Saturated(message, receipts);
         };
         let running = Running::new(route, &message);
@@ -870,7 +894,7 @@ impl SessionAdmission {
             while let Some(mut message) = running.steers.pop_front() {
                 let folds = match message.message_id {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
-                    MessageId::Job { .. } | MessageId::Follow(_) => false,
+                    MessageId::Github(_) | MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
                 if folds {
                     let mut grouped = Vec::new();
@@ -933,7 +957,10 @@ impl SessionAdmission {
 fn folds_in(message: &InboundMessage) -> bool {
     match message.message_id {
         MessageId::Native(_) => true,
-        MessageId::Wake { .. } | MessageId::Job { .. } | MessageId::Follow(_) => false,
+        MessageId::Wake { .. }
+        | MessageId::Github(_)
+        | MessageId::Job { .. }
+        | MessageId::Follow(_) => false,
     }
 }
 
@@ -1302,7 +1329,7 @@ impl Recall<'_> {
             .min(PLATFORM_RECALL_MAX_MESSAGES);
         let before = match &self.message.message_id {
             MessageId::Native(id) | MessageId::Follow(id) => Some(id.as_str()),
-            MessageId::Wake { .. } | MessageId::Job { .. } => None,
+            MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => None,
         };
         let read = tokio::time::timeout_at(
             deadline,
@@ -1622,7 +1649,7 @@ pub(crate) fn run_session(
         route,
         message,
         driver,
-        String::new(),
+        (String::new(), None),
         |_, queued| Some((queued.clone(), String::new())),
     )
 }
@@ -1632,16 +1659,29 @@ pub(crate) fn run_session_resolving(
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-    digest: String,
+    (digest, ticket): (String, Option<crate::transport::github::AdmissionTicket>),
     resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<(BoundRoute, String)> + Send + 'static,
 ) -> impl std::future::Future<Output = ()> + Send {
-    let receipts = Dispositions(message.constituents.clone());
+    let receipts = match &message.message_id {
+        MessageId::Github(_) => Dispositions(vec![message.receive_span.clone()]),
+        MessageId::Native(_)
+        | MessageId::Follow(_)
+        | MessageId::Wake { .. }
+        | MessageId::Job { .. } => Dispositions(message.constituents.clone()),
+    };
     async move {
         let span = message_span(&route, &message, &receipts);
         let mut held_by = dekopon_telemetry::span_trace_context(&span);
-        let mut admission = execute(&runner, &route, message, &driver, receipts, &digest)
-            .instrument(span)
-            .await;
+        let mut admission = execute(
+            &runner,
+            &route,
+            message,
+            &driver,
+            receipts,
+            (&digest, ticket),
+        )
+        .instrument(span)
+        .await;
         while let Some(resolved) =
             admission.and_then(|admission| admission.next_or_release_with(&resolve))
         {
@@ -1679,7 +1719,7 @@ async fn execute(
     message: InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     receipts: Dispositions,
-    digest: &str,
+    (digest, ticket): (&str, Option<crate::transport::github::AdmissionTicket>),
 ) -> Option<SessionAdmission> {
     if message.constituents.is_empty() {
         crate::collection::record_received(&message);
@@ -1688,10 +1728,23 @@ async fn execute(
     let message_kind = message.conversation.kind;
     let is_unattended = match message.message_id {
         MessageId::Native(_) => false,
-        MessageId::Wake { .. } | MessageId::Job { .. } | MessageId::Follow(_) => true,
+        MessageId::Github(_)
+        | MessageId::Wake { .. }
+        | MessageId::Job { .. }
+        | MessageId::Follow(_) => true,
     };
     let notice = crate::jobs::Notice::of(&message);
-    match runner.gate.admit(route, message, receipts) {
+    let admitted = runner.gate.admit(route, message, receipts);
+    if let Some(ticket) = ticket {
+        use crate::transport::github::Acked;
+        let answer = match &admitted {
+            Admit::Admitted(..) => Acked::Admitted,
+            Admit::Queued => Acked::Queued,
+            Admit::Steered(_) | Admit::Full(..) | Admit::Saturated(..) => Acked::Busy,
+        };
+        ticket.answer(answer);
+    }
+    match admitted {
         Admit::Admitted(admission, message, receipts) => {
             if let Some(notice) = &notice {
                 notice.record("new-turn");
@@ -1736,7 +1789,11 @@ async fn execute(
                 reason = "busy",
                 "gateway.session.rejected"
             );
-            if !matches!(message.message_id, MessageId::Follow(_))
+            let can_reply = match &message.message_id {
+                MessageId::Github(_) | MessageId::Follow(_) => false,
+                MessageId::Native(_) | MessageId::Wake { .. } | MessageId::Job { .. } => true,
+            };
+            if can_reply
                 && notice.is_none()
                 && (runner.reply_on_busy || !message.constituents.is_empty())
                 && let Some(_reply) = runner.gate.refusal()
@@ -1773,11 +1830,15 @@ async fn acknowledge_steer(
 async fn run_admitted(
     runner: &SessionRunner,
     route: &BoundRoute,
-    message: InboundMessage,
+    mut message: InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     receipts: Dispositions,
     (admission, digest): (SessionAdmission, &str),
 ) -> SessionAdmission {
+    if let MessageId::Github(batch) = &message.message_id {
+        message.text = batch.note(&message.subject);
+        record_admission(&message, "started", 0, None);
+    }
     let cancellation = admission.cancellation();
     let Ended { outcome, journal } = session(runner, route, &message, driver, cancellation.clone())
         .instrument(tracing::info_span!(
@@ -1865,7 +1926,7 @@ impl SessionSteers {
                 match &steer.message_id {
                     MessageId::Job { .. } => return Steer::Notice(steer.text),
                     MessageId::Native(id) => self.taken.lock().push(id.clone()),
-                    MessageId::Wake { .. } | MessageId::Follow(_) => {}
+                    MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => {}
                 }
                 self.taken.lock().append(&mut steer.folded);
                 let seconds = steer
@@ -2179,7 +2240,7 @@ async fn session_turn(
     };
     let mut newest_seen = match &message.message_id {
         MessageId::Native(id) | MessageId::Follow(id) => Some(id.clone()),
-        MessageId::Wake { .. } | MessageId::Job { .. } => None,
+        MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => None,
     };
     let (mut seeded, cache_key, conversation_lease, asset_access, delta) = match window {
         Some(window) => {

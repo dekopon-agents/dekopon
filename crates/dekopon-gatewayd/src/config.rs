@@ -802,12 +802,7 @@ pub struct RouteConfig {
     pub follow: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum GithubEvent {
-    PullRequest,
-    WorkflowRun,
-}
+pub use dekopon_core::github::GithubEventName as GithubEvent;
 
 fn github_events_present<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -2186,7 +2181,6 @@ pub(crate) fn resolve(
         match (&route.github_events, github_route) {
             (Some(events), true)
                 if !events.is_empty()
-                    && events.len() <= 2
                     && events
                         .iter()
                         .enumerate()

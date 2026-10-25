@@ -1302,7 +1302,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).unwrap();
-    let github_claim = |repo: &str, guid: &str| {
+    let github_claim = |repo: &str, thread: &str| {
         Attestation::for_chat(
             ExternalSubject::github("owner", repo).unwrap(),
             agent("chat-agent"),
@@ -1313,7 +1313,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
                     kind: ConversationKind::Thread,
                     container: Some("owner".into()),
                     id: format!("owner.{repo}"),
-                    thread: Some(guid.into()),
+                    thread: Some(thread.into()),
                 },
                 delivery: None,
                 trigger: Trigger::Message,
@@ -1321,7 +1321,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
         )
     };
     let granted = client
-        .session_surface(Some(github_claim("repo", "one")))
+        .session_surface(Some(github_claim("repo", "1")))
         .await
         .unwrap();
     assert_eq!(
@@ -1333,9 +1333,9 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
         granted.capabilities[0].capability.id.as_str(),
         "cli-probe.upper"
     );
-    for (repo, guid) in [("other", "one"), ("other", "two")] {
+    for (repo, thread) in [("other", "1"), ("other", "2")] {
         let denied = client
-            .session_surface(Some(github_claim(repo, guid)))
+            .session_surface(Some(github_claim(repo, thread)))
             .await
             .expect_err("the mapped second principal has no agent.prompt grant");
         assert!(matches!(denied, ClientError::SessionRefused(
@@ -1343,7 +1343,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
         ) if principal.as_str() == "other-principal"));
     }
     let unmapped = client
-        .session_surface(Some(github_claim("unknown", "three")))
+        .session_surface(Some(github_claim("unknown", "3")))
         .await
         .expect_err("unmapped repo has no principal");
     assert!(matches!(

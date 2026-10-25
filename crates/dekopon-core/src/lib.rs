@@ -9,6 +9,7 @@
     )
 )]
 pub mod asset;
+pub mod github;
 
 #[cfg(feature = "native")]
 pub mod base64;

@@ -79,6 +79,7 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
+    Github(Box<github::GithubBatch>),
     Follow(String),
     Wake {
         id: WakeId,
@@ -93,7 +94,7 @@ pub(crate) enum MessageId {
 impl MessageId {
     pub(crate) const fn trigger(&self) -> Trigger {
         match self {
-            Self::Native(_) | Self::Follow(_) => Trigger::Message,
+            Self::Native(_) | Self::Follow(_) | Self::Github(_) => Trigger::Message,
             Self::Wake { .. } => Trigger::Wake,
             Self::Job { .. } => Trigger::Job,
         }
@@ -104,6 +105,7 @@ impl fmt::Display for MessageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Native(id) | Self::Follow(id) => formatter.write_str(id),
+            Self::Github(batch) => formatter.write_str(&batch.lead().delivery),
             Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
             Self::Job { id, .. } => write!(formatter, "job-{id}"),
         }
@@ -137,13 +139,14 @@ pub(crate) fn record_conversation(span: &tracing::Span, conversation: &Conversat
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum TransportEvent {
     Connected {
         name: String,
         identity: TransportIdentity,
     },
     Message(Box<InboundMessage>),
+    Delivery(Box<InboundMessage>, github::AdmissionTicket),
     CancelRequested(CancelRequest),
 }
 
@@ -1008,6 +1011,7 @@ pub(crate) fn retry_after_from_body(body: &Value, max: Duration) -> Option<Retry
 pub(crate) struct SeenIds {
     order: VecDeque<String>,
     seen: HashSet<String>,
+    reserved: HashSet<String>,
     capacity: usize,
 }
 
@@ -1016,24 +1020,26 @@ impl SeenIds {
         Self {
             order: VecDeque::with_capacity(capacity),
             seen: HashSet::with_capacity(capacity),
+            reserved: HashSet::new(),
             capacity,
         }
     }
 
-    pub(crate) fn insert_if_absent(
-        &mut self,
-        key: &str,
-        accept: impl FnOnce() -> bool,
-    ) -> Result<bool, ()> {
+    fn reserve(&mut self, key: &str) -> github::Reservation {
         if self.seen.contains(key) {
-            return Ok(false);
+            return github::Reservation::Committed;
         }
-        if !accept() {
-            return Err(());
+        if !self.reserved.insert(key.to_owned()) {
+            return github::Reservation::Reserved;
         }
-        let inserted = self.insert(key.to_owned());
-        debug_assert!(inserted);
-        Ok(true)
+        github::Reservation::New
+    }
+
+    fn answer(&mut self, key: &str, commit: bool) {
+        self.reserved.remove(key);
+        if commit {
+            self.insert(key.to_owned());
+        }
     }
 
     pub(crate) fn insert(&mut self, key: String) -> bool {
@@ -1182,11 +1188,23 @@ mod tests {
     #[test]
     fn failed_acceptance_never_consumes_a_recent_delivery_id() {
         let mut seen = SeenIds::new(1024);
-        assert!(matches!(seen.insert_if_absent("guid", || false), Err(())));
-        assert!(matches!(seen.insert_if_absent("guid", || true), Ok(true)));
         assert!(matches!(
-            seen.insert_if_absent("guid", || panic!("duplicate must not enqueue")),
-            Ok(false)
+            seen.reserve("guid"),
+            super::github::Reservation::New
+        ));
+        assert!(matches!(
+            seen.reserve("guid"),
+            super::github::Reservation::Reserved
+        ));
+        seen.answer("guid", false);
+        assert!(matches!(
+            seen.reserve("guid"),
+            super::github::Reservation::New
+        ));
+        seen.answer("guid", true);
+        assert!(matches!(
+            seen.reserve("guid"),
+            super::github::Reservation::Committed
         ));
     }
 

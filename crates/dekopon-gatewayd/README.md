@@ -63,7 +63,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   Without a journal, persistent routes remain window-only and config-check warns once.
   `githubWebhook` configuration requires `name`, `bind` and `secretEnv` (the name of a nonblank
   environment credential); its path is fixed at `/webhooks/github`. A GitHub route must set
-  nonempty, unique `githubEvents` from `pull_request` and `workflow_run`, a canonical
+  nonempty, unique `githubEvents` from the supported typed families, a canonical
   `conversation` thread selector and `memory: { mode: oneShot }`. Non-GitHub routes cannot set
   `githubEvents`. First route match precedes event filtering. The verified GitHub POST mount
   shares WhatsApp's listener when both use the same bind; GitHub alone binds that port. It

@@ -1791,11 +1791,11 @@ async fn signed_reload_delivery(
 ) -> reqwest::StatusCode {
     use crate::transport::webhook::hmac_sha256;
     let claim = if event == "pull_request" {
-        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
-            "action":"opened","number":7,"pull_request":{"head":{"sha":"abc123"}}})
+        json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":repo},"sender":{"id":1},
+            "action":"opened","number":7,"pull_request":{"head":{"sha":"a".repeat(40)}}})
     } else {
-        json!({"repository":{"owner":{"login":"OWNER"},"name":repo},
-            "action":"completed","workflow_run":{"id":5,"head_sha":"abc123","conclusion":"success"}})
+        json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":repo},"sender":{"id":1},
+            "action":"completed","workflow_run":{"id":5,"head_sha":"a".repeat(40),"conclusion":"success"}})
     };
     let body = serde_json::to_vec(&claim).unwrap();
     let signature: String = hmac_sha256(b"secret", &body)
@@ -1812,6 +1812,22 @@ async fn signed_reload_delivery(
         .await
         .expect("signed webhook delivery")
         .status()
+}
+
+async fn take_github_delivery(
+    transport: &mut crate::transport::github::GithubTransport,
+    posting: impl std::future::Future<Output = reqwest::StatusCode>,
+) -> Box<InboundMessage> {
+    let receive = async {
+        let TransportEvent::Delivery(message, ticket) = transport.next().await.unwrap() else {
+            panic!("delivery")
+        };
+        ticket.answer(crate::transport::github::Acked::Ignored);
+        message
+    };
+    let (status, message) = tokio::join!(posting, receive);
+    assert_eq!(status, reqwest::StatusCode::OK);
+    message
 }
 
 #[tokio::test]
@@ -1880,13 +1896,11 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
             .is_err(),
         "initially unconfigured workflow event must not enter the queue"
     );
-    assert_eq!(
-        send("control-before", "pull_request", "CONTROL").await,
-        reqwest::StatusCode::OK
-    );
-    let TransportEvent::Message(control_before) = transport.next().await.unwrap() else {
-        panic!("control before reload")
-    };
+    let control_before = take_github_delivery(
+        &mut transport,
+        send("control-before", "pull_request", "CONTROL"),
+    )
+    .await;
     assert_eq!(control_before.subject.canonical(), "github.owner.control");
     config["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
     write_config(root.path(), &config);
@@ -1895,27 +1909,15 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
         broker.request().await.request,
         BrokerRequest::PrepareGeneration { .. }
     ));
-    assert_eq!(
-        send("run-added", "workflow_run", "REPO").await,
-        reqwest::StatusCode::OK
-    );
-    let TransportEvent::Message(added) =
-        tokio::time::timeout(Duration::from_secs(1), transport.next())
-            .await
-            .unwrap()
-            .unwrap()
-    else {
-        panic!("new event admitted")
-    };
+    let added =
+        take_github_delivery(&mut transport, send("run-added", "workflow_run", "REPO")).await;
     assert_eq!(added.subject.canonical(), "github.owner.repo");
     assert_eq!(added.message_id.to_string(), "run-added");
-    assert_eq!(
-        send("pr-before-remove", "pull_request", "REPO").await,
-        reqwest::StatusCode::OK
-    );
-    let TransportEvent::Message(before_remove) = transport.next().await.unwrap() else {
-        panic!("PR before removal")
-    };
+    let before_remove = take_github_delivery(
+        &mut transport,
+        send("pr-before-remove", "pull_request", "REPO"),
+    )
+    .await;
     assert_eq!(before_remove.message_id.to_string(), "pr-before-remove");
     config["routes"][0]["githubEvents"] = json!(["workflow_run"]);
     write_config(root.path(), &config);
@@ -1934,18 +1936,11 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
             .is_err(),
         "removed event must not enter the queue despite 200-on-ignore"
     );
-    assert_eq!(
-        send("control-after", "pull_request", "CONTROL").await,
-        reqwest::StatusCode::OK
-    );
-    let TransportEvent::Message(control_after) =
-        tokio::time::timeout(Duration::from_secs(1), transport.next())
-            .await
-            .unwrap()
-            .unwrap()
-    else {
-        panic!("control after reload")
-    };
+    let control_after = take_github_delivery(
+        &mut transport,
+        send("control-after", "pull_request", "CONTROL"),
+    )
+    .await;
     assert_eq!(control_after.subject.canonical(), "github.owner.control");
     assert_eq!(control_after.message_id.to_string(), "control-after");
 }
@@ -2000,12 +1995,10 @@ async fn authorize_github_fixture(
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "one mounted socket exercises queue saturation, eviction and restart in order"
+    reason = "one mounted socket exercises signed dedupe, eviction and restart in order"
 )]
 async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_eviction() {
-    use crate::transport::{
-        ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
-    };
+    use crate::transport::{ChatTransport, github::GithubTransport, webhook::hmac_sha256};
     let directory = temporary();
     fs::write(
         directory.path().join("dekopon.yaml"),
@@ -2031,8 +2024,8 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
     let routes =
         std::sync::Arc::new(crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap());
     let body = serde_json::to_vec(
-        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
-        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"abcdef"}}}),
+        &json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":"REPO"},"sender":{"id":1},
+        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"a".repeat(40)}}}),
     )
     .unwrap();
     let signature: String = hmac_sha256(b"secret", &body)
@@ -2048,17 +2041,17 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         None,
     );
     transport.connect().await.unwrap();
-    for guid in ["first", "first"] {
-        assert_eq!(
-            signed_github_request(&client, address, &body, &signature, guid).await,
-            reqwest::StatusCode::OK
-        );
-    }
-    let TransportEvent::Message(message) = transport.next().await.unwrap() else {
-        panic!("queued turn")
-    };
+    let message = take_github_delivery(
+        &mut transport,
+        signed_github_request(&client, address, &body, &signature, "first"),
+    )
+    .await;
+    assert_eq!(
+        signed_github_request(&client, address, &body, &signature, "first").await,
+        reqwest::StatusCode::OK
+    );
     assert_eq!(message.subject.canonical(), "github.owner.repo");
-    assert_eq!(message.conversation.key(), "owner.repo:first");
+    assert_eq!(message.conversation.key(), "owner.repo:7");
     let mut broker = dekopon_test_support::BrokerFixture::answering(
         directory.path(),
         [
@@ -2089,8 +2082,8 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         "a duplicate must not enqueue a second turn"
     );
     let other_body = serde_json::to_vec(
-        &json!({"repository":{"owner":{"login":"OTHER"},"name":"REPO"},
-        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"abcdef"}}}),
+        &json!({"repository":{"id":20,"owner":{"login":"OTHER"},"name":"REPO"},"sender":{"id":1},
+        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"a".repeat(40)}}}),
     )
     .unwrap();
     let other_signature: String = hmac_sha256(b"secret", &other_body)
@@ -2115,8 +2108,8 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         "another signed repo cannot use the first repo's route"
     );
     let run_body = serde_json::to_vec(
-        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
-        "action":"completed", "workflow_run":{"id":5,"head_sha":"abc","conclusion":"success"}}),
+        &json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":"REPO"},"sender":{"id":1},
+        "action":"completed", "workflow_run":{"id":5,"head_sha":"a".repeat(40),"conclusion":"success"}}),
     )
     .unwrap();
     let run_signature: String = hmac_sha256(b"secret", &run_body)
@@ -2134,8 +2127,8 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         .unwrap();
     assert_eq!(run_status.status(), reqwest::StatusCode::OK);
     let pending_run = serde_json::to_vec(
-        &json!({"repository":{"owner":{"login":"OWNER"},"name":"REPO"},
-        "action":"requested", "workflow_run":{"id":6,"head_sha":"abc","conclusion":null}}),
+        &json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":"REPO"},"sender":{"id":1},
+        "action":"requested", "workflow_run":{"id":6,"head_sha":"a".repeat(40),"conclusion":null}}),
     )
     .unwrap();
     let pending_signature: String = hmac_sha256(b"secret", &pending_run)
@@ -2162,76 +2155,20 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
             .is_err(),
         "the first selected route lacks workflow_run; the later route cannot claim it"
     );
-    let concurrent = futures_util::future::join_all(
-        (0..16).map(|_| signed_github_request(&client, address, &body, &signature, "simultaneous")),
+    for index in 0..1024 {
+        let id = format!("evict-{index}");
+        let delivery = take_github_delivery(
+            &mut transport,
+            signed_github_request(&client, address, &body, &signature, &id),
+        )
+        .await;
+        assert_eq!(delivery.message_id.to_string(), id);
+    }
+    let evicted = take_github_delivery(
+        &mut transport,
+        signed_github_request(&client, address, &body, &signature, "first"),
     )
     .await;
-    assert!(
-        concurrent
-            .iter()
-            .all(|status| *status == reqwest::StatusCode::OK)
-    );
-    let TransportEvent::Message(only) = transport.next().await.unwrap() else {
-        panic!("one accepted concurrent turn")
-    };
-    assert_eq!(only.message_id.to_string(), "simultaneous");
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(30), transport.next())
-            .await
-            .is_err()
-    );
-    for index in 0..64 {
-        assert_eq!(
-            signed_github_request(
-                &client,
-                address,
-                &body,
-                &signature,
-                &format!("queue-{index}")
-            )
-            .await,
-            reqwest::StatusCode::OK
-        );
-    }
-    assert_eq!(
-        signed_github_request(&client, address, &body, &signature, "retry").await,
-        reqwest::StatusCode::SERVICE_UNAVAILABLE
-    );
-    let TransportEvent::Message(_) = transport.next().await.unwrap() else {
-        panic!("release queue slot")
-    };
-    assert_eq!(
-        signed_github_request(&client, address, &body, &signature, "retry").await,
-        reqwest::StatusCode::OK
-    );
-    for _ in 0..64 {
-        let TransportEvent::Message(_) = transport.next().await.unwrap() else {
-            panic!("queued message")
-        };
-    }
-    for index in 0..1024 {
-        assert_eq!(
-            signed_github_request(
-                &client,
-                address,
-                &body,
-                &signature,
-                &format!("evict-{index}")
-            )
-            .await,
-            reqwest::StatusCode::OK
-        );
-        let TransportEvent::Message(_) = transport.next().await.unwrap() else {
-            panic!("eviction input")
-        };
-    }
-    assert_eq!(
-        signed_github_request(&client, address, &body, &signature, "first").await,
-        reqwest::StatusCode::OK
-    );
-    let TransportEvent::Message(evicted) = transport.next().await.unwrap() else {
-        panic!("evicted GUID is accepted")
-    };
     assert_eq!(evicted.message_id.to_string(), "first");
     drop(transport);
     tokio::task::yield_now().await;
@@ -2243,13 +2180,11 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         None,
     );
     restarted.connect().await.unwrap();
-    assert_eq!(
-        signed_github_request(&client, address, &body, &signature, "first").await,
-        reqwest::StatusCode::OK
-    );
-    let TransportEvent::Message(second) = restarted.next().await.unwrap() else {
-        panic!("restart accepts second turn")
-    };
+    let second = take_github_delivery(
+        &mut restarted,
+        signed_github_request(&client, address, &body, &signature, "first"),
+    )
+    .await;
     assert_eq!(second.subject, first_subject);
     authorize_github_fixture(second, &route, &gate, &mut broker).await;
 }
@@ -17925,6 +17860,7 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 mod attribution;
 #[path = "tests/generation.rs"]
 mod generation;
+mod github_burst;
 #[path = "tests/github_http_invocation.rs"]
 mod github_http_invocation;
 #[path = "tests/github_invocation.rs"]
@@ -20232,7 +20168,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         message("first"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        String::new(),
+        (String::new(), None),
         move |_, _queued| Some(((*selected.load_full()).clone(), String::new())),
     ));
     model.wait_until_entered().await;
@@ -20242,7 +20178,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         queued,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        String::new(),
+        (String::new(), None),
         move |_, _queued| None,
     );
     second.await;

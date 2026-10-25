@@ -4,7 +4,7 @@ use dekopon_broker_protocol::{BrokerRequest, ResponseEnvelope, Trigger};
 use dekopon_test_support::{BrokerFixture, CaptureLayer};
 use tracing_subscriber::prelude::*;
 
-fn github_message(owner: &str, repo: &str, guid: &str) -> InboundMessage {
+fn github_message(owner: &str, repo: &str, guid: &str, number: u64) -> InboundMessage {
     let mut inbound = message(
         "[gateway: unverified GitHub workflow_run claim] associated PR None; report only; read current checks before acting.",
     );
@@ -15,9 +15,20 @@ fn github_message(owner: &str, repo: &str, guid: &str) -> InboundMessage {
         kind: ConversationKind::Thread,
         container: Some(owner.into()),
         id: format!("{owner}.{repo}"),
-        thread: Some(guid.into()),
+        thread: Some(number.to_string()),
     };
-    inbound.message_id = MessageId::Native(guid.into());
+    inbound.message_id = MessageId::Github(Box::new(crate::transport::github::GithubBatch::new(
+        crate::transport::github::GithubEntry {
+            delivery: guid.into(),
+            event: crate::config::GithubEvent::WorkflowRun,
+            action: Some("completed".into()),
+            actor: dekopon_core::github::GithubId::new(1).unwrap(),
+            thread: number.to_string().parse().unwrap(),
+            head_sha: Some("a".repeat(40)),
+            run: Some(dekopon_core::github::GithubId::new(5).unwrap()),
+            conclusion: Some("success".into()),
+        },
+    )));
     inbound.addressed = Some(true);
     inbound.reply = ReplyTarget::GithubTrace;
     inbound
@@ -51,13 +62,13 @@ fn github_driver() -> Arc<dyn ChatDriver> {
 }
 
 #[test]
-fn github_admission_keys_separate_repositories_and_deliveries() {
+fn github_admission_keys_separate_repositories_and_numbers() {
     let gate = SessionGate::new(4);
     let route = github_route();
-    let first = github_message("owner", "repo", "guid-one");
-    let same_guid_other_repo = github_message("other", "repo", "guid-one");
-    let other_guid = github_message("owner", "repo", "guid-two");
-    let other_owner_same_repo = github_message("owner", "other", "guid-one");
+    let first = github_message("owner", "repo", "guid-one", 7);
+    let same_guid_other_repo = github_message("other", "repo", "guid-one", 7);
+    let other_guid = github_message("owner", "repo", "guid-two", 8);
+    let other_owner_same_repo = github_message("owner", "other", "guid-one", 7);
     assert_ne!(
         first.conversation.key(),
         same_guid_other_repo.conversation.key()
@@ -115,8 +126,8 @@ async fn github_report_claim_requires_a_fresh_prompt_grant_and_never_posts() {
         Arc::clone(&models),
         4,
     );
-    let denied = github_message("owner", "repo", "guid-one");
-    let accepted = github_message("owner", "repo", "guid-two");
+    let denied = github_message("owner", "repo", "guid-one", 7);
+    let accepted = github_message("owner", "repo", "guid-two", 7);
     run_session(
         Arc::clone(&runner),
         route.clone(),
@@ -129,7 +140,7 @@ async fn github_report_claim_requires_a_fresh_prompt_grant_and_never_posts() {
     assert_eq!(models.requests(), 1);
     let requests = broker.recorded();
     assert_eq!(requests.len(), 2);
-    for (request, guid) in requests.iter().zip(["guid-one", "guid-two"]) {
+    for (request, _guid) in requests.iter().zip(["guid-one", "guid-two"]) {
         let BrokerRequest::Capabilities {
             attestation: Some(claim),
         } = &request.request
@@ -138,7 +149,7 @@ async fn github_report_claim_requires_a_fresh_prompt_grant_and_never_posts() {
         };
         assert_eq!(claim.subject, subject);
         let scope = claim.scope.as_ref().unwrap();
-        assert_eq!(scope.conversation.thread.as_deref(), Some(guid));
+        assert_eq!(scope.conversation.thread.as_deref(), Some("7"));
         assert_eq!(scope.trigger, Trigger::Message);
     }
     assert_eq!(
@@ -179,7 +190,7 @@ async fn github_unmapped_and_busy_deliveries_never_infer_or_post() {
     run_session(
         Arc::clone(&runner),
         github_route(),
-        github_message("owner", "repo", "unmapped"),
+        github_message("owner", "repo", "unmapped", 7),
         Arc::clone(&driver),
     )
     .await;
@@ -191,7 +202,7 @@ async fn github_unmapped_and_busy_deliveries_never_infer_or_post() {
     run_session(
         runner,
         github_route(),
-        github_message("owner", "repo", "busy"),
+        github_message("owner", "repo", "busy", 7),
         driver,
     )
     .await;
@@ -229,7 +240,7 @@ async fn github_model_failure_does_not_post_or_invoke_a_fix() {
             1,
         ),
         github_route(),
-        github_message("owner", "repo", "failed"),
+        github_message("owner", "repo", "failed", 7),
         github_driver(),
     )
     .await;
