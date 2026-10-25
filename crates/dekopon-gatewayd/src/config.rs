@@ -1020,6 +1020,21 @@ pub struct ResolvedConfig {
     pub proxy: Option<crate::proxy::ResolvedProxy>,
 }
 
+impl ResolvedConfig {
+    pub(crate) fn emit_effective_indicators(&self) {
+        for (index, route) in self.routes.iter().enumerate() {
+            for (kind, resolved) in &route.indicators {
+                tracing::info!(event = "gateway_indicators_effective", route = index, transport = %route.transport.chars().take(64).collect::<String>(),
+                    kind = kind.as_str(), mode = ?resolved.settings.mode, status = ?resolved.settings.status,
+                    typing = ?resolved.settings.typing, working = ?resolved.settings.working,
+                    seen = ?resolved.settings.seen, progress = ?resolved.settings.progress,
+                    stream = resolved.settings.stream, status_text = resolved.settings.status_text,
+                    cancel_button = resolved.settings.cancel_button, "gateway.indicators.effective");
+            }
+        }
+    }
+}
+
 /// `Check` keeps going past a directory's fragment refusals so they are reported beside whatever
 /// the rest of startup finds; every rule is otherwise the one boot applies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2198,12 +2213,6 @@ pub(crate) fn resolve(
                         reason: "progressDetail: off requires streaming for a message-backed Stop control",
                     });
                 }
-                tracing::info!(event = "gateway_indicators_effective", route = index, transport = %route.transport.chars().take(64).collect::<String>(),
-                    kind = kind.as_str(), mode = ?resolved.settings.mode, status = ?resolved.settings.status,
-                    typing = ?resolved.settings.typing, working = ?resolved.settings.working,
-                    seen = ?resolved.settings.seen, progress = ?resolved.settings.progress,
-                    stream = resolved.settings.stream, status_text = resolved.settings.status_text,
-                    cancel_button = resolved.settings.cancel_button, "gateway.indicators.effective");
                 indicators.insert(kind, Arc::new(resolved));
             }
         }
@@ -3331,6 +3340,7 @@ routes:
         )
         .unwrap();
         assert_eq!(config.routes.len(), 1);
+        config.emit_effective_indicators();
         let events = capture.events_where(
             "dekopon_gatewayd",
             &[("event", "gateway_indicators_effective")],
