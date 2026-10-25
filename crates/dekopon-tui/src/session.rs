@@ -325,6 +325,7 @@ pub fn smoke_claim() -> ChatScopeClaim {
             thread: None,
         },
         trigger: Trigger::Message,
+        delivery: None,
     }
 }
 
@@ -793,6 +794,15 @@ impl CapabilityInvoker for LegHandle {
 
     fn script_finished(&self) {
         self.0.script_finished();
+    }
+
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        self.0.run(call, streams, tree)
     }
 
     fn invoke(

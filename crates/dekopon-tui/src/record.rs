@@ -265,6 +265,36 @@ impl<I: CapabilityInvoker> CapabilityInvoker for RecordingInvoker<I> {
         self.inner.script_finished();
     }
 
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let sequence = self.sequence.next();
+        let started = Instant::now();
+        let outcome = self.inner.run(call, streams, tree);
+        match &outcome {
+            dekopon_shell::RunResult::Invoked {
+                capability,
+                input,
+                result,
+                ..
+            } => emit(
+                &self.events,
+                SessionEvent::Capability(Box::new(CapabilityCall {
+                    sequence,
+                    capability: capability.clone(),
+                    input: input.clone(),
+                    outcome: CallOutcome::from(result),
+                    elapsed: started.elapsed(),
+                })),
+            ),
+            dekopon_shell::RunResult::Returned(_) | dekopon_shell::RunResult::Uncertain(_) => {}
+        }
+        outcome
+    }
+
     fn invoke(
         &self,
         proposal: CommandProposal,

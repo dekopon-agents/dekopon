@@ -206,8 +206,6 @@ jobs:
       - name: Compile workspace tests
         run: cargo test --workspace --all-features --locked --no-run
       # Cargo.toml builds Cranelift optimized in dev: this step went from ~17 min to ~2 (#334).
-      - name: Build console broker fixture
-        run: cargo build --locked -p dekopon-brokerd
       - name: Run workspace tests
         env:
           DEKOPON_TEST_BROKERD: ${{ github.workspace }}/target/debug/dekopon-brokerd

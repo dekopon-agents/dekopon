@@ -8,8 +8,8 @@
 )]
 
 use dekopon_broker_protocol::{
-    AssetEncoding, BrokerClient, CommandRunOutcome, DescriptorStream, FrameLimits, NewAsset,
-    ResponseEnvelope,
+    AssetEncoding, BrokerClient, BrokerResponse, CommandRunOutcome, DescriptorStream, FrameLimits,
+    NewAsset, ProtocolVersion, ResponseEnvelope, RunOutcome,
 };
 use dekopon_core::SecretUseProposal;
 use dekopon_shell::{
@@ -42,7 +42,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
             ("capabilities", "reviewer"),
             ("invoke", "reviewer"),
             ("capabilities", "reviewer"),
-            ("invoke", "reviewer"),
+            ("run", "reviewer"),
             ("capabilities", "reviewer"),
             ("capabilities", "other-agent"),
         ] {
@@ -72,10 +72,8 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
                     "outcome":"Succeeded"
                 })).unwrap(), vec![NewAsset { descriptor:0, content_type:"image/heic".into(), encoding:AssetEncoding::Identity, bytes:4, sha256:String::new() }], vec![], vec![])
             } else {
-                assert_eq!(
-                    request["invocation"]["input"],
-                    json!({"file":"chat-asset:1"})
-                );
+                assert_eq!(request["word"], "probe");
+                assert_eq!(request["argv"], json!([{"asset": 0}]));
                 let rows = &request["assets"];
                 assert_eq!(rows[0]["contentType"], "image/heic");
                 assert_eq!(rows[0]["encoding"], "identity");
@@ -87,11 +85,22 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
                     .read_exact_at(&mut bytes, 0)
                     .unwrap();
                 assert_eq!(bytes, [0, 1, 2, 255]);
-                ResponseEnvelope::invocation(serde_json::from_value(json!({
-                    "invocation":request["invocation"]["id"],
-                    "decision":{"decisionId":"asset-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-                    "outcome":"Failed", "exitStatus":141
-                })).unwrap(), vec![], vec![], vec![])
+                ResponseEnvelope {
+                    api_version: ProtocolVersion::V1Alpha2,
+                    response: BrokerResponse::Ran {
+                        outcome: RunOutcome::Invoked {
+                            capability: "probe.read".parse().unwrap(),
+                            input: json!({"file":"chat-asset:1"}),
+                            secret_use: None,
+                            result: serde_json::from_value(json!({
+                                "invocation":request["invocation"],
+                                "decision":{"decisionId":"asset-test", "authorizedBy":"broker", "policyDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                                "outcome":"Failed", "exitStatus":141
+                            })).unwrap(),
+                            attached: vec![], removed: vec![], sent: vec![],
+                        },
+                    },
+                }
             };
             let descriptors: Vec<std::os::fd::OwnedFd> =
                 attachment.into_iter().map(Into::into).collect();
@@ -155,10 +164,33 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
     )
     .await
     .unwrap();
-    let result =
-        tokio::task::spawn_blocking(move || invoke(second, json!({"file":"chat-asset:1"})))
-            .await
-            .unwrap();
+    let run = |leg: dekopon_agent::BrokerLeg| {
+        let (stdout, _reader) = UnixStream::pair().unwrap();
+        let outcome = LegHandle(Arc::new(leg)).run(
+            dekopon_shell::RunCall {
+                word: "probe".to_owned(),
+                argv: vec![dekopon_shell::Arg::Asset(
+                    dekopon_core::AssetNumber::parse("chat-asset:1").unwrap(),
+                )],
+            },
+            Streams {
+                stdin: None,
+                stdout: stdout.into(),
+            },
+            &dekopon_process::TreeContext::new(
+                dekopon_process::Limits::default(),
+                dekopon_process::CallBudget::new(4),
+            ),
+        );
+        match outcome {
+            dekopon_shell::RunResult::Invoked { result, .. }
+            | dekopon_shell::RunResult::Returned(result)
+            | dekopon_shell::RunResult::Uncertain(result) => result,
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || run(second))
+        .await
+        .unwrap();
     assert!(matches!(result, CapabilityCallResult::Exited { status, .. } if status.get() == 141));
     let reentered = open_agent_with_assets(
         client.clone(),
@@ -179,10 +211,9 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
     .await
     .unwrap();
     for stale in [reentered, other] {
-        let result =
-            tokio::task::spawn_blocking(move || invoke(stale, json!({"file":"chat-asset:1"})))
-                .await
-                .unwrap();
+        let result = tokio::task::spawn_blocking(move || run(stale))
+            .await
+            .unwrap();
         assert!(
             matches!(result, CapabilityCallResult::Denied { reason } if reason.contains("no attachment"))
         );

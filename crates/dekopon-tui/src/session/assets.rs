@@ -168,8 +168,8 @@ impl GeneratedAssetStore for ConsoleAssets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dekopon_agent::attachment::ChatAssetInputs;
-    use serde_json::json;
+    use dekopon_agent::attachment::{ChatAssetInputs, PreparedRun};
+    use dekopon_core::AssetNumber;
     use std::io::Write as _;
 
     #[tokio::test]
@@ -206,8 +206,17 @@ mod tests {
             b"returned"
         );
         let inputs = ChatAssetInputs::new(std::sync::Arc::<ConsoleAssets>::clone(&store));
-        let (prepared, pins) = inputs
-            .prepare(&json!({"file": "chat-asset:2"}), 0)
+        let PreparedRun {
+            assets: prepared,
+            pins,
+            ..
+        } = inputs
+            .prepare_run(
+                &[dekopon_shell::Arg::Asset(
+                    AssetNumber::parse("chat-asset:2").unwrap(),
+                )],
+                0,
+            )
             .await
             .unwrap();
         assert_eq!(prepared.descriptors.len(), 1);
@@ -227,7 +236,14 @@ mod tests {
         drop(blob);
         store.remove(local).unwrap();
         assert!(matches!(
-            inputs.prepare(&json!({"file": "chat-asset:1"}), 0).await,
+            inputs
+                .prepare_run(
+                    &[dekopon_shell::Arg::Asset(
+                        AssetNumber::parse("chat-asset:1").unwrap()
+                    )],
+                    0
+                )
+                .await,
             Err(ChatAssetRefusal::UnknownAsset)
         ));
         assert!(matches!(
