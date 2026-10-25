@@ -367,6 +367,40 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
 }
 
 #[tokio::test]
+async fn mixed_subject_kinds_report_every_offending_principal() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    let document = attested_document(uid);
+
+    let mut mixed = document;
+    mixed["principals"] = json!({
+        "cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "slack.t0123abc.c0123abc"]},
+        "someone-else": {"subjects": ["discord.123", "discord.456.789"]}
+    });
+    write_config(&path, &mixed);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("mixed kinds refused");
+    let config::ConfigError::MixedSubjectKinds { principals } = error else {
+        panic!("expected mixed subject kinds, got {error:?}");
+    };
+    assert_eq!(
+        principals.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        ["cpetersen", "someone-else"]
+    );
+}
+
+#[tokio::test]
 async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
@@ -396,14 +430,6 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
         config::ConfigError::DuplicateSubjects { subjects }
             if subjects == ["discord.1", "slack.t0123abc.u9xyz"]
     ));
-
-    let mut mixed = document.clone();
-    mixed["principals"] =
-        json!({"cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "slack.t0123abc.c0123abc"]}});
-    write_config(&path, &mixed);
-    assert!(
-        matches!(config::load(&path, uid).await, Err(config::ConfigError::MixedSubjectKinds { principal }) if principal.as_str() == "cpetersen")
-    );
 
     for namespaces in [
         json!(["sms"]),

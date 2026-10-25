@@ -931,12 +931,15 @@ impl BrokerRequest {
                 }
                 let mut named = [false; MAX_ASSET_DESCRIPTORS];
                 for argument in argv {
-                    if let Arg::Asset(index) = argument {
-                        let index = usize::from(index.0);
-                        if index >= assets.len() {
-                            return Err(ProtocolError::UnknownAssetIndex);
+                    match argument {
+                        Arg::Text(_) => {}
+                        Arg::Asset(index) => {
+                            let index = usize::from(index.0);
+                            if index >= assets.len() {
+                                return Err(ProtocolError::UnknownAssetIndex);
+                            }
+                            named[index] = true;
                         }
-                        named[index] = true;
                     }
                 }
                 let mut ids = std::collections::BTreeSet::new();
