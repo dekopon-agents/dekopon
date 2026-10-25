@@ -151,8 +151,9 @@ Telemetry follows `docs/observability.md`: spans (`prompt.session`, `prompt.mode
 `prompt.script`, and `prompt.asset_fetch` when an embedder supplies chat assets) and
 `dekopon_agent::audit` accounting events carry counts,
 durations, and stable categories. Prompts, model answers, and script text are emitted unconditionally;
-the gateway records them as span events in the message trace. The transcript is emitted whole
-once per session and extended by the messages each later turn appended. Skill and
+the gateway records them as span events in the message trace. Full transcripts occur initially,
+after steered cancellations, and when preparation changes previously transcribed content. Deltas
+carry appended messages between full events; each full event replaces the accumulated transcript. Skill and
 suggestion records are also unconditional. `agent.skill.read` carries `skill.name` (the
 operator-authored name the request matched, never the one the model typed), `skill.resource`
 (empty for the instructions), `skill.bytes`, and `skill.repeated`; `agent.skill.refused` carries a

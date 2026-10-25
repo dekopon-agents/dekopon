@@ -947,10 +947,14 @@ async fn responses_content(
                     .await
                     .map_err(TransportFailure::Blocking)?
                 {
-                    Ok(bytes) => Some(bytes),
+                    Ok(bytes) => {
+                        data.record_preparation(crate::asset::Preparation::Original);
+                        Some(bytes)
+                    }
                     Err(
                         crate::asset::BlobError::Reclaimed | crate::asset::BlobError::Unauthorized,
                     ) => {
+                        data.record_preparation(crate::asset::Preparation::ReleaseNotice);
                         content.push(ResponsesContent::InputText {
                             text: data.release_notice().into(),
                         });
@@ -1097,6 +1101,65 @@ mod tests {
         )
         .unwrap();
         (directory, server, client)
+    }
+
+    #[tokio::test]
+    async fn preparation_tracks_each_occurrence_without_changing_raw_serialization() {
+        use crate::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct ReadSequence {
+            blob: DiskBlob,
+            reads: AtomicUsize,
+        }
+        impl BlobSource for ReadSequence {
+            fn pin(&self) -> Result<DiskBlob, BlobError> {
+                if self.reads.fetch_add(1, Ordering::Relaxed) == 1 {
+                    Err(BlobError::Unauthorized)
+                } else {
+                    Ok(self.blob.clone())
+                }
+            }
+        }
+        let source = Arc::new(ReadSequence {
+            blob: DiskBlob::from_bytes(b"abc").unwrap(),
+            reads: AtomicUsize::new(0),
+        });
+        let reference = BlobReference::new(Arc::clone(&source) as Arc<dyn BlobSource>, 3, 7);
+        let message = ModelMessage::user_with_parts(vec![
+            ContentPart::Image {
+                mime: "image/png".into(),
+                data: reference.clone(),
+            },
+            ContentPart::File {
+                name: "photo.png".into(),
+                mime: "image/png".into(),
+                data: reference,
+            },
+        ]);
+        let wire = serde_json::to_value(responses_content(&message).await.unwrap()).unwrap();
+        assert_eq!(wire[0]["image_url"], "data:image/png;base64,YWJj");
+        let raw = serde_json::to_value(&message).unwrap();
+        let prepared = serde_json::to_value(message.prepared_for_trace()).unwrap();
+        assert_eq!(
+            prepared["content"][0],
+            "[image/png, 3 bytes] sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(prepared["content"][1], wire[1]["text"]);
+        assert_eq!(raw["content"][1], "[photo.png (image/png), 3 bytes]");
+        assert_eq!(source.reads.load(Ordering::Relaxed), 2);
+
+        let wire = serde_json::to_value(responses_content(&message).await.unwrap()).unwrap();
+        assert_eq!(wire[1]["file_data"], "data:image/png;base64,YWJj");
+        assert_eq!(
+            serde_json::to_value(message.prepared_for_trace()).unwrap(),
+            raw
+        );
+        assert_eq!(serde_json::to_value(&message).unwrap(), raw);
+        assert_eq!(source.reads.load(Ordering::Relaxed), 4);
     }
 
     #[test]

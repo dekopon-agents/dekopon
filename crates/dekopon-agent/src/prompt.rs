@@ -764,7 +764,7 @@ where
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
     let mut tool_calls = 0_u32;
-    let mut transcribed = 0_usize;
+    let mut transcribed = Vec::new();
     let mut asset_bytes = 0_usize;
     let mut agent_config_shown = false;
     let mut rejection_fed_back = false;
@@ -807,8 +807,18 @@ where
             let mut on_event = |event| stream.observe(event);
             model.complete(&messages, &model_tools, options, &mut on_event)
         };
-        let scope = if transcribed == 0 { "full" } else { "delta" };
-        let definitions = (transcribed == 0).then_some(tool_definitions.as_str());
+        let prepared = messages
+            .iter()
+            .map(|message| serde_json::to_value(message.prepared_for_trace()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![json!("<unserializable>")]);
+        let start = if prepared.get(..transcribed.len()) == Some(transcribed.as_slice()) {
+            transcribed.len()
+        } else {
+            0
+        };
+        let scope = if start == 0 { "full" } else { "delta" };
+        let definitions = (start == 0).then_some(tool_definitions.as_str());
         tracing::info!(
             target: "dekopon_agent::audit",
             {
@@ -817,11 +827,11 @@ where
                 transcript.scope = scope,
                 message.count = messages.len(),
                 gen_ai.tool.definitions = definitions,
-                messages = %transcript(&messages[transcribed..]),
+                messages = %transcript(&prepared[start..]),
             },
             "agent.model.prompt"
         );
-        transcribed = messages.len();
+        transcribed = prepared;
         stream.record_on(&model_span);
         let turn = match completion {
             Ok(turn) => turn,
@@ -853,7 +863,7 @@ where
                 );
                 drop(model_entered);
                 if steered {
-                    transcribed = 0;
+                    transcribed.clear();
                     continue;
                 }
                 return Err(PromptError::Cancelled);
@@ -1892,7 +1902,7 @@ fn record_usage(span: &tracing::Span, usage: &ModelUsage) {
     }
 }
 
-fn transcript(messages: &[ModelMessage]) -> String {
+fn transcript(messages: &[Value]) -> String {
     serde_json::to_string(messages).unwrap_or_else(|_| "<unserializable>".to_owned())
 }
 

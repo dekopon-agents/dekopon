@@ -226,7 +226,12 @@ fn summarize_wire_images(messages: &mut Value) -> usize {
     images
 }
 
-struct ImageAssets;
+struct ImageAssets(dekopon_model::asset::BlobReference);
+impl Default for ImageAssets {
+    fn default() -> Self {
+        Self(DiskBlob::from_bytes(b"synthetic pixels").unwrap().into())
+    }
+}
 impl AssetSource for ImageAssets {
     fn offers_fetch(&self) -> bool {
         true
@@ -236,7 +241,7 @@ impl AssetSource for ImageAssets {
         Ok(FetchedAsset {
             name: "photo.png".into(),
             mime: "image/png".into(),
-            data: DiskBlob::from_bytes(b"synthetic pixels").unwrap().into(),
+            data: self.0.clone(),
         })
     }
 }
@@ -244,17 +249,50 @@ impl AssetSource for ImageAssets {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_definitions() {
     use dekopon_model::openai::OpenAiClient;
-    use dekopon_test_support::{CaptureLayer, Record};
+    use dekopon_test_support::CaptureLayer;
     use std::collections::BTreeMap;
     use tracing_subscriber::prelude::*;
 
-    struct DescribedRuntime(SyntheticRuntime);
+    use dekopon_model::asset::{BlobError, BlobReference, BlobSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum ImageEnd {
+        Released,
+        Unauthorized,
+    }
+    struct RetainedImage {
+        blob: DiskBlob,
+        refusal: Mutex<Option<BlobError>>,
+        reads: AtomicUsize,
+    }
+    impl BlobSource for RetainedImage {
+        fn pin(&self) -> Result<DiskBlob, BlobError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            match *self.refusal.lock() {
+                Some(error) => Err(error),
+                None => Ok(self.blob.clone()),
+            }
+        }
+    }
+    struct DescribedRuntime {
+        runtime: SyntheticRuntime,
+        image: Arc<RetainedImage>,
+        ending: ImageEnd,
+    }
     impl ScriptRuntime for DescribedRuntime {
         fn capability_calls_used(&self) -> u32 {
-            self.0.capability_calls_used()
+            self.runtime.capability_calls_used()
         }
         fn run_script(&self, script: &str) -> ScriptOutcome {
-            self.0.run_script(script)
+            assert_eq!(script, "release image");
+            match self.ending {
+                ImageEnd::Released => self.image.blob.reclaim().unwrap(),
+                ImageEnd::Unauthorized => {
+                    *self.image.refusal.lock() = Some(BlobError::Unauthorized)
+                }
+            }
+            self.runtime.run_script(script)
         }
         fn command_words(&self) -> Vec<String> {
             vec!["synthetic".into()]
@@ -263,51 +301,100 @@ async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_defin
             BTreeMap::from([("synthetic".into(), "detailed help ".repeat(500))])
         }
     }
-    let call = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fetch-1","type":"function","function":{"name":"fetch_chat_asset","arguments":"{\"id\":1}"}}]},"finish_reason":"tool_calls"}]}
+    for ending in [ImageEnd::Released, ImageEnd::Unauthorized] {
+        let call = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"fetch-1","type":"function","function":{"name":"fetch_chat_asset","arguments":"{\"id\":1}"}}]},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
 
 "#;
-    let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"seen\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-    let server = LoopbackServer::sequence([response(call), response(answer), response(answer)]);
-    let timeout = Duration::from_secs(5);
-    let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout)
-        .unwrap()
-        .with_streaming(true);
-    let (_sender, receiver) = tokio::sync::watch::channel(false);
-    let bridge = BlockingModel::new(
-        Arc::new(ModelClient::OpenAiCompatible(client)),
-        tokio::runtime::Handle::current(),
-        receiver,
-        timeout,
-    );
-    let capture = CaptureLayer::workspace();
-    let captured = capture.clone();
-    tokio::task::spawn_blocking(move || {
-        let _guard = tracing_subscriber::registry().with(captured).set_default();
-        let runtime = DescribedRuntime(SyntheticRuntime::default());
-        let mut history = History::default();
-        for prompt in ["Look at chat-asset:1", "What did you see?"] {
-            run_prompt_session(
-                &bridge,
-                &runtime,
-                SessionInputs::new(
-                    prompt,
-                    PromptLimits {
-                        max_steps: 3,
-                        max_capability_calls: 1,
-                    },
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"seen\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let release = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"release-1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"release image\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+        let server = LoopbackServer::sequence([
+            response(call),
+            response(release),
+            response(answer),
+            response(answer),
+        ]);
+        let image = Arc::new(RetainedImage {
+            blob: DiskBlob::from_bytes(b"synthetic pixels").unwrap(),
+            refusal: Mutex::new(None),
+            reads: AtomicUsize::new(0),
+        });
+        let assets = ImageAssets(BlobReference::new(
+            Arc::clone(&image) as Arc<dyn BlobSource>,
+            16,
+            1,
+        ));
+        let retained = Arc::clone(&image);
+        let timeout = Duration::from_secs(5);
+        let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout)
+            .unwrap()
+            .with_streaming(true);
+        let (_sender, receiver) = tokio::sync::watch::channel(false);
+        let bridge = BlockingModel::new(
+            Arc::new(ModelClient::OpenAiCompatible(client)),
+            tokio::runtime::Handle::current(),
+            receiver,
+            timeout,
+        );
+        let capture = CaptureLayer::workspace();
+        let captured = capture.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = tracing_subscriber::registry().with(captured).set_default();
+            let runtime = DescribedRuntime {
+                runtime: SyntheticRuntime::default(),
+                image,
+                ending,
+            };
+            let mut history = History::default();
+            for prompt in ["Look at chat-asset:1", "What did you see?"] {
+                run_prompt_session(
+                    &bridge,
+                    &runtime,
+                    SessionInputs::new(
+                        prompt,
+                        PromptLimits {
+                            max_steps: 3,
+                            max_capability_calls: 1,
+                        },
+                    )
+                    .with_assets(&assets),
+                    &mut history,
                 )
-                .with_assets(&ImageAssets),
-                &mut history,
-            )
-            .unwrap();
-        }
-    })
-    .await
-    .unwrap();
-    let sent: Vec<Value> = (0..3).map(|_| body(&server.request_text())).collect();
-    server.join();
+                .unwrap();
+            }
+            assert_eq!(*runtime.runtime.0.lock(), ["release image"]);
+        })
+        .await
+        .unwrap();
+        let sent: Vec<Value> = (0..4).map(|_| body(&server.request_text())).collect();
+        server.join();
+        assert_eq!(retained.reads.load(Ordering::Relaxed), 2);
+        let prompts: Vec<_> = capture
+            .records()
+            .into_iter()
+            .filter(|record| record.field("audit.event") == Some("agent.model.prompt"))
+            .collect();
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|record| record.field("transcript.scope").unwrap())
+                .collect::<Vec<_>>(),
+            ["full", "delta", "full", "full"]
+        );
+        assert_eq!(assert_trace_reconstructs_requests(capture, sent), 1);
+    }
+}
+
+fn assert_trace_reconstructs_requests(
+    capture: dekopon_test_support::CaptureLayer,
+    sent: Vec<Value>,
+) -> usize {
+    use dekopon_test_support::Record;
     let mut messages = Vec::new();
     let mut definitions = Value::Null;
     let mut exchange = serde_json::Map::new();
@@ -378,7 +465,7 @@ data: [DONE]
             json!({"messages":sent["messages"],"tools":tools,"exchange":exchange})
         );
     }
-    assert!(images > 0);
+    images
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,7 +565,7 @@ data: [DONE]
                     max_capability_calls: 1,
                 },
             )
-            .with_assets(&ImageAssets)
+            .with_assets(&ImageAssets::default())
             .with_steering(&model.mailbox),
             &mut History::default(),
         )

@@ -229,12 +229,18 @@ pub trait BlobSource: Send + Sync {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
+pub(crate) enum Preparation {
+    Original,
+    ReleaseNotice,
+}
+
 pub struct BlobReference {
     source: Arc<dyn BlobSource>,
     bytes: usize,
     id: u64,
     sha256: Arc<OnceLock<String>>,
+    preparation: Mutex<Preparation>,
 }
 impl BlobReference {
     pub fn new(source: Arc<dyn BlobSource>, bytes: usize, id: u64) -> Self {
@@ -243,6 +249,7 @@ impl BlobReference {
             bytes,
             id,
             sha256: Arc::new(OnceLock::new()),
+            preparation: Mutex::new(Preparation::Original),
         }
     }
     #[must_use]
@@ -266,6 +273,15 @@ impl BlobReference {
     pub fn sha256(&self) -> Option<&str> {
         self.sha256.get().map(String::as_str)
     }
+    pub(crate) fn record_preparation(&self, preparation: Preparation) {
+        *self.preparation.lock() = preparation;
+    }
+    pub(crate) fn prepared_notice(&self) -> Option<String> {
+        match *self.preparation.lock() {
+            Preparation::Original => None,
+            Preparation::ReleaseNotice => Some(self.release_notice()),
+        }
+    }
     pub fn pin(&self) -> Result<DiskBlob, BlobError> {
         self.source.pin()
     }
@@ -275,6 +291,17 @@ impl BlobReference {
             "[gateway: chat-asset:{} was released from disk retention and is no longer available. Ask the user to resend it or choose another asset; do not silently reuse an original image.]",
             self.id
         )
+    }
+}
+impl Clone for BlobReference {
+    fn clone(&self) -> Self {
+        Self {
+            source: Arc::clone(&self.source),
+            bytes: self.bytes,
+            id: self.id,
+            sha256: Arc::clone(&self.sha256),
+            preparation: Mutex::new(*self.preparation.lock()),
+        }
     }
 }
 impl fmt::Debug for BlobReference {

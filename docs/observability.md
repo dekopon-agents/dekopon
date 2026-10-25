@@ -1175,14 +1175,14 @@ These events join the accounting and refusal ones:
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 | `gateway.wake.scheduled` | The wake id, whether it is a watch, and the canonical subject it will speak as; the note and probe script are in the `agent.model.answer` tool call that asked for it |
 
-`agent.model.prompt` is emitted whole at session start and extended between steered cancellations.
-Turn N's message list strictly contains turn N-1's, and everything appended since was already emitted by
-`agent.model.answer`, `agent.tool.script`, and `agent.tool.output` on the turn that produced it, so
-re-sending the whole list every turn would cost a long session O(N²) payload bytes of near-
-duplicates. `transcript.scope` says which shape an event carries (`full` or `delta`) and
+`agent.model.prompt` is emitted whole at session start and extended while prior content is unchanged.
+Sending only appended messages between full events avoids O(N²) duplicate payload bytes in a long
+session. `transcript.scope` says which shape an event carries (`full` or `delta`) and
 `message.count` gives the size of the request actually sent, so a reader can tell a trimmed session
-from a truncated event. After a steered cancellation, the next prompt event is `full` again,
-including tool definitions and image digests resolved during the resumed request. A reader replaces
+from a truncated event. After a steered cancellation or a change to previously transcribed content
+during preparation, the next prompt event is `full` again,
+including tool definitions and image digests resolved during the request. Released or unauthorized
+assets appear as the same text substitution that preparation sent to the model. A reader replaces
 its accumulated transcript on each `full` event and appends each `delta` to reconstruct the exact transcript.
 
 `accounting.model.turn` carries turn counts, durations, and outcomes. `agent.config.inspected`

@@ -459,11 +459,15 @@ impl<'a> WireMessage<'a> {
                         .await
                         .map_err(TransportFailure::Blocking)?
                         {
-                            Ok(bytes) => Some(bytes),
+                            Ok(bytes) => {
+                                data.record_preparation(crate::asset::Preparation::Original);
+                                Some(bytes)
+                            }
                             Err(
                                 crate::asset::BlobError::Reclaimed
                                 | crate::asset::BlobError::Unauthorized,
                             ) => {
+                                data.record_preparation(crate::asset::Preparation::ReleaseNotice);
                                 wire.push(WirePart::Text {
                                     text: data.release_notice().into(),
                                     cache_control: None,
