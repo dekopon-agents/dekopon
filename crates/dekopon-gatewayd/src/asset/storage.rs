@@ -672,6 +672,11 @@ impl Retention {
                 || binding.class == Refill::None
                 || binding.key.stem != stem
                 || binding.key.id >= next_id
+                || self
+                    .publications
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .any(|publication| publication.contains_stored(&binding.key))
         });
         self.collect()
     }
@@ -712,13 +717,18 @@ impl Retention {
 
 struct PublicationRange {
     key: AssetStateKey,
-    first: u64,
     end: AtomicU64,
 }
 
 impl PublicationRange {
     fn contains(&self, key: &AssetStateKey, id: u64) -> bool {
-        self.key == *key && (self.first..self.end.load(Ordering::Acquire)).contains(&id)
+        self.key == *key && id < self.end.load(Ordering::Acquire)
+    }
+
+    fn contains_stored(&self, key: &StoredKey) -> bool {
+        key.stem == self.key.conversation.journal_stem()
+            && key.grant == *self.key.grant
+            && key.id < self.end.load(Ordering::Acquire)
     }
 }
 
@@ -729,18 +739,20 @@ pub(crate) struct Publication {
 }
 
 impl Publication {
-    pub(super) fn new(retention: &Arc<Mutex<Retention>>, access: &AssetAccess) -> Self {
+    pub(super) fn new(retention: &Arc<Mutex<Retention>>, access: &AssetAccess) -> Option<Self> {
+        if retention.lock().dir.is_none() || access.key.generation.is_none() {
+            return None;
+        }
         let range = Arc::new(PublicationRange {
             key: access.key.clone(),
-            first: access.next_asset_id(),
             end: AtomicU64::new(u64::MAX),
         });
         retention.lock().publications.push(Arc::downgrade(&range));
-        Self {
+        Some(Self {
             retention: Arc::clone(retention),
             access: access.clone(),
             range,
-        }
+        })
     }
 
     pub(crate) fn seal(self) -> Self {
@@ -757,30 +769,27 @@ impl Drop for Publication {
         retention
             .publications
             .retain(|publication| !publication.ptr_eq(&Arc::downgrade(&self.range)));
-        let references = &retention.references;
-        let discard: HashSet<_> = retention
-            .index
-            .bindings
-            .iter()
-            .filter(|binding| {
-                binding.class == Refill::Platform
-                    && binding.key.stem == self.range.key.conversation.journal_stem()
-                    && binding.key.grant == *self.range.key.grant
-                    && (self.range.first
-                        ..self
-                            .range
-                            .end
-                            .load(Ordering::Acquire)
-                            .min(self.access.next_asset_id()))
-                        .contains(&binding.key.id)
-                    && !references.contains(&binding.key)
-            })
-            .map(|binding| binding.key.clone())
-            .collect();
-        retention
-            .index
-            .bindings
-            .retain(|binding| !discard.contains(&binding.key));
+        let end = self
+            .range
+            .end
+            .load(Ordering::Acquire)
+            .min(self.access.next_asset_id());
+        let Retention {
+            index,
+            references,
+            publications,
+            ..
+        } = &mut *retention;
+        index.bindings.retain(|binding| {
+            binding.class == Refill::None
+                || !self.range.contains_stored(&binding.key)
+                || binding.key.id >= end
+                || references.contains(&binding.key)
+                || publications
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .any(|publication| publication.contains_stored(&binding.key))
+        });
         if let Err(error) = retention.collect() {
             tracing::warn!(%error, "gateway.asset.reclaim.failed");
         }

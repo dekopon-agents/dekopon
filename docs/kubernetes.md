@@ -231,7 +231,8 @@ Private subdirectories are `0700`; files are `0600` with one link. Each daemon g
 
 Gateway `/tmp` is **disk-backed** `emptyDir`, sized by `volumeSizes.gatewayTmp` (default 1152Mi).
 Existing `volumeSizes.tmp` overrides now affect only broker scratch (still tmpfs, default 16Mi);
-set `gatewayTmp` explicitly when migrating a custom scratch limit. Chat assets share a 1 GiB default retention budget. With `sessions.journal`, the required
+set `gatewayTmp` explicitly when migrating a custom scratch limit. Chat assets share a 1 GiB
+default retention budget. With `sessions.journal`, the required
 `sessions.assets.path` stores content-addressed inbound files and their index on the state claim;
 the journal and asset chart mounts must be enabled together. Without a journal, retained assets
 use gateway temporary disk and do not survive restart. Generated files are session-only in either

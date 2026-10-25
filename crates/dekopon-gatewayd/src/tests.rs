@@ -22100,6 +22100,103 @@ async fn a_journal_less_session_offers_no_memory_tools() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_first_journaled_turn_reclaims_its_downloaded_upload() {
+    struct Upload;
+    impl AssetFetcher for Upload {
+        fn fetch(
+            &self,
+            _: &AssetSourceRef,
+            _: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            Box::pin(async { Ok(b"\x89PNG\r\n\x1a\nupload".to_vec()) })
+        }
+    }
+    let directory = temporary();
+    let journal_dir = temporary();
+    let asset_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = BlockedModel::new("cancelled answer");
+    let mut runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let store = Arc::new(asset_store().with_storage(asset_dir.path()).unwrap());
+    store
+        .attach_journal(runner.journal.as_ref().unwrap())
+        .unwrap();
+    Arc::get_mut(&mut runner).unwrap().assets = Arc::clone(&store);
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let mut inbound = message("cancel this upload");
+    inbound.assets = vec![pending("cancelled.png", "image/png", 14)];
+    let key = private_conversation_key("dev", &inbound.conversation.key(), SUBJECT);
+    let driver = Arc::new(RecordingDriver::default());
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_entered().await;
+    let seed = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window(),
+        None,
+        Instant::now(),
+    );
+    assert!(!seed.created);
+    let access = seed.assets.clone();
+    drop(seed.lease);
+    let assets = SessionAssets::new(
+        Arc::clone(&store),
+        access,
+        Some(Arc::new(Upload)),
+        tokio::runtime::Handle::current(),
+        true,
+    );
+    tokio::task::spawn_blocking(move || assets.fetch(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(asset_dir.path().join("blobs"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        runner
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
+        CancelOutcome::Cancelled
+    );
+    model.release();
+    session.await.unwrap();
+    assert_eq!(
+        fs::read_dir(asset_dir.path().join("blobs"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(asset_dir.path().join("index.json")).unwrap()).unwrap();
+    assert!(index["bindings"].as_array().unwrap().is_empty());
+    assert!(
+        runner
+            .journal
+            .as_ref()
+            .unwrap()
+            .recall(
+                &key.journal_stem(),
+                &crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+                recall_window(RecallSource::Journal),
+                SystemTime::now()
+            )
+            .unwrap()
+            .assets
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn append_failure_preserves_the_delivered_reply_without_a_journal_record() {
     let (capture, _guard) = capture_spans();

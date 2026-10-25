@@ -288,7 +288,7 @@ pub(crate) struct PostReply {
     pub key: ConversationKey,
     pub granted: Vec<String>,
     pub access: AssetAccess,
-    pub publication: crate::asset::Publication,
+    pub publication: Option<crate::asset::Publication>,
     pub window: MemoryWindow,
     pub turn: ConversationTurn,
 }

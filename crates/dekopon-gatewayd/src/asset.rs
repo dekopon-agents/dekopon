@@ -361,7 +361,7 @@ impl AssetStore {
         journal.attach_assets(&self.retention)
     }
 
-    pub(crate) fn publication(&self, access: &AssetAccess) -> Publication {
+    pub(crate) fn publication(&self, access: &AssetAccess) -> Option<Publication> {
         Publication::new(&self.retention, access)
     }
 
@@ -2003,19 +2003,19 @@ mod retention_tests {
             .unwrap();
         store.attach_journal(&journal).unwrap();
         let cancelled = access("cancelled");
-        let pending = store.publication(&cancelled);
+        let pending = store.publication(&cancelled).unwrap();
         let id = register(&store, &cancelled);
         drop(store.admit(&cancelled, id, b"aaa").unwrap());
         let pending = pending.seal();
         cancelled.fence.as_ref().unwrap().deactivate();
         store.inventory(&access("sweep"));
-        journal_inventory(&journal, &access("unrelated"), &[], SystemTime::now());
+        journal_inventory(&journal, &cancelled, &[], SystemTime::now());
         assert_eq!(store.retention.lock().bytes, 3);
         drop(pending);
         assert_eq!(store.retention.lock().bytes, 0);
         assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 0);
         let committed = access("committed");
-        let pending = store.publication(&committed);
+        let pending = store.publication(&committed).unwrap();
         let id = register(&store, &committed);
         drop(store.admit(&committed, id, b"bbb").unwrap());
         journal_inventory(
@@ -2025,10 +2025,16 @@ mod retention_tests {
             SystemTime::now(),
         );
         drop(pending);
-        let aborted = store.publication(&committed);
+        let aborted = store.publication(&committed).unwrap();
         let id = register(&store, &committed);
         drop(store.admit(&committed, id, b"ccc").unwrap());
+        let aborted = aborted.seal();
+        let following = store.publication(&committed).unwrap();
+        let id = register(&store, &committed);
+        drop(store.admit(&committed, id, b"ddd").unwrap());
         drop(aborted);
+        assert_eq!(store.retention.lock().bytes, 9);
+        drop(following);
         assert_eq!(store.retention.lock().bytes, 3);
         assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
     }

@@ -2147,13 +2147,13 @@ async fn session(
     .collect::<Vec<_>>()
     .join("\n\n");
     let images_supported = route.model.accepts_images();
+    let publication = runner.assets.publication(&asset_access);
     let delta = delta
         .and_then(|delta| delta.block(&runner.assets, &asset_access))
         .map(ConversationTurn::unanswered);
     if let Some(delta) = &delta {
         seeded.record(delta.clone());
     }
-    let publication = runner.assets.publication(&asset_access);
     let registered =
         runner
             .assets
@@ -2545,7 +2545,7 @@ async fn session(
                 key: key.clone(),
                 granted,
                 access: journal_access,
-                publication: publication.seal(),
+                publication: publication.map(asset::Publication::seal),
                 window,
                 turn,
             });
