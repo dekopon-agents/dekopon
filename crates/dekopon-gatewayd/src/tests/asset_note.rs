@@ -191,11 +191,12 @@ fn the_whole_note_uses_the_frozen_line_templates() {
             false,
         ),
     ];
-    let mut text = "[gateway: files in this conversation".to_owned();
+    let mut text = NOTE_HEADER.to_owned();
     for (kind, asset, arrived) in lines {
         text.push_str(&kind.render(&asset, arrived));
     }
-    text.push_str("\n  Call fetch_chat_asset with the number to look at an image or document.]");
+    text.push_str(NOTE_FOOTER);
+    text.push(']');
     assert_eq!(
         text,
         "[gateway: files in this conversation\n  chat-asset:6 — chart.png (image/png, 88 KB) — attached to this message\n  report.pdf (application/pdf, size unknown) — the gateway cannot see this file at all\n  chat-asset:4 — recording.mov (video/quicktime, 41.3 MB) — not readable here; a command can take it as chat-asset:4\n  chat-asset:3 — photo.jpg (image/jpeg, 1.2 MB) — this agent's model cannot be shown images\n  chat-asset:2 — notes.py (text/x-python, 3 KB) — read with `asset cat chat-asset:2`\n  chat-asset:1 — screenshot.png (image/png, 214 KB)\n  Call fetch_chat_asset with the number to look at an image or document.]"

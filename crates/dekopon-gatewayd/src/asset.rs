@@ -670,15 +670,16 @@ impl NoteLine {
     }
 }
 
+const NOTE_HEADER: &str = "[gateway: files in this conversation";
+const NOTE_FOOTER: &str =
+    "\n  Call fetch_chat_asset with the number to look at an image or document.";
+
 pub(crate) fn reference_note(
     registered: &Registered,
     images_supported: bool,
     reader: TextReader,
     budget: usize,
 ) -> InventoryNote {
-    const HEADER: &str = "[gateway: files in this conversation";
-    const FOOTER: &str =
-        "\n  Call fetch_chat_asset with the number to look at an image or document.";
     let mut inventory = registered.inventory.iter().collect::<Vec<_>>();
     inventory.sort_unstable_by_key(|asset| std::cmp::Reverse(asset.id));
     let omission = |listed: usize| match (inventory.last(), inventory.get(listed)) {
@@ -693,7 +694,7 @@ pub(crate) fn reference_note(
     let mut full = if inventory.is_empty() {
         String::new()
     } else {
-        HEADER.to_owned()
+        NOTE_HEADER.to_owned()
     };
     let mut full_shown = false;
     let mut complete = true;
@@ -701,7 +702,7 @@ pub(crate) fn reference_note(
         let kind = NoteLine::for_asset(asset, images_supported, reader);
         let line = kind.render(asset, registered.arrived.contains(&asset.id));
         full_shown |= kind.is_shown();
-        if full.len() + line.len() + 1 + if full_shown { FOOTER.len() } else { 0 } > budget {
+        if full.len() + line.len() + 1 + if full_shown { NOTE_FOOTER.len() } else { 0 } > budget {
             complete = false;
             break;
         }
@@ -710,7 +711,7 @@ pub(crate) fn reference_note(
     if complete {
         if !inventory.is_empty() {
             if full_shown {
-                full.push_str(FOOTER);
+                full.push_str(NOTE_FOOTER);
             }
             full.push(']');
         }
@@ -721,10 +722,10 @@ pub(crate) fn reference_note(
             omitted: 0,
         };
     }
-    let framed = HEADER.len() + 1 + omission(0).len() <= budget;
+    let framed = NOTE_HEADER.len() + 1 + omission(0).len() <= budget;
     let fit = |framed: bool| {
         let mut text = if framed && !inventory.is_empty() {
-            HEADER.to_owned()
+            NOTE_HEADER.to_owned()
         } else {
             String::new()
         };
@@ -739,7 +740,7 @@ pub(crate) fn reference_note(
             let line = kind.render(asset, arrived);
             let next_shown = shown || kind.is_shown();
             let footer = if framed && next_shown {
-                FOOTER.len()
+                NOTE_FOOTER.len()
             } else {
                 0
             };
@@ -756,7 +757,11 @@ pub(crate) fn reference_note(
         if text.len()
             + omitted_line.len()
             + usize::from(framed)
-            + if framed && shown { FOOTER.len() } else { 0 }
+            + if framed && shown {
+                NOTE_FOOTER.len()
+            } else {
+                0
+            }
             > budget
         {
             text.clear();
@@ -765,7 +770,7 @@ pub(crate) fn reference_note(
             text.push_str(&omitted_line);
             if framed {
                 if shown {
-                    text.push_str(FOOTER);
+                    text.push_str(NOTE_FOOTER);
                 }
                 text.push(']');
             }
