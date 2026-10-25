@@ -39,7 +39,7 @@ homepage = "https://github.com/dekopon-agents/dekopon"
 authors = ["Dekopon contributors"]
 
 [workspace.dependencies]
-dekopon-tui = { path = "crates/dekopon-tui" }
+dekopon-tui = { version = "=0.51.0", path = "crates/dekopon-tui" }
 prost = "0.14.3"
 opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
