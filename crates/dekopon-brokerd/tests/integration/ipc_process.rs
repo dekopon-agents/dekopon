@@ -173,6 +173,88 @@ fn an_over_deadline_connection_makes_the_broker_process_exit_nonzero() {
     );
 }
 
+#[test]
+fn unavailable_stderr_preserves_the_broker_failure_exit_within_the_deadline() {
+    use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    const ROLE: &str = "DEKOPON_UNAVAILABLE_STDERR_CHILD";
+    const GRACE: Duration = Duration::from_secs(5);
+    if std::env::var_os(ROLE).is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let code = observed::finish(runtime, async {
+            let deadline = dekopon_brokerd::ShutdownDeadline::default();
+            deadline.start(GRACE);
+            tokio::time::advance(GRACE).await;
+            observed::observed(
+                Install::new(Console {
+                    format: ConsoleFormat::Json,
+                    writer: ConsoleWriter::Stdout,
+                    filter: ConsoleFilter::Directive("info".into()),
+                }),
+                async { Err::<(), _>(dekopon_brokerd::ServerError::ShutdownTimeout) },
+                Some(deadline),
+            )
+            .await
+        });
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            1
+        });
+    }
+    let (reader, writer) = std::io::pipe().unwrap();
+    let flags = fcntl_getfl(&writer).unwrap();
+    fcntl_setfl(&writer, flags | OFlags::NONBLOCK).unwrap();
+    let mut fill = &[0; 4096][..];
+    loop {
+        match rustix::io::write(&writer, fill) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::AGAIN) if fill.len() > 1 => fill = &fill[..1],
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(error) => panic!("fill stderr pipe: {error}"),
+        }
+    }
+    fcntl_setfl(&writer, flags).unwrap();
+    for reader in [Some(reader), None] {
+        let until = Instant::now() + GRACE;
+        let mut child = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ipc_process::unavailable_stderr_preserves_the_broker_failure_exit_within_the_deadline",
+                    "--nocapture",
+                ])
+                .env(ROLE, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(writer.try_clone().unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < until,
+                "stderr must not extend the shutdown deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "stderr availability must preserve the failure exit"
+        );
+        drop(reader);
+    }
+}
+
 async fn over_deadline_child() -> std::process::ExitCode {
     use dekopon_broker_protocol::{BrokerResponse, ResponseEnvelope, read_frame};
     use dekopon_telemetry::{Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install};

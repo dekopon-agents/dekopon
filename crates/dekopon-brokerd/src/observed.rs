@@ -30,19 +30,22 @@ pub(crate) async fn observed<E: std::error::Error>(
         Err(error) => {
             if deadline.is_none() {
                 tracing::error!(event = "broker_exit", error = %error_chain(&error), "broker.exit");
+                ExitCode::FAILURE
             } else {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "level": "ERROR",
-                        "event": "broker_exit",
-                        "error": error_chain(&error),
-                        "message": "broker.exit",
-                        "target": "dekopon_brokerd",
-                    })
-                );
+                diagnostic(
+                    &format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "level": "ERROR",
+                            "event": "broker_exit",
+                            "error": error_chain(&error),
+                            "message": "broker.exit",
+                            "target": "dekopon_brokerd",
+                        })
+                    ),
+                    ExitCode::FAILURE,
+                )
             }
-            ExitCode::FAILURE
         }
     };
     let flushed = match deadline
@@ -51,22 +54,26 @@ pub(crate) async fn observed<E: std::error::Error>(
     {
         None => telemetry.shutdown(),
         Some(deadline) if tokio::time::Instant::now() >= deadline => {
-            eprintln!("dekopon-brokerd: telemetry flush abandoned at the shutdown deadline");
-            return code;
+            return diagnostic(
+                "dekopon-brokerd: telemetry flush abandoned at the shutdown deadline\n",
+                code,
+            );
         }
         Some(deadline) => {
             let flush = tokio::task::spawn_blocking(move || telemetry.shutdown());
             match tokio::time::timeout_at(deadline, flush).await {
                 Ok(Ok(flushed)) => flushed,
                 Ok(Err(error)) => {
-                    eprintln!("dekopon-brokerd: telemetry flush failed: {error}");
-                    return code;
+                    return diagnostic(
+                        &format!("dekopon-brokerd: telemetry flush failed: {error}\n"),
+                        code,
+                    );
                 }
                 Err(_) => {
-                    eprintln!(
-                        "dekopon-brokerd: telemetry flush abandoned at the shutdown deadline"
+                    return diagnostic(
+                        "dekopon-brokerd: telemetry flush abandoned at the shutdown deadline\n",
+                        code,
                     );
-                    return code;
                 }
             }
         }
@@ -79,4 +86,21 @@ pub(crate) async fn observed<E: std::error::Error>(
         );
     }
     code
+}
+
+fn diagnostic(message: &str, code: ExitCode) -> ExitCode {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let stderr = std::io::stderr();
+    let written = (|| {
+        let flags = fcntl_getfl(&stderr)?;
+        fcntl_setfl(&stderr, flags | OFlags::NONBLOCK)?;
+        let result = rustix::io::write(&stderr, message.as_bytes());
+        let restored = fcntl_setfl(&stderr, flags);
+        result?;
+        restored
+    })();
+    match written {
+        Ok(()) | Err(_) => code,
+    }
 }
