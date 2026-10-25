@@ -16338,15 +16338,6 @@ async fn a_steer_keeps_the_original_wall_clock_deadline() {
     .await;
     model.release_next();
     model.wait_until_asked().await;
-    assert!(
-        capture.events().into_iter().any(|(fields, _)| {
-            fields.contains(" audit.event=\"agent.model.prompt\"")
-                && fields.contains(" model.turn=2")
-                && fields.contains("and one more thing")
-        }),
-        "the steer is taken into the running session before its deadline: {}",
-        capture.events_text()
-    );
 
     assert_eq!(
         wall_clock_stops_after(&capture, Duration::from_millis(19_999)).await,
@@ -16360,6 +16351,15 @@ async fn a_steer_keeps_the_original_wall_clock_deadline() {
     );
     model.release_next();
     session.await.expect("the stopped session unwinds");
+    assert!(
+        capture.events().into_iter().any(|(fields, _)| {
+            fields.contains(" audit.event=\"agent.model.prompt\"")
+                && fields.contains(" model.turn=2")
+                && fields.contains("and one more thing")
+        }),
+        "the steer is taken into the running session before its deadline: {}",
+        capture.events_text()
+    );
 }
 
 #[tokio::test(start_paused = true)]
