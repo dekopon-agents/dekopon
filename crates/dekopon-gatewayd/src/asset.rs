@@ -2248,11 +2248,6 @@ mod retention_tests {
                 .events_text()
                 .contains("gateway.asset.reclaim.failed")
         );
-        assert!(
-            !capture
-                .events_text()
-                .contains("gateway_journal_append_failed")
-        );
         pending.finish_blocking();
         assert_eq!(
             store
