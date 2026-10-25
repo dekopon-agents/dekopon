@@ -657,23 +657,29 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_conditional_or(&mut self) -> Result<Conditional, ParseError> {
-        let mut left = self.parse_conditional_and()?;
+        let first = self.parse_conditional_and()?;
+        if !matches!(self.peek_kind(), Some(TokenKind::OrOr)) {
+            return Ok(first);
+        }
+        let mut terms = vec![first];
         while matches!(self.peek_kind(), Some(TokenKind::OrOr)) {
             self.position += 1;
-            let right = self.parse_conditional_and()?;
-            left = Conditional::Or(Box::new(left), Box::new(right));
+            terms.push(self.parse_conditional_and()?);
         }
-        Ok(left)
+        Ok(Conditional::Or(terms))
     }
 
     fn parse_conditional_and(&mut self) -> Result<Conditional, ParseError> {
-        let mut left = self.parse_conditional_unary()?;
+        let first = self.parse_conditional_unary()?;
+        if !matches!(self.peek_kind(), Some(TokenKind::AndAnd)) {
+            return Ok(first);
+        }
+        let mut terms = vec![first];
         while matches!(self.peek_kind(), Some(TokenKind::AndAnd)) {
             self.position += 1;
-            let right = self.parse_conditional_unary()?;
-            left = Conditional::And(Box::new(left), Box::new(right));
+            terms.push(self.parse_conditional_unary()?);
         }
-        Ok(left)
+        Ok(Conditional::And(terms))
     }
 
     fn parse_conditional_unary(&mut self) -> Result<Conditional, ParseError> {
