@@ -942,7 +942,7 @@ An optional leaf resolves from built-in defaults, `sessions.indicators`, transpo
 `indicators`, its matching `indicators.conversations.<kind>`, then route `indicators`.
 The last authored value wins, even when an earlier layer set `off`; absent and `null`
 inherit without resetting unrelated leaves. Resolved `mode: off` suppresses all indicators.
-For every route/kind, startup and reload emit a bounded `gateway_indicators_effective` record
+For every route/kind, boot and each activated reload emit one bounded `gateway_indicators_effective` record
 with route index, transport name, kind, enum settings and booleans only, not message text,
 identity, coordinates or credentials.
 
