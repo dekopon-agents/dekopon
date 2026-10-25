@@ -213,6 +213,7 @@ pub struct CheckReport {
     pub problems: Vec<BrokerdError>,
     pub warnings: Vec<StartupWarning>,
     private_sources: Vec<PathBuf>,
+    pub peak_rss_bytes: Option<u64>,
 }
 
 /// Runs the startup validation `run` runs, then stops: no socket, no credentials file, no secret
@@ -222,7 +223,7 @@ pub async fn check(
     providers: Option<CheckProviders>,
     workflows: Option<&Path>,
 ) -> CheckReport {
-    load_candidate(
+    let mut report = load_candidate(
         config_path.as_ref(),
         Mode::Check {
             providers,
@@ -230,7 +231,9 @@ pub async fn check(
         },
     )
     .await
-    .1
+    .1;
+    report.peak_rss_bytes = dekopon_broker_host::peak_rss_bytes();
+    report
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -46,6 +46,8 @@ mod http;
 mod memory;
 mod metadata;
 mod random;
+mod rss;
+pub use rss::peak_rss_bytes;
 mod settings;
 pub mod skills;
 mod spawn;
@@ -642,6 +644,7 @@ fn compile_component(
         elapsed_us = tracing::field::Empty,
         elapsed_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
+        peak_rss_bytes = tracing::field::Empty,
     );
     span.in_scope(|| {
         let started = Instant::now();
@@ -655,6 +658,9 @@ fn compile_component(
         span.record("elapsed_us", elapsed_us);
         span.record("elapsed_ms", elapsed_ms);
         span.record("outcome", outcome);
+        if let Some(bytes) = peak_rss_bytes() {
+            span.record("peak_rss_bytes", bytes);
+        }
         match &result {
             Ok(_) => tracing::info!(elapsed_us, outcome, "provider.load.finished"),
             Err(error) => tracing::error!(elapsed_us, outcome, error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(error)), "provider.load.failed"),

@@ -849,9 +849,14 @@ dekopon-brokerd provider --lock-file /etc/dekopon/providers.lock.yaml \
 
 `precompile` reads only the lock and checked local blobs; it holds the activation and store locks
 while filling or repairing each cache entry, then prunes old indexes and orphaned objects. Its
-report contains `providers`, `compiled`, `repaired`, `removedFiles` and `removedBytes`; repaired
+report contains `providers`, `compiled`, `repaired`, `removedFiles`, `removedBytes` and `peakRssBytes`; repaired
 components are included in `compiled`. An error exits non-zero without pruning. `verify` neither
 locks nor publishes compiled artifacts.
+
+Both `provider --output=json precompile` and
+`check --output=json` include `peakRssBytes`: process peak RSS so far (Linux VmHWM); null where unavailable.
+The value is in bytes for the whole process, not a per-component increment or a cgroup figure.
+For `check`, it is read after provider-set sync and precompile finish.
 
 `skills` reads only the lock and each locked local blob, under the same broker-UID ownership
 rules as `list` and `verify`. It verifies length and SHA-256 on the one buffer it parses, walks
