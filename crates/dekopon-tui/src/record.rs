@@ -217,12 +217,8 @@ impl<I> RecordingInvoker<I> {
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for RecordingInvoker<I> {
-    fn cancelled(&self) -> bool {
-        self.inner.cancelled()
-    }
-
-    fn script_started(&self, timeout: Duration) {
-        self.inner.script_started(timeout);
+    fn script_started(&self, tree: &mut TreeContext) {
+        self.inner.script_started(tree);
     }
 
     fn job_control(&self) -> Option<&dyn JobControl> {

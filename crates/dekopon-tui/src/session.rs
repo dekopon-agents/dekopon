@@ -748,12 +748,8 @@ pub async fn run_turn(
 pub struct LegHandle(pub Arc<BrokerLeg>);
 
 impl CapabilityInvoker for LegHandle {
-    fn cancelled(&self) -> bool {
-        self.0.cancelled()
-    }
-
-    fn script_started(&self, timeout: Duration) {
-        self.0.script_started(timeout);
+    fn script_started(&self, tree: &mut TreeContext) {
+        self.0.script_started(tree);
     }
 
     fn job_control(&self) -> Option<&dyn JobControl> {
