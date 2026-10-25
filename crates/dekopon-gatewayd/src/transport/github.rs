@@ -26,7 +26,7 @@ use super::{
     whatsapp::WhatsappTransport,
 };
 use crate::{config::GithubEvent, gateway::CurrentGeneration};
-use dekopon_core::github::{GithubNumber, GithubThread, thread};
+use dekopon_core::github::{GithubId, GithubThread, thread};
 use std::collections::VecDeque;
 
 const CALLBACK: &str = "/webhooks/github";
@@ -39,10 +39,10 @@ pub(crate) struct GithubEntry {
     pub delivery: String,
     pub event: GithubEvent,
     pub action: Option<String>,
-    pub actor: GithubNumber,
+    pub actor: GithubId,
     pub thread: GithubThread,
     pub head_sha: Option<String>,
-    pub run: Option<GithubNumber>,
+    pub run: Option<GithubId>,
     pub conclusion: Option<String>,
 }
 
@@ -398,9 +398,9 @@ fn ignored(state: &StateData, delivery: &str, reason: &str) {
         reason,
         "gateway.github.ignored"
     );
-    tracing::info!(target: "dekopon_gatewayd::audit", audit.event = "gateway.admission",
+    tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.admission",
         outcome = "ignored", transport = %state.name, github.deliveries = &[delivery],
-        queue.depth = 0, "gateway.admission");
+        queue.depth = 0 }, "gateway.admission");
 }
 
 fn field<'a>(root: &'a Value, path: &str, max: usize) -> Option<&'a str> {
@@ -424,7 +424,7 @@ fn parse(
         id: format!("{}.{}", subject.tenant()?, subject.subject()),
         thread: Some(thread.to_string()),
     };
-    let actor = GithubNumber::new(root.pointer("/sender/id")?.as_u64()?).ok()?;
+    let actor = GithubId::new(root.pointer("/sender/id")?.as_u64()?).ok()?;
     let action = field(root, "/action", 64)
         .filter(|v| {
             v.bytes()
@@ -439,7 +439,7 @@ fn parse(
         ),
         GithubEvent::WorkflowRun => (
             Some(field(root, "/workflow_run/head_sha", 128)?.to_owned()),
-            Some(GithubNumber::new(root.pointer("/workflow_run/id")?.as_u64()?).ok()?),
+            Some(GithubId::new(root.pointer("/workflow_run/id")?.as_u64()?).ok()?),
             field(root, "/workflow_run/conclusion", 64).map(str::to_owned),
         ),
         _ => (None, None, None),

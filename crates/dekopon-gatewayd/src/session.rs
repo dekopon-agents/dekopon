@@ -591,7 +591,6 @@ pub(crate) fn record_admission(
         MessageId::Github(batch) => Some(batch.deliveries()),
         MessageId::Native(_)
         | MessageId::Follow(_)
-        | MessageId::Github(_)
         | MessageId::Wake { .. }
         | MessageId::Job { .. } => None,
     };

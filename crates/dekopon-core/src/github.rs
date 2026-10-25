@@ -158,46 +158,22 @@ pub fn thread(event: GithubEventName, body: &Value) -> Result<GithubThread, Gith
         }
         E::IssueDependencies => {
             let blocked_repository = body
-                .pointer("/blocked_issue/repository/id")
+                .pointer("/blocked_issue_repo/id")
                 .and_then(Value::as_u64)
                 .and_then(|id| GithubNumber::new(id).ok());
-            if own_repository.is_some() && own_repository == blocked_repository {
+            let local = match body.get("action").and_then(Value::as_str) {
+                Some("blocked_by_added" | "blocked_by_removed") => own_repository.is_some(),
+                _ => own_repository.is_some() && own_repository == blocked_repository,
+            };
+            if local {
                 number("/blocked_issue/number")
             } else {
                 Ok(GithubThread::Repository)
             }
         }
-        E::WorkflowRun | E::CheckRun | E::CheckSuite => {
-            let path = match event {
-                E::WorkflowRun => "/workflow_run/pull_requests",
-                E::CheckRun => "/check_run/pull_requests",
-                E::CheckSuite => "/check_suite/pull_requests",
-                _ => unreachable!(),
-            };
-            let mut numbers = Vec::new();
-            if let Some(prs) = body.pointer(path).and_then(Value::as_array) {
-                for pr in prs {
-                    let repository = pr
-                        .pointer("/base/repo/id")
-                        .and_then(Value::as_u64)
-                        .and_then(|id| GithubNumber::new(id).ok());
-                    if own_repository.is_some()
-                        && repository == own_repository
-                        && let Some(n) = pr
-                            .get("number")
-                            .and_then(Value::as_u64)
-                            .and_then(|n| GithubNumber::new(n).ok())
-                        && !numbers.contains(&n)
-                    {
-                        numbers.push(n);
-                    }
-                }
-            }
-            match numbers.as_slice() {
-                [n] => Ok(GithubThread::Number(*n)),
-                _ => Ok(GithubThread::Repository),
-            }
-        }
+        E::WorkflowRun => Ok(associated_thread(body, "/workflow_run/pull_requests")),
+        E::CheckRun => Ok(associated_thread(body, "/check_run/pull_requests")),
+        E::CheckSuite => Ok(associated_thread(body, "/check_suite/pull_requests")),
         E::BranchProtectionConfiguration
         | E::BranchProtectionRule
         | E::CodeScanningAlert
@@ -243,5 +219,83 @@ pub fn thread(event: GithubEventName, body: &Value) -> Result<GithubThread, Gith
         | E::Watch
         | E::WorkflowDispatch
         | E::WorkflowJob => Ok(GithubThread::Repository),
+    }
+}
+
+fn associated_thread(body: &Value, path: &str) -> GithubThread {
+    let repository = body
+        .pointer("/repository/id")
+        .and_then(Value::as_u64)
+        .and_then(|id| GithubNumber::new(id).ok());
+    let mut number = None;
+    if let Some(prs) = body.pointer(path).and_then(Value::as_array) {
+        for pr in prs {
+            let base = pr
+                .pointer("/base/repo/id")
+                .and_then(Value::as_u64)
+                .and_then(|id| GithubNumber::new(id).ok());
+            if repository.is_some()
+                && repository == base
+                && let Some(next) = pr
+                    .get("number")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| GithubNumber::new(n).ok())
+            {
+                if number.is_some_and(|previous| previous != next) {
+                    return GithubThread::Repository;
+                }
+                number = Some(next);
+            }
+        }
+    }
+    number.map_or(GithubThread::Repository, GithubThread::Number)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GithubId(GithubNumber);
+
+impl GithubId {
+    pub fn new(value: u64) -> Result<Self, GithubNumberError> {
+        GithubNumber::new(value).map(Self)
+    }
+}
+
+impl fmt::Display for GithubId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn issue_dependencies_key_only_by_a_local_blocked_issue() {
+        let local_blocked = json!({
+            "action": "blocked_by_added", "repository": {"id": 10},
+            "blocked_issue": {"number": 7}, "blocking_issue": {"number": 987},
+            "blocking_issue_repo": {"id": 20}
+        });
+        let foreign_blocked = json!({
+            "action": "blocking_added", "repository": {"id": 10},
+            "blocked_issue": {"number": 987}, "blocked_issue_repo": {"id": 20},
+            "blocking_issue": {"number": 7}
+        });
+        let local_dependency = json!({
+            "action": "blocking_removed", "repository": {"id": 10},
+            "blocked_issue": {"number": 7}, "blocked_issue_repo": {"id": 10},
+            "blocking_issue": {"number": 8}
+        });
+        for (body, expected) in [
+            (local_blocked, "7"),
+            (foreign_blocked, "repository"),
+            (local_dependency, "7"),
+        ] {
+            let selected = thread(GithubEventName::IssueDependencies, &body).unwrap();
+            assert_eq!(selected.to_string(), expected);
+            assert!(!format!("{selected:?}").contains("987"));
+        }
     }
 }
