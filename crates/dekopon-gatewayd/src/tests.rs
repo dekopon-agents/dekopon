@@ -17677,6 +17677,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
     }
 }
 
+#[path = "tests/attribution.rs"]
+mod attribution;
 #[path = "tests/generation.rs"]
 mod generation;
 #[path = "tests/github_http_invocation.rs"]
@@ -22046,6 +22048,3 @@ async fn a_cold_platform_recall_skips_messages_before_the_seal() {
     assert!(recalled.contains("at the seal"));
     assert!(recalled.contains("after the seal"));
 }
-
-#[path = "tests/attribution.rs"]
-mod attribution;
