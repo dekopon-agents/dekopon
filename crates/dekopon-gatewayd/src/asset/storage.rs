@@ -666,6 +666,15 @@ impl Retention {
         }
     }
 
+    pub(crate) fn retain_record(&mut self, keys: impl IntoIterator<Item = StoredKey>) {
+        self.references.extend(keys);
+        for binding in &mut self.index.bindings {
+            if self.references.contains(&binding.key) {
+                binding.retained = true;
+            }
+        }
+    }
+
     pub(crate) fn finish_pending(&mut self, stem: &str, next_id: u64) -> Result<(), BlobError> {
         self.index.bindings.retain(|binding| {
             binding.retained

@@ -634,6 +634,22 @@ impl Journal {
             .mode(0o600)
             .open(&path)?;
         file.write_all(&encoded)?;
+        // Ownership transfers before fallible scans can encounter another corrupt journal file.
+        if let Some(assets) = self
+            .assets
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            assets.lock().retain_record(line.assets.iter().map(|asset| {
+                crate::asset::StoredKey::new(
+                    stem.to_owned(),
+                    asset.id,
+                    Duration::from_millis(asset.at_ms),
+                    line.grant.clone(),
+                )
+            }));
+        }
         drop(file);
         let horizon = millis(entry.at).saturating_sub(duration_millis(self.age_for(stem)));
         match sweep_file(&path, horizon) {

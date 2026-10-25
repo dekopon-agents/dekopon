@@ -1989,6 +1989,93 @@ mod retention_tests {
     }
 
     #[test]
+    fn a_written_upload_survives_failed_reconciliation_cleanup_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("journal");
+        let asset_path = directory.path().join("assets");
+        let journal = crate::memory::journal::Journal::open(
+            &journal_path,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(&asset_path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let access = access("written");
+        let pending = store.publication(&access).unwrap();
+        let id = register(&store, &access);
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        let unrelated = journal_path.join(format!(
+            "{}.jsonl",
+            self::access("malformed").key.conversation.journal_stem()
+        ));
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        std::fs::write(&unrelated, b"{broken\n").unwrap();
+        assert!(matches!(
+            journal.append(
+                &access.key.conversation.journal_stem(),
+                &crate::memory::journal::Entry {
+                    at: SystemTime::now(),
+                    grant: &access.key.grant,
+                    turn: &dekopon_agent::prompt::ConversationTurn::completed("file", "seen"),
+                    inventory: &store.inventory(&access),
+                    next_asset_id: access.next_asset_id(),
+                    prepared: None,
+                },
+                durable_window(),
+            ),
+            Err(crate::memory::journal::JournalError::Corrupt)
+        ));
+        drop(pending);
+        assert_eq!(
+            store
+                .pin(&access, id, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+        drop(store);
+        drop(journal);
+        let journal = crate::memory::journal::Journal::open(
+            &journal_path,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let store = AssetStore::with_retention(8, Duration::from_secs(3600), 3)
+            .with_storage(&asset_path)
+            .unwrap();
+        store.attach_journal(&journal).unwrap();
+        let recalled = journal
+            .recall(
+                &access.key.conversation.journal_stem(),
+                "grant",
+                durable_window(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        store.restore(
+            &access,
+            recalled.assets,
+            recalled.next_asset_id,
+            Instant::now(),
+        );
+        assert_eq!(
+            store
+                .pin(&access, id, Recency::Keep)
+                .unwrap()
+                .unwrap()
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+    }
+
+    #[test]
     fn terminal_publication_reclaims_unjournaled_uploads_but_protects_live_handoffs() {
         let directory = tempfile::tempdir().unwrap();
         let journal = crate::memory::journal::Journal::open(

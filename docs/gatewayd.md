@@ -490,7 +490,10 @@ A successful provider `attach` returns a descriptor and typed metadata, not a JS
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
 stderr note naming the reference, declared content type and stored-byte count. The declared label
 is authoritative; a bounded decoded-prefix disagreement produces one metadata-only event.
-Pathless outputs are retained without copying and reclaimed by closing their last descriptor.
+With `sessions.journal`, admission copies provider outputs into the content-addressed store under
+`sessions.assets.path`; generated files remain session-only and are discarded at restart. Without
+a journal, pathless outputs stay on temporary disk without copying and are reclaimed by closing
+their last descriptor. Both modes share `sessions.assetRetentionBytes`, defaulting to 1 GiB.
 All descriptor reads are positional. A trap, denial or timeout admits no asset effects.
 
 Outbound `video/mp4` files are named `asset-N.mp4`, and their bytes bypass the model: an MP4
