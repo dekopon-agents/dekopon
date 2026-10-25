@@ -4019,7 +4019,7 @@ async fn a_space_only_policy_error_records_its_id() {
     .expect("world")
     .with_subjects(mappings.clone());
     let policy = r#"@id("both") permit(principal, action, resource);
-        @id("space-error") forbid(principal == Dekopon::Principal::"space", action == Dekopon::Action::"http-probe.fetch", resource) when { context has request && 9223372036854775807 + 1 > 0 };"#;
+        @id("space-error") forbid(principal == Dekopon::Principal::"space", action == Dekopon::Action::"http-probe.fetch", resource) when { context has request } when { 9223372036854775807 + 1 > 0 };"#;
     let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
     let broker = Broker::new(
         registry,
