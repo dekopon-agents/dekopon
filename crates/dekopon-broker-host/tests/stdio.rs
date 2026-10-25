@@ -442,9 +442,10 @@ async fn without_streams_stdin_is_absent_and_stdout_is_closed() {
         .expect("no streams means no stdin and a closed stdout");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn time_parked_on_stdin_is_not_charged_to_the_timeout() {
     let body = r"
+        call $stdout i32.const 3072 i32.const 5 i32.const 56 call $write
         i32.const 32 call $stdin
         i32.const 36 i32.load i32.const 64 i32.const 48 call $read
         i32.const 52 i32.load i32.eqz
@@ -452,17 +453,31 @@ async fn time_parked_on_stdin_is_not_charged_to_the_timeout() {
         call $ok";
     for (write, expected) in [(true, None), (false, Some(3))] {
         let (stdin_host, mut stdin_peer) = UnixStream::pair().unwrap();
-        let (stdout_host, _stdout_peer) = UnixStream::pair().unwrap();
-        let peer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(600));
-            if write {
-                stdin_peer.write_all(b"x").unwrap();
+        let (stdout_host, stdout_peer) = UnixStream::pair().unwrap();
+        stdout_peer.set_nonblocking(true).unwrap();
+        let mut stdout_peer = tokio::net::UnixStream::from_std(stdout_peer).unwrap();
+        let invocation = run(body, 100, streams(Some(stdin_host), stdout_host));
+        tokio::pin!(invocation);
+        let mut ready = [0; 5];
+        tokio::select! {
+            result = &mut invocation => panic!("stdin must wait for its peer: {result:?}"),
+            result = tokio::io::AsyncReadExt::read_exact(&mut stdout_peer, &mut ready) => {
+                result.unwrap();
             }
-        });
-        let started = Instant::now();
-        let result = run(body, 100, streams(Some(stdin_host), stdout_host)).await;
-        assert!(started.elapsed() >= Duration::from_millis(600));
-        peer.join().unwrap();
+        }
+        assert_eq!(&ready, b"boom\n");
+        tokio::time::advance(Duration::from_millis(600)).await;
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(invocation.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        if write {
+            stdin_peer.write_all(b"x").unwrap();
+        }
+        drop(stdin_peer);
+        let result = invocation.await;
         match (result, expected) {
             (Ok(_), None) => {}
             (Err(failure), Some(status)) => assert!(

@@ -3765,8 +3765,14 @@ impl ManagedBroker {
 
     async fn ready(&self, task: &tokio::task::JoinHandle<Result<(), super::BrokerdError>>) {
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            while !self.socket().exists() {
+            let parent = fs::symlink_metadata(self.directory.path()).unwrap();
+            loop {
                 assert!(!task.is_finished(), "broker exited before binding");
+                if fs::symlink_metadata(self.socket()).is_ok_and(|socket| {
+                    dekopon_broker_protocol::secure_socket(&socket, current_uid(), &parent)
+                }) {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
