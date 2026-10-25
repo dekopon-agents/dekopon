@@ -687,9 +687,15 @@ carries the running `count` of events the policy's bounded queue could not take,
 `gateway_progress_terminal_unobserved` carries nothing at all: the ending was written on screen and
 the session task that asked for it had already gone, so the receipt saying whether the person was
 told went nowhere.
-A permanent Slack installation fallback emits the same degraded record with `transport=slack` and a
-`surface` of `agent-status`, `assistant-status` or `reaction`, which is a transport-wide breaker rather than a
-per-session one. `gateway_session_stop_requested` carries the transport and
+A permanent Slack installation fallback emits the same degraded record with a `surface` of
+`agent-status`, `assistant-status` or `reaction`, which is a transport-wide breaker rather than a
+per-session one. For `reaction`, `transport` is the configured transport name and `category` is the
+typed Slack error category: `missing_scope` (the bot needs `reactions:write`) or
+`not_allowed_token_type` (the installation supplied the wrong token type). This warning is emitted
+once per transport instance, disables later working and seen reaction calls, and never fails the
+answer. Correct the Slack app's scopes or token outside the gateway and restart it to reset the
+breaker. The status surfaces still carry `transport=slack`.
+`gateway_session_stop_requested` carries the transport and
 `via` (`native-stop`, `button`, `stop-reply`, `wall-clock`); `gateway_session_stop_ignored` carries
 the transport and `reason` (`no-session`, `other-subject`, `already-ended`). Three transport-side
 records sit beside those. `gateway_cancel_ack_failed` (debug, Discord) and
