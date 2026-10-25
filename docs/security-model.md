@@ -406,10 +406,12 @@ startup before Wasmtime maps them. The hash detects corruption; it does not esta
 or defend against an adversary replacing both index and compiled bytes. The operator keeps mapped
 inodes unchanged for their entire lifetime. Same-UID/root filesystem attacks are out of scope.
 
-The only unsafe-code exception is the private `dekopon-broker-host::cwasm::deserialize` call to
+The production unsafe-code exception is the private `dekopon-broker-host::cwasm::deserialize` call to
 `Component::deserialize_file`. It is reached only for compiler-produced, locally indexed artifacts
 that were just published or verified. Wasmtime checks compatibility. Publication never overwrites
 an existing inode. Failures stop startup; `compileOnLoad: true` explicitly bypasses the feature.
+An explicit test-only opt-in also permits in-memory deserialization of immutable bytes serialized
+by the same process, keyed by engine compatibility and source SHA-256. Daemon paths never enable it.
 No hash, file read, or cache authority decision runs on invocations. Provider authority and source
 identity are unchanged. See [configuration and limits](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
 

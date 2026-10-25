@@ -86,6 +86,7 @@ when {{ context.via == "{GATEWAY_PRINCIPAL}"
 }
 
 fn broker_config(directory: &Path, uid: u32) -> Value {
+    dekopon_brokerd::enable_test_component_memoization();
     json!({
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),

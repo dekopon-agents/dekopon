@@ -339,6 +339,7 @@ fn directory<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Ident
 }
 
 async fn probe_registry(limits: BrokerHostLimits) -> BrokerProviderRegistry {
+    dekopon_broker_host::enable_test_component_memoization();
     BrokerProviderRegistry::load([provider_fixture("cli-probe-provider.wasm")], limits)
         .await
         .expect("cli-probe provider fixture loads")
@@ -503,6 +504,7 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = probe_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let error = Broker::new(
@@ -598,6 +600,7 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     reason = "one server proves every denied shape sends zero bytes while one admitted shape sends exactly once"
 )]
 async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_test_support::CaptureLayer;
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -923,6 +926,7 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
     reason = "one server proves the three admitted bodies send exactly once and the four denied ones send nothing"
 )]
 async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_one_before_egress() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_test_support::CaptureLayer;
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -1140,6 +1144,7 @@ async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_on
 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_test_support::CaptureLayer;
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -1220,6 +1225,7 @@ async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn http_audit_contains_only_sanitized_call_metadata() {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -1312,6 +1318,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scope() {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -1428,6 +1435,7 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
 #[tokio::test(flavor = "multi_thread")]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_capability::InvocationOutcome::{Failed, Succeeded};
 
     for (response, expected) in [
@@ -1636,6 +1644,7 @@ impl RefreshingCredential for ScriptedRefreshingCredential {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_budget() {
+    dekopon_broker_host::enable_test_component_memoization();
     const ACCESS: &str = "refreshed-access-token-audit-must-never-see";
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
@@ -1745,6 +1754,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -1848,6 +1858,7 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_binding_and_cedar() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_broker::{DefaultSecretSink, DefaultSecretUse};
     use dekopon_test_support::CaptureLayer;
     use tracing::instrument::WithSubscriber as _;
@@ -1992,6 +2003,7 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
 
 #[tokio::test(flavor = "multi_thread")]
 async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
+    dekopon_broker_host::enable_test_component_memoization();
     const SECRET: &[u8] = b"drn-secret-never-visible";
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
@@ -2089,6 +2101,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes() {
+    dekopon_broker_host::enable_test_component_memoization();
     use dekopon_capability::InvocationOutcome::{Denied, Failed};
 
     for (policy, resolver, outcome, error) in [
@@ -2254,6 +2267,7 @@ fn basic_secret_broker(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username() {
+    dekopon_broker_host::enable_test_component_memoization();
     let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
@@ -2374,6 +2388,7 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
 #[tokio::test(flavor = "multi_thread")]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_it() {
+    dekopon_broker_host::enable_test_component_memoization();
     const DEFAULT_SECRET: &str = "dekopon-agents-token";
     const OVERRIDE_SECRET: &str = "scientist-hq-token";
     for credential in [Some("github-pat"), None] {
@@ -2533,6 +2548,7 @@ async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_i
 
 #[tokio::test(flavor = "multi_thread")]
 async fn credentialed_constraint_sets_fail_closed_at_construction() {
+    dekopon_broker_host::enable_test_component_memoization();
     let http = |hosts: Vec<String>| ExecutionConstraints {
         asset: None,
         timeout_ms: 5_000,
@@ -3809,6 +3825,7 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
     reason = "reshaped by the unit that next rewrites this"
 )]
 async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broker() {
+    dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),

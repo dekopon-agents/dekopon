@@ -45,6 +45,7 @@ use dekopon_broker::{
     Leniency, PolicyBuildError, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::BrokerProviderRegistry;
+pub use dekopon_broker_host::enable_test_component_memoization;
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
 use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, bounded_problems, error_chain};

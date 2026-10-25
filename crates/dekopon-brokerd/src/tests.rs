@@ -38,6 +38,7 @@ pub(super) fn write_owner_only(path: &Path, contents: &[u8]) {
 }
 
 pub(super) fn write_config(path: &Path, document: &serde_json::Value) {
+    dekopon_broker_host::enable_test_component_memoization();
     write_owner_only(
         path,
         &serde_json::to_vec(document).expect("config serializes"),
@@ -1221,6 +1222,7 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
 
 #[tokio::test]
 async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
+    dekopon_broker_host::enable_test_component_memoization();
     use std::sync::Arc;
 
     use dekopon_broker::{
