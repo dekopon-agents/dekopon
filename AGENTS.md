@@ -293,11 +293,15 @@ How a verifier reads a change against the Rust guidelines, and how an editor rep
 verifier is the check that replaces pre-approval of crate internals, so it is never skipped and
 never relaxed; the final PR reviewer has a different job and does not repeat it.
 
-**Findings are tagged.** Every finding is one of `contract` (WIT, wire frames, config keys and
-values, chart values and mounts, a deletion, a proof-gate invariant), `guideline` (a rule in this section,
-quoted by heading) or `taste`. `contract` and `guideline` findings carry `file:line`, the concrete
-failure and the exact fix, and make the verdict `FIX REQUIRED`. `taste` is advisory, listed last,
-and never blocks.
+**Findings are tagged.** Every finding has a type, `contract`, `guideline` or `taste`, and an
+origin: `introduced` (this change wrote it), `exposed` (an existing defect this change makes
+reachable or worse) or `inherited` (existing and untouched). `contract` covers WIT, wire frames,
+config keys and values, chart values and mounts, a deletion, a proof-gate invariant, the brief's
+must-holds, and three sections of this file: [Errors](#errors), [Panics](#panics) and
+[Boundaries that must survive](#boundaries-that-must-survive). `guideline` is any other rule in this
+section, quoted by heading. `taste` is advisory. Only an `introduced` or `exposed` `contract`
+finding makes the verdict `FIX REQUIRED`; it carries `file:line`, the concrete failure and the exact
+fix. Every other finding goes under `Follow-ups` in the report and never blocks.
 
 **Evidence standard.** A finding names what it saw, not what it suspects; "this could leak" is not
 a finding until the line that leaks is named. A claim in the editor's report ("mirrors
