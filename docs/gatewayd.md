@@ -210,9 +210,11 @@ sessions:
   maxJobs: 2                                  # optional, default 2; 0 refused
   replyOnBusy: true                           # default true; saturation or a full mailbox only
   maxConversations: 1024                      # optional, default 1024 tracked
-  assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
+  assetRetentionBytes: 1073741824             # optional, shared disk budget; 0 disables assets
   journal:                                    # optional; absent, no conversation text is written to disk
     path: /var/lib/dekopon-gatewayd/journal           # relative paths resolve against this file; file sweep uses the longer of memory retention and journal-route forgetAfterMs
+  assets:                                     # required with journal; refused without it
+    path: /var/lib/dekopon-gatewayd/assets      # separate directory; relative paths resolve against this file
   wakes:                                      # optional; absent, no route may schedule a wake
     path: /var/lib/dekopon-gatewayd/wakes.jsonl       # relative paths resolve against this file
     maxPerSubject: 20                         # optional, default 20 pending wakes per person
@@ -236,7 +238,13 @@ The route's `conversation:` block is the **match**: `kind` is the word `any` or 
 
 `sessions.memory` accepts `retention: {maxAgeMs, maxBytesPerAgent}` (defaults: 604800000 ms, 67108864 bytes), `arena: {maxTransientBytes}` (default: 134217728 bytes), and `agents.<agentId>` entries with optional `retention: {maxAgeMs?, maxBytes?}`, `routine`, and `policy`. Per-agent ceilings may only narrow the global limits; IDs must name a routed agent. Arena sweeping is fixed at one hour, not a config field. A persistent route may override its agent policy under `routes[].memory.policy`; without a policy, the resolved policy retains only `original` with fixed selection. A policy requires `capture: {user, assistant, toolRequest, toolResult}` (positive byte counts or `uncapped`), `routines: [{id, kind, maxBytes?, model?, parts?}]`, nonempty `retain`, and `selection: {mode, routine?, decisionCapability?, fallback?, backend?, model?, requireProbabilities?}`. Routine IDs are 1–128 ASCII letters, digits, `-`, `_` or `.`, because a decider offers them as labels. Kinds are `original`, `prefix` and `progressiveOneShot`/`progressiveTurducken`. A prefix needs `maxBytes`; progressive routines need a direct configured model and strictly increasing cumulative `{id, maxBytes}` parts. Selection is `fixed` (retained `routine`), `agentPreference` (retained route default `routine`, optionally replaced by the agent setting), or `decider` (nonempty `decisionCapability`, retained `fallback`, nonempty `backend` and `model`, and a boolean `requireProbabilities`, all required; at most 32 retained routines). `backend`, `model` and `requireProbabilities` are passed to the decision provider unchanged and refuse at load outside `decider` mode. Irrelevant fields and unknown names refuse at load. Without a journal, persistent routes remain window-only and config-check prints one warning; explicit `recall: journal` still refuses without storage. On journal-backed persistent routes, `read_memory_record`, `set_memory_pin`, and `clear_memory_pin` use the full scoped conversation key and current grant; one-shot and journal-less routes offer none of them. Reads and pins name a retained routine, so a refusal lists the same eligible representation IDs as the historical envelope. Reads return at most 16 KiB of eligible UTF-8 text (or a bounded unavailable/range reason) and persist only source/version/range/outcome references. Pins survive restart and choose representation fidelity for included records, not inclusion; a pin reports its selected text byte cost, even if that choice grows the output. Selected records carry their opaque record ID and eligible representation IDs in the model-facing historical envelope.
 
-GitHub configuration: a transport of `kind: githubWebhook` requires `name`, `bind` (nonzero socket port), and `secretEnv` (an environment variable name, never the secret). The path is fixed at `/webhooks/github`; `callbackPath` is not accepted for GitHub. When sharing a listener with WhatsApp, binds must agree and callback paths cannot collide. `check` validates structure and warns about the credential without reading it; boot requires a present nonblank credential. GitHub POST on the shared listener bounds headers and the 256 KiB body, verifies the exact raw-body HMAC-SHA256 before parsing the signed repository owner/name, and queues eligible `pull_request` opened/reopened/synchronize or `workflow_run` completed success/failure claims. A completed run with no PR association is report-only. No GitHub API client or outbound reply exists in the gateway. A 2xx acknowledges accepted enqueue, ignored event or recent duplicate, not completion; queue saturation returns retryable 503. Dedupe holds 1,024 GUIDs in memory, and restart, eviction or signed-body replay may open another freshly authorized turn. The delivery GUID is unsigned and GitHub signs no timestamp. A GitHub route requires `githubEvents: [pull_request, workflow_run]` (one or both, nonempty and unique), `memory: { mode: oneShot }`, and a canonical thread selector such as `conversation: { kind: [thread], container: owner, ids: [owner.repo] }`. `githubEvents` is forbidden on other transports; `null`, unknown events and dotted repo IDs fail. Declaration-order selection happens before the selected route's event filter: a later overlapping route cannot receive an event the first route omits. No repository registration list or automatic post target exists. An accepted delivery enters the ordinary route admission gate as a fresh one-shot, addressed `message` turn with `github.<owner>.<repo>` as its attested subject and the delivery GUID as its thread; it never resumes a chat watch or a previous repo session. Each turn must connect to the broker, receive fresh capabilities under `agent.prompt`, and only then call the model. Unmapped subjects, denied grants, busy sessions and model failures produce no GitHub transport post; final answers remain in the session trace. A signed run claim, including one with no PR association, grants no fix authority: an agent needs its own broker-granted current-check read and a separate narrow write grant. A route may opt into the existing wakes; those turns are likewise silent, and an independently watched chat may also wake for the same PR.
+GitHub configuration: a transport of `kind: githubWebhook` requires `name`, `bind` (nonzero socket port), and `secretEnv` (an environment variable name, never the secret). The path is fixed at `/webhooks/github`; `callbackPath` is not accepted for GitHub. When sharing a listener with WhatsApp, binds must agree and callback paths cannot collide. `check` validates structure and warns about the credential without reading it; boot requires a present nonblank credential. GitHub POST bounds headers and the 256 KiB body and verifies the exact raw-body HMAC-SHA256 before parsing. Unknown event headers and repository-less events, including `ping`, are acknowledged and ignored. A GitHub route requires a nonempty, unique `githubEvents` list of typed family names (for example, `[issues, issue_comment, push]`), `memory: { mode: oneShot }`, and a canonical selector such as `conversation: { kind: [thread], container: owner, ids: [owner.repo] }`. `githubEvents: [pull_request, workflow_run]` retains its existing filters: opened/reopened/synchronize PR events and completed success/failure runs. Other listed families wake on every action. `githubEvents` is forbidden on other transports; `null`, unknown family names and dotted repo IDs fail. Declaration-order selection happens before the selected route's event filter: a later overlapping route cannot receive an event the first route omits.
+
+A GitHub delivery enters the session admission gate as an addressed `message` with `github.<owner>.<repo>` as its attested subject. Conversations key by `owner.repo:<n>` for a local issue, PR or discussion number, or `owner.repo:repository` for repository-level events. A run or check keys by its one local associated PR, otherwise by the repository. A dependency keys by its local blocked issue; a foreign blocked issue uses the repository bucket, and a foreign blocking issue supplies no number or fact. Deliveries never steer or interrupt: consecutive queued deliveries from one actor coalesce into batches of at most 16. Another actor starts a new batch. The mailbox remains 100 slots and the session permit remains the global concurrency bound. Notes render from the batch at turn start, contain no titles, bodies or other prose from the payload, and direct the agent to read current state through a broker-granted capability.
+
+A 200 acknowledges session admission, queueing, an ignored delivery, or a committed recent duplicate, not completion. Busy admission, a full transport queue or mailbox, an unanswered reserved duplicate, a closed channel and the webhook deadline return 503. A timed-out request may still be admitted later; a late admission commits its GUID. Dedupe retains 1,024 committed GUIDs in memory, while reservations remain pending until answered or dropped. Busy or dropped tickets release their GUID for redelivery. GitHub does not automatically redeliver failed webhook deliveries; the 503 is visible in its delivery log for manual redelivery. Restart, eviction or signed-body replay may open another freshly authorized turn. The delivery GUID is unsigned and GitHub signs no timestamp.
+
+No GitHub API client, outbound reply, repository registration list or automatic post target exists in the gateway. Each turn opens a fresh broker leg and receives fresh capabilities under `agent.prompt` before calling the model. Unmapped subjects, denied grants, busy sessions and model failures produce no GitHub transport post; final answers remain in the session trace. A signed run claim, including one with no PR association, grants no fix authority: an agent needs a broker-granted current-check read and a separate narrow write grant. A route may opt into the existing silent wakes; a delivery never resumes a chat watch or a previous repo session.
 
 The `memory:` block — which was called `conversation:` before 0.14.0 — is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
 
@@ -492,7 +500,10 @@ A successful provider `attach` returns a descriptor and typed metadata, not a JS
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
 stderr note naming the reference, declared content type and stored-byte count. The declared label
 is authoritative; a bounded decoded-prefix disagreement produces one metadata-only event.
-Pathless outputs are retained without copying and reclaimed by closing their last descriptor.
+With `sessions.journal`, admission copies provider outputs into the content-addressed store under
+`sessions.assets.path`; generated files remain session-only and are discarded at restart. Without
+a journal, pathless outputs stay on temporary disk without copying and are reclaimed by closing
+their last descriptor. Both modes share `sessions.assetRetentionBytes`, defaulting to 1 GiB.
 All descriptor reads are positional. A trap, denial or timeout admits no asset effects.
 
 Outbound `video/mp4` files are named `asset-N.mp4`, and their bytes bypass the model: an MP4
@@ -510,9 +521,8 @@ adds one bounded gateway notice to the next turn. An output retention refusal na
 without suggesting a repeat of an already-executed paid capability.
 
 Limits are **8 MiB decoded per asset, five distinct references or attached outputs and 40 MiB
-decoded per invocation**, and the shared `assetRetentionBytes` disk LRU. There is no per-conversation
-count and no idle expiry for a live generation: a file stays addressable while its generation is
-live and the LRU keeps its bytes. One-shot inventories retain their one-hour idle expiry.
+decoded per invocation**, and the configurable 1 GiB default disk budget. There is no per-conversation
+count cap or idle expiry for live generations. One-shot inventories retain their one-hour idle expiry.
 An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
 Disk retention and broker in-flight spool budgets account for actual stored bytes.
 These limits are separate from model-facing fetch limits. Resolving bytes updates LRU recency.
@@ -709,21 +719,29 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   the same inventory with capability/invocation provenance. A bounded typed-output note names each
   retained reference; same-session and later-turn edits can address it without carrying bytes in
   the shell, prompt transcript or history. Retention and delivery are separate acts.
-- **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **268435456**
-  (256 MiB) across all conversations and generated/inbound assets in this gateway process. **Zero
-  disables retention**: newly fetched/generated assets cannot be retained or delivered; text remains
-  usable. It is never an unlimited setting. The shared 8 MiB per-file and transport/proposal limits
-  remain independent safety limits, not competing retention caches. Empty files charge one byte.
-  Configure disk-backed temporary storage with sufficient capacity separately from this logical budget.
-- **Use means consumption.** Successful scoped resolution for model inclusion or provider submission
-  refreshes recency; inventory listing and history reference replay do not. Least-recently-used
-  unpinned files are reclaimed before admission. Individually oversized assets are refused without
-  evicting useful entries; insufficient unpinned space refuses clearly. Active provider requests and
-  outbound delivery hold temporary pins charged to the same budget. Model messages hold weak
-  references, never residency ownership. Retired generations and idle-expired one-shot inventories are pruned lazily, at the next
-  store call; a dropped row reclaims its unpinned file in the same step, and a pinned one at the
-  first admission after its pins finish. Unlink failures retain accounting rather than pretending
-  disk space was freed.
+- **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **1073741824**
+  (1 GiB), shared across conversations and generated/inbound files. Zero disables assets and removes
+  `fetch_chat_asset`; it is never unlimited. Content-identical stored representations share one file
+  and one charge. Empty files charge one byte. The 8 MiB decoded per-file and 40 MiB per-request
+  limits remain independent safety limits.
+- **History owns durable bytes.** With `sessions.journal`, `sessions.assets.path` is required and
+  stores SHA-256-named files plus a restartable index. `assets: null` means absent; `{}`, an empty
+  path and an unresolvable path refuse configuration. The assets directory must neither equal,
+  contain nor sit inside the journal directory, including resolved aliases. Relative paths resolve
+  against the configuration file. Uploaded files already downloaded for use become resident again
+  when their conversation is recalled after restart, without another download. Arrival alone never
+  downloads. Generated outputs are session-only, share this budget while live, and are not restored.
+- **Use means consumption.** Successful scoped consumption refreshes persisted recency; listing,
+  replay and `pin(Recency::Keep)` do not. Admission evicts unpinned re-downloadable inbound files
+  first, then generated files, least recently used within each class. Unloaded conversations count
+  toward the budget and supply eviction candidates after restart. An oversized file or insufficient
+  unpinned capacity evicts nothing. Failed storage preserves a not-stored reference; attaching an
+  output does not fail because its bytes could not be stored. Failure surfaces when it is used.
+- **Journal retention owns deletion.** Sweep, record compaction, forget and seal retention release
+  references; the last retained record naming a digest releases its file and index bindings. Shared
+  digests survive while any conversation still names them. One-shot idle expiry and generation
+  retirement release in-memory rows and pins without deleting journal-owned bytes. Fence-less
+  inventories still expire when idle. The conversation ceiling no longer evicts asset inventories.
 - **One download per attachment.** A cold attachment downloads in a store-owned task, at most two
   at a time, under the 60-second fetch deadline. Model fetches and provider inputs that ask for the
   same attachment share that download; when the last of them is cancelled, so is the download, and
@@ -736,13 +754,11 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
   IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
   to avoid reuse after one-shot inventory expiry.
-- **Private scratch, not persistence.** The gateway creates 0700 directories and 0600 files beneath
-  the process temporary directory. No model/provider path is accepted or serialized; reads use the
-  original descriptor. After a restart, a conversation recalled from its platform's history
-  numbers its inbound files again from that history and downloads each on first use; generated files, and the files of a
-  journal-backed conversation, do not survive a restart.
-  Cleanup failures emit bounded diagnostics; abrupt process death can leave scratch until the
-  temporary volume is removed.
+- **Gateway-private storage.** Store files are 0600 inside 0700 directories owned by the gateway
+  UID. The index contains digest, row identity, origin class, state and recency, never attachment
+  sources or platform locators. Locators remain in the journal. Reads stay session-bound and the
+  broker receives descriptors, never a store path. Without a journal, attachments continue to use
+  process-lifetime private temporary files; no durable assets directory may be configured.
 - **Storage failures are not successful empty images.** Capacity exhaustion, OS IO categories
   (including disk-full), and changed/truncated length are sanitized failures, never paths or bytes.
   An unlinked file still reads through its original descriptor while a lease owns it. No storage
@@ -756,7 +772,7 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   in place. An unpolled transport future or runtime shutdown before queued work starts can still
   drop leases on the calling thread; this is not a general asynchronous cleanup service.
 - **Disk backing is an operator requirement.** The chart uses disk-backed gateway `/tmp`, separately
-  sized by `volumeSizes.gatewayTmp`; broker scratch stays tmpfs. Other installations must provide
+  sized by `volumeSizes.gatewayTmp`, and mounts durable assets on the state claim when enabled; broker scratch stays tmpfs. Other installations must provide
   a disk-backed temporary directory, not a memory-backed `emptyDir` or `TMPDIR`. Existing deployed
   manifests and overrides need separate rollout verification. This removes retained bulk bytes,
   not all peak allocations: bounded downloads/decodes, textual conversion, base64/JSON request

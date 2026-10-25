@@ -29,6 +29,25 @@ pub use install::{
     TelemetryGuard, optional_logger_provider, optional_tracer_provider,
 };
 
+#[derive(Clone, Debug)]
+pub struct EventStringArray {
+    pub name: &'static str,
+    pub values: Vec<String>,
+}
+
+pub fn with_event_string_array<T>(
+    name: &'static str,
+    values: &[&str],
+    emit: impl FnOnce() -> T,
+) -> T {
+    let context = Context::current().with_value(EventStringArray {
+        name,
+        values: values.iter().map(|value| (*value).to_owned()).collect(),
+    });
+    let _scope = context.attach();
+    emit()
+}
+
 pub fn link_span(execution: &tracing::Span, receipt: &tracing::Span) {
     let context = receipt.context();
     let span = context.span();

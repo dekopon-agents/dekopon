@@ -285,19 +285,31 @@ where
         let native = opentelemetry::Context::current();
         let span = native.span();
         let ids = span.span_context();
-        if !ids.is_valid() {
+        let array = native.get::<crate::EventStringArray>();
+        if !ids.is_valid() && array.is_none() {
             return self.0.format_event(context, writer, event);
         }
         let mut json = String::new();
         self.0
             .format_event(context, fmt::format::Writer::new(&mut json), event)?;
         let object = json.strip_suffix("}\n").ok_or(std::fmt::Error)?;
-        writeln!(
-            writer,
-            "{object},\"trace_id\":\"{}\",\"span_id\":\"{}\"}}",
-            ids.trace_id(),
-            ids.span_id(),
-        )
+        writer.write_str(object)?;
+        if ids.is_valid() {
+            write!(
+                writer,
+                ",\"trace_id\":\"{}\",\"span_id\":\"{}\"",
+                ids.trace_id(),
+                ids.span_id()
+            )?;
+        }
+        if let Some(array) = array {
+            let name =
+                serde_json::to_string(array.name).map_err(|_invalid_json| std::fmt::Error)?;
+            let values =
+                serde_json::to_string(&array.values).map_err(|_invalid_json| std::fmt::Error)?;
+            write!(writer, ",{name}:{values}")?;
+        }
+        writeln!(writer, "}}")
     }
 }
 
@@ -403,7 +415,7 @@ impl Install {
         let logger_provider = logs.map(|logs| {
             layers.push(
                 OpenTelemetryTracingBridge::new(&logs.provider)
-                    .with_filter(otlp_filter(&logs.filter))
+                    .with_filter(log_filter(&logs.filter))
                     .boxed(),
             );
             logs.provider
@@ -517,6 +529,22 @@ pub enum InstallError {
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct ShutdownError(String);
+
+fn log_filter<S>(directive: &str) -> impl tracing_subscriber::layer::Filter<S> + use<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use tracing_subscriber::filter::{FilterExt as _, dynamic_filter_fn};
+    otlp_filter(directive)
+        .or(dynamic_filter_fn(|metadata, _| {
+            metadata.is_event()
+                && metadata.fields().field("audit.event").is_some()
+                && opentelemetry::Context::current()
+                    .get::<crate::EventStringArray>()
+                    .is_some()
+        }))
+        .and(EnvFilter::new(format!("trace,{EXPORTER_DIAGNOSTICS_OFF}")))
+}
 
 fn trace_layer<S>(
     tracer: opentelemetry_sdk::trace::Tracer,
@@ -800,6 +828,32 @@ mod tests {
         assert_eq!(dropped.load(super::Ordering::Relaxed), 7);
     }
 
+    #[test]
+    fn console_event_arrays_are_json_arrays_without_a_trace_exporter() {
+        use tracing_subscriber::{layer::SubscriberExt as _, registry};
+        let output = Output::default();
+        let writer = output.clone();
+        let console = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .event_format(super::CorrelatedJson(
+                tracing_subscriber::fmt::format().json().flatten_event(true),
+            ))
+            .with_writer(move || writer.clone());
+        tracing::subscriber::with_default(registry().with(console), || {
+            crate::with_event_string_array("github.deliveries", &["first", "second"], || {
+                tracing::info!(outcome = "queued", "admission")
+            });
+            tracing::info!(outcome = "ignored", "next");
+        });
+        let lines = json_lines(&output);
+        assert_eq!(
+            lines[0]["github.deliveries"],
+            serde_json::json!(["first", "second"])
+        );
+        assert!(lines[1].get("github.deliveries").is_none());
+    }
+
     fn wait_until_console_is_closed(state: &Mutex<super::ConsoleState>) {
         loop {
             let closed = match &*state.lock() {
@@ -937,6 +991,24 @@ mod tests {
         fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
             self.0.lock().push(event.metadata().target().to_owned());
         }
+    }
+
+    #[test]
+    fn native_array_audits_pass_the_log_filter_without_exporting_other_payloads() {
+        let recorded = RecordTargets::default();
+        let subscriber = registry().with(
+            recorded
+                .clone()
+                .with_filter(super::log_filter("job=debug,meter=info")),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "dekopon_gatewayd::audit", {audit.event = "gateway.message.received"}, "inbound");
+            crate::with_event_string_array("github.deliveries", &["first"], || {
+                tracing::info!(target: "dekopon_gatewayd::audit", {audit.event = "gateway.admission"}, "admission");
+                tracing::error!(target: "opentelemetry", {audit.event = "gateway.admission"}, "must not reexport");
+            });
+        });
+        assert_eq!(*recorded.0.lock(), vec!["dekopon_gatewayd::audit"]);
     }
 
     #[test]

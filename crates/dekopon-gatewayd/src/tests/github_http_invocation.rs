@@ -28,6 +28,9 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
     let mut second = doc["routes"][0].clone();
     second["conversation"]["ids"] = json!(["owner.other"]);
     doc["routes"].as_array_mut().unwrap().push(second);
+    let mut denied = doc["routes"][0].clone();
+    denied["conversation"]["ids"] = json!(["owner.denied"]);
+    doc["routes"].as_array_mut().unwrap().push(denied);
     let config = resolved(directory.path(), &doc).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let mut broker = BrokerFixture::scripted(directory.path(), |request, _| {
@@ -39,15 +42,10 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
         };
         assert_eq!(claim.agent.as_str(), "reviewer");
         let response = match claim.subject.canonical().as_str() {
-            "github.owner.repo"
-                if claim.scope.as_ref().unwrap().conversation.thread.as_deref()
-                    == Some("no-prompt") =>
-            {
-                ResponseEnvelope::error(
-                    dekopon_broker_protocol::ERROR_UNAUTHENTICATED,
-                    "agent-denied",
-                )
-            }
+            "github.owner.denied" => ResponseEnvelope::error(
+                dekopon_broker_protocol::ERROR_UNAUTHENTICATED,
+                "agent-denied",
+            ),
             "github.owner.repo" => ResponseEnvelope::chat_capabilities(
                 vec![capability("repo.read")],
                 vec![],
@@ -100,22 +98,21 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
         tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
     let client = reqwest::Client::new();
     let mut sessions = tokio::task::JoinSet::new();
-    let mut collector = crate::collection::Collector::new(&config.transports, 4);
-    let mut follow = crate::follow::Debounce::default();
     for (guid, repo) in [
         ("first", "REPO"),
         ("second", "OTHER"),
-        ("no-prompt", "REPO"),
+        ("no-prompt", "DENIED"),
     ] {
-        assert_eq!(
-            signed_reload_delivery(&client, address, guid, "workflow_run", repo).await,
-            reqwest::StatusCode::OK
-        );
-        let TransportEvent::Message(message) = transport.next().await.unwrap() else {
-            panic!("signed delivery queued")
+        let send = signed_reload_delivery(&client, address, guid, "workflow_run", repo);
+        let dispatch = async {
+            let TransportEvent::Delivery(message, ticket) = transport.next().await.unwrap() else {
+                panic!("signed delivery queued")
+            };
+            assert_eq!(message.conversation.thread.as_deref(), Some("repository"));
+            gateway.dispatch_delivery(&mut sessions, *message, ticket);
         };
-        assert_eq!(message.conversation.thread.as_deref(), Some(guid));
-        gateway.dispatch(&mut sessions, &mut collector, &mut follow, *message);
+        let (status, ()) = tokio::join!(send, dispatch);
+        assert_eq!(status, reqwest::StatusCode::OK);
         tokio::time::timeout(Duration::from_secs(5), sessions.join_next())
             .await
             .unwrap()
@@ -129,10 +126,10 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
         3,
         "no automatic fix or note invocation from reported runs"
     );
-    for (request, (guid, principal_subject)) in requests.iter().zip([
+    for (request, (_guid, principal_subject)) in requests.iter().zip([
         ("first", "github.owner.repo"),
         ("second", "github.owner.other"),
-        ("no-prompt", "github.owner.repo"),
+        ("no-prompt", "github.owner.denied"),
     ]) {
         let BrokerRequest::Capabilities {
             attestation: Some(claim),
@@ -143,7 +140,7 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
         assert_eq!(claim.subject.canonical(), principal_subject);
         assert_eq!(
             claim.scope.as_ref().unwrap().conversation.thread.as_deref(),
-            Some(guid)
+            Some("repository")
         );
         assert_eq!(claim.scope.as_ref().unwrap().trigger, Trigger::Message);
     }

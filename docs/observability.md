@@ -234,7 +234,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
-| `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
+| `gateway.asset.store_started` | `dekopon-gatewayd` | once after durable store startup has reconciled journal references: `asset.store.path`, filesystem `asset.store.free_bytes`, and configured `asset.store.budget_bytes`; the pin reverts when free bytes are below the budget |
+| `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`), plus sanitized storage error cause when applicable; no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
 | `agent.skill.read` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
@@ -623,6 +624,13 @@ fixed chat warning directs the sender to audit before retrying.
 Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopon_gatewayd::audit`, with `outcome`
 (`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
 plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
+GitHub admission records also cover `started` and `ignored`; every GitHub record carries
+`github.deliveries`, a native string array in arrival order. On a queued append it lists the whole
+tail batch so far; the last queued record names exactly that batch's deliveries. A busy record
+names the refused delivery, and a started record names the batch starting its turn.
+`outcome` and `busy.cause` (`saturated` or `same-conversation`) are low-cardinality alarm-able fields;
+`queue.depth` is numeric and alarm-able. OpenObserve or Grafana alerts can key on these fields,
+for example `outcome = busy` for the GitHub transport. This repository ships no alert rule.
 Only `busy` carries `busy.cause`. A full mailbox also emits `gateway_steer_refused` with
 `reason = mailbox-full`. An interrupted model call records `accounting.model.turn` with
 `outcome = steered` and `gateway.progress` with `kind = steered`; its replacement prompt contains
@@ -1170,7 +1178,9 @@ is no blind span ([storage telemetry and audit](#storage-telemetry-and-audit)).
 
 ## Model and tool transcript
 
-The gateway's OTLP log filter is `job=debug,meter=info`. The `agent.model.prompt`,
+The gateway's OTLP log filter is `job=debug,meter=info`; audit events carrying a scoped native
+array, including GitHub `gateway.admission` records, also reach the log exporter. Exporter
+diagnostics remain excluded. The `agent.model.prompt`,
 `agent.model.answer` and `agent.tool.*` events therefore reach OpenObserve as span events in the
 traces stream, rather than log records. Reconstruct the transcript from those events within the
 message trace.

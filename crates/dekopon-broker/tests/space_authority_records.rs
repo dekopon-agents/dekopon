@@ -155,7 +155,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
             kind: ConversationKind::Thread,
             container: Some("owner".into()),
             id: "owner.repo".into(),
-            thread: Some("delivery-1".into()),
+            thread: Some("7".into()),
         },
         trigger: Trigger::Message,
         delivery: Some(DeliveryIdentity::Github {

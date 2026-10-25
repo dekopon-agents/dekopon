@@ -63,7 +63,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   Without a journal, persistent routes remain window-only and config-check warns once.
   `githubWebhook` configuration requires `name`, `bind` and `secretEnv` (the name of a nonblank
   environment credential); its path is fixed at `/webhooks/github`. A GitHub route must set
-  nonempty, unique `githubEvents` from `pull_request` and `workflow_run`, a canonical
+  nonempty, unique `githubEvents` from the supported typed families, a canonical
   `conversation` thread selector and `memory: { mode: oneShot }`. Non-GitHub routes cannot set
   `githubEvents`. First route match precedes event filtering. The verified GitHub POST mount
   shares WhatsApp's listener when both use the same bind; GitHub alone binds that port. It
@@ -162,8 +162,11 @@ record failure cannot change an already delivered answer. Receipts do not prove 
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
 ordinary serving requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.
 
-Asset retention is process-wide: `sessions.assetRetentionBytes` defaults to 268435456 bytes on
-private disk scratch. Zero disables asset retention and attachment delivery, not the bound;
+Asset retention shares one `sessions.assetRetentionBytes` budget, defaulting to 1073741824 bytes
+(1 GiB). With `sessions.journal`, the required `sessions.assets.path` holds content-addressed files
+and a durable index; uploaded files survive restart while journal records name them. Without a
+journal, files use private temporary disk and die with the process. Generated files remain
+session-only in both modes. Zero disables asset retention and attachment delivery, not the bound;
 text-only sessions remain usable. Weak model references cannot prevent LRU reclamation. Generated
 PNG results publish gateway-owned `chat-asset:<N>` markers for successive edits; availability is
 not delivery confirmation. See [chat assets](../../docs/gatewayd.md#chat-assets) for lifecycle,

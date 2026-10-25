@@ -169,7 +169,9 @@ impl Conversation {
                             subject.tenant().unwrap_or_default(),
                             subject.subject()
                         )
-                    && thread.is_some_and(lowercase_scope_value)
+                    && thread.is_some_and(|value| {
+                        value.parse::<dekopon_core::github::GithubThread>().is_ok()
+                    })
             }
             ChatTransportKind::Local => {
                 container.is_none_or(lowercase_scope_value)
@@ -567,7 +569,7 @@ mod local_selector_tests {
             kind: ConversationKind::Thread,
             container: Some("a".into()),
             id: "a.x".into(),
-            thread: Some("delivery-guid".into()),
+            thread: Some("7".into()),
         };
         assert!(conversation.is_canonical_for(ChatTransportKind::Github, &subject));
         assert!(!conversation.is_canonical_for(

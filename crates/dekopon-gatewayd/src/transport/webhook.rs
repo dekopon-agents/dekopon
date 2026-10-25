@@ -1,7 +1,7 @@
 use std::{io, sync::Arc, time::Duration};
 
 use axum::{
-    Router,
+    Extension, Router,
     body::{Bytes, to_bytes},
     extract::Request,
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -20,6 +20,9 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_CONNECTION_BUFFER_BYTES: usize = 16 * 1024;
 pub(super) const MAX_WEBHOOK_CONCURRENCY: usize = 16;
 pub(super) const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+pub(super) struct RequestDeadline(pub(super) tokio::time::Instant);
 
 pub(super) async fn listen(
     bind: std::net::SocketAddr,
@@ -73,14 +76,17 @@ pub(super) async fn listen(
                             }
                         },
                     };
+                    let request_deadline = RequestDeadline(tokio::time::Instant::now() + WEBHOOK_REQUEST_TIMEOUT);
+                    let connection_deadline = request_deadline.0 + Duration::from_secs(1);
                     let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
                         continue;
                     };
-                    let service = TowerToHyperService::new(router.clone());
+                    let service = TowerToHyperService::new(router.clone().layer(Extension(request_deadline)));
                     connections.spawn(async move {
                         let _connection_permit = connection_permit;
                         let mut builder = hyper::server::conn::http1::Builder::new();
                         builder
+                            .keep_alive(false)
                             .max_headers(MAX_WEBHOOK_HEADERS)
                             .max_buf_size(MAX_CONNECTION_BUFFER_BYTES);
                         let connection = builder.serve_connection(TokioIo::new(stream), service);
@@ -91,7 +97,8 @@ pub(super) async fn listen(
                                       connection ended, by deadline or by hanging up; the \
                                       router already recorded whatever it answered"
                         )]
-                        let _ = tokio::time::timeout(WEBHOOK_REQUEST_TIMEOUT, connection).await;
+                        let _ = tokio::time::timeout_at(connection_deadline, connection)
+                        .await;
                     });
                 }
                 Some(_) = connections.join_next(), if !connections.is_empty() => {}
