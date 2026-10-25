@@ -568,6 +568,11 @@ where
                             .as_ref()
                             .and_then(|claim| broker.display_principal(&claim.subject)),
                     )
+                    .with_space(broker.space_grants(
+                        context,
+                        peer.attestor.as_ref(),
+                        attestation.as_ref(),
+                    ))
                 }
                 Err(_)
                     if attestation
