@@ -715,6 +715,8 @@ mod tests {
     fn check_output_serializes_peak_rss_as_number_or_null() {
         for peak in [Some(1234_u64), None] {
             let output = super::CheckOutput {
+                policy_digest: None,
+                identity_digest: None,
                 ok: true,
                 problems: Vec::new(),
                 warnings: Vec::new(),
