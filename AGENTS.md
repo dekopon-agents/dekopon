@@ -40,7 +40,7 @@ The model proposes; a separate broker authorizes and executes provider effects.
   what it lists: cut each release it allows and journal the version. Follow the
   [release procedure](README.md#maintainer-release-process), not memory.
 - Inside an approved execution contract, merge, tag, release and deploy without waiting when the
-  diff does what the plan said. The fresh adversarial review of the merged head is the review.
+  diff does what the plan said. The fresh adversarial review of the merged head or of a reviewed ancestor joined by clean base merges is the review.
   A coordinator-launched Astra review satisfies it, since each runs in a new thread; warm Claude
   review rounds are an additional check where the gate requires one.
 - Stop for the owner when the work leaves the plan: a change it did not name, a change to a contract
