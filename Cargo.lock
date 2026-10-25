@@ -1188,6 +1188,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "mime",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
