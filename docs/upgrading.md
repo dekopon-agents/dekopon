@@ -14,7 +14,8 @@ No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
 
 - A live conversation generation no longer drops attachments past 32 entries or after idle expiry. The `sessions.assetRetentionBytes` disk LRU is the only bound on retained bytes; one-shot inventories keep their one-hour idle bound.
 - The gateway sends no metadata rows on `Invoke`. A 0.54.0 broker still accepts them from older clients.
-- Rust callers: `dekopon_shell::run_parsed` and `dekopon_agent::command_run_from_outcome` are removed.
+- `dekopon-brokerd` writes its terminal `broker_exit` diagnostic to stderr, not stdout or OTLP. A log pipeline that watches for it reads stderr.
+- Rust callers: `dekopon_shell::run_parsed`, `dekopon_shell::CapabilityInvoker::run_command`, `CommandRun::Proposed`, `dekopon_agent::command_run_from_outcome`, `dekopon_agent::attachment::ChatAssetSource::rows` and `ChatAssetInputs::prepare` are removed. A `CapabilityInvoker` implements `run` instead of `run_command`, and `dekopon_shell::render_run` replaces `run_parsed`.
 
 ## Space-scoped storage and the config-check catalog mount (0.53.0)
 
