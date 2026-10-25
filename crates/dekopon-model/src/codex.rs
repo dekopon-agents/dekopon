@@ -187,6 +187,8 @@ impl CodexClient {
             ))
             .await
             .inspect_err(|_| record_phase(FailurePhase::BeforeSend))??;
+        span.record("tool_choice", body.tool_choice);
+        span.record("parallel_tool_calls", body.parallel_tool_calls);
         let encoded = compact_json_body(&body).map_err(TransportFailure::Encoding)?;
         drop(body);
         let builder = self
@@ -945,10 +947,14 @@ async fn responses_content(
                     .await
                     .map_err(TransportFailure::Blocking)?
                 {
-                    Ok(bytes) => Some(bytes),
+                    Ok(bytes) => {
+                        data.record_preparation(crate::asset::Preparation::Original);
+                        Some(bytes)
+                    }
                     Err(
                         crate::asset::BlobError::Reclaimed | crate::asset::BlobError::Unauthorized,
                     ) => {
+                        data.record_preparation(crate::asset::Preparation::ReleaseNotice);
                         content.push(ResponsesContent::InputText {
                             text: data.release_notice().into(),
                         });
@@ -1097,6 +1103,65 @@ mod tests {
         (directory, server, client)
     }
 
+    #[tokio::test]
+    async fn preparation_tracks_each_occurrence_without_changing_raw_serialization() {
+        use crate::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct ReadSequence {
+            blob: DiskBlob,
+            reads: AtomicUsize,
+        }
+        impl BlobSource for ReadSequence {
+            fn pin(&self) -> Result<DiskBlob, BlobError> {
+                if self.reads.fetch_add(1, Ordering::Relaxed) == 1 {
+                    Err(BlobError::Unauthorized)
+                } else {
+                    Ok(self.blob.clone())
+                }
+            }
+        }
+        let source = Arc::new(ReadSequence {
+            blob: DiskBlob::from_bytes(b"abc").unwrap(),
+            reads: AtomicUsize::new(0),
+        });
+        let reference = BlobReference::new(Arc::clone(&source) as Arc<dyn BlobSource>, 3, 7);
+        let message = ModelMessage::user_with_parts(vec![
+            ContentPart::Image {
+                mime: "image/png".into(),
+                data: reference.clone(),
+            },
+            ContentPart::File {
+                name: "photo.png".into(),
+                mime: "image/png".into(),
+                data: reference,
+            },
+        ]);
+        let wire = serde_json::to_value(responses_content(&message).await.unwrap()).unwrap();
+        assert_eq!(wire[0]["image_url"], "data:image/png;base64,YWJj");
+        let raw = serde_json::to_value(&message).unwrap();
+        let prepared = serde_json::to_value(message.prepared_for_trace()).unwrap();
+        assert_eq!(
+            prepared["content"][0],
+            "[image/png, 3 bytes] sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(prepared["content"][1], wire[1]["text"]);
+        assert_eq!(raw["content"][1], "[photo.png (image/png), 3 bytes]");
+        assert_eq!(source.reads.load(Ordering::Relaxed), 2);
+
+        let wire = serde_json::to_value(responses_content(&message).await.unwrap()).unwrap();
+        assert_eq!(wire[1]["file_data"], "data:image/png;base64,YWJj");
+        assert_eq!(
+            serde_json::to_value(message.prepared_for_trace()).unwrap(),
+            raw
+        );
+        assert_eq!(serde_json::to_value(&message).unwrap(), raw);
+        assert_eq!(source.reads.load(Ordering::Relaxed), 4);
+    }
+
     #[test]
     fn message_snapshots_only_supply_text_for_messages_without_deltas() {
         for (delta, expected) in [
@@ -1228,6 +1293,21 @@ mod tests {
         );
         assert_eq!(replay[2]["content"][0]["text"], "unindexed");
         assert_eq!(replay[3]["content"][0]["text"], "again");
+    }
+
+    #[tokio::test]
+    async fn codex_span_tool_options_equal_the_sent_body() {
+        let (_directory, server, client) = fixture(vec![MockResponse::sse(include_str!(
+            "fixtures/codex-answer.sse"
+        ))]);
+        let (result, span) =
+            crate::trace_capture::exported_model_span(generate(&client, &control())).await;
+        result.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        crate::trace_capture::assert_tool_options(&span, &body);
     }
 
     #[tokio::test]

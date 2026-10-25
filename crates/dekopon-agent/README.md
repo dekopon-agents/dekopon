@@ -150,18 +150,19 @@ the dependency discipline CI enforces for `dekopon-gatewayd`.
 Telemetry follows `docs/observability.md`: spans (`prompt.session`, `prompt.model_turn`,
 `prompt.script`, and `prompt.asset_fetch` when an embedder supplies chat assets) and
 `dekopon_agent::audit` accounting events carry counts,
-durations, and stable categories; prompts, model answers, and script text ride the log stream only
-when the embedding binary opts into payload telemetry, and then the transcript is emitted whole
-once per session and extended by the messages each later turn appended. The skill and
-suggestion records fire in either payload mode. `agent.skill.read` carries `skill.name` (the
+durations, and stable categories. Prompts, model answers, and script text are emitted unconditionally;
+the gateway records them as span events in the message trace. Full transcripts occur initially,
+after steered cancellations, and when preparation changes previously transcribed content. Deltas
+carry appended messages between full events; each full event replaces the accumulated transcript. Skill and
+suggestion records are also unconditional. `agent.skill.read` carries `skill.name` (the
 operator-authored name the request matched, never the one the model typed), `skill.resource`
 (empty for the instructions), `skill.bytes`, and `skill.repeated`; `agent.skill.refused` carries a
 `reason` of `unknown-skill` or `unknown-resource`. `agent.improvement.suggested` carries
 `suggestion.index` and the six bounded fields, model-authored text included, same as every other
 model-authored record (goal 2); `agent.improvement.refused` carries a `reason` of
 `invalid-category`, `invalid-confidence`, `empty-field`, `field-too-long`, or `session-limit` and
-none of the submitted text. A `read_skill` result reaches the log stream only inside the next
-turn's `agent.model.prompt` delta, with payloads on; neither `agent.tool.script` nor
+none of the submitted text. A `read_skill` result reaches the message trace only inside the next
+turn's `agent.model.prompt` delta; neither `agent.tool.script` nor
 `agent.tool.output` fires for it.
 
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see

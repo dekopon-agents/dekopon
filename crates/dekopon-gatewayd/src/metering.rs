@@ -471,7 +471,7 @@ impl ChatModel for ChatProviderGovernor {
         let fresh = messages.get(seen..).unwrap_or(messages);
         let estimate = Estimate::from_sizes(
             Sizes {
-                bytes: json_bytes(messages).saturating_add(json_bytes(tools)),
+                bytes: json_bytes(messages).saturating_add(serialized_bytes(tools)),
                 images: images(messages),
             },
             Some((
@@ -541,8 +541,24 @@ impl std::io::Write for ByteCount {
     }
 }
 
-/// Image and file bytes serialize as a short summary, so this counts text and structure only.
-fn json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+struct MeteredMessages<'a>(&'a [ModelMessage]);
+
+impl serde::Serialize for MeteredMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for message in self.0 {
+            sequence.serialize_element(&message.for_metering())?;
+        }
+        sequence.end()
+    }
+}
+
+fn json_bytes(messages: &[ModelMessage]) -> usize {
+    serialized_bytes(&MeteredMessages(messages))
+}
+
+fn serialized_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     let mut count = ByteCount(0);
     match serde_json::to_writer(&mut count, value) {
         Ok(()) => count.0,
@@ -641,6 +657,119 @@ mod tests {
     }
 
     #[test]
+    fn reading_images_does_not_change_metered_json_bytes() {
+        let data: dekopon_model::asset::BlobReference =
+            dekopon_model::asset::DiskBlob::from_bytes(b"pixels")
+                .unwrap()
+                .into();
+        let image = ContentPart::Image {
+            mime: "image/png".to_owned(),
+            data: data.clone(),
+        };
+        let messages = [ModelMessage::user_with_parts(vec![
+            image.clone(),
+            image,
+            ContentPart::File {
+                name: "pixels.bin".to_owned(),
+                mime: "application/octet-stream".to_owned(),
+                data: data.clone(),
+            },
+            ContentPart::Text(format!(" sha256:{}", "0".repeat(64))),
+        ])];
+        let before = json_bytes(&messages);
+        assert_eq!(before, serialized_bytes(&messages));
+        data.read().unwrap();
+        assert_eq!(serialized_bytes(&messages), before + 2 * 72);
+        assert_eq!(json_bytes(&messages), before);
+    }
+
+    #[tokio::test]
+    async fn concurrent_digest_initialization_does_not_change_metered_json_bytes() {
+        use dekopon_model::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
+        use std::sync::mpsc;
+
+        struct PausedRead {
+            blob: DiskBlob,
+            entered: mpsc::SyncSender<()>,
+            resume: parking_lot::Mutex<mpsc::Receiver<()>>,
+        }
+        impl BlobSource for PausedRead {
+            fn pin(&self) -> Result<DiskBlob, BlobError> {
+                Ok(self.blob.clone())
+            }
+            fn read(&self) -> Result<Vec<u8>, BlobError> {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                self.blob.read()
+            }
+        }
+        struct InitializeDuringText {
+            count: ByteCount,
+            initialize: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+        }
+        impl std::io::Write for InitializeDuringText {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() >= 65_536
+                    && let Some((resume, initialized)) = self.initialize.take()
+                {
+                    resume.send(()).unwrap();
+                    initialized.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                std::io::Write::write(&mut self.count, bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                std::io::Write::flush(&mut self.count)
+            }
+        }
+        let (entered, started) = mpsc::sync_channel(1);
+        let (resume, resumed) = mpsc::sync_channel(1);
+        let (initialized, completed) = mpsc::sync_channel(1);
+        let data = BlobReference::new(
+            Arc::new(PausedRead {
+                blob: DiskBlob::from_bytes(b"pixels").unwrap(),
+                entered,
+                resume: parking_lot::Mutex::new(resumed),
+            }),
+            6,
+            1,
+        );
+        let messages = [
+            ModelMessage::user("history"),
+            ModelMessage::user_with_parts(vec![
+                ContentPart::Text("x".repeat(65_536)),
+                ContentPart::Image {
+                    mime: "image/png".into(),
+                    data: data.clone(),
+                },
+            ]),
+        ];
+        let whole_before = json_bytes(&messages);
+        let fresh_before = json_bytes(&messages[1..]);
+        assert_eq!(serialized_bytes(&messages), whole_before);
+        let read = tokio::task::spawn_blocking(move || {
+            let bytes = data.read().unwrap();
+            initialized.send(()).unwrap();
+            bytes
+        });
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        read.abort();
+        let mut writer = InitializeDuringText {
+            count: ByteCount(0),
+            initialize: Some((resume, completed)),
+        };
+        serde_json::to_writer(&mut writer, &MeteredMessages(&messages)).unwrap();
+        assert!(writer.initialize.is_none());
+        assert_eq!(writer.count.0, whole_before);
+        assert_eq!(json_bytes(&messages), whole_before);
+        assert_eq!(json_bytes(&messages[1..]), fresh_before);
+        assert_eq!(serialized_bytes(&messages), whole_before + 72);
+        assert_eq!(read.await.unwrap(), b"pixels");
+    }
+
+    #[test]
     fn a_refused_call_never_reaches_the_inner_model() {
         let metering = metering(10);
         let inner = streaming(None);
@@ -671,7 +800,7 @@ mod tests {
         let input = Estimate::from_sizes(
             Sizes {
                 bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
-                    + json_bytes::<[ModelTool]>(&[]),
+                    + serialized_bytes::<[ModelTool]>(&[]),
                 images: 0,
             },
             None,
@@ -754,7 +883,7 @@ mod tests {
         let estimated_input = Estimate::from_sizes(
             Sizes {
                 bytes: json_bytes(&[ModelMessage::user("x".repeat(400))])
-                    + json_bytes::<[ModelTool]>(&[]),
+                    + serialized_bytes::<[ModelTool]>(&[]),
                 images: 0,
             },
             None,

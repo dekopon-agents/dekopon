@@ -23,8 +23,8 @@ log exporter loses audit; that is the accepted consequence of the constitution's
 crash-durable audit ([non-goals](design.md#non-goals)).
 
 **A span is a span of time; a log is a fact that is not a duration.** A log event justifies itself
-as a payload — text too large or too unbounded for a span attribute, the model and tool transcript
-below — or as a survivor: costs, refusals, and errors, which outlive trace retention and sampling.
+as a payload — text too large or too unbounded for a span attribute — or as a survivor: costs,
+refusals, and errors, which outlive trace retention and sampling.
 An `X.started` event is neither, because the span's start time is strictly better and carries
 parent and duration besides.
 
@@ -148,6 +148,7 @@ library uses `tracing` only and installs no subscriber.
 | `model.stream`, `cache.style` | local streamed/buffered mode and `automatic`/`explicitPrefix` encoding |
 | `generation.max_output_tokens`, `generation.temperature`, `generation.top_p`, `reasoning.effort` | authored OpenRouter requests, absent when omitted |
 | `routing.allow_fallbacks`, `routing.require_parameters`, `routing.only`, `cache.ttl` | authored routing/TTL hints; `routing.only` is a bounded comma-separated diagnostic |
+| `tool_choice`, `parallel_tool_calls` | request tool selection (string) and parallel-call permission (boolean), only when the dialect sends that option |
 | `timing.total_ms` | complete exchange duration, including preparation and permitted refresh/resend |
 | `timing.headers_ms` | most recent send-to-headers duration; a Codex resend replaces the earlier value |
 | `timing.first_event_ms`, `stream.first_delta_ms` | time since adapter exchange starts (before preparation) to first SSE event / first visible text; absent when no such event/text exists |
@@ -176,8 +177,12 @@ never enter `model.complete` fields, and `traceparent` is not forwarded to the i
 Counts, byte totals, `output.partial`, `model.stream`, `cache.style` and the reported model are
 recorded once per exchange, not per delta or chunk, so a long stream cannot push `outcome` or
 `usage.*` past the span's attribute limit.
-`agent.model.prompt` includes `tools`: comma-joined names offered to that exact model turn,
-empty when none. Values over 4096 bytes end with `[…]`; the prefix is not a complete tool list.
+`agent.model.prompt` includes `gen_ai.tool.definitions` on the session's `full` event: an
+unbounded JSON array of the exact tool names, descriptions and parameter schemas given to the
+client. The tool set is fixed for the session. Image summaries retain `[mime, N bytes]` and append
+`sha256:<hex>` for decoded bytes read during request preparation. The digest is cached on the blob
+reference without another read. A failed preparation that never read an image has no digest.
+The prompt event is emitted after the model call, including failures, before the answer event.
 `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
 
 Requested settings describe what Dekopon encoded, not what a remote provider honored.
@@ -246,10 +251,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never
-reduced to a category — because a suggestion nobody can read is not a suggestion. Unlike a model's
-own prompt and answer text, which rides the log stream only when the embedding binary opts into
-payload telemetry, this record is unconditional: offering `suggest_improvement` is itself what puts
-the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
+reduced to a category — because a suggestion nobody can read is not a suggestion. This record is
+unconditional: offering `suggest_improvement` is itself what puts the text in scope, per goal 2. It carries no chat text the gateway holds and no subject, only what
 the model wrote into those fields.
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
@@ -1134,7 +1137,7 @@ withholds half of it serves nobody the constitution recognizes ([goal
 | `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — argv, drained provider or buffered-builtin input when recorded, and the rendered command result |
 | `provider.run_command` | `command.arguments`, `command.stdin`, `command.output` — the argv, the piped value, and the guest's answer |
 | `http.request` | `url.full` — the destination with its path and query |
-| model/tool log events | the verbatim transcript; see below |
+| model/tool span events | the verbatim transcript; see below |
 
 The six command fields and both `input` fields cut at the same place. A value of up to 4096 bytes
 passes unchanged; a longer one is cut at the last character boundary within 4096 bytes and suffixed
@@ -1159,17 +1162,16 @@ is no blind span ([storage telemetry and audit](#storage-telemetry-and-audit)).
 
 ## Model and tool transcript
 
-The verbatim exchange between the model and its tools rides the **log stream**, not span attributes.
-A conversation is unbounded text: span attributes are the wrong container for it, every trace fetch
-would drag the payload along, and a backend indexes log bodies for full-text search rather than span
-fields. Both signals carry the same `trace_id` and `span_id`, so a log result pivots to the turn it
-belongs to.
+The gateway's OTLP log filter is `job=debug,meter=info`. The `agent.model.prompt`,
+`agent.model.answer` and `agent.tool.*` events therefore reach OpenObserve as span events in the
+traces stream, rather than log records. Reconstruct the transcript from those events within the
+message trace.
 
 These events join the accounting and refusal ones:
 
 | Event | Carries |
 |---|---|
-| `agent.model.prompt` | The session's opening message list on its first turn, and on every later turn only the messages appended since the previous one |
+| `agent.model.prompt` | The session's message list on `full` events, and only the messages appended since the previous event on `delta` events |
 | `agent.model.answer` | Assistant text and the tool calls it requested, with arguments; `stream.interrupted = true` when a cancellation cut the turn short, and the text is then what had arrived |
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
@@ -1178,13 +1180,15 @@ These events join the accounting and refusal ones:
 | `gateway.session.cache_key` | The prompt cache key this session declared, and whether its route is persistent |
 | `gateway.wake.scheduled` | The wake id, whether it is a watch, and the canonical subject it will speak as; the note and probe script are in the `agent.model.answer` tool call that asked for it |
 
-`agent.model.prompt` is emitted whole once per session and extended thereafter. Turn N's message
-list strictly contains turn N-1's, and everything appended since was already emitted by
-`agent.model.answer`, `agent.tool.script`, and `agent.tool.output` on the turn that produced it, so
-re-sending the whole list every turn would cost a long session O(N²) payload bytes of near-
-duplicates. `transcript.scope` says which shape an event carries (`full` or `delta`) and
+`agent.model.prompt` is emitted whole at session start and extended while prior content is unchanged.
+Sending only appended messages between full events avoids O(N²) duplicate payload bytes in a long
+session. `transcript.scope` says which shape an event carries (`full` or `delta`) and
 `message.count` gives the size of the request actually sent, so a reader can tell a trimmed session
-from a truncated log. Concatenating a session's events in order reconstructs the exact transcript.
+from a truncated event. After a steered cancellation or a change to previously transcribed content
+during preparation, the next prompt event is `full` again,
+including tool definitions and image digests resolved during the request. Released or unauthorized
+assets appear as the same text substitution that preparation sent to the model. A reader replaces
+its accumulated transcript on each `full` event and appends each `delta` to reconstruct the exact transcript.
 
 `accounting.model.turn` carries turn counts, durations, and outcomes. `agent.config.inspected`
 carries only the bounded result byte count and whether this call repeated an earlier one; it never
@@ -1199,7 +1203,7 @@ A mounted skill takes the same route as that meta result. The listing the model 
 one-line descriptions under one sentence that says to call `read_skill` — is a system message of its own,
 placed after the standing instructions, so it rides the first turn's `full` `agent.model.prompt`.
 The skill's text does not: a `read_skill` result is appended to the conversation like any other tool
-message and reaches the log stream only inside the following turn's `agent.model.prompt` delta.
+message and reaches the message trace only inside the following turn's `agent.model.prompt` delta.
 Neither `agent.tool.script` nor `agent.tool.output` fires for a skill read; `agent.skill.read`
 records the name, the path, and the byte count.
 
