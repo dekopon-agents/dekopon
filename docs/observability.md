@@ -646,7 +646,7 @@ the journal directory, with `reason` `missing`, `loose-mode` or `malformed`; it 
 secret. Every conversation's cache key changes once after it.
 
 `gateway_indicators_effective` is emitted once per resolved route/conversation kind at
-configuration load: route index, transport name, kind, mode, status, typing, working, seen,
+boot and each activated reload: route index, transport name, kind, mode, status, typing, working, seen,
 progress, stream, status-text, and cancel-button values only. It contains no subject,
 conversation coordinate, principal, message, credential or model text. It is configuration
 telemetry, not a broker decision or an indication that a chat service accepted a reaction.
