@@ -70,8 +70,15 @@ async fn script_deadline_cancellation_does_not_change_a_jobs_deadline_error() {
         timeout: Duration::from_secs(5),
         ..Limits::default()
     };
-    let script =
-        TreeContext::new(limits, CallBudget::new(32)).with_script_timeout(Some(limits.timeout));
+    let mut timer = Box::pin(tokio::time::sleep(limits.timeout));
+    assert!(
+        std::future::Future::poll(
+            timer.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
+    let script = TreeContext::new(limits, CallBudget::new(32)).with_script_timer(Some(timer));
     let job = script
         .clone()
         .with_cancel(vec![CancelSignal::never()])

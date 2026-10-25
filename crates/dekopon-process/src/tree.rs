@@ -177,10 +177,6 @@ impl TreeContext {
         self.retained.load(Ordering::Relaxed)
     }
 
-    pub fn max_value_bytes(&self) -> u64 {
-        self.limits.max_value_bytes
-    }
-
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
         if Instant::now() >= self.deadline {
             Err(LimitExceeded::Deadline {

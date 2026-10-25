@@ -85,7 +85,7 @@ impl Budget {
 
     #[must_use]
     pub fn max_value_bytes(&self) -> u64 {
-        self.tree.max_value_bytes()
+        self.tree.limits().max_value_bytes
     }
 }
 
