@@ -34,7 +34,8 @@ error after submission can mean effects already happened and must not trigger a 
 
 `RunCommand` (`runCommand`) remains the legacy parse-only operation. It grants no authority and
 carries no descriptors. `Invoke` remains for gateway-built proposals such as the memory Decider;
-it retains its metadata-table shape, with no input asset descriptors. An unrebuilt console's plain
+the gateway sends no metadata rows or input asset descriptors. The frame retains its existing
+shape, and the broker still accepts metadata rows from old clients. An unrebuilt console's plain
 commands still run through `RunCommand` plus `Invoke`; its attachment inputs are refused.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660` sockets, and

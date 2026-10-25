@@ -17,10 +17,9 @@ pub const GATEWAY_ASSETS_NOTE: &str = "[Gateway assets: this reply adapter accep
     retains a file but only a separately authorized asset.send delivers it. References use \
     chat-asset:<N>, never data URLs.]";
 
-const GRANTED: [&str; 25] = [
+const GRANTED: [&str; 24] = [
     "asset.attach",
     "asset.cat",
-    "asset.ls",
     "asset.rm",
     "asset.send",
     "gh.branch.read",
@@ -236,7 +235,6 @@ const ASSET_HELP: &str = "Manage conversation assets; attaching does not send
 Usage: asset <COMMAND>
 
 Commands:
-  ls      List conversation asset metadata
   rm      Remove an unsent asset
   send    Queue an asset for this turn's reply
   cat     Read bounded UTF-8 text from an asset
@@ -291,12 +289,12 @@ impl Parsed {
     }
 }
 
-fn clap_error(message: &str) -> CommandRun {
-    CommandRun::Rendered {
+fn clap_error(message: &str) -> Result<dekopon_shell::CommandProposal, CommandRun> {
+    Err(CommandRun::Rendered {
         stdout: String::new(),
         stderr: format!("error: {message}\n\nFor more information, try '--help'.\n"),
         status: 2,
-    }
+    })
 }
 
 enum ArgumentError<'a> {
@@ -305,7 +303,7 @@ enum ArgumentError<'a> {
 }
 
 impl ArgumentError<'_> {
-    fn render(&self) -> CommandRun {
+    fn render(&self) -> Result<dekopon_shell::CommandProposal, CommandRun> {
         match self {
             Self::Unexpected(name) => clap_error(&format!("unexpected argument '{name}' found")),
             Self::MissingValue(name) => clap_error(&format!(
@@ -348,27 +346,27 @@ fn parse<'a>(argv: &[&'a str]) -> Result<Parsed, ArgumentError<'a>> {
     Ok(parsed)
 }
 
-fn rendered(page: &str) -> CommandRun {
-    CommandRun::Rendered {
+fn rendered(page: &str) -> Result<dekopon_shell::CommandProposal, CommandRun> {
+    Err(CommandRun::Rendered {
         stdout: format!("{page}\n"),
         stderr: String::new(),
         status: 0,
-    }
+    })
 }
 
-fn usage(message: &str) -> CommandRun {
-    CommandRun::Failed {
+fn usage(message: &str) -> Result<dekopon_shell::CommandProposal, CommandRun> {
+    Err(CommandRun::Failed {
         message: message.to_owned(),
-    }
+    })
 }
 
-fn proposed(capability: &str, input: Value) -> CommandRun {
-    CommandRun::Proposed {
+fn proposed(capability: &str, input: Value) -> Result<dekopon_shell::CommandProposal, CommandRun> {
+    Ok(dekopon_shell::CommandProposal {
         capability: capability.to_owned(),
         input,
         secret_use: None,
         report: None,
-    }
+    })
 }
 
 fn is_help(argv: &[&str]) -> bool {
@@ -377,7 +375,7 @@ fn is_help(argv: &[&str]) -> bool {
         || argv.first() == Some(&"help")
 }
 
-fn gh(argv: &[&str]) -> CommandRun {
+fn gh(argv: &[&str]) -> Result<dekopon_shell::CommandProposal, CommandRun> {
     let words = argv
         .iter()
         .copied()
@@ -465,7 +463,7 @@ fn gh(argv: &[&str]) -> CommandRun {
     proposed(capability, input)
 }
 
-fn wikipedia(argv: &[&str]) -> CommandRun {
+fn wikipedia(argv: &[&str]) -> Result<dekopon_shell::CommandProposal, CommandRun> {
     if is_help(argv) || argv.is_empty() {
         return match argv
             .iter()
@@ -510,7 +508,7 @@ fn wikipedia(argv: &[&str]) -> CommandRun {
     }
 }
 
-fn image(argv: &[&str]) -> CommandRun {
+fn image(argv: &[&str]) -> Result<dekopon_shell::CommandProposal, CommandRun> {
     if is_help(argv) || argv.is_empty() {
         return match argv.first() {
             Some(&"generate") => rendered(IMAGE_GENERATE_HELP),
@@ -545,7 +543,7 @@ fn image(argv: &[&str]) -> CommandRun {
     }
 }
 
-fn asset(argv: &[&str]) -> CommandRun {
+fn asset(argv: &[&str]) -> Result<dekopon_shell::CommandProposal, CommandRun> {
     if is_help(argv) || argv.is_empty() {
         return match argv.first() {
             Some(&"send") => rendered(ASSET_SEND_HELP),
@@ -553,7 +551,6 @@ fn asset(argv: &[&str]) -> CommandRun {
         };
     }
     match argv {
-        ["ls"] => proposed("asset.ls", json!({})),
         ["send" | "rm" | "cat", n] => {
             let id = n.strip_prefix("chat-asset:").unwrap_or(n);
             if id.parse::<u64>().is_err() {
@@ -810,10 +807,7 @@ impl Orchard {
                 self.attached.lock().push(id);
                 json!({"image": {"generationId": format!("img_{id:04}"), "bytes": 1_843_211, "quality": "medium", "size": "1024x1024", "background": "opaque", "outputFormat": "png"}, "model": "gpt-image-2", "usage": {"inputTokens": 26, "outputTokens": 772, "totalTokens": 798}, "requestId": format!("req_{id:04}")})
             }
-            "asset.ls" => {
-                let assets = self.attached.lock().iter().map(|id| json!({"id": format!("chat-asset:{id}"), "content_type": "image/png", "encoding": "binary", "bytes": 1_843_211, "seekable": true, "origin": "capability", "sent": false})).collect::<Vec<_>>();
-                json!({"assets": assets})
-            }
+
             "asset.send" | "asset.rm" | "asset.cat" => {
                 let id = input["id"]
                     .as_str()
@@ -841,6 +835,24 @@ impl Orchard {
     }
 }
 
+impl Orchard {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        _stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        Some(match word {
+            "gh" => gh(&argv),
+            "wikipedia" => wikipedia(&argv),
+            "image" => image(&argv),
+            "asset" => asset(&argv),
+            _ => return None,
+        })
+    }
+}
+
 impl CapabilityInvoker for Orchard {
     fn granted(&self) -> Vec<String> {
         GRANTED.iter().map(|id| (*id).to_owned()).collect()
@@ -861,15 +873,44 @@ impl CapabilityInvoker for Orchard {
         ])
     }
 
-    fn run_command(&self, word: &str, argv: &[String], _stdin_piped: bool) -> Option<CommandRun> {
-        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
-        Some(match word {
-            "gh" => gh(&argv),
-            "wikipedia" => wikipedia(&argv),
-            "image" => image(&argv),
-            "asset" => asset(&argv),
-            _ => return None,
-        })
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
+            }
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
 
     fn invoke(

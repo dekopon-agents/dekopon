@@ -43,8 +43,8 @@ use dekopon_process::CancelHandle;
 use dekopon_process::{CallBudget, Limits as ShellLimits};
 use dekopon_protocol::Agent;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, CommandRun,
-    JobControl, Streams,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, JobControl,
+    Streams,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -786,10 +786,6 @@ impl CapabilityInvoker for LegHandle {
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         self.0.describe(capability)
-    }
-
-    fn run_command(&self, word: &str, argv: &[String], stdin: bool) -> Option<CommandRun> {
-        self.0.run_command(word, argv, stdin)
     }
 
     fn script_finished(&self) {

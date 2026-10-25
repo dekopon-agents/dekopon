@@ -773,14 +773,6 @@ impl ChatAssetSource for SessionAssets {
             })
         })
     }
-
-    fn rows(&self) -> Vec<AssetRow> {
-        self.store
-            .get_inventory(&self.access)
-            .iter()
-            .map(|asset| asset.row(asset.size))
-            .collect()
-    }
 }
 
 enum Located {
@@ -1581,6 +1573,15 @@ mod resolve_tests;
 mod retention_tests {
     use super::*;
 
+    fn inventory_rows(session: &SessionAssets) -> Vec<AssetRow> {
+        session
+            .store
+            .get_inventory(&session.access)
+            .iter()
+            .map(|asset| asset.row(asset.size))
+            .collect()
+    }
+
     #[test]
     fn row_limit_matches_the_protocol_contract() {
         assert_eq!(
@@ -2023,7 +2024,7 @@ mod retention_tests {
             session
                 .register(fd, &metadata, "asset.attach", "invocation")
                 .unwrap();
-            assert_eq!(session.rows().len(), MAX_ASSETS_PER_CONVERSATION);
+            assert_eq!(inventory_rows(&session).len(), MAX_ASSETS_PER_CONVERSATION);
             assert!(
                 store
                     .get_access(&access, first.unwrap(), Instant::now())
@@ -2222,8 +2223,7 @@ mod retention_tests {
             true,
         );
         assert_eq!(
-            session
-                .rows()
+            inventory_rows(&session)
                 .iter()
                 .map(|row| row.bytes)
                 .collect::<Vec<_>>(),
@@ -2234,26 +2234,26 @@ mod retention_tests {
             let id = registered.arrived[0];
             let blob = input(&session, id).unwrap();
             assert_eq!(blob.len(), 3);
-            assert_eq!(session.rows()[0].bytes, Some(3));
+            assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
             drop(blob);
             reclaim(&store, &access, id);
             assert_eq!(
                 input(&session, id).unwrap_err(),
                 ChatAssetRefusal::Reclaimed
             );
-            assert_eq!(session.rows()[0].bytes, Some(3));
+            assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
             let empty_id = registered.arrived[1];
             let empty = store.admit(&access, empty_id, b"").unwrap();
             assert_eq!(empty.len(), 0);
-            assert_eq!(session.rows()[1].bytes, Some(0));
+            assert_eq!(inventory_rows(&session)[1].bytes, Some(0));
             drop(empty);
             reclaim(&store, &access, empty_id);
             assert_eq!(
                 input(&session, empty_id).unwrap_err(),
                 ChatAssetRefusal::Reclaimed
             );
-            assert_eq!(session.rows()[1].bytes, Some(0));
+            assert_eq!(inventory_rows(&session)[1].bytes, Some(0));
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
         })
         .await
@@ -2305,7 +2305,7 @@ mod retention_tests {
                     ChatAssetRefusal::Reclaimed
                 );
                 assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
-                assert_eq!(session.rows()[0].bytes, Some(3));
+                assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
                 assert_eq!(store.retention.lock().bytes, 0);
                 assert_eq!(residents(&store), 0);
             })
@@ -2660,7 +2660,7 @@ mod retention_tests {
             .unwrap();
         session.remove(id).unwrap();
         assert_eq!(store.retention.lock().bytes, 0);
-        assert!(session.rows().is_empty());
+        assert!(inventory_rows(&session).is_empty());
         let disabled = Arc::new(AssetStore::with_retention(8, Duration::from_secs(600), 0));
         let disabled_session = SessionAssets::new(
             Arc::clone(&disabled),
@@ -2715,7 +2715,7 @@ mod retention_tests {
                 session.register(fd, &metadata, "image.edit", "overflow"),
                 Err(BlobError::TooLarge)
             );
-            assert_eq!(session.rows().len(), 5);
+            assert_eq!(inventory_rows(&session).len(), 5);
         }
     }
 
@@ -2743,8 +2743,7 @@ mod retention_tests {
                     .register(fd, &metadata, "image.edit", "invocation")
                     .unwrap();
                 assert_eq!(
-                    session
-                        .rows()
+                    inventory_rows(&session)
                         .iter()
                         .find(|row| row.id == id)
                         .unwrap()
@@ -2799,7 +2798,7 @@ mod retention_tests {
             assert!(note.contains(&"a".repeat(128)));
             assert!(!note.contains(&"a".repeat(129)));
             assert_eq!(
-                session.rows().last().unwrap().content_type,
+                inventory_rows(&session).last().unwrap().content_type,
                 label,
                 "only presentation is bounded, never the authoritative label"
             );

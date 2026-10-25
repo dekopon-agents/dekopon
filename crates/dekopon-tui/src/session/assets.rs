@@ -116,15 +116,6 @@ impl ChatAssetSource for ConsoleAssets {
             })
         })
     }
-
-    fn rows(&self) -> Vec<AssetRow> {
-        self.0
-            .lock()
-            .items
-            .values()
-            .map(|(row, _)| row.clone())
-            .collect()
-    }
 }
 
 impl GeneratedAssetStore for ConsoleAssets {
@@ -229,10 +220,19 @@ mod tests {
         assert_eq!(descriptor_bytes, b"returned");
         drop(pins);
         drop(prepared);
-        assert_eq!(store.rows().len(), 2);
-        assert_eq!(store.rows()[0].encoding, AssetEncoding::Identity);
-        assert_eq!(store.rows()[0].content_type, "image/heic");
-        assert_eq!(store.rows()[1].content_type, "image/png");
+        assert_eq!(store.0.lock().items.len(), 2);
+        assert_eq!(
+            store.resolve_input(1).await.unwrap().row.encoding,
+            AssetEncoding::Identity
+        );
+        assert_eq!(
+            store.resolve_input(1).await.unwrap().row.content_type,
+            "image/heic"
+        );
+        assert_eq!(
+            store.resolve_input(2).await.unwrap().row.content_type,
+            "image/png"
+        );
         drop(blob);
         store.remove(local).unwrap();
         assert!(matches!(
@@ -300,6 +300,6 @@ mod tests {
                 .attach_base64("image/heic", &"A".repeat(699_052))
                 .is_err()
         );
-        assert!(store.rows().is_empty());
+        assert!(store.0.lock().items.is_empty());
     }
 }
