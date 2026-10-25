@@ -204,6 +204,9 @@ spec:
             - name: against-source
               mountPath: /check/live.d
               readOnly: true
+            - name: catalog
+              mountPath: {{ .Values.paths.catalogDir }}
+              readOnly: true
 {{- end }}
             - name: tmp
               mountPath: /tmp
@@ -268,6 +271,18 @@ spec:
         - name: against-source
           configMap:
             name: {{ $check.gateway.againstConfigMap }}
+        - name: catalog
+          configMap:
+{{- if .Values.gateway.catalog.existingConfigMap }}
+            name: {{ .Values.gateway.catalog.existingConfigMap }}
+{{- with .Values.gateway.catalog.existingConfigMapKey }}
+            items:
+              - key: {{ . }}
+                path: {{ $.Values.gateway.catalog.fileName }}
+{{- end }}
+{{- else }}
+            name: {{ include "dekopon.catalogConfigMapName" . }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if $skills }}

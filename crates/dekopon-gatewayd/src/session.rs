@@ -1899,7 +1899,7 @@ async fn session(
 ) -> Ended {
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
-    let key = conversation_key(route, message);
+    let mut key = conversation_key(route, message);
     let is_follow = matches!(message.message_id, MessageId::Follow(_));
     if is_follow {
         let ticket = runner.follow.as_ref().map(|table| {
@@ -1922,7 +1922,7 @@ async fn session(
             return MessageOutcome::FollowInactive.into();
         }
     }
-    let sealed = sealed_conversation(
+    let mut sealed = sealed_conversation(
         runner,
         &key,
         route
@@ -1933,29 +1933,8 @@ async fn session(
             }),
     )
     .await;
-    match message.conversation.kind {
-        ConversationKind::Thread if sealed.is_some() => {
-            revoke_thread_ownership(runner, message);
-            tracing::info!(
-                event = "gateway_session_rejected",
-                reason = "sealed",
-                "gateway.session.rejected"
-            );
-            if !is_follow
-                && !message
-                    .thread_continuation
-                    .as_ref()
-                    .is_some_and(|continuation| continuation.inherited)
-                && answer(driver, message, SEALED_THREAD_REPLY).await
-            {
-                reply_delivered(MessageOutcome::Sealed);
-            }
-            return MessageOutcome::Sealed.into();
-        }
-        ConversationKind::Thread
-        | ConversationKind::DirectMessage
-        | ConversationKind::GroupDirectMessage
-        | ConversationKind::Channel => {}
+    if reject_sealed_thread(runner, message, driver, sealed).await {
+        return MessageOutcome::Sealed.into();
     }
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
@@ -2049,6 +2028,42 @@ async fn session(
             return MessageOutcome::Failed.into();
         }
     };
+    let space_grants = match route.memory {
+        MemoryPolicy::Persistent(MemoryWindow {
+            scope: MemoryScope::SharedConversation,
+            ..
+        }) => leg.space_grants(),
+        MemoryPolicy::OneShot
+        | MemoryPolicy::Persistent(MemoryWindow {
+            scope: MemoryScope::PrivateConversation,
+            ..
+        }) => None,
+    };
+    if space_grants.is_some() {
+        key = ConversationKey::for_space(
+            dekopon_core::SpaceKey {
+                agent: route.agent.clone(),
+                transport: message.transport.clone().into(),
+                workspace: message.conversation.container.clone().map(Into::into),
+                channel: message.conversation.id.clone().into(),
+            },
+            message.conversation.thread.clone(),
+        );
+        sealed = sealed_conversation(
+            runner,
+            &key,
+            route
+                .memory
+                .window()
+                .map_or(crate::config::DEFAULT_FORGET_AFTER, |window| {
+                    window.forget_after
+                }),
+        )
+        .await;
+        if reject_sealed_thread(runner, message, driver, sealed).await {
+            return MessageOutcome::Sealed.into();
+        }
+    }
     // Same-sender steers use this leg; other senders and wakes open their own follow-up leg.
     let granted = leg.granted();
     // Removing the entry, not just refusing further calls, matters because a revoked subject's
@@ -2056,9 +2071,11 @@ async fn session(
     // about.
     if granted.is_empty() {
         revoke_thread_ownership(runner, message);
-        runner
-            .conversations
-            .remove(&key, EvictionReason::GrantChanged);
+        if space_grants.is_none() {
+            runner
+                .conversations
+                .remove(&key, EvictionReason::GrantChanged);
+        }
         tracing::info!(
             event = "gateway_session_rejected",
             transport = message.transport.as_str(),
@@ -2083,6 +2100,9 @@ async fn session(
         }
         return MessageOutcome::Unauthorized.into();
     }
+    let granted = space_grants.map_or(granted, |grants| {
+        grants.iter().map(ToString::to_string).collect()
+    });
     // A chat thread becomes a continuation surface only after this exact sender's fresh broker
     // grant succeeds; merely mentioning the bot or putting coordinates in model text cannot claim
     // one.
@@ -2834,6 +2854,39 @@ async fn session(
             journal: pending_journal,
         }
     }
+}
+
+async fn reject_sealed_thread(
+    runner: &SessionRunner,
+    message: &InboundMessage,
+    driver: &Arc<dyn ChatDriver>,
+    sealed: Option<SealedConversation>,
+) -> bool {
+    match message.conversation.kind {
+        ConversationKind::Thread if sealed.is_some() => {
+            revoke_thread_ownership(runner, message);
+            tracing::info!(
+                event = "gateway_session_rejected",
+                reason = "sealed",
+                "gateway.session.rejected"
+            );
+            if !matches!(message.message_id, MessageId::Follow(_))
+                && !message
+                    .thread_continuation
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.inherited)
+                && answer(driver, message, SEALED_THREAD_REPLY).await
+            {
+                reply_delivered(MessageOutcome::Sealed);
+            }
+            return true;
+        }
+        ConversationKind::Thread
+        | ConversationKind::DirectMessage
+        | ConversationKind::GroupDirectMessage
+        | ConversationKind::Channel => {}
+    }
+    false
 }
 
 async fn sealed_conversation(

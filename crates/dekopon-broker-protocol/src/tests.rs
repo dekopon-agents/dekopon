@@ -2950,3 +2950,18 @@ fn a_github_thread_is_a_number_or_the_repository() {
         );
     }
 }
+
+#[test]
+fn space_grants_are_optional_and_an_empty_space_remains_present() {
+    let old = ResponseEnvelope::capabilities(Vec::new(), Vec::new(), Default::default());
+    let bytes = serde_json::to_vec(&old).expect("old answer");
+    assert_eq!(bytes, br#"{"apiVersion":"dekopon.dev/broker/v1alpha2","response":{"type":"capabilities","capabilities":[],"command_words":[]}}"#);
+    assert_eq!(
+        serde_json::from_slice::<ResponseEnvelope>(&bytes).expect("decode"),
+        old
+    );
+    let space = old.clone().with_space(Some(Vec::new()));
+    let mut expected = serde_json::to_value(&old).expect("value");
+    expected["response"]["space"] = serde_json::json!([]);
+    assert_eq!(serde_json::to_value(space).expect("space answer"), expected);
+}

@@ -48,9 +48,9 @@ use tokio::{
     sync::oneshot,
 };
 
-#[path = "fixture/parked_component.rs"]
+#[path = "../fixture/parked_component.rs"]
 mod parked_component;
-#[path = "fixture/spawn_component.rs"]
+#[path = "../fixture/spawn_component.rs"]
 mod spawn_component;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
