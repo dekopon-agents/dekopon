@@ -668,12 +668,12 @@ protected paths; the IPC directory is not a credential or data directory. The ga
 local development **chat** socket is `0600` under its own private parent. The chart's distinct
 container identities and init layout are documented in the chart.
 
-`tests/ipc_process.rs` runs real broker and client subprocesses; an unprivileged run exercises
+`tests/integration/ipc_process.rs` runs real broker and client subprocesses; an unprivileged run exercises
 owner-UID access, not cross-UID isolation. In a disposable Linux root container, require the full
 UID-switch, unmapped-peer, wrong-server, and private-file proof:
 
 ```console
-DEKOPON_REQUIRE_CROSS_UID=1 cargo test -p dekopon-brokerd --test ipc_process --locked -- --nocapture
+DEKOPON_REQUIRE_CROSS_UID=1 cargo test -p dekopon-brokerd --test integration --locked -- ipc_process:: --nocapture
 ```
 
 ### Telemetry
