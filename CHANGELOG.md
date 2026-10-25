@@ -7,6 +7,33 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-10-26
+
+### Added
+
+- Keep uploaded attachments in a durable content-addressed store with sessions.assets.path required alongside sessions.journal.
+
+### Changed
+
+- Pipes, the job vocabulary and exit codes now live in dekopon-process.
+- GitHub deliveries share one conversation per issue or pull request (or one per repository), queue without steering and coalesce into one follow-up turn.
+- Evict re-downloadable attachments before generated files and raise the default attachment budget to 1 GiB.
+
+### Fixed
+
+- a GitHub delivery refused at session admission is answered 503 instead of 200, and repository-less events such as ping are acknowledged.
+
+## [dekopon-chart-0.42.0] - 2026-10-26
+
+### Added
+
+- Keep uploaded attachments in a durable content-addressed store with sessions.assets.path required alongside sessions.journal.
+
+### Changed
+
+- Evict re-downloadable attachments before generated files and raise the default attachment budget to 1 GiB.
+- Chart 0.42.0 targets core v0.55.0 and renders the `v0.55.0` image tag.
+
 ## [0.54.0] - 2026-10-25
 
 ### Changed
