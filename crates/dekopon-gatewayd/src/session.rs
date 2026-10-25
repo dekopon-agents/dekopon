@@ -1521,6 +1521,7 @@ fn inventory_prompt(
     principal: Option<&PrincipalId>,
     notice_bytes: usize,
 ) -> String {
+    let original_text = text;
     let text = if text.trim().is_empty() { "" } else { text };
     let separator = if text.is_empty() { "" } else { "\n\n" };
     let budget = crate::transport::MAX_INBOUND_TEXT_BYTES
@@ -1532,7 +1533,7 @@ fn inventory_prompt(
     debug_assert_eq!(note.listed + note.omitted, registered.inventory.len());
     debug_assert!(note.bytes <= budget);
     if note.text.is_empty() {
-        text.to_owned()
+        original_text.to_owned()
     } else {
         format!("{text}{separator}{}", note.text)
     }
