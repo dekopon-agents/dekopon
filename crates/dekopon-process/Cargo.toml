@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-process"
-description = "Script-tree cancellation, deadlines and shared budgets for Dekopon frontends"
+description = "Script-tree budgets, cancellation, pipes, job vocabulary and exit codes for Dekopon frontends"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

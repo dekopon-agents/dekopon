@@ -23,5 +23,7 @@ result. The same latch refuses capability calls proposed after Stop before any
 proposal exists. The broker remains the only authorizer.
 
 `dekopon-process` owns `TreeContext`, `CallBudget`, `RetainedBytes`, `Limits`,
-`LimitExceeded`, and the `DEFAULT_*` limit constants. Shell recursion budgets,
-output buffers, pipes, jobs and exit codes remain in `dekopon-shell`.
+`LimitExceeded`, the `DEFAULT_*` limit constants, bounded pipes, the job vocabulary
+(`JOBS_OFF`, `JobId`, `JobOutcome`, `JobState`, `JobSummary`, `JobWait`) and `ExitCode`.
+Shell recursion budgets, output buffers, stage telemetry and the job control seam
+(`JobControl`, `JobSeed`, `JobRefusal`, `ScriptJobs`) remain in `dekopon-shell`.

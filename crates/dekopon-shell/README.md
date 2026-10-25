@@ -27,6 +27,10 @@ pub trait CapabilityInvoker: Send + Sync {
 }
 ```
 
+Bounded pipes, job vocabulary and exit codes live in `dekopon-process`. The shell
+retains stage telemetry and the `JobControl`, `JobSeed`, `JobRefusal` and `ScriptJobs`
+control seam.
+
 ## Command resolution
 
 A command word resolves in a fixed order. A word this shell refuses outright (`eval`, `exec`, `source`, job control, `declare`) ends the script naming itself; otherwise a shell function declared earlier in the script runs, then a builtin, then a command word the session's loaded providers contribute. Anything else is `command not found` at exit `127`, and that includes a word shaped like a capability identifier, granted or not: `wikipedia_page --title x` is an unknown command. A capability is reached only through the provider command word that proposes it. `cap --list` prints what this session was granted, `cap --describe <id>` prints one identifier and its description, and `<word> --help` is how to use it.
