@@ -6790,6 +6790,246 @@ async fn a_session_delivers_the_model_answer() {
     assert_eq!(driver.replies(), ["Done."]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let other_subject: ExternalSubject = "tel.16034700183".parse().expect("valid other subject");
+    for attempt in 0..3 {
+        let mut inbound = message("private stranger message");
+        if attempt == 2 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            inbound.subject = other_subject.clone();
+        }
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        let request = observed
+            .try_recv()
+            .expect("each attempt freshly asks the broker");
+        assert!(matches!(
+            request.request,
+            dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+        ));
+    }
+    assert!(observed.try_recv().is_err());
+    assert_eq!(
+        driver.replies(),
+        ["I only talk to the Lange family. I've let my owner know you stopped by."]
+    );
+    assert_eq!(models.requests(), 0);
+    let notices = capture.events_where(
+        "dekopon_gatewayd",
+        &[("audit.event", "gateway.session.rejected")],
+    );
+    assert_eq!(notices.len(), 3, "{}", capture.events_text());
+    for (index, notice) in notices.iter().enumerate() {
+        for (key, expected) in [
+            ("transport", "dev"),
+            ("route", "0"),
+            ("conversation.kind", "directMessage"),
+            ("conversation.container", ""),
+            ("conversation.id", "dev"),
+            ("conversation.thread", ""),
+            ("reason", "unmapped-subject"),
+        ] {
+            assert_eq!(notice.field(key), Some(expected));
+        }
+        let expected = if index == 2 {
+            other_subject.canonical()
+        } else {
+            subject().canonical()
+        };
+        assert_eq!(notice.field("subject"), Some(expected.as_str()));
+        assert!(!format!("{notice:?}").contains("private stranger message"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stranger_notice_never_caches_the_subjects_mapping() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            ),
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("Welcome.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    for _ in 0..2 {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message("hello"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert!(matches!(
+            observed.try_recv().unwrap().request,
+            dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+        ));
+    }
+    assert_eq!(
+        driver.replies(),
+        [crate::session::UNMAPPED_REPLY, "Welcome."]
+    );
+    assert_eq!(models.requests(), 1);
+    assert!(observed.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_mapped_agent_denial_names_the_principal_without_an_owner_notice() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::session_refused(
+            &dekopon_broker_protocol::SessionRefusal::AgentDenied {
+                principal: "simon".parse().unwrap(),
+            },
+        )],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("private mapped message"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies(),
+        ["Sorry simon, you don't have permission for this agent."]
+    );
+    assert_eq!(models.requests(), 0);
+    assert!(matches!(
+        observed.try_recv().unwrap().request,
+        dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+    ));
+    assert!(observed.try_recv().is_err());
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.session.rejected")]
+            )
+            .is_empty()
+    );
+    let rejections =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+    assert_eq!(rejections.len(), 1, "{}", capture.events_text());
+    let rejection = &rejections[0];
+    for (key, expected) in [
+        ("transport", "dev"),
+        ("route", "0"),
+        ("conversation.kind", "directMessage"),
+        ("conversation.container", ""),
+        ("conversation.id", "dev"),
+        ("conversation.thread", ""),
+        ("reason", "agent-denied"),
+    ] {
+        assert_eq!(rejection.field(key), Some(expected));
+    }
+    let expected = subject().canonical();
+    assert_eq!(rejection.field("subject"), Some(expected.as_str()));
+    assert!(!format!("{rejection:?}").contains("private mapped message"));
+}
+
+#[tokio::test]
+async fn a_mapped_empty_grant_gets_a_named_reply_without_an_owner_notice() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::chat_capabilities(
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            Some("simon".parse().unwrap()),
+        )],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("private empty grant message"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(
+        driver.replies(),
+        ["Sorry simon, you don't have permission for this agent."]
+    );
+    assert_eq!(models.requests(), 0);
+    assert!(matches!(
+        observed.try_recv().unwrap().request,
+        dekopon_broker_protocol::BrokerRequest::Capabilities { .. }
+    ));
+    assert!(observed.try_recv().is_err());
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.session.rejected")]
+            )
+            .is_empty()
+    );
+    let rejections =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+    assert_eq!(rejections.len(), 1, "{}", capture.events_text());
+    let rejection = &rejections[0];
+    for (key, expected) in [
+        ("transport", "dev"),
+        ("route", "0"),
+        ("conversation.kind", "directMessage"),
+        ("conversation.container", ""),
+        ("conversation.id", "dev"),
+        ("conversation.thread", ""),
+        ("reason", "unauthorized"),
+    ] {
+        assert_eq!(rejection.field(key), Some(expected));
+    }
+    let expected = subject().canonical();
+    assert_eq!(rejection.field("subject"), Some(expected.as_str()));
+    assert!(!format!("{rejection:?}").contains("private empty grant message"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     let directory = temporary();

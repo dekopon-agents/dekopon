@@ -176,15 +176,21 @@ capabilities before connecting transports. Unknown operation tags fail strict de
 `invalid-request`; no compatibility sink accepts them. The broker's `--http-bind` argument and chart
 `broker.httpBind` value are refused, including an empty chart value.
 
+For the session-refusal extension, upgrade the chart's shared core image atomically: both daemons use the same image and the Deployment uses `Recreate`, so there is no gateway-first binary rollout or mixed daemon pair in that deployment. Retain broker-first runtime startup. The broker writes the causes; the gateway/protocol client reads them.
+
+Verified against deployed core v0.51.0 (release commit `03dc3303e712d897f5f1f8b33906c396c8756d4b`): its `Error` variant accepts arbitrary string `code` and `message` values but rejects additional fields. This extension uses that existing shape. For independently installed binaries, an old gateway accepts a new code as a remote error and gives its generic failure reply before any model or capability call; a new gateway with an old broker preserves opaque authentication refusals, while attributed empty grants receive the named reply. Neither combination grants authority. Unknown future codes remain tolerated remote errors.
+
+The separate `dekopon-console` consumer pins broker-protocol `=0.49.1`. Its decoder accepts the new codes as ordinary remote errors; its TUI's `session_refusal` adds the broker-log guidance only for `unauthenticated`, so typed refusals show the generic error without that guidance or the gateway's friendly rendering. This is degraded text, not authority: the turn still stops before inference. No console upgrade is required for safe atomic core deployment; friendly console rendering is a separate follow-up.
+
 ## Failure codes
 
-A failure response carries a stable code and a bounded message. The code is the contract; the
-message is human-facing and may change. Codes are exported as constants from
-`dekopon-broker-protocol` so clients need not hardcode strings.
+A failure response carries a stable code and a bounded message. The code is the contract; the message is human-facing and may change except for `agent-denied`: its `message` field is a validated `PrincipalId` for display, not prose. `SessionRefusal` decodes the session refusal codes into typed variants. Unknown codes remain ordinary remote errors; a known `agent-denied` with an invalid principal is a malformed refusal, not an unknown cause. Other failure codes are exported as constants so clients need not hardcode strings.
 
 | Code | Meaning | Safe to resubmit? |
 | --- | --- | --- |
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
+| `unmapped-subject` | Session inspection found no principal for the attested subject. No model or provider work began. | Only after mapping changes. |
+| `agent-denied` | Session inspection denied `agent.prompt`; `message` contains the mapped principal ID for display. No policy detail is returned. | Only after grants change. |
 | `invalid-request` | The request frame could not be decoded, or an attestation was malformed or mismatched to its operation or proposal. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
 | `capacity-exhausted` | A bounded broker resource is full (including the connection limit, which sends one non-blocking refusal frame before closing, or an embedding's non-evicting audit log). No provider work began. | Safe to reassess; a connection permit may become available, but an exhausted audit log needs operator intervention. Do not blindly retry. |
