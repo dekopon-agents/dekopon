@@ -34,7 +34,8 @@ error after submission can mean effects already happened and must not trigger a 
 
 `RunCommand` (`runCommand`) remains the legacy parse-only operation. It grants no authority and
 carries no descriptors. `Invoke` remains for gateway-built proposals such as the memory Decider;
-it retains its metadata-table shape, with no input asset descriptors. An unrebuilt console's plain
+the gateway sends no metadata rows or input asset descriptors. The frame retains its existing
+shape, and the broker still accepts metadata rows from old clients. An unrebuilt console's plain
 commands still run through `RunCommand` plus `Invoke`; its attachment inputs are refused.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660` sockets, and
@@ -180,7 +181,7 @@ For the session-refusal extension, upgrade the chart's shared core image atomica
 
 Verified against deployed core v0.51.0 (release commit `03dc3303e712d897f5f1f8b33906c396c8756d4b`): its `Error` variant accepts arbitrary string `code` and `message` values but rejects additional fields. This extension uses that existing shape. For independently installed binaries, an old gateway accepts a new code as a remote error and gives its generic failure reply before any model or capability call; a new gateway with an old broker preserves opaque authentication refusals, while attributed empty grants receive the named reply. Neither combination grants authority. Unknown future codes remain tolerated remote errors.
 
-The separate `dekopon-console` consumer pins broker-protocol `=0.49.1`. Its decoder accepts the new codes as ordinary remote errors; its TUI's `session_refusal` adds the broker-log guidance only for `unauthenticated`, so typed refusals show the generic error without that guidance or the gateway's friendly rendering. This is degraded text, not authority: the turn still stops before inference. No console upgrade is required for safe atomic core deployment; friendly console rendering is a separate follow-up.
+The workspace `dekopon-console` consumer uses the current broker-protocol path dependency. Its decoder accepts the new codes as ordinary remote errors; its TUI's `session_refusal` adds the broker-log guidance only for `unauthenticated`, so typed refusals show the generic error without that guidance or the gateway's friendly rendering. This is degraded text, not authority: the turn still stops before inference. The console ships with core; friendly console rendering remains a separate follow-up.
 
 ## Failure codes
 

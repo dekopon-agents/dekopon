@@ -471,7 +471,11 @@ scope and generation fences are unchanged.
 
 ## Asset handles and delivery
 
-The gateway's conversation-generation table is the asset inventory. To hand a file to a provider
+The gateway's conversation-generation table is the only asset inventory. The model learns it from
+the note on its newest turn, which lists every attachment that fits, newest first, and says how to
+read it: `fetch_chat_asset` for an image or document, `asset cat chat-asset:N` for other text when
+`asset.cat` is granted. Every reachable file has a number, including files the model cannot show.
+Older files omitted for space remain addressable by their numbers. To hand a file to a provider
 command, write `chat-asset:N` as its own unquoted word. Quoted references, escaped text, variable
 values and references inside larger words are plain text. Builtins never read attachments;
 use `asset cat chat-asset:3 | head` to pipe file text into a builtin.
@@ -483,8 +487,8 @@ and descriptor. Pins last until the response or cancellation. Data URLs in argv,
 value after the first `=`, are refused before submission. The broker parses the command word and
 authorizes its proposal through the existing subject, Cedar, grants, secret-use and HTTP checks.
 An unquoted literal `<word> --help` uses the cached page without a frame or capability-call charge.
-The legacy `RunCommand` operation remains for old consoles; `Invoke` carries metadata but no asset
-input descriptors, so an unrebuilt console can run plain commands but cannot hand files to them.
+The legacy `RunCommand` operation remains for old clients. Gateway-built proposals use `Invoke`
+with no inventory rows or asset input descriptors; old clients can still send metadata rows.
 
 A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
@@ -510,15 +514,15 @@ or cancelled turns deliver none. Delivery disposition is logged as `agent.asset.
 adds one bounded gateway notice to the next turn. An output retention refusal names the failure
 without suggesting a repeat of an already-executed paid capability.
 
-Limits are **8 MiB decoded per asset, five distinct references / attached outputs and 40 MiB decoded
-per invocation**, 32 table entries per conversation and the configurable 1 GiB default disk budget.
+Limits are **8 MiB decoded per asset, five distinct references or attached outputs and 40 MiB
+decoded per invocation**, and the configurable 1 GiB default disk budget. There is no per-conversation
+count cap or idle expiry for live generations. One-shot inventories retain their one-hour idle expiry.
 An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
 Disk retention and broker in-flight spool budgets account for actual stored bytes.
-These limits are separate from model-facing fetch limits. Listing metadata does not update LRU
-recency; resolving bytes does. Unknown inbound lengths are shown as `size unknown` in reference
-notes and as null stored-byte counts in provider listings, not as empty files. Reported or fetched
-lengths, including a genuine zero, remain numeric. Listing never fetches files just to learn their
-size. Reclaimed files retain their last known length and never refetch or silently substitute older pixels.
+These limits are separate from model-facing fetch limits. Resolving bytes updates LRU recency.
+Unknown inbound lengths are shown as `size unknown` in the inventory note and as null stored-byte
+counts in metadata rows, not as empty files. Reported or fetched lengths, including a genuine zero,
+remain numeric. Building the inventory never fetches files just to learn their size. Reclaimed files retain their last known length and never refetch or silently substitute older pixels.
 
 Delivery keeps existing native paths: Slack external upload, Discord multipart Create Message,
 Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each upload reads
@@ -681,28 +685,28 @@ When someone mentions the bot and nothing happens:
 
 A screenshot is part of the message that carried it. Slack, Discord, Telegram, and WhatsApp deliver it by reference rather than by value, so the gateway resolves that reference in order to hear the whole request. Slack, Telegram, and WhatsApp require the bot token they already terminate here — and on Slack the `files:read` scope, without which Slack withholds the file's id and URL and the upload is reported as one the gateway cannot open; Discord CDN downloads do not receive it. This grants no policy, no provider credential, and no way to write anything.
 
-What it does not do is read every file that arrives. Bytes cost tokens on every turn they appear in, and most turns do not need them. So each attachment is *named* in the prompt and fetched only if the model decides the answer depends on it:
+What it does not do is read every file that arrives. Bytes cost tokens on every turn they appear in, and most turns do not need them. So each attachment is named in the fitted inventory note and fetched when the model requests it through `fetch_chat_asset` or hands its reference to a provider command:
 
 ```text
 what does this say?
 
-[gateway: the sender attached
+[gateway: files in this conversation
+  chat-asset:2 — recording.mov (video/quicktime, 41.3 MB) — not readable here; a command can take it as chat-asset:2
   chat-asset:1 — screenshot.png (image/png, 214 KB)
-  recording.mov (video/quicktime, 41.3 MB) — not a type the gateway can show you
-  Call fetch_chat_asset with the number to look at one.]
+  Call fetch_chat_asset with the number to look at an image or document.]
 ```
 
 The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry an image — Chat Completions types a `tool` message's content as a string, and the Responses API types `function_call_output.output` the same way — the answer arrives as two messages: the tool result says the asset follows, and a `user` message carries the bytes. That shape is the only one both wire formats accept.
 
 Whether a session offers `fetch_chat_asset` is decided once, when it starts: every session whose conversation generation is live and whose gateway retains assets (`assetRetentionBytes` above zero) carries the tool on every turn, including turns with nothing to fetch, so the tool list stays part of the cached request prefix. A file that arrives by steer or from a provider mid-session is fetchable through it. A call that names nothing addressable — no such file, a retired generation, a released file — gets a refusal sentence as its tool result and no bytes.
 
-- **Numbering follows the exact history audience and live generation.** `chat-asset:5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives independent asset TTL/LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed arrival lines; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport; one-shot IDs are process-monotonic so expiry cannot alias an old reference.
-- **Every prompt names the whole inventory**, not only what the newest message brought, with the new ones marked. A reference line is the only way a model learns a number exists, and one confined to the turn that introduced it goes unreachable as soon as ordinary chatter pushes that turn out of the replayed history window — while the store holds the file for another hour. The inventory note is not recorded: history keeps each turn's text plus one `[gateway: attached chat-asset:N — name]` line per file that arrived with it, the same line platform recall writes, so replayed turns do not each carry a stale copy of the inventory.
+- **Numbering follows the exact history audience and live generation.** `chat-asset:5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed arrival lines; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport; one-shot IDs are process-monotonic so expiry cannot alias an old reference.
+- **Every prompt names every attachment that fits**, newest first, with the new ones marked and one omission line naming the oldest range left out for space. A reference line is the only way a model learns a number exists, and one confined to the turn that introduced it goes unreachable as soon as ordinary chatter pushes that turn out of the replayed history window — while its generation is still live. One-shot inventories alone retain files for up to another hour of idleness. The inventory note is not recorded: history keeps each turn's text plus one `[gateway: attached chat-asset:N — name]` line per file that arrived with it, the same line platform recall writes, so replayed turns do not each carry a stale copy of the inventory.
 - **The reference line is what history remembers, not the bytes.** It is a few dozen bytes, so it replays inside the conversation byte budget instead of evicting real conversation the way a base64 screenshot would.
 - **A file that cannot be shown is named anyway.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so, which the model can answer around instead of denying a screenshot that plainly exists.
 - **Only the media types a model can actually accept are offered.** Images: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Documents: PDF, plain text, Markdown, CSV, HTML, XML, JSON, RTF, and the Word, PowerPoint, and Excel formats. A chat service imposes no allowlist on uploads at all — a 700 MB screen recording is a legal attachment — so the narrow end of that intersection is the one worth enforcing. A spreadsheet is parsed to its first thousand rows per sheet, which is worth knowing before concluding a model ignored the bottom of one.
 - **A route's model has to opt in to images.** `modalities: [image]` on a model entry; the default is text only, because an OpenAI-compatible endpoint is very often a small local model that will either error or invent an answer when handed an image. Documents need no modality: a PDF is a parsed attachment to every endpoint that accepts one at all, so gating it on vision would refuse it to a model perfectly able to read it.
-- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Fetched assets carried in one model request total at most 40 MiB decoded; a crossing fetch refuses and names the unseen ID without discarding earlier images. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session. With retention smaller than the carried request, a crossing fetch can evict its own file from the conversation before refusing; a later retry cannot recover it.
+- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Fetched assets carried in one model request total at most 40 MiB decoded; a crossing fetch refuses and names the unseen ID without discarding earlier images. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session. With retention smaller than the carried request, a crossing fetch can evict its own file from the conversation before refusing; a later retry cannot recover it.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop and re-attaches the token by hand. Both URLs are checked on one rule, at the single place the token is attached: the URL the event supplied and the `location` after it are parsed rather than prefix-matched, and each must name an allowlisted Slack host over HTTPS on the default port with no credentials in the authority. A refused URL fails the fetch before any request is made.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
 - **Gateway-owned disk LRU, weak references.** Uploads fetch once; descriptor-backed outputs join
@@ -729,7 +733,7 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   output does not fail because its bytes could not be stored. Failure surfaces when it is used.
 - **Journal retention owns deletion.** Sweep, record compaction, forget and seal retention release
   references; the last retained record naming a digest releases its file and index bindings. Shared
-  digests survive while any conversation still names them. The count cap, idle expiry and generation
+  digests survive while any conversation still names them. One-shot idle expiry and generation
   retirement release in-memory rows and pins without deleting journal-owned bytes. Fence-less
   inventories still expire when idle. The conversation ceiling no longer evicts asset inventories.
 - **One download per attachment.** A cold attachment downloads in a store-owned task, at most two
@@ -743,7 +747,7 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   Actual descriptor IO/corruption errors remain errors, not fabricated release notices. Scoped
   inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
   IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
-  to avoid reuse after independent inventory expiry.
+  to avoid reuse after one-shot inventory expiry.
 - **Gateway-private storage.** Store files are 0600 inside 0700 directories owned by the gateway
   UID. The index contains digest, row identity, origin class, state and recency, never attachment
   sources or platform locators. Locators remain in the journal. Reads stay session-bound and the
@@ -938,7 +942,7 @@ Every kind but `directMessage` — a group DM and a thread included — initiall
 
 A route matching every channel widens no authority whatsoever, and an operator reading "available in all channels" must not read it as "available to everyone". Every session opens an attested broker leg naming the sender's canonical subject; the broker maps that subject to a principal, requires policy permitting `agent.prompt` for it, and refuses an unmapped sender before any model call is made. A catch-all route changes *where* the mapped people can reach the bot. It does not change who they are, and somebody the owner never mapped gets the same refusal in a catch-all channel that they would have got in a named one.
 
-Nor do two people in one channel share a conversation **by default**. A persistent route whose scope is omitted or `privateConversation` keys history per authenticated subject, so the bot remembers each person separately. An operator can explicitly choose `sharedConversation`; that changes prompt audience, not authority, and carries the warnings in [Scope selects the replay audience](#scope-selects-the-replay-audience). A catch-all channel does not imply that choice.
+Nor do two people in one channel share a conversation **by default**. A persistent route whose scope is omitted or `privateConversation` keys history per authenticated subject, so the bot remembers each person separately. An operator can explicitly choose `sharedConversation`; that changes prompt audience, not authority, and carries the warnings in [Scope selects the replay audience](#scope-selects-the-replay-audience). A catch-all channel does not imply that choice. On a shared route in a mapped channel, history is keyed by the channel’s space and thread, and the space’s granted capability identifiers keep that history across speakers.
 
 ## Liveness, progress, and stopping a run
 
@@ -948,7 +952,7 @@ An optional leaf resolves from built-in defaults, `sessions.indicators`, transpo
 `indicators`, its matching `indicators.conversations.<kind>`, then route `indicators`.
 The last authored value wins, even when an earlier layer set `off`; absent and `null`
 inherit without resetting unrelated leaves. Resolved `mode: off` suppresses all indicators.
-For every route/kind, startup and reload emit a bounded `gateway_indicators_effective` record
+For every route/kind, boot and each activated reload emit one bounded `gateway_indicators_effective` record
 with route index, transport name, kind, enum settings and booleans only, not message text,
 identity, coordinates or credentials.
 
@@ -1183,7 +1187,7 @@ whole gateway through the same bounded drain as shutdown, but with a nonzero exi
 
 **Status: Current.** History is a trust surface rather than a feature flag; [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) states the surface it accepts.
 
-A `persistent` route keeps a bounded history and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. The history is private per authenticated subject by default; `scope: sharedConversation` shares it among authenticated participants in one exact routed conversation. `persistent` with the default window is the route default; `memory: { mode: oneShot }` opts out.
+A `persistent` route keeps a bounded history and replays it into the next prompt, so a follow-up question can say "and the second one?" and be answered. The history is private per authenticated subject by default; `scope: sharedConversation` shares it among authenticated participants in one exact routed conversation. In a mapped channel it uses the channel’s space key, with separate windows per thread, and the space principal’s grants gate replay and journal recall across speakers. The grant comparison below uses those space grants on mapped shared routes; an asker with no grants is refused without evicting the shared window. Private routes keep their per-subject keys and grants. `persistent` with the default window is the route default; `memory: { mode: oneShot }` opts out.
 
 ### The history lives in the gateway
 

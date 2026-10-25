@@ -86,7 +86,7 @@ use crate::{
 pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
 const INBOUND_BUFFER: usize = 64;
-const ASSET_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const ONE_SHOT_ASSET_IDLE: Duration = Duration::from_secs(60 * 60);
 
 #[must_use]
 pub fn current_uid() -> u32 {
@@ -209,7 +209,7 @@ where
     let budget = config.sessions.asset_retention_bytes;
     let journal_assets = journal.clone();
     let assets = tokio::task::spawn_blocking(move || {
-        let store = AssetStore::with_retention(conversations, ASSET_IDLE_TIMEOUT, budget);
+        let store = AssetStore::with_retention(conversations, ONE_SHOT_ASSET_IDLE, budget);
         let store = match assets_path {
             Some(path) => store
                 .with_storage(&path)

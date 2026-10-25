@@ -1,0 +1,35 @@
+[package]
+name = "dekopon-console"
+description = "Interactive terminal console for a running Dekopon broker"
+version.workspace = true
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["agents", "console", "tui", "capabilities", "security"]
+categories = ["command-line-utilities"]
+include = ["src/**", "tests/**", "Cargo.toml"]
+
+[dependencies]
+clap.workspace = true
+dekopon-config.workspace = true
+dekopon-core.workspace = true
+dekopon-tui.workspace = true
+dekopon-telemetry = { workspace = true, features = ["exporter"] }
+opentelemetry_sdk.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = { workspace = true }
+rustix.workspace = true
+tokio = { workspace = true, features = ["io-std", "signal"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -30,6 +30,23 @@ struct ResourceIdentity {
     values: Vec<String>,
 }
 
+impl ResourceIdentity {
+    fn valid(&self) -> bool {
+        self.api_version == IDENTITY_VERSION
+            && self.values.len() <= 7
+            && self.values.iter().enumerate().all(|(index, value)| {
+                let maximum = match self.scope {
+                    dekopon_capability::StorageScope::Space if index == 2 => 4_096,
+                    dekopon_capability::StorageScope::Space
+                    | dekopon_capability::StorageScope::PrivateConversation
+                    | dekopon_capability::StorageScope::SharedConversation
+                    | dekopon_capability::StorageScope::Agent => 1024,
+                };
+                value.len() <= maximum
+            })
+    }
+}
+
 fn identity(request: &StorageGrantRequest) -> ResourceIdentity {
     ResourceIdentity {
         api_version: IDENTITY_VERSION.to_owned(),
@@ -49,10 +66,7 @@ pub(crate) fn read_identity(
             crate::report_decode_failure("storage-resource", &error);
             base.corrupt("identity", "storage-resource")
         })?;
-    if document.api_version != IDENTITY_VERSION
-        || document.values.len() > 7
-        || document.values.iter().any(|value| value.len() > 1024)
-    {
+    if !document.valid() {
         return Err(base.corrupt("identity", "storage-resource"));
     }
     Ok(Some((document.scope, document.values)))
@@ -178,6 +192,9 @@ impl NamespacePlan {
         .map_err(|error: StorageHostError| error.in_namespace(&base_token, None))?;
 
         let expected = identity(request);
+        if !expected.valid() {
+            return Err(StorageHostError::InvalidArgument);
+        }
         let resource_identity = serde_json::to_vec(&expected).map_err(|error| {
             tracing::error!(error = %error, "storage.identity.unencodable");
             StorageHostError::Arithmetic

@@ -23,9 +23,8 @@ use std::{
 use dekopon_broker_protocol::TraceParent;
 #[cfg(unix)]
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatMemorySurface, ClientError, CommandRunOutcome,
-    ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest, SessionSurface, Upcall,
-    UpcallExit, UpcallStreams,
+    Attestation, BrokerClient, ChatMemorySurface, ClientError, ERROR_UNAUTHENTICATED,
+    InvocationOutcome, InvocationRequest, SessionSurface, Upcall, UpcallExit, UpcallStreams,
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
@@ -33,8 +32,7 @@ use dekopon_process::{CallBudget, CancelSignal, Limits as ShellLimits, TreeConte
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, Interpreter, JobControl,
-    ScriptOutcome,
+    CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, JobControl, ScriptOutcome,
 };
 use serde_json::Value;
 #[cfg(unix)]
@@ -206,26 +204,17 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         tree: &TreeContext,
     ) -> dekopon_shell::RunResult {
         if self.direct.has_command_word(&call.word) {
-            let argv = call
-                .argv
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            let parsed = self
-                .direct
-                .run_command(&call.word, &argv, streams.stdin.is_some());
-            return dekopon_shell::run_parsed(self, call, parsed, streams, tree);
+            return self.direct.run(call, streams, tree);
         }
         match &self.broker {
             Some(broker) => broker.run(call, streams, tree),
-            None => dekopon_shell::run_parsed(self, call, None, streams, tree),
+            None => dekopon_shell::render_command(
+                streams,
+                "",
+                format!("dekopon-shell: {}: command not found\n", call.word),
+                127,
+            ),
         }
-    }
-
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        self.direct
-            .run_command(word, argv, stdin_piped)
-            .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin_piped))
     }
 
     fn note(&self, text: &str, eta: Option<Duration>) {
@@ -292,34 +281,6 @@ fn minted_trace_parent() -> TraceParent {
         .expect("the low bit of each identifier is set, so neither is all zeroes")
 }
 
-#[must_use]
-pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
-    match outcome {
-        CommandRunOutcome::Proposed {
-            capability,
-            input,
-            secret_use,
-        } => CommandRun::Proposed {
-            capability: capability.to_string(),
-            input,
-            secret_use,
-            report: None,
-        },
-        CommandRunOutcome::Rendered {
-            stdout,
-            stderr,
-            status,
-        } => CommandRun::Rendered {
-            stdout,
-            stderr,
-            status,
-        },
-        CommandRunOutcome::Failed { error } => CommandRun::Failed {
-            message: error.message,
-        },
-    }
-}
-
 #[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum BrokerLegError {
@@ -343,6 +304,7 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     chat_memory: Option<ChatMemorySurface>,
     principal: Option<PrincipalId>,
+    space: Option<Vec<dekopon_core::CapabilityId>>,
     cancel: CancelSignal,
     script_tree: parking_lot::Mutex<Option<TreeContext>>,
     attachments: Option<Arc<ReplyAttachments>>,
@@ -375,6 +337,7 @@ impl BrokerLeg {
             command_word_help,
             chat_memory,
             principal,
+            space,
         } = surface;
         let (capabilities, effective_capabilities) = snapshot(available)?;
         Ok(Self {
@@ -388,6 +351,7 @@ impl BrokerLeg {
             attestation,
             chat_memory,
             principal,
+            space,
             cancel: CancelSignal::never(),
             script_tree: parking_lot::Mutex::new(None),
             attachments: None,
@@ -454,6 +418,11 @@ impl BrokerLeg {
     }
 
     #[must_use]
+    pub fn space_grants(&self) -> Option<&[dekopon_core::CapabilityId]> {
+        self.space.as_deref()
+    }
+
+    #[must_use]
     pub fn principal(&self) -> Option<&PrincipalId> {
         self.principal.as_ref()
     }
@@ -461,32 +430,6 @@ impl BrokerLeg {
     #[must_use]
     pub const fn session_trace(&self) -> TraceId {
         self.identifiers.trace()
-    }
-
-    async fn prepare_assets(
-        &self,
-        input: &Value,
-    ) -> Result<
-        (
-            dekopon_broker_protocol::InvokeAssets,
-            Vec<dekopon_model::asset::DiskBlob>,
-        ),
-        ChatAssetRefusal,
-    > {
-        let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
-        let prepared = match &self.asset_inputs {
-            Some(inputs) => inputs.prepare(input, remaining).await,
-            None => Ok((
-                dekopon_broker_protocol::InvokeAssets {
-                    sends_remaining: remaining,
-                    ..Default::default()
-                },
-                Vec::new(),
-            )),
-        };
-        prepared.inspect_err(|refusal| {
-            tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "agent.chat_asset_input.refused");
-        })
     }
 }
 
@@ -632,85 +575,6 @@ impl CapabilityInvoker for BrokerLeg {
             duration: started.elapsed(),
         });
         outcome
-    }
-
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        if !self.command_words.contains(word) {
-            return None;
-        }
-        let reported = CommandWord::new(word);
-        let started = Instant::now();
-        self.emit(ProgressEvent::ToolStarted {
-            word: reported.clone(),
-            argument_count: bounded_count(argv.len()),
-            calls_used: self.calls.used(),
-            calls_max: self.calls.maximum(),
-        });
-        let cancel = &self.cancel;
-        let tree = self.script_tree.lock().clone();
-        let mut run = self.runtime.block_on(async {
-            tokio::select! {
-                biased;
-                result = self.client.run_command(
-                    self.attestation.clone(), word.to_owned(), argv.to_vec(),
-                    stdin_piped, self.identifiers.trace_parent(),
-                ) => match result {
-                    Ok(outcome) => command_run_from_outcome(outcome),
-                    Err(error) => CommandRun::Errored {
-                        message: dekopon_core::error_chain(&error),
-                    },
-                },
-                () = async {
-                    tokio::select! {
-                        () = cancel.cancelled() => {},
-                        () = async {
-                            match tree {
-                                Some(tree) => tokio::time::sleep(tree.remaining()).await,
-                                None => std::future::pending().await,
-                            }
-                        } => {},
-                    }
-                } => CommandRun::Denied {
-                    reason: "session-cancelled".to_owned(),
-                },
-            }
-        });
-        let outcome = match &mut run {
-            CommandRun::Proposed { report, .. } => {
-                let sink = self.progress.clone();
-                *report = Some(dekopon_shell::CommandReport::new(move |outcome| {
-                    if let Some(sink) = sink {
-                        let outcome = match outcome {
-                            dekopon_shell::CommandReportOutcome::Succeeded => {
-                                ToolOutcome::Succeeded
-                            }
-                            dekopon_shell::CommandReportOutcome::Denied => ToolOutcome::Denied,
-                            dekopon_shell::CommandReportOutcome::Failed => ToolOutcome::Failed,
-                            dekopon_shell::CommandReportOutcome::Cancelled => {
-                                ToolOutcome::Cancelled
-                            }
-                        };
-                        sink.emit(ProgressEvent::ToolFinished {
-                            word: reported,
-                            outcome,
-                            duration: started.elapsed(),
-                        });
-                    }
-                }));
-                return Some(run);
-            }
-            CommandRun::Rendered { status: 0, .. } => ToolOutcome::Succeeded,
-            CommandRun::Rendered { .. }
-            | CommandRun::Failed { .. }
-            | CommandRun::Errored { .. } => ToolOutcome::Failed,
-            CommandRun::Denied { .. } => ToolOutcome::Cancelled,
-        };
-        self.emit(ProgressEvent::ToolFinished {
-            word: reported,
-            outcome,
-            duration: started.elapsed(),
-        });
-        Some(run)
     }
 
     fn invoke(
@@ -1084,7 +948,10 @@ impl BrokerLeg {
             self.runtime.block_on(async {
                 tokio::select! {
                     result = async {
-                        let (mut assets, _pins) = self.prepare_assets(&input).await?;
+                        let mut assets = dekopon_broker_protocol::InvokeAssets {
+                            sends_remaining: self.attachments.as_ref().map_or(0, |slot| slot.remaining()),
+                            ..Default::default()
+                        };
                         assets.streams = Some(dekopon_broker_protocol::Streams {
                             stdin: streams.stdin,
                             stdout: streams.stdout,
@@ -1720,9 +1587,8 @@ mod tests {
         };
 
         use dekopon_broker_protocol::{
-            BrokerClient, BrokerRequest, CommandRunOutcome, DescriptorStream,
-            ERROR_UNAUTHENTICATED, FrameLimits, InvocationOutcome, InvocationResult,
-            RequestEnvelope, ResponseEnvelope,
+            BrokerClient, BrokerRequest, DescriptorStream, ERROR_UNAUTHENTICATED, FrameLimits,
+            InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
         };
         use dekopon_capability::DecisionReference;
         use dekopon_core::{
@@ -1732,7 +1598,7 @@ mod tests {
         use dekopon_process::Limits;
         use dekopon_shell::{
             CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal,
-            CommandRun, ExitCode,
+            ExitCode,
         };
         use serde_json::json;
         use tokio::{
@@ -1815,6 +1681,41 @@ mod tests {
             (leg_with(&socket, attestation), receiver)
         }
 
+        async fn stub_leg_parked(
+            directory: &Path,
+        ) -> (
+            BrokerLeg,
+            mpsc::UnboundedReceiver<RequestEnvelope>,
+            oneshot::Sender<()>,
+        ) {
+            let socket = directory.join("broker.sock");
+            let listener = UnixListener::bind(&socket).expect("bind stub broker");
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .expect("secure stub socket");
+            let (observed, receiver) = mpsc::unbounded_channel();
+            let (release, released) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("stub broker accepts");
+                let mut stream = DescriptorStream::new(stream);
+                let (request, _) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
+                    .await
+                    .expect("stub broker reads one request");
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "the test may have finished observing before the stub reports"
+                )]
+                let _ = observed.send(request);
+                #[allow(
+                    clippy::let_underscore_must_use,
+                    reason = "a dropped sender and a sent signal both mean the test is done"
+                )]
+                let _ = released.await;
+                drop(stream);
+            });
+            (leg_for(&socket), receiver, release)
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn a_run_error_is_uncertain_and_never_refunds_its_call() {
             let directory = private_broker_directory();
@@ -1859,9 +1760,6 @@ mod tests {
                         entered.send(()).unwrap();
                         std::future::pending().await
                     })
-                }
-                fn rows(&self) -> Vec<dekopon_broker_protocol::AssetRow> {
-                    Vec::new()
                 }
             }
             let directory = private_broker_directory();
@@ -1935,9 +1833,6 @@ mod tests {
                 fn resolve_input(&self, _: u64) -> ResolveFuture<'_> {
                     Box::pin(async { Err(ChatAssetRefusal::UnknownAsset) })
                 }
-                fn rows(&self) -> Vec<dekopon_broker_protocol::AssetRow> {
-                    Vec::new()
-                }
             }
             for (script, refusal) in [
                 (
@@ -1995,254 +1890,6 @@ mod tests {
             leg_with(socket, None)
         }
 
-        async fn stub_leg_parked(
-            directory: &Path,
-        ) -> (
-            BrokerLeg,
-            mpsc::UnboundedReceiver<RequestEnvelope>,
-            oneshot::Sender<()>,
-        ) {
-            let socket = directory.join("broker.sock");
-            let listener = UnixListener::bind(&socket).expect("bind stub broker");
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-                .expect("secure stub socket");
-            let (observed, receiver) = mpsc::unbounded_channel();
-            let (release, released) = oneshot::channel::<()>();
-            tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.expect("stub broker accepts");
-                let mut stream = DescriptorStream::new(stream);
-                let (request, _) = stream
-                    .read_frame::<RequestEnvelope>(FrameLimits::default())
-                    .await
-                    .expect("stub broker reads one request");
-                #[allow(
-                    clippy::let_underscore_must_use,
-                    reason = "the test may have finished observing before the stub reports"
-                )]
-                let _ = observed.send(request);
-                #[allow(
-                    clippy::let_underscore_must_use,
-                    reason = "a dropped sender and a sent signal both mean the test is done"
-                )]
-                let _ = released.await;
-                drop(stream);
-            });
-            (leg_for(&socket), receiver, release)
-        }
-
-        async fn run_word(
-            leg: BrokerLeg,
-            argv: &'static [&'static str],
-            stdin: Option<&'static str>,
-        ) -> Option<CommandRun> {
-            tokio::task::spawn_blocking(move || {
-                let argv = argv
-                    .iter()
-                    .map(|argument| (*argument).to_owned())
-                    .collect::<Vec<_>>();
-                leg.run_command("probe", &argv, stdin.is_some())
-            })
-            .await
-            .expect("blocking dispatch completes")
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_rendered_run_reaches_the_script_with_its_status() {
-            let directory = private_broker_directory();
-            let rendered = CommandRunOutcome::Rendered {
-                stdout: "Usage: probe <COMMAND>\n".to_owned(),
-                stderr: String::new(),
-                status: 0,
-            };
-            let (mut leg, mut observed) = stub_leg_observing(
-                directory.path(),
-                vec![ResponseEnvelope::command_run(rendered)],
-                None,
-            )
-            .await;
-            leg.command_words.insert("probe".to_owned());
-            let trace_parent = leg.identifiers.trace_parent();
-
-            let Some(CommandRun::Rendered {
-                stdout,
-                stderr,
-                status,
-            }) = run_word(leg, &["--help"], None).await
-            else {
-                panic!("expected rendered help")
-            };
-            assert_eq!(stdout, "Usage: probe <COMMAND>\n");
-            assert!(stderr.is_empty());
-            assert_eq!(status, 0);
-            let request = observed.recv().await.expect("stub broker saw the run");
-            assert_eq!(
-                request.request,
-                BrokerRequest::RunCommand {
-                    attestation: None,
-                    word: "probe".to_owned(),
-                    argv: vec!["--help".to_owned()],
-                    stdin_piped: false,
-                    trace_parent,
-                }
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn only_whether_stdin_is_piped_travels_in_the_run_frame() {
-            let directory = private_broker_directory();
-            let proposed = CommandRunOutcome::Proposed {
-                capability: "cli-probe.upper".parse().expect("valid capability fixture"),
-                input: json!({"text": "hello"}),
-                secret_use: None,
-            };
-            let (mut leg, mut observed) = stub_leg_observing(
-                directory.path(),
-                vec![ResponseEnvelope::command_run(proposed)],
-                None,
-            )
-            .await;
-            leg.command_words.insert("probe".to_owned());
-            let trace_parent = leg.identifiers.trace_parent();
-
-            let Some(CommandRun::Proposed {
-                capability,
-                input,
-                secret_use,
-                report,
-            }) = run_word(leg, &["upper", "-"], Some("hello")).await
-            else {
-                panic!("expected proposal")
-            };
-            assert_eq!(capability, "cli-probe.upper");
-            assert_eq!(input, json!({"text": "hello"}));
-            assert!(secret_use.is_none());
-            assert!(report.is_some());
-            let request = observed.recv().await.expect("stub broker saw the run");
-            assert!(
-                matches!(
-                    &request.request,
-                    BrokerRequest::RunCommand {
-                        stdin_piped: true,
-                        trace_parent: sent,
-                        ..
-                    } if *sent == trace_parent
-                ),
-                "{request:?}"
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_proposed_secret_use_survives_the_broker_leg() {
-            let directory = private_broker_directory();
-            let secret_use = SecretUseProposal::HttpBasic {
-                secret: "drn:com.xrl:secret:prod:api/token"
-                    .parse::<SecretDrn>()
-                    .expect("canonical DRN fixture"),
-                username: "deploy".to_owned(),
-            };
-            let proposed = CommandRunOutcome::Proposed {
-                capability: CAPABILITY.parse().expect("valid capability fixture"),
-                input: json!({"uri": "https://example.test/"}),
-                secret_use: Some(secret_use.clone()),
-            };
-            let (mut leg, _observed) = stub_leg_observing(
-                directory.path(),
-                vec![ResponseEnvelope::command_run(proposed)],
-                None,
-            )
-            .await;
-            leg.command_words.insert("probe".to_owned());
-
-            let Some(CommandRun::Proposed {
-                capability,
-                input,
-                secret_use: received,
-                report,
-            }) = run_word(leg, &["fetch", "https://example.test/"], None).await
-            else {
-                panic!("expected proposal")
-            };
-            assert_eq!(capability, CAPABILITY);
-            assert_eq!(input, json!({"uri": "https://example.test/"}));
-            assert_eq!(received, Some(secret_use));
-            assert!(report.is_some());
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_cancel_signal_abandons_an_in_flight_run() {
-            let directory = private_broker_directory();
-            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
-            leg.command_words.insert("probe".to_owned());
-            let (handle, signal) = CancelSignal::pair();
-            let leg = leg.with_cancel_signal(signal);
-
-            let run = tokio::task::spawn_blocking(move || {
-                leg.run_command("probe", &["--help".to_owned()], false)
-            });
-            observed.recv().await.expect("the run reached the broker");
-            handle.cancel();
-
-            assert!(
-                matches!(run.await.expect("blocking dispatch completes"), Some(CommandRun::Denied { reason }) if reason == "session-cancelled")
-            );
-            drop(release);
-        }
-
-        #[tokio::test(flavor = "current_thread", start_paused = true)]
-        async fn a_script_deadline_aborts_an_in_flight_broker_leg() {
-            let directory = private_broker_directory();
-            let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
-            leg.command_words.insert("probe".to_owned());
-            leg.script_started(&mut dekopon_process::TreeContext::new(
-                Limits {
-                    timeout: Duration::from_secs(5),
-                    ..Limits::default()
-                },
-                dekopon_process::CallBudget::new(32),
-            ));
-            let run = tokio::task::spawn_blocking(move || {
-                let result = leg.run_command("probe", &["--help".to_owned()], false);
-                leg.script_finished();
-                result
-            });
-            observed
-                .recv()
-                .await
-                .expect("the command reached the broker");
-            tokio::time::advance(Duration::from_secs(5)).await;
-            assert!(matches!(
-                run.await.expect("blocking dispatch completes"),
-                Some(CommandRun::Denied { reason }) if reason == "session-cancelled"
-            ));
-            drop(release);
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_transport_failure_names_its_cause_and_never_the_socket() {
-            let directory = private_broker_directory();
-            let socket = directory.path().join("dekopon-secret-broker.sock");
-            let mut leg = leg_for(&socket);
-            leg.command_words.insert("probe".to_owned());
-
-            let Some(CommandRun::Errored { message }) = run_word(leg, &["--help"], None).await
-            else {
-                panic!("a missing broker socket is an infrastructure failure, not a decline");
-            };
-            assert!(
-                message.starts_with("could not inspect broker socket: "),
-                "{message}"
-            );
-            assert!(!message.contains("dekopon-secret-broker"), "{message}");
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_word_no_provider_owns_never_reaches_the_broker() {
-            let directory = private_broker_directory();
-            let leg = leg_for(&directory.path().join("absent.sock"));
-
-            assert!(run_word(leg, &["--help"], None).await.is_none());
-        }
-
         fn attestation() -> Attestation {
             Attestation {
                 subject: SUBJECT
@@ -2283,6 +1930,7 @@ mod tests {
                 attestation,
                 chat_memory: None,
                 principal: None,
+                space: None,
                 cancel: CancelSignal::never(),
                 script_tree: parking_lot::Mutex::new(None),
                 attachments: None,
@@ -3515,34 +3163,6 @@ mod tests {
             }
         }
 
-        #[tokio::test(flavor = "multi_thread")]
-        async fn an_opted_in_note_precedes_a_dropped_proposals_report() {
-            let directory = private_broker_directory();
-            let (leg, sink) =
-                reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
-            let leg = leg.with_progress_notes();
-            tokio::task::spawn_blocking(move || {
-                let proposal = leg.run_command("probe", &[], false);
-                assert!(matches!(proposal, Some(CommandRun::Proposed { .. })));
-                leg.note(
-                    " rendering the image ",
-                    Some(std::time::Duration::from_secs(40)),
-                );
-                drop(proposal);
-                leg.script_finished();
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                sink.labels(),
-                vec![
-                    "started probe arguments=0 calls=0/4",
-                    "note \"rendering the image\" Some(40s)",
-                    "finished probe Failed",
-                ]
-            );
-        }
-
         #[tokio::test]
         async fn notes_without_the_broker_opt_in_emit_nothing() {
             let directory = private_broker_directory();
@@ -3715,130 +3335,11 @@ mod tests {
         }
 
         fn proposal_of(capability: &str) -> ResponseEnvelope {
-            ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
+            ResponseEnvelope::command_run(dekopon_broker_protocol::CommandRunOutcome::Proposed {
                 capability: capability.parse().expect("valid capability fixture"),
                 input: json!({"number": 7}),
                 secret_use: None,
             })
-        }
-
-        fn rendered_at(status: u8) -> ResponseEnvelope {
-            ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
-                stdout: String::new(),
-                stderr: String::new(),
-                status,
-            })
-        }
-
-        fn owned_proposal(run: Option<CommandRun>) -> CommandProposal {
-            match run {
-                Some(CommandRun::Proposed {
-                    capability,
-                    input,
-                    secret_use,
-                    report,
-                }) => CommandProposal {
-                    capability,
-                    input,
-                    secret_use,
-                    report,
-                },
-                other => panic!("expected proposal: {other:?}"),
-            }
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn an_overlapping_direct_grant_settles_the_brokers_report_with_its_outcome() {
-            let directory = private_broker_directory();
-            let (leg, sink) =
-                reporting_probe_leg(directory.path(), vec![proposal_of(CAPABILITY)]).await;
-            let invoker = crate::SessionInvoker {
-                direct: super::FakeLeg::new(CAPABILITY, "direct"),
-                broker: Some(Box::new(leg)),
-            };
-            let (result, stdout) = tokio::task::spawn_blocking(move || {
-                let (streams, reader) = streams();
-                let result = invoker.invoke(
-                    owned_proposal(invoker.run_command("probe", &[], false)),
-                    streams,
-                    &dekopon_process::TreeContext::new(
-                        dekopon_process::Limits::default(),
-                        dekopon_process::CallBudget::new(64),
-                    ),
-                );
-                (result, output(reader))
-            })
-            .await
-            .unwrap();
-            assert_eq!(result, CapabilityCallResult::Succeeded);
-            assert_eq!(stdout, "{\"leg\":\"direct\"}\n");
-            assert_eq!(sink.labels().last().unwrap(), "finished probe Succeeded");
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn two_stage_threads_keep_their_proposals_reports_paired() {
-            let directory = private_broker_directory();
-            let reply = |outcome| {
-                ResponseEnvelope::invocation(result(outcome, None), vec![], vec![], vec![])
-            };
-            let (mut leg, sink) = reporting_probe_leg(
-                directory.path(),
-                vec![
-                    proposal_of(CAPABILITY),
-                    proposal_of(CAPABILITY),
-                    reply(InvocationOutcome::Succeeded),
-                    reply(InvocationOutcome::Failed),
-                ],
-            )
-            .await;
-            leg.command_words.insert("second".to_owned());
-            tokio::task::spawn_blocking(move || {
-                std::thread::scope(|scope| {
-                    let (ready, observed) = std::sync::mpsc::sync_channel(1);
-                    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
-                    let leg = &leg;
-                    let first = scope.spawn(move || {
-                        let proposal = owned_proposal(leg.run_command("probe", &[], false));
-                        ready.send(()).unwrap();
-                        resumed.recv().unwrap();
-                        leg.invoke(
-                            proposal,
-                            streams().0,
-                            &dekopon_process::TreeContext::new(
-                                dekopon_process::Limits::default(),
-                                dekopon_process::CallBudget::new(64),
-                            ),
-                        )
-                    });
-                    observed.recv().unwrap();
-                    let second = scope.spawn(move || {
-                        leg.invoke(
-                            owned_proposal(leg.run_command("second", &[], false)),
-                            streams().0,
-                            &dekopon_process::TreeContext::new(
-                                dekopon_process::Limits::default(),
-                                dekopon_process::CallBudget::new(64),
-                            ),
-                        )
-                    });
-                    let second = second.join().unwrap();
-                    assert!(matches!(second, CapabilityCallResult::Succeeded));
-                    resume.send(()).unwrap();
-                    let first = first.join().unwrap();
-                    assert!(matches!(first, CapabilityCallResult::Failed { .. }));
-                });
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                sink.labels(),
-                vec![
-                    "started probe arguments=0 calls=0/4",
-                    "started second arguments=0 calls=0/4",
-                    "finished second Succeeded",
-                    "finished probe Failed",
-                ]
-            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -3896,88 +3397,6 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_word_that_proposes_nothing_is_one_pair_under_the_word_with_its_own_outcome() {
-            let directory = private_broker_directory();
-            let (leg, sink) =
-                reporting_probe_leg(directory.path(), vec![rendered_at(0), rendered_at(2)]).await;
-
-            let (help, usage_error) = tokio::task::spawn_blocking(move || {
-                let help = leg.run_command("probe", &["--help".to_owned()], false);
-                let usage_error = leg.run_command("probe", &["--nonsense".to_owned()], false);
-                leg.script_finished();
-                (help, usage_error)
-            })
-            .await
-            .expect("blocking dispatch completes");
-
-            assert!(
-                matches!(help, Some(CommandRun::Rendered { status: 0, .. })),
-                "{help:?}"
-            );
-            assert!(
-                matches!(usage_error, Some(CommandRun::Rendered { status: 2, .. })),
-                "{usage_error:?}"
-            );
-            assert_eq!(
-                sink.labels(),
-                vec![
-                    "started probe arguments=1 calls=0/4".to_owned(),
-                    "finished probe Succeeded".to_owned(),
-                    "started probe arguments=1 calls=0/4".to_owned(),
-                    "finished probe Failed".to_owned(),
-                ]
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_proposing_word_is_one_pair_under_the_word_finished_by_the_call_it_proposed() {
-            let directory = private_broker_directory();
-            let (leg, sink) = reporting_probe_leg(
-                directory.path(),
-                vec![
-                    proposal_of(CAPABILITY),
-                    ResponseEnvelope::invocation(
-                        result(InvocationOutcome::Denied, Some("policy-denied")),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                ],
-            )
-            .await;
-
-            let called = tokio::task::spawn_blocking(move || {
-                let argv = ["fetch".to_owned(), "7".to_owned()];
-                let called = leg.invoke(
-                    owned_proposal(leg.run_command("probe", &argv, false)),
-                    streams().0,
-                    &dekopon_process::TreeContext::new(
-                        dekopon_process::Limits::default(),
-                        dekopon_process::CallBudget::new(64),
-                    ),
-                );
-                leg.script_finished();
-                called
-            })
-            .await
-            .expect("blocking dispatch completes");
-
-            assert_eq!(
-                called,
-                CapabilityCallResult::Denied {
-                    reason: "policy-denied".to_owned(),
-                }
-            );
-            assert_eq!(
-                sink.labels(),
-                vec![
-                    "started probe arguments=2 calls=0/4".to_owned(),
-                    "finished probe Denied".to_owned(),
-                ]
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
         async fn a_proposal_the_script_never_invokes_finishes_failed_before_the_script_returns() {
             let directory = private_broker_directory();
             let (leg, sink) =
@@ -4006,44 +3425,6 @@ mod tests {
                 "{}",
                 outcome.output
             );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_later_word_does_not_settle_an_earlier_owned_proposal() {
-            let directory = private_broker_directory();
-            let (leg, sink) = reporting_probe_leg(
-                directory.path(),
-                vec![proposal_of("gh.pr-merge"), rendered_at(0)],
-            )
-            .await;
-
-            let (merge, help) = tokio::task::spawn_blocking(move || {
-                let merge = leg.run_command("probe", &["merge".to_owned(), "7".to_owned()], false);
-                let help = leg.run_command("probe", &["--help".to_owned()], false);
-                leg.script_finished();
-                (merge, help)
-            })
-            .await
-            .expect("blocking dispatch completes");
-
-            assert!(
-                matches!(merge, Some(CommandRun::Proposed { .. })),
-                "{merge:?}"
-            );
-            assert!(
-                matches!(help, Some(CommandRun::Rendered { status: 0, .. })),
-                "{help:?}"
-            );
-            assert_eq!(
-                sink.labels(),
-                vec![
-                    "started probe arguments=2 calls=0/4",
-                    "started probe arguments=1 calls=0/4",
-                    "finished probe Succeeded",
-                ]
-            );
-            drop(merge);
-            assert_eq!(sink.labels().last().unwrap(), "finished probe Failed");
         }
 
         #[tokio::test(flavor = "multi_thread")]

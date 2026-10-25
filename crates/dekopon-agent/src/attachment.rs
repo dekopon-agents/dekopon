@@ -4,7 +4,6 @@ use dekopon_broker_protocol::{
 use dekopon_core::base64::{DecoderReader, STANDARD};
 use dekopon_model::asset::{BlobError, DiskBlob};
 use parking_lot::Mutex;
-use serde_json::Value;
 use std::{fmt, future::Future, io::Read, os::fd::OwnedFd, pin::Pin, sync::Arc};
 use thiserror::Error;
 
@@ -340,7 +339,6 @@ pub trait ChatAssetSource: Send + Sync {
     /// Resolving a released (reclaimed) asset refuses permanently rather than trying to redownload
     /// it, since the underlying bytes are gone.
     fn resolve_input(&self, id: u64) -> ResolveFuture<'_>;
-    fn rows(&self) -> Vec<AssetRow>;
 }
 pub struct PreparedRun {
     pub argv: Vec<dekopon_broker_protocol::Arg>,
@@ -354,22 +352,6 @@ pub struct ChatAssetInputs {
 impl ChatAssetInputs {
     pub fn new(source: Arc<dyn ChatAssetSource>) -> Self {
         Self { source }
-    }
-    pub async fn prepare(
-        &self,
-        input: &Value,
-        sends_remaining: u8,
-    ) -> Result<(InvokeAssets, Vec<DiskBlob>), ChatAssetRefusal> {
-        let _ = input;
-        Ok((
-            InvokeAssets {
-                rows: self.source.rows(),
-                descriptors: Vec::new(),
-                sends_remaining,
-                streams: None,
-            },
-            Vec::new(),
-        ))
     }
 
     pub async fn prepare_run(
@@ -491,13 +473,6 @@ mod tests {
                 })
                 .ok_or(ChatAssetRefusal::UnknownAsset);
             Box::pin(async move { resolved })
-        }
-        fn rows(&self) -> Vec<AssetRow> {
-            self.blobs
-                .iter()
-                .zip(1..)
-                .map(|(blob, id)| row(id, blob))
-                .collect()
         }
     }
     fn arguments(ids: &[u64]) -> Vec<dekopon_shell::Arg> {

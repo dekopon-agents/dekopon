@@ -10,6 +10,34 @@ struct Replay {
     calls: Mutex<Vec<Value>>,
 }
 
+impl Replay {
+    fn parse_command(
+        &self,
+        word: &str,
+        argv: &[String],
+        stdin_piped: bool,
+    ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
+        self.calls.lock().push(json!({
+            "word": word, "argv": argv, "stdin": stdin_piped.then_some(""),
+        }));
+        let output = match (word, argv.first().map(String::as_str)) {
+            ("gh", Some("pr")) => json!({"headSha": "0123456789012345678901234567890123456789"}),
+            ("ssh", _) if argv.iter().any(|s| s == "--job") => json!({"outcome": "done"}),
+            ("ssh", _) if argv.iter().any(|s| s == "--run") => {
+                json!({"outcome": "unknown", "jobId": "job-7"})
+            }
+            ("date", _) => json!("2026-09-30"),
+            _ => json!("ok"),
+        };
+        Some(Ok(dekopon_shell::CommandProposal {
+            capability: "replay.command".to_owned(),
+            input: json!({"result": output}),
+            secret_use: None,
+            report: None,
+        }))
+    }
+}
+
 impl CapabilityInvoker for Replay {
     fn granted(&self) -> Vec<String> {
         vec!["replay.command".to_owned()]
@@ -30,25 +58,44 @@ impl CapabilityInvoker for Replay {
         matches!(word, "gh" | "python" | "ssh" | "turso" | "date")
     }
 
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        self.calls.lock().push(json!({
-            "word": word, "argv": argv, "stdin": stdin_piped.then_some(""),
-        }));
-        let output = match (word, argv.first().map(String::as_str)) {
-            ("gh", Some("pr")) => json!({"headSha": "0123456789012345678901234567890123456789"}),
-            ("ssh", _) if argv.iter().any(|s| s == "--job") => json!({"outcome": "done"}),
-            ("ssh", _) if argv.iter().any(|s| s == "--run") => {
-                json!({"outcome": "unknown", "jobId": "job-7"})
+    fn run(
+        &self,
+        call: dekopon_shell::RunCall,
+        streams: dekopon_shell::Streams,
+        tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::RunResult {
+        let argv = call
+            .argv
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
+            Some(Ok(proposal)) => {
+                let capability = proposal.capability.clone();
+                let input = proposal.input.clone();
+                let secret_use = proposal.secret_use.clone();
+                if !self.is_granted(&capability) {
+                    return dekopon_shell::render_command(
+                        streams,
+                        "",
+                        format!(
+                            "dekopon-shell: {}: requires capability {}, which is not granted in this session\n",
+                            call.word, capability
+                        ),
+                        127,
+                    );
+                }
+                let result = self.invoke(proposal, streams, tree);
+                dekopon_shell::RunResult::Invoked {
+                    capability,
+                    input,
+                    secret_use,
+                    result,
+                }
             }
-            ("date", _) => json!("2026-09-30"),
-            _ => json!("ok"),
-        };
-        Some(CommandRun::Proposed {
-            capability: "replay.command".to_owned(),
-            input: json!({"result": output}),
-            secret_use: None,
-            report: None,
-        })
+            Some(Err(rendered)) => dekopon_shell::render_run(call, Some(rendered), streams),
+            None => dekopon_shell::render_run(call, None, streams),
+        }
     }
 
     fn invoke(

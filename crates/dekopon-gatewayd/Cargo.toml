@@ -39,6 +39,7 @@ humantime.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 libc.workspace = true
+mime = "0.3.17"
 reqwest = { workspace = true, features = ["multipart"] }
 rustix.workspace = true
 serde.workspace = true

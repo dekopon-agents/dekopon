@@ -11,8 +11,8 @@ use std::{
 use dekopon_broker_protocol::ConversationMatch;
 use dekopon_process::TreeContext;
 use dekopon_shell::{
-    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, CommandRun,
-    JobControl, Streams,
+    CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, JobControl,
+    Streams,
 };
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -361,9 +361,7 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
             RunResult::Uncertain(result) => RunResult::Uncertain(result),
         }
     }
-    fn run_command(&self, word: &str, argv: &[String], stdin_piped: bool) -> Option<CommandRun> {
-        self.inner.run_command(word, argv, stdin_piped)
-    }
+
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         self.inner.describe(capability)
     }

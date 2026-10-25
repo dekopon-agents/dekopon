@@ -318,9 +318,10 @@ async fn a_cancel_racing_a_completion_never_publishes_twice_or_strands_a_downloa
 }
 
 #[tokio::test]
-async fn an_expired_conversation_releases_its_bytes_before_a_live_resident_is_evicted() {
+async fn an_idle_one_shot_releases_its_bytes_before_a_live_resident_is_evicted() {
     let store = store(6);
-    let (expired, live) = (access("expired"), access("live"));
+    let expired = AssetAccess::one_shot(access("expired").key.conversation);
+    let live = access("live");
     let kept = register(&store, &live, Some(3));
     drop(store.admit(&live, kept, b"kkk").unwrap());
     let stale = register(&store, &expired, Some(3));

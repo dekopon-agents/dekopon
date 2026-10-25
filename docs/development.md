@@ -23,7 +23,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
 | Config discovery and validation | `crates/dekopon-config/src/`; skill-directory loading (`SKILL.md` front matter, resources, and enforcement of core's size/depth/count bounds) in `crates/dekopon-config/src/skill.rs`; the Kubernetes projection rule shared with gateway sources in `crates/dekopon-config/src/projection.rs` | `crates/dekopon-config/src/tests.rs`, including catalog-relative skill loading and one-refusal reporting of every unmountable skill; inline front-matter, bound, symlink-refusal and Kubernetes-projection tests in `skill.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/catalog/dekopon.yaml`, which mounts `examples/catalog/skills/pull-request-review/`, and `examples/conditional-write/dekopon.yaml` |
 | Trace context (always built) and OTLP exporter settings and subscriber wiring (`exporter` feature) | `crates/dekopon-telemetry/src/lib.rs`; `crates/dekopon-telemetry/src/exporter.rs` | Inline endpoint, transport, environment-credential, and OTLP-filter tests |
-| Isolated model auth commands | `crates/dekopon-gatewayd/src/{cli,auth,auth_result,auth_render,auth_output}.rs` | `crates/dekopon-gatewayd/tests/auth.rs` and inline parser/renderer/export-guard tests |
+| Isolated model auth commands | `crates/dekopon-gatewayd/src/{cli,auth,auth_result,auth_render,auth_output}.rs` | `crates/dekopon-gatewayd/tests/integration/auth.rs` and inline parser/renderer/export-guard tests |
 | Model clients and ChatGPT auth | `crates/dekopon-model/src/`; the per-dialect usage normalization shared with the guest proxy in `wire.rs` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
 | Token meters, budgets, the refusal sentence, and per-call metering | `crates/dekopon-model-token-governor/src/` (no I/O; every method takes its time as `UnixMillis`) | `src/tests.rs`: per-kind limit, wait, `Never` and debt; reservations; seeded restore equivalence; refusal sentences; `Metering`/`Admission` charge and `meter` record tests including an abort mid-await |
 | Typed provider SDK, guest imports and adapter | `crates/dekopon-provider-sdk/src/` (including the wasm-only `skills!` embedding macro), `crates/dekopon-provider-sdk/wit/` | Typed dispatch, handles, schema and WIT mirror tests; `wit/{http,storage,clock}/` publication packages |
@@ -31,20 +31,22 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Bounded native HTTP host | `crates/dekopon-http-host/src/` | Inline destination, method, DNS, header, bound, and loopback mock-server tests |
 | Broker async component host | `crates/dekopon-broker-host/src/` (including the offline nested custom-section reader in `skills.rs` and shared locked-byte verification), `crates/dekopon-broker-host/wit/` | Inline adapter tests plus `crates/dekopon-broker-host/tests/host.rs` authorization-boundary, Wasmtime, clock-refusal, and loopback tests, and `crates/dekopon-broker-host/tests/spans.rs` for store, instantiation, fuel, and clock-probe telemetry |
 | Cedar policy adapter | `crates/dekopon-policy/src/lib.rs` | `crates/dekopon-policy/src/tests.rs` validation-refusal, deny-by-default, context-matching, explanation, and digest-stability tests |
-| Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context and bounded in-memory audit tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation and redaction tests, `crates/dekopon-broker/tests/audit_log_events.rs` for the audit log record, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
+| Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context and bounded in-memory audit tests, `crates/dekopon-broker/tests/integration/broker.rs` constraint-validation and redaction tests, `crates/dekopon-broker/tests/audit_log_events.rs` for the audit log record, and `crates/dekopon-broker/tests/integration/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
-| Authenticated Unix broker service, private secret sources, and offline provider manager | `crates/dekopon-brokerd/src/`; strict public-DRN/private-map adapters in `secrets.rs`; provider set/lock, bounded OCI transport, content store, skill-directory export, and lifecycle commands in `provider_manager.rs`; the `check --workflows` essential-workflow phase in `workflows.rs` | Inline strict-config/socket/CLI tests; secret-map aggregate validation, strict JSON/YAML projection, secure-file and mock-backed 1Password/Vault/AWS/GCP/Azure/Kubernetes/`oauth2Refresh` adapters; local mock-registry resolution, locked-sync, offline list/verify/skills export, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, and clean-shutdown tests, `audit_stdout.rs` and `audit_trace.rs` for the audit record on stdout and in the caller's trace, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
+| Authenticated Unix broker service, private secret sources, and offline provider manager | `crates/dekopon-brokerd/src/`; strict public-DRN/private-map adapters in `secrets.rs`; provider set/lock, bounded OCI transport, content store, skill-directory export, and lifecycle commands in `provider_manager.rs`; the `check --workflows` essential-workflow phase in `workflows.rs` | Inline strict-config/socket/CLI tests; secret-map aggregate validation, strict JSON/YAML projection, secure-file and mock-backed 1Password/Vault/AWS/GCP/Azure/Kubernetes/`oauth2Refresh` adapters; local mock-registry resolution, locked-sync, offline list/verify/skills export, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/integration/server.rs` mapped/unmapped-peer, end-to-end invocation, and clean-shutdown tests, `tests/integration/audit_stdout.rs` and `tests/audit_trace.rs` for the audit record on stdout and in the caller's trace, and `crates/dekopon-brokerd/tests/integration/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/tests/grammar.rs` |
 | Cancel latch and shared script-tree accounting (`TreeContext`, `CallBudget`, `RetainedBytes`, `Limits`, `LimitExceeded`, `DEFAULT_*`) | `crates/dekopon-process/src/` | Direct signal-wait tests for requested cancellation, dropped handles and never signals, plus synchronous latch reads; Stop or the script deadline drops a command word in flight, after which the script reads `session-cancelled` |
 | Shared prompt loop, the safe agent-configuration meta view, session capability dispatch, descriptor-backed asset integration, mounted skills, and improvement suggestions | `crates/dekopon-agent/src/`; the typed-output intake and `chat-asset:` reference discovery in `attachment.rs`, the skills listing and `read_skill` tool in `skills.rs`, the `suggest_improvement` tool and its bounds in `improvement.rs` | Inline prompt/meta-tool, explicit-send slot and descriptor-reference, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests, plus inline listing/argument and suggestion-validation tests in those two modules |
-| Chat gateway configuration, text/attachment transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopon-gatewayd/src/` | `crates/dekopon-gatewayd/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key derivation and stability, explicit asset delivery and descriptor inputs, route-mounted skills read on demand, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopon-gatewayd/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopon-gatewayd/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopon-gatewayd/tests/examples.rs` for the checked-in walkthrough configuration |
+| Chat gateway configuration, text/attachment transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopon-gatewayd/src/` | `crates/dekopon-gatewayd/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key derivation and stability, explicit asset delivery and descriptor inputs, route-mounted skills read on demand, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopon-gatewayd/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopon-gatewayd/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopon-gatewayd/tests/integration/examples.rs` for the checked-in walkthrough configuration |
 | Gateway token budgets and boot restore | `crates/dekopon-gatewayd/src/metering.rs` (config, validation, `ChatProviderGovernor`), `crates/dekopon-gatewayd/src/meter_restore.rs` (OpenObserve and Quickwit queries and parsers) | Inline config, governor, parser, timeout and unsynced-clock tests; `crates/dekopon-gatewayd/src/tests.rs` for the refusal reply end to end |
 | Guest model proxy | `crates/dekopon-model-proxy/src/` (router, dialect error bodies and usage taps, the SSE tee, the mTLS listener); `crates/dekopon-gatewayd/src/proxy.rs` (config, validation, upstream credentials, listener ownership); the request peek in `crates/dekopon-model/src/wire.rs` | `crates/dekopon-model-proxy/src/tests.rs` against loopback upstreams (pass-through, refusal shapes, 413, `count_tokens`, pings, a disconnect charge, Codex rewrites); `tls.rs` certificate tests from a generated CA; `crates/dekopon-gatewayd/src/proxy.rs` config and started-listener tests |
-| Typed provider test harness | `crates/dekopon-provider-sdk-testkit/src/` | `tests/typed.rs` parity and conformance; broker-host `tests/fixture_host.rs` refuses fetched 0.3.0 memory-chat at load and drives checked storage/CLI components under exact grants |
+| Typed provider test harness | `crates/dekopon-provider-sdk-testkit/src/` | `tests/typed.rs` parity and conformance; broker-host `tests/integration/fixture_host.rs` refuses fetched 0.3.0 memory-chat at load and drives checked storage/CLI components under exact grants |
 | Rust provider fixtures | `examples/providers/cli-probe/`, `clock-probe/`, `http-probe/`, `memory-reservation-probe/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, broker-host validation, loopback mocks, and broker/VFS tests; exact standalone JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
-| End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopon-gatewayd/tests/examples.rs` |
+| End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/integration/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopon-gatewayd/tests/integration/examples.rs` |
 | Agent skill example | `examples/catalog/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/catalog/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs` |
 | Shared test scaffolding | `crates/dekopon-test-support/src/` | Not published and never a normal dependency: `provider_fixture`, the `LoopbackServer` builder, `content_length`, one `tracing` `CaptureLayer` read by field name, the socket `BrokerFixture`, `snapshot_tree`, and `shutdown_on`, reached only as a path `[dev-dependencies]` entry |
+| Console CLI, profiles and telemetry | `crates/dekopon-console/src/` | Inline tests and `crates/dekopon-console/tests/` |
+| Console session, rendering and terminal state | `crates/dekopon-tui/src/` | Inline tests and `crates/dekopon-tui/tests/`, including local broker/component integration |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
@@ -205,7 +207,7 @@ Declare shared versions and path dependencies in the root `Cargo.toml`; commit `
 
 GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization; an execution contract the owner approved gives it for what it lists.
 
-Expensive validation runs on pull requests only; the one exception is the x86-64 lane of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check, which runs after merge. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them and a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`; the required `quality (stable)` context aggregates all four lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs `cargo package --workspace --locked --no-verify` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
+Expensive validation runs on pull requests, with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them and a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`; the required `quality (stable)` context aggregates all four lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs `cargo package --workspace --locked --no-verify` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
 
 The chart CI render lane checks that enabling the private VM proxy rejects missing or mismatched
 inline daemon binds and still renders opaque configuration for the candidate check hook. Its
@@ -214,13 +216,14 @@ kubeconform covers the workflow mount and the `check-peers` ConfigMap. It also r
 `charts/dekopon/ci/test-private-files.py`, which requires `broker.privateFiles` to be copied into the
 broker as `0600` files the gateway never mounts and refuses an unsafe file segment. The render lane
 also runs `charts/dekopon/ci/test-live-sources.py` (using `helm` and `yq`) to check live read-only
-gateway projections, broker-only sources, and preserved broker/credential roll triggers.
+gateway projections, broker-only sources, preserved broker/credential roll triggers, and the live
+catalog mount used by config-check baselines (including catalog key projection).
 
 Pull-request caches are restore-only. The workspace-test lane uses SHA-pinned `Swatinem/rust-cache` for Cargo registry/Git dependencies and compiled dependency artifacts in its own `target/`, alongside the existing read-only sccache compiler cache. Its `workspace-tests-v1` shared key matches the dedicated test-dependencies job in `.github/workflows/cache-warm.yml`; runner, toolchain, Rust environment and manifest/lockfile hashes also qualify the cache. The action's default pruning excludes workspace crates, linked test executables and incremental artifacts; `cache-bin: false` leaves installed tools alone. Other PR lanes retain the existing registry/compiler caches. The warmer saves test dependency artifacts only on `main`, and still writes the other lanes' default-branch registry cache capped at 512 MiB plus granular sccache objects. Warmers compile but execute no tests and are not a second validation gate. The first PR introducing this key is cold until a main-branch warmer populates it; cache restore/save overhead and actual build times, not a lookup hit alone, determine whether it helps.
 
 The required `test (Rust)` job now separates `Compile workspace tests` (`cargo test --no-run`) from `Run workspace tests` (library, binary and integration tests). Both run on the same runner and reuse its linked binaries; the run step still invokes Cargo for freshness checks and may rebuild if inputs change. Default example compilation remains in the compile step. Doctests run exactly once in `Test documentation`, because stable Cargo does not support combining `--doc` with `--no-run`. No test harness or parallelism setting changes.
 
-Linux releases also restore main-owned dependency caches. The `release-dependencies` matrix in `.github/workflows/cache-warm.yml` runs the exact release CLI build on native `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (ARM64): `cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd --target <TARGET>`. It installs the same pinned toolchain/target and uses the same SHA-pinned Swatinem action and `linux-release-v1-<TARGET>` shared key as `.github/workflows/release.yml`. Neither side uses a compiler wrapper; Swatinem sets `CARGO_INCREMENTAL=0` before constructing the key. The action additionally keys by host OS/architecture, Rust toolchains/environment and dependency manifests/lockfile, with a dependency-hash fallback; a cold or evicted cache remains a normal build. This is separate from the PR test cache and the stable lane's release-profile `cargo check` compiler objects.
+Linux releases also restore main-owned dependency caches. The `release-dependencies` matrix in `.github/workflows/cache-warm.yml` runs the exact release CLI build on native `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (ARM64): `cargo build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console --target <TARGET>`. It installs the same pinned toolchain/target and uses the same SHA-pinned Swatinem action and `linux-release-v1-<TARGET>` shared key as `.github/workflows/release.yml`. Neither side uses a compiler wrapper; Swatinem sets `CARGO_INCREMENTAL=0` before constructing the key. The action additionally keys by host OS/architecture, Rust toolchains/environment and dependency manifests/lockfile, with a dependency-hash fallback; a cold or evicted cache remains a normal build. This is separate from the PR test cache and the stable lane's release-profile `cargo check` compiler objects.
 
 The release warmer runs only on `main`, on the workflow's matching pushes (including release workflow changes) or a manual dispatch against `main`. It builds binaries only to populate dependency artifacts: no tests, provider downloads, archives, attestations or publication. Only successful main builds may save. Workspace crates/final executables are pruned from the saved cache, so releases still build the tagged project and perform final linking. Linux tag jobs restore only and create no new tag-specific copies. macOS retains its existing tag-local retry cache; package/publication caches are unchanged.
 
@@ -244,7 +247,7 @@ Use an isolated checkout so selecting the optimized lock never changes the stock
 git worktree add --detach ../dekopon-wasmtime-optimization HEAD
 cd ../dekopon-wasmtime-optimization
 cp .cargo/wasmtime-optimization.lock Cargo.lock
-cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
 cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
 ```
 
@@ -295,7 +298,7 @@ Privileged broker path:
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, maps distinct configured peer UIDs, bounds concurrent connections, and serves with `TraceOnlyAuditLog`, so its audit is the log record alone.
 - `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, `skills --out DIR`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the rustls `reqwest` client.
-- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary). Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopon-gatewayd`. In the reverse direction, CI rejects `dekopon-agent`, `dekopon-shell`, `dekopon-process`, or `dekopon-config` in the normal dependency tree of `dekopon-brokerd`; `dekopon-model` is allowed for the shared `chatgpt::CredentialFile` refresh implementation. Both gates allow the shared `dekopon-broker-protocol` client.
+- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary). Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, `dekopon-console`, or `dekopon-tui` in the normal dependency tree of `dekopon-gatewayd`. In the reverse direction, CI rejects `dekopon-agent`, `dekopon-shell`, `dekopon-process`, `dekopon-config`, `dekopon-console`, or `dekopon-tui` in the normal dependency tree of `dekopon-brokerd`; `dekopon-model` is allowed for the shared `chatgpt::CredentialFile` refresh implementation. Both gates allow the shared `dekopon-broker-protocol` client.
 - `dekopon-gatewayd` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. See [`gatewayd.md`](gatewayd.md).
 
 See [`gatewayd.md`](gatewayd.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
@@ -316,6 +319,10 @@ For deployment diagnosis, inspect the deployed runtime version/ref and provider 
 
 ### Root workspace
 
+The gateway dependency gate rejects privileged broker machinery and both `dekopon-console` and
+`dekopon-tui`. The broker dependency gate rejects unprivileged orchestration and both console
+crates. Neither daemon may acquire the console through a normal dependency.
+
 This is the complete list of root-workspace commands behind the required `quality (stable)` context and the `dependency policy` job, in each lane's order in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml); the comment above each command is what it gates.
 
 ```console
@@ -323,23 +330,23 @@ This is the complete list of root-workspace commands behind the required `qualit
 cargo fmt --all --check
 # Lint every target with warnings denied.
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-# Release-profile compile of the two daemons; tag workflows perform the final linked builds.
-cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd
+# Release-profile compile of both daemons and console; tag workflows perform the final linked builds.
+cargo check --release --locked -p dekopon-brokerd -p dekopon-gatewayd -p dekopon-console
 # Unused dependencies; CI pins cargo-machete 0.9.2.
 cargo machete
-# Opposite-direction normal-dependency gates; broker-protocol is allowed in both.
+# Opposite-direction normal-dependency gates; both reject console and tui; broker-protocol is allowed in both.
 # Run in Bash; fail on Cargo errors as well as forbidden exact package names.
 (
   set -euo pipefail
   tree=$(cargo tree --locked -p dekopon-gatewayd --edges normal --prefix none)
-  if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
+  if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy|console|tui) v' <<<"$tree"; then
     printf '%s\n' "$tree" >&2
     exit 1
   fi
   # dekopon-model is absent: the broker's `kind: chatgptSubscription` credential
   # resolves through `dekopon_model::chatgpt::CredentialFile`, the one implementation of it.
   tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
-  if grep -Eq '^dekopon-(agent|shell|process|config) v' <<<"$tree"; then
+  if grep -Eq '^dekopon-(agent|shell|process|config|console|tui) v' <<<"$tree"; then
     printf '%s\n' "$tree" >&2
     exit 1
   fi
@@ -356,6 +363,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --lock
 # test (Rust): fixtures, compilation, execution using the same target/, then doctests once.
 ci/fetch-external-provider-components.sh examples/providers
 cargo test --workspace --all-features --locked --no-run
+DEKOPON_TEST_BROKERD="$PWD/target/debug/dekopon-brokerd" \
+DEKOPON_TEST_PROBE_WASM="$PWD/examples/providers/cli-probe-provider.wasm" \
+DEKOPON_TEST_ASSET_WASM="$PWD/examples/providers/http-probe-provider.wasm" \
 cargo test --workspace --all-features --locked --lib --bins --tests
 cargo test --workspace --all-features --locked --doc
 # broker-host components (Linux ARM64): on an aarch64 Linux host only, the component host's own tests.
@@ -374,7 +384,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --locked
 ```
 
-Only `dekopon-gatewayd` packages `tests/**`; every other published crate's `include` list omits it, so Cargo may warn that an integration file such as `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, `tests/refusal_logging.rs`, `tests/span_parenting.rs`, `tests/server.rs`, `tests/examples.rs`, `tests/failure_logging.rs`, `tests/span_redaction.rs`, `tests/wit_mirror.rs`, or `tests/harness.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
+Only `dekopon-gatewayd` packages `tests/**`; every other published crate's `include` list omits it, so Cargo may warn that an integration file such as `tests/storage.rs`, `tests/host.rs`, `tests/integration/main.rs`, `tests/refusal_logging.rs`, `tests/span_parenting.rs`, `tests/examples.rs`, `tests/failure_logging.rs`, `tests/span_redaction.rs`, or `tests/wit_mirror.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
 
 ### Documentation gates
 
@@ -606,17 +616,19 @@ image that matches the machine.
 
 Do not add a compile stage to the Dockerfile: the point of the image is that its binaries are the
 release's binaries, verifiable with `sha256sum` against the published archive. The workflow checks
-exactly that for all four before it pushes anything, and the staging script refuses to stage a
+exactly that for all six before it pushes anything, and the staging script refuses to stage a
 binary that needs a glibc newer than the runtime base provides.
 
 `ci/verify-image-broker.sh` starts the real broker with the baked `cli-probe` component and waits
-under a deadline for its post-load socket. The workflow always runs this component-load check on
-release tags. Pull requests stage against the newest published release and check image structure
-and binary identity; they also run broker startup when that release is v0.31.0 or newer. Only PRs
-staged with an earlier, pre-stdio archive skip the incompatible component-load check, with a
-notice. A green PR staged with 0.30.0 is **not** evidence of 0.31.0 broker startup. The tag
-workflow retains the mandatory real load gate. This validates released image bytes,
-not a native build of source HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
+under a deadline for its post-load socket. Pull requests use the newest published release and
+check its source tree for `crates/dekopon-console/Cargo.toml`. If that release predates the
+workspace console, the workflow runs only the staging contract tests for image validation and
+reports the gap; it skips archive staging, image builds, binary identity verification, and
+execution checks. Once the release contains the console, PRs run those checks, including broker
+component loading. Publication always stages the archives, builds both architecture images,
+verifies all three binaries against the release archives, and runs the amd64 binaries and broker
+component-load check before pushing. These checks validate released image bytes, not a native
+build of source HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The two
 checked in-tree components must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
 

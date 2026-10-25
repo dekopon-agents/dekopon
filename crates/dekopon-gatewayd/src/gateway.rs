@@ -259,6 +259,7 @@ impl Gateway {
             _digest: gateway_digest.clone(),
             _broker_digest: broker_digest.clone(),
         }));
+        candidate.config.emit_effective_indicators();
         self.reload = Some(ReloadState {
             active: Arc::clone(&self.active),
             path,
@@ -1141,6 +1142,7 @@ impl ReloadState {
             _digest: digest.clone(),
             _broker_digest: broker_digest.clone(),
         }));
+        candidate.config.emit_effective_indicators();
         self.credentials.set_active_models(&candidate.config.models);
         self.config = candidate.config;
         self.sources = sources;
