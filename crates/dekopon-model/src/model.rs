@@ -180,6 +180,35 @@ pub enum ModelMessage {
 }
 
 impl ModelMessage {
+    pub fn for_metering(&self) -> Cow<'_, Self> {
+        match self {
+            Self::User {
+                content: MessageContent::Parts(parts),
+            } => {
+                let mut metered = None;
+                for (index, part) in parts.iter().enumerate() {
+                    match part {
+                        ContentPart::Image { mime, data } => {
+                            metered.get_or_insert_with(|| parts.clone())[index] =
+                                ContentPart::Text(format!("[{mime}, {} bytes]", data.len()));
+                        }
+                        ContentPart::Text(_) | ContentPart::File { .. } => {}
+                    }
+                }
+                match metered {
+                    Some(parts) => Cow::Owned(Self::user_with_parts(parts)),
+                    None => Cow::Borrowed(self),
+                }
+            }
+            Self::System { .. }
+            | Self::User {
+                content: MessageContent::Text(_),
+            }
+            | Self::Assistant { .. }
+            | Self::ToolResults { .. } => Cow::Borrowed(self),
+        }
+    }
+
     pub fn prepared_for_trace(&self) -> Cow<'_, Self> {
         match self {
             Self::User {
