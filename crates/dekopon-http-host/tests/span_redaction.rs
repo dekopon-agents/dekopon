@@ -28,6 +28,7 @@ async fn http_span_carries_evidence_fields_and_no_payload() {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
             request_templates: Vec::new(),
+            signed_download: None,
         },
         HttpHostCeilings::default(),
         Duration::from_secs(5),
@@ -85,6 +86,7 @@ async fn templated_requests_trace_the_rebuilt_url(captured: &CaptureLayer) {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            signed_download: None,
             request_templates: vec![
                 serde_json::from_value::<RequestTemplate>(serde_json::json!({
                     "method": "GET",
@@ -135,6 +137,7 @@ async fn refusals_carry_their_failure_class_and_are_still_accounted(captured: &C
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
             request_templates: Vec::new(),
+            signed_download: None,
         },
         HttpHostCeilings::default(),
         Duration::from_secs(5),
