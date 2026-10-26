@@ -7,6 +7,20 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-10-26
+
+### Changed
+
+- Bind captured turns to the model identity reported by the provider.
+- Rebuild model continuations from reasoning, text and tool calls.
+- a refused host call tells the model why (byte-limit, host-call-limit, denied, invalid-http-request, …) instead of host-call-rejected
+
+## [dekopon-chart-0.44.0] - 2026-10-26
+
+### Changed
+
+- Chart 0.44.0 targets core v0.57.0 and renders the `v0.57.0` image tag.
+
 ## [0.56.0] - 2026-10-26
 
 ### Added
