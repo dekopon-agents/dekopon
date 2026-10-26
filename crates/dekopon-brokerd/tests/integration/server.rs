@@ -2551,10 +2551,10 @@ async fn an_unknown_word_answers_not_found() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invoke_over_the_row_bound_is_refused() {
-    use dekopon_broker_protocol::{AssetEncoding, AssetRow, MAX_ASSET_ROWS, ProtocolError};
+    use dekopon_broker_protocol::{AssetEncoding, AssetRow, MAX_ASSET_DESCRIPTORS, ProtocolError};
     let harness = RunHarness::start("caller").await;
     let (mut assets, output) = stdio(None);
-    assets.rows = (1..=u64::try_from(MAX_ASSET_ROWS + 1).unwrap())
+    assets.rows = (1..=u64::try_from(MAX_ASSET_DESCRIPTORS + 1).unwrap())
         .map(|id| AssetRow {
             id,
             content_type: "image/png".to_owned(),

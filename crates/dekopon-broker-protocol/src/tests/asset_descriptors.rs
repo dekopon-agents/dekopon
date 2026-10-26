@@ -9,8 +9,8 @@ use tokio::{io::Interest, net::UnixStream};
 
 use crate::{
     AssetEncoding, AssetRow, BrokerRequest, DescriptorStream, FrameLimits, MAX_ASSET_DESCRIPTORS,
-    MAX_ASSET_ROWS, MAX_DESCRIPTORS_PER_FRAME, NewAsset, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, StreamDescriptors, Streams, validate_response_descriptors,
+    MAX_DESCRIPTORS_PER_FRAME, NewAsset, ProtocolError, RequestEnvelope, ResponseEnvelope,
+    StreamDescriptors, Streams, validate_response_descriptors,
 };
 
 fn files(count: usize) -> Vec<std::fs::File> {
@@ -291,7 +291,7 @@ fn typed_rows_and_response_indexes_are_exact() {
     let request = RequestEnvelope::invoke(
         None,
         super::invocation(),
-        vec![row; MAX_ASSET_ROWS + 1],
+        vec![row; MAX_ASSET_DESCRIPTORS + 1],
         4,
         None,
     );

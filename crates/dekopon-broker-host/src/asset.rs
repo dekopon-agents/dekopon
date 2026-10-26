@@ -1756,7 +1756,7 @@ mod tests {
     }
     #[tokio::test]
     async fn input_rows_over_the_invocation_bound_are_refused() {
-        let count = MAX_ASSET_ROWS + 1;
+        let count = MAX_ASSET_DESCRIPTORS + 1;
         let inputs = AssetInputs {
             rows: (1..=count as u64)
                 .map(|id| AssetRow {
