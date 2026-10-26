@@ -1,2 +1,2 @@
 [patch.crates-io]
-wasmtime = { git = "https://github.com/dekopon-agents/wasmtime", rev = "6e850d9e9df96b0eacd6867e8ffb8a813200e42f" }
+wasmtime = { git = "https://github.com/dekopon-agents/wasmtime", rev = "84c7a78bf410ff2f4d4fc829ff0eac8139415d0e" }
