@@ -379,7 +379,7 @@ impl BufferedHttpClient {
             response_bytes = response_bytes
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
-            self.evidence[index].response_bytes = response_bytes;
+            self.evidence[index].response_bytes += chunk.len() as u64;
             if response_bytes > grant.max_response_bytes {
                 return Err(http_error(
                     ErrorCode::ResponseTooLarge,
@@ -400,7 +400,6 @@ impl BufferedHttpClient {
             }
         }
         self.evidence[index].status = Some(status);
-        self.evidence[index].response_bytes = response_bytes;
         Ok(StreamedResponse {
             status,
             headers,
@@ -596,12 +595,22 @@ impl BufferedHttpClient {
                 });
             }
         }
-        match metadata {
+        let charged_bytes = match metadata {
             super::ResponseMetadata::Ordinary => {
                 super::signed_download::redact_api_locations(&mut headers);
+                let returned_bytes = super::returned_head_bytes(&headers);
+                if returned_bytes > self.ceilings.max_header_bytes as u64
+                    || returned_bytes > grant.max_response_bytes
+                {
+                    return Err(http_error(
+                        ErrorCode::ResponseTooLarge,
+                        "redacted headers exceed the authorized byte limit",
+                    ));
+                }
+                response_bytes.max(returned_bytes)
             }
-            super::ResponseMetadata::SignedDownload => {}
-        }
+            super::ResponseMetadata::SignedDownload => response_bytes,
+        };
         let head = Response {
             status,
             headers,
@@ -633,7 +642,7 @@ impl BufferedHttpClient {
         Ok(Head {
             status,
             headers: head.headers,
-            bytes: response_bytes,
+            bytes: charged_bytes,
             body: ResponseBody {
                 response,
                 decoder,
@@ -1224,6 +1233,39 @@ mod tests {
         );
         server.join();
         result.map_err(|error| error.code)
+    }
+
+    #[tokio::test]
+    async fn location_redaction_cannot_exceed_response_or_header_limits() {
+        let wire = b"HTTP/1.1 302 Found\r\nLocation: /path?#\r\nContent-Length: 32\r\n\r\n01234567890123456789012345678901";
+        for path in [Path::Send, Path::Stream] {
+            for (maximum, header_maximum) in [(87, 55 + 20), (107, 55)] {
+                let server = LoopbackServer::once(wire);
+                let mut client = client(server.authority(), maximum, None);
+                client.ceilings.max_header_bytes = header_maximum;
+                let root = tempfile::tempdir().unwrap();
+                let result = match path {
+                    Path::Send => client
+                        .send(Request {
+                            method: "POST".to_owned(),
+                            uri: server.url(),
+                            headers: vec![],
+                            body: vec![],
+                        })
+                        .await
+                        .map(|_| ()),
+                    Path::Stream => client
+                        .stream(
+                            request(&server, vec![]),
+                            &AssetDirectory::new(root.path().to_owned(), maximum),
+                        )
+                        .await
+                        .map(|_| ()),
+                };
+                assert_eq!(result.unwrap_err().code, ErrorCode::ResponseTooLarge);
+                server.join();
+            }
+        }
     }
 
     #[tokio::test]
