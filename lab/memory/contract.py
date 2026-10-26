@@ -21,22 +21,28 @@ CODES = {"pass": 0, "fail": 1, "usage": 2, "timeout": 3,
          "missing-evidence": 4, "infrastructure": 5, "not-applicable": 6, "exploratory": 0}
 
 
-def verdict_exit(run):
-    report.evidence(run)
+def verdict_exit(run, scenario):
+    meta, _ = report.evidence(run)
     if not (run / "summary.md").read_text().strip():
         raise ValueError("empty summary.md")
     verdict = json.loads((run / "verdict.json").read_text())
-    if verdict["label"] not in {"required", "exploratory"}:
+    if verdict["scenario"] != meta["scenario"] or meta["scenario"] != scenario:
+        raise ValueError("verdict scenario does not match the run")
+    if verdict["label"] != report.LABELS[scenario]:
         raise ValueError("invalid verdict label")
+    requirements = report.assertion_requirements(scenario)
     outcome = verdict["outcome"]
     if outcome not in {"pass", "fail", "not-applicable", "exploratory"} or not verdict["reason"]:
         raise ValueError("invalid verdict outcome")
     assertions = verdict["assertions"]
     if not isinstance(assertions, list) or not assertions:
         raise ValueError("no assertions")
+    if len(assertions) != len(requirements) or {a["name"] for a in assertions} != requirements.keys():
+        raise ValueError("incomplete or unknown assertions")
     for assertion in assertions:
         if (not assertion["name"] or assertion["result"] not in {"pass", "fail", "not-applicable"}
-                or not isinstance(assertion["numbers"], dict) or type(assertion["required"]) is not bool):
+                or not isinstance(assertion["numbers"], dict) or type(assertion["required"]) is not bool
+                or assertion["required"] != requirements[assertion["name"]]):
             raise ValueError("invalid assertion")
     required = [a for a in assertions if a["required"]]
     expected = ("exploratory" if verdict["label"] == "exploratory" else
@@ -91,7 +97,7 @@ def main(args):
                 outcome, reason = "infrastructure", f"runner exited {status}"
             else:
                 try:
-                    outcome, reason = verdict_exit(Path(pointer.read_text().strip()))
+                    outcome, reason = verdict_exit(Path(pointer.read_text().strip()), args[1])
                 except (OSError, ValueError, KeyError, TypeError):
                     outcome, reason = "missing-evidence", "required evidence absent or unparseable"
         if pointer.exists():

@@ -19,6 +19,47 @@ DEADLINES = {name: seconds for name, seconds in (
     ("summaries-off-vs-on", 1800), ("config-check", 900))}
 
 
+SUMMARIZER_BEHAVIOURS = {
+    "summarizer-hang": ("hang", {"hung-client-gone", "hung-until-shutdown"}),
+    "summarizer-fail": ("fail", {"503"}),
+    "summarizer-refuse": ("refuse", {"refused"}),
+}
+
+
+def assertion_requirements(scenario):
+    names = ["every turn got a reply"]
+    if scenario in SUMMARIZER_BEHAVIOURS:
+        names += ["configured summarizer behavior was exercised", "no reply waited on a summary",
+                  "other routes did not wait on a summary"]
+    if scenario == "restart-mid-summary":
+        names += ["slot resume"]
+    if scenario == "unloadable-journal":
+        names += ["exactly one reset record", "clean start"]
+    return dict.fromkeys(names, LABELS[scenario] == "required")
+
+
+def summarizer_evidence(meta, turns, summaries):
+    routes = {route: [t for t in turns if t["conversation"] == route] for route in ("summary", "none")}
+    for route, rows in routes.items():
+        if len(rows) != 10 or {row["turn"] for row in rows} != {str(n) for n in range(1, 11)}:
+            raise ValueError(f"incomplete {route} route evidence")
+    numbers = {"summary_turns": len(routes["summary"]), "other_turns": len(routes["none"])}
+    applicability = (meta.get("findings") or {}).get("summarizer applicability")
+    if applicability is not None:
+        if (not isinstance(applicability, dict) or applicability.get("result") != "not-applicable"
+                or not isinstance(applicability.get("reason"), str) or not applicability["reason"].strip()
+                or summaries):
+            raise ValueError("invalid summarizer applicability evidence")
+        return "not-applicable", dict(numbers, calls=0)
+    behaviour, statuses = SUMMARIZER_BEHAVIOURS[meta["scenario"]]
+    matching = [call for call in summaries
+                if call.get("tag", {}).get("sum") == behaviour and call.get("status") in statuses
+                and call.get("tag", {}).get("turn") in {f"summary-{n}" for n in range(1, 11)}]
+    if not matching:
+        raise ValueError("configured summarizer behavior was not observed")
+    return "pass", dict(numbers, calls=len(matching))
+
+
 def evidence(run):
     meta = json.loads((run / "meta.json").read_text())
     if meta["scenario"] not in LABELS or not isinstance(meta["sha"], str):
@@ -39,9 +80,18 @@ def evidence(run):
         wall = float(turn["wall_ms"])
         if not math.isfinite(wall) or wall < 0 or not turn["kind"] or not turn["conversation"]:
             raise ValueError("invalid latency value")
-    batches = (run / "traces.jsonl").read_text().splitlines()
-    if not batches or any(not isinstance(json.loads(line), dict) for line in batches):
+    batches = 0
+    with (run / "traces.jsonl").open() as stream:
+        for line in stream:
+            if not isinstance(json.loads(line), dict):
+                raise ValueError("invalid trace evidence")
+            batches += 1
+    if not batches:
         raise ValueError("invalid trace evidence")
+    if meta["scenario"] in SUMMARIZER_BEHAVIOURS:
+        summaries = [call for call in records(run / "model-calls.jsonl", strict=True)
+                     if call.get("kind") == "summary"]
+        summarizer_evidence(meta, turns, summaries)
     return meta, turns
 
 
@@ -49,18 +99,21 @@ SLOT = re.compile(r"slot", re.I)
 DROPPED = re.compile(r"drop", re.I)
 
 
-def records(path):
-    if not path.exists():
-        return []
-    rows = []
-    for line in path.read_text(errors="replace").splitlines():
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
+def records(path, *, strict=False):
+    if not path.exists() and not strict:
+        return
+    with path.open(errors="strict" if strict else "replace") as stream:
+        for line in stream:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                if strict:
+                    raise
+                continue
+            if isinstance(row, dict):
+                yield row
+            elif strict:
+                raise ValueError("invalid record")
 
 
 def event_name(row):
@@ -121,10 +174,10 @@ def tree_bytes(path):
 def build(run):
     meta, turns = evidence(run)
     ref8 = meta["sha"][:8]
-    gateway = records(run / "gatewayd.stdout.log")
-    broker = records(run / "brokerd.stdout.log")
+    gateway = list(records(run / "gatewayd.stdout.log"))
+    broker = list(records(run / "brokerd.stdout.log"))
     events = collections.Counter(event_name(row) for row in gateway if event_name(row))
-    calls = records(run / "model-calls.jsonl")
+    calls = list(records(run / "model-calls.jsonl"))
     summaries = [c for c in calls if c.get("kind") == "summary"]
     chats = [c for c in calls if c.get("kind") == "chat"]
     lab_events = records(run / "events.jsonl")
@@ -229,31 +282,41 @@ def verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8)
     timeout = meta["summarizer_timeout_ms"]
     lines = ["## Verdict", ""]
     assertions = []
+    requirements = assertion_requirements(scenario)
 
     def assertion(name, passed, **numbers):
-        assertions.append({"name": name, "result": "pass" if passed else "fail",
-                           "numbers": numbers, "required": LABELS[scenario] == "required"})
+        result = "not-applicable" if passed is None else "pass" if passed else "fail"
+        assertions.append({"name": name, "result": result,
+                           "numbers": numbers, "required": requirements[name]})
     lost = [t for t in turns if t["kind"] != "reply"]
     if not turns:
         raise ValueError("no turns ran")
     assertion("every turn got a reply", not lost, turns=len(turns), lost=len(lost))
     lines.append(f"- every turn got a reply: {'yes' if not lost else 'NO, ' + str(len(lost)) + ' did not'}")
-    if scenario.startswith("summarizer-"):
-        waited = [t for t in replies if t["conversation"] == "summary" and float(t["wall_ms"]) >= timeout * 0.8]
-        lines.append(f"- summary-route replies that took ≥ 80% of the {timeout} ms summarizer timeout: "
-                     f"{len(waited)} of {sum(1 for t in replies if t['conversation'] == 'summary')}"
-                     + (" — **replies waited on a summary**" if waited else " — no reply waited on a summary"))
-        assertion("no reply waited on a summary", not waited,
-                  slow=len(waited), threshold_ms=timeout * 0.8,
-                  replies=sum(t["conversation"] == "summary" for t in replies))
-        other = [t for t in replies if t["conversation"] != "summary" and float(t["wall_ms"]) >= timeout * 0.8]
-        lines.append(f"- other-route replies that slow: {len(other)}")
-        assertion("other routes did not wait on a summary", not other, slow=len(other), threshold_ms=timeout * 0.8)
+    if scenario in SUMMARIZER_BEHAVIOURS:
+        exercised, numbers = summarizer_evidence(meta, turns, summaries)
+        assertion("configured summarizer behavior was exercised", True if exercised == "pass" else None, **numbers)
+        if exercised == "not-applicable":
+            reason = meta["findings"]["summarizer applicability"]["reason"]
+            lines.append(f"- summarizer assertions: **not applicable at {ref8}** ({reason})")
+            assertion("no reply waited on a summary", None)
+            assertion("other routes did not wait on a summary", None)
+        else:
+            waited = [t for t in replies if t["conversation"] == "summary" and float(t["wall_ms"]) >= timeout * 0.8]
+            lines.append(f"- summary-route replies that took ≥ 80% of the {timeout} ms summarizer timeout: "
+                         f"{len(waited)} of {sum(1 for t in replies if t['conversation'] == 'summary')}"
+                         + (" — **replies waited on a summary**" if waited else " — no reply waited on a summary"))
+            assertion("no reply waited on a summary", not waited,
+                      slow=len(waited), threshold_ms=timeout * 0.8,
+                      replies=sum(t["conversation"] == "summary" for t in replies))
+            other = [t for t in replies if t["conversation"] != "summary" and float(t["wall_ms"]) >= timeout * 0.8]
+            lines.append(f"- other-route replies that slow: {len(other)}")
+            assertion("other routes did not wait on a summary", not other, slow=len(other), threshold_ms=timeout * 0.8)
     if scenario == "restart-mid-summary":
         findings = meta.get("findings", {})
         if not slot_events:
             assertions.append({"name": "slot resume", "result": "not-applicable", "numbers": {},
-                               "required": LABELS[scenario] == "required"})
+                               "required": requirements["slot resume"]})
             lines.append(f"- slot resume: **not applicable at {ref8}** (no summary slot events or files; "
                          f"the summarizer was re-called {findings.get('summarizer re-called for killed turn after restart')} "
                          "times for the killed turn)")

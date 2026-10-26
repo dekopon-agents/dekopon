@@ -188,3 +188,17 @@ Overrides:
 Run the self-test beside the lab: `cd lab/memory && python3 -m unittest -v`.
 It needs no Docker, Rust build or network. Recorded run evidence and executable
 commands on PATH exercise the real shell runner, deadline supervisor and reporter.
+
+Required summarizer scenarios need all ten scripted turns on both `summary` and `none`,
+and a `model-calls.jsonl` summary call whose turn tag, fault tag and terminal status match
+hang, 503 or refusal. Missing or mismatched exercise evidence is code 4 before latency
+is evaluated. An explicit `meta.json` finding named `summarizer applicability`, with
+`result: not-applicable` and a nonempty `reason`, records established non-applicability
+as code 6; it requires both routes and an empty summary-call log. Absence alone never
+establishes non-applicability. The verdict reader checks its scenario, label and complete
+assertion declarations against the reporter's shared requirements.
+
+Lab import failures are infrastructure errors. The collector must still be running before
+shutdown and exit zero after the requested stop; an unexpected termination is code 5 even
+when retained report evidence passes. Trace validation and report iteration stream batches
+line by line; the self-test exercises a trace larger than the reader's memory budget.

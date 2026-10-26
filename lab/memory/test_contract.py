@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import resource
 from pathlib import Path
 import shutil
 import signal
@@ -38,7 +39,16 @@ class ExitContract(unittest.TestCase):
         mkdir -p "$2/debug"
         touch "$2/debug/dekopon-brokerd" "$2/debug/dekopon-gatewayd"''')
         self.stub("docker", '''[ "${STUB_DOCKER_FAIL:-0}" != 1 ] || exit 18
-        [ "$1" != container ] || exit 1''')
+        case "$1" in
+          run) touch "$STUB_ROOT/collector" ;;
+          container) test -f "$STUB_ROOT/collector" ;;
+          inspect)
+            case "$3" in
+              *Running*) if [ -n "${STUB_COLLECTOR_EARLY_EXIT:-}" ]; then echo false; else echo true; fi ;;
+              *ExitCode*) echo "${STUB_COLLECTOR_EARLY_EXIT:-${STUB_COLLECTOR_EXIT:-0}}" ;;
+            esac ;;
+          rm) rm -f "$STUB_ROOT/collector" ;;
+        esac''')
         self.stub("curl", "exit 0")
         self.stub("id", "echo 1000")
         self.stub("python3", '''case "$1" in
@@ -52,7 +62,9 @@ class ExitContract(unittest.TestCase):
             ;;
           */report.py)
             [ "${STUB_REPORT_FAIL:-0}" != 1 ] || exit 19
-            exec "$STUB_PYTHON" "$@" ;;
+            "$STUB_PYTHON" "$@"
+            [ ! -f "$STUB_ROOT/verdict_fault.py" ] || "$STUB_PYTHON" "$STUB_ROOT/verdict_fault.py" "$2"
+            ;;
           *) exec "$STUB_PYTHON" "$@" ;;
         esac''')
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
@@ -71,13 +83,30 @@ class ExitContract(unittest.TestCase):
         (self.recorded / "meta.json").write_text(json.dumps(self.meta))
         with (self.recorded / "latency.csv").open("w", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["kind", "conversation", "phase", "wall_ms", "summary_in_flight"])
-            writer.writerow(["reply", "summary", "run", wall, "yes"])
+            writer.writerow(["turn", "kind", "conversation", "phase", "wall_ms", "summary_in_flight"])
+            for turn in range(1, 11):
+                writer.writerow([turn, "reply", "summary", "run", wall, "yes"])
+                writer.writerow([turn, "reply", "none", "run", 1, "no"])
+        behaviour = self.meta["scenario"].removeprefix("summarizer-")
+        statuses = {"hang": "hung-client-gone", "fail": "503", "refuse": "refused"}
+        call = {"kind": "summary", "tag": {"turn": "summary-1", "sum": behaviour},
+                "status": statuses.get(behaviour, "summary")}
+        (self.recorded / "model-calls.jsonl").write_text(json.dumps(call) + "\n")
         (self.recorded / "traces.jsonl").write_text('{"resourceSpans": []}\n')
 
-    def run_lab(self, code, reason, *args, **env):
+    def tamper_verdict(self, change):
+        (self.root / "verdict_fault.py").write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "path = Path(sys.argv[1]) / 'verdict.json'\n"
+            "verdict = json.loads(path.read_text())\n" + change + "\n"
+            "path.write_text(json.dumps(verdict))\n")
+
+    def run_lab(self, code, reason, *args, memory_limit=None, **env):
+        options = {}
+        if memory_limit is not None:
+            options["preexec_fn"] = lambda: resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
         result = subprocess.run(["bash", str(self.lab / "run.sh"), "main", self.meta["scenario"], *args],
-                                env=dict(self.env, **env), capture_output=True, text=True, timeout=25)
+                                env=dict(self.env, **env), capture_output=True, text=True, timeout=25, **options)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         self.assertIn(reason, result.stderr.splitlines())
         return result
@@ -88,6 +117,78 @@ class ExitContract(unittest.TestCase):
     def test_replies_under_the_threshold_pass_every_required_assertion(self):
         self.record(15999)
         self.run_lab(0, "lab: pass: every required assertion passed")
+
+    def test_summarizer_scenarios_require_both_complete_scripted_routes(self):
+        with (self.recorded / "latency.csv").open("w") as stream:
+            stream.write("turn,kind,conversation,phase,wall_ms,summary_in_flight\n1,reply,none,run,1,no\n")
+        self.run_lab(4, "lab: missing-evidence: report.py failed")
+
+    def test_summarizer_scenarios_require_observed_scripted_summarizer_behavior(self):
+        self.record(1)
+        for calls in ("", json.dumps({"kind": "summary", "tag": {"sum": "ok", "turn": "summary-1"},
+                                       "status": "summary"}) + "\n"):
+            with self.subTest(calls=calls):
+                (self.recorded / "model-calls.jsonl").write_text(calls)
+                self.run_lab(4, "lab: missing-evidence: report.py failed")
+
+    def test_explicit_summarizer_non_applicability_is_not_a_pass(self):
+        self.meta["findings"] = {"summarizer applicability": {
+            "result": "not-applicable", "reason": "tested ref has no configured summarizer"}}
+        self.record(1)
+        (self.recorded / "model-calls.jsonl").write_text("")
+        self.run_lab(6, "lab: not-applicable: required assertion not applicable at aaaaaaaa")
+
+    def test_a_verdict_cannot_downgrade_omit_or_replace_the_scenarios_assertions(self):
+        faults = {
+            "label": "verdict.update(label='exploratory', outcome='exploratory')",
+            "omitted": "verdict['assertions'] = [a for a in verdict['assertions'] if a['name'] != 'no reply waited on a summary']; verdict['outcome'] = 'pass'",
+            "unknown": "verdict['assertions'][0]['name'] = 'unknown assertion'",
+            "downgraded": "verdict['assertions'][2]['required'] = False; verdict['outcome'] = 'pass'",
+            "scenario": "verdict['scenario'] = 'baseline'",
+            "duplicate": "verdict['assertions'][0] = verdict['assertions'][1]",
+        }
+        for name, change in faults.items():
+            with self.subTest(fault=name):
+                self.tamper_verdict(change)
+                self.run_lab(4, "lab: missing-evidence: required evidence absent or unparseable")
+
+    def test_the_verdict_scenario_must_match_the_requested_run(self):
+        meta = dict(self.meta, scenario="baseline")
+        (self.recorded / "meta.json").write_text(json.dumps(meta))
+        self.run_lab(4, "lab: missing-evidence: required evidence absent or unparseable")
+
+    def test_lab_import_exceptions_are_infrastructure_and_not_usage(self):
+        (self.lab / "lab.py").write_text('raise RuntimeError("lab import failed")\n')
+        self.run_lab(5, "lab: infrastructure: runner exited 5")
+
+    def test_unknown_scenarios_remain_usage_errors(self):
+        self.meta["scenario"] = "unknown"
+        self.run_lab(2, "lab: usage: expected <ref> <scenario> [--profile fake|real|codex] [--diagnostic]")
+
+    def test_a_collector_that_already_exited_cannot_pass_even_with_exit_zero(self):
+        self.record(1)
+        self.run_lab(5, "lab: infrastructure: collector exited unexpectedly (running=false, exit=0)",
+                     STUB_COLLECTOR_EARLY_EXIT="0")
+
+    def test_a_collectors_nonzero_terminal_status_is_infrastructure(self):
+        self.record(1)
+        self.run_lab(5, "lab: infrastructure: collector exited unexpectedly (running=true, exit=23)",
+                     STUB_COLLECTOR_EXIT="23")
+
+    def test_an_already_failed_collector_cannot_be_hidden_by_retained_evidence(self):
+        self.record(1)
+        self.run_lab(5, "lab: infrastructure: collector exited unexpectedly (running=false, exit=23)",
+                     STUB_COLLECTOR_EARLY_EXIT="23")
+
+    def test_trace_validation_and_reporting_stream_beyond_the_process_memory_budget(self):
+        self.record(1)
+        batch = {"resourceSpans": [{"resource": {"attributes": [
+            {"key": "test.payload", "value": {"stringValue": "x" * 4096}}]}, "scopeSpans": []}]}
+        block = (json.dumps(batch) + "\n") * 64
+        with (self.recorded / "traces.jsonl").open("w") as stream:
+            for _ in range(512):
+                stream.write(block)
+        self.run_lab(0, "lab: pass: every required assertion passed", memory_limit=96 * 1024 * 1024)
 
     def test_the_whole_run_deadline_terminates_a_sleeping_lab(self):
         self.run_lab(3, "lab: timeout: whole-run deadline of 0.5s exceeded", LAB_DEADLINE_SECS="0.5", STUB_SLEEP="1")

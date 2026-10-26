@@ -47,8 +47,20 @@ for command in cargo docker git python3 setpriv curl; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 5; }
 done
 case "$build" in debug | release) ;; *) echo "LAB_BUILD must be debug or release" >&2; exit 2 ;; esac
-python3 -c "import sys; sys.path.insert(0, '$lab'); import lab; sys.exit('$scenario' not in lab.SCENARIOS)" \
-  || { echo "unknown scenario: $scenario" >&2; exit 2; }
+scenario_status=0
+python3 - "$lab" "$scenario" <<'PYSCENARIO' || scenario_status=$?
+import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    import lab
+except Exception:
+    print("lab: infrastructure: lab.py import failed", file=sys.stderr)
+    sys.exit(5)
+if sys.argv[2] not in lab.SCENARIOS:
+    print("unknown scenario: " + sys.argv[2], file=sys.stderr)
+    sys.exit(2)
+PYSCENARIO
+[ "$scenario_status" -eq 0 ] || exit "$scenario_status"
 
 if ! sha="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")"; then
   git -C "$repo" fetch --quiet origin "$ref"
@@ -164,13 +176,20 @@ python3 "$lab/lab.py" --run "$run" --state "$state" --bin "$state/bin" --scenari
   --cost-cap "${LAB_COST_CAP_USD:-2}" "${codex_flags[@]}" \
   || lab_status=$?
 
+collector_status=0
+collector_running="$(docker inspect --format '{{.State.Running}}' "$container")"
 docker stop --time 10 "$container" >/dev/null
 docker logs "$container" >"$run/collector.log" 2>&1
+collector_exit="$(docker inspect --format '{{.State.ExitCode}}' "$container")"
+if [ "$collector_running" != true ] || [ "$collector_exit" != 0 ]; then
+  echo "lab: infrastructure: collector exited unexpectedly (running=$collector_running, exit=$collector_exit)" >&2
+  collector_status=5
+fi
 docker rm "$container" >/dev/null
 report_status=0
 python3 "$lab/report.py" "$run" || report_status=$?
-if [ "$lab_status" -ne 0 ]; then
-  echo "lab: infrastructure: lab.py exited $lab_status" >&2
+if [ "$lab_status" -ne 0 ] || [ "$collector_status" -ne 0 ]; then
+  [ "$lab_status" -eq 0 ] || echo "lab: infrastructure: lab.py exited $lab_status" >&2
   exit 5
 fi
 if [ "$report_status" -ne 0 ]; then
