@@ -252,6 +252,9 @@ impl BlobReference {
             preparation: Mutex::new(Preparation::Original),
         }
     }
+    pub fn id(&self) -> u64 {
+        self.id
+    }
     #[must_use]
     pub fn len(&self) -> usize {
         self.bytes

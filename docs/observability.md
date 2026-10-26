@@ -231,9 +231,12 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | Event | Emitted by | Carries |
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (the first turn with a rejection, for an unknown tool or a malformed `bash` call); `warn` when `rejection.fed_back = true`, `error` when false — never the model's own tool name or arguments |
-| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `evicted`, `platform-gone`, `revoked`, `store-failed`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
+| `gateway.asset.evicted` | `dekopon-gatewayd` | once per successful budget eviction, excluding journal deletion: `asset.origin` (`inbound` or `generated`), numeric `asset.bytes`, `asset.store.bytes`, `asset.store.budget_bytes` |
+| `gateway.asset.refetch` | `dekopon-gatewayd` | once per refetch attempt: `outcome` (`refetched`, `platform-gone`, `revoked`, `unavailable`), numeric `asset.store.bytes`, `asset.store.budget_bytes`; failed re-admission is `unavailable` here and `store-failed` to the model |
+| `gateway.asset.store_failed` | `dekopon-gatewayd` | once per failed store, excluding disabled retention: `reason` (`budget-too-small`, `stored-too-large`, `decoded-too-large`, `all-pinned`, `io`), numeric `asset.bytes`, `asset.store.bytes`, `asset.store.budget_bytes` |
 | `gateway.asset.store_started` | `dekopon-gatewayd` | once after durable store startup has reconciled journal references: `asset.store.path`, filesystem `asset.store.free_bytes`, and configured `asset.store.budget_bytes`; the pin reverts when free bytes are below the budget |
 | `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`), plus sanitized storage error cause when applicable; no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
@@ -1400,3 +1403,10 @@ never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.de
 native hosts (`bytes`, `duration_us`); `asset.spool` remains the positional scratch-read lifecycle.
 A send failure leaves a bounded next-turn notice; `dispatched` belongs only to `agent.asset.send`,
 not an asset table field. Broker decisions still record the ordinary asset.send authorization.
+
+Each `accounting.model.turn` outcome also carries numeric `asset.inventory.count` and
+`asset.inventory.bytes` for the fitted inventory notes carried by the request,
+`asset.inventory.omitted` for their omitted entries, and `asset.inventory.referenced` for distinct
+listed attachments used this turn (fetches, provider inputs, or history image preparation).
+The store snapshots on asset eviction, refetch and failure records serve as its gauges; no rollup
+exporter is awaited. These records contain no attachment source, URL or platform identifier.

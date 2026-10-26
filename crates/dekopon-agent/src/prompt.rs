@@ -97,8 +97,26 @@ impl fmt::Debug for FetchedAsset {
     }
 }
 
+#[derive(Default)]
+pub struct AssetRequest {
+    pub pins: Vec<dekopon_model::asset::DiskBlob>,
+    pub inventory: AssetInventory,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct AssetInventory {
+    pub count: usize,
+    pub bytes: usize,
+    pub referenced: usize,
+    pub omitted: usize,
+}
+
 pub trait AssetSource {
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String>;
+
+    fn prepare_request(&self, _messages: &mut [ModelMessage], _text_bytes: usize) -> AssetRequest {
+        AssetRequest::default()
+    }
 
     /// Asked once per session; the answer fixes whether the session offers the fetch tool.
     fn offers_fetch(&self) -> bool;
@@ -745,6 +763,7 @@ where
     if memory_tools.is_some() {
         model_tools.extend(crate::memory_tools::tools());
     }
+    let request_assets = assets;
     let assets = assets.filter(|source| source.offers_fetch());
     if assets.is_some() {
         model_tools.push(asset_tool());
@@ -764,7 +783,7 @@ where
     let mut capability_invocations = 0_u32;
     let mut tool_calls = 0_u32;
     let mut transcribed = Vec::new();
-    let mut asset_bytes = 0_usize;
+    let mut asset_bytes = AssetBytes::default();
     let mut agent_config_shown = false;
     let mut first_rejected_turn = None;
     let mut skill_reads = SkillReads::default();
@@ -802,11 +821,17 @@ where
             },
         );
         let mut stream = TurnStream::new(model_turns, model_started, progress, cancellation);
+        let mut request_messages = messages.clone();
+        let asset_request = request_assets.map_or_else(AssetRequest::default, |source| {
+            source.prepare_request(&mut request_messages, asset_bytes.text)
+        });
+        let inventory = asset_request.inventory;
         let completion = {
             let mut on_event = |event| stream.observe(event);
-            model.complete(&messages, &model_tools, options, &mut on_event)
+            model.complete(&request_messages, &model_tools, options, &mut on_event)
         };
-        let prepared = messages
+        drop(asset_request);
+        let prepared = request_messages
             .iter()
             .map(|message| serde_json::to_value(message.prepared_for_trace()))
             .collect::<Result<Vec<_>, _>>()
@@ -841,6 +866,10 @@ where
                     target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                         model.turn = model_turns,
                         agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
@@ -872,6 +901,10 @@ where
                     target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                         model.turn = model_turns,
                         agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
@@ -887,6 +920,10 @@ where
                     target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                         model.turn = model_turns,
                         agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
@@ -909,6 +946,10 @@ where
             target: "dekopon_agent::audit",
             {
                 audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                 model.turn = model_turns,
                 agent = agent,
                 duration_ms = milliseconds(model_started.elapsed()),
@@ -1591,12 +1632,18 @@ fn asset_tool() -> ModelTool {
 
 /// A tool result cannot carry an attachment on either wire format, so the asset always arrives as a
 /// following message; this shape must not be simplified.
+#[derive(Default)]
+struct AssetBytes {
+    total: usize,
+    text: usize,
+}
+
 fn fetch_asset_into(
     messages: &mut Vec<ModelMessage>,
     source: &dyn AssetSource,
     call: &ModelToolCall,
     model_turn: u32,
-    asset_bytes: &mut usize,
+    asset_bytes: &mut AssetBytes,
 ) -> Result<(), PromptError> {
     let id = match asset_argument(&call.function.name, &call.function.arguments) {
         Ok(id) => id,
@@ -1652,7 +1699,7 @@ fn fetch_asset_into(
         .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
     let text = text.map(clamp_textual_asset);
     let bytes = text.as_ref().map_or(asset.data.len(), String::len);
-    if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(*asset_bytes) {
+    if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(asset_bytes.total) {
         let reason = format!(
             "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Say that chat-asset:{id} went unseen."
         );
@@ -1664,7 +1711,10 @@ fn fetch_asset_into(
         messages.push(ModelMessage::tool(call.id.clone(), reason));
         return Ok(());
     }
-    *asset_bytes += bytes;
+    asset_bytes.total += bytes;
+    if text.is_some() {
+        asset_bytes.text += bytes;
+    }
     // Only size and media type are logged, never the bytes or the sender's file name, since the
     // file name is untrusted.
     tracing::info!(
@@ -4577,6 +4627,55 @@ mod tests {
             assert_eq!(observed.len(), 2);
             assert_eq!(observed[0], observed[1]);
         }
+    }
+
+    #[test]
+    fn request_preparation_receives_the_retained_text_attachment_charge() {
+        struct MeasuredText {
+            source: FixedAssets,
+            charges: Mutex<Vec<usize>>,
+        }
+        impl AssetSource for MeasuredText {
+            fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
+                self.source.fetch(id)
+            }
+            fn offers_fetch(&self) -> bool {
+                true
+            }
+            fn prepare_request(
+                &self,
+                _: &mut [ModelMessage],
+                text_bytes: usize,
+            ) -> super::AssetRequest {
+                self.charges.lock().push(text_bytes);
+                super::AssetRequest::default()
+            }
+        }
+        let source = MeasuredText {
+            source: FixedAssets(vec![
+                text_asset("text attachment"),
+                FetchedAsset {
+                    name: "photo.png".into(),
+                    mime: "image/png".into(),
+                    data: dekopon_model::asset::DiskBlob::from_bytes(b"aaa")
+                        .unwrap()
+                        .into(),
+                },
+            ]),
+            charges: Mutex::new(vec![]),
+        };
+        let model = ScriptedModel::new([asset_call(1), asset_call(2), answer("seen")]);
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("read", limits(3, 2)).with_assets(&source),
+            &mut History::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            *source.charges.lock(),
+            [0, "text attachment".len(), "text attachment".len()]
+        );
     }
 
     #[test]
