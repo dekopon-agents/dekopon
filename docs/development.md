@@ -213,8 +213,9 @@ The optional `memory-lab` workflow runs the pinned memory harness's deterministi
 scenarios against the exact pull-request head SHA on `pull_request`, filtered to
 `crates/dekopon-gatewayd/**`, `crates/dekopon-agent/**`, `crates/dekopon-model/**`, `Cargo.lock`,
 `rust-toolchain.toml` and `.github/workflows/memory-lab.yml` (with no base-branch filter);
-it first self-tests the exit contract, then reports required verdicts and exploratory results,
-is not a required context, and also supports `workflow_dispatch` with a dispatch-only real
+it first self-tests the exit contract, validates scenario exercise evidence and complete assertion
+declarations, checks collector termination, then reports required verdicts and exploratory results;
+it is not a required context, and also supports `workflow_dispatch` with a dispatch-only real
 profile capped at $2 per scenario using the existing `LAB_OPENROUTER_API_KEY` repository secret.
 
 The chart CI render lane checks that enabling the private VM proxy rejects missing or mismatched
