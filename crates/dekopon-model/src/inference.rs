@@ -134,12 +134,15 @@ pub(crate) async fn retry_opaque(
             &identity,
         )
         .await;
-    if matches!(
-        result,
-        Err(InferenceError::Protocol(
-            crate::error::ProtocolFailure::ContinuationMismatch
-        ))
-    ) {
+    if admitted
+        && !stream.verified
+        && matches!(
+            result,
+            Err(InferenceError::Protocol(
+                crate::error::ProtocolFailure::ContinuationMismatch
+            ))
+        )
+    {
         let portable: Vec<_> = request
             .messages
             .iter()
