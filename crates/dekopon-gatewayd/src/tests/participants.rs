@@ -1,5 +1,8 @@
 use super::*;
 use crate::session::{Admit, CancelOutcome};
+use crate::{collection::Dispositions, routes::BoundRoute, transport::CancelRequest};
+use dekopon_agent::prompt::CancellationProbe as _;
+use dekopon_broker_protocol::{DeliveryIdentity, SessionRefusal};
 use tracing::instrument::WithSubscriber as _;
 
 fn listing(principal: &str, mapped: bool) -> ResponseEnvelope {
@@ -82,7 +85,6 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
             .running,
         CancelOutcome::OtherSubject
     );
-    // The non-owner stop removes pending text, so submit it again before the drain.
     for text in ["Ana's request", "Ana's followup"] {
         run_session(
             Arc::clone(&runner),
@@ -96,6 +98,7 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
     finish(task).await;
     assert_eq!(driver.replies(), ["final"]);
     assert_eq!(models.requests(), 2);
+    assert_eq!(models.interrupted.load(Ordering::SeqCst), 0);
     let prompt = models.prompt(1);
     let ana = prompt
         .iter()
@@ -161,9 +164,12 @@ async fn refused_and_empty_participant_legs_never_expose_their_messages_or_asset
     ] {
         let (capture, _guard) = capture_spans();
         let directory = temporary();
-        let (broker, mut observed) =
-            stub_broker(directory.path(), vec![listing("asker", true), refused]).await;
-        let models = InterruptibleModel::new([answer("final")]);
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            vec![listing("asker", true), refused, listing("asker", true)],
+        )
+        .await;
+        let models = InterruptibleModel::new([answer("final"), answer("next")]);
         let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
         let driver = Arc::new(RecordingDriver::default());
         let route = shared_route();
@@ -183,7 +189,7 @@ async fn refused_and_empty_participant_legs_never_expose_their_messages_or_asset
             .push(pending("refused-secret.png", "image/png", 12));
         run_session(
             Arc::clone(&runner),
-            route,
+            route.clone(),
             refused,
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
@@ -192,7 +198,14 @@ async fn refused_and_empty_participant_legs_never_expose_their_messages_or_asset
         finish(task).await;
         assert_eq!(models.requests(), 1);
         assert_eq!(driver.replies(), ["final"]);
-        assert_eq!(capability_listings(&mut observed), 2);
+        run_session(
+            Arc::clone(&runner),
+            route,
+            speaker(9, "next turn"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert_eq!(capability_listings(&mut observed), 3);
         let admissions = capture.events_where(
             "dekopon_gatewayd::audit",
             &[
@@ -201,12 +214,18 @@ async fn refused_and_empty_participant_legs_never_expose_their_messages_or_asset
             ],
         );
         assert_eq!(admissions.len(), 1);
-        assert!(
-            !capture
-                .events_text()
-                .contains("untrusted participant secret")
-        );
-        assert!(!capture.events_text().contains("refused-secret.png"));
+        for (_, text) in models.prompt(1) {
+            assert!(!text.contains("untrusted participant secret"));
+            assert!(!text.contains("refused-secret.png"));
+        }
+        for record in capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "agent.model.prompt")],
+        ) {
+            let transcript = record.field("messages").expect("model prompt transcript");
+            assert!(!transcript.contains("untrusted participant secret"));
+            assert!(!transcript.contains("refused-secret.png"));
+        }
     }
 }
 
@@ -296,4 +315,90 @@ fn mapping_resolution_promotes_pending_messages_and_keeps_unmapped_routes_queued
         assert_eq!(gate.take_steers(&key).len(), usize::from(mapped));
         assert_eq!(admission.next_or_release().is_some(), !mapped);
     }
+}
+
+#[test]
+fn github_transport_never_steers_even_with_a_native_message_id_on_a_mapped_route() {
+    let gate = SessionGate::new(1);
+    let route = shared_route();
+    let first = speaker(9, "first");
+    let key = (first.transport.clone(), first.conversation.key());
+    let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+    else {
+        panic!("first admitted")
+    };
+    gate.resolve_mapping(&key, &admission.cancellation(), true);
+    let mut incoming = speaker(8, "github event");
+    incoming.transport_kind = dekopon_broker_protocol::ChatTransportKind::Github;
+    assert!(matches!(
+        gate.admit(&route, incoming, Dispositions(Vec::new())),
+        Admit::Queued
+    ));
+    assert!(gate.take_steers(&key).is_empty());
+    assert!(admission.next_or_release().is_some());
+}
+
+#[test]
+fn private_scope_and_direct_messages_keep_other_senders_as_followups() {
+    for private in [true, false] {
+        let gate = SessionGate::new(1);
+        let mut route = shared_route();
+        let mut first = speaker(9, "first");
+        let mut second = speaker(8, "second");
+        if private {
+            route.memory = MemoryPolicy::Persistent(window());
+        } else {
+            first.conversation.kind = ConversationKind::DirectMessage;
+            second.conversation.kind = ConversationKind::DirectMessage;
+        }
+        let key = (first.transport.clone(), first.conversation.key());
+        let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+        else {
+            panic!("first admitted")
+        };
+        gate.resolve_mapping(&key, &admission.cancellation(), true);
+        assert!(matches!(
+            gate.admit(&route, second, Dispositions(Vec::new())),
+            Admit::Queued
+        ));
+        assert!(gate.take_steers(&key).is_empty());
+        assert!(admission.next_or_release().is_some());
+    }
+}
+
+#[test]
+fn only_the_askers_native_chat_steer_interrupts_a_mapped_turn() {
+    let gate = SessionGate::new(1);
+    let route = shared_route();
+    let first = speaker(9, "first");
+    let key = (first.transport.clone(), first.conversation.key());
+    let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+    else {
+        panic!("first admitted")
+    };
+    let cancellation = admission.cancellation();
+    let model = cancellation.model_watch();
+    gate.resolve_mapping(&key, &cancellation, true);
+    assert!(matches!(
+        gate.admit(
+            &route,
+            speaker(8, "other participant"),
+            Dispositions(Vec::new())
+        ),
+        Admit::Steered(_)
+    ));
+    assert!(!*model.borrow());
+    let mut github = speaker(9, "same subject Github");
+    github.transport_kind = dekopon_broker_protocol::ChatTransportKind::Github;
+    assert!(matches!(
+        gate.admit(&route, github, Dispositions(Vec::new())),
+        Admit::Queued
+    ));
+    assert!(!*model.borrow());
+    assert!(matches!(
+        gate.admit(&route, speaker(9, "asker steer"), Dispositions(Vec::new())),
+        Admit::Steered(_)
+    ));
+    assert!(*model.borrow());
+    assert!(!cancellation.is_cancelled());
 }

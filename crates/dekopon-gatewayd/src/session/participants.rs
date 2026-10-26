@@ -1,6 +1,7 @@
 use super::*;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
+use tracing::instrument::WithSubscriber as _;
 
 const MAX_LEGS: usize = 8;
 
@@ -108,29 +109,58 @@ pub(super) enum Batch {
     Sealed(Seal),
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum DrainMode {
+    Take,
+    SealOrTake,
+}
+
+impl DrainMode {
+    fn seals(self) -> bool {
+        match self {
+            Self::Take => false,
+            Self::SealOrTake => true,
+        }
+    }
+}
+
 pub(super) struct Request {
-    seal: bool,
+    mode: DrainMode,
     reply: oneshot::Sender<Batch>,
 }
 
 pub(super) struct Drain {
     requests: mpsc::Sender<Request>,
     runtime: tokio::runtime::Handle,
+    cancellation: SessionCancellation,
 }
 
 impl Drain {
-    pub(super) fn take(&self, seal: bool) -> Batch {
+    pub(super) fn take(&self, mode: DrainMode) -> Batch {
         self.runtime.block_on(async {
             let (reply, result) = oneshot::channel();
-            if self.requests.send(Request { seal, reply }).await.is_err() {
-                return Batch::Sealed(Seal::Stopped);
+            if self.requests.send(Request { mode, reply }).await.is_err() {
+                return self.failed();
             }
-            result.await.unwrap_or(Batch::Sealed(Seal::Stopped))
+            match result.await {
+                Ok(batch) => batch,
+                Err(_) => self.failed(),
+            }
         })
+    }
+
+    fn failed(&self) -> Batch {
+        if self.cancellation.cancel(CancelSource::Operator) {
+            tracing::Span::current().record("outcome", "failed");
+        }
+        Batch::Sealed(Seal::Stopped)
     }
 }
 
-pub(super) fn channel(mapped: bool) -> (Option<Drain>, Option<mpsc::Receiver<Request>>) {
+pub(super) fn channel(
+    mapped: bool,
+    cancellation: &SessionCancellation,
+) -> (Option<Drain>, Option<mpsc::Receiver<Request>>) {
     if !mapped {
         return (None, None);
     }
@@ -139,6 +169,7 @@ pub(super) fn channel(mapped: bool) -> (Option<Drain>, Option<mpsc::Receiver<Req
         Some(Drain {
             requests,
             runtime: tokio::runtime::Handle::current(),
+            cancellation: cancellation.clone(),
         }),
         Some(receiver),
     )
@@ -173,8 +204,15 @@ impl Worker {
                         let mut legs = vec![(inputs.asker.clone(), Arc::clone(&inputs.leg))];
                         let mut joined = BTreeSet::from([inputs.asker.clone()]);
                         while let Some(request) = requests.recv().await {
-                            let batch =
-                                authorize(&inputs, &mut legs, &mut joined, request.seal).await;
+                            let batch = loop {
+                                let batch =
+                                    authorize(&inputs, &mut legs, &mut joined, request.mode).await;
+                                match &batch {
+                                    Batch::Steers(steers)
+                                        if request.mode.seals() && steers.is_empty() => {}
+                                    Batch::Steers(_) | Batch::Sealed(_) => break batch,
+                                }
+                            };
                             if request.reply.send(batch).is_err() {
                                 break;
                             }
@@ -186,6 +224,7 @@ impl Worker {
                         _ = stopped => {},
                     }
                 }
+                .with_current_subscriber()
                 .instrument(tracing::Span::current()),
             );
             stop
@@ -194,13 +233,13 @@ impl Worker {
     }
 
     pub(super) async fn finish(mut self) {
-        if let Some(stop) = self.stop.take() {
-            if stop.send(()).is_err() {
-                tracing::debug!(
-                    event = "gateway_participant_worker_ended",
-                    "gateway.participant.worker.ended"
-                );
-            }
+        if let Some(stop) = self.stop.take()
+            && stop.send(()).is_err()
+        {
+            tracing::debug!(
+                event = "gateway_participant_worker_ended",
+                "gateway.participant.worker.ended"
+            );
         }
         while let Some(result) = self.tasks.join_next().await {
             if let Err(error) = result {
@@ -231,7 +270,7 @@ async fn authorize(
     inputs: &Inputs,
     legs: &mut Vec<(ExternalSubject, Arc<BrokerLeg>)>,
     joined: &mut BTreeSet<ExternalSubject>,
-    seal: bool,
+    mode: DrainMode,
 ) -> Batch {
     let messages = {
         let mut entries = inputs.gate.in_flight.lock();
@@ -240,7 +279,7 @@ async fn authorize(
                 if running.cancellation.is_cancelled() {
                     return Batch::Sealed(Seal::Stopped);
                 }
-                if seal && running.steers.is_empty() {
+                if mode.seals() && running.steers.is_empty() {
                     return Batch::Sealed(seal_locked(&entries, &inputs.key, &inputs.cancellation));
                 }
                 running.cancellation.rearm_model();
@@ -263,11 +302,11 @@ async fn authorize(
             None => match open(inputs, &message).await {
                 Ok(leg) if !leg.granted().is_empty() && leg.principal().is_some() => Arc::new(leg),
                 Ok(_) => {
-                    record_admission(&message, "unauthorized", 0, Some("empty-grant"));
+                    participant_admission(&message, "unauthorized", Some("empty-grant"));
                     continue;
                 }
                 Err(error) => {
-                    record_admission(&message, "unauthorized", 0, Some(refusal_reason(&error)));
+                    participant_admission(&message, "unauthorized", Some(refusal_reason(&error)));
                     continue;
                 }
             },
@@ -283,12 +322,7 @@ async fn authorize(
         };
         if message.subject != inputs.asker {
             let overflow = existing.is_none() && legs.len() == MAX_LEGS;
-            record_admission(
-                &message,
-                "steered",
-                0,
-                overflow.then_some("participant-limit"),
-            );
+            participant_admission(&message, "steered", overflow.then_some("participant-limit"));
             if existing.is_none() && !overflow {
                 legs.push((message.subject.clone(), Arc::clone(&leg)));
             }
@@ -302,12 +336,23 @@ async fn authorize(
     Batch::Steers(ready)
 }
 
+fn participant_admission(message: &InboundMessage, outcome: &str, cause: Option<&str>) {
+    message
+        .receive_span
+        .in_scope(|| record_admission(message, outcome, 0, cause));
+}
+
 async fn open(inputs: &Inputs, message: &InboundMessage) -> Result<BrokerLeg, SessionError> {
     let claim = chat_claim(&inputs.route, message)?;
-    let leg = BrokerLeg::connect(inputs.broker.leg_client()?, Some(claim))
-        .instrument(tracing::info_span!("gateway.participant.lookup",
-            turn.owner = %inputs.asker, subject = %message.subject))
-        .await?;
+    let span = tracing::info_span!("gateway.participant.lookup",
+        turn.owner = %inputs.asker, subject = %message.subject, error = tracing::field::Empty);
+    let result = BrokerLeg::connect(inputs.broker.leg_client()?, Some(claim))
+        .instrument(span.clone())
+        .await;
+    if let Err(error) = &result {
+        span.record("error", tracing::field::display(error));
+    }
+    let leg = result?;
     Ok(leg
         .with_cancel_signal(inputs.cancellation.signal())
         .with_progress(Arc::clone(&inputs.progress), inputs.calls.clone()))
@@ -322,7 +367,18 @@ fn refusal_reason(error: &SessionError) -> &'static str {
                 SessionRefusal::Other => "attestation-refused",
             }
         }
-        _ => error.category(),
+        SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote { code, .. }))
+            if code == ERROR_UNAUTHENTICATED =>
+        {
+            "attestation-refused"
+        }
+        SessionError::BrokerClient(_)
+        | SessionError::BrokerLeg(_)
+        | SessionError::TransportId(_)
+        | SessionError::Model(_)
+        | SessionError::ModelCredential(_)
+        | SessionError::Prompt(_)
+        | SessionError::ProxyOnlyModel { .. } => error.category(),
     }
 }
 

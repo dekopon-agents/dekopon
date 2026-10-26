@@ -687,7 +687,8 @@ impl SessionGate {
             }
             if message.subject == running.subject
                 && match message.message_id {
-                    MessageId::Native(_) | MessageId::Job { .. } => true,
+                    MessageId::Native(_) => participants::native_chat(&message),
+                    MessageId::Job { .. } => true,
                     MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => false,
                 }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
@@ -1927,7 +1928,7 @@ struct SessionSteers {
 impl SteerSource for SessionSteers {
     fn take(&self) -> Vec<Steer> {
         match &self.participants {
-            Some(drain) => match drain.take(false) {
+            Some(drain) => match drain.take(participants::DrainMode::Take) {
                 participants::Batch::Steers(steers) => self.stage_participants(steers),
                 participants::Batch::Sealed(_) => Vec::new(),
             },
@@ -1937,7 +1938,7 @@ impl SteerSource for SessionSteers {
 
     fn seal_or_take(&self) -> Handoff {
         if let Some(drain) = &self.participants {
-            return match drain.take(true) {
+            return match drain.take(participants::DrainMode::SealOrTake) {
                 participants::Batch::Steers(steers) => {
                     Handoff::Steers(self.stage_participants(steers))
                 }
@@ -2490,7 +2491,8 @@ async fn session_turn(
         },
     );
     let text = participants::with_join(text, asker_join.as_deref());
-    let (participant_drain, participant_requests) = participants::channel(mapped_participants);
+    let (participant_drain, participant_requests) =
+        participants::channel(mapped_participants, &cancellation);
     let frame = |text: String| {
         let text = match &delivery_notice {
             Some(note) => bound_inbound(&format!("{note}\n{text}")),
