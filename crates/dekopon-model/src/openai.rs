@@ -147,7 +147,9 @@ impl OpenAiClient {
                 .buffered(control, |bytes| {
                     let response: ChatResponse = serde_json::from_slice(bytes)
                         .map_err(|error| secrets.decode_failure(error))?;
+                    let reported = response.model.clone();
                     turn_from_response(secrets, response)
+                        .map(|turn| turn.with_model_key(self.model_key().with_reported(reported)))
                 })
                 .await;
         }
@@ -186,8 +188,10 @@ impl OpenAiClient {
             record_phase(crate::error::FailurePhase::ReadingBody);
             return Err(ProtocolFailure::MissingTerminal.into());
         }
+        let reported = state.model.clone();
         state
             .into_turn(secrets)
+            .map(|turn| turn.with_model_key(self.model_key().with_reported(reported)))
             .inspect_err(|_| record_phase(crate::error::FailurePhase::ReadingBody))
     }
 }

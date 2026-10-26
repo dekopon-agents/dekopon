@@ -27,7 +27,7 @@ impl Kept {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Item {
     User(Kept),
@@ -38,7 +38,7 @@ pub enum Item {
     Asset(AssetNumber),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Reasoning {
     Plain(Kept),
     Opaque {
@@ -47,14 +47,14 @@ pub enum Reasoning {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exchange {
     pub call: Call,
     pub result: ToolResult,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Call {
     pub id: ToolCallId,
@@ -62,7 +62,7 @@ pub struct Call {
     pub arguments: Kept,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Tool {
     Bash,
     ReadSkill,
@@ -93,7 +93,7 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResult {
     pub outcome: Outcome,
@@ -107,7 +107,7 @@ pub enum Outcome {
     Failed,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapturedTurn {
     pub original: Vec<Item>,
     pub model: ModelKey,

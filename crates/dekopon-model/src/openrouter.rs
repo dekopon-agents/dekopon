@@ -630,7 +630,7 @@ impl RouterStream {
             self.usage,
             self.reason.as_ref(),
         )
-        .with_openrouter_continuation(identity.clone(), self.replay))
+        .with_openrouter_continuation(identity.clone().with_reported(self.model), self.replay))
     }
 }
 

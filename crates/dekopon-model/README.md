@@ -2,7 +2,7 @@
 
 `dekopon-model` contains Dekopon's bounded model-client boundary:
 
-- the generic `ChatModel` request/response contract, whose one method reports a turn's visible text
+- the generic `ChatModel` request/response contract, whose completion method reports a turn's visible text
   through a caller-supplied callback while the turn is still arriving, and stops the turn when that
   callback says to;
 - `ModelText`, the only container model-authored visible text travels in, which nothing outside this
@@ -21,6 +21,12 @@
 - request-scoped prompt-cache routing hints plus normalized provider-reported cached-token usage;
 - multimodal message content, where a message carries `ContentPart`s — text, images, documents —
   instead of a single string.
+
+Continuation identity is a serializable `ModelKey`: backend, configured upstream model and optional
+reported model. Rebuilding a client for the same model keeps that identity. Codex retains reasoning
+items only and rebuilds assistant text and function calls from their parsed parts; another backend
+receives the portable text and calls without the opaque reasoning. Opaque capture uses compact JSON,
+and its debug representation exposes only a byte count.
 
 A message is text unless it is built with `ModelMessage::user_with_parts`. A text-only message
 serializes as a bare string on the chat-completions wire and as one `input_text` part on

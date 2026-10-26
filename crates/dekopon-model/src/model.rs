@@ -379,7 +379,9 @@ pub struct AssistantTurn {
 
 #[derive(Clone, PartialEq)]
 enum Continuation {
-    Portable,
+    Portable {
+        model: Option<Box<ModelKey>>,
+    },
     OpenRouter {
         client: Box<ModelKey>,
         state: crate::openrouter::Replay,
@@ -442,6 +444,8 @@ impl ModelKey {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OpaqueReasoning(Box<serde_json::value::RawValue>);
 
+impl Eq for OpaqueReasoning {}
+
 impl PartialEq for OpaqueReasoning {
     fn eq(&self, other: &Self) -> bool {
         self.0.get() == other.0.get()
@@ -478,8 +482,15 @@ impl AssistantTurn {
             content,
             tool_calls,
             usage,
-            continuation: Continuation::Portable,
+            continuation: Continuation::Portable { model: None },
         }
+    }
+
+    pub(crate) fn with_model_key(mut self, model: ModelKey) -> Self {
+        self.continuation = Continuation::Portable {
+            model: Some(Box::new(model)),
+        };
+        self
     }
 
     pub(crate) fn with_codex_continuation(
@@ -501,7 +512,7 @@ impl AssistantTurn {
 
     pub fn model_key(&self) -> Option<&ModelKey> {
         match &self.continuation {
-            Continuation::Portable => None,
+            Continuation::Portable { model } => model.as_deref(),
             Continuation::Codex { client, .. } | Continuation::OpenRouter { client, .. } => {
                 Some(client)
             }
@@ -510,7 +521,7 @@ impl AssistantTurn {
 
     pub fn opaque_reasoning(&self) -> Result<Vec<OpaqueReasoning>, serde_json::Error> {
         match &self.continuation {
-            Continuation::Portable => Ok(Vec::new()),
+            Continuation::Portable { .. } => Ok(Vec::new()),
             Continuation::Codex { items, .. } => {
                 items.iter().map(OpaqueReasoning::from_value).collect()
             }
@@ -520,7 +531,7 @@ impl AssistantTurn {
 
     pub(crate) fn codex_reported_model(&self) -> Option<&str> {
         match &self.continuation {
-            Continuation::Portable | Continuation::OpenRouter { .. } => None,
+            Continuation::Portable { .. } | Continuation::OpenRouter { .. } => None,
             Continuation::Codex { reported_model, .. } => reported_model.as_deref(),
         }
     }
@@ -540,13 +551,13 @@ impl AssistantTurn {
     pub(crate) fn openrouter_replay(&self) -> Option<&crate::openrouter::Replay> {
         match &self.continuation {
             Continuation::OpenRouter { state, .. } => Some(state),
-            Continuation::Portable | Continuation::Codex { .. } => None,
+            Continuation::Portable { .. } | Continuation::Codex { .. } => None,
         }
     }
 
     pub(crate) fn codex_items(&self) -> Option<&[Value]> {
         match &self.continuation {
-            Continuation::Portable | Continuation::OpenRouter { .. } => None,
+            Continuation::Portable { .. } | Continuation::OpenRouter { .. } => None,
             Continuation::Codex { items, .. } => Some(items),
         }
     }
