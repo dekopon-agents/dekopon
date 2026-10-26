@@ -46,7 +46,7 @@ class ExitContract(unittest.TestCase):
             shift
             while [ "$1" != --run ]; do shift; done
             run="$2"
-            [ "${STUB_SLEEP:-0}" != 1 ] || { touch "$STUB_ROOT/sleeping"; sleep 10; }
+            [ "${STUB_SLEEP:-0}" != 1 ] || { touch "$STUB_ROOT/sleeping"; sleep 60; }
             [ "${STUB_LAB_FAIL:-0}" != 1 ] || exit 1
             cp "$STUB_RECORDED/"* "$run/"
             ;;
