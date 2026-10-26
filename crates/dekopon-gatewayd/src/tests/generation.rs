@@ -198,13 +198,28 @@ async fn a_failed_summary_replies_and_persists_only_metadata() {
 }
 
 #[tokio::test]
-async fn memory_persists_after_the_session_span_ends_as_its_sibling() {
-    use opentelemetry::trace::TracerProvider as _;
+async fn a_memory_persist_span_reaches_the_installed_trace_pipeline() {
+    if std::env::var_os("DEKOPON_TEST_MEMORY_PERSIST_SUBSCRIBER").is_none() {
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::generation::a_memory_persist_span_reaches_the_installed_trace_pipeline",
+            ])
+            .env("DEKOPON_TEST_MEMORY_PERSIST_SUBSCRIBER", "1")
+            .output()
+            .expect("isolated subscriber test");
+        assert!(
+            child.status.success(),
+            "subscriber test: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        return;
+    }
     use opentelemetry_sdk::{
         error::OTelSdkResult,
         trace::{SdkTracerProvider, SpanData, SpanExporter},
     };
-    use tracing_subscriber::prelude::*;
 
     #[derive(Clone, Debug, Default)]
     struct Exported(Arc<Mutex<Vec<SpanData>>>);
@@ -220,9 +235,18 @@ async fn memory_persists_after_the_session_span_ends_as_its_sibling() {
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exported.clone())
         .build();
-    let _subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("persist-test")))
-        .set_default();
+    let telemetry = dekopon_telemetry::Install::new(dekopon_telemetry::Console {
+        format: dekopon_telemetry::ConsoleFormat::Json,
+        writer: dekopon_telemetry::ConsoleWriter::Stderr,
+        filter: dekopon_telemetry::ConsoleFilter::Directive("info".into()),
+    })
+    .with_traces(provider, "persist-test", crate::OTEL_TRACE_FILTER)
+    .with_logs(
+        opentelemetry_sdk::logs::SdkLoggerProvider::builder().build(),
+        "job=debug,meter=info",
+    )
+    .install()
+    .expect("sole global test subscriber");
     let directory = temporary();
     let journal = temporary();
     let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
@@ -243,7 +267,7 @@ async fn memory_persists_after_the_session_span_ends_as_its_sibling() {
     )
     .await;
     assert_eq!(driver.replies(), ["reply delivered"]);
-    provider.force_flush().unwrap();
+    telemetry.shutdown().expect("exporters flushed");
 
     let spans = exported.0.lock().clone();
     let named = |name: &str| {
@@ -279,7 +303,6 @@ async fn memory_persists_after_the_session_span_ends_as_its_sibling() {
             .iter()
             .any(|event| event.name == "gateway.memory.deviation")
     );
-    provider.shutdown().unwrap();
 }
 
 #[tokio::test]
