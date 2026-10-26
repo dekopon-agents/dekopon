@@ -466,10 +466,6 @@ impl Journal {
         }
     }
 
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     pub fn recall(
         &self,
         stem: &str,
@@ -1587,6 +1583,39 @@ mod tests {
             text: None,
         });
         rewrite(&journal.path(stem), &lines).expect("version");
+    }
+
+    #[test]
+    fn a_seal_refuses_record_reads_and_pins_through_shared_admission() {
+        use dekopon_agent::memory_tools::MemoryTools;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+        let stem = key().journal_stem();
+        let at = SystemTime::now();
+        append_versioned(&journal, &stem, at, "sealed-canary");
+        let tools = JournalMemoryTools {
+            journal: &journal,
+            stem: stem.clone(),
+            grant: GRANT.into(),
+            versions: [("original".into(), "v1".into())].into(),
+        };
+        assert!(tools.read(1, "original", None).contains("sealed-canary"));
+        journal.seal(&stem, at).unwrap();
+        assert_eq!(
+            tools.read(1, "original", None),
+            "record unavailable: expired or changed grant"
+        );
+        assert_eq!(
+            tools.set_pin(1, "original"),
+            "record unavailable: expired or changed grant"
+        );
+        assert!(
+            journal
+                .recall(&stem, GRANT, window(), at)
+                .unwrap()
+                .history
+                .is_empty()
+        );
     }
 
     #[test]

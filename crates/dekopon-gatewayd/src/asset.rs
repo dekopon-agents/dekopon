@@ -1071,7 +1071,7 @@ impl SessionAssets {
 
 enum Download {
     Ready(DiskBlob),
-    Pending(Waiter),
+    Pending(Box<Waiter>),
 }
 
 #[derive(Clone)]
@@ -1194,10 +1194,10 @@ impl AssetStore {
                     }
                     Attachment::Downloading(downloading) if downloading.interests > 0 => {
                         downloading.interests += 1;
-                        return Ok(Download::Pending(Waiter {
+                        return Ok(Download::Pending(Box::new(Waiter {
                             ticket: ticket(downloading.attempt),
                             outcome: downloading.outcome.clone(),
-                        }));
+                        })));
                     }
                     Attachment::Downloading(_) | Attachment::Registered => (),
                 }
@@ -1224,10 +1224,10 @@ impl AssetStore {
                     interests: 1,
                     outcome: outcome.clone(),
                 });
-                Ok(Download::Pending(Waiter {
+                Ok(Download::Pending(Box::new(Waiter {
                     ticket: ticket(attempt),
                     outcome,
-                }))
+                })))
             })
             .unwrap_or(Err(AssetFailure::Storage(BlobError::Unauthorized)))
     }
