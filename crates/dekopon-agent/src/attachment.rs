@@ -342,8 +342,6 @@ pub struct ResolvedInput {
 pub type ResolveFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ResolvedInput, ChatAssetRefusal>> + Send + 'a>>;
 pub trait ChatAssetSource: Send + Sync {
-    /// Resolving a released (reclaimed) asset refuses permanently rather than trying to redownload
-    /// it, since the underlying bytes are gone.
     fn resolve_input(&self, id: u64) -> ResolveFuture<'_>;
 }
 pub struct PreparedRun {

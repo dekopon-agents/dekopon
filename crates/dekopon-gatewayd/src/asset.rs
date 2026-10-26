@@ -1062,6 +1062,7 @@ impl AssetSource for SessionAssets {
                 });
                 match resolved {
                     Ok((pin, decoded)) => {
+                        seen.insert(id, Some(decoded));
                         if decoded > remaining {
                             *part = ContentPart::Text(format!(
                                 "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit."
@@ -1069,7 +1070,6 @@ impl AssetSource for SessionAssets {
                             continue;
                         }
                         remaining -= decoded;
-                        seen.insert(id, Some(decoded));
                         *data = self.reference(id, decoded);
                         request.pins.push(pin);
                     }
@@ -1542,9 +1542,7 @@ impl AssetFailure {
             Self::Storage(BlobError::Reclaimed) => {
                 Self::Refused(ChatAssetRefusal::Evicted).for_model(id)
             }
-            Self::Storage(error) => format!(
-                "chat-asset:{id} is unavailable: {error}. No automatic refetch or fallback was performed."
-            ),
+            Self::Storage(error) => format!("chat-asset:{id} is unavailable: {error}."),
             Self::Unknown => format!(
                 "There is no chat-asset:{id} in this conversation. The reference lines in the messages above name the ones there are."
             ),
@@ -3768,7 +3766,7 @@ mod retention_tests {
         drop(store.admit(&access, b, b"bbb").unwrap());
         assert!(matches!(
             second.wait().await,
-            Err(AssetFailure::Storage(BlobError::Reclaimed))
+            Err(AssetFailure::Unavailable)
         ));
     }
 

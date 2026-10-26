@@ -951,7 +951,9 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
     session.inventory.lock().note(&note, &registered);
     tokio::task::spawn_blocking(move || {
         let capture = dekopon_test_support::CaptureLayer::workspace();
+        let numeric = NumericEvents::default();
         let _guard = tracing_subscriber::registry()
+            .with(numeric.clone())
             .with(capture.clone())
             .set_default();
         let model = dekopon_test_support::ScriptedStreamModel::scripted(
@@ -992,6 +994,18 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
         );
         assert_eq!(records[0].field("asset.inventory.referenced"), Some("1"));
         assert_eq!(records[0].field("asset.inventory.omitted"), Some("0"));
+        let events = numeric.0.lock();
+        let event = events
+            .iter()
+            .find(|event| event.name == "accounting.model.turn")
+            .unwrap();
+        assert_eq!(event.numbers.get("asset.inventory.count"), Some(&2));
+        assert_eq!(
+            event.numbers.get("asset.inventory.bytes"),
+            Some(&(bytes as u64))
+        );
+        assert_eq!(event.numbers.get("asset.inventory.referenced"), Some(&1));
+        assert_eq!(event.numbers.get("asset.inventory.omitted"), Some(&0));
     })
     .await
     .unwrap();
@@ -1146,4 +1160,63 @@ async fn a_refetch_waiting_for_a_permit_rechecks_revocation_before_the_transport
         ChatAssetRefusal::Revoked
     );
     assert_eq!(gate.fetches(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_larger_refill_cannot_sneak_duplicate_history_images_past_the_request_budget() {
+    use dekopon_model::model::{ContentPart, ModelMessage};
+    let store = store(64 * 1024 * 1024);
+    let access = access("changed-length");
+    let id = register(&store, &access, Some(3));
+    drop(store.admit(&access, id, b"aaa").unwrap());
+    let gate = Gate::open(b"aaaa");
+    let session = session(&store, &access, &gate);
+    tokio::task::spawn_blocking(move || {
+        let original = session.fetch(id).unwrap();
+        let mut parts = Vec::new();
+        for index in 0..5 {
+            let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES - if index == 0 { 3 } else { 0 };
+            let carried = register(&store, &access, Some(size as u64));
+            drop(
+                store
+                    .admit(&access, carried, &vec![index as u8; size])
+                    .unwrap(),
+            );
+            let image = session.fetch(carried).unwrap();
+            parts.push(ContentPart::Image {
+                mime: image.mime,
+                data: image.data,
+            });
+        }
+        {
+            let mut entries = store.entries.lock();
+            let row = row_mut(&mut entries, &access.key, id).unwrap();
+            store
+                .retention
+                .lock()
+                .evict((access.key.clone(), id), row)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            parts.push(ContentPart::Image {
+                mime: original.mime.clone(),
+                data: original.data.clone(),
+            });
+        }
+        let mut messages = vec![ModelMessage::user_with_parts(parts)];
+        let request = session.prepare_request(&mut messages);
+        let parts = messages[0].parts().unwrap();
+        for part in &parts[5..] {
+            match part {
+                ContentPart::Text(text) => assert!(text.contains("40 MiB decoded asset limit")),
+                ContentPart::Image { .. } | ContentPart::File { .. } => {
+                    panic!("the larger refill must not cross the byte budget")
+                }
+            }
+        }
+        assert_eq!(request.pins.len(), 5);
+        assert_eq!(gate.fetches(), 1);
+    })
+    .await
+    .unwrap();
 }
