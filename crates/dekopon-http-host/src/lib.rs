@@ -1437,9 +1437,7 @@ impl BufferedHttpClient {
             }
             ResponseMetadata::SignedDownload => None,
         };
-        let output_head = headers.iter().fold(16_u64, |total, header| {
-            total.saturating_add((header.name.len() + header.value.len() + 4) as u64)
-        });
+        let output_head = returned_head_bytes(&headers);
         if output_head > grant.max_response_bytes
             || (redactor.is_some() && output_head > self.ceilings.max_header_bytes as u64)
         {
@@ -1456,7 +1454,7 @@ impl BufferedHttpClient {
                 .ok_or_else(|| {
                     http_error(ErrorCode::ResponseTooLarge, "response size overflowed")
                 })?;
-            self.evidence[evidence_index].response_bytes = response_bytes;
+            self.evidence[evidence_index].response_bytes += chunk.len() as u64;
             if response_bytes > grant.max_response_bytes {
                 return Err(http_error(
                     ErrorCode::ResponseTooLarge,
@@ -1911,6 +1909,12 @@ fn bounded_message(message: &str) -> String {
         }
     }
     output
+}
+
+fn returned_head_bytes(headers: &[Header]) -> u64 {
+    headers.iter().fold(16_u64, |total, header| {
+        total.saturating_add((header.name.len() + header.value.len() + 4) as u64)
+    })
 }
 
 fn response_head_bytes(
