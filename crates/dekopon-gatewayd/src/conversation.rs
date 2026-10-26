@@ -26,60 +26,96 @@ use crate::{
 enum ConversationAudience {
     Private(ExternalSubject),
     Shared,
-    Space(Box<(dekopon_core::SpaceKey, Option<String>)>),
 }
 
 /// The transport, agent, and audience together stop two agents or installations from sharing
 /// history; the key has no Debug so a subject or native conversation id can't leak into a log span.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct ConversationKey {
-    agent: AgentId,
-    transport: String,
-    conversation: String,
+    space: dekopon_core::SpaceKey,
+    thread: Option<String>,
     audience: ConversationAudience,
 }
 
 impl ConversationKey {
+    pub(crate) fn of(
+        agent: &AgentId,
+        transport: &str,
+        conversation: &dekopon_broker_protocol::Conversation,
+        subject: Option<&ExternalSubject>,
+    ) -> Self {
+        Self {
+            space: dekopon_core::SpaceKey {
+                agent: agent.clone(),
+                transport: transport.to_owned().into(),
+                workspace: conversation.container.clone().map(Into::into),
+                channel: conversation.id.clone().into(),
+            },
+            thread: conversation.thread.clone(),
+            audience: match subject {
+                Some(subject) => ConversationAudience::Private(subject.clone()),
+                None => ConversationAudience::Shared,
+            },
+        }
+    }
+
+    #[cfg(test)]
     pub fn private(
         agent: &AgentId,
         transport: &str,
-        conversation: &str,
+        channel: &str,
         subject: &ExternalSubject,
     ) -> Self {
         Self {
-            agent: agent.clone(),
-            transport: transport.to_owned(),
-            conversation: conversation.to_owned(),
+            space: dekopon_core::SpaceKey {
+                agent: agent.clone(),
+                transport: transport.to_owned().into(),
+                workspace: None,
+                channel: channel.to_owned().into(),
+            },
+            thread: None,
             audience: ConversationAudience::Private(subject.clone()),
         }
     }
 
-    pub fn shared(agent: &AgentId, transport: &str, conversation: &str) -> Self {
-        Self {
-            agent: agent.clone(),
-            transport: transport.to_owned(),
-            conversation: conversation.to_owned(),
-            audience: ConversationAudience::Shared,
-        }
+    #[cfg(test)]
+    pub fn shared(agent: &AgentId, transport: &str, channel: &str) -> Self {
+        Self::for_space(
+            dekopon_core::SpaceKey {
+                agent: agent.clone(),
+                transport: transport.to_owned().into(),
+                workspace: None,
+                channel: channel.to_owned().into(),
+            },
+            None,
+        )
     }
 
     pub(crate) fn for_space(space: dekopon_core::SpaceKey, thread: Option<String>) -> Self {
         Self {
-            agent: space.agent.clone(),
-            transport: String::new(),
-            conversation: String::new(),
-            audience: ConversationAudience::Space(Box::new((space, thread))),
+            space,
+            thread,
+            audience: ConversationAudience::Shared,
         }
     }
 
     pub(crate) fn absorb(&self, digest: &mut impl Update) {
-        match &self.audience {
-            ConversationAudience::Private(_) | ConversationAudience::Shared => {
-                for part in [self.agent.as_str(), &self.transport, &self.conversation] {
-                    cache_key::absorb(digest, part.as_bytes());
-                }
+        cache_key::absorb(digest, self.space.agent.as_str().as_bytes());
+        cache_key::absorb(digest, self.space.transport.0.as_bytes());
+        match &self.space.workspace {
+            Some(workspace) => {
+                digest.update(&[1]);
+                cache_key::absorb(digest, workspace.0.as_bytes());
             }
-            ConversationAudience::Space(_) => {}
+            None => digest.update(&[0]),
+        }
+        cache_key::absorb(digest, self.space.channel.0.as_bytes());
+        match &self.thread {
+            Some(thread) => {
+                digest.update(&[1]);
+                cache_key::absorb(digest, thread.as_bytes());
+            }
+            None => digest.update(&[0]),
         }
         match &self.audience {
             ConversationAudience::Private(subject) => {
@@ -87,22 +123,9 @@ impl ConversationKey {
                 cache_key::absorb(digest, subject.canonical().as_bytes());
             }
             ConversationAudience::Shared => digest.update(&[0]),
-            ConversationAudience::Space(binding) => {
-                let (space, thread) = binding.as_ref();
-                digest.update(&space.encode());
-                match thread {
-                    Some(thread) => {
-                        digest.update(&[1]);
-                        cache_key::absorb(digest, thread.as_bytes());
-                    }
-                    None => digest.update(&[0]),
-                }
-                digest.update(&[0]);
-            }
         }
     }
 
-    /// A digest, so any subject or native conversation id encodes to a safe file name.
     pub fn journal_stem(&self) -> String {
         let mut digest = Sha256::new();
         self.absorb(&mut digest);
@@ -111,7 +134,7 @@ impl ConversationKey {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        format!("{}/{stem}", self.agent.as_str())
+        format!("{}/{stem}", self.space.agent.as_str())
     }
 }
 
@@ -709,6 +732,46 @@ fn evicted(reason: EvictionReason) {
 #[cfg(test)]
 mod space_tests {
     use super::*;
+
+    #[test]
+    fn colliding_joined_coordinates_have_distinct_memory_and_cache_keys() {
+        use dekopon_broker_protocol::{Conversation, ConversationKind};
+        let agent = "reviewer".parse().unwrap();
+        let secret = CacheKeySecret::from_bytes([7; 32]);
+        let coordinates =
+            |workspace: Option<&str>, channel: &str, thread: Option<&str>| Conversation {
+                kind: ConversationKind::Thread,
+                container: workspace.map(str::to_owned),
+                id: channel.to_owned(),
+                thread: thread.map(str::to_owned),
+            };
+        let first = coordinates(Some("workspace"), "a:b", Some("c"));
+        let second = coordinates(Some("workspace"), "a", Some("b:c"));
+        assert_eq!(first.key(), second.key());
+        let keys = [
+            ConversationKey::of(&agent, "slack", &first, None),
+            ConversationKey::of(&agent, "slack", &second, None),
+            ConversationKey::of(&agent, "slack", &coordinates(None, "a:b", Some("c")), None),
+            ConversationKey::of(
+                &agent,
+                "slack",
+                &coordinates(Some(""), "a:b", Some("c")),
+                None,
+            ),
+            ConversationKey::of(
+                &agent,
+                "slack",
+                &coordinates(Some("workspace"), "a:b", None),
+                None,
+            ),
+        ];
+        for (index, key) in keys.iter().enumerate() {
+            for other in &keys[index + 1..] {
+                assert_ne!(key.journal_stem(), other.journal_stem());
+                assert_ne!(secret.for_conversation(key), secret.for_conversation(other));
+            }
+        }
+    }
 
     #[test]
     fn space_replay_stem_is_frozen_and_threads_remain_separate() {

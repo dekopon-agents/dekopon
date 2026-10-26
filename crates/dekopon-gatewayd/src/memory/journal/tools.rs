@@ -40,10 +40,23 @@ impl<'a> JournalMemoryTools<'a> {
     }
 
     fn eligible(&self, line: &Line) -> bool {
-        line.grant == self.grant
-            && line.at_ms
-                >= millis(SystemTime::now())
-                    .saturating_sub(duration_millis(self.journal.age_for(&self.stem)))
+        let sealed = match self
+            .journal
+            .read_seal(&self.stem, self.journal.seal_retention)
+        {
+            Ok(sealed) => sealed.map(|seal| millis(seal.at)),
+            Err(error) => {
+                tracing::warn!(reason = error.label(), "gateway memory seal read failed");
+                return false;
+            }
+        };
+        super::admits(
+            line,
+            &self.grant,
+            millis(SystemTime::now())
+                .saturating_sub(duration_millis(self.journal.age_for(&self.stem))),
+            sealed,
+        )
     }
     fn representation(&self, line: &Line, id: &str) -> Option<String> {
         super::body(line, id, self.versions.get(id)?)
