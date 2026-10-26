@@ -454,8 +454,9 @@ are never split. There is at most one collecting batch per compatible actor key 
 most `sessions.maxConcurrent` batches, independently of execution permits.
 
 At quiet expiry or the hard deadline, whichever comes first, the batch attempts normal admission.
-For a running conversation with mailbox room, the same sender's batch becomes a steer; another
-sender's batch queues as a follow-up. After cancellation or the turn's seal, both queue.
+For a running conversation with mailbox room, batches follow the session’s steering rule:
+on mapped shared or one-shot channels another authorized native-chat participant joins the turn;
+elsewhere the same sender steers and another sender queues. After cancellation or the turn’s seal, both queue.
 Steers and follow-ups share a 100-item mailbox. A full mailbox or exhausted execution capacity
 makes a batch eligible for a busy reply even when `replyOnBusy` is false, subject to the bounded
 refusal-reply capacity and transport delivery.
@@ -465,7 +466,8 @@ maximum (15 seconds by default); Telegram waits its fixed 3 seconds. Queueing, i
 transport time remain additional; collection does not guarantee that every group member joins one turn.
 
 New turns receive fresh broker authorization and generation selection after admission; a same-sender
-steer joins the running turn's existing leg and asset access. Collection itself does
+steer joins the running turn's existing leg and asset access. Other participants on a mapped
+shared or one-shot channel receive fresh authorization before joining its asset access. Collection itself does
 not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
 reply target and native delivery identity; other message IDs are not fabricated into an album ID.
 An authenticated stop removes only that actor's pending work and preserves the existing ownership
@@ -1331,7 +1333,7 @@ The default is 15 minutes, which resolves toward the person because the user-vis
 
 ### The prompt cache key
 
-Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Sharing a key grants nothing: each new session opens a fresh attested leg; steers share only their running session's leg.
+Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Sharing a key grants nothing: each new session opens a fresh attested leg; authorized steers share the running session’s bounded participant table; scripts use the asker’s leg until the companion handle change ships.
 
 **It is a keyed HMAC, so nobody outside the gateway can recompute it.** The key is `gatewayd-conversation-` or `gatewayd-route-` followed by the first 32 hex digits of HMAC-SHA256, under a 32-byte gateway-held secret, over a domain-separation prefix and the length-prefixed fields below. Without the secret a provider cannot recompute a key or test a guessed subject against one, phone numbers included. The same conversation names the same lane after an idle or capacity eviction or a grant change, so the provider's sticky routing lands it where its instructions and tools prefix is already cached.
 
