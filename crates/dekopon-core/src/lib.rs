@@ -807,7 +807,8 @@ mod command_word_tests {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
 pub struct AssetNumber(std::num::NonZeroU64);
 
 impl AssetNumber {
@@ -822,6 +823,20 @@ impl AssetNumber {
             return None;
         }
         digits.parse().ok().map(Self)
+    }
+}
+
+impl TryFrom<u64> for AssetNumber {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        std::num::NonZeroU64::try_from(value).map(Self)
+    }
+}
+
+impl From<AssetNumber> for u64 {
+    fn from(value: AssetNumber) -> Self {
+        value.get()
     }
 }
 

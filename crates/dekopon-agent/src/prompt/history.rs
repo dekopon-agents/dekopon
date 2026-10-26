@@ -355,9 +355,19 @@ pub struct ConversationTurn {
     answer: Option<RawAnswer>,
     exchanges: Vec<Exchange>,
     memory_id: Option<u64>,
+    captured: Option<crate::memory::CapturedTurn>,
 }
 
 impl ConversationTurn {
+    pub fn captured(&self) -> Option<&crate::memory::CapturedTurn> {
+        self.captured.as_ref()
+    }
+
+    pub(super) fn with_capture(mut self, captured: crate::memory::CapturedTurn) -> Self {
+        self.captured = Some(captured);
+        self
+    }
+
     #[must_use]
     pub fn completed(user: impl Into<String>, answer: impl Into<RawAnswer>) -> Self {
         Self {
@@ -365,6 +375,7 @@ impl ConversationTurn {
             answer: Some(answer.into()),
             exchanges: Vec::new(),
             memory_id: None,
+            captured: None,
         }
     }
 
@@ -375,6 +386,7 @@ impl ConversationTurn {
             answer: None,
             exchanges: Vec::new(),
             memory_id: None,
+            captured: None,
         }
     }
 
@@ -391,6 +403,7 @@ impl ConversationTurn {
             answer: self.answer.clone(),
             exchanges: Vec::new(),
             memory_id: self.memory_id,
+            captured: None,
         }
     }
 

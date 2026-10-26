@@ -7,10 +7,10 @@ use crate::{
         TransportFailure,
     },
     http::{InferenceHttp, Progress, record_phase},
-    inference::{GenerateRequest, InferenceModel},
+    inference::{GenerateRequest, InferenceModel, ReplayEvent},
     model::{
-        AssistantTurn, ClientIdentity, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
-        ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, compact_json_body,
+        AssistantTurn, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
+        ModelFunctionCall, ModelKey, ModelMessage, ModelTool, ModelToolCall, compact_json_body,
         sanitize_diagnostic,
     },
     sse::{SseEvent, decode_transcript},
@@ -33,7 +33,7 @@ pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/re
 pub struct CodexClient {
     name: String,
     model: String,
-    identity: ClientIdentity,
+    identity: parking_lot::RwLock<ModelKey>,
     credential: Arc<CredentialFile>,
     http: InferenceHttp,
     endpoint: String,
@@ -88,13 +88,17 @@ impl CodexClient {
     ) -> Result<Self, InferenceError> {
         Ok(Self {
             name: model.clone(),
+            identity: parking_lot::RwLock::new(ModelKey::new(crate::model::Backend::Codex, &model)),
             model,
-            identity: ClientIdentity::new(),
             credential,
             http: InferenceHttp::new(timeout)?,
             endpoint,
             loopback: false,
         })
+    }
+
+    pub fn model_key(&self) -> crate::model::ModelKey {
+        self.identity.read().clone()
     }
 
     #[must_use]
@@ -106,7 +110,6 @@ impl CodexClient {
     pub fn with_loopback_endpoint(mut self, endpoint: &str) -> Result<Self, InferenceError> {
         self.endpoint = crate::loopback::endpoint(endpoint)?;
         self.loopback = true;
-        self.identity = ClientIdentity::new();
         Ok(self)
     }
 
@@ -155,28 +158,17 @@ impl CodexClient {
             .map_err(credential_failure)
     }
 
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     async fn exchange(
         &self,
         request: GenerateRequest<'_>,
-        observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        observe: &mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
         progress: &mut Progress,
+        identity: &ModelKey,
     ) -> Result<AssistantTurn, InferenceError> {
         let span = tracing::Span::current();
         span.record("model.stream", true);
         span.record("cache.style", "automatic");
-        for message in request.messages {
-            if let ModelMessage::Assistant { turn } = message
-                && !turn.accepts_client(&self.identity)
-            {
-                record_phase(FailurePhase::BeforeSend);
-                return Err(ProtocolFailure::ContinuationMismatch.into());
-            }
-        }
         let credentials = self.credential(RefreshMode::IfNeeded, control).await?;
         let body = control
             .run(build_request_body(
@@ -184,11 +176,17 @@ impl CodexClient {
                 request.messages,
                 request.tools,
                 request.options,
+                identity,
             ))
             .await
             .inspect_err(|_| record_phase(FailurePhase::BeforeSend))??;
         span.record("tool_choice", body.tool_choice);
         span.record("parallel_tool_calls", body.parallel_tool_calls);
+        let continued_model = body
+            .input
+            .iter()
+            .any(|item| matches!(item, ResponsesItem::Replay(_)))
+            .then(|| identity.clone());
         let encoded = compact_json_body(&body).map_err(TransportFailure::Encoding)?;
         drop(body);
         let builder = self
@@ -242,15 +240,7 @@ impl CodexClient {
         let response = response.check(control, secrets).await?;
         let mut reducer = CodexReducer {
             secrets,
-            continued_model: request
-                .messages
-                .iter()
-                .rev()
-                .find_map(|message| match message {
-                    ModelMessage::Assistant { turn } => turn.codex_reported_model(),
-                    _ => None,
-                })
-                .map(str::to_owned),
+            continued_model,
             ..CodexReducer::default()
         };
         response
@@ -259,20 +249,44 @@ impl CodexClient {
                 let SseEvent::Data(data) = event else {
                     return Ok(ControlFlow::Break(()));
                 };
-                reducer.apply(data, &mut |event| progress.observe(event, observe))
+                reducer.apply_replay(data, &mut |event| match event {
+                    ReplayEvent::ModelVerified => observe(ReplayEvent::ModelVerified),
+                    ReplayEvent::Text(event) => {
+                        progress.observe(event, &mut |event| observe(ReplayEvent::Text(event)))
+                    }
+                })
             })
             .await?;
         control
             .check()
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
         let turn = reducer
-            .finish(&self.identity)
+            .finish(identity)
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
         control
             .check()
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
         tracing::Span::current().record("output.partial", false);
+        if let Some(key) = turn.model_key() {
+            *self.identity.write() = key.clone();
+        }
         Ok(turn)
+    }
+}
+
+impl crate::inference::ReplayModel for CodexClient {
+    fn resolved_key(&self) -> ModelKey {
+        self.model_key()
+    }
+    async fn exchange<'a>(
+        &'a self,
+        request: GenerateRequest<'a>,
+        observe: &'a mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
+        control: &'a TurnControl,
+        progress: &'a mut Progress,
+        identity: &'a ModelKey,
+    ) -> Result<AssistantTurn, InferenceError> {
+        CodexClient::exchange(self, request, observe, control, progress, identity).await
     }
 }
 
@@ -292,8 +306,14 @@ impl InferenceModel for CodexClient {
                 async {
                     let mut progress = Progress::new();
                     (
-                        self.exchange(request, observe, control, &mut progress)
-                            .await,
+                        crate::inference::retry_opaque(
+                            self,
+                            request,
+                            observe,
+                            control,
+                            &mut progress,
+                        )
+                        .await,
                         progress,
                     )
                 },
@@ -458,19 +478,30 @@ pub(crate) struct CodexReducer<'a> {
     call_order: Vec<String>,
     terminal: Terminal,
     usage: Option<ModelUsage>,
-    continued_model: Option<String>,
+    continued_model: Option<ModelKey>,
     reported_model: Option<String>,
 }
 
 impl CodexReducer<'_> {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     pub(crate) fn apply(
         &mut self,
         data: &str,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<ControlFlow<()>, InferenceError> {
+        self.apply_replay(data, &mut |event| match event {
+            ReplayEvent::ModelVerified => ControlFlow::Continue(()),
+            ReplayEvent::Text(event) => observe(event),
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
+    fn apply_replay(
+        &mut self,
+        data: &str,
+        observe: &mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
     ) -> Result<ControlFlow<()>, InferenceError> {
         let event: Value =
             serde_json::from_str(data).map_err(|error| self.secrets.decode_failure(error))?;
@@ -516,10 +547,11 @@ impl CodexReducer<'_> {
             .and_then(|response| response.model.as_deref())
         {
             let model = self.secrets.sanitize(model);
-            if self
+            if self.continued_model.as_ref().is_some_and(|expected| {
+                expected != &expected.clone().with_reported(Some(model.clone()))
+            }) || self
                 .reported_model
                 .as_deref()
-                .or(self.continued_model.as_deref())
                 .is_some_and(|prior| prior != model)
             {
                 return Err(ProtocolFailure::ContinuationMismatch.into());
@@ -527,6 +559,9 @@ impl CodexReducer<'_> {
             if self.reported_model.is_none() {
                 tracing::Span::current().record("model.returned", model.as_str());
                 self.reported_model = Some(model);
+                if observe(ReplayEvent::ModelVerified).is_break() {
+                    return Err(InferenceError::Cancelled);
+                }
             }
         }
         if failed {
@@ -575,7 +610,11 @@ impl CodexReducer<'_> {
                         self.unattributed_deltas = true;
                     }
                     self.text.push_str(&delta);
-                    if observe(TurnEvent::TextDelta(ModelText::from_model(delta))).is_break() {
+                    if observe(ReplayEvent::Text(TurnEvent::TextDelta(
+                        ModelText::from_model(delta),
+                    )))
+                    .is_break()
+                    {
                         return Err(InferenceError::Cancelled);
                     }
                 }
@@ -762,10 +801,20 @@ impl CodexReducer<'_> {
         Ok(())
     }
 
-    pub(crate) fn finish(
-        mut self,
-        identity: &ClientIdentity,
-    ) -> Result<AssistantTurn, InferenceError> {
+    pub(crate) fn finish(mut self, identity: &ModelKey) -> Result<AssistantTurn, InferenceError> {
+        let reported = self.reported_model.clone().or_else(|| {
+            self.continued_model
+                .as_ref()
+                .and_then(ModelKey::reported)
+                .map(str::to_owned)
+        });
+        if self
+            .continued_model
+            .as_ref()
+            .is_some_and(|expected| expected != &identity.clone().with_reported(reported.clone()))
+        {
+            return Err(ProtocolFailure::ContinuationMismatch.into());
+        }
         match self.terminal {
             Terminal::Streaming => return Err(ProtocolFailure::MissingTerminal.into()),
             Terminal::Completed => {}
@@ -804,7 +853,7 @@ impl CodexReducer<'_> {
             AssistantTurn::new(content, calls, self.usage).with_codex_continuation(
                 self.native_items,
                 identity.clone(),
-                self.reported_model.or(self.continued_model),
+                reported,
             ),
         )
     }
@@ -823,7 +872,7 @@ pub(crate) fn replay_transcript(
         SseEvent::Data(data) => reducer.apply(data, observe),
         SseEvent::Done => Ok(ControlFlow::Break(())),
     })?;
-    reducer.finish(&ClientIdentity::new())
+    reducer.finish(&ModelKey::new(crate::model::Backend::Codex, "transcript"))
 }
 #[expect(
     clippy::wildcard_enum_match_arm,
@@ -984,6 +1033,7 @@ async fn build_request_body<'a>(
     messages: &'a [ModelMessage],
     tools: &'a [ModelTool],
     options: &'a CompletionOptions,
+    identity: &ModelKey,
 ) -> Result<ResponsesRequest<'a>, InferenceError> {
     let instructions = messages
         .iter()
@@ -1007,9 +1057,10 @@ async fn build_request_body<'a>(
                 content: responses_content(message).await?,
             })),
             ModelMessage::Assistant { turn } => {
-                if let Some(items) = turn.codex_items().filter(|items| !items.is_empty()) {
+                if let Some(items) = turn.codex_items().filter(|items| {
+                    !items.is_empty() && turn.model_key().is_some_and(|key| key == identity)
+                }) {
                     input.extend(items.iter().map(ResponsesItem::Replay));
-                    continue;
                 }
                 if let Some(content) = message.content().filter(|content| !content.is_empty()) {
                     input.push(ResponsesItem::Message(ResponsesMessage {
@@ -1071,7 +1122,14 @@ pub(crate) async fn request_body_json(
     tools: &[ModelTool],
     options: &CompletionOptions,
 ) -> Result<Value, InferenceError> {
-    let body = build_request_body(model, messages, tools, options).await?;
+    let body = build_request_body(
+        model,
+        messages,
+        tools,
+        options,
+        &ModelKey::new(crate::model::Backend::Codex, model),
+    )
+    .await?;
     let encoded = compact_json_body(&body).expect("the request body serializes");
     Ok(serde_json::from_slice(&encoded).expect("a compact request body is JSON"))
 }
@@ -1191,7 +1249,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 reducer
-                    .finish(&ClientIdentity::new())
+                    .finish(&ModelKey::fixture())
                     .unwrap()
                     .content
                     .as_deref(),
@@ -1229,7 +1287,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             reducer
-                .finish(&ClientIdentity::new())
+                .finish(&ModelKey::fixture())
                 .unwrap()
                 .content
                 .as_deref(),
@@ -1280,19 +1338,13 @@ mod tests {
                 .unwrap()
                 .is_break()
         );
-        let turn = reducer.finish(&ClientIdentity::new()).unwrap();
+        let turn = reducer.finish(&ModelKey::fixture()).unwrap();
         assert_eq!(turn.content.as_deref(), Some("firstunindexedagain"));
         let replay = turn.codex_items().unwrap();
-        assert_eq!(replay.len(), 4);
-        assert_eq!(replay[0]["id"], "z");
-        assert_eq!(replay[0]["extra"], true);
-        assert_eq!(replay[0]["content"][0]["text"], "replacement");
         assert_eq!(
-            replay[1],
-            serde_json::json!({"type":"reasoning","id":"a","text":"final"})
+            replay,
+            &[serde_json::json!({"type":"reasoning","id":"a","text":"final"})]
         );
-        assert_eq!(replay[2]["content"][0]["text"], "unindexed");
-        assert_eq!(replay[3]["content"][0]["text"], "again");
     }
 
     #[tokio::test]
@@ -1374,13 +1426,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_public_codex_override_rejects_remote_hosts_and_invalidates_native_replay() {
-        let (_directory, server, client) = fixture(vec![MockResponse::sse(include_str!(
-            "fixtures/codex-tool.sse"
-        ))]);
+    async fn a_public_codex_override_rejects_remote_hosts_and_keeps_model_identity() {
+        let (_directory, server, client) = fixture(vec![
+            MockResponse::sse(include_str!("fixtures/codex-tool.sse")),
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+        ]);
         let first = generate(&client, &control()).await.unwrap();
         let client = client.with_loopback_endpoint(&server.base_url()).unwrap();
-        let error = client
+        let answer = client
             .generate(
                 GenerateRequest {
                     messages: &[crate::model::assistant_message(&first)],
@@ -1391,12 +1444,9 @@ mod tests {
                 &control(),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            InferenceError::Protocol(ProtocolFailure::ContinuationMismatch)
-        ));
-        assert_eq!(server.requests.lock().len(), 1);
+            .unwrap();
+        assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
+        assert_eq!(server.requests.lock().len(), 2);
         assert!(matches!(
             client.with_loopback_endpoint("http://localhost:8000"),
             Err(InferenceError::InvalidRequest(
@@ -1957,13 +2007,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_continuation_cannot_cross_configured_clients() {
+    async fn a_new_client_for_the_same_model_replays_reasoning() {
         let (_directory, _server, client) = fixture(vec![MockResponse::sse(include_str!(
-            "fixtures/codex-answer.sse"
+            "fixtures/codex-tool.sse"
         ))]);
         let turn = generate(&client, &control()).await.unwrap();
-        let (_other_directory, other_server, other) = fixture(Vec::new());
-        let result = other
+        let (_other_directory, other_server, other) = fixture(vec![
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+        ]);
+        generate(&other, &control()).await.unwrap();
+        assert_eq!(other.model_key(), *turn.model_key().unwrap());
+        other
             .generate(
                 GenerateRequest {
                     messages: &[crate::model::assistant_message(&turn)],
@@ -1973,43 +2028,309 @@ mod tests {
                 &mut |_| ControlFlow::Continue(()),
                 &control(),
             )
-            .await;
-        assert!(matches!(
-            result,
-            Err(InferenceError::Protocol(
-                ProtocolFailure::ContinuationMismatch
-            ))
-        ));
-        assert!(other_server.requests.lock().is_empty());
+            .await
+            .unwrap();
+        let requests = other_server.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            turn.codex_items().unwrap().len()
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call")
+        );
     }
 
     #[tokio::test]
-    async fn a_reported_model_change_cannot_cross_a_bound_continuation() {
+    async fn replayed_reasoning_streams_a_delta_before_the_response_completes() {
+        let created =
+            serde_json::json!({"type":"response.created","response":{"model":"gpt-test"}});
+        let delta = serde_json::json!({"type":"response.output_text.delta","delta":"live canary"});
+        let prefix = format!("data: {created}\n\ndata: {delta}\n\n");
+        let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","model":"gpt-test"}});
+        let body = format!("{prefix}data: {terminal}\n\n");
+        let (response, waiting, release) = MockResponse::sse(&body).stalled_after(prefix.len());
+        let (_directory, server, client) = fixture(vec![
+            MockResponse::sse(include_str!("fixtures/codex-tool.sse")),
+            response,
+        ]);
+        let first = generate(&client, &control()).await.unwrap();
+        let (seen, delta) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut seen = Some(seen);
+            client
+                .generate(
+                    GenerateRequest {
+                        messages: &[
+                            crate::model::assistant_message(&first),
+                            ModelMessage::tool(first.tool_calls[0].id.clone(), "done"),
+                        ],
+                        tools: &[],
+                        options: &CompletionOptions::default(),
+                    },
+                    &mut |event| {
+                        if let Some(seen) = seen.take() {
+                            let _closed = seen.send(event);
+                        }
+                        ControlFlow::Continue(())
+                    },
+                    &control(),
+                )
+                .await
+        });
+        waiting.await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), delta).await;
+        release.send(()).unwrap();
+        let answer = task.await.unwrap().unwrap();
+        let TurnEvent::TextDelta(text) = event
+            .expect("delta before releasing terminal event")
+            .unwrap();
+        assert_eq!(text.as_str(), "live canary");
+        assert_eq!(answer.content.as_deref(), Some("live canary"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let body: Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_then_present_reported_identity_retries_without_releasing_discarded_text() {
+        let initial =
+            include_str!("fixtures/codex-tool.sse").replace(",\"model\":\"gpt-test\"", "");
+        let created =
+            serde_json::json!({"type":"response.created","response":{"model":"gpt-test"}});
+        let delta = serde_json::json!({"type":"response.output_text.delta","delta":"discarded"});
+        let completed = serde_json::json!({"type":"response.completed","response":{"status":"completed","model":"gpt-test"}});
+        let changed = format!("data: {created}\n\ndata: {delta}\n\ndata: {completed}\n\n");
+        let replacement =
+            include_str!("fixtures/codex-answer.sse").replace("Echoed hello.", "replacement");
+        let (_directory, server, client) = fixture(vec![
+            MockResponse::sse(&initial),
+            MockResponse::sse(&changed),
+            MockResponse::sse(&replacement),
+        ]);
+        let first = generate(&client, &control()).await.unwrap();
+        assert_eq!(first.model_key().unwrap().reported(), None);
+        let mut seen = String::new();
+        let answer = client
+            .generate(
+                GenerateRequest {
+                    messages: &[
+                        crate::model::assistant_message(&first),
+                        ModelMessage::tool(first.tool_calls[0].id.clone(), "done"),
+                    ],
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
+                &mut |event| {
+                    let TurnEvent::TextDelta(text) = event;
+                    seen.push_str(text.as_str());
+                    ControlFlow::Continue(())
+                },
+                &control(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen, "replacement");
+        assert_eq!(answer.content.as_deref(), Some(seen.as_str()));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        assert!(
+            bodies[1]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        );
+        assert!(
+            bodies[2]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reported_model_drift_retries_once_without_opaque_reasoning() {
         let changed =
             include_str!("fixtures/codex-answer.sse").replace("gpt-test", "another-model");
         let (_directory, server, client) = fixture(vec![
-            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+            MockResponse::sse(include_str!("fixtures/codex-tool.sse")),
+            MockResponse::sse(&changed),
             MockResponse::sse(&changed),
         ]);
         let turn = generate(&client, &control()).await.unwrap();
-        let result = client
+        let mut events = Vec::new();
+        let answer = client
             .generate(
                 GenerateRequest {
                     messages: &[crate::model::assistant_message(&turn)],
                     tools: &[],
                     options: &CompletionOptions::default(),
                 },
+                &mut |event| {
+                    events.push(event);
+                    ControlFlow::Continue(())
+                },
+                &control(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.model_key().unwrap().reported(),
+            Some("another-model")
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        assert!(
+            bodies[1]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        );
+        assert!(
+            bodies[2]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
+        );
+        assert_eq!(
+            bodies[1]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] != "reasoning")
+                .collect::<Vec<_>>(),
+            bodies[2]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        let text: String = events
+            .iter()
+            .map(|event| match event {
+                TurnEvent::TextDelta(text) => text.as_str(),
+            })
+            .collect();
+        assert_eq!(text, answer.content.as_deref().unwrap());
+    }
+
+    #[tokio::test]
+    async fn changing_configured_models_replays_only_portable_text_and_calls() {
+        let (_directory, _server, client) = fixture(vec![MockResponse::sse(include_str!(
+            "fixtures/codex-tool.sse"
+        ))]);
+        let first = generate(&client, &control()).await.unwrap();
+        let changed = include_str!("fixtures/codex-answer.sse").replace("gpt-test", "reported-b");
+        let (_directory_b, server_b, mut client_b) = fixture(vec![MockResponse::sse(&changed)]);
+        client_b.model = "configured-b".to_owned();
+        client_b.identity =
+            parking_lot::RwLock::new(ModelKey::new(crate::model::Backend::Codex, "configured-b"));
+        let answer = client_b
+            .generate(
+                GenerateRequest {
+                    messages: &[crate::model::assistant_message(&first)],
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
                 &mut |_| ControlFlow::Continue(()),
                 &control(),
             )
-            .await;
-        assert!(matches!(
-            result,
-            Err(InferenceError::Protocol(
-                ProtocolFailure::ContinuationMismatch
-            ))
-        ));
-        assert_eq!(server.requests.lock().len(), 2);
+            .await
+            .unwrap();
+        assert_eq!(answer.model_key().unwrap().reported(), Some("reported-b"));
+        let requests = server_b.requests();
+        assert_eq!(requests.len(), 1);
+        let body: Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call")
+        );
+    }
+
+    #[tokio::test]
+    async fn unequal_reported_models_under_one_alias_strip_opaque_reasoning() {
+        let (_directory, _server, client_a) = fixture(vec![MockResponse::sse(include_str!(
+            "fixtures/codex-tool.sse"
+        ))]);
+        let turn_a = generate(&client_a, &control()).await.unwrap();
+        let changed = include_str!("fixtures/codex-answer.sse").replace("gpt-test", "reported-b");
+        let (_directory_b, server_b, client_b) = fixture(vec![
+            MockResponse::sse(&changed),
+            MockResponse::sse(&changed),
+        ]);
+        generate(&client_b, &control()).await.unwrap();
+        assert_ne!(client_b.model_key(), *turn_a.model_key().unwrap());
+        client_b
+            .generate(
+                GenerateRequest {
+                    messages: &[crate::model::assistant_message(&turn_a)],
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
+                &mut |_| ControlFlow::Continue(()),
+                &control(),
+            )
+            .await
+            .unwrap();
+        let requests = server_b.requests();
+        assert_eq!(requests.len(), 2);
+        let body: Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call")
+        );
     }
 
     #[tokio::test]
@@ -2037,7 +2358,7 @@ mod tests {
         assert_eq!(turn.content.as_deref(), Some("firstsecond"));
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].function.arguments, "{}");
-        assert_eq!(turn.codex_items().unwrap().len(), 3);
+        assert!(turn.codex_items().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

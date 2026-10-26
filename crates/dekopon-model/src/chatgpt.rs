@@ -1255,7 +1255,7 @@ mod tests {
                     "id": "rs_1",
                     "encrypted_content": "opaque"
                 })],
-                crate::model::ClientIdentity::new(),
+                crate::model::ModelKey::fixture(),
                 None,
             );
         assistant.tool_calls.push(crate::model::ModelToolCall {
@@ -1288,7 +1288,9 @@ mod tests {
         assert_eq!(body["instructions"], "Be concise");
         assert_eq!(body["tools"][0]["name"], "echo_echo");
         assert_eq!(body["input"][1]["type"], "reasoning");
-        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][2]["arguments"], "{}");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
     }
 
     fn request_text(fragment: &Value) -> String {
@@ -1345,7 +1347,7 @@ mod tests {
                     "arguments": arguments,
                 }),
             ],
-            crate::model::ClientIdentity::new(),
+            crate::model::ModelKey::fixture(),
             None,
         )
     }
@@ -1807,7 +1809,7 @@ mod tests {
         );
         let items = turn.codex_items().expect("native continuation");
         assert_eq!(items[0]["type"], "reasoning");
-        assert_eq!(items[1]["arguments"], r#"{"message":"hello"}"#);
+        assert_eq!(items.len(), 1);
         assert_eq!(
             turn.usage,
             Some(dekopon_model_token_governor::ModelUsage {
