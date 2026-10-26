@@ -296,11 +296,11 @@ async fn selected_summary_with_limit(
         turn
     };
     let inbound = message("next question");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let journal = runner.journal.as_ref().unwrap();
     let stem = key.journal_stem();
@@ -663,11 +663,11 @@ async fn shorter_bare_check_log_summary_with_larger_envelope_keeps_original() {
     route.memory_policy = Some(policy(SelectionMode::Fixed));
     let config = route.memory_policy.as_ref().unwrap();
     let inbound = message("next question");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let original_text = "hi\nok";
     let summary = "sum";
@@ -804,11 +804,11 @@ async fn a_selected_omission_never_replays_its_resident_original() {
     let mut route = persistent_route(model_config(), window);
     route.memory_policy = Some(ResolvedPolicy::default());
     let inbound = message("next question");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let grant = crate::journal::grant_digest(&granted(&["cli-probe.upper"]));
     let turn = ConversationTurn::completed("X".repeat(40), "ok")
@@ -901,11 +901,11 @@ async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
     let mut route = persistent_route(model_config(), window);
     route.memory_policy = Some(ResolvedPolicy::default());
     let inbound = message("next question");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let grant_ids = granted(&["cli-probe.upper"]);
     let grant = crate::journal::grant_digest(&grant_ids);
@@ -1034,11 +1034,11 @@ async fn a_missing_journal_line_does_not_erase_a_committed_resident_window() {
     let window = recall_window(RecallSource::Journal);
     let route = persistent_route(model_config(), window);
     let inbound = message("next question");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let granted = granted(&["cli-probe.upper"]);
     let seed = runner
@@ -1094,11 +1094,11 @@ async fn journal_projection_fits_newest_whole_turns_without_downgrading() {
     let mut route = persistent_route(model_config(), window);
     route.memory_policy = Some(ResolvedPolicy::default());
     let inbound = message("next question");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let stem = key.journal_stem();
     let grant = crate::journal::grant_digest(&granted(&["cli-probe.upper"]));

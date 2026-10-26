@@ -150,11 +150,11 @@ async fn a_failed_summary_replies_and_persists_only_metadata() {
     let mut route = persistent_route(model_config(), recall_window(RecallSource::Journal));
     route.memory_policy = Some(policy("progressiveOneShot", &["summary"]));
     let inbound = message("PRIVATE_SOURCE_SENTINEL");
-    let stem = ConversationKey::private(
+    let stem = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     )
     .journal_stem();
     let driver = Arc::new(RecordingDriver::default());
@@ -446,11 +446,11 @@ async fn admission_remains_held_until_generation_and_append_finish() {
     first_route.memory_policy = Some(policy("progressiveOneShot", &["summary"]));
     let second_route = persistent_route(model_config(), recall_window(RecallSource::Journal));
     let first_message = message("one");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &first_route.agent,
         &first_route.transport,
-        &first_message.conversation.key(),
-        &first_message.subject,
+        &first_message.conversation,
+        Some(&first_message.subject),
     );
     let driver = Arc::new(RecordingDriver::default());
     let first = tokio::spawn(run_session(

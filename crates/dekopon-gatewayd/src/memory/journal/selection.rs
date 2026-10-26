@@ -444,9 +444,7 @@ impl Journal {
                 }
                 Err(error) => return Err(error),
             };
-            let eligible = line.grant == input.grant
-                && line.at_ms >= horizon
-                && input.sealed_at.is_none_or(|at| line.at_ms > millis(at));
+            let eligible = super::admits(&line, input.grant, horizon, input.sealed_at.map(millis));
             if !visit(line, eligible) || !eligible {
                 return Ok(());
             }

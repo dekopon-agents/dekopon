@@ -98,7 +98,8 @@ struct LineAsset {
     mime: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
-    source: AssetSourceRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<AssetSourceRef>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -516,10 +517,12 @@ impl Journal {
                         mime: asset.mime,
                         size: asset.size,
                         source: match asset.source {
-                            AssetSourceRef::WhatsApp { .. } if asset.at_ms < media_horizon_ms => {
+                            Some(AssetSourceRef::WhatsApp { .. })
+                                if asset.at_ms < media_horizon_ms =>
+                            {
                                 None
                             }
-                            source => Some(source),
+                            source => source,
                         },
                     },
                 })
@@ -587,17 +590,16 @@ impl Journal {
                 .inventory
                 .iter()
                 .filter_map(|asset| {
-                    let source = asset
-                        .source
-                        .as_ref()
-                        .filter(|source| !matches!(source, AssetSourceRef::Generated { .. }))?;
+                    if matches!(&asset.source, Some(AssetSourceRef::Generated { .. })) {
+                        return None;
+                    }
                     Some(LineAsset {
                         id: asset.id,
                         at_ms: millis(asset.arrived),
                         name: asset.name.clone(),
                         mime: asset.mime.clone(),
                         size: asset.size,
-                        source: source.clone(),
+                        source: asset.source.clone(),
                     })
                 })
                 .collect(),
@@ -961,6 +963,12 @@ pub(crate) fn grant_digest(granted: &[String]) -> String {
         .collect()
 }
 
+fn admits(line: &Line, grant: &str, horizon_ms: u64, sealed_at_ms: Option<u64>) -> bool {
+    line.grant == grant
+        && line.at_ms >= horizon_ms
+        && sealed_at_ms.is_none_or(|seal| line.at_ms > seal)
+}
+
 fn encode_line(line: &Line) -> Result<Vec<u8>, JournalError> {
     let mut encoded = serde_json::to_vec(line).map_err(io::Error::from)?;
     encoded.push(b'\n');
@@ -1109,11 +1117,7 @@ fn read_window(
     while let Some(mut line) = lines.next_line()? {
         #[cfg(test)]
         observe_live_decoded(1 + usize::from(last.is_some()));
-        if line.grant != grant
-            || line.at_ms < horizon_ms
-            || line.at_ms < age_horizon_ms
-            || seal_ms.is_some_and(|seal| line.at_ms <= seal)
-        {
+        if !admits(&line, grant, horizon_ms.max(age_horizon_ms), seal_ms) {
             break;
         }
         records += 1;
@@ -1908,6 +1912,72 @@ mod tests {
     }
 
     #[test]
+    fn a_source_less_row_survives_two_append_reopen_cycles() {
+        for source in [None, Some(whatsapp(0))] {
+            let dir = tempfile::tempdir().unwrap();
+            let stem = key().journal_stem();
+            let at = UNIX_EPOCH + Duration::from_millis(millis(SystemTime::now()));
+            let mut inventory = photos(2, whatsapp);
+            inventory[0].source = source;
+            let arrived = if inventory[0].source.is_some() {
+                at - WHATSAPP_MEDIA_LIFETIME - Duration::from_millis(1)
+            } else {
+                at
+            };
+            inventory[0].arrived = arrived;
+            inventory[1].source = Some(AssetSourceRef::Generated {
+                capability: "image.generate".into(),
+                invocation: "generated".into(),
+            });
+            let window = MemoryWindow {
+                forget_after: Duration::from_secs(30 * 24 * 60 * 60),
+                ..window()
+            };
+            let turn = ConversationTurn::completed("attachments", "kept");
+            for _ in 0..2 {
+                let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+                journal
+                    .append(
+                        &stem,
+                        &Entry {
+                            at,
+                            grant: GRANT,
+                            turn: &turn,
+                            inventory: &inventory,
+                            next_asset_id: 3,
+                            prepared: None,
+                        },
+                        window,
+                    )
+                    .unwrap();
+                drop(journal);
+                let journal = Journal::open(dir.path(), RETENTION, RETENTION).unwrap();
+                let recalled = journal.recall(&stem, GRANT, window, at).unwrap();
+                assert_eq!(recalled.next_asset_id, 3);
+                assert_eq!(recalled.assets.len(), 1);
+                let row = &recalled.assets[0];
+                assert_eq!(row.id, 1);
+                assert_eq!(row.asset.name, "photo-0.jpg");
+                assert_eq!(row.asset.mime, "image/jpeg");
+                assert_eq!(row.asset.size, Some(1000));
+                assert_eq!(row.arrived, arrived);
+                assert!(row.asset.source.is_none());
+                let store = AssetStore::new(8, RETENTION);
+                let access = AssetAccess::persistent(key(), 1, Arc::new(AssetFence::new()));
+                store.restore(
+                    &access,
+                    recalled.assets,
+                    recalled.next_asset_id,
+                    Instant::now(),
+                );
+                assert_eq!(access.next_asset_id(), 3);
+                inventory = store.inventory(&access);
+                drop(journal);
+            }
+        }
+    }
+
+    #[test]
     fn a_generated_asset_is_not_journaled_but_keeps_its_number() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
@@ -1921,25 +1991,6 @@ mod tests {
         let recalled = journal.recall(&stem, GRANT, window(), now).expect("recall");
         assert!(recalled.assets.is_empty());
         assert_eq!(recalled.next_asset_id, 2);
-    }
-
-    #[test]
-    fn whatsapp_media_past_its_lifetime_is_recalled_without_a_source() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
-        let stem = key().journal_stem();
-        let now = UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
-        let long = MemoryWindow {
-            forget_after: Duration::from_secs(30 * 24 * 60 * 60),
-            ..window()
-        };
-        let mut inventory = photos(1, whatsapp);
-        inventory[0].arrived = now - WHATSAPP_MEDIA_LIFETIME - Duration::from_millis(1);
-        let turn = ConversationTurn::completed("still about that photo", "yes");
-        append_turn(&journal, &stem, now, GRANT, &turn, &inventory, long);
-        let recalled = journal.recall(&stem, GRANT, long, now).expect("recall");
-        assert_eq!(recalled.assets.len(), 1);
-        assert!(recalled.assets[0].asset.source.is_none());
     }
 
     #[test]

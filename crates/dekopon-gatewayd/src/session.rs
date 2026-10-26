@@ -1477,23 +1477,23 @@ impl Delta {
 }
 
 fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> ConversationKey {
-    let conversation = message.conversation.key();
-    match route.memory {
+    let subject = match route.memory {
         MemoryPolicy::Persistent(MemoryWindow {
             scope: MemoryScope::SharedConversation,
             ..
-        }) => ConversationKey::shared(&route.agent, &route.transport, &conversation),
+        }) => None,
         MemoryPolicy::OneShot
         | MemoryPolicy::Persistent(MemoryWindow {
             scope: MemoryScope::PrivateConversation,
             ..
-        }) => ConversationKey::private(
-            &route.agent,
-            &route.transport,
-            &conversation,
-            &message.subject,
-        ),
-    }
+        }) => Some(&message.subject),
+    };
+    ConversationKey::of(
+        &route.agent,
+        &route.transport,
+        &message.conversation,
+        subject,
+    )
 }
 
 pub(crate) const RESTRICTED_REPLY_ASSETS_NOTE: &str = "[gateway: this chat shows only image/png and \
