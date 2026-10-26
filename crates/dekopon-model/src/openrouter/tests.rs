@@ -1214,3 +1214,97 @@ async fn router_span_tool_options_equal_the_sent_body() {
     assert_eq!(requests.len(), 1);
     crate::trace_capture::assert_tool_options(&span, &request_json(&requests[0]));
 }
+
+#[tokio::test]
+async fn a_reported_model_echoing_the_credential_is_redacted_in_the_key() {
+    let body = TOOL.replace("vendor/model", "synthetic-key");
+    let server = MockServer::start(vec![MockResponse::sse(&body)]);
+    let client = client(&server, Settings::default());
+    let turn = generate(&client, &[]).await.unwrap();
+    let key = turn.model_key().unwrap();
+    assert_eq!(key.reported(), Some("[REDACTED]"));
+    assert!(!format!("{key:?}").contains("synthetic-key"));
+    assert!(
+        !serde_json::to_string(key)
+            .unwrap()
+            .contains("synthetic-key")
+    );
+    assert_eq!(client.model_key(), *key);
+}
+
+#[tokio::test]
+async fn unequal_reported_models_under_one_alias_strip_opaque_reasoning() {
+    let server = MockServer::start(vec![
+        MockResponse::sse(TOOL),
+        MockResponse::sse(&TOOL.replace("vendor/model", "reported-b")),
+        MockResponse::sse(ANSWER),
+    ]);
+    let client_a = client(&server, Settings::default());
+    let turn_a = generate(&client_a, &[]).await.unwrap();
+    let client_b = client(&server, Settings::default());
+    let turn_b = generate(&client_b, &[]).await.unwrap();
+    assert_ne!(turn_a.model_key(), turn_b.model_key());
+    assert!(
+        turn_a
+            .model_key()
+            .unwrap()
+            .is_for(crate::model::Backend::OpenRouter, "vendor/model")
+    );
+    generate(&client_b, &[assistant_message(&turn_a)])
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let assistant = &request_json(&requests[2])["messages"][0];
+    assert!(assistant.get("reasoning_details").is_none());
+    assert_eq!(
+        assistant["tool_calls"][0]["function"]["arguments"],
+        turn_a.tool_calls[0].function.arguments
+    );
+}
+
+#[tokio::test]
+async fn a_reported_model_drift_retries_once_without_opaque_reasoning() {
+    let changed = format!("data: {{\"model\":\"reported-b\"}}\n\n{ANSWER}");
+    let server = MockServer::start(vec![
+        MockResponse::sse(TOOL),
+        MockResponse::sse(&changed),
+        MockResponse::sse(&changed),
+    ]);
+    let client = client(&server, Settings::default());
+    let turn = generate(&client, &[]).await.unwrap();
+    let mut events = Vec::new();
+    let answer = client
+        .generate(
+            GenerateRequest {
+                messages: &[assistant_message(&turn)],
+                tools: &[],
+                options: &CompletionOptions::default(),
+            },
+            &mut |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            },
+            &control(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer.model_key().unwrap().reported(), Some("reported-b"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let first = request_json(&requests[1]);
+    let retry = request_json(&requests[2]);
+    assert!(first["messages"][0].get("reasoning_details").is_some());
+    assert!(retry["messages"][0].get("reasoning_details").is_none());
+    assert_eq!(
+        retry["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        turn.tool_calls[0].function.arguments
+    );
+    let text: String = events
+        .iter()
+        .map(|event| match event {
+            TurnEvent::TextDelta(text) => text.as_str(),
+        })
+        .collect();
+    assert_eq!(text, "done");
+}

@@ -1,3 +1,9 @@
+use crate::{
+    improvement::IMPROVEMENT_TOOL_NAME,
+    prompt::{AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, SCRIPT_TOOL_NAME},
+    skills::SKILL_TOOL_NAME,
+    wake::WAKE_TOOL_NAME,
+};
 use dekopon_core::AssetNumber;
 use dekopon_model::model::{
     AssistantTurn, ModelKey, ModelMessage, ModelToolCall, OpaqueReasoning, ToolCallId,
@@ -79,15 +85,15 @@ pub enum Tool {
 impl Tool {
     fn named(name: &str, cap: usize) -> Self {
         match name {
-            "bash" => Self::Bash,
-            "read_skill" => Self::ReadSkill,
-            "fetch_chat_asset" => Self::FetchChatAsset,
+            SCRIPT_TOOL_NAME => Self::Bash,
+            SKILL_TOOL_NAME => Self::ReadSkill,
+            ASSET_TOOL_NAME => Self::FetchChatAsset,
             "read_memory_record" => Self::ReadMemoryRecord,
             "set_memory_pin" => Self::SetMemoryPin,
             "clear_memory_pin" => Self::ClearMemoryPin,
-            "inspect_agent_config" => Self::InspectAgentConfig,
-            "suggest_improvement" => Self::SuggestImprovement,
-            "wake" => Self::Wake,
+            AGENT_CONFIG_TOOL_NAME => Self::InspectAgentConfig,
+            IMPROVEMENT_TOOL_NAME => Self::SuggestImprovement,
+            WAKE_TOOL_NAME => Self::Wake,
             _ => Self::Rejected(Kept::new(name, cap)),
         }
     }
@@ -167,7 +173,7 @@ impl RecordBuilder {
             call: Call {
                 id: call.id.clone(),
                 tool: Tool::named(&call.function.name, self.cap),
-                arguments: Kept::new(&call.function.arguments, self.cap),
+                arguments: Kept::new(&call.function.arguments, usize::MAX),
             },
             result: ToolResult {
                 outcome,
@@ -229,6 +235,34 @@ mod tests {
         assert_eq!(exchange.result.text.text(), "é");
         assert_eq!(exchange.result.text.original_bytes(), 4);
         assert_eq!(exchange.result.outcome, Outcome::Failed);
+    }
+
+    #[test]
+    fn arguments_larger_than_the_result_cap_are_captured_exactly() {
+        let cap = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
+        let arguments = format!(" {{\"command\":\"{}🦀\"}} ", "x".repeat(cap + 1));
+        let mut builder = RecordBuilder::new("user", ModelKey::new(Backend::Codex, "model"), cap);
+        let call = ModelToolCall {
+            id: "large".into(),
+            kind: "function".into(),
+            function: ModelFunctionCall {
+                name: SCRIPT_TOOL_NAME.into(),
+                arguments: arguments.clone(),
+            },
+        };
+        builder.exchange(&call, &"é".repeat(cap), Outcome::Exit(0));
+        let record = builder.finish();
+        let Item::Exchange(exchange) = &record.original[1] else {
+            panic!("expected exchange");
+        };
+        assert_eq!(exchange.call.arguments.text(), arguments);
+        assert_eq!(
+            exchange.call.arguments.original_bytes(),
+            arguments.len() as u64
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(exchange.call.arguments.text()).is_ok());
+        assert_eq!(exchange.result.text.text().len(), cap);
+        assert_eq!(exchange.result.text.original_bytes(), (cap * 2) as u64);
     }
 
     #[test]

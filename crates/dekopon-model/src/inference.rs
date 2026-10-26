@@ -53,3 +53,81 @@ impl InferenceModel for ModelClient {
         }
     }
 }
+
+pub(crate) trait ReplayModel {
+    fn resolved_key(&self) -> crate::model::ModelKey;
+    fn exchange<'a>(
+        &'a self,
+        request: GenerateRequest<'a>,
+        observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        control: &'a TurnControl,
+        progress: &'a mut crate::http::Progress,
+        identity: &'a crate::model::ModelKey,
+    ) -> impl Future<Output = Result<AssistantTurn, InferenceError>> + Send + 'a;
+}
+
+pub(crate) async fn retry_opaque(
+    model: &impl ReplayModel,
+    request: GenerateRequest<'_>,
+    observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    control: &TurnControl,
+    progress: &mut crate::http::Progress,
+) -> Result<AssistantTurn, InferenceError> {
+    let identity = model.resolved_key();
+    if !request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(&identity) && turn.has_opaque_reasoning())) {
+        return model.exchange(request, observe, control, progress, &identity).await;
+    }
+    let mut events = Vec::new();
+    let result = model
+        .exchange(
+            GenerateRequest { ..request },
+            &mut |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            },
+            control,
+            progress,
+            &identity,
+        )
+        .await;
+    if matches!(
+        result,
+        Err(InferenceError::Protocol(
+            crate::error::ProtocolFailure::ContinuationMismatch
+        ))
+    ) {
+        let portable: Vec<_> = request
+            .messages
+            .iter()
+            .map(|message| match message {
+                ModelMessage::Assistant { turn } => {
+                    crate::model::assistant_message(&turn.without_opaque())
+                }
+                ModelMessage::System { .. }
+                | ModelMessage::User { .. }
+                | ModelMessage::ToolResults { .. } => message.clone(),
+            })
+            .collect();
+        model
+            .exchange(
+                GenerateRequest {
+                    messages: &portable,
+                    ..request
+                },
+                observe,
+                control,
+                progress,
+                &identity,
+            )
+            .await
+    } else {
+        if result.is_ok() {
+            for event in events {
+                if observe(event).is_break() {
+                    return Err(InferenceError::Cancelled);
+                }
+            }
+        }
+        result
+    }
+}

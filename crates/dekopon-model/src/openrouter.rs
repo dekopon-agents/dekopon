@@ -35,7 +35,7 @@ pub struct OpenRouterClient {
     name: String,
     token: Redacted<String>,
     settings: Settings,
-    identity: ModelKey,
+    identity: parking_lot::RwLock<ModelKey>,
 }
 
 impl OpenRouterClient {
@@ -59,7 +59,10 @@ impl OpenRouterClient {
             http: InferenceHttp::new(timeout)?,
             endpoint: ENDPOINT.into(),
             name: model.clone(),
-            identity: ModelKey::new(crate::model::Backend::OpenRouter, &model),
+            identity: parking_lot::RwLock::new(ModelKey::new(
+                crate::model::Backend::OpenRouter,
+                &model,
+            )),
             model,
             token: Redacted::new(token),
             settings,
@@ -67,7 +70,7 @@ impl OpenRouterClient {
     }
 
     pub fn model_key(&self) -> crate::model::ModelKey {
-        crate::model::ModelKey::new(crate::model::Backend::OpenRouter, &self.model)
+        self.identity.read().clone()
     }
 
     #[must_use]
@@ -87,7 +90,16 @@ impl OpenRouterClient {
         self
     }
 
-    async fn prepare<'a>(&self, request: GenerateRequest<'a>) -> Result<Vec<u8>, InferenceError> {
+    #[cfg(test)]
+    async fn prepare(&self, request: GenerateRequest<'_>) -> Result<Vec<u8>, InferenceError> {
+        self.prepare_for(request, &self.model_key()).await
+    }
+
+    async fn prepare_for<'a>(
+        &self,
+        request: GenerateRequest<'a>,
+        identity: &ModelKey,
+    ) -> Result<Vec<u8>, InferenceError> {
         let explicit = self
             .settings
             .cache
@@ -104,11 +116,10 @@ impl OpenRouterClient {
         let mut messages = Vec::with_capacity(request.messages.len());
         for (index, message) in request.messages.iter().enumerate() {
             if let ModelMessage::Assistant { turn } = message {
-                if let Some(native) = turn.openrouter_replay().filter(|_| {
-                    turn.model_key().is_some_and(|key| {
-                        key.is_for(crate::model::Backend::OpenRouter, &self.model)
-                    })
-                }) {
+                if let Some(native) = turn
+                    .openrouter_replay()
+                    .filter(|_| turn.model_key().is_some_and(|key| key == identity))
+                {
                     messages.push(RouterMessage::Native {
                         role: "assistant",
                         content: turn.content.as_deref(),
@@ -235,11 +246,12 @@ impl OpenRouterClient {
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
         progress: &mut Progress,
+        identity: &ModelKey,
     ) -> Result<AssistantTurn, InferenceError> {
         let secrets = DiagnosticSecrets::new(Some(&self.token));
         self.record_settings(secrets);
         let body = control
-            .run(self.prepare(request))
+            .run(self.prepare_for(GenerateRequest { ..request }, identity))
             .await
             .and_then(|result| result)
             .inspect_err(|_| record_phase(FailurePhase::BeforeSend))?;
@@ -285,9 +297,33 @@ impl OpenRouterClient {
         control
             .check()
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
-        state
-            .finish(&self.identity, secrets)
-            .inspect_err(|_| record_phase(FailurePhase::ReadingBody))
+        let admitted = request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(identity) && turn.has_opaque_reasoning()));
+        let turn = state
+            .finish(identity, secrets)
+            .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
+        if admitted && turn.model_key() != Some(identity) {
+            return Err(ProtocolFailure::ContinuationMismatch.into());
+        }
+        if let Some(key) = turn.model_key() {
+            *self.identity.write() = key.clone();
+        }
+        Ok(turn)
+    }
+}
+
+impl crate::inference::ReplayModel for OpenRouterClient {
+    fn resolved_key(&self) -> ModelKey {
+        self.model_key()
+    }
+    async fn exchange<'a>(
+        &'a self,
+        request: GenerateRequest<'a>,
+        observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        control: &'a TurnControl,
+        progress: &'a mut Progress,
+        identity: &'a ModelKey,
+    ) -> Result<AssistantTurn, InferenceError> {
+        OpenRouterClient::exchange(self, request, observe, control, progress, identity).await
     }
 }
 
@@ -307,8 +343,14 @@ impl InferenceModel for OpenRouterClient {
                 async {
                     let mut progress = Progress::new();
                     (
-                        self.exchange(request, observe, control, &mut progress)
-                            .await,
+                        crate::inference::retry_opaque(
+                            self,
+                            request,
+                            observe,
+                            control,
+                            &mut progress,
+                        )
+                        .await,
                         progress,
                     )
                 },
@@ -376,6 +418,9 @@ pub(crate) struct Replay {
 }
 
 impl Replay {
+    pub(crate) fn has_reasoning(&self) -> bool {
+        !self.reasoning.is_empty()
+    }
     pub(crate) fn opaque_reasoning(
         &self,
     ) -> Result<Vec<crate::model::OpaqueReasoning>, serde_json::Error> {
@@ -630,7 +675,15 @@ impl RouterStream {
             self.usage,
             self.reason.as_ref(),
         )
-        .with_openrouter_continuation(identity.clone().with_reported(self.model), self.replay))
+        .with_openrouter_continuation(
+            identity.clone().with_reported(
+                self.model
+                    .as_deref()
+                    .or_else(|| identity.reported())
+                    .map(|model| secrets.sanitize(model)),
+            ),
+            self.replay,
+        ))
     }
 }
 

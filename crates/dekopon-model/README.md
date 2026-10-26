@@ -23,9 +23,11 @@
   instead of a single string.
 
 Continuation identity is a serializable `ModelKey`: backend, configured upstream model and optional
-reported model. Rebuilding a client for the same model keeps that identity. Codex retains reasoning
+reported model. A client learns its resolved key from sanitized responses; opaque replay requires
+equality with that complete key, including the reported model. An unresolved client omits reasoning
+whose reported identity is not established. Codex retains reasoning
 items only and rebuilds assistant text and function calls from their parsed parts; another backend
-receives the portable text and calls without the opaque reasoning. Opaque capture uses compact JSON,
+receives the portable text and calls without the opaque reasoning. A reported-model drift retries once with reasoning omitted. Opaque capture uses compact JSON,
 and its debug representation exposes only a byte count.
 
 A message is text unless it is built with `ModelMessage::user_with_parts`. A text-only message
