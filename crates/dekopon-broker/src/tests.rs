@@ -1257,7 +1257,11 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
     let broker = Broker::new(
         registry,
         "broker".parse().unwrap(),
-        PolicyEngine::new("permit(principal, action, resource);", &world).unwrap(),
+        PolicyEngine::new(
+            r#"@id("exit-status") permit(principal, action, resource);"#,
+            &world,
+        )
+        .unwrap(),
         ConstraintCatalog::new([(
             capability.clone(),
             ConstraintSet {
@@ -1287,8 +1291,15 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
                 .with_writer(std::sync::Mutex::new(json.reopen().unwrap())),
         )
         .set_default();
-    let context =
-        AuthenticatedContext::new(principal.clone(), Actor::Service { principal }).unwrap();
+    let context = AuthenticatedContext::attested(
+        principal,
+        Actor::Agent {
+            agent: "provider-test".parse().unwrap(),
+        },
+        "gateway".parse().unwrap(),
+        "slack.team.user".parse().unwrap(),
+    )
+    .unwrap();
     let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
     let _result = broker
         .invoke(
@@ -1316,7 +1327,7 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
         .unwrap();
     let mut output = String::new();
     std::io::Read::read_to_string(&mut stdout, &mut output).unwrap();
-    assert_eq!(output, "boom\n");
+    assert_eq!(output, "boom\n", "{_result:?} {}", captured.events_text());
     let records = captured.events_where(
         "dekopon_broker::audit",
         &[("audit.event", "broker.execution")],
