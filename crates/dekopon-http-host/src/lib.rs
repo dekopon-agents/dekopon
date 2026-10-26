@@ -97,6 +97,42 @@ pub enum ErrorCode {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyViolation {
+    Denied,
+    HostCallLimit,
+    InvalidHttpRequest,
+    ByteLimit,
+}
+
+impl PolicyViolation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::HostCallLimit => "host-call-limit",
+            Self::InvalidHttpRequest => "invalid-http-request",
+            Self::ByteLimit => "byte-limit",
+        }
+    }
+
+    fn from_code(code: ErrorCode) -> Option<Self> {
+        match code {
+            ErrorCode::Denied => Some(Self::Denied),
+            ErrorCode::HostCallLimit => Some(Self::HostCallLimit),
+            ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
+                Some(Self::InvalidHttpRequest)
+            }
+            ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => Some(Self::ByteLimit),
+            ErrorCode::Dns
+            | ErrorCode::Connect
+            | ErrorCode::Tls
+            | ErrorCode::Timeout
+            | ErrorCode::Protocol
+            | ErrorCode::Internal => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpError {
     pub code: ErrorCode,
@@ -685,7 +721,7 @@ pub struct BufferedHttpClient {
     calls: u32,
     secret_injections: u32,
     attempted: bool,
-    policy_violation: Option<&'static str>,
+    policy_violation: Option<PolicyViolation>,
     asset_over_budget: bool,
     evidence: Vec<HttpCallEvidence>,
     resolved: HashMap<String, Vec<SocketAddr>>,
@@ -815,7 +851,7 @@ impl BufferedHttpClient {
         self.attempted
     }
 
-    pub fn policy_violation(&self) -> Option<&'static str> {
+    pub fn policy_violation(&self) -> Option<PolicyViolation> {
         self.policy_violation
     }
 
@@ -901,7 +937,8 @@ impl BufferedHttpClient {
         });
 
         if let Some(error) = failure {
-            self.policy_violation = violation_label(error.code).or(self.policy_violation);
+            self.policy_violation =
+                PolicyViolation::from_code(error.code).or(self.policy_violation);
         }
     }
 
@@ -1820,23 +1857,8 @@ fn bounded_message(message: &str) -> String {
     output
 }
 
-/// This match must stay exhaustive with no wildcard arm, or a new ErrorCode could silently disagree
-/// across policy_violation, the span, and accounting.
 fn violation_label(code: ErrorCode) -> Option<&'static str> {
-    match code {
-        ErrorCode::Denied => Some("denied"),
-        ErrorCode::HostCallLimit => Some("host-call-limit"),
-        ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
-            Some("invalid-http-request")
-        }
-        ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => Some("byte-limit"),
-        ErrorCode::Dns
-        | ErrorCode::Connect
-        | ErrorCode::Tls
-        | ErrorCode::Timeout
-        | ErrorCode::Protocol
-        | ErrorCode::Internal => None,
-    }
+    PolicyViolation::from_code(code).map(PolicyViolation::label)
 }
 
 fn outcome_label<T>(result: &Result<T, HttpError>) -> &'static str {
@@ -1864,8 +1886,9 @@ mod tests {
     use super::{
         BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
         HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, MIN_CREDENTIAL_BYTES,
-        PlaintextHostError, PlaintextHosts, Request, authority_matches, bounded_addresses,
-        bounded_message, is_forbidden_public_destination, map_reqwest_error, plaintext_permitted,
+        PlaintextHostError, PlaintextHosts, PolicyViolation, Request, authority_matches,
+        bounded_addresses, bounded_message, is_forbidden_public_destination, map_reqwest_error,
+        plaintext_permitted,
     };
 
     fn grant(authority: String, method: &str) -> HttpConstraints {
@@ -2549,7 +2572,7 @@ mod tests {
             .await
             .expect_err("different authority must fail before connection");
         assert_eq!(error.code, ErrorCode::Denied);
-        assert_eq!(client.policy_violation(), Some("denied"));
+        assert_eq!(client.policy_violation(), Some(PolicyViolation::Denied));
 
         let mut client = BufferedHttpClient::authorized(
             grant("127.0.0.1:9".to_owned(), "GET"),
@@ -2570,7 +2593,10 @@ mod tests {
             .await
             .expect_err("guest authorization header must fail before connection");
         assert_eq!(error.code, ErrorCode::InvalidHeader);
-        assert_eq!(client.policy_violation(), Some("invalid-http-request"));
+        assert_eq!(
+            client.policy_violation(),
+            Some(PolicyViolation::InvalidHttpRequest)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3308,7 +3334,7 @@ mod tests {
             .await
             .expect_err("unbound destinations are refused, not sent unauthenticated");
         assert_eq!(error.code, ErrorCode::Denied);
-        assert_eq!(client.policy_violation(), Some("denied"));
+        assert_eq!(client.policy_violation(), Some(PolicyViolation::Denied));
         let evidence = client.into_evidence();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].authority, "127.0.0.1:9");
@@ -3550,7 +3576,7 @@ mod tests {
             .await
             .expect_err("response bound must stop buffering");
         assert_eq!(error.code, ErrorCode::ResponseTooLarge);
-        assert_eq!(client.policy_violation(), Some("byte-limit"));
+        assert_eq!(client.policy_violation(), Some(PolicyViolation::ByteLimit));
         server.join();
 
         let server = LoopbackServer::once(

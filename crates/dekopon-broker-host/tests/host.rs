@@ -306,7 +306,9 @@ async fn wit_send_and_stream_each_cross_one_pre_dns_decision() {
             matches!(
                 failure.error.as_ref(),
                 BrokerHostError::HostCallRejected {
-                    reason: "denied",
+                    reason: dekopon_broker_host::HostCallRejection::Http(
+                        dekopon_http_host::PolicyViolation::Denied
+                    ),
                     ..
                 }
             ),
@@ -370,7 +372,9 @@ async fn denies_http_when_authorization_has_no_http_grant() {
     assert!(matches!(
         error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "denied",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::Denied
+            ),
             ..
         }
     ));
@@ -403,7 +407,9 @@ async fn rejects_a_destination_outside_the_exact_authority_grant() {
     assert!(matches!(
         failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "denied",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::Denied
+            ),
             ..
         }
     ));
@@ -444,7 +450,9 @@ async fn rejects_guest_control_of_authorization_headers() {
     assert!(matches!(
         error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "invalid-http-request",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::InvalidHttpRequest
+            ),
             ..
         }
     ));
@@ -481,7 +489,9 @@ async fn guest_code_cannot_mask_a_policy_rejection() {
     assert!(matches!(
         error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "denied",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::Denied
+            ),
             ..
         }
     ));
@@ -529,7 +539,9 @@ async fn enforces_response_bytes_while_streaming() {
     assert!(matches!(
         error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "byte-limit",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::ByteLimit
+            ),
             ..
         }
     ));
@@ -775,7 +787,9 @@ async fn pinned_https_uses_exact_grant_and_verifies_tls_authority() {
     assert!(matches!(
         denied.error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "denied",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::Denied
+            ),
             ..
         }
     ));
@@ -1566,7 +1580,9 @@ async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
     assert!(matches!(
         failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "denied",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::Denied
+            ),
             ..
         }
     ));
@@ -1604,7 +1620,9 @@ async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit
     assert!(matches!(
         failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "host-call-limit",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::HostCallLimit
+            ),
             ..
         }
     ));
@@ -2141,7 +2159,7 @@ async fn oversize_random_read_is_a_terminal_host_refusal() {
     assert!(matches!(
         error.error.as_ref(),
         BrokerHostError::HostCallRejected {
-            reason: "random-too-large",
+            reason: dekopon_broker_host::HostCallRejection::RandomTooLarge,
             ..
         }
     ));
@@ -2380,7 +2398,7 @@ async fn real_guest_asset_effects_exist_only_on_success_and_caught_denials_stay_
             "catch-denied" => assert!(matches!(
                 *result.unwrap_err().error,
                 BrokerHostError::HostCallRejected {
-                    reason: "asset-call-rejected",
+                    reason: dekopon_broker_host::HostCallRejection::AssetCallRejected,
                     ..
                 }
             )),

@@ -307,8 +307,12 @@ past a pod restart configures `telemetry`. `RUST_LOG` filters the stdout copy on
 than `info` on the `dekopon_broker::audit` target drops the records from it.
 
 `error` is the broker's own classification — `provider-failure`, `provider-timeout`,
-`storage-quota` — and is the field to alert and group on. `error.code` and `error.message` are the
-provider's own answer, present only when the component returned a typed failure and absent for every
+`storage-quota` — and is the field to alert and group on. Host-call refusals name the fixed reason:
+`byte-limit`, `host-call-limit`, `denied`, `invalid-http-request`, `asset-call-rejected`,
+`monotonic-overflow`, `random-too-large`, or `random-entropy`. The same classification reaches the
+model through `InvocationResult.error`; it contains no request or response content.
+
+`error.code` and `error.message` are the provider's own answer, present only when the component returned a typed failure and absent for every
 host, transport, or storage failure no provider reported. They explain the class rather than
 replacing it: `provider-failure` cannot separate an upstream moderation refusal from a malformed
 argument, and without them the reason a run failed exists nowhere in the trace. Both are

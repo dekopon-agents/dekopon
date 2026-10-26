@@ -1,4 +1,4 @@
-use crate::{ClockState, StoreState, bindings::dekopon::random::source};
+use crate::{ClockState, HostCallRejection, StoreState, bindings::dekopon::random::source};
 
 const MAX_RANDOM_BYTES: u32 = 4096;
 
@@ -21,7 +21,7 @@ fn read(
         ClockState::Granted { failure, .. } => failure,
     };
     if length > MAX_RANDOM_BYTES {
-        failure.get_or_insert("random-too-large");
+        failure.get_or_insert(HostCallRejection::RandomTooLarge);
         tracing::info!(
             event = "provider_random_read",
             length,
@@ -35,7 +35,7 @@ fn read(
         return Ok(bytes);
     }
     if let Err(source) = fill(&mut bytes) {
-        failure.get_or_insert("random-entropy");
+        failure.get_or_insert(HostCallRejection::RandomEntropy);
         tracing::error!(
             event = "provider_random_read",
             length,
@@ -56,7 +56,7 @@ impl source::Host for StoreState {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RANDOM_BYTES, read};
+    use super::{HostCallRejection, MAX_RANDOM_BYTES, read};
     use crate::{
         BrokerHostLimits, BrokerHostOptions, ClockState, Runtime,
         clock::tests::{SERVICES, component_in},
@@ -97,7 +97,7 @@ mod tests {
             ))
             .is_err()
         );
-        assert_eq!(granted.failure(), Some("random-too-large"));
+        assert_eq!(granted.failure(), Some(HostCallRejection::RandomTooLarge));
     }
 
     #[test]
@@ -121,7 +121,7 @@ mod tests {
             })
             .is_err()
         );
-        assert_eq!(granted.failure(), Some("random-entropy"));
+        assert_eq!(granted.failure(), Some(HostCallRejection::RandomEntropy));
     }
 
     #[test]
