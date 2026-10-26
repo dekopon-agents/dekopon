@@ -12531,7 +12531,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
         .await
         .expect("blocking fetch completes")
         .expect_err("retired bytes never reach the model");
-    assert!(refusal.contains("(revoked)"), "{refusal}");
+    assert!(refusal.contains("revoked:"), "{refusal}");
 }
 
 #[test]

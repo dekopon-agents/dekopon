@@ -114,7 +114,7 @@ pub struct AssetInventory {
 pub trait AssetSource {
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String>;
 
-    fn prepare_request(&self, _messages: &mut [ModelMessage]) -> AssetRequest {
+    fn prepare_request(&self, _messages: &mut [ModelMessage], _text_bytes: usize) -> AssetRequest {
         AssetRequest::default()
     }
 
@@ -783,7 +783,7 @@ where
     let mut capability_invocations = 0_u32;
     let mut tool_calls = 0_u32;
     let mut transcribed = Vec::new();
-    let mut asset_bytes = 0_usize;
+    let mut asset_bytes = AssetBytes::default();
     let mut agent_config_shown = false;
     let mut first_rejected_turn = None;
     let mut skill_reads = SkillReads::default();
@@ -823,7 +823,7 @@ where
         let mut stream = TurnStream::new(model_turns, model_started, progress, cancellation);
         let mut request_messages = messages.clone();
         let asset_request = request_assets.map_or_else(AssetRequest::default, |source| {
-            source.prepare_request(&mut request_messages)
+            source.prepare_request(&mut request_messages, asset_bytes.text)
         });
         let inventory = asset_request.inventory;
         let completion = {
@@ -1632,12 +1632,18 @@ fn asset_tool() -> ModelTool {
 
 /// A tool result cannot carry an attachment on either wire format, so the asset always arrives as a
 /// following message; this shape must not be simplified.
+#[derive(Default)]
+struct AssetBytes {
+    total: usize,
+    text: usize,
+}
+
 fn fetch_asset_into(
     messages: &mut Vec<ModelMessage>,
     source: &dyn AssetSource,
     call: &ModelToolCall,
     model_turn: u32,
-    asset_bytes: &mut usize,
+    asset_bytes: &mut AssetBytes,
 ) -> Result<(), PromptError> {
     let id = match asset_argument(&call.function.name, &call.function.arguments) {
         Ok(id) => id,
@@ -1693,7 +1699,7 @@ fn fetch_asset_into(
         .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
     let text = text.map(clamp_textual_asset);
     let bytes = text.as_ref().map_or(asset.data.len(), String::len);
-    if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(*asset_bytes) {
+    if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(asset_bytes.total) {
         let reason = format!(
             "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Say that chat-asset:{id} went unseen."
         );
@@ -1705,7 +1711,10 @@ fn fetch_asset_into(
         messages.push(ModelMessage::tool(call.id.clone(), reason));
         return Ok(());
     }
-    *asset_bytes += bytes;
+    asset_bytes.total += bytes;
+    if text.is_some() {
+        asset_bytes.text += bytes;
+    }
     // Only size and media type are logged, never the bytes or the sender's file name, since the
     // file name is untrusted.
     tracing::info!(

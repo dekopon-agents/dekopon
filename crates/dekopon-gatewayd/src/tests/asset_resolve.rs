@@ -123,7 +123,8 @@ fn downloading(store: &AssetStore) -> usize {
             Attachment::Registered
             | Attachment::Resident(_)
             | Attachment::Evicted
-            | Attachment::NotStored(_) => false,
+            | Attachment::NotStored(_)
+            | Attachment::PlatformGone => false,
         })
         .count()
 }
@@ -1220,7 +1221,7 @@ async fn a_larger_refill_cannot_sneak_duplicate_history_images_past_the_request_
             });
         }
         let mut messages = vec![ModelMessage::user_with_parts(parts)];
-        let request = session.prepare_request(&mut messages);
+        let request = session.prepare_request(&mut messages, 0);
         let parts = messages[0].parts().unwrap();
         for part in &parts[5..] {
             match part {

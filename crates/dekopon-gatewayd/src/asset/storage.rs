@@ -669,7 +669,8 @@ impl Retention {
                 Attachment::Resident(_)
                 | Attachment::Registered
                 | Attachment::Evicted
-                | Attachment::NotStored(_) => (),
+                | Attachment::NotStored(_)
+                | Attachment::PlatformGone => (),
             }
             let stored = StoredKey::of(key, &row.asset);
             if self.dir.is_none()

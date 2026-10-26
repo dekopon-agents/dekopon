@@ -277,6 +277,7 @@ enum Attachment {
     Resident(String),
     NotStored(StoreFailure),
     Evicted,
+    PlatformGone,
 }
 
 struct Downloading {
@@ -427,11 +428,13 @@ impl AssetStore {
                         Attachment::Registered
                         | Attachment::Downloading(_)
                         | Attachment::Evicted
-                        | Attachment::NotStored(_) => (),
+                        | Attachment::NotStored(_)
+                        | Attachment::PlatformGone => (),
                     },
                     Attachment::Registered
                     | Attachment::Downloading(_)
-                    | Attachment::NotStored(_) => (),
+                    | Attachment::NotStored(_)
+                    | Attachment::PlatformGone => (),
                 }
             }
         }
@@ -1007,10 +1010,29 @@ impl AssetSource for SessionAssets {
     fn prepare_request(
         &self,
         messages: &mut [dekopon_model::model::ModelMessage],
+        text_bytes: usize,
     ) -> dekopon_agent::prompt::AssetRequest {
         use dekopon_model::model::ContentPart;
         let mut request = dekopon_agent::prompt::AssetRequest::default();
-        let mut remaining = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES;
+        let mut remaining =
+            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(text_bytes);
+        let mut residents = HashMap::new();
+        for data in messages
+            .iter()
+            .filter_map(dekopon_model::model::ModelMessage::parts)
+            .flatten()
+            .filter_map(|part| match part {
+                ContentPart::Image { data, .. } | ContentPart::File { data, .. } => Some(data),
+                ContentPart::Text(_) => None,
+            })
+        {
+            if let std::collections::hash_map::Entry::Vacant(entry) = residents.entry(data.id())
+                && let Ok(Some(pin)) = self.store.pin(&self.access, data.id(), Recency::Keep)
+            {
+                entry.insert(pin);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + ASSET_FETCH_TIMEOUT;
         let mut seen = HashMap::new();
         for message in messages {
             let parts = match message {
@@ -1052,9 +1074,17 @@ impl AssetSource for SessionAssets {
                 }
                 seen.insert(id, None);
                 let resolved = self.asset(id).and_then(|asset| {
-                    let pin = self
-                        .runtime
-                        .block_on(self.resolve(&asset, Recency::Touch))?;
+                    let pin = match residents.remove(&id) {
+                        Some(pin) => {
+                            self.inventory.lock().used.insert(id);
+                            pin
+                        }
+                        None => self.runtime.block_on(async {
+                            tokio::time::timeout_at(deadline, self.resolve(&asset, Recency::Touch))
+                                .await
+                                .map_err(|_elapsed| AssetFailure::TimedOut)?
+                        })?,
+                    };
                     let decoded = GeneratedImage::new(pin.clone(), asset.mime, asset.encoding)
                         .decoded_len()
                         .map_err(AssetFailure::Storage)?;
@@ -1291,6 +1321,17 @@ impl Attempt {
     }
 
     fn finish(mut self, completion: Completion) {
+        if let Err(AssetFailure::Refused(ChatAssetRefusal::PlatformGone)) = completion
+            && let Some(store) = self.ticket.store.upgrade()
+        {
+            self.ticket.access.with_active(|key| {
+                if let Some(row) = row_mut(&mut store.entries.lock(), key, self.ticket.id)
+                    && row.state.is_attempt(self.ticket.attempt)
+                {
+                    row.state = Attachment::PlatformGone;
+                }
+            });
+        }
         self.outcome = match completion {
             Ok(()) => RefetchOutcome::Refetched,
             Err(failure) => match failure.for_capability() {
@@ -1373,9 +1414,10 @@ impl AssetStore {
                 let retry = match &row.state {
                     Attachment::Evicted => Retry::Refetch,
                     Attachment::Downloading(downloading) => downloading.retry,
-                    Attachment::Registered | Attachment::Resident(_) | Attachment::NotStored(_) => {
-                        Retry::Initial
-                    }
+                    Attachment::Registered
+                    | Attachment::Resident(_)
+                    | Attachment::NotStored(_)
+                    | Attachment::PlatformGone => Retry::Initial,
                 };
                 let ticket = |attempt| Ticket {
                     store: Arc::downgrade(self),
@@ -1392,6 +1434,9 @@ impl AssetStore {
                             .pin(resident, Recency::Keep)
                             .map(Download::Ready)
                             .map_err(AssetFailure::Storage);
+                    }
+                    Attachment::PlatformGone => {
+                        return Err(AssetFailure::Refused(ChatAssetRefusal::PlatformGone));
                     }
                     Attachment::NotStored(_) => {
                         return Err(AssetFailure::Refused(ChatAssetRefusal::StoreFailed));
@@ -1443,10 +1488,7 @@ impl AssetStore {
                     outcome,
                 }))
             })
-            .unwrap_or_else(|| {
-                self.retention.lock().refetch(RefetchOutcome::Revoked);
-                Err(AssetFailure::Refused(ChatAssetRefusal::Revoked))
-            })
+            .unwrap_or_else(|| Err(AssetFailure::Refused(ChatAssetRefusal::Revoked)))
     }
 
     fn release_interest(&self, ticket: &Ticket) {
@@ -1467,7 +1509,8 @@ impl AssetStore {
                 Attachment::Registered
                 | Attachment::Resident(_)
                 | Attachment::Evicted
-                | Attachment::NotStored(_) => (),
+                | Attachment::NotStored(_)
+                | Attachment::PlatformGone => (),
             }
         });
     }
@@ -1514,7 +1557,11 @@ impl Attachment {
     const fn is_attempt(&self, attempt: u64) -> bool {
         match self {
             Self::Downloading(downloading) => downloading.attempt == attempt,
-            Self::Registered | Self::Resident(_) | Self::Evicted | Self::NotStored(_) => false,
+            Self::Registered
+            | Self::Resident(_)
+            | Self::Evicted
+            | Self::NotStored(_)
+            | Self::PlatformGone => false,
         }
     }
 }
@@ -1534,10 +1581,7 @@ enum AssetFailure {
 impl AssetFailure {
     fn for_model(self, id: u64) -> String {
         match self {
-            Self::Refused(reason) => format!(
-                "chat-asset:{id} is unavailable ({}): {reason}.",
-                reason.reason()
-            ),
+            Self::Refused(reason) => format!("chat-asset:{id} is unavailable: {reason}."),
             Self::Storage(BlobError::Unauthorized) => {
                 Self::Refused(ChatAssetRefusal::Revoked).for_model(id)
             }
@@ -1609,6 +1653,9 @@ impl AssetStore {
                     let mut entries = self.entries.lock();
                     let row = row_mut(&mut entries, key, id);
                     match row.map(|row| &row.state) {
+                        Some(Attachment::PlatformGone) => {
+                            Err(AssetFailure::Refused(ChatAssetRefusal::PlatformGone))
+                        }
                         Some(Attachment::NotStored(_)) => {
                             Err(AssetFailure::Refused(ChatAssetRefusal::StoreFailed))
                         }
@@ -1627,14 +1674,8 @@ impl AssetStore {
                         None => Err(AssetFailure::Refused(ChatAssetRefusal::Evicted)),
                     }
                 })
-                .unwrap_or_else(|| {
-                    self.retention.lock().refetch(RefetchOutcome::Revoked);
-                    Err(AssetFailure::Refused(ChatAssetRefusal::Revoked))
-                }),
-            Err(BlobError::Unauthorized) => {
-                self.retention.lock().refetch(RefetchOutcome::Revoked);
-                Err(AssetFailure::Refused(ChatAssetRefusal::Revoked))
-            }
+                .unwrap_or_else(|| Err(AssetFailure::Refused(ChatAssetRefusal::Revoked))),
+            Err(BlobError::Unauthorized) => Err(AssetFailure::Refused(ChatAssetRefusal::Revoked)),
             Err(BlobError::Unknown) => Err(AssetFailure::Unknown),
             Err(error) => Err(AssetFailure::Storage(error)),
         }
@@ -1688,7 +1729,7 @@ impl AssetStore {
                         );
                         Err(error)
                     }
-                    Attachment::Evicted => {
+                    Attachment::Evicted | Attachment::PlatformGone => {
                         retention.miss(
                             id,
                             row.asset.size.unwrap_or_default() as usize,
@@ -1735,7 +1776,8 @@ impl AssetStore {
             | Attachment::Registered
             | Attachment::Downloading(_)
             | Attachment::Evicted
-            | Attachment::NotStored(_) => (),
+            | Attachment::NotStored(_)
+            | Attachment::PlatformGone => (),
         }
         row.asset.size = Some(bytes.len() as u64);
         let result = if bytes.len() > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
