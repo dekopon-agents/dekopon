@@ -125,7 +125,7 @@ fn turducken_parts_receive_prior_parts_and_keep_a_successful_prefix_after_failur
         true,
     );
     assert_eq!(model.requests(), 2);
-    assert!(model.prompt(1)[2].1.contains("Earlier parts:\nfirst"));
+    assert!(model.prompt(1)[1].1.contains("Earlier parts:\nfirst"));
     assert_eq!(prepared.representations.len(), 2);
     assert!(prepared.representations[0].text.is_none());
     assert_eq!(prepared.representations[1].part.as_deref(), Some("core"));

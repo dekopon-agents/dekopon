@@ -18705,9 +18705,9 @@ async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message(
             "{latest}"
         );
     }
-    assert_eq!(prompt[1], ("user".to_owned(), prompt[1].1.clone()));
-    assert!(prompt[1].1.starts_with("[memory: {\"recordId\":1,"));
-    assert!(prompt[1].1.contains("four photos"));
+    assert_eq!(prompt[2], ("user".to_owned(), prompt[2].1.clone()));
+    assert!(prompt[2].1.starts_with("[memory: {\"recordId\":1,"));
+    assert!(prompt[2].1.contains("four photos"));
 }
 
 type Asked = (Option<String>, Option<String>, usize);
@@ -18887,7 +18887,7 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     assert_eq!(driver.asked.lock().as_slice(), [(None, Some(trigger), 24)]);
     let prompt = models.prompt(0);
     assert_eq!(
-        prompt[1..3],
+        prompt[2..4],
         [
             (
                 "user".to_owned(),
@@ -18897,13 +18897,13 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
         ]
     );
     assert_eq!(
-        prompt[3].1,
+        prompt[4].1,
         "[gateway: chat history, from U2]\nlook at this\n[gateway: attached chat-asset:1 — graph.png]"
     );
     assert!(
-        prompt[4].1.contains("graph.png (image/png"),
+        prompt[5].1.contains("graph.png (image/png"),
         "{}",
-        prompt[4].1
+        prompt[5].1
     );
 }
 
