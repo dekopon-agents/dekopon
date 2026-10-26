@@ -18,7 +18,8 @@ use dekopon_agent::{
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
-        PromptError, ReplyDisposition, Seal, SessionInputs, Steer, SteerSource, run_prompt_session,
+        PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer, SteerSource,
+        run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -2652,6 +2653,7 @@ async fn session_turn(
             };
             let mut history = seeded;
             let mut first_shown = None;
+            let mut replay_source = ReplaySource::Conversation;
             if let (Some(journal), Some(window)) = (memory_journal.as_ref(), selection_window) {
                 let policy = &selection_policy;
                 match journal.project(
@@ -2670,6 +2672,7 @@ async fn session_turn(
                     Ok(projected) => {
                         history = projected.history;
                         first_shown = projected.first_shown;
+                        replay_source = projected.source;
                         memory_facts.extend(projected.facts);
                     }
                     Err(error) => {
@@ -2680,7 +2683,7 @@ async fn session_turn(
                             | MemoryFact::Replaced { .. }
                             | MemoryFact::GrantBoundary
                             | MemoryFact::ThreadWithoutMemory
-                            | MemoryFact::Fidelity => false,
+                            | MemoryFact::Fidelity { .. } => false,
                         }) {
                             memory_facts.push(MemoryFact::RecallFailed {
                                 reason: error.label(),
@@ -2700,7 +2703,9 @@ async fn session_turn(
                     memory_facts.push(MemoryFact::ThreadWithoutMemory);
                 }
             } else {
-                memory_facts.push(MemoryFact::Fidelity);
+                memory_facts.push(MemoryFact::Fidelity {
+                    source: replay_source,
+                });
             }
             let memory_notice = MemoryNotice::new(&memory_facts, first_shown);
             if let Some(notice) = memory_notice.as_ref() {

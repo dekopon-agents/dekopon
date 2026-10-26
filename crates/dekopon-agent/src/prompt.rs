@@ -34,7 +34,7 @@ use crate::{
 mod history;
 mod notice;
 use crate::memory::{Outcome as RecordedOutcome, RecordBuilder};
-pub use notice::{MemoryFact, MemoryNotice, OmissionReason};
+pub use notice::{MemoryFact, MemoryNotice, OmissionReason, ReplaySource};
 
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,

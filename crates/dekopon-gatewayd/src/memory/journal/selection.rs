@@ -3,9 +3,7 @@ use crate::config::{
     MemoryWindow,
     memory::{ResolvedPolicy, RoutineKind, Selection, SelectionMode},
 };
-use dekopon_agent::prompt::{
-    ConversationTurn, History, MemoryFact, OmissionReason, Representation,
-};
+use dekopon_agent::prompt::{ConversationTurn, History, MemoryFact, OmissionReason, ReplaySource};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
 use dekopon_process::{ExitCode, TreeContext};
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandProposal, Streams};
@@ -180,6 +178,24 @@ fn text(line: &Line, id: &str, policy: &ResolvedPolicy) -> Option<String> {
     body(line, id, &crate::memory::generation::version(routine))
 }
 
+fn omitted_bytes(line: &Line, id: &str, policy: &ResolvedPolicy) -> u64 {
+    let Some(routine) = policy.routines.iter().find(|routine| routine.id == id) else {
+        return 0;
+    };
+    let version = crate::memory::generation::version(routine);
+    let (source, shown) = line
+        .representations
+        .iter()
+        .filter(|rep| rep.routine_id == id && rep.version == version && rep.text.is_some())
+        .fold((0_u64, 0_u64), |(source, shown), rep| {
+            (
+                source.max(rep.captured_bytes),
+                shown.saturating_add(rep.text.as_ref().map_or(0, |text| text.len() as u64)),
+            )
+        });
+    source.saturating_sub(shown)
+}
+
 fn eligible_ids(line: &Line, policy: &ResolvedPolicy) -> Vec<String> {
     policy
         .retain
@@ -257,11 +273,20 @@ pub(crate) struct Projected {
     pub history: History,
     pub facts: Vec<MemoryFact>,
     pub first_shown: Option<u64>,
+    pub source: ReplaySource,
 }
 
 impl Fitted {
     fn finish(self, window: MemoryWindow, older: bool, boundary: bool) -> Projected {
         let first_shown = self.records.iter().find_map(|id| *id);
+        let source = match (
+            first_shown.is_some(),
+            self.records.iter().any(Option::is_none),
+        ) {
+            (true, false) => ReplaySource::Journal,
+            (true, true) => ReplaySource::Mixed,
+            (false, false) | (false, true) => ReplaySource::Conversation,
+        };
         let mut facts = Vec::new();
         if let Some(first_shown) = first_shown
             && (older || self.chosen.keys().any(|id| *id < first_shown))
@@ -288,6 +313,7 @@ impl Fitted {
             history: self.history,
             facts,
             first_shown,
+            source,
         }
     }
 }
@@ -339,6 +365,7 @@ fn envelope(
     text: &str,
     original_id: Option<&str>,
     eligible: &[String],
+    policy: &ResolvedPolicy,
 ) -> ConversationTurn {
     let label = format!(
         "[memory: {}]\n",
@@ -346,11 +373,7 @@ fn envelope(
             "recordId": line.record_id,
             "representationId": id,
             "eligibleRepresentationIds": eligible,
-            "omittedBytes": line
-                .representations
-                .iter()
-                .find(|rep| rep.routine_id == id && rep.text.is_some())
-                .map_or(0, Representation::omitted_bytes),
+            "omittedBytes": omitted_bytes(line, id, policy),
         })
     );
     if Some(id) == original_id
@@ -390,7 +413,7 @@ fn choose(
         pin.as_deref().unwrap_or(choice)
     };
     let eligible = eligible_ids(&line, policy);
-    let wrap = |id: &str, text: String| envelope(&line, id, &text, original_id, &eligible);
+    let wrap = |id: &str, text: String| envelope(&line, id, &text, original_id, &eligible, policy);
     let original = original_id.and_then(|id| text(&line, id, policy).map(|text| wrap(id, text)));
     let mut target = requested;
     let mut replacement = text(&line, requested, policy).map(|text| wrap(requested, text));
@@ -446,12 +469,8 @@ fn choose(
         }
         None => reason,
     };
-    let replaced = (included && Some(actual) != original_id).then(|| {
-        line.representations
-            .iter()
-            .find(|rep| rep.routine_id == actual && rep.text.is_some())
-            .map_or(0, Representation::omitted_bytes)
-    });
+    let replaced =
+        (included && Some(actual) != original_id).then(|| omitted_bytes(&line, actual, policy));
     (
         Chosen {
             requested: requested.to_owned(),

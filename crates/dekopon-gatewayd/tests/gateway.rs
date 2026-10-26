@@ -33,7 +33,7 @@ const MAPPED_PRINCIPAL: &str = "cpetersen";
 const OTHER_MAPPED_PRINCIPAL: &str = "jortega";
 const GATEWAY_PRINCIPAL: &str = "dekopon-gatewayd";
 const AGENT: &str = "chat-agent";
-const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
 
 fn provider(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -1,3 +1,10 @@
+#[derive(Clone, Copy, Debug)]
+pub enum ReplaySource {
+    Journal,
+    Conversation,
+    Mixed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OmissionReason {
     WindowFit,
@@ -34,7 +41,9 @@ pub enum MemoryFact {
     RecallFailed {
         reason: &'static str,
     },
-    Fidelity,
+    Fidelity {
+        source: ReplaySource,
+    },
 }
 
 impl MemoryFact {
@@ -46,7 +55,7 @@ impl MemoryFact {
             Self::GrantBoundary => "grant-boundary",
             Self::ThreadWithoutMemory => "thread-without-memory",
             Self::RecallFailed { .. } => "recall-failed",
-            Self::Fidelity => "fidelity",
+            Self::Fidelity { .. } => "fidelity",
         }
     }
 }
@@ -91,7 +100,11 @@ impl MemoryNotice {
                 MemoryFact::GrantBoundary => "Earlier turns were recorded under a different capability grant and are not shown.\n".into(),
                 MemoryFact::ThreadWithoutMemory => "This message replies in a thread with earlier messages; none are in your memory.\n".into(),
                 MemoryFact::RecallFailed { reason } => format!("Memory recall or projection failed this turn ({reason}).\n"),
-                MemoryFact::Fidelity => "Replayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n".into(),
+                MemoryFact::Fidelity { source } => match source {
+                    ReplaySource::Journal => "Replayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n",
+                    ReplaySource::Conversation => "Replayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n",
+                    ReplaySource::Mixed => "Replayed turns keep the request and your final reply; journal records retain captured bash exchanges, but resident turns do not. Reasoning and other tool calls are not kept.\n",
+                }.into(),
             };
             notice.text.push_str(&line);
         }
@@ -179,7 +192,9 @@ mod tests {
             MemoryFact::GrantBoundary,
             MemoryFact::ThreadWithoutMemory,
             MemoryFact::RecallFailed { reason: "corrupt" },
-            MemoryFact::Fidelity,
+            MemoryFact::Fidelity {
+                source: ReplaySource::Mixed,
+            },
         ];
         for record in 1..1000 {
             for reason in [

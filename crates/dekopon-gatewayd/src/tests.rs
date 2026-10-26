@@ -7345,7 +7345,8 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
-const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
+const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
 
 fn expected_instructions() -> String {
     "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
@@ -18642,7 +18643,7 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
-            ("system", FIDELITY_NOTICE),
+            ("system", JOURNAL_FIDELITY_NOTICE),
             (
                 "user",
                 "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\n[gateway: unmapped participant]\nwhat broke?"

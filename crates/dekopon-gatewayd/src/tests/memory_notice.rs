@@ -255,3 +255,171 @@ async fn records_dropped_to_fit_the_byte_window_are_named_in_the_request() {
     fixture.run().await;
     assert!(fixture.notice(0).contains("Omitted window-fit: 1"));
 }
+
+#[tokio::test]
+async fn additive_summary_parts_count_their_source_once_in_the_notice() {
+    use crate::config::memory::{Part, ResolvedPolicy, Routine, RoutineKind};
+    use crate::memory::generation::{self, Prepared};
+    use dekopon_agent::prompt::Representation;
+    use std::num::NonZeroU64;
+
+    let mut fixture = Fixture::new(&["cli-probe.upper"]).await;
+    let mut policy = ResolvedPolicy::default();
+    let routine = Routine {
+        id: "summary".into(),
+        kind: RoutineKind::ProgressiveOneShot,
+        max_bytes: None,
+        model: None,
+        parts: Some(vec![
+            Part {
+                id: "core".into(),
+                max_bytes: NonZeroU64::new(100).unwrap(),
+            },
+            Part {
+                id: "detail".into(),
+                max_bytes: NonZeroU64::new(300).unwrap(),
+            },
+        ]),
+    };
+    let version = generation::version(&routine);
+    let parts: Vec<_> = [
+        ("stale", "old-version", 900),
+        ("core", version.as_str(), 100),
+        ("detail", version.as_str(), 200),
+    ]
+    .into_iter()
+    .map(|(part, version, bytes)| Representation {
+        routine_id: "summary".into(),
+        version: version.into(),
+        source_record_id: 0,
+        part: Some(part.into()),
+        kind: "progressiveOneShot".into(),
+        captured_bytes: 1000,
+        text: Some("s".repeat(bytes)),
+    })
+    .collect();
+    policy.routines.push(routine);
+    policy.retain.push("summary".into());
+    policy.selection.routine = Some("summary".into());
+    fixture.route.memory_policy = Some(policy);
+    fixture
+        .runner
+        .journal
+        .as_ref()
+        .unwrap()
+        .append(
+            &fixture.stem,
+            &Entry {
+                at: SystemTime::now(),
+                grant: &crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+                turn: &ConversationTurn::completed("source", "reply"),
+                inventory: &[],
+                next_asset_id: 1,
+                prepared: Some(&Prepared {
+                    include_chat: true,
+                    original: false,
+                    representations: parts,
+                    exchanges: vec![],
+                    availability: vec!["summary".into()],
+                    failed_routines: vec![],
+                }),
+            },
+            fixture.route.memory.window().unwrap(),
+        )
+        .unwrap();
+    fixture.run().await;
+    assert!(fixture.notice(0).contains("1 (700 bytes omitted)"));
+    let replay = &fixture.models.prompt(0)[2].1;
+    assert!(replay.ends_with(&"s".repeat(300)));
+    assert!(replay.contains("\"omittedBytes\":700"));
+}
+
+#[tokio::test]
+async fn a_bash_turn_followed_by_resident_replay_reports_that_bash_is_not_kept() {
+    let mut fixture = Fixture::new(&["cli-probe.upper"]).await;
+    *fixture.models.turns.lock() = VecDeque::from([
+        Ok(script_call("printf resident-bash-sentinel")),
+        Ok(answer("after bash")),
+        Ok(answer("next reply")),
+    ]);
+    fixture.route.memory = MemoryPolicy::Persistent(recall_window(RecallSource::None));
+    fixture.route.memory_policy = Some(crate::config::memory::ResolvedPolicy::default());
+    fixture.run().await;
+    assert!(
+        fixture
+            .models
+            .prompt(1)
+            .iter()
+            .any(|(role, text)| role == "tool" && text.contains("resident-bash-sentinel"))
+    );
+    fixture.run().await;
+    assert_eq!(fixture.notice(2), FIDELITY_NOTICE);
+    assert!(
+        !fixture
+            .models
+            .prompt(2)
+            .iter()
+            .any(|(_, text)| text.contains("resident-bash-sentinel"))
+    );
+}
+
+#[tokio::test]
+async fn platform_recall_reports_conversation_only_fidelity() {
+    let mut fixture = Fixture::new(&["cli-probe.upper"]).await;
+    fixture.route.memory = MemoryPolicy::Persistent(recall_window(RecallSource::Platform));
+    let driver = HistoryDriver::new(Ok(vec![
+        past("0000000001", "U1", SUBJECT, "older question"),
+        bot_past("0000000002", "older reply"),
+    ]));
+    run_session(
+        Arc::clone(&fixture.runner),
+        fixture.route.clone(),
+        fixture.inbound.clone(),
+        driver as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(fixture.notice(0), FIDELITY_NOTICE);
+}
+
+#[tokio::test]
+async fn mixed_replay_qualifies_bash_retention_for_resident_turns() {
+    let fixture = Fixture::new(&["cli-probe.upper"]).await;
+    fixture.append(&["cli-probe.upper"], "journal question");
+    let key = ConversationKey::of(
+        &fixture.route.agent,
+        &fixture.route.transport,
+        &fixture.inbound.conversation,
+        Some(&fixture.inbound.subject),
+    );
+    let window = fixture.route.memory.window().unwrap();
+    let seed = fixture.runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window,
+        None,
+        Instant::now(),
+    );
+    assert!(
+        seed.lease.commit(
+            window,
+            ConversationTurn::completed("pending question", "pending reply")
+                .with_memory_id(crate::journal::mint_turn_id()),
+            TakenIn::default(),
+            &seed.cache_key,
+            Instant::now()
+        )
+    );
+    fixture.run().await;
+    let notice = fixture.notice(0);
+    assert!(
+        notice
+            .contains("journal records retain captured bash exchanges, but resident turns do not")
+    );
+    assert!(
+        fixture
+            .models
+            .prompt(0)
+            .iter()
+            .any(|(_, text)| text.contains("pending question"))
+    );
+}
