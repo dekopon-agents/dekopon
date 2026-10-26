@@ -294,10 +294,14 @@ impl Drop for ReplyAttachments {
 pub enum ChatAssetRefusal {
     #[error("{0}")]
     Storage(BlobError),
-    #[error("the asset was released; ask the user to resend it or select another asset")]
-    Reclaimed,
-    #[error("the asset is unavailable in this conversation generation")]
-    Unauthorized,
+    #[error("evicted: the asset was released; ask the user to resend it or select another asset")]
+    Evicted,
+    #[error("platform-gone: the platform no longer allows this attachment to be downloaded")]
+    PlatformGone,
+    #[error("store-failed: the attachment could not be retained; ask for another attachment")]
+    StoreFailed,
+    #[error("revoked: the asset is unavailable in this conversation generation")]
+    Revoked,
     #[error("the conversation has no attachment with that number")]
     UnknownAsset,
     #[error("the attachment is not readable by this consumer")]
@@ -315,8 +319,10 @@ impl ChatAssetRefusal {
     pub const fn reason(&self) -> &'static str {
         match self {
             Self::Storage(_) => "storage",
-            Self::Reclaimed => "reclaimed",
-            Self::Unauthorized => "unauthorized",
+            Self::Evicted => "evicted",
+            Self::PlatformGone => "platform-gone",
+            Self::StoreFailed => "store-failed",
+            Self::Revoked => "revoked",
             Self::UnknownAsset => "unknown-asset",
             Self::UnsupportedMedia => "unsupported-media",
             Self::PerInvocationLimit => "per-invocation-limit",

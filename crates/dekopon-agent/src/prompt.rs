@@ -97,8 +97,26 @@ impl fmt::Debug for FetchedAsset {
     }
 }
 
+#[derive(Default)]
+pub struct AssetRequest {
+    pub pins: Vec<dekopon_model::asset::DiskBlob>,
+    pub inventory: AssetInventory,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct AssetInventory {
+    pub count: usize,
+    pub bytes: usize,
+    pub referenced: usize,
+    pub omitted: usize,
+}
+
 pub trait AssetSource {
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String>;
+
+    fn prepare_request(&self, _messages: &mut [ModelMessage]) -> AssetRequest {
+        AssetRequest::default()
+    }
 
     /// Asked once per session; the answer fixes whether the session offers the fetch tool.
     fn offers_fetch(&self) -> bool;
@@ -745,8 +763,7 @@ where
     if memory_tools.is_some() {
         model_tools.extend(crate::memory_tools::tools());
     }
-    let assets = assets.filter(|source| source.offers_fetch());
-    if assets.is_some() {
+    if assets.is_some_and(AssetSource::offers_fetch) {
         model_tools.push(asset_tool());
     }
 
@@ -802,11 +819,17 @@ where
             },
         );
         let mut stream = TurnStream::new(model_turns, model_started, progress, cancellation);
+        let mut request_messages = messages.clone();
+        let asset_request = assets.map_or_else(AssetRequest::default, |source| {
+            source.prepare_request(&mut request_messages)
+        });
+        let inventory = asset_request.inventory;
         let completion = {
             let mut on_event = |event| stream.observe(event);
-            model.complete(&messages, &model_tools, options, &mut on_event)
+            model.complete(&request_messages, &model_tools, options, &mut on_event)
         };
-        let prepared = messages
+        drop(asset_request);
+        let prepared = request_messages
             .iter()
             .map(|message| serde_json::to_value(message.prepared_for_trace()))
             .collect::<Result<Vec<_>, _>>()
@@ -841,6 +864,10 @@ where
                     target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                         model.turn = model_turns,
                         agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
@@ -872,6 +899,10 @@ where
                     target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                         model.turn = model_turns,
                         agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
@@ -887,6 +918,10 @@ where
                     target: "dekopon_agent::audit",
                     {
                         audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                         model.turn = model_turns,
                         agent = agent,
                         duration_ms = milliseconds(model_started.elapsed()),
@@ -909,6 +944,10 @@ where
             target: "dekopon_agent::audit",
             {
                 audit.event = "accounting.model.turn",
+                        asset.inventory.count = inventory.count,
+                        asset.inventory.bytes = inventory.bytes,
+                        asset.inventory.referenced = inventory.referenced,
+                        asset.inventory.omitted = inventory.omitted,
                 model.turn = model_turns,
                 agent = agent,
                 duration_ms = milliseconds(model_started.elapsed()),
