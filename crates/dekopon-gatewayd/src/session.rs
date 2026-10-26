@@ -1540,36 +1540,6 @@ fn attributed_prompt(principal: Option<&PrincipalId>, text: &str) -> String {
     bound_inbound(&format!("{}{text}", attribution_header(principal)))
 }
 
-fn inventory_prompt(
-    text: &str,
-    registered: &asset::Registered,
-    images_supported: bool,
-    reader: asset::TextReader,
-    principal: Option<&PrincipalId>,
-    notice_bytes: usize,
-    inventory: Option<&Mutex<asset::InventoryUsage>>,
-) -> String {
-    let original_text = text;
-    let text = if text.trim().is_empty() { "" } else { text };
-    let separator = if text.is_empty() { "" } else { "\n\n" };
-    let budget = crate::transport::MAX_INBOUND_TEXT_BYTES
-        .saturating_sub(text.len())
-        .saturating_sub(separator.len())
-        .saturating_sub(attribution_header(principal).len())
-        .saturating_sub(notice_bytes);
-    let note = asset::reference_note(registered, images_supported, reader, budget);
-    if let Some(inventory) = inventory {
-        inventory.lock().note(&note, registered);
-    }
-    debug_assert_eq!(note.listed + note.omitted, registered.inventory.len());
-    debug_assert!(note.bytes <= budget);
-    if note.text.is_empty() {
-        original_text.to_owned()
-    } else {
-        format!("{text}{separator}{}", note.text)
-    }
-}
-
 #[derive(Clone, Copy)]
 enum InventoryPath {
     Turn,
@@ -1585,6 +1555,35 @@ struct PromptFrame<'a> {
 }
 
 impl PromptFrame<'_> {
+    fn inventory_prompt(
+        &self,
+        text: &str,
+        registered: &asset::Registered,
+        images_supported: bool,
+        reader: asset::TextReader,
+        notice_bytes: usize,
+    ) -> String {
+        let original_text = text;
+        let text = if text.trim().is_empty() { "" } else { text };
+        let separator = if text.is_empty() { "" } else { "\n\n" };
+        let budget = crate::transport::MAX_INBOUND_TEXT_BYTES
+            .saturating_sub(text.len())
+            .saturating_sub(separator.len())
+            .saturating_sub(attribution_header(self.principal).len())
+            .saturating_sub(notice_bytes);
+        let note = asset::reference_note(registered, images_supported, reader, budget);
+        if let Some(inventory) = self.inventory {
+            inventory.lock().note(&note, registered);
+        }
+        debug_assert_eq!(note.listed + note.omitted, registered.inventory.len());
+        debug_assert!(note.bytes <= budget);
+        if note.text.is_empty() {
+            original_text.to_owned()
+        } else {
+            format!("{text}{separator}{}", note.text)
+        }
+    }
+
     fn inventory(
         &self,
         text: &str,
@@ -1595,15 +1594,7 @@ impl PromptFrame<'_> {
     ) -> String {
         let reserved = self.delivery.map_or(0, |notice| notice.len() + 1)
             + self.stop.map_or(0, |notice| notice.len() + 1);
-        let text = inventory_prompt(
-            text,
-            registered,
-            images_supported,
-            reader,
-            self.principal,
-            reserved,
-            self.inventory,
-        );
+        let text = self.inventory_prompt(text, registered, images_supported, reader, reserved);
         let text = match path {
             InventoryPath::Turn | InventoryPath::Follow => match self.stop {
                 Some(notice) => bound_inbound(&format!("{notice}\n{text}")),

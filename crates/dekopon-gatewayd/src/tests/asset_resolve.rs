@@ -479,3 +479,671 @@ async fn a_panicking_session_task_surfaces_as_panicked_with_its_cause() {
         TaskFailure::Panicked { cause } if cause == "asset store exploded"
     ));
 }
+
+fn evict_with_pressure(store: &AssetStore, access: &AssetAccess, id: u64) {
+    drop(store.admit(access, id, b"aaa").unwrap());
+    let pressure = register(store, access, Some(3));
+    drop(store.admit(access, pressure, b"bbb").unwrap());
+    assert_eq!(
+        store.pin(access, id, Recency::Keep),
+        Err(BlobError::Reclaimed)
+    );
+}
+
+struct FencedFetcher {
+    access: AssetAccess,
+    inner: Arc<dyn AssetFetcher>,
+    calls: AtomicUsize,
+}
+
+impl AssetFetcher for FencedFetcher {
+    fn fetch(
+        &self,
+        source: &AssetSourceRef,
+        limit: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        assert_eq!(
+            self.access
+                .with_active(|key| (key.generation, key.grant.as_str().to_owned())),
+            Some((Some(1), "current-grant".into()))
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch(source, limit)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_platform_refetch_uses_the_full_slack_uri_and_live_grant_once() {
+    use crate::{
+        config::SlackExperience,
+        transport::{ChatTransport, slack::SlackTransport},
+    };
+    let peer = dekopon_test_support::LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\naaa",
+    );
+    let uri = format!("{}/prefix/files/F-private?download=1", peer.url());
+    let transport = SlackTransport::new(
+        "slack".into(),
+        format!("{}/prefix", peer.url()),
+        "fixture-app".into(),
+        "fixture-bot".into(),
+        SlackExperience::Classic,
+    )
+    .unwrap();
+    let store = store(3);
+    let mut access = access("slack-refetch");
+    access.fence = Some(Arc::new(
+        AssetFence::new().with_grant("current-grant".into()),
+    ));
+    access.key.grant = Arc::clone(&access.fence.as_ref().unwrap().grant);
+    let id = store
+        .assets_for_access(
+            &access,
+            vec![PendingAsset {
+                name: "photo.png".into(),
+                mime: "image/png".into(),
+                size: Some(3),
+                source: Some(AssetSourceRef::Slack {
+                    file_id: "F-private".into(),
+                    url: uri.clone(),
+                }),
+            }],
+            Instant::now(),
+        )
+        .arrived[0];
+    evict_with_pressure(&store, &access, id);
+    let guarded = Arc::new(FencedFetcher {
+        access: access.clone(),
+        inner: transport.asset_fetcher().unwrap(),
+        calls: AtomicUsize::new(0),
+    });
+    let session = SessionAssets::new(
+        store,
+        access,
+        Some(Arc::clone(&guarded) as Arc<dyn AssetFetcher>),
+        Handle::current(),
+        true,
+    );
+    let resolved = session.resolve_input(id).await.unwrap();
+    assert_eq!(resolved.blob.read().unwrap(), b"aaa");
+    assert_eq!(resolved.row.id, id);
+    assert_eq!(guarded.calls.load(Ordering::SeqCst), 1);
+    let request = peer.request_text();
+    let target = request
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    assert_eq!(format!("{}{}", peer.url(), target), uri);
+    assert!(peer.recorded().is_empty());
+    peer.join();
+}
+
+#[tokio::test]
+async fn two_evicted_uses_join_one_download_and_keep_is_only_a_probe() {
+    let store = store(3);
+    let access = access("join-refetch");
+    let id = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, id);
+    let gate = Gate::stalled(b"aaa");
+    let session = session(&store, &access, &gate);
+    let used = store.retention.lock().index_snapshot();
+    assert_eq!(
+        store.pin(&access, id, Recency::Keep),
+        Err(BlobError::Reclaimed)
+    );
+    assert_eq!(store.retention.lock().index_snapshot(), used);
+    assert_eq!(gate.fetches(), 0);
+    let first = session.resolve_input(id);
+    let second = session.resolve_input(id);
+    let release = async {
+        gate.entered.notified().await;
+        gate.release.add_permits(1);
+    };
+    let (first, second, ()) = tokio::join!(first, second, release);
+    assert_eq!(first.unwrap().blob.read().unwrap(), b"aaa");
+    assert_eq!(second.unwrap().blob.read().unwrap(), b"aaa");
+    assert_eq!(gate.fetches(), 1);
+}
+
+#[tokio::test]
+async fn a_retired_refetch_refuses_revoked_without_downloading() {
+    let store = store(3);
+    let access = access("revoked-refetch");
+    let id = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, id);
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    access.fence.as_ref().unwrap().deactivate();
+    assert_eq!(
+        session
+            .resolve_input(id)
+            .await
+            .map(|resolved| resolved.blob)
+            .unwrap_err(),
+        ChatAssetRefusal::Revoked
+    );
+    assert_eq!(gate.fetches(), 0);
+}
+
+struct ServiceFailure {
+    code: &'static str,
+    calls: AtomicUsize,
+}
+impl ServiceFailure {
+    fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+impl AssetFetcher for ServiceFailure {
+    fn fetch(&self, _: &AssetSourceRef, _: u64) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(TransportError::Service {
+                code: self.code.into(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn platform_refusal_codes_name_platform_gone_and_other_codes_stay_retryable() {
+    for code in [
+        "404", "410", "401", "403", "http-404", "http-410", "http-401", "http-403", "500",
+    ] {
+        let store = store(3);
+        let access = access(code);
+        let id = register(&store, &access, Some(3));
+        evict_with_pressure(&store, &access, id);
+        let session = SessionAssets::new(
+            Arc::clone(&store),
+            access.clone(),
+            Some(Arc::new(ServiceFailure::new(code))),
+            Handle::current(),
+            true,
+        );
+        let expected = if code == "500" {
+            ChatAssetRefusal::Unavailable
+        } else {
+            ChatAssetRefusal::PlatformGone
+        };
+        assert_eq!(
+            session
+                .resolve_input(id)
+                .await
+                .map(|resolved| resolved.blob)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            store.pin(&access, id, Recency::Keep),
+            Err(BlobError::Reclaimed)
+        );
+        let gate = Gate::open(b"aaa");
+        assert_eq!(
+            self::session(&store, &access, &gate)
+                .resolve_input(id)
+                .await
+                .unwrap()
+                .blob
+                .read()
+                .unwrap(),
+            b"aaa"
+        );
+        assert_eq!(gate.fetches(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refetch_timeout_leaves_evicted_and_the_next_use_retries() {
+    let store = store(3);
+    let access = access("timeout-refetch");
+    let id = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, id);
+    let gate = Gate::stalled(b"aaa");
+    let session = session(&store, &access, &gate);
+    assert_eq!(
+        session
+            .resolve_input(id)
+            .await
+            .map(|resolved| resolved.blob)
+            .unwrap_err(),
+        ChatAssetRefusal::Unavailable
+    );
+    assert_eq!(
+        store.pin(&access, id, Recency::Keep),
+        Err(BlobError::Reclaimed)
+    );
+    gate.release.add_permits(1);
+    assert_eq!(
+        session
+            .resolve_input(id)
+            .await
+            .unwrap()
+            .blob
+            .read()
+            .unwrap(),
+        b"aaa"
+    );
+    assert_eq!(gate.fetches(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_intake_is_silent_and_use_names_evicted_or_store_failed() {
+    let store = store(3);
+    let access = access("generated-refusal");
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    let (fd, metadata) = received(b"aaa", AssetEncoding::Identity);
+    let generated = session
+        .register(fd, &metadata, "asset.draw", "one")
+        .unwrap();
+    let pressure = register(&store, &access, Some(3));
+    drop(store.admit(&access, pressure, b"bbb").unwrap());
+    assert_eq!(
+        session
+            .resolve_input(generated)
+            .await
+            .map(|resolved| resolved.blob)
+            .unwrap_err(),
+        ChatAssetRefusal::Evicted
+    );
+    let (fd, metadata) = received(b"toolarge", AssetEncoding::Identity);
+    let not_stored = session
+        .register(fd, &metadata, "asset.draw", "two")
+        .unwrap();
+    assert_eq!(
+        session
+            .resolve_input(not_stored)
+            .await
+            .map(|resolved| resolved.blob)
+            .unwrap_err(),
+        ChatAssetRefusal::StoreFailed
+    );
+    let text = tokio::task::spawn_blocking(move || session.fetch(generated).unwrap_err())
+        .await
+        .unwrap();
+    assert!(text.contains("evicted"), "{text}");
+    assert_eq!(gate.fetches(), 0);
+}
+
+struct HistoryModel {
+    inner: dekopon_model::blocking::BlockingModel,
+    id: u64,
+    calls: AtomicUsize,
+}
+impl dekopon_model::model::ChatModel for HistoryModel {
+    fn complete(
+        &self,
+        messages: &[dekopon_model::model::ModelMessage],
+        tools: &[dekopon_model::model::ModelTool],
+        options: &dekopon_model::model::CompletionOptions,
+        on_event: &mut (dyn FnMut(dekopon_model::TurnEvent) -> std::ops::ControlFlow<()> + Send),
+    ) -> Result<dekopon_model::model::AssistantTurn, dekopon_model::error::InferenceError> {
+        use dekopon_model::model::{AssistantTurn, ModelFunctionCall, ModelToolCall};
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (name, arguments) = match call {
+            0 => ("fetch_chat_asset", serde_json::json!({"id": self.id})),
+            1 => ("bash", serde_json::json!({"command": "evict"})),
+            _ => return self.inner.complete(messages, tools, options, on_event),
+        };
+        Ok(AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: format!("call-{call}").into(),
+                kind: "function".into(),
+                function: ModelFunctionCall {
+                    name: name.into(),
+                    arguments: arguments.to_string(),
+                },
+            }],
+            None,
+        ))
+    }
+}
+
+struct HistoryPressure {
+    store: Arc<AssetStore>,
+    access: AssetAccess,
+    id: u64,
+}
+impl dekopon_agent::prompt::ScriptRuntime for HistoryPressure {
+    fn capability_calls_used(&self) -> u32 {
+        0
+    }
+    fn run_script(&self, script: &str) -> dekopon_shell::ScriptOutcome {
+        assert_eq!(script, "evict");
+        evict_with_pressure(&self.store, &self.access, self.id);
+        dekopon_shell::ScriptOutcome {
+            output: String::new(),
+            exit_code: dekopon_process::ExitCode::SUCCESS,
+            truncated: false,
+            capability_calls: 0,
+            steps: 1,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encoding_a_history_image_refills_bytes_or_reports_platform_gone() {
+    use dekopon_model::{blocking::BlockingModel, inference::ModelClient, openai::OpenAiClient};
+    use tracing_subscriber::prelude::*;
+    for gone in [false, true] {
+        let store = store(3);
+        let access = access("history-refetch");
+        let id = register(&store, &access, Some(3));
+        drop(store.admit(&access, id, b"aaa").unwrap());
+        let gate = Gate::open(b"aaa");
+        let mut session = session(&store, &access, &gate);
+        let service = Arc::new(ServiceFailure::new("404"));
+        if gone {
+            session.fetcher = Some(Arc::clone(&service) as Arc<dyn AssetFetcher>);
+        }
+        let response = br#"{"choices":[{"message":{"role":"assistant","content":"seen"},"finish_reason":"stop"}]}"#;
+        let response = [format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).into_bytes(), response.to_vec()].concat();
+        let peer = dekopon_test_support::LoopbackServer::once(&response);
+        let model = OpenAiClient::new(peer.url(), "fixture", None, Duration::from_secs(5))
+            .unwrap()
+            .with_streaming(false);
+        let (_, cancel) = tokio::sync::watch::channel(false);
+        let model = BlockingModel::new(
+            Arc::new(ModelClient::OpenAiCompatible(model)),
+            Handle::current(),
+            cancel,
+            Duration::from_secs(5),
+        );
+        tokio::task::spawn_blocking(move || {
+            let capture = dekopon_test_support::CaptureLayer::workspace();
+            let _guard = tracing_subscriber::registry()
+                .with(capture.clone())
+                .set_default();
+            let model = HistoryModel {
+                inner: model,
+                id,
+                calls: AtomicUsize::new(0),
+            };
+            let runtime = HistoryPressure { store, access, id };
+            dekopon_agent::prompt::run_prompt_session(
+                &model,
+                &runtime,
+                dekopon_agent::prompt::SessionInputs::new(
+                    "show the photo, then use the script",
+                    dekopon_agent::prompt::PromptLimits {
+                        max_steps: 3,
+                        max_capability_calls: 0,
+                    },
+                )
+                .with_assets(&session),
+                &mut dekopon_agent::prompt::History::default(),
+            )
+            .unwrap();
+            assert_eq!(model.calls.load(Ordering::SeqCst), 3);
+            let text = peer.request_text();
+            let body: serde_json::Value =
+                serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let part = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .find(|part| {
+                    part["type"] == "image_url"
+                        || part["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("was released"))
+                })
+                .unwrap();
+            if gone {
+                assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(part["type"], "text");
+                assert!(part["text"].as_str().unwrap().contains("was released"));
+                assert!(capture.records().iter().any(|record| {
+                    record.field("audit.event") == Some("agent.asset.refused")
+                        && record
+                            .field("reason")
+                            .unwrap_or_default()
+                            .contains("platform-gone")
+                }));
+                let events = capture.events_where(
+                    "dekopon_gatewayd::audit",
+                    &[
+                        ("audit.event", "gateway.asset.refetch"),
+                        ("outcome", "platform-gone"),
+                    ],
+                );
+                assert_eq!(events.len(), 1);
+            } else {
+                assert_eq!(part["type"], "image_url");
+                assert_eq!(part["image_url"]["url"], "data:image/png;base64,YWFh");
+                assert_eq!(gate.fetches(), 1);
+            }
+            assert!(peer.recorded().is_empty());
+            peer.join();
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
+    use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+    use tracing_subscriber::prelude::*;
+    let store = store(6);
+    let access = access("inventory-metrics");
+    let first = register(&store, &access, Some(3));
+    let second = register(&store, &access, Some(3));
+    drop(store.admit(&access, first, b"aaa").unwrap());
+    drop(store.admit(&access, second, b"bbb").unwrap());
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    let registered = Registered {
+        inventory: store.inventory(&access),
+        arrived: vec![second],
+    };
+    let note = reference_note(&registered, true, TextReader::AssetCat, 16384);
+    session.inventory.lock().note(&note, &registered);
+    tokio::task::spawn_blocking(move || {
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let model = dekopon_test_support::ScriptedStreamModel::scripted(
+            vec![],
+            dekopon_model::model::AssistantTurn::new(Some("seen".into()), vec![], None),
+        );
+        model.release_next();
+        Handle::current()
+            .block_on(session.resolve_input(first))
+            .unwrap();
+        Handle::current()
+            .block_on(session.resolve_input(first))
+            .unwrap();
+        let bytes = note.text.len();
+        run_prompt_session(
+            &model,
+            &super::retention_tests::NoScripts,
+            SessionInputs::new(
+                &note.text,
+                PromptLimits {
+                    max_steps: 1,
+                    max_capability_calls: 0,
+                },
+            )
+            .with_assets(&session),
+            &mut History::default(),
+        )
+        .unwrap();
+        let records = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "accounting.model.turn")],
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].field("asset.inventory.count"), Some("2"));
+        assert_eq!(
+            records[0].field("asset.inventory.bytes"),
+            Some(bytes.to_string().as_str())
+        );
+        assert_eq!(records[0].field("asset.inventory.referenced"), Some("1"));
+        assert_eq!(records[0].field("asset.inventory.omitted"), Some("0"));
+    })
+    .await
+    .unwrap();
+}
+
+#[derive(Clone, Default)]
+struct NumericEvents(Arc<Mutex<Vec<NumericEvent>>>);
+#[derive(Default)]
+struct NumericEvent {
+    name: String,
+    numbers: std::collections::BTreeMap<String, u64>,
+}
+impl tracing::field::Visit for NumericEvent {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "audit.event" {
+            self.name = value.to_owned();
+        }
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.numbers.insert(field.name().into(), value);
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.numbers
+            .insert(field.name().into(), u64::try_from(value).unwrap());
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NumericEvents {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut fields = NumericEvent::default();
+        event.record(&mut fields);
+        self.0.lock().push(fields);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn asset_mutation_records_are_once_numeric_and_exclude_slack_sources() {
+    use tracing_subscriber::prelude::*;
+    let store = store(3);
+    let access = access("store-records");
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    tokio::task::spawn_blocking(move || {
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let numeric = NumericEvents::default();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(numeric.clone())
+            .set_default();
+        let secret_url = "https://files.slack.com/files-pri/T-private/F-secret?token=bearer";
+        let id = store
+            .assets_for_access(
+                &access,
+                vec![PendingAsset {
+                    name: "private.png".into(),
+                    mime: "image/png".into(),
+                    size: Some(3),
+                    source: Some(AssetSourceRef::Slack {
+                        file_id: "F-secret".into(),
+                        url: secret_url.into(),
+                    }),
+                }],
+                Instant::now(),
+            )
+            .arrived[0];
+        evict_with_pressure(&store, &access, id);
+        let resolved = Handle::current()
+            .block_on(session.resolve_input(id))
+            .unwrap();
+        assert_eq!(resolved.blob.read().unwrap(), b"aaa");
+        let (fd, metadata) = received(b"oversize", AssetEncoding::Identity);
+        session
+            .register(fd, &metadata, "asset.draw", "one")
+            .unwrap();
+        for (name, count) in [
+            ("gateway.asset.evicted", 2),
+            ("gateway.asset.refetch", 1),
+            ("gateway.asset.store_failed", 1),
+        ] {
+            let records = capture.events_where("dekopon_gatewayd::audit", &[("audit.event", name)]);
+            assert_eq!(records.len(), count, "{name}");
+            let events = numeric.0.lock();
+            let events: Vec<_> = events.iter().filter(|event| event.name == name).collect();
+            assert_eq!(events.len(), count);
+            for event in events {
+                assert_eq!(event.numbers.get("asset.store.budget_bytes"), Some(&3));
+                assert!(event.numbers.contains_key("asset.store.bytes"));
+                if name != "gateway.asset.refetch" {
+                    assert!(event.numbers.contains_key("asset.bytes"));
+                }
+            }
+        }
+        assert_eq!(
+            capture.events_where(
+                "dekopon_gatewayd::audit",
+                &[("audit.event", "gateway.asset.refetch")]
+            )[0]
+            .field("outcome"),
+            Some("refetched")
+        );
+        for sensitive in [secret_url, "F-secret", "T-private", "bearer"] {
+            assert!(!capture.text().contains(sensitive));
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn failed_refetch_readmission_names_store_failed_and_does_not_retry_storage() {
+    let store = store(3);
+    let access = access("readmission");
+    let id = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, id);
+    let pressure = store.inventory(&access).last().unwrap().id;
+    let pin = store
+        .pin(&access, pressure, Recency::Keep)
+        .unwrap()
+        .unwrap();
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    for _ in 0..2 {
+        assert_eq!(
+            session
+                .resolve_input(id)
+                .await
+                .map(|resolved| resolved.blob)
+                .unwrap_err(),
+            ChatAssetRefusal::StoreFailed
+        );
+    }
+    assert_eq!(gate.fetches(), 1);
+    assert_eq!(pin.read().unwrap(), b"bbb");
+}
+
+#[tokio::test]
+async fn a_refetch_waiting_for_a_permit_rechecks_revocation_before_the_transport() {
+    let store = store(3);
+    let access = access("queued-revocation");
+    let id = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, id);
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    let permits = store.downloads.permits.acquire_many(2).await.unwrap();
+    let mut use_asset = session.resolve_input(id);
+    assert!(futures_util::poll!(&mut use_asset).is_pending());
+    tokio::task::yield_now().await;
+    access.fence.as_ref().unwrap().deactivate();
+    drop(permits);
+    assert_eq!(
+        use_asset.await.map(|resolved| resolved.blob).unwrap_err(),
+        ChatAssetRefusal::Revoked
+    );
+    assert_eq!(gate.fetches(), 0);
+}

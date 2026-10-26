@@ -516,6 +516,11 @@ impl Retention {
     }
 
     #[cfg(test)]
+    pub(super) fn index_snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(&self.index).unwrap()
+    }
+
+    #[cfg(test)]
     pub(super) fn resident_files(&self) -> usize {
         self.index
             .files

@@ -528,7 +528,7 @@ Disk retention and broker in-flight spool budgets account for actual stored byte
 These limits are separate from model-facing fetch limits. Resolving bytes updates LRU recency.
 Unknown inbound lengths are shown as `size unknown` in the inventory note and as null stored-byte
 counts in metadata rows, not as empty files. Reported or fetched lengths, including a genuine zero,
-remain numeric. Building the inventory never fetches files just to learn their size. Reclaimed files retain their last known length and never refetch or silently substitute older pixels.
+remain numeric. Building the inventory never fetches files just to learn their size. Evicted files retain their last known length; a session-bound use refetches inbound bytes with fresh authorization. Generated files are never regenerated.
 
 Delivery keeps existing native paths: Slack external upload, Discord multipart Create Message,
 Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each upload reads
@@ -753,7 +753,7 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   session-bound path within the request byte budget and pinned through encoding. Parts still
   missing bytes become an explicit gateway-authored release notice.
   Actual descriptor IO/corruption errors remain errors, not fabricated release notices. Scoped
-  inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
+  inventory state and at most 1024 release tombstones distinguish released, unknown and revoked
   IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
   to avoid reuse after one-shot inventory expiry.
 - **Use refusals name the cause.** Both provider-input refusals and `fetch_chat_asset` tool text
