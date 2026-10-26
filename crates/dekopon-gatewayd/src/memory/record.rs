@@ -194,3 +194,27 @@ mod io_kind {
         )
     }
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct PinLine {
+    pub at_ms: u64,
+    pub record: RecordId,
+    pub pin: Option<dekopon_agent::memory_tools::Rung>,
+    #[serde(default, skip_serializing_if = "Subject::is_record")]
+    pub subject: Subject,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ChoiceLine {
+    pub at_ms: u64,
+    pub record: RecordId,
+    pub choice: dekopon_agent::memory_tools::Rung,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum AssetSideLine {
+    Slot(SlotLine),
+    Pin(PinLine),
+}

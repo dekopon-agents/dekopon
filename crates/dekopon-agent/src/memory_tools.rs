@@ -1,7 +1,15 @@
 use crate::prompt::PromptError;
 use dekopon_model::model::{ModelMessage, ModelTool, ModelToolCall};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Rung {
+    Native,
+    Summary(std::num::NonZeroU8),
+    Metadata,
+}
 
 pub trait MemoryTools: Send + Sync {
     fn read(&self, record_id: u64, representation_id: &str, range: Option<(u64, u64)>) -> String;
