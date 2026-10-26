@@ -70,3 +70,13 @@ fn spawn_dependency_mirrors_match_the_canonical_package() {
         assert_eq!(canonical, mirror);
     }
 }
+
+#[test]
+fn signed_download_mirrors_match_the_new_published_contract() {
+    let canonical = include_str!("../../../wit/signed-download/signed-download.wit");
+    assert_eq!(canonical, include_str!("../wit/deps/signed-download.wit"));
+    assert_eq!(
+        canonical,
+        include_str!("../../dekopon-broker-host/wit/deps/signed-download.wit")
+    );
+}

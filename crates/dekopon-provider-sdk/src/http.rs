@@ -245,13 +245,13 @@ impl Error for BuildError {}
 /// invocation and may refuse it with Denied.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
-    let request = bindings::dekopon::http::client::Request {
+    let request = bindings::dekopon::http1_1_0::client::Request {
         method: request.method,
         uri: request.uri,
         headers: request
             .headers
             .into_iter()
-            .map(|header| bindings::dekopon::http::client::Header {
+            .map(|header| bindings::dekopon::http1_1_0::client::Header {
                 name: header.name,
                 value: header.value,
             })
@@ -259,7 +259,7 @@ pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
         body: request.body,
     };
 
-    bindings::dekopon::http::client::send(&request)
+    bindings::dekopon::http1_1_0::client::send(&request)
         .map(|response| Response {
             status: response.status,
             headers: response
@@ -282,7 +282,7 @@ pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
 /// configured before it will spool a response.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
-    use bindings::dekopon::http::client as wit;
+    use bindings::dekopon::http1_1_0::client as wit;
     let request = wit::StreamedRequest {
         method: request.method,
         uri: request.uri,
@@ -326,8 +326,8 @@ pub(crate) fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, H
 }
 
 #[cfg(target_arch = "wasm32")]
-fn map_error_code(code: bindings::dekopon::http::client::ErrorCode) -> HttpErrorCode {
-    use bindings::dekopon::http::client::ErrorCode as Wit;
+fn map_error_code(code: bindings::dekopon::http1_1_0::client::ErrorCode) -> HttpErrorCode {
+    use bindings::dekopon::http1_1_0::client::ErrorCode as Wit;
     match code {
         Wit::InvalidMethod => HttpErrorCode::InvalidMethod,
         Wit::InvalidUri => HttpErrorCode::InvalidUri,

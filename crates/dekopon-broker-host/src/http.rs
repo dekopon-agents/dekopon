@@ -6,7 +6,9 @@ use dekopon_http_host::{
     HttpError as NativeHttpError, HttpHostCeilings, Request as NativeRequest, RequestAuthorizer,
 };
 
-use crate::bindings::dekopon::http::client::{ErrorCode, Header, HttpError, Request, Response};
+use crate::bindings::dekopon::http1_1_0::client::{
+    ErrorCode, Header, HttpError, Request, Response,
+};
 
 pub use dekopon_http_host::{
     BoundCredential, ConfigurationError as HttpConfigurationError, HttpCallEvidence,

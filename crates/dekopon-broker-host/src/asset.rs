@@ -1088,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn streamed_assets_share_the_invocation_budget_and_response_replay_refuses_before_dispatch()
      {
-        use crate::bindings::dekopon::http::client as http;
+        use crate::bindings::dekopon::http1_1_0::client as http;
         use http::Host as _;
         let root = tempfile::tempdir().unwrap();
         let input_file = tempfile::NamedTempFile::new().unwrap();
@@ -1118,6 +1118,7 @@ mod tests {
                 allow_plaintext_loopback: true,
                 propagate_trace: false,
                 request_templates: Vec::new(),
+                signed_download: None,
             }),
             None,
             None,

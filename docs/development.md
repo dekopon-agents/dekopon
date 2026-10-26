@@ -161,7 +161,7 @@ require provider rebuilds.
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), [`../wit/clock/wkg.toml`](../wit/clock/wkg.toml) plus [`../wit/clock/wkg.lock`](../wit/clock/wkg.lock), and [`../wit/random/wkg.toml`](../wit/random/wkg.toml) plus [`../wit/random/wkg.lock`](../wit/random/wkg.lock), and [`../wit/spawn/wkg.toml`](../wit/spawn/wkg.toml) plus [`../wit/spawn/wkg.lock`](../wit/spawn/wkg.lock), independently define the HTTP, storage, clock, random, and spawn packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the stdio-importing `dekopon:provider@0.4.0` worlds on release tags and the interface-only `dekopon:http@1.1.0` (including its `dekopon:asset@0.1.0` dependency), `dekopon:storage@0.1.1`, `dekopon:clock@1.1.0`, and `dekopon:random@0.1.0`, and `dekopon:spawn@0.1.0` packages independently. Spawn depends on `dekopon:stdio@0.1.0` and declares no world. The broker host's own provider world is not published. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
-`dekopon-broker-host` links project-owned HTTP `@1.1.0` only,
+`dekopon-broker-host` links project-owned HTTP `@1.1.0` and signed-download `@0.1.0`,
 asset `@0.1.0`, storage, both clock interfaces, and OS entropy, consumes `AuthorizedInvocation` and an exact optional storage
 grant, and maps WIT values to native engines enforcing exact grants beneath independent ceilings.
 Both clocks and entropy are readable only in an invocation's store; a read during a description or command run traps.
@@ -649,3 +649,22 @@ group- or world-writable, or `dekopon-brokerd` refuses to start.
 - Follow the [PR template](../.github/pull_request_template.md): summary, security impact, validation actually run, and limitations/follow-ups.
 - Use a conventional commit subject where practical.
 - Push the branch, open the PR, and verify the required checks rather than assuming local success implies remote success.
+
+### Signed-download package and release order
+
+The new published contract is `dekopon:http/signed-download@0.1.0`, in the independent
+`dekopon:http@0.1.0` package under `wit/signed-download/`. Existing HTTP 1.1 bytes remain immutable.
+Its canonical `signed-download.wit` is mirrored byte-for-byte in the SDK and broker-host
+`wit/deps/signed-download.wit`; its asset dependency mirrors `wit/asset/asset.wit`.
+The WIT publication workflow builds, validates, compares mirrors, round-trips and publishes this
+package beside the existing packages. The SDK exposes it through `signed_download` and the broker
+links the separate interface. Rebuild the seven checked components with their pinned scripts and
+verify existing imports before publication. SDK/testkit exact pins move together for consumers.
+
+Ship the core interface PR first and carry it in a dekopon **minor** release before the provider
+PR imports it. The stated deployment baseline is core 0.55.0 live with 0.56.0 rolling out, and
+provider-gh 0.11.0 live; neither baseline supports this import. Core deployment must precede new
+provider imports and grant configuration. Validate the actual deployed component imports and
+configuration before activation; source inspection alone does not establish deployment readiness.
+This PR does not release, deploy, implement provider rendering/cursors, or grant logs authority.
+The owner retains the actions-grants decision, including the recommended response-byte limit.

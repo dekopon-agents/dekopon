@@ -12,7 +12,9 @@
     )
 )]
 pub mod asset;
+mod signed_download;
 mod stream;
+pub use signed_download::{Coverage, DownloadError, DownloadResponse, Window};
 pub use stream::{
     CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
 };
@@ -97,9 +99,16 @@ pub enum ErrorCode {
     Internal,
 }
 
+#[derive(Clone, Copy)]
+enum ResponseMetadata {
+    Ordinary,
+    SignedDownload,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyViolation {
     Denied,
+    RedirectRefused,
     HostCallLimit,
     InvalidHttpRequest,
     ByteLimit,
@@ -109,6 +118,7 @@ impl PolicyViolation {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Denied => "denied",
+            Self::RedirectRefused => "redirect-refused",
             Self::HostCallLimit => "host-call-limit",
             Self::InvalidHttpRequest => "invalid-http-request",
             Self::ByteLimit => "byte-limit",
@@ -726,6 +736,8 @@ pub struct BufferedHttpClient {
     evidence: Vec<HttpCallEvidence>,
     resolved: HashMap<String, Vec<SocketAddr>>,
     pinned_client: Option<PinnedClient>,
+    #[cfg(test)]
+    signed_download_destination: Option<signed_download::Destination>,
 }
 
 impl std::fmt::Debug for BufferedHttpClient {
@@ -829,6 +841,8 @@ impl BufferedHttpClient {
             evidence: Vec::new(),
             resolved: HashMap::new(),
             pinned_client: None,
+            #[cfg(test)]
+            signed_download_destination: None,
         })
     }
 
@@ -1074,8 +1088,19 @@ impl BufferedHttpClient {
     }
 
     async fn send_checked(&mut self, request: Request) -> Result<Response, HttpError> {
+        self.send_with_metadata(request, ResponseMetadata::Ordinary)
+            .await
+    }
+
+    async fn send_with_metadata(
+        &mut self,
+        request: Request,
+        metadata: ResponseMetadata,
+    ) -> Result<Response, HttpError> {
         let (prepared, grant, evidence_index) = self.authorize_request(request, None).await?;
-        let response = self.execute(prepared, &grant, evidence_index).await?;
+        let response = self
+            .execute(prepared, &grant, evidence_index, metadata)
+            .await?;
         if self
             .credential
             .as_ref()
@@ -1377,6 +1402,7 @@ impl BufferedHttpClient {
         request: PreparedRequest,
         grant: &HttpConstraints,
         evidence_index: usize,
+        metadata: ResponseMetadata,
     ) -> Result<Response, HttpError> {
         let remaining = self.remaining()?;
         let client = self.pinned_client(&request.host, &request.addresses, remaining)?;
@@ -1400,10 +1426,29 @@ impl BufferedHttpClient {
 
         let stream::Head {
             status,
-            headers,
+            mut headers,
             bytes: mut response_bytes,
             body: mut decoded,
-        } = self.accept_head(&request.method, response, grant, evidence_index)?;
+        } = self.accept_head(&request.method, response, grant, evidence_index, metadata)?;
+        let mut redactor = match metadata {
+            ResponseMetadata::Ordinary => None,
+            ResponseMetadata::SignedDownload if status != 302 => {
+                Some(signed_download::ApiRedactor::new(&mut headers)?)
+            }
+            ResponseMetadata::SignedDownload => None,
+        };
+        let output_head = headers.iter().fold(16_u64, |total, header| {
+            total.saturating_add((header.name.len() + header.value.len() + 4) as u64)
+        });
+        if output_head > grant.max_response_bytes
+            || (redactor.is_some() && output_head > self.ceilings.max_header_bytes as u64)
+        {
+            return Err(http_error(
+                ErrorCode::ResponseTooLarge,
+                "redacted headers exceed the authorized byte limit",
+            ));
+        }
+        let maximum = grant.max_response_bytes - output_head;
         let mut body = Vec::new();
         while let Some(chunk) = decoded.next().await? {
             response_bytes = response_bytes
@@ -1418,7 +1463,18 @@ impl BufferedHttpClient {
                     "response exceeds the authorized byte limit",
                 ));
             }
-            body.extend_from_slice(&chunk);
+            match &mut redactor {
+                Some(redactor) => {
+                    for bytes in chunk.chunks(stream::CHUNK_BYTES) {
+                        redactor.push(bytes, &mut body, maximum)?;
+                    }
+                }
+                None => body.extend_from_slice(&chunk),
+            }
+        }
+
+        if let Some(redactor) = &mut redactor {
+            redactor.finish(&mut body, maximum)?;
         }
 
         Ok(Response {
@@ -1857,6 +1913,38 @@ fn bounded_message(message: &str) -> String {
     output
 }
 
+fn response_head_bytes(
+    headers: &HeaderMap,
+    ceilings: &HttpHostCeilings,
+    maximum: u64,
+) -> Result<u64, HttpError> {
+    if headers.len() > ceilings.max_headers {
+        return Err(http_error(
+            ErrorCode::ResponseTooLarge,
+            "response has too many headers",
+        ));
+    }
+    let mut bytes = 16_u64;
+    if bytes > ceilings.max_header_bytes as u64 || bytes > maximum {
+        return Err(http_error(
+            ErrorCode::ResponseTooLarge,
+            "response headers exceed an authorized bound",
+        ));
+    }
+    for (name, value) in headers {
+        bytes = bytes
+            .checked_add((name.as_str().len() + value.as_bytes().len() + 4) as u64)
+            .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
+        if bytes > ceilings.max_header_bytes as u64 || bytes > maximum {
+            return Err(http_error(
+                ErrorCode::ResponseTooLarge,
+                "response headers exceed an authorized bound",
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
 fn violation_label(code: ErrorCode) -> Option<&'static str> {
     PolicyViolation::from_code(code).map(PolicyViolation::label)
 }
@@ -1901,6 +1989,7 @@ mod tests {
             allow_plaintext_loopback: true,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         }
     }
 
@@ -2928,6 +3017,7 @@ mod tests {
     fn templated(authority: &str, template: serde_json::Value) -> HttpConstraints {
         HttpConstraints {
             allowed_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            signed_download: None,
             request_templates: vec![
                 serde_json::from_value::<RequestTemplate>(template).expect("template fixture"),
             ],
