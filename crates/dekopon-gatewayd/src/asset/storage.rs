@@ -27,6 +27,24 @@ impl Refill {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RefetchOutcome {
+    Refetched,
+    PlatformGone,
+    Revoked,
+    Unavailable,
+}
+impl RefetchOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Refetched => "refetched",
+            Self::PlatformGone => "platform-gone",
+            Self::Revoked => "revoked",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub(super) enum StoreFailure {
     BudgetTooSmall,
@@ -34,6 +52,18 @@ pub(super) enum StoreFailure {
     DecodedTooLarge,
     AllPinned,
     Io,
+}
+
+impl StoreFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BudgetTooSmall => "budget-too-small",
+            Self::StoredTooLarge => "stored-too-large",
+            Self::DecodedTooLarge => "decoded-too-large",
+            Self::AllPinned => "all-pinned",
+            Self::Io => "io",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -342,6 +372,9 @@ impl Retention {
             BlobError::TooLarge | BlobError::Disabled | BlobError::Capacity => (),
         }
         let reason = self.failure(asset.size.unwrap_or_default() as usize, error);
+        tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.store_failed",
+            reason = reason.label(), asset.bytes = asset.size.unwrap_or_default(),
+            asset.store.bytes = self.bytes, asset.store.budget_bytes = self.budget }, "gateway.asset.store_failed");
         let key = StoredKey::of(key, asset);
         self.index.bindings.retain(|binding| binding.key != key);
         self.index.bindings.push(Binding {
@@ -402,6 +435,12 @@ impl Retention {
             .is_some_and(|file| file.resident)
     }
 
+    pub(super) fn refetch(&self, outcome: RefetchOutcome) {
+        tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.refetch",
+            outcome = outcome.label(), asset.store.bytes = self.bytes,
+            asset.store.budget_bytes = self.budget }, "gateway.asset.refetch");
+    }
+
     pub(super) fn reserve(&mut self, id: u64, len: usize) -> Result<(), BlobError> {
         self.check_size(id, len)?;
         self.sweep();
@@ -433,11 +472,19 @@ impl Retention {
             self.miss(id, len, "all-pinned");
             return Err(BlobError::Capacity);
         }
-        for (digest, _, _, _) in candidates {
+        for (digest, class, _, _) in candidates {
             if self.bytes + len.max(1) <= self.budget {
                 break;
             }
+            let bytes = self.index.files.get(&digest).map_or(0, |file| file.len);
             self.evict_digest(&digest)?;
+            let origin = match class {
+                Refill::Platform => "inbound",
+                Refill::None => "generated",
+            };
+            tracing::info!(target: "dekopon_gatewayd::audit", { audit.event = "gateway.asset.evicted",
+                asset.origin = origin, asset.bytes = bytes, asset.store.bytes = self.bytes,
+                asset.store.budget_bytes = self.budget }, "gateway.asset.evicted");
         }
         self.persist()
     }
@@ -466,6 +513,11 @@ impl Retention {
         file.resident = false;
         self.bytes -= file.len.max(1);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn index_snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(&self.index).unwrap()
     }
 
     #[cfg(test)]
@@ -617,7 +669,8 @@ impl Retention {
                 Attachment::Resident(_)
                 | Attachment::Registered
                 | Attachment::Evicted
-                | Attachment::NotStored(_) => (),
+                | Attachment::NotStored(_)
+                | Attachment::PlatformGone => (),
             }
             let stored = StoredKey::of(key, &row.asset);
             if self.dir.is_none()

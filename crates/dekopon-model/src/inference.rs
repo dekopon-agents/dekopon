@@ -54,12 +54,58 @@ impl InferenceModel for ModelClient {
     }
 }
 
+pub(crate) enum ReplayEvent {
+    ModelVerified,
+    Text(TurnEvent),
+}
+
+struct ReplayStream {
+    verified: bool,
+    held: String,
+}
+
+impl ReplayStream {
+    fn observe(
+        &mut self,
+        event: ReplayEvent,
+        observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> ControlFlow<()> {
+        match event {
+            ReplayEvent::ModelVerified => {
+                self.verified = true;
+                self.flush(observe)
+            }
+            ReplayEvent::Text(event) => {
+                if self.verified {
+                    observe(event)
+                } else {
+                    let TurnEvent::TextDelta(text) = event;
+                    self.held.push_str(text.as_str());
+                    ControlFlow::Continue(())
+                }
+            }
+        }
+    }
+
+    fn flush(
+        &mut self,
+        observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> ControlFlow<()> {
+        if self.held.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        observe(TurnEvent::TextDelta(crate::stream::ModelText::from_model(
+            std::mem::take(&mut self.held),
+        )))
+    }
+}
+
 pub(crate) trait ReplayModel {
     fn resolved_key(&self) -> crate::model::ModelKey;
     fn exchange<'a>(
         &'a self,
         request: GenerateRequest<'a>,
-        observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        observe: &'a mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
         progress: &'a mut crate::http::Progress,
         identity: &'a crate::model::ModelKey,
@@ -74,17 +120,15 @@ pub(crate) async fn retry_opaque(
     progress: &mut crate::http::Progress,
 ) -> Result<AssistantTurn, InferenceError> {
     let identity = model.resolved_key();
-    if !request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(&identity) && turn.has_opaque_reasoning())) {
-        return model.exchange(request, observe, control, progress, &identity).await;
-    }
-    let mut events = Vec::new();
+    let admitted = request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(&identity) && turn.has_opaque_reasoning()));
+    let mut stream = ReplayStream {
+        verified: !admitted,
+        held: String::new(),
+    };
     let result = model
         .exchange(
             GenerateRequest { ..request },
-            &mut |event| {
-                events.push(event);
-                ControlFlow::Continue(())
-            },
+            &mut |event| stream.observe(event, observe),
             control,
             progress,
             &identity,
@@ -114,20 +158,24 @@ pub(crate) async fn retry_opaque(
                     messages: &portable,
                     ..request
                 },
-                observe,
+                &mut |event| match event {
+                    ReplayEvent::ModelVerified => ControlFlow::Continue(()),
+                    ReplayEvent::Text(event) => observe(event),
+                },
                 control,
                 progress,
                 &identity,
             )
             .await
     } else {
-        if result.is_ok() {
-            for event in events {
-                if observe(event).is_break() {
-                    return Err(InferenceError::Cancelled);
-                }
-            }
+        let stopped = stream.flush(observe).is_break();
+        if result.is_ok() && stopped {
+            Err(InferenceError::Cancelled)
+        } else {
+            result
         }
-        result
     }
 }
+
+#[cfg(test)]
+mod tests;

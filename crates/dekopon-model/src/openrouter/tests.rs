@@ -1308,3 +1308,65 @@ async fn a_reported_model_drift_retries_once_without_opaque_reasoning() {
         .collect();
     assert_eq!(text, "done");
 }
+
+#[tokio::test]
+async fn replayed_reasoning_flushes_pre_model_text_and_streams_before_the_terminal_event() {
+    let before = json!({"choices":[{"delta":{"content":"before "}}]});
+    let identified = json!({"model":"vendor/model","choices":[{"delta":{"content":"after "}}]});
+    let live = json!({"choices":[{"delta":{"content":"live"}}]});
+    let prefix = format!("data: {before}\n\ndata: {identified}\n\ndata: {live}\n\n");
+    let terminal = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    let body = format!("{prefix}data: {terminal}\n\ndata: [DONE]\n\n");
+    let (response, waiting, release) = MockResponse::sse(&body).stalled_after(prefix.len());
+    let server = MockServer::start(vec![MockResponse::sse(TOOL), response]);
+    let client = client(&server, Settings::default());
+    let first = generate(&client, &[]).await.unwrap();
+    let (seen, observed) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut seen = Some(seen);
+        let answer = client
+            .generate(
+                GenerateRequest {
+                    messages: &[
+                        assistant_message(&first),
+                        ModelMessage::tool(first.tool_calls[0].id.clone(), "done"),
+                    ],
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
+                &mut |event| {
+                    let TurnEvent::TextDelta(text) = event;
+                    events.push(text.as_str().to_owned());
+                    if text.as_str() == "live"
+                        && let Some(seen) = seen.take()
+                    {
+                        let _closed = seen.send(());
+                    }
+                    ControlFlow::Continue(())
+                },
+                &control(),
+            )
+            .await;
+        (answer, events)
+    });
+    waiting.await.unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(2), observed).await;
+    release.send(()).unwrap();
+    let (answer, events) = task.await.unwrap();
+    observed
+        .expect("live delta before releasing terminal event")
+        .unwrap();
+    assert_eq!(events, ["before ", "after ", "live"]);
+    assert_eq!(
+        answer.unwrap().content.as_deref(),
+        Some("before after live")
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        request_json(&requests[1])["messages"][0]
+            .get("reasoning_details")
+            .is_some()
+    );
+}
