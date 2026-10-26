@@ -7,7 +7,7 @@ use crate::{
         TransportFailure,
     },
     http::{InferenceHttp, Progress, record_phase},
-    inference::{GenerateRequest, InferenceModel},
+    inference::{GenerateRequest, InferenceModel, ReplayEvent},
     model::{
         AssistantTurn, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
         ModelFunctionCall, ModelKey, ModelMessage, ModelTool, ModelToolCall, compact_json_body,
@@ -161,7 +161,7 @@ impl CodexClient {
     async fn exchange(
         &self,
         request: GenerateRequest<'_>,
-        observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        observe: &mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
         progress: &mut Progress,
         identity: &ModelKey,
@@ -249,7 +249,12 @@ impl CodexClient {
                 let SseEvent::Data(data) = event else {
                     return Ok(ControlFlow::Break(()));
                 };
-                reducer.apply(data, &mut |event| progress.observe(event, observe))
+                reducer.apply_replay(data, &mut |event| match event {
+                    ReplayEvent::ModelVerified => observe(ReplayEvent::ModelVerified),
+                    ReplayEvent::Text(event) => {
+                        progress.observe(event, &mut |event| observe(ReplayEvent::Text(event)))
+                    }
+                })
             })
             .await?;
         control
@@ -276,7 +281,7 @@ impl crate::inference::ReplayModel for CodexClient {
     async fn exchange<'a>(
         &'a self,
         request: GenerateRequest<'a>,
-        observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        observe: &'a mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
         progress: &'a mut Progress,
         identity: &'a ModelKey,
@@ -478,14 +483,25 @@ pub(crate) struct CodexReducer<'a> {
 }
 
 impl CodexReducer<'_> {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     pub(crate) fn apply(
         &mut self,
         data: &str,
         observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<ControlFlow<()>, InferenceError> {
+        self.apply_replay(data, &mut |event| match event {
+            ReplayEvent::ModelVerified => ControlFlow::Continue(()),
+            ReplayEvent::Text(event) => observe(event),
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reshaped by the unit that next rewrites this"
+    )]
+    fn apply_replay(
+        &mut self,
+        data: &str,
+        observe: &mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
     ) -> Result<ControlFlow<()>, InferenceError> {
         let event: Value =
             serde_json::from_str(data).map_err(|error| self.secrets.decode_failure(error))?;
@@ -542,6 +558,9 @@ impl CodexReducer<'_> {
             if self.reported_model.is_none() {
                 tracing::Span::current().record("model.returned", model.as_str());
                 self.reported_model = Some(model);
+                if observe(ReplayEvent::ModelVerified).is_break() {
+                    return Err(InferenceError::Cancelled);
+                }
             }
         }
         if failed {
@@ -590,7 +609,11 @@ impl CodexReducer<'_> {
                         self.unattributed_deltas = true;
                     }
                     self.text.push_str(&delta);
-                    if observe(TurnEvent::TextDelta(ModelText::from_model(delta))).is_break() {
+                    if observe(ReplayEvent::Text(TurnEvent::TextDelta(
+                        ModelText::from_model(delta),
+                    )))
+                    .is_break()
+                    {
                         return Err(InferenceError::Cancelled);
                     }
                 }
@@ -2024,6 +2047,65 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|item| item["type"] == "function_call")
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_reasoning_streams_a_delta_before_the_response_completes() {
+        let created =
+            serde_json::json!({"type":"response.created","response":{"model":"gpt-test"}});
+        let delta = serde_json::json!({"type":"response.output_text.delta","delta":"live canary"});
+        let prefix = format!("data: {created}\n\ndata: {delta}\n\n");
+        let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","model":"gpt-test"}});
+        let body = format!("{prefix}data: {terminal}\n\n");
+        let (response, waiting, release) = MockResponse::sse(&body).stalled_after(prefix.len());
+        let (_directory, server, client) = fixture(vec![
+            MockResponse::sse(include_str!("fixtures/codex-tool.sse")),
+            response,
+        ]);
+        let first = generate(&client, &control()).await.unwrap();
+        let (seen, delta) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut seen = Some(seen);
+            client
+                .generate(
+                    GenerateRequest {
+                        messages: &[
+                            crate::model::assistant_message(&first),
+                            ModelMessage::tool(first.tool_calls[0].id.clone(), "done"),
+                        ],
+                        tools: &[],
+                        options: &CompletionOptions::default(),
+                    },
+                    &mut |event| {
+                        if let Some(seen) = seen.take() {
+                            let _closed = seen.send(event);
+                        }
+                        ControlFlow::Continue(())
+                    },
+                    &control(),
+                )
+                .await
+        });
+        waiting.await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), delta).await;
+        release.send(()).unwrap();
+        let answer = task.await.unwrap().unwrap();
+        let TurnEvent::TextDelta(text) = event
+            .expect("delta before releasing terminal event")
+            .unwrap();
+        assert_eq!(text.as_str(), "live canary");
+        assert_eq!(answer.content.as_deref(), Some("live canary"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let body: Value =
+            serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
         );
     }
 

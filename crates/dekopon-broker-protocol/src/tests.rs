@@ -1774,26 +1774,6 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
             RequestEnvelope::capabilities(Some(chat.clone())),
         ),
         (
-            "runCommand",
-            RequestEnvelope::run_command(
-                None,
-                "memory".to_owned(),
-                Vec::new(),
-                false,
-                sample_trace_parent(),
-            ),
-        ),
-        (
-            "runCommand",
-            RequestEnvelope::run_command(
-                Some(chat.clone()),
-                "memory".to_owned(),
-                vec!["search".to_owned(), "-".to_owned()],
-                true,
-                sample_trace_parent(),
-            ),
-        ),
-        (
             "invoke",
             RequestEnvelope::invoke(None, invocation(), vec![], 0, None),
         ),
@@ -1947,10 +1927,6 @@ fn recording_is_reachable_only_through_its_own_operation() {
             "id": "invoke-chat", "capability": "cli-probe.upper",
             "traceParent": SAMPLE_TRACE_PARENT, "input": {},
         }, "turn": turn.clone()}),
-        json!({
-            "operation": "runCommand", "traceParent": SAMPLE_TRACE_PARENT, "word": "memory",
-            "argv": [], "turn": turn.clone(),
-        }),
         json!({"operation": "capabilities", "turn": turn}),
     ] {
         assert!(
@@ -1962,101 +1938,6 @@ fn recording_is_reachable_only_through_its_own_operation() {
             "{smuggled} decoded a delivered turn onto an operation that must not carry one"
         );
     }
-}
-
-#[test]
-fn a_run_command_frame_carries_whether_stdin_is_piped_never_its_bytes() {
-    let bare = RequestEnvelope::run_command(
-        None,
-        "probe".to_owned(),
-        vec!["--help".to_owned()],
-        false,
-        sample_trace_parent(),
-    );
-    let encoded = serde_json::to_value(&bare).expect("envelope serializes");
-    assert_eq!(encoded["request"]["operation"], json!("runCommand"));
-    assert_eq!(encoded["request"]["stdinPiped"], json!(false), "{encoded}");
-    assert_eq!(
-        serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
-        bare
-    );
-
-    let piped = RequestEnvelope::run_command(
-        None,
-        "probe".to_owned(),
-        vec!["upper".to_owned(), "-".to_owned()],
-        true,
-        sample_trace_parent(),
-    );
-    let encoded = serde_json::to_value(&piped).expect("envelope serializes");
-    assert_eq!(encoded["request"]["stdinPiped"], json!(true), "{encoded}");
-    assert!(encoded["request"].get("stdin").is_none(), "{encoded}");
-    assert_eq!(
-        serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
-        piped
-    );
-}
-
-#[test]
-fn a_run_command_frame_requires_one_well_formed_trace_parent() {
-    let complete = serde_json::to_value(RequestEnvelope::run_command(
-        None,
-        "probe".to_owned(),
-        vec!["upper".to_owned(), "--text".to_owned(), "hello".to_owned()],
-        false,
-        sample_trace_parent(),
-    ))
-    .expect("envelope serializes");
-    assert_eq!(
-        complete["request"]["traceParent"],
-        json!(SAMPLE_TRACE_PARENT),
-        "{complete}"
-    );
-    let decoded =
-        serde_json::from_value::<RequestEnvelope>(complete.clone()).expect("envelope decodes");
-    let BrokerRequest::RunCommand { trace_parent, .. } = decoded.request else {
-        panic!("decoded a different operation: {decoded:?}");
-    };
-    assert_eq!(
-        trace_parent.trace().to_string(),
-        "4bf92f3577b34da6a3ce929d0e0e4736"
-    );
-
-    for (rejected, cause) in [
-        (json!(null), "invalid type: null"),
-        (
-            json!("not-a-traceparent"),
-            "traceparent must be `00-<32 hex>-<16 hex>-<2 hex>`",
-        ),
-        (
-            json!("00-00000000000000000000000000000000-00f067aa0ba902b7-01"),
-            "traceparent trace identifier must not be all zeroes",
-        ),
-    ] {
-        let mut frame = complete.clone();
-        frame["request"]
-            .as_object_mut()
-            .expect("request object")
-            .insert("traceParent".to_owned(), rejected.clone());
-        let error = serde_json::from_value::<RequestEnvelope>(frame)
-            .expect_err("a malformed trace parent must not decode");
-        assert!(
-            error.to_string().contains(cause),
-            "{rejected} was refused for the wrong reason: {error}"
-        );
-    }
-
-    let mut omitted = complete;
-    omitted["request"]
-        .as_object_mut()
-        .expect("request object")
-        .remove("traceParent");
-    let error = serde_json::from_value::<RequestEnvelope>(omitted)
-        .expect_err("a run frame without a trace parent must not decode");
-    assert!(
-        error.to_string().contains("missing field `traceParent`"),
-        "refused for the wrong reason: {error}"
-    );
 }
 
 #[test]
@@ -2142,113 +2023,6 @@ fn a_command_run_response_round_trips_each_outcome() {
             "{encoded}"
         );
     }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn a_run_command_exchange_decodes_a_rendered_answer() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    use tokio::net::UnixListener;
-
-    use super::BrokerClient;
-
-    let directory = private_socket_directory();
-    let socket = directory.path().join("broker.sock");
-    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-        .expect("make fixture socket private");
-    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
-    let limits = FrameLimits {
-        max_frame_bytes: 4 * 1024,
-        io_timeout: Duration::from_secs(1),
-    };
-    let rendered = CommandRunOutcome::Rendered {
-        stdout: "Usage: probe <COMMAND>\n".to_owned(),
-        stderr: String::new(),
-        status: 0,
-    };
-    let answer = rendered.clone();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept client fixture");
-        let request = read_frame::<_, RequestEnvelope>(&mut stream, limits)
-            .await
-            .expect("server decodes request");
-        assert_eq!(
-            request.request,
-            BrokerRequest::RunCommand {
-                attestation: None,
-                trace_parent: sample_trace_parent(),
-                word: "probe".to_owned(),
-                argv: vec!["--help".to_owned()],
-                stdin_piped: false,
-            }
-        );
-        write_frame(&mut stream, &ResponseEnvelope::command_run(answer), limits)
-            .await
-            .expect("server writes response");
-    });
-
-    let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
-    let outcome = client
-        .run_command(
-            None,
-            "probe".to_owned(),
-            vec!["--help".to_owned()],
-            false,
-            sample_trace_parent(),
-        )
-        .await
-        .expect("authenticated exchange succeeds");
-    assert_eq!(outcome, rendered);
-    server.await.expect("server fixture exits");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn an_oversized_command_frame_is_refused_before_it_leaves_the_client() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    use tokio::net::UnixListener;
-
-    use super::{BrokerClient, ClientError, ExchangePhase};
-
-    let directory = private_socket_directory();
-    let socket = directory.path().join("unread.sock");
-    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-        .expect("make fixture socket private");
-    let uid = std::fs::metadata(&socket).expect("socket metadata").uid();
-    let tight = FrameLimits {
-        max_frame_bytes: 64,
-        io_timeout: Duration::from_secs(1),
-    };
-    let client = BrokerClient::new(&socket, uid, tight).expect("valid client limits");
-    let refused = client
-        .run_command(
-            None,
-            "probe".to_owned(),
-            vec!["upper".to_owned(), "x".repeat(256)],
-            false,
-            sample_trace_parent(),
-        )
-        .await
-        .expect_err("an oversized command frame must fail");
-    drop(listener);
-    assert!(
-        matches!(
-            &refused,
-            ClientError::Protocol {
-                phase: ExchangePhase::Request,
-                source: ProtocolError::FrameTooLarge { .. },
-            }
-        ),
-        "expected a request-phase frame bound, got {refused}"
-    );
-    assert!(!refused.may_have_executed());
-    let rendered = refused.to_string();
-    assert!(rendered.contains("maximum is 64"), "rendered {rendered}");
-    assert!(!rendered.contains("unread.sock"), "rendered {rendered}");
 }
 
 #[cfg(unix)]

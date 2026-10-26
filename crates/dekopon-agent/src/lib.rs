@@ -1990,9 +1990,9 @@ mod tests {
 
             use dekopon_broker_protocol::{
                 BrokerClient, BrokerRequest, BrokerResponse, ChatScopeClaim, ChatTransportKind,
-                CommandRunOutcome, Conversation, ConversationKind, DescriptorStream, FrameLimits,
-                InvocationOutcome, ProtocolVersion, RequestEnvelope, ResponseEnvelope, TraceParent,
-                Trigger, UpcallStdin,
+                Conversation, ConversationKind, DescriptorStream, FrameLimits, InvocationOutcome,
+                ProtocolVersion, RequestEnvelope, ResponseEnvelope, TraceParent, Trigger,
+                UpcallStdin,
             };
             use dekopon_process::CancelSignal;
             use dekopon_process::ExitCode;
@@ -2152,76 +2152,61 @@ mod tests {
             }
 
             async fn accept(listener: &UnixListener) -> Call {
-                loop {
-                    let (stream, _) = listener.accept().await.expect("fake broker accepts");
-                    let mut stream = DescriptorStream::new(stream);
-                    let (request, descriptors) = stream
-                        .read_frame::<RequestEnvelope>(FrameLimits::default())
-                        .await
-                        .expect("fake broker reads a request");
-                    let run = matches!(&request.request, BrokerRequest::Run { .. });
-                    let (attestation, invocation) = match request.request {
-                        BrokerRequest::Run {
-                            attestation,
-                            invocation,
-                            trace_parent,
-                            argv,
-                            ..
-                        } => {
-                            let uri = match argv.last() {
-                                Some(dekopon_broker_protocol::Arg::Text(text)) => text.as_str(),
-                                _ => "",
-                            };
-                            (
-                                attestation,
-                                dekopon_broker_protocol::InvocationRequest {
-                                    id: invocation,
-                                    trace_parent,
-                                    capability: CAPABILITY.parse().unwrap(),
-                                    input: json!({"uri":uri}),
-                                    secret_use: None,
-                                },
-                            )
-                        }
-                        BrokerRequest::RunCommand { argv, .. } => {
-                            let proposal =
-                                ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
-                                    capability: CAPABILITY.parse().expect("capability"),
-                                    input: json!({"uri": argv.last()}),
-                                    secret_use: None,
-                                });
-                            stream
-                                .write_frame(&proposal, &[], FrameLimits::default())
-                                .await
-                                .expect("fake broker proposes");
-                            continue;
-                        }
-                        BrokerRequest::Invoke {
-                            attestation,
-                            invocation,
-                            ..
-                        } => (attestation, invocation),
-                        other @ (BrokerRequest::Capabilities { .. }
-                        | BrokerRequest::RecordDeliveredTurn { .. }
-                        | BrokerRequest::UpcallResult { .. }
-                        | BrokerRequest::PrepareGeneration { .. }
-                        | BrokerRequest::CommitGeneration { .. }
-                        | BrokerRequest::AbortGeneration { .. }
-                        | BrokerRequest::ObserveGeneration) => {
-                            panic!("unexpected request {other:?}")
-                        }
-                    };
-                    return Call {
-                        run,
-                        stream,
-                        uri: invocation.input["uri"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
+                let (stream, _) = listener.accept().await.expect("fake broker accepts");
+                let mut stream = DescriptorStream::new(stream);
+                let (request, descriptors) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
+                    .await
+                    .expect("fake broker reads a request");
+                let run = matches!(&request.request, BrokerRequest::Run { .. });
+                let (attestation, invocation) = match request.request {
+                    BrokerRequest::Run {
                         attestation,
-                        trace_parent: invocation.trace_parent,
-                        descriptors,
-                    };
+                        invocation,
+                        trace_parent,
+                        argv,
+                        ..
+                    } => {
+                        let uri = match argv.last() {
+                            Some(dekopon_broker_protocol::Arg::Text(text)) => text.as_str(),
+                            _ => "",
+                        };
+                        (
+                            attestation,
+                            dekopon_broker_protocol::InvocationRequest {
+                                id: invocation,
+                                trace_parent,
+                                capability: CAPABILITY.parse().unwrap(),
+                                input: json!({"uri":uri}),
+                                secret_use: None,
+                            },
+                        )
+                    }
+                    BrokerRequest::Invoke {
+                        attestation,
+                        invocation,
+                        ..
+                    } => (attestation, invocation),
+                    other @ (BrokerRequest::Capabilities { .. }
+                    | BrokerRequest::RecordDeliveredTurn { .. }
+                    | BrokerRequest::UpcallResult { .. }
+                    | BrokerRequest::PrepareGeneration { .. }
+                    | BrokerRequest::CommitGeneration { .. }
+                    | BrokerRequest::AbortGeneration { .. }
+                    | BrokerRequest::ObserveGeneration) => {
+                        panic!("unexpected request {other:?}")
+                    }
+                };
+                Call {
+                    run,
+                    stream,
+                    uri: invocation.input["uri"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    attestation,
+                    trace_parent: invocation.trace_parent,
+                    descriptors,
                 }
             }
 

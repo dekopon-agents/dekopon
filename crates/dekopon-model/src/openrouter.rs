@@ -6,7 +6,7 @@ use crate::{
     diagnostic::DiagnosticSecrets,
     error::{FailurePhase, InferenceError, ProtocolFailure, RequestError, TransportFailure},
     http::{InferenceHttp, Progress, record_phase},
-    inference::{GenerateRequest, InferenceModel},
+    inference::{GenerateRequest, InferenceModel, ReplayEvent},
     model::{AssistantTurn, ModelKey, ModelMessage, ModelToolCall, compact_json_body},
     openai::{
         ChunkError, FinishReason, OpenAiTool, WireMessage, WireToolCall, complete_turn,
@@ -243,7 +243,7 @@ impl OpenRouterClient {
     async fn exchange(
         &self,
         request: GenerateRequest<'_>,
-        observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        observe: &mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
         control: &TurnControl,
         progress: &mut Progress,
         identity: &ModelKey,
@@ -273,6 +273,8 @@ impl OpenRouterClient {
             .await?;
         response.require_sse(secrets)?;
         let mut state = RouterStream::new();
+        let admitted = request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(identity) && turn.has_opaque_reasoning()));
+        let mut verified = false;
         response
             .sse(control, &mut |event| {
                 progress.event();
@@ -282,11 +284,26 @@ impl OpenRouterClient {
                         Ok(ControlFlow::Break(()))
                     }
                     SseEvent::Data(data) => {
-                        let chunk = serde_json::from_str(data)
+                        let chunk: RouterChunk = serde_json::from_str(data)
                             .map_err(|error| secrets.decode_failure(error))?;
+                        let first_model = !verified && chunk.model.is_some();
+                        if first_model {
+                            let reported =
+                                chunk.model.as_deref().map(|model| secrets.sanitize(model));
+                            if admitted && identity.clone().with_reported(reported) != *identity {
+                                return Err(ProtocolFailure::ContinuationMismatch.into());
+                            }
+                            verified = true;
+                            if observe(ReplayEvent::ModelVerified).is_break() {
+                                return Err(InferenceError::Cancelled);
+                            }
+                        }
                         state.apply(
                             chunk,
-                            &mut |event| progress.observe(event, observe),
+                            &mut |event| {
+                                progress
+                                    .observe(event, &mut |event| observe(ReplayEvent::Text(event)))
+                            },
                             secrets,
                         )?;
                         Ok(ControlFlow::Continue(()))
@@ -297,13 +314,9 @@ impl OpenRouterClient {
         control
             .check()
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
-        let admitted = request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(identity) && turn.has_opaque_reasoning()));
         let turn = state
             .finish(identity, secrets)
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
-        if admitted && turn.model_key() != Some(identity) {
-            return Err(ProtocolFailure::ContinuationMismatch.into());
-        }
         if let Some(key) = turn.model_key() {
             *self.identity.write() = key.clone();
         }
@@ -318,7 +331,7 @@ impl crate::inference::ReplayModel for OpenRouterClient {
     async fn exchange<'a>(
         &'a self,
         request: GenerateRequest<'a>,
-        observe: &'a mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        observe: &'a mut (dyn FnMut(ReplayEvent) -> ControlFlow<()> + Send),
         control: &'a TurnControl,
         progress: &'a mut Progress,
         identity: &'a ModelKey,
