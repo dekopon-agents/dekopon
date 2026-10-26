@@ -21,6 +21,8 @@ impl wit::Host for StoreState {
         request: wit::Request,
     ) -> wasmtime::Result<Result<wit::Response, wit::DownloadError>> {
         let Some(directory) = self.assets.directory()? else {
+            self.assets
+                .reject(crate::bindings::dekopon::asset::asset::ErrorCode::Unconfigured);
             return Ok(Err(wit::DownloadError {
                 code: wit::ErrorCode::Internal,
             }));
@@ -40,6 +42,10 @@ impl wit::Host for StoreState {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
+                if self.http.client.asset_over_budget() {
+                    self.assets
+                        .reject(crate::bindings::dekopon::asset::asset::ErrorCode::OverBudget);
+                }
                 return Ok(Err(wit::DownloadError {
                     code: match error {
                         DownloadError::Denied => wit::ErrorCode::Denied,
@@ -83,7 +89,8 @@ impl wit::Host for StoreState {
                         .await;
                         let handle = match handle {
                             Ok(handle) => handle,
-                            Err(_) => {
+                            Err(error) => {
+                                self.assets.reject(error.code);
                                 return Ok(Err(wit::DownloadError {
                                     code: wit::ErrorCode::Internal,
                                 }));

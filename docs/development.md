@@ -649,3 +649,22 @@ group- or world-writable, or `dekopon-brokerd` refuses to start.
 - Follow the [PR template](../.github/pull_request_template.md): summary, security impact, validation actually run, and limitations/follow-ups.
 - Use a conventional commit subject where practical.
 - Push the branch, open the PR, and verify the required checks rather than assuming local success implies remote success.
+
+### Signed-download package and release order
+
+The new published contract is `dekopon:http/signed-download@0.1.0`, in the independent
+`dekopon:http@0.1.0` package under `wit/signed-download/`. Existing HTTP 1.1 bytes remain immutable.
+Its canonical `signed-download.wit` is mirrored byte-for-byte in the SDK and broker-host
+`wit/deps/signed-download.wit`; its asset dependency mirrors `wit/asset/asset.wit`.
+The WIT publication workflow builds, validates, compares mirrors, round-trips and publishes this
+package beside the existing packages. The SDK exposes it through `signed_download` and the broker
+links the separate interface. Rebuild the seven checked components with their pinned scripts and
+verify existing imports before publication. SDK/testkit exact pins move together for consumers.
+
+Ship the core interface PR first and carry it in a dekopon **minor** release before the provider
+PR imports it. The stated deployment baseline is core 0.55.0 live with 0.56.0 rolling out, and
+provider-gh 0.11.0 live; neither baseline supports this import. Core deployment must precede new
+provider imports and grant configuration. Validate the actual deployed component imports and
+configuration before activation; source inspection alone does not establish deployment readiness.
+This PR does not release, deploy, implement provider rendering/cursors, or grant logs authority.
+The owner retains the actions-grants decision, including the recommended response-byte limit.

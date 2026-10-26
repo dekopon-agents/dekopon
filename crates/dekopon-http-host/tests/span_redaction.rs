@@ -86,6 +86,7 @@ async fn templated_requests_trace_the_rebuilt_url(captured: &CaptureLayer) {
             max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
+            signed_download: None,
             request_templates: vec![
                 serde_json::from_value::<RequestTemplate>(serde_json::json!({
                     "method": "GET",

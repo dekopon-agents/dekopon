@@ -1859,6 +1859,38 @@ fn bounded_message(message: &str) -> String {
     output
 }
 
+fn response_head_bytes(
+    headers: &HeaderMap,
+    ceilings: &HttpHostCeilings,
+    maximum: u64,
+) -> Result<u64, HttpError> {
+    if headers.len() > ceilings.max_headers {
+        return Err(http_error(
+            ErrorCode::ResponseTooLarge,
+            "response has too many headers",
+        ));
+    }
+    let mut bytes = 16_u64;
+    if bytes > ceilings.max_header_bytes as u64 || bytes > maximum {
+        return Err(http_error(
+            ErrorCode::ResponseTooLarge,
+            "response headers exceed an authorized bound",
+        ));
+    }
+    for (name, value) in headers {
+        bytes = bytes
+            .checked_add((name.as_str().len() + value.as_bytes().len() + 4) as u64)
+            .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
+        if bytes > ceilings.max_header_bytes as u64 || bytes > maximum {
+            return Err(http_error(
+                ErrorCode::ResponseTooLarge,
+                "response headers exceed an authorized bound",
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
 fn violation_label(code: ErrorCode) -> Option<&'static str> {
     PolicyViolation::from_code(code).map(PolicyViolation::label)
 }
@@ -2931,6 +2963,7 @@ mod tests {
     fn templated(authority: &str, template: serde_json::Value) -> HttpConstraints {
         HttpConstraints {
             allowed_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            signed_download: None,
             request_templates: vec![
                 serde_json::from_value::<RequestTemplate>(template).expect("template fixture"),
             ],

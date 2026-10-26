@@ -1312,6 +1312,7 @@ fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
         max_response_bytes: 1024,
         allow_plaintext_loopback: false,
         propagate_trace: false,
+        signed_download: None,
         request_templates: vec![
             serde_json::from_value::<RequestTemplate>(serde_json::json!({
                 "method": "GET",

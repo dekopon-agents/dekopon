@@ -571,26 +571,13 @@ impl BufferedHttpClient {
         };
         let status = response.status().as_u16();
         self.evidence[index].status = Some(status);
-        if response.headers().len() > self.ceilings.max_headers {
-            return Err(http_error(
-                ErrorCode::ResponseTooLarge,
-                "response has too many headers",
-            ));
-        }
+        let response_bytes = super::response_head_bytes(
+            response.headers(),
+            &self.ceilings,
+            grant.max_response_bytes,
+        )?;
         let mut headers = Vec::with_capacity(response.headers().len());
-        let mut response_bytes = 16_u64;
         for (name, value) in response.headers() {
-            response_bytes = response_bytes
-                .checked_add((name.as_str().len() + value.as_bytes().len() + 4) as u64)
-                .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
-            if response_bytes > self.ceilings.max_header_bytes as u64
-                || response_bytes > grant.max_response_bytes
-            {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
-                    "response headers exceed an authorized bound",
-                ));
-            }
             if !is_forbidden_response_header(name)
                 && (decoder.is_none()
                     || (name != reqwest::header::CONTENT_ENCODING

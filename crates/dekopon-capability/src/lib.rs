@@ -1106,6 +1106,7 @@ mod tests {
             max_response_bytes: 1,
             allow_plaintext_loopback: false,
             propagate_trace: false,
+            signed_download: None,
             request_templates: serde_json::from_value(templates).expect("template fixtures"),
         };
         let replies = json!({"method": "GET", "path": "/api/conversations.replies",

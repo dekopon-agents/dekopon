@@ -103,6 +103,23 @@ attestation and tree budget. The gateway runs the script, not the broker;
 secrets remain broker-side. A probe and a probe-started job retain their
 read-only capability surface, so nesting cannot turn a read into a write.
 
+## Signed downloads
+
+The separate `dekopon:http/signed-download@0.1.0` interface requires an invocation's
+`signedDownload: github-actions-logs-v1` constraint. Its API GET retains ordinary exact-host,
+method, policy and credential-binding checks. Only the fixed Actions job-log route can produce
+one native storage hop. Storage hostname families are compiled, anchored and bounded; unknown
+families, plaintext, literals, userinfo, fragments, oversized Location headers and additional
+redirects refuse. DNS addresses are validated and pinned, with no production private-address
+exception. Storage transport has no credential binding, inherited headers or trace propagation.
+The signed URL remains native and redacted; traces retain both effects without secret URL bytes.
+A byte-zero probe establishes the total before an explicit bounded window request. All requests
+consume the invocation's request count and the download sequence retains its deadline. Status,
+headers and body share the response-byte grant; the storage body separately caps at 64 KiB.
+The host returns non-302 API responses unchanged and storage status/coverage separately; the
+provider owns GitHub outcome semantics, untrusted-text rendering and continuation cursors.
+No deployment gains this constraint or a logs capability merely by upgrading core.
+
 ## Public DRNs and private resolution
 
 **Status: current.** A model may propose one canonical logical DRN only through the typed top-level

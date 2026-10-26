@@ -72,13 +72,110 @@ impl From<HttpError> for DownloadError {
 }
 
 struct Destination {
-    uri: Url,
-    transport: BufferedHttpClient,
-    grant: HttpConstraints,
+    uri: dekopon_core::Redacted<Url>,
+    client: reqwest::Client,
+    headers: reqwest::header::HeaderMap,
+    authority: String,
+    request_bytes: u64,
+    span: tracing::Span,
+}
+
+impl Destination {
+    async fn new(
+        uri: Url,
+        grant: HttpConstraints,
+        ceilings: super::HttpHostCeilings,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, DownloadError> {
+        let budget = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(DownloadError::Timeout)?;
+        let mut validator = BufferedHttpClient::authorized(grant.clone(), ceilings, budget)
+            .map_err(|_cause| DownloadError::Internal)?;
+        validator.deadline = deadline;
+        let prepared = validator
+            .prepare(
+                Request {
+                    method: "GET".to_owned(),
+                    uri: uri.as_str().to_owned(),
+                    headers: vec![
+                        Header {
+                            name: "accept-encoding".to_owned(),
+                            value: b"identity".to_vec(),
+                        },
+                        Header {
+                            name: "user-agent".to_owned(),
+                            value: b"dekopon".to_vec(),
+                        },
+                    ],
+                    body: vec![],
+                },
+                &grant,
+                None,
+            )
+            .await
+            .map_err(|error| match error.code {
+                ErrorCode::Denied => DownloadError::RedirectRefused,
+                ErrorCode::InvalidMethod
+                | ErrorCode::InvalidUri
+                | ErrorCode::InvalidHeader
+                | ErrorCode::RequestTooLarge
+                | ErrorCode::HostCallLimit
+                | ErrorCode::Dns
+                | ErrorCode::Connect
+                | ErrorCode::Tls
+                | ErrorCode::Timeout
+                | ErrorCode::Protocol
+                | ErrorCode::ResponseTooLarge
+                | ErrorCode::Internal => DownloadError::from(error),
+            })?;
+        let client = validator
+            .pinned_client(
+                &prepared.host,
+                &prepared.addresses,
+                validator.remaining().map_err(DownloadError::from)?,
+            )
+            .map_err(DownloadError::from)?;
+        Ok(Self {
+            uri: dekopon_core::Redacted::new(prepared.url),
+            client,
+            headers: prepared.headers,
+            authority: prepared.authority,
+            request_bytes: prepared.request_bytes,
+            span: tracing::Span::none(),
+        })
+    }
 }
 
 impl BufferedHttpClient {
     pub async fn signed_download(
+        &mut self,
+        api_uri: String,
+        window: Window,
+        directory: &AssetDirectory,
+    ) -> Result<DownloadResponse, DownloadError> {
+        let result = self
+            .signed_download_checked(api_uri, window, directory)
+            .await;
+        let violation = match &result {
+            Ok(_) => None,
+            Err(error) => match error {
+                DownloadError::Denied | DownloadError::RedirectRefused => {
+                    Some(super::PolicyViolation::Denied)
+                }
+                DownloadError::RequestLimit => Some(super::PolicyViolation::HostCallLimit),
+                DownloadError::ResponseTooLarge => Some(super::PolicyViolation::ByteLimit),
+                DownloadError::Timeout
+                | DownloadError::Incomplete
+                | DownloadError::Storage
+                | DownloadError::Internal => None,
+            },
+        };
+        self.policy_violation = violation.or(self.policy_violation);
+        result
+    }
+
+    async fn signed_download_checked(
         &mut self,
         api_uri: String,
         window: Window,
@@ -98,7 +195,14 @@ impl BufferedHttpClient {
         }
         let span = tracing::info_span!(
             "http.request",
+            "url.full" = api_uri,
             "http.request.method" = "GET",
+            "server.address" = tracing::field::Empty,
+            "http.response.status_code" = tracing::field::Empty,
+            "dekopon.http.request.accounted_bytes" = tracing::field::Empty,
+            "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
+            "error.code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
             outcome = tracing::field::Empty
         );
         let index = self.evidence.len();
@@ -106,7 +210,10 @@ impl BufferedHttpClient {
             .send_checked(Request {
                 method: "GET".to_owned(),
                 uri: api_uri,
-                headers: vec![],
+                headers: vec![Header {
+                    name: "user-agent".to_owned(),
+                    value: b"dekopon".to_vec(),
+                }],
                 body: vec![],
             })
             .instrument(span.clone())
@@ -130,14 +237,7 @@ impl BufferedHttpClient {
         grant.allow_plaintext_loopback = false;
         let mut ceilings = self.ceilings.clone();
         ceilings.non_public_https = std::sync::Arc::new(Vec::new());
-        let mut transport = Self::authorized(grant.clone(), ceilings, self.timeout)
-            .map_err(|_| DownloadError::Internal)?;
-        transport.deadline = self.deadline;
-        let mut destination = Destination {
-            uri,
-            transport,
-            grant,
-        };
+        let mut destination = Destination::new(uri, grant, ceilings, self.deadline).await?;
         let probe = self.storage_get(&mut destination, 0, 0).await?;
         if probe.status().as_u16() != 206 {
             return storage_status(probe.status().as_u16());
@@ -197,66 +297,50 @@ impl BufferedHttpClient {
         self.calls += 1;
         let span = tracing::info_span!(
             "http.request",
-            "server.address" = destination.uri.host_str(),
+            "server.address" = destination.uri.expose().host_str(),
             "http.request.method" = "GET",
-            "http.response.status_code" = tracing::field::Empty
+            "http.response.status_code" = tracing::field::Empty,
+            "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
+            "error.code" = tracing::field::Empty,
+            outcome = tracing::field::Empty
         );
+        destination.span = span.clone();
         async {
-            let prepared = destination
-                .transport
-                .prepare(
-                    Request {
-                        method: "GET".to_owned(),
-                        uri: destination.uri.as_str().to_owned(),
-                        headers: vec![
-                            Header {
-                                name: "range".to_owned(),
-                                value: format!("bytes={start}-{end}").into_bytes(),
-                            },
-                            Header {
-                                name: "accept-encoding".to_owned(),
-                                value: b"identity".to_vec(),
-                            },
-                            Header {
-                                name: "user-agent".to_owned(),
-                                value: b"dekopon".to_vec(),
-                            },
-                        ],
-                        body: vec![],
-                    },
-                    &destination.grant,
-                    None,
-                )
-                .await
-                .map_err(DownloadError::from)?;
+            let range = format!("bytes={start}-{end}");
+            let request_bytes = destination
+                .request_bytes
+                .checked_add((range.len() + 9) as u64)
+                .ok_or(DownloadError::Denied)?;
+            if request_bytes
+                > self
+                    .grant
+                    .as_ref()
+                    .ok_or(DownloadError::Denied)?
+                    .max_request_bytes
+            {
+                return Err(DownloadError::Denied);
+            }
             self.evidence.push(HttpCallEvidence {
                 method: "GET".to_owned(),
-                authority: prepared.authority,
+                authority: destination.authority.clone(),
                 status: None,
-                request_bytes: prepared.request_bytes,
+                request_bytes,
                 response_bytes: 0,
                 upstream_request_id: None,
                 credential_injected: false,
             });
-            let client = destination
-                .transport
-                .pinned_client(
-                    &prepared.host,
-                    &prepared.addresses,
-                    self.remaining().map_err(DownloadError::from)?,
-                )
-                .map_err(DownloadError::from)?;
-            // This transport is constructed without a credential and never enters the injector.
             let response = timeout_at(
                 self.deadline,
-                client
-                    .request(Method::GET, prepared.url)
-                    .headers(prepared.headers)
+                destination
+                    .client
+                    .request(Method::GET, destination.uri.expose().clone())
+                    .headers(destination.headers.clone())
+                    .header("range", range)
                     .send(),
             )
             .await
-            .map_err(|_| DownloadError::Timeout)?
-            .map_err(|_| DownloadError::Storage)?;
+            .map_err(|_cause| DownloadError::Timeout)?
+            .map_err(|_cause| DownloadError::Storage)?;
             let status = response.status().as_u16();
             tracing::Span::current().record("http.response.status_code", status);
             if let Some(evidence) = self.evidence.last_mut() {
@@ -278,21 +362,8 @@ impl BufferedHttpClient {
             .as_ref()
             .ok_or(DownloadError::Denied)?
             .max_response_bytes;
-        if response.headers().len() > self.ceilings.max_headers {
-            return Err(DownloadError::ResponseTooLarge);
-        }
-        let mut bytes = 16_u64;
-        for (name, value) in response.headers() {
-            bytes = bytes
-                .checked_add((name.as_str().len() + value.len() + 4) as u64)
-                .ok_or(DownloadError::ResponseTooLarge)?;
-            if bytes > maximum || bytes > self.ceilings.max_header_bytes as u64 {
-                return Err(DownloadError::ResponseTooLarge);
-            }
-        }
-        if response.headers().contains_key("content-encoding") {
-            return Err(DownloadError::Incomplete);
-        }
+        let bytes = super::response_head_bytes(response.headers(), &self.ceilings, maximum)
+            .map_err(DownloadError::from)?;
         if let Some(evidence) = self.evidence.last_mut() {
             evidence.response_bytes = bytes;
         }
@@ -300,6 +371,34 @@ impl BufferedHttpClient {
     }
 
     async fn read_storage(
+        &mut self,
+        response: reqwest::Response,
+        destination: &Destination,
+        coverage: Coverage,
+        directory: &AssetDirectory,
+    ) -> Result<AssetFile, DownloadError> {
+        let result = self
+            .read_storage_checked(response, destination, coverage, directory)
+            .instrument(destination.span.clone())
+            .await;
+        destination
+            .span
+            .record("outcome", if result.is_ok() { "ok" } else { "error" });
+        if let Some(evidence) = self.evidence.last() {
+            destination.span.record(
+                "dekopon.http.response.accounted_bytes",
+                evidence.response_bytes,
+            );
+        }
+        if let Err(error) = &result {
+            destination
+                .span
+                .record("error.code", tracing::field::debug(error));
+        }
+        result
+    }
+
+    async fn read_storage_checked(
         &mut self,
         mut response: reqwest::Response,
         destination: &Destination,
@@ -311,7 +410,23 @@ impl BufferedHttpClient {
             .as_ref()
             .ok_or(DownloadError::Denied)?
             .max_response_bytes;
+        if response
+            .headers()
+            .get_all("content-encoding")
+            .iter()
+            .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(DownloadError::Incomplete);
+        }
         let expected = coverage.end_exclusive - coverage.start;
+        if let Some(length) = response.content_length() {
+            if length > expected {
+                return Err(DownloadError::ResponseTooLarge);
+            }
+            if length != expected {
+                return Err(DownloadError::Incomplete);
+            }
+        }
         if expected > u64::from(WINDOW_BYTES) {
             return Err(DownloadError::ResponseTooLarge);
         }
@@ -322,8 +437,13 @@ impl BufferedHttpClient {
         let mut read = 0_u64;
         let mut scan = Vec::new();
         let patterns = [
-            destination.uri.as_str().as_bytes(),
-            destination.uri.query().unwrap_or_default().as_bytes(),
+            destination.uri.expose().as_str().as_bytes(),
+            destination
+                .uri
+                .expose()
+                .query()
+                .unwrap_or_default()
+                .as_bytes(),
         ];
         let overlap = patterns
             .iter()
@@ -334,8 +454,8 @@ impl BufferedHttpClient {
         let mut credential_scan = Vec::new();
         while let Some(chunk) = timeout_at(self.deadline, response.chunk())
             .await
-            .map_err(|_| DownloadError::Timeout)?
-            .map_err(|_| DownloadError::Incomplete)?
+            .map_err(|_cause| DownloadError::Timeout)?
+            .map_err(|_cause| DownloadError::Incomplete)?
         {
             read = read
                 .checked_add(chunk.len() as u64)
@@ -404,20 +524,26 @@ fn api_route(uri: &str) -> bool {
         return false;
     }
     let segments = url.path().split('/').collect::<Vec<_>>();
-    let Some(route) = segments.windows(7).last() else {
+    let [
+        "",
+        "repos",
+        owner,
+        repository,
+        "actions",
+        "jobs",
+        job,
+        "logs",
+    ] = segments.as_slice()
+    else {
         return false;
     };
-    route[0] == "repos"
-        && route[3] == "actions"
-        && route[4] == "jobs"
-        && route[6] == "logs"
-        && [route[1], route[2]].iter().all(|value| {
-            !value.is_empty()
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        })
-        && route[5].parse::<u64>().is_ok_and(|id| id > 0)
+    [owner, repository].iter().all(|value| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    }) && job.bytes().all(|byte| byte.is_ascii_digit())
+        && job.parse::<u64>().is_ok_and(|id| id > 0)
 }
 
 fn location(headers: &[Header]) -> Result<Url, DownloadError> {
@@ -427,12 +553,16 @@ fn location(headers: &[Header]) -> Result<Url, DownloadError> {
     let header = locations.next().ok_or(DownloadError::RedirectRefused)?;
     if locations.next().is_some()
         || header.value.len() > LOCATION_BYTES
-        || header.value.iter().any(|b| b.is_ascii_control())
+        || header
+            .value
+            .iter()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
     {
         return Err(DownloadError::RedirectRefused);
     }
-    let value = std::str::from_utf8(&header.value).map_err(|_| DownloadError::RedirectRefused)?;
-    let uri = Url::parse(value).map_err(|_| DownloadError::RedirectRefused)?;
+    let value =
+        std::str::from_utf8(&header.value).map_err(|_cause| DownloadError::RedirectRefused)?;
+    let uri = Url::parse(value).map_err(|_cause| DownloadError::RedirectRefused)?;
     if uri.scheme() != "https"
         || uri.port_or_known_default() != Some(443)
         || !uri.username().is_empty()
@@ -532,20 +662,15 @@ mod tests {
         }
     }
 
-    fn destination(server: &LoopbackServer, parent: &BufferedHttpClient) -> Destination {
-        let grant = grant(server.authority());
-        let mut transport = BufferedHttpClient::authorized(
-            grant.clone(),
+    async fn destination(server: &LoopbackServer, parent: &BufferedHttpClient) -> Destination {
+        Destination::new(
+            Url::parse(&format!("{}?sig=private-signed-query", server.url())).unwrap(),
+            grant(server.authority()),
             HttpHostCeilings::default(),
-            Duration::from_secs(5),
+            parent.deadline,
         )
-        .unwrap();
-        transport.deadline = parent.deadline;
-        Destination {
-            uri: Url::parse(&format!("{}?sig=private-signed-query", server.url())).unwrap(),
-            transport,
-            grant,
-        }
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -622,7 +747,7 @@ mod tests {
         ]);
         let root = tempfile::tempdir().unwrap();
         let directory = AssetDirectory::new(root.path().to_owned(), 131072);
-        let mut target = destination(&storage, &parent);
+        let mut target = destination(&storage, &parent).await;
         let deadline = parent.deadline;
         let probe = parent.storage_get(&mut target, 0, 0).await.unwrap();
         let coverage = content_range(&probe).unwrap();
@@ -666,7 +791,7 @@ mod tests {
         ] {
             let server = LoopbackServer::once(&response);
             let mut parent = BufferedHttpClient::authorized(grant(server.authority()), HttpHostCeilings::default(), Duration::from_secs(5)).unwrap();
-            let mut target = destination(&server, &parent);
+            let mut target = destination(&server, &parent).await;
             let root = tempfile::tempdir().unwrap();
             let directory = AssetDirectory::new(root.path().to_owned(), 65536);
             let result = match parent.storage_get(&mut target, 0, 2).await {
@@ -700,8 +825,199 @@ mod tests {
             }
         }
         assert!(!api_route("https://api.github.com/user"));
+        assert!(!api_route(
+            "https://api.github.com/extra/repos/owner/repo/actions/jobs/1/logs"
+        ));
+        assert!(!api_route(
+            "https://api.github.com/repos/owner/repo/actions/jobs/+1/logs"
+        ));
         assert!(api_route(
             "https://api.github.com/repos/owner/repo/actions/jobs/1/logs"
         ));
+    }
+    async fn tls_api(
+        response: Vec<u8>,
+    ) -> (String, HttpHostCeilings, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["api.fixture.test".to_owned()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let authority = format!("api.fixture.test:{}", address.port());
+        let pin =
+            crate::LoopbackHttpsPin::new(&authority, address, certified.cert.pem().into_bytes())
+                .unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let count = tls.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+                assert!(request.len() < 16384);
+            }
+            tls.write_all(&response).await.unwrap();
+            tls.shutdown().await.unwrap();
+            request
+        });
+        (
+            format!("https://{authority}/repos/owner/repo/actions/jobs/1/logs"),
+            HttpHostCeilings {
+                loopback_https_pin: Some(pin),
+                ..HttpHostCeilings::default()
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_signed_download_rejects_locations_before_any_storage_request_and_keeps_api_statuses()
+     {
+        for value in [
+            "http://productionresultssa1.blob.core.windows.net/log".to_owned(),
+            "https://evil.test/log".to_owned(),
+            "https://127.0.0.1/log".to_owned(),
+            "https://[::1]/log".to_owned(),
+            format!(
+                "https://productionresultssa1.blob.core.windows.net/{}",
+                "x".repeat(8192)
+            ),
+        ] {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {value}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let (uri, ceilings, server) = tls_api(response.into_bytes()).await;
+            let authority = Url::parse(&uri).unwrap().authority().to_owned();
+            let secret = "native-tls-api-secret-sixteen-bytes";
+            let credential = BoundCredential::bearer(
+                "Bearer",
+                Redacted::new(secret.to_owned()),
+                vec![authority.clone()],
+            )
+            .unwrap();
+            let mut parent = BufferedHttpClient::authorized_with_credential(
+                grant(&authority),
+                Some(credential),
+                ceilings,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let result = parent
+                .signed_download(
+                    uri,
+                    Window::Tail(65536),
+                    &AssetDirectory::new(root.path().to_owned(), 131072),
+                )
+                .await;
+            assert_eq!(result.err(), Some(DownloadError::RedirectRefused));
+            assert_eq!(parent.calls, 1);
+            assert_eq!(parent.evidence.len(), 1);
+            let request = String::from_utf8(server.await.unwrap()).unwrap();
+            assert!(request.contains(secret));
+            assert!(request.to_ascii_lowercase().contains("user-agent: dekopon"));
+            assert!(request.starts_with("GET /repos/owner/repo/actions/jobs/1/logs HTTP/1.1"));
+        }
+        for status in [403, 404, 410] {
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Length: 3\r\nX-Fixture: safe\r\nConnection: close\r\n\r\nraw"
+            );
+            let (uri, ceilings, server) = tls_api(response.into_bytes()).await;
+            let authority = Url::parse(&uri).unwrap().authority().to_owned();
+            let mut parent =
+                BufferedHttpClient::authorized(grant(&authority), ceilings, Duration::from_secs(5))
+                    .unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let response = parent
+                .signed_download(
+                    uri,
+                    Window::Tail(65536),
+                    &AssetDirectory::new(root.path().to_owned(), 131072),
+                )
+                .await
+                .unwrap();
+            match response {
+                DownloadResponse::Api(response) => {
+                    assert_eq!(response.status, status);
+                    assert_eq!(response.body, b"raw");
+                }
+                DownloadResponse::Storage { .. } => panic!("API status became a storage status"),
+            }
+            assert_eq!(parent.calls, 1);
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn native_signed_storage_traces_exclude_signed_urls_and_keep_opaque_bytes() {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let captured = dekopon_test_support::CaptureLayer::workspace();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        async {
+            let response = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xff\x1b\0\n";
+            let server = LoopbackServer::once(response);
+            let mut parent = BufferedHttpClient::authorized(grant(server.authority()), HttpHostCeilings::default(), Duration::from_secs(5)).unwrap();
+            let mut target = destination(&server, &parent).await;
+            let root = tempfile::tempdir().unwrap();
+            let response = parent.storage_get(&mut target, 0, 3).await.unwrap();
+            let coverage = content_range(&response).unwrap();
+            let body = parent.read_storage(response, &target, coverage, &AssetDirectory::new(root.path().to_owned(), 65536)).await.unwrap();
+            let bytes = crate::read_decoded(body.file(), crate::Representation::Identity, 0, 4).unwrap();
+            assert_eq!(bytes, b"\xff\x1b\0\n");
+            assert!(server.request_text().contains("sig=private-signed-query"));
+            server.join();
+        }.with_subscriber(subscriber).await;
+        let recorded = captured.text();
+        assert!(recorded.contains("http.request"));
+        assert!(recorded.contains("206"));
+        assert!(!recorded.contains("private-signed-query"));
+        assert!(!recorded.contains("?sig="));
+    }
+
+    #[tokio::test]
+    async fn native_signed_download_requires_its_separate_grant_before_api_egress() {
+        let mut constraints = grant("api.github.com");
+        constraints.signed_download = None;
+        let mut parent = BufferedHttpClient::authorized(
+            constraints,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let result = parent
+            .signed_download(
+                "https://api.github.com/repos/owner/repo/actions/jobs/1/logs".to_owned(),
+                Window::Tail(65536),
+                &AssetDirectory::new(root.path().to_owned(), 65536),
+            )
+            .await;
+        assert_eq!(result.err(), Some(DownloadError::Denied));
+        assert_eq!(parent.calls, 0);
+        assert!(parent.evidence.is_empty());
+        assert_eq!(
+            parent.policy_violation(),
+            Some(crate::PolicyViolation::Denied)
+        );
     }
 }

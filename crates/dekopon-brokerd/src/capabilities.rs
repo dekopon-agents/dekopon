@@ -245,7 +245,7 @@ mod tests {
     use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
 
     use super::{
-        CapabilityConfig, CapabilityProblem, ManifestCapability, ProviderCapabilities,
+        CapabilityConfig, CapabilityProblem, HttpPatch, ManifestCapability, ProviderCapabilities,
         constraint_sets,
     };
 
@@ -454,5 +454,25 @@ absent:
         assert!(problems.contains(&CapabilityProblem::UnknownProvider {
             provider: "absent".parse().expect("provider"),
         }));
+    }
+    #[test]
+    fn signed_download_is_a_closed_optional_constraint_inherited_without_changing_hosts() {
+        use dekopon_capability::SignedDownload;
+        let base: HttpPatch = serde_yaml::from_str(
+            "allowedHosts: [api.github.com]\nsignedDownload: github-actions-logs-v1\n",
+        )
+        .unwrap();
+        let inherited = HttpPatch::default().over(&base);
+        assert_eq!(
+            inherited.signed_download,
+            Some(SignedDownload::GithubActionsLogsV1)
+        );
+        assert_eq!(
+            inherited.allowed_hosts,
+            Some(vec!["api.github.com".to_owned()])
+        );
+        let absent: HttpPatch = serde_yaml::from_str("allowedHosts: [api.github.com]").unwrap();
+        assert_eq!(absent.signed_download, None);
+        assert!(serde_yaml::from_str::<HttpPatch>("signedDownload: arbitrary-hosts").is_err());
     }
 }
