@@ -8,6 +8,14 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Signed downloads and per-thread conversation keys (0.58.0)
+
+No configuration change is required, and existing providers need no re-pin. Before upgrading:
+
+- Providers may import the new `dekopon:http/signed-download@0.1.0` interface (published as the WIT package `dekopon:http@0.1.0`, beside `dekopon:http@1.1.0`) through the 0.58.0 SDK. An import is usable only under a grant whose HTTP constraints add `signedDownload: github-actions-logs-v1`; it is disabled when absent, and no existing grant changes. The API request still needs its exact `allowedHosts` entry, GET and destination-bound credential; see the brokerd README's signed-download constraint for the admitted storage hosts and the recommended `maxResponseBytes: 131072`. Deploy this core before a provider that imports the interface. Rust callers constructing `dekopon_capability::HttpConstraints` struct literals must add `signed_download: None` unless enabling signed downloads.
+- Conversation keys now separate workspace, channel and thread. Per-conversation journals, seals, pins, stored attachment references and prompt-cache keys use the new key, so conversation memory and attachment references recorded before the upgrade are not recalled after it, and prompt caches miss once. Files under the old stems are left in place, subject to normal retention; they are not migrated or reset. Space-scoped memory keeps its key. Downgrading to 0.57.0 uses the old keys again and may recall retained pre-upgrade conversation history; history under the new keys is not recalled. 0.58.0 also journals attachment rows without a byte source, which 0.57.0 cannot read: at startup it resets every journal holding one (`gateway.journal.reset`, `reason=corrupt`), space-scoped journals and their pre-upgrade history included.
+- An attachment whose bytes are unavailable keeps its metadata row, and a content-filter refusal keeps its provider code.
+
 ## Host-call refusal reasons and durable model identity (0.57.0)
 
 No configuration change and no provider WIT or SDK re-pin. Before upgrading:
