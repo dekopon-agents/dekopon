@@ -1,3 +1,5 @@
+#[expect(dead_code, reason = "summary engine is staged before the B4 switch")]
+pub(crate) mod engine;
 pub(crate) mod generation;
 pub(crate) mod journal;
 

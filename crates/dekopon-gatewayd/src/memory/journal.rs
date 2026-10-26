@@ -1,3 +1,9 @@
+#[expect(
+    dead_code,
+    reason = "v3 journal primitives are staged before the B4 switch"
+)]
+pub(crate) mod records;
+
 mod selection;
 pub(crate) use selection::{Projection, decide};
 mod tools;
@@ -180,8 +186,20 @@ impl Journal {
         seal_retention: Duration,
         now: SystemTime,
     ) -> Result<Self, JournalError> {
+        let journal = Self::create(dir, max_age, retention, seal_retention)?;
+        journal.reset_invalid_files()?;
+        journal.expire(now)?;
+        Ok(journal)
+    }
+
+    fn create(
+        dir: &Path,
+        max_age: Duration,
+        retention: Duration,
+        seal_retention: Duration,
+    ) -> Result<Self, JournalError> {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let journal = Self {
+        Ok(Self {
             dir: dir.to_path_buf(),
             max_age,
             agent_ages: HashMap::new(),
@@ -191,10 +209,7 @@ impl Journal {
             seal_retention,
             lock: Mutex::new(()),
             assets: Mutex::new(None),
-        };
-        journal.reset_invalid_files()?;
-        journal.expire(now)?;
-        Ok(journal)
+        })
     }
 
     pub(crate) fn attach_assets(
@@ -971,7 +986,7 @@ fn encode_line(line: &Line) -> Result<Vec<u8>, JournalError> {
     Ok(encoded)
 }
 
-fn millis(at: SystemTime) -> u64 {
+pub(super) fn millis(at: SystemTime) -> u64 {
     duration_millis(at.duration_since(UNIX_EPOCH).unwrap_or_default())
 }
 

@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use dekopon_agent::prompt::PromptLimits;
 use dekopon_broker_protocol::{Conversation, ConversationKind, ConversationMatch};
@@ -51,6 +55,7 @@ pub(crate) struct BoundRoute {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RoutingTable {
     routes: Vec<BoundRoute>,
+    pub(crate) models: BTreeMap<String, Arc<ModelConfig>>,
 }
 
 impl RoutingTable {
@@ -141,7 +146,13 @@ impl RoutingTable {
             });
         }
         if problems.is_empty() {
-            Ok(Self { routes })
+            Ok(Self {
+                routes,
+                models: models
+                    .into_iter()
+                    .map(|model| (model.name().to_owned(), model))
+                    .collect(),
+            })
         } else {
             Err(RouteError { problems })
         }
