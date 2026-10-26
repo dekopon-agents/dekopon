@@ -136,17 +136,28 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
             })
         );
     }
-    assert!(
-        capture
-            .events_where("dekopon_broker", &[("audit.event", "broker.decision")])
-            .is_empty()
+    let lookups = capture
+        .records()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record,
+                dekopon_test_support::Record::Span {
+                    name: "gateway.participant.lookup",
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lookups.len(), 1);
+    assert_eq!(lookups[0].parent(), Some("gateway.session"));
+    assert_eq!(
+        lookups[0].field("turn.owner"),
+        Some(first.subject.canonical()).as_deref()
     );
-    let parents = capture.span_parents();
-    assert!(
-        parents
-            .iter()
-            .any(|(name, parent)| *name == "gateway.participant.lookup"
-                && parent.as_deref() == Some("gateway.session"))
+    assert_eq!(
+        lookups[0].field("subject"),
+        Some(speaker(8, "").subject.canonical()).as_deref()
     );
 }
 
@@ -405,49 +416,86 @@ fn only_the_askers_native_chat_steer_interrupts_a_mapped_turn() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_subject() {
-    let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![
-            listing("asker", true),
-            listing("ana", true),
-            ResponseEnvelope::session_refused(&SessionRefusal::Other),
-        ],
-    )
-    .await;
-    let models = InterruptibleModel::new([answer("owner final"), answer("participant final")]);
-    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
-    let driver = Arc::new(RecordingDriver::default());
-    let mut route = shared_route();
-    route.limits.max_steps = 1;
-    let task = tokio::spawn(run_session(
-        Arc::clone(&runner),
-        route.clone(),
-        speaker(9, "asker request"),
-        Arc::clone(&driver) as Arc<dyn ChatDriver>,
-    ));
-    models.wait_until_entered().await;
-    for (index, text) in [
-        (8, "authorized participant text"),
-        (7, "unchecked participant marker"),
-    ] {
-        run_session(
-            Arc::clone(&runner),
-            route.clone(),
-            speaker(index, text),
-            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    for third_authorized in [false, true] {
+        let directory = temporary();
+        let third = if third_authorized {
+            listing("carol", true)
+        } else {
+            ResponseEnvelope::session_refused(&SessionRefusal::Other)
+        };
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            vec![listing("asker", true), listing("ana", true), third],
         )
         .await;
+        let mut answers = vec![answer("owner final"), answer("participant final")];
+        if third_authorized {
+            answers.push(answer("third final"));
+        }
+        let models = InterruptibleModel::new(answers);
+        let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+        let driver = Arc::new(RecordingDriver::default());
+        let mut route = shared_route();
+        route.limits.max_steps = 1;
+        let task = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            speaker(9, "asker request"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        models.wait_until_entered().await;
+        for (index, text) in [
+            (8, "authorized participant text"),
+            (7, "unchecked participant marker"),
+        ] {
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                speaker(index, text),
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            )
+            .await;
+        }
+        models.release();
+        finish(task).await;
+        assert_eq!(models.requests(), if third_authorized { 3 } else { 2 });
+        let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        for (request, subject) in requests.iter().zip([9, 8, 7]) {
+            let BrokerRequest::Capabilities {
+                attestation: Some(claim),
+            } = &request.request
+            else {
+                panic!("each leftover must get its own capability lookup");
+            };
+            assert_eq!(claim.subject, speaker(subject, "").subject);
+        }
+        assert!(models.prompt(1).iter().any(|(role, text)| role == "user"
+            && text.starts_with("[gateway: authenticated participant: ana]\n")
+            && text.contains("authorized participant text")));
+        assert!(
+            !models
+                .prompt(1)
+                .iter()
+                .any(|(_, text)| text.contains("unchecked participant marker"))
+        );
+        if third_authorized {
+            assert!(models.prompt(2).iter().any(|(role, text)| role == "user"
+                && text.starts_with("[gateway: authenticated participant: carol]\n")
+                && text.contains("unchecked participant marker")));
+            assert_eq!(
+                driver.replies(),
+                ["owner final", "participant final", "third final"]
+            );
+        } else {
+            assert_eq!(
+                driver.replies(),
+                [
+                    "owner final",
+                    "participant final",
+                    crate::session::UNAUTHORIZED_REPLY
+                ]
+            );
+        }
     }
-    models.release();
-    finish(task).await;
-    assert_eq!(models.requests(), 2);
-    assert_eq!(capability_listings(&mut observed), 2);
-    assert!(
-        !models
-            .prompt(1)
-            .iter()
-            .any(|(_, text)| text.contains("unchecked participant marker")),
-        "the third subject's capability refusal was never requested, but its text reached the model under Ana's leg"
-    );
 }

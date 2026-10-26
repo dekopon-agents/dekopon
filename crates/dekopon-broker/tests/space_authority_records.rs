@@ -29,12 +29,18 @@ fn only(captured: &CaptureLayer, id: &str) -> Record {
 async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let mappings = [
         ("slack.team.user", "asker"),
+        ("slack.team.other", "participant"),
         ("slack.team.channel", "space"),
         ("github.owner.repo", "repo"),
     ]
     .map(|(subject, id)| (subject.parse().expect("subject"), principal(id)));
     let world = PolicyWorld::new(
-        [principal("asker"), principal("space"), principal("repo")],
+        [
+            principal("asker"),
+            principal("participant"),
+            principal("space"),
+            principal("repo"),
+        ],
         [(
             "cli-probe.reverse".parse().expect("capability"),
             "cli-probe".parse().expect("provider"),
@@ -246,4 +252,66 @@ async fn a_space_subject_cannot_be_an_attested_sender() {
         );
         assert_refused(&broker, &audit, id, claim, reason).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn participant_capability_lookups_do_not_record_effect_decisions() {
+    use tracing::instrument::WithSubscriber as _;
+
+    let (broker, audit) = broker_fixture().await;
+    let captured = CaptureLayer::workspace();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(captured.clone()));
+    let gateway = AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
+        },
+    )
+    .expect("gateway");
+    tracing::dispatcher::with_default(&dispatch, || {
+        let turn = tracing::info_span!("gateway.session", turn.owner = "asker");
+        let _turn = turn.enter();
+        for subject in ["slack.team.user", "slack.team.other"] {
+            let claim = Attestation::for_chat(
+                subject.parse().unwrap(),
+                "test-agent".parse().unwrap(),
+                slack_scope(),
+            );
+            broker
+                .session_surface(
+                    &gateway,
+                    Some(&AttestorGrant { namespaces: None }),
+                    Some(&claim),
+                )
+                .unwrap_or_else(|refusal| panic!("lookup refused: {}", refusal.reason));
+        }
+    });
+    assert!(audit.records().is_empty());
+    assert!(
+        captured
+            .events_where(
+                "dekopon_broker::audit",
+                &[("audit.event", "broker.decision")]
+            )
+            .is_empty()
+    );
+    let claim = Attestation::for_chat(
+        "slack.team.user".parse().unwrap(),
+        "test-agent".parse().unwrap(),
+        slack_scope(),
+    );
+    assert_refused(
+        &broker,
+        &audit,
+        "effect-after-lookups",
+        claim,
+        "policy-denied",
+    )
+    .with_subscriber(dispatch)
+    .await;
+    assert_eq!(audit.records().len(), 1);
+    assert_eq!(
+        only(&captured, "effect-after-lookups").field("principal"),
+        Some("asker")
+    );
 }

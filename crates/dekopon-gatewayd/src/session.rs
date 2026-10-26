@@ -506,7 +506,14 @@ impl Running {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FollowUpKind {
+    Turn,
+    MappingPending,
+}
+
 pub(crate) struct FollowUp {
+    kind: FollowUpKind,
     pub route: BoundRoute,
     pub message: InboundMessage,
     pub receipts: Dispositions,
@@ -708,13 +715,18 @@ impl SessionGate {
                 }
                 return Admit::Steered(receipts);
             }
-            if !(running.mapping == participants::Mapping::Pending
+            let kind = if running.mapping == participants::Mapping::Pending
                 && participants::native_chat(&message)
-                && message.subject != running.subject)
+                && message.subject != running.subject
+                && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
+                FollowUpKind::MappingPending
+            } else {
                 record_admission(&message, MessageOutcome::Queued.label(), depth + 1, None);
-            }
+                FollowUpKind::Turn
+            };
             running.follow_ups.push_back(FollowUp {
+                kind,
                 route: route.clone(),
                 message,
                 receipts,
@@ -921,12 +933,16 @@ impl SessionAdmission {
                 };
                 if folds {
                     let mut grouped = Vec::new();
-                    while let Some(next) = running.steers.pop_front_if(|steer| folds_in(steer)) {
+                    while let Some(next) = running
+                        .steers
+                        .pop_front_if(|steer| folds_in(steer) && steer.subject == message.subject)
+                    {
                         grouped.push(next);
                     }
                     fold(&mut message, grouped);
                 }
                 leftovers.push(FollowUp {
+                    kind: FollowUpKind::Turn,
                     route: (*self.route).clone(),
                     receipts: crate::collection::Dispositions(message.constituents.clone()),
                     message,

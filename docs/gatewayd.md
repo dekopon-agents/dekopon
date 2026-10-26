@@ -1162,7 +1162,9 @@ jobs in that conversation, including when no turn is active.
 ## Sessions
 
 Each admitted turn runs one session. In a mapped channel with shared or one-shot scope, every
-authorized participant’s admitted native chat message steers that turn and is consumed there.
+authorized participant’s admitted native chat message can steer that turn. Messages left queued
+at the final model step start later turns, each freshly authorized under its own subject; messages
+from different subjects are never folded together. A consumed steer never runs again.
 Only the asker interrupts or stops it. DMs, private scope, and unmapped routes retain same-sender
 steering and other-sender follow-ups; wakes and GitHub deliveries remain separate turns. On a `oneShot` route (`memory: { mode: oneShot }`) each
 session starts without prior history; the `persistent` clauses in steps 4 and 5 describe replay:
@@ -1310,6 +1312,9 @@ joins, while a refusal exposes nothing. An overflow message has one admission re
 `participant-limit`. Join lookups belong to the asker’s turn trace, not participant effect decisions.
 Every retained leg carries its opening message’s delivery coordinate; the asker’s carries the turn’s
 starting message. The delivered turn remains the asker’s, with authorized steer texts appended.
+Messages still queued when the final model step ends start later turns with their own participant
+as the asker. Every such turn opens a fresh leg and gets the normal capability answer; an
+unauthorized leftover is refused before inference. Folding combines messages only from one subject.
 
 This first change keeps `bash` execution on the asker’s leg and exposes no model-selectable handles.
 The companion change adds handle selection; both changes must ship together. All legs share the

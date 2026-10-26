@@ -76,8 +76,9 @@ impl SessionGate {
                 Mapping::Unmapped
             };
             let mut remaining = VecDeque::new();
-            while let Some(queued) = running.follow_ups.pop_front() {
-                if native_chat(&queued.message) && queued.message.subject != running.subject {
+            while let Some(mut queued) = running.follow_ups.pop_front() {
+                if queued.kind == FollowUpKind::MappingPending {
+                    queued.kind = FollowUpKind::Turn;
                     if mapped
                         && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
                     {
