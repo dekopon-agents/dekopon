@@ -306,7 +306,7 @@ pub enum ChatAssetRefusal {
     UnknownAsset,
     #[error("the attachment is not readable by this consumer")]
     UnsupportedMedia,
-    #[error("one invocation may reference at most five distinct assets")]
+    #[error("one invocation may reference at most {MAX_ASSET_DESCRIPTORS} distinct assets")]
     PerInvocationLimit,
     #[error("the assets exceed the 40 MiB per-invocation decoded-byte budget")]
     ByteBudget,

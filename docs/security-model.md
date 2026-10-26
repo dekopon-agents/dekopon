@@ -301,8 +301,8 @@ chat invocation may reach the two retrieval routes but never the record route.
 
 Command words are the only way a script reaches a provider: a capability identifier used as a word
 is `command not found`, and `cap` lists and describes grants without invoking anything. A provider
-command word is ungated. Normal dispatch sends one typed `Run` frame and receives `Ran`;
-the retained `runCommand` operation is the legacy parse-only path. Neither grants authority, so the
+command word is ungated. Dispatch sends one typed `Run` frame and receives `Ran`. This grants
+no authority, so the
 broker runs the declaring component's argv handling — a
 pure, import-free guest call under the ordinary fuel and wall-clock bounds — before any
 authorization, and authorizes only the proposal that comes back, on exactly the path a direct
@@ -315,12 +315,11 @@ word are both answered as an unknown word before the guest is instantiated, so a
 renders not even its help page, and a proposal that lands on a chat-memory route is refused after
 the run whatever word produced it. Argv is bounded by the client's frame ceiling before it leaves
 the process and by the host's `maxInputBytes` before a store exists. Host failures retain their
-cause in `command.resolve.failed`. Legacy `runCommand` host failures return the opaque
-`provider-error` reply; normal `Run` parser refusals return `Ran` with `RunOutcome::Refused`,
+cause in `command.resolve.failed`. `Run` parser refusals return `Ran` with `RunOutcome::Refused`,
 before invocation authorization begins. Unknown words return `NotFound`. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#command-execution-refusals)
 carries the wire detail. The same provider-authored `--help` text is also rendered once per
 provider at broker load — one render maps to every command word that provider declares, since
-`runCommand` takes no word — and baked into the bash tool description once per page with every word it serves named, so a reachable word's help
+the guest command parser takes no word — and baked into the bash tool description once per page with every word it serves named, so a reachable word's help
 reads as part of the tool surface without a per-session round trip. That baked text is exactly as
 untrusted as any other guest-rendered output and grants no authority: it lives inside the tool
 description a model reads as instructions because that is where the words are listed, not because
