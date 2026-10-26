@@ -12,6 +12,12 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
 
+#[derive(Debug, thiserror::Error)]
+#[error("journal slice read failed: {kind:?}")]
+pub(crate) struct ReadFailure {
+    pub kind: io::ErrorKind,
+}
+
 const BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -203,7 +209,9 @@ fn read_chunk(mut read: ReadChunk) -> io::Result<ReadChunk> {
         .try_into_mut()
         .unwrap_or_else(|_| BytesMut::with_capacity(BUFFER_BYTES));
     buffer.resize(count, 0);
-    read.file.read_exact_at(&mut buffer, read.offset)?;
+    read.file
+        .read_exact_at(&mut buffer, read.offset)
+        .map_err(|error| io::Error::new(error.kind(), ReadFailure { kind: error.kind() }))?;
     read.offset = read.offset.checked_add(count as u64).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "journal slice offset overflow")
     })?;
@@ -257,6 +265,34 @@ impl JsonBody {
         text.chunks(&mut self.chunks)
     }
 
+    pub(crate) fn joined(&mut self, texts: &[crate::text::Text]) -> Result<(), serde_json::Error> {
+        self.raw(b"\"");
+        for text in texts {
+            match text {
+                crate::text::Text::Owned(text) => {
+                    let bytes = scalar_bytes(text)?;
+                    self.raw(&bytes[1..bytes.len() - 1]);
+                }
+                crate::text::Text::File { file, offset, len } => {
+                    self.flush();
+                    self.chunks.push(Chunk::File {
+                        file: Arc::clone(file),
+                        offset: *offset,
+                        len: *len,
+                    });
+                }
+                crate::text::Text::Opaque(_) => {
+                    return Err(serde_json::Error::io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "opaque reasoning is not visible text",
+                    )));
+                }
+            }
+        }
+        self.raw(b"\"");
+        Ok(())
+    }
+
     pub(crate) fn source(&mut self, source: &OpaqueSource) {
         self.flush();
         self.chunks.push(Chunk::Opaque(source.clone()));
@@ -268,9 +304,7 @@ impl JsonBody {
     ) -> Result<(), serde_json::Error> {
         self.flush();
         self.chunks
-            .push(Chunk::Opaque(OpaqueSource::Owned(Bytes::from(
-                serde_json::to_vec(value)?,
-            ))));
+            .push(Chunk::Opaque(OpaqueSource::Owned(scalar_bytes(value)?)));
         Ok(())
     }
 
@@ -298,4 +332,12 @@ pub(crate) async fn collect(chunks: &[Chunk]) -> io::Result<Vec<u8>> {
         bytes.extend_from_slice(&frame?.into_data().expect("data frame"));
     }
     Ok(bytes)
+}
+
+pub(crate) fn scalar_bytes(
+    value: &(impl serde::Serialize + ?Sized),
+) -> Result<Bytes, serde_json::Error> {
+    let mut body = JsonBody::default();
+    body.value(value)?;
+    Ok(Bytes::from(body.literal))
 }

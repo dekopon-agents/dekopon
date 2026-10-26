@@ -55,12 +55,32 @@ impl ChatModel for Script {
         _on_event: &mut (dyn FnMut(dekopon_model::TurnEvent) -> ControlFlow<()> + Send),
     ) -> Result<AssistantTurn, InferenceError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.inputs.lock().push(
-            messages
-                .iter()
-                .filter_map(ModelMessage::content)
-                .collect::<String>(),
-        );
+        let mut captured = String::new();
+        for message in messages {
+            if let ModelMessage::Journal {
+                message: ReplayMessage::User(texts),
+            } = message
+            {
+                for text in texts {
+                    match text {
+                        Text::Owned(text) => captured.push_str(text),
+                        Text::File { file, offset, len } => captured.push_str(
+                            &super::super::journal::records::escaped_text(
+                                file,
+                                *offset,
+                                *len,
+                                256 * 1024,
+                            )
+                            .unwrap(),
+                        ),
+                        Text::Opaque(_) => panic!("opaque source in summary input"),
+                    }
+                }
+            } else if let Some(text) = message.content() {
+                captured.push_str(text);
+            }
+        }
+        self.inputs.lock().push(captured);
         let action = self
             .actions
             .lock()
@@ -832,4 +852,24 @@ async fn a_restart_mid_summary_requeues_and_resumes_from_the_original() {
     assert_eq!(script.calls.load(Ordering::Relaxed), 3);
     assert!(script.inputs.lock()[0].contains("a\n🦀\\\"z"));
     owned.shutdown().await;
+}
+
+#[test]
+fn summary_input_keeps_originals_as_bounded_held_file_slices() {
+    use dekopon_agent::memory::{Item, Kept};
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    record.original = vec![Item::User(Kept::new(
+        &"source-canary-é\n".repeat(100_000),
+        usize::MAX,
+    ))];
+    journal.append_record(STEM, &record, Vec::new()).unwrap();
+    let snapshot = journal.record_snapshot(STEM, false).unwrap().unwrap();
+    let input = super::input(&snapshot, &snapshot.records[0], 128 * 1024).unwrap();
+    assert_eq!(input.len(), 1);
+    let Text::File { file, len, .. } = &input[0] else {
+        panic!("original stays in journal");
+    };
+    assert!(Arc::ptr_eq(file, &snapshot.file));
+    assert!(*len > 0 && *len <= 128 * 1024);
 }

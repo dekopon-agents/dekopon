@@ -99,8 +99,6 @@ pub enum RequestError {
     CacheAnchor,
     #[error("invalid OpenRouter setting: {0}")]
     OpenRouterSetting(crate::openrouter::settings::SettingsProblem),
-    #[error("model request body cannot be replayed")]
-    NonReplayableBody,
     #[error("model deadline exceeds the clock range")]
     DeadlineOutOfRange,
     #[error("model timeout must be greater than zero")]

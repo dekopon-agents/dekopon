@@ -9,8 +9,8 @@ use crate::{
     inference::{GenerateRequest, InferenceModel},
     model::{AssistantTurn, ModelKey, ModelMessage, ModelToolCall},
     openai::{
-        ChunkError, FinishReason, OpenAiTool, WireMessage, WireToolCall, complete_turn,
-        stream_failure,
+        CacheControl, ChunkError, FinishReason, OpenAiTool, WireMessage, WireToolCall,
+        complete_turn, stream_failure,
     },
     sse::SseEvent,
     stream::{ModelText, TurnEvent},
@@ -125,6 +125,7 @@ impl OpenRouterClient {
                 messages.push(RouterMessage::Journal {
                     message,
                     model: identity.clone(),
+                    cache: None,
                 });
             } else if let ModelMessage::Assistant { turn } = message {
                 if let Some(native) = turn
@@ -407,9 +408,11 @@ impl RouterRequest<'_> {
                 body.raw(b",");
             }
             match message {
-                RouterMessage::Journal { message, model } => {
-                    message.chat(&mut body, Some(model))?
-                }
+                RouterMessage::Journal {
+                    message,
+                    model,
+                    cache,
+                } => message.chat(&mut body, Some(model), cache.as_ref())?,
                 RouterMessage::Ordinary(_) | RouterMessage::PortableAssistant { .. } => {
                     body.value(message)?
                 }
@@ -487,6 +490,7 @@ enum RouterMessage<'a> {
     Journal {
         message: &'a crate::replay::ReplayMessage,
         model: ModelKey,
+        cache: Option<CacheControl>,
     },
     PortableAssistant {
         role: &'static str,
@@ -618,13 +622,23 @@ fn mark_newest_text(
         .skip(range.start)
         .rev()
     {
-        if let (
-            ModelMessage::User { .. } | ModelMessage::ToolResults { .. },
-            RouterMessage::Ordinary(wire),
-        ) = (message, wire)
-            && wire.mark_last_text(ttl)
-        {
-            return;
+        match wire {
+            RouterMessage::Journal { message, cache, .. } => {
+                if message.cacheable() {
+                    *cache = Some(CacheControl::new(ttl));
+                    return;
+                }
+            }
+            RouterMessage::Ordinary(wire) => {
+                if matches!(
+                    message,
+                    ModelMessage::User { .. } | ModelMessage::ToolResults { .. }
+                ) && wire.mark_last_text(ttl)
+                {
+                    return;
+                }
+            }
+            RouterMessage::PortableAssistant { .. } | RouterMessage::Native { .. } => {}
         }
     }
 }

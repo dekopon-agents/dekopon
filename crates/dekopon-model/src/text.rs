@@ -54,9 +54,7 @@ impl Text {
 
     pub fn chunks(&self, chunks: &mut Vec<Chunk>) -> Result<(), serde_json::Error> {
         match self {
-            Self::Owned(text) => {
-                chunks.push(Chunk::Literal(Bytes::from(serde_json::to_vec(text)?)))
-            }
+            Self::Owned(text) => chunks.push(Chunk::Literal(crate::body::scalar_bytes(text)?)),
             Self::File { file, offset, len } => {
                 chunks.push(Chunk::Literal(Bytes::from_static(b"\"")));
                 chunks.push(Chunk::File {

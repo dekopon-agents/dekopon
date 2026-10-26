@@ -21,7 +21,7 @@ pub struct ReplayReasoning {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReplayMessage {
-    User(Text),
+    User(Vec<Text>),
     Assistant {
         content: Option<Text>,
         calls: Vec<ReplayCall>,
@@ -53,10 +53,30 @@ impl ReplayMessage {
 
     pub fn content(&self) -> Option<&str> {
         let text = match self {
-            Self::User(text) | Self::Tool { text, .. } => Some(text),
+            Self::User(texts) => {
+                if let [text] = texts.as_slice() {
+                    Some(text)
+                } else {
+                    None
+                }
+            }
+            Self::Tool { text, .. } => Some(text),
             Self::Assistant { content, .. } => content.as_ref(),
         };
         text.and_then(Text::as_owned)
+    }
+
+    pub(crate) fn cacheable(&self) -> bool {
+        let nonempty = |text: &Text| match text {
+            Text::Owned(text) => !text.is_empty(),
+            Text::File { len, .. } => *len > 0,
+            Text::Opaque(_) => false,
+        };
+        match self {
+            Self::User(texts) => texts.iter().any(nonempty),
+            Self::Tool { text, .. } => nonempty(text),
+            Self::Assistant { .. } => false,
+        }
     }
 
     pub(crate) fn is_empty_for(&self, model: &ModelKey) -> bool {
@@ -90,17 +110,18 @@ impl ReplayMessage {
         &self,
         body: &mut JsonBody,
         model: Option<&ModelKey>,
+        cache: Option<&crate::openai::CacheControl>,
     ) -> Result<(), serde_json::Error> {
         body.raw(b"{\"role\":");
         body.value(self.role())?;
         match self {
-            Self::User(text) => {
+            Self::User(texts) => {
                 body.raw(b",\"content\":");
-                body.text(text)?;
+                chat_text(body, texts, cache)?;
             }
             Self::Tool { id, text } => {
                 body.raw(b",\"content\":");
-                body.text(text)?;
+                chat_text(body, std::slice::from_ref(text), cache)?;
                 body.raw(b",\"tool_call_id\":");
                 body.value(id)?;
             }
@@ -185,7 +206,7 @@ impl ReplayMessage {
                 }
                 if let Some(text) = content {
                     comma(body);
-                    responses_text(body, "assistant", "output_text", text)?;
+                    responses_text(body, "assistant", "output_text", std::slice::from_ref(text))?;
                 }
                 for call in calls {
                     comma(body);
@@ -203,18 +224,35 @@ impl ReplayMessage {
     }
 }
 
+fn chat_text(
+    body: &mut JsonBody,
+    texts: &[Text],
+    cache: Option<&crate::openai::CacheControl>,
+) -> Result<(), serde_json::Error> {
+    if cache.is_some() {
+        body.raw(b"[{\"type\":\"text\",\"text\":");
+    }
+    body.joined(texts)?;
+    if let Some(cache) = cache {
+        body.raw(b",\"cache_control\":");
+        body.value(cache)?;
+        body.raw(b"}]");
+    }
+    Ok(())
+}
+
 fn responses_text(
     body: &mut JsonBody,
     role: &str,
     kind: &str,
-    text: &Text,
+    text: &[Text],
 ) -> Result<(), serde_json::Error> {
     body.raw(b"{\"type\":\"message\",\"role\":");
     body.value(role)?;
     body.raw(b",\"content\":[{\"type\":");
     body.value(kind)?;
     body.raw(b",\"text\":");
-    body.text(text)?;
+    body.joined(text)?;
     if kind == "output_text" {
         body.raw(b",\"annotations\":[]");
     }
@@ -250,7 +288,7 @@ mod tests {
         let output = slice("result\n\\é");
         let messages = [
             ModelMessage::Journal {
-                message: ReplayMessage::User(user),
+                message: ReplayMessage::User(vec![user]),
             },
             ModelMessage::Journal {
                 message: ReplayMessage::Assistant {
@@ -304,5 +342,95 @@ mod tests {
             );
             assert_eq!(body["messages"][2]["content"], "result\n\\é");
         }
+    }
+
+    #[tokio::test]
+    async fn file_opaque_replay_requires_the_full_model_key_and_never_enters_a_literal() {
+        use crate::{
+            body::{Chunk, JsonBody, OpaqueSource},
+            model::{Backend, ModelKey},
+        };
+        let raw = br#"{"type":"reasoning","encrypted_content":"opaque-file-canary"}"#;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(raw).unwrap();
+        let key = ModelKey::new(Backend::Codex, "alias").with_reported(Some("model-a".to_owned()));
+        let message = ReplayMessage::Assistant {
+            content: None,
+            calls: Vec::new(),
+            reasoning: vec![super::ReplayReasoning {
+                model: key.clone(),
+                value: OpaqueSource::File {
+                    file: Arc::new(file),
+                    offset: 0,
+                    len: raw.len() as u64,
+                },
+            }],
+        };
+        let mut body = JsonBody::default();
+        message.responses(&mut body, &key).unwrap();
+        let chunks = body.finish();
+        assert!(matches!(
+            chunks.as_slice(),
+            [Chunk::Opaque(OpaqueSource::File { .. })]
+        ));
+        assert_eq!(crate::body::collect(&chunks).await.unwrap(), raw);
+        let other =
+            ModelKey::new(Backend::Codex, "alias").with_reported(Some("model-b".to_owned()));
+        assert!(message.is_empty_for(&other));
+        let mut body = JsonBody::default();
+        message.responses(&mut body, &other).unwrap();
+        assert!(body.finish().is_empty());
+        let audit = ModelMessage::Journal { message };
+        assert!(
+            !serde_json::to_string(&audit)
+                .unwrap()
+                .contains("opaque-file-canary")
+        );
+        assert!(!format!("{audit:?}").contains("opaque-file-canary"));
+    }
+
+    #[tokio::test]
+    async fn explicit_prefix_cache_markers_keep_the_stable_file_text_anchor() {
+        use crate::openrouter::settings::{Cache, CacheStyle, Settings, Ttl};
+        let messages = [
+            ModelMessage::system("instructions"),
+            ModelMessage::Journal {
+                message: ReplayMessage::User(vec![slice("history")]),
+            },
+            ModelMessage::user("current"),
+        ];
+        let options = CompletionOptions::default().with_stable_prefix(2);
+        let router = crate::openrouter::OpenRouterClient::new(
+            "alias",
+            "synthetic-test-token".to_owned(),
+            Duration::from_secs(1),
+            Settings {
+                cache: Some(Cache {
+                    style: CacheStyle::ExplicitPrefix,
+                    ttl: Some(Ttl::OneHour),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let encoded = router
+            .prepare(crate::inference::GenerateRequest {
+                messages: &messages,
+                tools: &[],
+                options: &options,
+            })
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(body["messages"][1]["content"][0]["text"], "history");
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+        assert_eq!(body["messages"][2]["content"][0]["text"], "current");
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 }

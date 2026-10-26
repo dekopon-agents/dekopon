@@ -76,3 +76,75 @@ async fn an_opaque_slice_is_unquoted_and_a_short_read_fails_once() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn a_slice_read_failure_retains_its_io_kind_through_http() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let _closed = socket.read_to_end(&mut bytes).await;
+    });
+    let file = Arc::new(tempfile::tempfile().unwrap());
+    let body = SliceBody::new(&[Chunk::File {
+        file,
+        offset: 0,
+        len: 1,
+    }])
+    .unwrap();
+    let error = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{address}"))
+        .body(reqwest::Body::wrap(body))
+        .send()
+        .await
+        .unwrap_err();
+    let error = crate::http::http_failure(crate::error::FailurePhase::AwaitingHeaders, None, error);
+    let crate::error::InferenceError::Transport(crate::error::TransportFailure::Body(error)) =
+        error
+    else {
+        panic!("typed body failure: {error:?}");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn joined_text_splices_multiple_file_slices_inside_one_json_string() {
+    let mut first = tempfile::tempfile().unwrap();
+    first.write_all(b"first\\n").unwrap();
+    let mut second = tempfile::tempfile().unwrap();
+    second.write_all("secondé".as_bytes()).unwrap();
+    let texts = [
+        crate::text::Text::Owned("Source:\n".to_owned()),
+        crate::text::Text::File {
+            file: Arc::new(first),
+            offset: 0,
+            len: 7,
+        },
+        crate::text::Text::File {
+            file: Arc::new(second),
+            offset: 0,
+            len: 8,
+        },
+    ];
+    let mut encoder = super::JsonBody::default();
+    encoder.joined(&texts).unwrap();
+    let chunks = encoder.finish();
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| matches!(chunk, Chunk::File { .. }))
+            .count(),
+        2
+    );
+    let encoded = super::collect(&chunks).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<String>(&encoded).unwrap(),
+        "Source:\nfirst\nsecondé"
+    );
+}

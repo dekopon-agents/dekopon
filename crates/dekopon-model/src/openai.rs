@@ -436,17 +436,26 @@ struct WireFile<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct CacheControl {
+pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     ttl: Option<crate::openrouter::settings::Ttl>,
 }
 
+impl CacheControl {
+    pub(crate) const fn new(ttl: Option<crate::openrouter::settings::Ttl>) -> Self {
+        Self {
+            kind: "ephemeral",
+            ttl,
+        }
+    }
+}
+
 impl<'a> WireMessage<'a> {
     pub(crate) fn chunks(&self, body: &mut crate::body::JsonBody) -> Result<(), serde_json::Error> {
         match self.replay {
-            Some(message) => message.chat(body, None),
+            Some(message) => message.chat(body, None, None),
             None => body.value(self),
         }
     }
@@ -460,19 +469,13 @@ impl<'a> WireMessage<'a> {
         };
         self.content = Some(WireContent::Parts(vec![WirePart::Text {
             text: (*text).into(),
-            cache_control: Some(CacheControl {
-                kind: "ephemeral",
-                ttl,
-            }),
+            cache_control: Some(CacheControl::new(ttl)),
         }]));
         Ok(())
     }
 
     pub(crate) fn mark_last_text(&mut self, ttl: Option<crate::openrouter::settings::Ttl>) -> bool {
-        let marker = Some(CacheControl {
-            kind: "ephemeral",
-            ttl,
-        });
+        let marker = Some(CacheControl::new(ttl));
         match &mut self.content {
             Some(WireContent::Text(text)) if !text.is_empty() => {
                 self.content = Some(WireContent::Parts(vec![WirePart::Text {
