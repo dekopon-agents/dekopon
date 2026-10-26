@@ -104,8 +104,19 @@ pub(super) struct Authorized {
     pub join: Option<String>,
 }
 
+pub(super) struct Ready {
+    messages: Vec<Authorized>,
+    _reservation: InFlight,
+}
+
+impl Ready {
+    pub(super) fn stage(self, steers: &SessionSteers) -> Vec<Steer> {
+        steers.stage_participants(self.messages)
+    }
+}
+
 pub(super) enum Batch {
-    Steers(Vec<Authorized>),
+    Steers(Ready),
     Sealed(Seal),
 }
 
@@ -209,7 +220,7 @@ impl Worker {
                                     authorize(&inputs, &mut legs, &mut joined, request.mode).await;
                                 match &batch {
                                     Batch::Steers(steers)
-                                        if request.mode.seals() && steers.is_empty() => {}
+                                        if request.mode.seals() && steers.messages.is_empty() => {}
                                     Batch::Steers(_) | Batch::Sealed(_) => break batch,
                                 }
                             };
@@ -250,16 +261,18 @@ impl Worker {
     }
 }
 
-struct InFlight<'a> {
-    inputs: &'a Inputs,
+struct InFlight {
+    gate: SessionGate,
+    key: AdmissionKey,
+    state: Arc<AtomicU8>,
     count: usize,
 }
 
-impl Drop for InFlight<'_> {
+impl Drop for InFlight {
     fn drop(&mut self) {
-        let mut entries = self.inputs.gate.in_flight.lock();
-        if let Some(Holder::Session(running)) = entries.get_mut(&self.inputs.key)
-            && Arc::ptr_eq(&running.cancellation.state, &self.inputs.cancellation.state)
+        let mut entries = self.gate.in_flight.lock();
+        if let Some(Holder::Session(running)) = entries.get_mut(&self.key)
+            && Arc::ptr_eq(&running.cancellation.state, &self.state)
         {
             running.authorizing -= self.count;
         }
@@ -290,8 +303,10 @@ async fn authorize(
             Some(Holder::Probe) | None => return Batch::Sealed(Seal::Stopped),
         }
     };
-    let _in_flight = InFlight {
-        inputs,
+    let reservation = InFlight {
+        gate: inputs.gate.clone(),
+        key: inputs.key.clone(),
+        state: Arc::clone(&inputs.cancellation.state),
         count: messages.len(),
     };
     let mut ready = Vec::new();
@@ -333,7 +348,10 @@ async fn authorize(
             join,
         });
     }
-    Batch::Steers(ready)
+    Batch::Steers(Ready {
+        messages: ready,
+        _reservation: reservation,
+    })
 }
 
 fn participant_admission(message: &InboundMessage, outcome: &str, cause: Option<&str>) {

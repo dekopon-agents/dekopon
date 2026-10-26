@@ -1929,7 +1929,7 @@ impl SteerSource for SessionSteers {
     fn take(&self) -> Vec<Steer> {
         match &self.participants {
             Some(drain) => match drain.take(participants::DrainMode::Take) {
-                participants::Batch::Steers(steers) => self.stage_participants(steers),
+                participants::Batch::Steers(steers) => steers.stage(self),
                 participants::Batch::Sealed(_) => Vec::new(),
             },
             None => self.stage(self.gate.take_steers(&self.key)),
@@ -1939,9 +1939,7 @@ impl SteerSource for SessionSteers {
     fn seal_or_take(&self) -> Handoff {
         if let Some(drain) = &self.participants {
             return match drain.take(participants::DrainMode::SealOrTake) {
-                participants::Batch::Steers(steers) => {
-                    Handoff::Steers(self.stage_participants(steers))
-                }
+                participants::Batch::Steers(steers) => Handoff::Steers(steers.stage(self)),
                 participants::Batch::Sealed(seal) => Handoff::Sealed(seal),
             };
         }
