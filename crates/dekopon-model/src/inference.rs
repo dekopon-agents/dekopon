@@ -74,8 +74,14 @@ pub(crate) async fn retry_opaque(
     progress: &mut crate::http::Progress,
 ) -> Result<AssistantTurn, InferenceError> {
     let identity = model.resolved_key();
-    if !request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(&identity) && turn.has_opaque_reasoning())) {
-        return model.exchange(request, observe, control, progress, &identity).await;
+    if !request
+        .messages
+        .iter()
+        .any(|message| message.admits_opaque(&identity))
+    {
+        return model
+            .exchange(request, observe, control, progress, &identity)
+            .await;
     }
     let mut events = Vec::new();
     let result = model
@@ -103,6 +109,9 @@ pub(crate) async fn retry_opaque(
                 ModelMessage::Assistant { turn } => {
                     crate::model::assistant_message(&turn.without_opaque())
                 }
+                ModelMessage::Journal { message } => ModelMessage::Journal {
+                    message: message.without_opaque(),
+                },
                 ModelMessage::System { .. }
                 | ModelMessage::User { .. }
                 | ModelMessage::ToolResults { .. } => message.clone(),

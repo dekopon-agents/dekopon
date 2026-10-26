@@ -966,3 +966,126 @@ fn an_unknown_tag_is_refused_before_reading_its_large_payload() {
     ));
     assert!(probe.stream_position().unwrap() <= BUFFER as u64);
 }
+
+#[test]
+fn the_backward_window_skips_bodies_and_joins_side_lines_in_file_order() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    record.original = vec![Item::User(Kept::new(
+        &"x".repeat(2 * 1024 * 1024),
+        usize::MAX,
+    ))];
+    for id in 1..=4 {
+        record.id = RecordId(NonZeroU64::new(id).unwrap());
+        journal
+            .append_record("agent/hash", &record, Vec::new())
+            .unwrap();
+    }
+    for slot in [Slot::Running, Slot::Generated("latest".to_owned())] {
+        journal
+            .write_slot(
+                "agent/hash",
+                SlotLine {
+                    at_ms: 1,
+                    record: record.id,
+                    part: NonZeroU8::new(1).unwrap(),
+                    slot,
+                    subject: Subject::Record,
+                },
+            )
+            .unwrap();
+    }
+    for subject in [
+        Subject::Asset(1.try_into().unwrap()),
+        Subject::Asset(2.try_into().unwrap()),
+    ] {
+        journal
+            .write_slot(
+                "agent/hash",
+                SlotLine {
+                    at_ms: 1,
+                    record: record.id,
+                    part: NonZeroU8::new(1).unwrap(),
+                    slot: Slot::Running,
+                    subject,
+                },
+            )
+            .unwrap();
+    }
+    let _writer = journal.lock.lock();
+    DECODED_BYTES.set(0);
+    let snapshot = journal
+        .record_window("agent/hash", 2.try_into().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .records
+            .iter()
+            .map(|head| head.header.id.0.get())
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert_eq!(
+        snapshot.records[1].header.summaries[0],
+        Slot::Generated("latest".to_owned())
+    );
+    assert_eq!(snapshot.records[1].asset_lines.len(), 2);
+    for (line, expected) in snapshot.records[1].asset_lines.iter().zip([1, 2]) {
+        let AssetSideLine::Slot(line) = line else {
+            panic!("slot line")
+        };
+        assert_eq!(line.subject, Subject::Asset(expected.try_into().unwrap()));
+    }
+    assert!(DECODED_BYTES.get() < 64 * 1024);
+}
+
+#[test]
+fn a_backward_window_skips_a_torn_last_header_or_body_without_decoding_it() {
+    let (_dir, journal) = journal();
+    let record = fixture();
+    journal
+        .append_record("agent/hash", &record, Vec::new())
+        .unwrap();
+    for tail in [b"{\"b\":[\"torn".as_slice(), b"{\"h\":{\"torn"] {
+        let original = std::fs::metadata(journal.path("agent/hash")).unwrap().len();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.path("agent/hash"))
+            .unwrap();
+        file.write_all(tail).unwrap();
+        let snapshot = journal
+            .record_window("agent/hash", 2.try_into().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        file.set_len(original).unwrap();
+    }
+}
+
+#[test]
+fn seal_readers_keep_a_whole_inode_and_never_wait_on_the_writer() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let (_dir, journal) = journal();
+    let stem = "agent/hash";
+    journal
+        .seal(stem, UNIX_EPOCH + Duration::from_millis(1))
+        .unwrap();
+    let mut original = File::open(journal.seal_path(stem)).unwrap();
+    journal.seal(stem, SystemTime::now()).unwrap();
+    let mut bytes = Vec::new();
+    original.read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<super::super::Seal>(&bytes)
+            .unwrap()
+            .at_ms,
+        1
+    );
+    let _writer = journal.lock.lock();
+    assert!(
+        journal
+            .sealed(stem, Duration::from_secs(3600))
+            .unwrap()
+            .is_some()
+    );
+}

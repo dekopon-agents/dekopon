@@ -6,7 +6,7 @@ use crate::{
     inference::{GenerateRequest, InferenceModel},
     model::{
         AssistantTurn, ContentPart, DataUrl, JSON_CONTENT_TYPE, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall, compact_json_body,
+        ModelTool, ModelToolCall,
     },
     sse::{SseEvent, decode_transcript},
     stream::{ModelText, TurnEvent},
@@ -114,7 +114,7 @@ impl OpenAiClient {
                     }),
                 };
                 span.record("tool_choice", body.tool_choice);
-                compact_json_body(&body)
+                body.chunks()
                     .map_err(|error| InferenceError::Transport(TransportFailure::Encoding(error)))
             })
             .await
@@ -132,7 +132,9 @@ impl OpenAiClient {
                 },
             )
             .header("content-type", JSON_CONTENT_TYPE)
-            .body(encoded);
+            .body(reqwest::Body::wrap(
+                crate::body::SliceBody::new(&encoded).map_err(TransportFailure::Body)?,
+            ));
         if let Some(token) = &self.bearer_token {
             builder = builder.bearer_auth(token.expose());
         }
@@ -340,6 +342,41 @@ struct ChatRequest<'a> {
     stream_options: Option<StreamOptions>,
 }
 
+impl ChatRequest<'_> {
+    fn chunks(&self) -> Result<Vec<crate::body::Chunk>, serde_json::Error> {
+        let mut body = crate::body::JsonBody::default();
+        body.raw(b"{\"model\":");
+        body.value(self.model)?;
+        body.raw(b",\"messages\":");
+        body.raw(b"[");
+        for (index, message) in self.messages.iter().enumerate() {
+            if index > 0 {
+                body.raw(b",");
+            }
+            message.chunks(&mut body)?;
+        }
+        body.raw(b"]");
+        body.raw(b",\"tools\":");
+        body.value(self.tools)?;
+        body.raw(b",\"tool_choice\":");
+        body.value(self.tool_choice)?;
+        if let Some(key) = self.prompt_cache_key {
+            body.raw(b",\"prompt_cache_key\":");
+            body.value(key)?;
+        }
+        if let Some(stream) = self.stream {
+            body.raw(b",\"stream\":");
+            body.value(&stream)?;
+        }
+        if let Some(options) = &self.stream_options {
+            body.raw(b",\"stream_options\":");
+            body.value(options)?;
+        }
+        body.raw(b"}");
+        Ok(body.finish())
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
@@ -350,6 +387,8 @@ struct StreamOptions {
 /// forever.
 #[derive(Debug, Serialize)]
 pub(crate) struct WireMessage<'a> {
+    #[serde(skip)]
+    replay: Option<&'a crate::replay::ReplayMessage>,
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<WireContent<'a>>,
@@ -405,6 +444,13 @@ struct CacheControl {
 }
 
 impl<'a> WireMessage<'a> {
+    pub(crate) fn chunks(&self, body: &mut crate::body::JsonBody) -> Result<(), serde_json::Error> {
+        match self.replay {
+            Some(message) => message.chat(body, None),
+            None => body.value(self),
+        }
+    }
+
     pub(crate) fn mark_cache(
         &mut self,
         ttl: Option<crate::openrouter::settings::Ttl>,
@@ -508,6 +554,13 @@ impl<'a> WireMessage<'a> {
             message.content().map(WireContent::Text)
         };
         Ok(Self {
+            replay: match message {
+                ModelMessage::Journal { message } => Some(message),
+                ModelMessage::System { .. }
+                | ModelMessage::User { .. }
+                | ModelMessage::Assistant { .. }
+                | ModelMessage::ToolResults { .. } => None,
+            },
             role: message.role(),
             content,
             tool_calls: message.tool_calls(),
@@ -917,6 +970,25 @@ fn completion_url(endpoint: &str) -> String {
     } else {
         format!("{endpoint}/chat/completions")
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn request_body_json(messages: &[ModelMessage]) -> serde_json::Value {
+    let mut prepared = Vec::new();
+    for message in messages {
+        prepared.push(WireMessage::prepare(message).await.unwrap());
+    }
+    let body = ChatRequest {
+        model: "gpt-test",
+        messages: &prepared,
+        tools: &[],
+        tool_choice: "auto",
+        prompt_cache_key: None,
+        stream: None,
+        stream_options: None,
+    };
+    let chunks = body.chunks().unwrap();
+    serde_json::from_slice(&crate::body::collect(&chunks).await.unwrap()).unwrap()
 }
 
 #[cfg(test)]
@@ -2445,10 +2517,19 @@ mod tests {
     async fn a_request_body_buffer_is_exactly_the_bytes_it_carries() {
         let body = json!({"data": "x".repeat(1_000_000)});
 
-        let encoded = super::compact_json_body(&body).expect("the request body serializes");
-
+        let mut encoder = crate::body::JsonBody::default();
+        encoder.value(&body).expect("the request body serializes");
+        let chunks = encoder.finish();
+        let [crate::body::Chunk::Literal(bytes)] = chunks.as_slice() else {
+            panic!("one literal");
+        };
+        let encoded = bytes.clone().to_vec();
+        let capacity = match chunks.into_iter().next().unwrap() {
+            crate::body::Chunk::Literal(bytes) => bytes.try_into_mut().unwrap().capacity(),
+            crate::body::Chunk::File { .. } | crate::body::Chunk::Opaque(_) => panic!("literal"),
+        };
         assert_eq!(
-            encoded.capacity(),
+            capacity,
             encoded.len(),
             "the buffer grew past the body it holds"
         );

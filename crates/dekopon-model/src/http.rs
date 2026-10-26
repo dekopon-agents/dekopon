@@ -190,6 +190,7 @@ impl InferenceHttp {
                     InferenceError::Authentication(AuthError::Credential(_))
                     | InferenceError::Transport(
                         TransportFailure::Blocking(_)
+                        | TransportFailure::Body(_)
                         | TransportFailure::Encoding(_)
                         | TransportFailure::Credential(_),
                     )
@@ -212,6 +213,7 @@ impl InferenceHttp {
                         | InferenceError::Transport(
                             TransportFailure::Encoding(_)
                                 | TransportFailure::Blocking(_)
+                                | TransportFailure::Body(_)
                                 | TransportFailure::Credential(_)
                         )
                 ) {

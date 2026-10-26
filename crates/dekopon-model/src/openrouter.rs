@@ -7,7 +7,7 @@ use crate::{
     error::{FailurePhase, InferenceError, ProtocolFailure, RequestError, TransportFailure},
     http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
-    model::{AssistantTurn, ModelKey, ModelMessage, ModelToolCall, compact_json_body},
+    model::{AssistantTurn, ModelKey, ModelMessage, ModelToolCall},
     openai::{
         ChunkError, FinishReason, OpenAiTool, WireMessage, WireToolCall, complete_turn,
         stream_failure,
@@ -91,15 +91,21 @@ impl OpenRouterClient {
     }
 
     #[cfg(test)]
-    async fn prepare(&self, request: GenerateRequest<'_>) -> Result<Vec<u8>, InferenceError> {
-        self.prepare_for(request, &self.model_key()).await
+    pub(crate) async fn prepare(
+        &self,
+        request: GenerateRequest<'_>,
+    ) -> Result<Vec<u8>, InferenceError> {
+        let chunks = self.prepare_for(request, &self.model_key()).await?;
+        crate::body::collect(&chunks)
+            .await
+            .map_err(|error| TransportFailure::Body(error).into())
     }
 
     async fn prepare_for<'a>(
         &self,
         request: GenerateRequest<'a>,
         identity: &ModelKey,
-    ) -> Result<Vec<u8>, InferenceError> {
+    ) -> Result<Vec<crate::body::Chunk>, InferenceError> {
         let explicit = self
             .settings
             .cache
@@ -115,7 +121,12 @@ impl OpenRouterClient {
         }
         let mut messages = Vec::with_capacity(request.messages.len());
         for (index, message) in request.messages.iter().enumerate() {
-            if let ModelMessage::Assistant { turn } = message {
+            if let ModelMessage::Journal { message } = message {
+                messages.push(RouterMessage::Journal {
+                    message,
+                    model: identity.clone(),
+                });
+            } else if let ModelMessage::Assistant { turn } = message {
                 if let Some(native) = turn
                     .openrouter_replay()
                     .filter(|_| turn.model_key().is_some_and(|key| key == identity))
@@ -177,7 +188,7 @@ impl OpenRouterClient {
             session_id: request.options.prompt_cache_key(),
         };
         tracing::Span::current().record("tool_choice", body.tool_choice);
-        let body = compact_json_body(&body).map_err(TransportFailure::Encoding)?;
+        let body = body.chunks().map_err(TransportFailure::Encoding)?;
         Ok(body)
     }
 
@@ -264,7 +275,9 @@ impl OpenRouterClient {
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .header("X-OpenRouter-Cache", "false")
-                    .body(body),
+                    .body(reqwest::Body::wrap(
+                        crate::body::SliceBody::new(&body).map_err(TransportFailure::Body)?,
+                    )),
                 control,
                 secrets,
             )
@@ -297,7 +310,10 @@ impl OpenRouterClient {
         control
             .check()
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
-        let admitted = request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(identity) && turn.has_opaque_reasoning()));
+        let admitted = request
+            .messages
+            .iter()
+            .any(|message| message.admits_opaque(identity));
         let turn = state
             .finish(identity, secrets)
             .inspect_err(|_| record_phase(FailurePhase::ReadingBody))?;
@@ -380,6 +396,79 @@ struct RouterRequest<'a> {
     session_id: Option<&'a str>,
 }
 
+impl RouterRequest<'_> {
+    fn chunks(&self) -> Result<Vec<crate::body::Chunk>, serde_json::Error> {
+        let mut body = crate::body::JsonBody::default();
+        body.raw(b"{\"model\":");
+        body.value(self.model)?;
+        body.raw(b",\"messages\":[");
+        for (index, message) in self.messages.iter().enumerate() {
+            if index > 0 {
+                body.raw(b",");
+            }
+            match message {
+                RouterMessage::Journal { message, model } => {
+                    message.chat(&mut body, Some(model))?
+                }
+                RouterMessage::Ordinary(_) | RouterMessage::PortableAssistant { .. } => {
+                    body.value(message)?
+                }
+                RouterMessage::Native {
+                    role,
+                    content,
+                    tool_calls,
+                    reasoning_details,
+                } => {
+                    body.raw(b"{\"role\":");
+                    body.value(role)?;
+                    body.raw(b",\"content\":");
+                    body.value(content)?;
+                    if !tool_calls.is_empty() {
+                        body.raw(b",\"tool_calls\":");
+                        body.value(tool_calls)?;
+                    }
+                    if !reasoning_details.is_empty() {
+                        body.raw(b",\"reasoning_details\":");
+                        body.opaque(reasoning_details)?;
+                    }
+                    body.raw(b"}");
+                }
+            }
+        }
+        body.raw(b"],\"tools\":");
+        body.value(&self.tools)?;
+        body.raw(b",\"tool_choice\":");
+        body.value(self.tool_choice)?;
+        body.raw(b",\"stream\":true");
+        if let Some(value) = self.max_tokens {
+            body.raw(b",\"max_tokens\":");
+            body.value(&value)?;
+        }
+        if let Some(value) = self.temperature {
+            body.raw(b",\"temperature\":");
+            body.value(&value)?;
+        }
+        if let Some(value) = self.top_p {
+            body.raw(b",\"top_p\":");
+            body.value(&value)?;
+        }
+        if let Some(value) = self.reasoning {
+            body.raw(b",\"reasoning\":");
+            body.value(value)?;
+        }
+        if let Some(value) = &self.provider {
+            body.raw(b",\"provider\":");
+            body.value(value)?;
+        }
+        if let Some(value) = self.session_id {
+            body.raw(b",\"session_id\":");
+            body.value(value)?;
+        }
+        body.raw(b"}");
+        Ok(body.finish())
+    }
+}
+
 #[derive(Serialize)]
 struct Provider<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +483,11 @@ struct Provider<'a> {
 #[serde(untagged)]
 enum RouterMessage<'a> {
     Ordinary(WireMessage<'a>),
+    #[serde(skip)]
+    Journal {
+        message: &'a crate::replay::ReplayMessage,
+        model: ModelKey,
+    },
     PortableAssistant {
         role: &'static str,
         content: Option<&'a str>,

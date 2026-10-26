@@ -163,6 +163,8 @@ impl ProviderFailure {
 
 #[derive(Debug, Error)]
 pub enum TransportFailure {
+    #[error("could not read request body: {0}")]
+    Body(#[source] std::io::Error),
     #[error("{context}")]
     Http {
         context: ProviderFailure,
