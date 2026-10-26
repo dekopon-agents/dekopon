@@ -145,14 +145,13 @@ agent may act in is written in policy.
 
 ## Command execution refusals
 
-Everything that is not the guest's own answer collapses into one opaque reply. A word no loaded
-provider declares, an input past the host bound, a guest that traps or reaches for a host import,
-and an answer the broker cannot decode all return the stable `provider-error` code with a fixed
-message; the guest's own failure text is provider-controlled and never reaches a caller through this
-path. The broker logs `command.resolve.failed` naming the word, so an operator can tell the cases
-apart from the audit stream a caller cannot read. A provider that simply *declines* the arguments is
-not a failure at all: that is a usage error, and the provider's own message travels back for the
-model to read.
+`Run` answers parsing failures with `Ran`, before invocation authorization begins. A word no
+loaded provider declares returns `RunOutcome::NotFound`. An input past the host bound, a guest that
+traps or reaches for a host import, and an answer the broker cannot decode return
+`RunOutcome::Refused` with code `command-failed` and the fixed message `command word could not be
+run`. The broker logs `command.resolve.failed` naming the word and cause, so an operator can tell
+these cases apart. A provider that simply declines the arguments returns `RunOutcome::Refused`
+with the provider's own failure code and message for the model to read.
 
 Reserved words are unreachable through this path, and what reserves them is the deployment's own
 `capabilities`: every word belonging to the provider a chat-memory `route:` names is refused here

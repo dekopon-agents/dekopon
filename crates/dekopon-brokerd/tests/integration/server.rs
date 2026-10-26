@@ -2333,6 +2333,7 @@ async fn a_connection_outliving_the_shutdown_deadline_fails_the_drain_at_that_de
 }
 
 struct RunHarness {
+    socket: std::path::PathBuf,
     client: BrokerClient,
     audit: Arc<InMemoryAuditLog>,
     stop: oneshot::Sender<()>,
@@ -2403,6 +2404,7 @@ impl RunHarness {
         let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
         Self {
             client: BrokerClient::new(&socket, uid, limits.frame).unwrap(),
+            socket,
             audit,
             stop,
             task,
@@ -2565,6 +2567,14 @@ async fn an_invoke_over_the_row_bound_is_refused() {
         })
         .collect();
     assert!(assets.descriptors.is_empty());
+    let invocation = request("whole-table");
+    let raw = RequestEnvelope::invoke(
+        Some(session().bound_to(invocation.id.clone())),
+        invocation,
+        assets.rows.clone(),
+        0,
+        None,
+    );
     let error = harness
         .client
         .invoke(
@@ -2583,6 +2593,15 @@ async fn an_invoke_over_the_row_bound_is_refused() {
         }
     ));
     assert!(output.join().unwrap().is_empty());
+    let limits = server_limits().frame;
+    let mut stream = DescriptorStream::new(UnixStream::connect(&harness.socket).await.unwrap());
+    stream.write_frame(&raw, &[], limits).await.unwrap();
+    let (response, descriptors) = stream.read_frame::<ResponseEnvelope>(limits).await.unwrap();
+    assert!(descriptors.is_empty());
+    assert_eq!(
+        response,
+        ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid")
+    );
     assert!(harness.audit.records().is_empty());
     harness.stop().await;
 }

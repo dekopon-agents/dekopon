@@ -11,9 +11,11 @@ orchestration.
 
 Output limits bound what the host parses, not peak allocation: the JSON-over-WIT adapter lifts the
 whole guest string before measuring it. Per-memory size and memory/table/instance count ceilings
-bound that allocation path independently. For command words the input ceiling counts argv plus the
-piped value before creating a store. A refusal is an opaque routed `provider-error` response; only
-broker-side diagnostics name the bound.
+bound that allocation path independently. For command words the input ceiling counts argv before
+creating a store. `Run` answers with `Ran`: an unknown word returns `RunOutcome::NotFound`, while
+a host parsing failure returns `RunOutcome::Refused` with code `command-failed` and the fixed
+message `command word could not be run`; only broker-side diagnostics name the bound. A provider
+that declines the arguments returns `RunOutcome::Refused` with its own failure code and message.
 
 ## Execution boundary
 

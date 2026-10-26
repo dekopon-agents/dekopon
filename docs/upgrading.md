@@ -1184,7 +1184,7 @@ are unchanged. `probe upper --text hello` authorizes as `cli-probe.upper`.
    `cap --describe`, `cap <id>`, capability identifiers used as words (`wikipedia_`,
    `gh.pull-request.`), and `curl`, and point the model at the provider's own `<word> --help`. A
    skill still teaching `wikipedia_page --title` gets exit 127 on every call.
-4. **Upgrade both daemons together.** the legacy command-parse operation now requires a `traceParent`, and both envelopes
+4. **Upgrade both daemons together.** The legacy command-parse operation now requires a `traceParent`, and both envelopes
    are strict-decoded: a 0.14.0 `dekopond` against a 0.15.0 broker has every command word refused
    `invalid-request`, and a 0.15.0 `dekopond` against a 0.14.0 broker fails the same way. The
    protocol version stays `dekopon.dev/broker/v1alpha2`, so nothing earlier in the connection says

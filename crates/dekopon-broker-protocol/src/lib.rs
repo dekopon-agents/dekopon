@@ -88,9 +88,6 @@ pub const ERROR_INVALID_REQUEST: &str = "invalid-request";
 /// invocation identifier.
 pub const ERROR_BROKER_UNAVAILABLE: &str = "broker-unavailable";
 
-/// The provider's own failure text is deliberately opaque to the caller; an operator correlates the
-/// code with the audit event naming the word.
-pub const ERROR_PROVIDER: &str = "provider-error";
 /// The external effect may already have happened, so the request must never be resubmitted; the
 /// audit log is the only record of it.
 pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
