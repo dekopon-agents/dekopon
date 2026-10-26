@@ -1,0 +1,23 @@
+package dekopon:http@0.1.0;
+
+interface signed-download {
+    use dekopon:asset/asset@0.1.0.{handle};
+    record header { name: string, value: list<u8> }
+    variant window { tail(u32), offset(offset-window) }
+    record offset-window { start: u64, length: u32 }
+    record request { api-uri: string, window: window }
+    record api-response { status: u16, headers: list<header>, body: list<u8> }
+    record coverage { start: u64, end-exclusive: u64, total: u64 }
+    record storage-response {
+        status: u16,
+        coverage: option<coverage>,
+        body: option<handle>,
+    }
+    variant response { api(api-response), storage(storage-response) }
+    enum error-code {
+        denied, redirect-refused, request-limit, timeout, response-too-large,
+        incomplete, storage, internal,
+    }
+    record download-error { code: error-code }
+    download: func(request: request) -> result<response, download-error>;
+}

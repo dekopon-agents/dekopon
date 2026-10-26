@@ -46,6 +46,7 @@ mod memory;
 mod metadata;
 mod random;
 mod rss;
+mod signed_download;
 pub use rss::peak_rss_bytes;
 mod settings;
 pub mod skills;
@@ -55,7 +56,7 @@ mod storage;
 mod test_component_memo;
 use clock::ClockState;
 pub use dekopon_broker_protocol::{Streams, UpcallStdin, UpcallStreams};
-pub use dekopon_http_host::{HttpRequestFacts, RequestAuthorizer};
+pub use dekopon_http_host::{HttpRequestFacts, PolicyViolation, RequestAuthorizer};
 pub use http::{
     BoundCredential, HttpCallEvidence, HttpConfigurationError, HttpInvocation,
     NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts, destinations_cover,
@@ -415,6 +416,11 @@ impl Runtime {
             .clone()
             .map(|root| cwasm::Cache::new(root, &engine));
         let mut linker = Linker::new(&engine);
+        signed_download::bindings::dekopon::http0_1_0::signed_download::add_to_linker::<
+            _,
+            HasSelf<_>,
+        >(&mut linker, |state| state)
+        .map_err(|source| BrokerHostError::Linker { source })?;
         bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|source| BrokerHostError::Linker { source })?;
         asset::link_bounded_writer(&mut linker)
@@ -506,17 +512,17 @@ struct StoreState {
     instantiations: u64,
 }
 
-impl bindings::dekopon::http::client::Host for StoreState {
+impl bindings::dekopon::http1_1_0::client::Host for StoreState {
     async fn stream(
         &mut self,
-        request: bindings::dekopon::http::client::StreamedRequest,
+        request: bindings::dekopon::http1_1_0::client::StreamedRequest,
     ) -> wasmtime::Result<
         Result<
-            bindings::dekopon::http::client::StreamedResponse,
-            bindings::dekopon::http::client::HttpError,
+            bindings::dekopon::http1_1_0::client::StreamedResponse,
+            bindings::dekopon::http1_1_0::client::HttpError,
         >,
     > {
-        use bindings::dekopon::http::client as wit;
+        use bindings::dekopon::http1_1_0::client as wit;
         let Some(directory) = self.assets.directory()? else {
             self.assets
                 .reject(bindings::dekopon::asset::asset::ErrorCode::Unconfigured);
@@ -612,11 +618,11 @@ impl bindings::dekopon::http::client::Host for StoreState {
 
     async fn send(
         &mut self,
-        request: bindings::dekopon::http::client::Request,
+        request: bindings::dekopon::http1_1_0::client::Request,
     ) -> wasmtime::Result<
         Result<
-            bindings::dekopon::http::client::Response,
-            bindings::dekopon::http::client::HttpError,
+            bindings::dekopon::http1_1_0::client::Response,
+            bindings::dekopon::http1_1_0::client::HttpError,
         >,
     > {
         Ok(self.http.send(request).await)

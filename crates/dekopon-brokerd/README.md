@@ -1203,3 +1203,18 @@ rejects a route naming an absent catalog agent; operators must cross-check polic
 against that catalog. Principal literals are always checked; undeclared providers and capabilities
 are fatal with `strict: true`, otherwise reported as schema-only phantoms. Policy cannot widen
 owner-authored execution constraints or bind another credential.
+
+### Signed-download constraint
+
+`signedDownload: github-actions-logs-v1` is an optional HTTP constraint for the separate
+`dekopon:http/signed-download@0.1.0` import. It is disabled when absent. The API request still
+requires an exact `allowedHosts` entry, GET and its destination-bound credential; storage hosts
+are never added to that credential's destinations. The host admits only authenticated-route
+redirects to `productionresultssa[a-z0-9]{1,5}.blob.core.windows.net` or
+`pipelines[a-z0-9-]{0,54}.actions.githubusercontent.com`, subject to DNS label and public-address
+validation. Every storage request counts against `maxRequests`; no redirects follow from storage.
+
+For a full 64-KiB body, **recommend** `maxResponseBytes: 131072` to leave room for the existing
+64-KiB response-head ceiling. The combined total remains enforced. This is guidance, not a grant:
+the operator must separately authorize the capability and choose its limits. No example or
+homelab grant is enabled by this change. See the [security model](../../docs/security-model.md#signed-download).

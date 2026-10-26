@@ -1215,6 +1215,7 @@ dependencies = [
 name = "dekopon-http-host"
 version = "0.57.0"
 dependencies = [
+ "aho-corasick",
  "base64 0.23.1",
  "bytes",
  "dekopon-capability",
