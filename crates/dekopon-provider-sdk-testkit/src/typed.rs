@@ -535,6 +535,7 @@ impl ScriptServer {
             max_response_bytes: HTTP_BYTES as u64,
             allow_plaintext_loopback: false,
             propagate_trace: false,
+            signed_download: None,
             request_templates: templates,
         }
     }

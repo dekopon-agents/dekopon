@@ -46,6 +46,7 @@ env:
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.4.0
   STDIO_WIT_PACKAGE: dekopon:stdio@0.1.0
   HTTP_WIT_PACKAGE: dekopon:http@1.1.0
+  SIGNED_DOWNLOAD_WIT_PACKAGE: dekopon:http@0.1.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.1
   CLOCK_WIT_PACKAGE: dekopon:clock@1.1.0
   RANDOM_WIT_PACKAGE: dekopon:random@0.1.0
@@ -297,6 +298,20 @@ jobs:
               --config ../../wkg/config.toml \
               --cache "$RUNNER_TEMP/wkg-build-cache"
           )
+          (
+            cd wit/signed-download
+            wkg build --wit-dir . --output ../../target/wit-package/dekopon-signed-download.wasm --config ../../wkg/config.toml
+          )
+          wasm-tools validate target/wit-package/dekopon-signed-download.wasm
+          wasm-tools component wit --json target/wit-package/dekopon-signed-download.wasm > target/wit-package/dekopon-signed-download.json
+          jq --exit-status --arg package "$SIGNED_DOWNLOAD_WIT_PACKAGE" '
+            ([.packages[].name] | index($package) != null) and
+            ([.interfaces[].name] | index("signed-download") != null)
+          ' target/wit-package/dekopon-signed-download.json
+          cmp wit/signed-download/signed-download.wit crates/dekopon-provider-sdk/wit/deps/signed-download.wit
+          cmp wit/signed-download/signed-download.wit crates/dekopon-broker-host/wit/deps/signed-download.wit
+          cmp wit/asset/asset.wit wit/signed-download/deps/asset.wit
+          git diff --exit-code -- wit/signed-download/wkg.lock
           git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock wit/random/wkg.lock wit/spawn/wkg.lock
 
       - name: Verify provider exports and the stdio import
@@ -702,7 +717,7 @@ jobs:
           [registry."local.test".local]
           root = "$registry/packages"
           EOF
-          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random dekopon-spawn; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random dekopon-spawn dekopon-signed-download; do
             wkg publish \
               --config "$registry/config.toml" \
               --cache "$registry/publish-cache" \
@@ -736,6 +751,8 @@ jobs:
           cmp target/wit-package/dekopon-clock.wasm "$registry/fetched-clock.wasm"
           cmp target/wit-package/dekopon-random.wasm "$registry/fetched-random.wasm"
           cmp target/wit-package/dekopon-spawn.wasm "$registry/fetched-spawn.wasm"
+          wkg get --config "$registry/config.toml" --cache "$registry/fetch-cache" --output "$registry/fetched-signed-download.wasm" "$SIGNED_DOWNLOAD_WIT_PACKAGE"
+          cmp target/wit-package/dekopon-signed-download.wasm "$registry/fetched-signed-download.wasm"
 
       - name: Upload the verified packages
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -749,6 +766,7 @@ jobs:
             target/wit-package/dekopon-clock.wasm
             target/wit-package/dekopon-random.wasm
             target/wit-package/dekopon-spawn.wasm
+            target/wit-package/dekopon-signed-download.wasm
           if-no-files-found: error
           retention-days: 1
 
@@ -802,7 +820,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random dekopon-spawn; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock dekopon-random dekopon-spawn dekopon-signed-download; do
             wkg publish \
               --skip-dupes \
               --config wkg/config.toml \
@@ -842,6 +860,8 @@ jobs:
           cmp target/wit-package/dekopon-clock.wasm "$RUNNER_TEMP/published-clock.wasm"
           cmp target/wit-package/dekopon-random.wasm "$RUNNER_TEMP/published-random.wasm"
           cmp target/wit-package/dekopon-spawn.wasm "$RUNNER_TEMP/published-spawn.wasm"
+          wkg get --config wkg/config.toml --cache "$RUNNER_TEMP/wkg-verify-cache" --output "$RUNNER_TEMP/published-signed-download.wasm" "$SIGNED_DOWNLOAD_WIT_PACKAGE"
+          cmp target/wit-package/dekopon-signed-download.wasm "$RUNNER_TEMP/published-signed-download.wasm"
 
       - name: Log out of GHCR
         if: always()

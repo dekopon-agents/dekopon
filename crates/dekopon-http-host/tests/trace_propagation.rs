@@ -43,6 +43,7 @@ fn grant(authority: &str) -> HttpConstraints {
         allow_plaintext_loopback: true,
         propagate_trace: false,
         request_templates: Vec::new(),
+        signed_download: None,
     }
 }
 

@@ -14,3 +14,8 @@ world provider {
     import dekopon:settings/config@0.1.0;
     import dekopon:spawn/run@0.1.0;
 }
+
+world signed-download-host {
+    import dekopon:asset/asset@0.1.0;
+    import dekopon:http/signed-download@0.1.0;
+}

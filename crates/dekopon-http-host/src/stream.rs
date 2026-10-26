@@ -363,7 +363,13 @@ impl BufferedHttpClient {
             headers,
             bytes: mut response_bytes,
             mut body,
-        } = self.accept_head(&prepared.method, response, &grant, index)?;
+        } = self.accept_head(
+            &prepared.method,
+            response,
+            &grant,
+            index,
+            super::ResponseMetadata::Ordinary,
+        )?;
         let overlap = self
             .credential
             .as_ref()
@@ -555,6 +561,7 @@ impl BufferedHttpClient {
         response: reqwest::Response,
         grant: &HttpConstraints,
         index: usize,
+        metadata: super::ResponseMetadata,
     ) -> Result<Head, HttpError> {
         let mut codings = response
             .headers()
@@ -586,26 +593,13 @@ impl BufferedHttpClient {
         };
         let status = response.status().as_u16();
         self.evidence[index].status = Some(status);
-        if response.headers().len() > self.ceilings.max_headers {
-            return Err(http_error(
-                ErrorCode::ResponseTooLarge,
-                "response has too many headers",
-            ));
-        }
+        let response_bytes = super::response_head_bytes(
+            response.headers(),
+            &self.ceilings,
+            grant.max_response_bytes,
+        )?;
         let mut headers = Vec::with_capacity(response.headers().len());
-        let mut response_bytes = 16_u64;
         for (name, value) in response.headers() {
-            response_bytes = response_bytes
-                .checked_add((name.as_str().len() + value.as_bytes().len() + 4) as u64)
-                .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
-            if response_bytes > self.ceilings.max_header_bytes as u64
-                || response_bytes > grant.max_response_bytes
-            {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
-                    "response headers exceed an authorized bound",
-                ));
-            }
             if !is_forbidden_response_header(name)
                 && (decoder.is_none()
                     || (name != reqwest::header::CONTENT_ENCODING
@@ -634,18 +628,21 @@ impl BufferedHttpClient {
             return Err(echoed());
         }
         self.evidence[index].response_bytes = response_bytes;
-        self.evidence[index].upstream_request_id = response
-            .headers()
-            .get("x-github-request-id")
-            .and_then(|value| {
-                let bytes = value.as_bytes();
-                (1..=64)
-                    .contains(&bytes.len())
-                    .then_some(bytes)
-                    .filter(|bytes| bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)))
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .map(str::to_owned)
-            });
+        self.evidence[index].upstream_request_id = match metadata {
+            super::ResponseMetadata::SignedDownload => None,
+            super::ResponseMetadata::Ordinary => response
+                .headers()
+                .get("x-github-request-id")
+                .and_then(|value| {
+                    let bytes = value.as_bytes();
+                    (1..=64)
+                        .contains(&bytes.len())
+                        .then_some(bytes)
+                        .filter(|bytes| bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)))
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .map(str::to_owned)
+                }),
+        };
         Ok(Head {
             status,
             headers: head.headers,
@@ -658,7 +655,7 @@ impl BufferedHttpClient {
         })
     }
 
-    fn asset_error(&mut self, error: AssetIoError) -> HttpError {
+    pub(super) fn asset_error(&mut self, error: AssetIoError) -> HttpError {
         if matches!(error, AssetIoError::OverBudget) {
             self.asset_over_budget = true;
         }
@@ -718,6 +715,7 @@ mod tests {
                 allow_plaintext_loopback: true,
                 propagate_trace: false,
                 request_templates: Vec::new(),
+                signed_download: None,
             },
             credential,
             HttpHostCeilings::default(),
@@ -1329,6 +1327,7 @@ mod tests {
             allow_plaintext_loopback: false,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         };
         let mut client = BufferedHttpClient::authorized(
             grant,
@@ -1522,6 +1521,7 @@ mod tests {
                     allow_plaintext_loopback: false,
                     propagate_trace: false,
                     request_templates: Vec::new(),
+                    signed_download: None,
                 },
                 HttpHostCeilings {
                     loopback_https_pin: Some(pin),
