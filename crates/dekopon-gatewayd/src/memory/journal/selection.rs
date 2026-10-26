@@ -637,7 +637,6 @@ mod tests {
                     Some((ResponseEnvelope::error("denied", "fixture refusal"), vec![]))
                 }
                 other @ (BrokerRequest::Run { .. }
-                | BrokerRequest::RunCommand { .. }
                 | BrokerRequest::RecordDeliveredTurn { .. }
                 | BrokerRequest::UpcallResult { .. }
                 | BrokerRequest::PrepareGeneration { .. }

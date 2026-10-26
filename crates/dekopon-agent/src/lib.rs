@@ -1989,9 +1989,9 @@ mod tests {
 
             use dekopon_broker_protocol::{
                 BrokerClient, BrokerRequest, BrokerResponse, ChatScopeClaim, ChatTransportKind,
-                CommandRunOutcome, Conversation, ConversationKind, DescriptorStream, FrameLimits,
-                InvocationOutcome, ProtocolVersion, RequestEnvelope, ResponseEnvelope, TraceParent,
-                Trigger, UpcallStdin,
+                Conversation, ConversationKind, DescriptorStream, FrameLimits, InvocationOutcome,
+                ProtocolVersion, RequestEnvelope, ResponseEnvelope, TraceParent, Trigger,
+                UpcallStdin,
             };
             use dekopon_process::CancelSignal;
             use dekopon_process::ExitCode;
@@ -2181,19 +2181,6 @@ mod tests {
                                     secret_use: None,
                                 },
                             )
-                        }
-                        BrokerRequest::RunCommand { argv, .. } => {
-                            let proposal =
-                                ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
-                                    capability: CAPABILITY.parse().expect("capability"),
-                                    input: json!({"uri": argv.last()}),
-                                    secret_use: None,
-                                });
-                            stream
-                                .write_frame(&proposal, &[], FrameLimits::default())
-                                .await
-                                .expect("fake broker proposes");
-                            continue;
                         }
                         BrokerRequest::Invoke {
                             attestation,

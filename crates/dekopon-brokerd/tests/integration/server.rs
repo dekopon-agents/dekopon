@@ -20,11 +20,10 @@ use dekopon_broker::{
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, BrokerRequest, BrokerResponse, ChatScopeClaim, ChatTransportKind,
-    ClientError, CommandRunOutcome, Conversation, ConversationKind, DeliveredAnswer,
-    DeliveredTurnRequest, DeliveryIdentity, DescriptorStream, ERROR_BROKER_UNAVAILABLE,
-    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED, FrameLimits,
-    ProtocolVersion, RequestEnvelope, ResponseEnvelope, Trigger, UpcallStdin, UpcallStreams,
-    read_frame, write_frame,
+    ClientError, Conversation, ConversationKind, DeliveredAnswer, DeliveredTurnRequest,
+    DeliveryIdentity, DescriptorStream, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED,
+    ERROR_INVALID_REQUEST, ERROR_UNAUTHENTICATED, FrameLimits, ProtocolVersion, RequestEnvelope,
+    ResponseEnvelope, Trigger, UpcallStdin, UpcallStreams, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerError, ServerLimits,
@@ -283,114 +282,6 @@ fn server_limits() -> ServerLimits {
         max_connections: 4,
         shutdown_grace: Duration::from_secs(2),
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
-async fn run_command_over_the_socket_renders_help_then_proposes() {
-    let uid = current_uid();
-    let directory = private_directory();
-    let socket_path = directory.path().join("broker.sock");
-    let listener = bind_fixture(&socket_path);
-    let (broker, audit) = broker().await;
-    let mut identities = BTreeMap::new();
-    identities.insert(
-        uid,
-        MappedPeer {
-            context: context("caller"),
-            attestor: Some(attestor_grant()),
-        },
-    );
-    let limits = server_limits();
-    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
-    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
-
-    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    let surface = client
-        .session_surface(Some(session()))
-        .await
-        .expect("inspect the surface");
-    assert_eq!(surface.command_words, ["probe"]);
-
-    match client
-        .run_command(
-            Some(session()),
-            "probe".to_owned(),
-            vec!["--help".to_owned()],
-            false,
-            TRACE_PARENT.parse().expect("valid traceparent fixture"),
-        )
-        .await
-        .expect("the help page renders")
-    {
-        CommandRunOutcome::Rendered {
-            stdout,
-            stderr,
-            status,
-        } => {
-            assert_eq!(status, 0);
-            assert!(stdout.starts_with("Usage: probe <COMMAND>"), "{stdout}");
-            assert!(stderr.is_empty(), "{stderr}");
-        }
-        other => panic!("expected a rendered help page, got {other:?}"),
-    }
-    assert!(audit.records().is_empty(), "rendering decides nothing");
-
-    let (capability, input) = match client
-        .run_command(
-            Some(session()),
-            "probe".to_owned(),
-            vec!["upper".to_owned(), "-".to_owned()],
-            true,
-            TRACE_PARENT.parse().expect("valid traceparent fixture"),
-        )
-        .await
-        .expect("the piped value proposes")
-    {
-        CommandRunOutcome::Proposed {
-            capability,
-            input,
-            secret_use: None,
-        } => (capability, input),
-        other => panic!("expected a proposal, got {other:?}"),
-    };
-    assert_eq!(capability.as_str(), "cli-probe.upper");
-    assert_eq!(input, json!({"text": "", "piped": true}));
-
-    let (streams, stdout) = stdio(Some(b"hello"));
-    let result = client
-        .invoke(
-            Some(session()),
-            InvocationRequest {
-                id: "invoke-probe-upper"
-                    .parse::<InvocationId>()
-                    .expect("valid invocation fixture"),
-                capability,
-                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                secret_use: None,
-                input,
-            },
-            streams,
-            async |_upcall| unreachable!(),
-        )
-        .await
-        .expect("invoke the proposal");
-    assert_eq!(stdout.join().unwrap(), b"{\"text\":\"HELLO\"}\n");
-    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(
-        audit.records().len(),
-        2,
-        "one decision and one execution for the one invocation"
-    );
-
-    shutdown_send.send(()).expect("signal clean shutdown");
-    task.await
-        .expect("server task exits")
-        .expect("server shuts down");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2659,11 +2550,11 @@ async fn an_unknown_word_answers_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_invoke_with_a_whole_table_and_no_descriptors_still_runs() {
-    use dekopon_broker_protocol::{AssetEncoding, AssetRow};
+async fn an_invoke_over_the_row_bound_is_refused() {
+    use dekopon_broker_protocol::{AssetEncoding, AssetRow, MAX_ASSET_ROWS, ProtocolError};
     let harness = RunHarness::start("caller").await;
     let (mut assets, output) = stdio(None);
-    assets.rows = (1..=32)
+    assets.rows = (1..=u64::try_from(MAX_ASSET_ROWS + 1).unwrap())
         .map(|id| AssetRow {
             id,
             content_type: "image/png".to_owned(),
@@ -2674,7 +2565,7 @@ async fn an_invoke_with_a_whole_table_and_no_descriptors_still_runs() {
         })
         .collect();
     assert!(assets.descriptors.is_empty());
-    let response = harness
+    let error = harness
         .client
         .invoke(
             Some(session()),
@@ -2683,13 +2574,16 @@ async fn an_invoke_with_a_whole_table_and_no_descriptors_still_runs() {
             async |_| panic!("probe cannot upcall"),
         )
         .await
-        .unwrap();
-    assert_eq!(response.result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.join().unwrap()).unwrap(),
-        json!({"text":"HELLO THROUGH BROKER"})
-    );
-    assert_eq!(harness.audit.records().len(), 2);
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ClientError::Protocol {
+            source: ProtocolError::TooManyAssetRows,
+            ..
+        }
+    ));
+    assert!(output.join().unwrap().is_empty());
+    assert!(harness.audit.records().is_empty());
     harness.stop().await;
 }
 

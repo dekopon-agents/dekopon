@@ -20,9 +20,8 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatScopeClaim, ChatTransportKind, CommandRunOutcome, Conversation,
-    ConversationKind, DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
-    TraceParent,
+    Attestation, BrokerClient, ChatScopeClaim, ChatTransportKind, Conversation, ConversationKind,
+    DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, TraceParent,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
@@ -41,7 +40,6 @@ const CLIENT_TRACE_ID: [u8; 16] = [
 ];
 const CLIENT_SPAN_ID: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
 const CLIENT_TRACE_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-const CLIENT_SPAN_HEX: &str = "00f067aa0ba902b7";
 
 const SUBJECT: &str = "slack.t0123abc.u9xyz";
 const AGENT: &str = "chat-agent";
@@ -528,113 +526,59 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn every_command_run_carries_the_client_s_w3c_trace_id() {
+async fn command_parsing_stays_in_the_invocations_trace() {
+    use dekopon_broker_protocol::{Arg, InvokeAssets, RunOutcome, RunRequest, Streams};
     let probe = install();
     let served = serve().await;
-
-    let proposed = served
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        bytes
+    });
+    let response = served
         .client
-        .run_command(
+        .run(
             Some(session()),
-            "probe".to_owned(),
-            vec!["upper".to_owned(), "--text".to_owned(), "hello".to_owned()],
-            false,
-            trace_parent(),
+            RunRequest {
+                invocation: "run-traced".parse().unwrap(),
+                trace_parent: trace_parent(),
+                word: "probe".to_owned(),
+                argv: vec![Arg::Text("--help".to_owned())],
+            },
+            InvokeAssets {
+                streams: Some(Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
+            async |_| unreachable!(),
         )
         .await
-        .expect("the word proposes");
-    assert!(
-        matches!(
-            proposed,
-            CommandRunOutcome::Proposed { ref capability, .. }
-                if capability.as_str() == "cli-probe.upper"
-        ),
-        "{proposed:?}"
-    );
-    let help = served
-        .client
-        .run_command(
-            Some(session()),
-            "probe".to_owned(),
-            vec!["--help".to_owned()],
-            false,
-            trace_parent(),
-        )
-        .await
-        .expect("the help page renders");
-    assert!(
-        matches!(help, CommandRunOutcome::Rendered { status: 0, .. }),
-        "{help:?}"
-    );
-    let declined = served
-        .client
-        .run_command(
-            Some(session()),
-            "probe".to_owned(),
-            vec!["upper".to_owned(), "-".to_owned()],
-            false,
-            trace_parent(),
-        )
-        .await
-        .expect("the guest's decline is an answer");
-    assert!(
-        matches!(
-            declined,
-            CommandRunOutcome::Failed { ref error }
-                if error.message.contains("nothing was piped in")
-        ),
-        "{declined:?}"
-    );
-    let refused = served
-        .client
-        .run_command(
-            Some(session()),
-            "nosuchword".to_owned(),
-            Vec::new(),
-            false,
-            trace_parent(),
-        )
-        .await;
-    assert!(refused.is_err(), "an undeclared word answers: {refused:?}");
-
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RunOutcome::Rendered { status: 0, .. }
+    ));
+    captured.join().unwrap();
     served.stop().await;
-
     for name in ["broker.command_run", "provider.run_command"] {
         let traces = probe.traces_entered(name);
         assert!(!traces.is_empty(), "{name} was never entered");
-        assert!(
-            traces.iter().all(|trace| trace == CLIENT_TRACE_HEX),
-            "{name} left the client's trace: {traces:?}"
-        );
+        assert!(traces.iter().all(|trace| trace == CLIENT_TRACE_HEX));
     }
-    assert_eq!(
-        probe.parents_ended("broker.command_run"),
-        [CLIENT_SPAN_HEX; 4],
-        "every run is the child of the span the client's traceparent named"
-    );
-    let outcomes = probe
-        .span_fields("broker.command_run")
-        .into_iter()
-        .filter_map(|fields| fields.strip_prefix(" outcome=").map(str::to_owned))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        outcomes,
-        [
-            r#""proposed""#,
-            r#""rendered""#,
-            r#""failed""#,
-            r#""error""#
-        ],
-        "each run records its outcome under its exact name, in order"
-    );
+    let invocation = probe
+        .ended
+        .lock()
+        .iter()
+        .find(|span| span.name == "broker.invocation")
+        .unwrap()
+        .clone();
+    assert_eq!(invocation.parent_span_id, "00f067aa0ba902b7");
+    assert_eq!(probe.parents_ended("broker.command_run").len(), 1);
     assert_eq!(
         probe.statuses_ended("broker.command_run"),
-        [
-            opentelemetry::trace::Status::Unset,
-            opentelemetry::trace::Status::Unset,
-            opentelemetry::trace::Status::Unset,
-            opentelemetry::trace::Status::error(""),
-        ],
-        "only a run the broker could not complete is an error; a guest's own decline is an answer"
+        [opentelemetry::trace::Status::Unset]
     );
 }

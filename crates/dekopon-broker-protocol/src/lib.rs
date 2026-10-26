@@ -798,26 +798,6 @@ impl RequestEnvelope {
     }
 
     #[must_use]
-    pub const fn run_command(
-        attestation: Option<Attestation>,
-        word: String,
-        argv: Vec<String>,
-        stdin_piped: bool,
-        trace_parent: TraceParent,
-    ) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha2,
-            request: BrokerRequest::RunCommand {
-                attestation,
-                trace_parent,
-                word,
-                argv,
-                stdin_piped,
-            },
-        }
-    }
-
-    #[must_use]
     pub const fn invoke(
         attestation: Option<Attestation>,
         invocation: InvocationRequest,
@@ -880,16 +860,6 @@ pub enum BrokerRequest {
         #[serde(rename = "sendsRemaining")]
         sends_remaining: u8,
         streams: StreamDescriptors,
-    },
-    RunCommand {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
-        #[serde(rename = "traceParent")]
-        trace_parent: TraceParent,
-        word: String,
-        argv: Vec<String>,
-        #[serde(default, rename = "stdinPiped")]
-        stdin_piped: bool,
     },
     Invoke {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -966,7 +936,6 @@ impl BrokerRequest {
             }
             Self::Invoke { .. }
             | Self::Capabilities { .. }
-            | Self::RunCommand { .. }
             | Self::RecordDeliveredTurn { .. }
             | Self::UpcallResult { .. }
             | Self::PrepareGeneration { .. }
@@ -1066,7 +1035,7 @@ pub enum RunOutcome {
     },
 }
 
-pub const MAX_ASSET_ROWS: usize = 32;
+pub const MAX_ASSET_ROWS: usize = MAX_ASSET_DESCRIPTORS;
 pub const MAX_ASSET_DESCRIPTORS: usize = 5;
 pub const MAX_STREAM_DESCRIPTORS: usize = 2;
 pub const MAX_DESCRIPTORS_PER_FRAME: usize = 8;
@@ -1830,36 +1799,6 @@ impl BrokerClient {
         Ok(self.session_surface(None).await?.capabilities)
     }
 
-    /// A refused attestation must answer exactly as an unknown word would, since naming the word
-    /// would disclose the surface withheld.
-    pub async fn run_command(
-        &self,
-        attestation: Option<Attestation>,
-        word: String,
-        argv: Vec<String>,
-        stdin_piped: bool,
-        trace_parent: TraceParent,
-    ) -> Result<CommandRunOutcome, ClientError> {
-        match self
-            .exchange(RequestEnvelope::run_command(
-                attestation,
-                word,
-                argv,
-                stdin_piped,
-                trace_parent,
-            ))
-            .await?
-        {
-            BrokerResponse::CommandRun { result } => Ok(result),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
-            | BrokerResponse::Ran { .. }
-            | BrokerResponse::Invocation { .. }
-            | BrokerResponse::Upcall { .. }
-            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
     /// Strict alternation: the broker writes nothing while a child runs, so no read is outstanding
     /// and a parked invocation is bounded by the caller's cancellation, not the io timer.
     pub async fn run(
@@ -2128,7 +2067,6 @@ impl BrokerClient {
             | BrokerRequest::AbortGeneration { digest } => digest,
             BrokerRequest::Capabilities { .. }
             | BrokerRequest::Run { .. }
-            | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
             | BrokerRequest::UpcallResult { .. }

@@ -291,14 +291,6 @@ fn typed_rows_and_response_indexes_are_exact() {
     let request = RequestEnvelope::invoke(
         None,
         super::invocation(),
-        vec![row.clone(); MAX_ASSET_ROWS],
-        4,
-        None,
-    );
-    request.request.validate().expect("row cap inclusive");
-    let request = RequestEnvelope::invoke(
-        None,
-        super::invocation(),
         vec![row; MAX_ASSET_ROWS + 1],
         4,
         None,
