@@ -141,7 +141,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
             assert!(matches!(
                 *result.unwrap_err().error,
                 BrokerHostError::HostCallRejected {
-                    reason: "asset-call-rejected",
+                    reason: dekopon_broker_host::HostCallRejection::AssetCallRejected,
                     ..
                 }
             ));

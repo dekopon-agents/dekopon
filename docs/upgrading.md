@@ -8,11 +8,20 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## RunCommand removed and attachments refetched on use (0.56.0)
+
+No configuration change and no provider WIT or SDK re-pin. Before upgrading:
+
+- Upgrade the broker and its clients together. The legacy `runCommand` broker operation is removed: a 0.56.0 broker answers it `invalid-request`. In-tree gateways and consoles have sent `run` since 0.54.0; an older client's command words all fail. The `provider-error` code goes with it. Rust callers lose `BrokerRequest::RunCommand`, `RequestEnvelope::run_command`, `BrokerClient::run_command` and `ERROR_PROVIDER`; send `run` and match its `RunOutcome`.
+- An `Invoke` carries at most five asset rows, the bound `run` already had; a request with more is refused `invalid-request`.
+- A session-bound use of an evicted inbound attachment downloads it again under the live generation and current grant; generated files are never regenerated. Attachment refusals name `evicted`, `platform-gone`, `revoked` or `store-failed` instead of `reclaimed` and `unauthorized`, in `agent.chat_asset_input.refused` reasons and `fetch_chat_asset` text; a dashboard or alert keyed on the old reasons needs the new ones. The gateway adds `gateway.asset.evicted`, `gateway.asset.refetch` and `gateway.asset.store_failed`.
+
 ## Durable attachment store and per-issue GitHub conversations (0.55.0)
 
 A gateway with a journal needs one configuration change; no provider WIT or SDK re-pin. Before upgrading:
 
 - With `sessions.journal` set, the gateway refuses to start without `sessions.assets.path`, a directory that neither equals, contains nor sits inside the journal directory; `sessions.assets` without `sessions.journal` is refused too. A 0.54.0 gateway refuses `sessions.assets`, so the key and the image roll out, and revert, together. With the chart, set `gateway.assets.enabled: true` beside `gateway.journal.enabled` and point `sessions.assets.path` at `gateway.assets.mountPath` (default `/var/lib/dekopon-gatewayd/assets`). `dekopon-gatewayd check --probe --against` cannot load a 0.54.0-shaped baseline with a journal, so it warns that the baseline did not load and probes every model. For the upgrade itself, compare against a baseline that already carries `sessions.assets.path` (with the chart, point `configCheck.gateway.againstConfigMap` at such a ConfigMap) or expect every model to be probed.
+- Rolling back from 0.55.0 to 0.54.0 needs the same care in reverse: a 0.54.0 `dekopon-gatewayd check --probe --against` cannot load a 0.55.0-shaped live set, because it refuses `sessions.assets`, so it warns that the baseline did not load and probes every model. Remove `sessions.assets` and restore the image in one change, and compare against that change's own gateway set: with the chart, point `configCheck.gateway.againstConfigMap` at the ConfigMap holding the rolled-back configuration in the same rollback.
 - The default `sessions.assetRetentionBytes` rises from 256 MiB to 1 GiB. With a journal, retained uploads live on the state claim, so its filesystem needs that much free, or set a smaller budget. The chart's `volumeSizes.gatewayTmp` and `volumeSizes.brokerAssets` defaults rise to 1152Mi; a deployment that sets either explicitly, or runs without a journal, must size them for the 1 GiB budget plus staging. At startup the gateway logs `gateway.asset.store_started` with the store's free bytes and budget.
 - GitHub deliveries share one conversation per issue or pull request (or one per repository) instead of one per delivery, and a delivery refused at session admission is answered 503 instead of 200.
 - Rust callers: `ExitCode`, `JOBS_OFF`, `JobId`, `JobOutcome`, `JobState`, `JobSummary` and `JobWait` move from `dekopon_shell` to `dekopon_process`; `ExitCode::from_capability_result(&result)` becomes `ExitCode::from(&result)`.
@@ -1076,8 +1085,8 @@ Embedders lose the machinery with it:
   `serde_json::from_str::<CommandRunOutcome>`.
 - **The `resolveCommand` broker operation is removed from the wire.** `BrokerRequest::ResolveCommand`
   and `BrokerResponse::CommandResolution` no longer exist, and a broker answers the operation tag
-  with `invalid-request`. It was kept for one release for a client predating `runCommand`; no
-  in-tree client has sent it since 0.13.0. Send `runCommand` and match the `CommandRunOutcome`.
+  with `invalid-request`. It was kept for one release for a client predating the legacy command-parse operation; no
+  in-tree client has sent it since 0.13.0. Send the legacy command-parse operation and match the `CommandRunOutcome`.
 
 ## A route may set the script deadline (0.15.2)
 
@@ -1111,7 +1120,7 @@ choice. `maxDurationMs` is unchanged and remains the session bound.
 **Upgrade both daemons together.** A failed `InvocationResult` gains `detail`, a `{ code, message }`
 object, whenever the broker's classification came from a provider's own typed failure. The result is
 strict-decoded in both directions, so a 0.15.0 `dekopond` reading a 0.15.1 broker's failed result
-cannot decode it — exactly as [`runCommand` couples in 0.15.0](#providers-run-on-argv-only-0150).
+cannot decode it — exactly as [the command-parse operation couples in 0.15.0](#providers-run-on-argv-only-0150).
 There is no tolerant read and no default: a gateway that quietly dropped the field would discard the
 only record of why a provider refused. The protocol version stays `dekopon.dev/broker/v1alpha2`.
 
@@ -1184,7 +1193,7 @@ are unchanged. `probe upper --text hello` authorizes as `cli-probe.upper`.
    `cap --describe`, `cap <id>`, capability identifiers used as words (`wikipedia_`,
    `gh.pull-request.`), and `curl`, and point the model at the provider's own `<word> --help`. A
    skill still teaching `wikipedia_page --title` gets exit 127 on every call.
-4. **Upgrade both daemons together.** `runCommand` now requires a `traceParent`, and both envelopes
+4. **Upgrade both daemons together.** The legacy command-parse operation now requires a `traceParent`, and both envelopes
    are strict-decoded: a 0.14.0 `dekopond` against a 0.15.0 broker has every command word refused
    `invalid-request`, and a 0.15.0 `dekopond` against a 0.14.0 broker fails the same way. The
    protocol version stays `dekopon.dev/broker/v1alpha2`, so nothing earlier in the connection says
@@ -1195,7 +1204,7 @@ are unchanged. `probe upper --text hello` authorizes as `cli-probe.upper`.
    - `shell.command` and `provider.run_command` carry the arguments, the piped value, and the
      output, each up to 4096 bytes plus `…[truncated]`, beside a `.bytes` total. A loop exports
      every iteration's.
-   - `broker.command_run` is a new span per `runCommand`
+   - `broker.command_run` is a new span per the legacy command-parse operation
      ([`observability.md`](observability.md#broker-execution-spans)).
    - Storage-backed spans and audit records carry the subject, agent, capability, provider, policy
      fields, and `input` every other invocation does, and storage evidence carries exact `readBytes`
@@ -1463,7 +1472,7 @@ See [`operations.md`](operations.md#audit).
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
-### 0.12.0 → 0.13.0 — command words run over `runCommand`, and `imageGenerator:` is removed
+### 0.12.0 → 0.13.0 — command words run over the legacy command-parse operation, and `imageGenerator:` is removed
 
 One item here — the removed `imageGenerator:` — **does** need a configuration edit; nothing else
 does.
@@ -1501,10 +1510,10 @@ does.
 
 - **Upgrade the broker before its clients, and both daemons together.** The local protocol
   stays `dekopon.dev/broker/v1alpha2`, but `dekopond` now sends a provider
-  command word as `runCommand` — the word, its argv, and the optional piped value — and reads back
+  command word as the legacy command-parse operation — the word, its argv, and the optional piped value — and reads back
   the guest's own outcome. A newer broker still answers the legacy `resolveCommand`, with a
   rendered page degraded to a decline carrying its stdout then stderr, so an older client keeps
-  working for one release. The reverse does not hold: an older broker refuses `runCommand` as
+  working for one release. The reverse does not hold: an older broker refuses the legacy command-parse operation as
   `invalid-request` at the `operation` tag, indistinguishable from a corrupt frame, so a newer
   client against an older broker reports every command word as a failed run until the broker moves.
 - **Upgrade the broker host before a provider adopts `run-command`.** A component built against

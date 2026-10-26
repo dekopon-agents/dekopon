@@ -1540,32 +1540,6 @@ fn attributed_prompt(principal: Option<&PrincipalId>, text: &str) -> String {
     bound_inbound(&format!("{}{text}", attribution_header(principal)))
 }
 
-fn inventory_prompt(
-    text: &str,
-    registered: &asset::Registered,
-    images_supported: bool,
-    reader: asset::TextReader,
-    principal: Option<&PrincipalId>,
-    notice_bytes: usize,
-) -> String {
-    let original_text = text;
-    let text = if text.trim().is_empty() { "" } else { text };
-    let separator = if text.is_empty() { "" } else { "\n\n" };
-    let budget = crate::transport::MAX_INBOUND_TEXT_BYTES
-        .saturating_sub(text.len())
-        .saturating_sub(separator.len())
-        .saturating_sub(attribution_header(principal).len())
-        .saturating_sub(notice_bytes);
-    let note = asset::reference_note(registered, images_supported, reader, budget);
-    debug_assert_eq!(note.listed + note.omitted, registered.inventory.len());
-    debug_assert!(note.bytes <= budget);
-    if note.text.is_empty() {
-        original_text.to_owned()
-    } else {
-        format!("{text}{separator}{}", note.text)
-    }
-}
-
 #[derive(Clone, Copy)]
 enum InventoryPath {
     Turn,
@@ -1574,12 +1548,42 @@ enum InventoryPath {
 }
 
 struct PromptFrame<'a> {
+    inventory: Option<&'a Mutex<asset::InventoryUsage>>,
     principal: Option<&'a PrincipalId>,
     delivery: Option<&'a str>,
     stop: Option<&'a str>,
 }
 
 impl PromptFrame<'_> {
+    fn inventory_prompt(
+        &self,
+        text: &str,
+        registered: &asset::Registered,
+        images_supported: bool,
+        reader: asset::TextReader,
+        notice_bytes: usize,
+    ) -> String {
+        let original_text = text;
+        let text = if text.trim().is_empty() { "" } else { text };
+        let separator = if text.is_empty() { "" } else { "\n\n" };
+        let budget = crate::transport::MAX_INBOUND_TEXT_BYTES
+            .saturating_sub(text.len())
+            .saturating_sub(separator.len())
+            .saturating_sub(attribution_header(self.principal).len())
+            .saturating_sub(notice_bytes);
+        let note = asset::reference_note(registered, images_supported, reader, budget);
+        if let Some(inventory) = self.inventory {
+            inventory.lock().note(&note, registered);
+        }
+        debug_assert_eq!(note.listed + note.omitted, registered.inventory.len());
+        debug_assert!(note.bytes <= budget);
+        if note.text.is_empty() {
+            original_text.to_owned()
+        } else {
+            format!("{text}{separator}{}", note.text)
+        }
+    }
+
     fn inventory(
         &self,
         text: &str,
@@ -1590,14 +1594,7 @@ impl PromptFrame<'_> {
     ) -> String {
         let reserved = self.delivery.map_or(0, |notice| notice.len() + 1)
             + self.stop.map_or(0, |notice| notice.len() + 1);
-        let text = inventory_prompt(
-            text,
-            registered,
-            images_supported,
-            reader,
-            self.principal,
-            reserved,
-        );
+        let text = self.inventory_prompt(text, registered, images_supported, reader, reserved);
         let text = match path {
             InventoryPath::Turn | InventoryPath::Follow => match self.stop {
                 Some(notice) => bound_inbound(&format!("{notice}\n{text}")),
@@ -1897,6 +1894,7 @@ struct SessionSteers {
     stop_notice: Option<String>,
     principal: Option<PrincipalId>,
     received_at: tokio::time::Instant,
+    inventory: Arc<Mutex<asset::InventoryUsage>>,
     raw_texts: Mutex<Vec<String>>,
     taken: Mutex<Vec<String>>,
 }
@@ -1943,6 +1941,7 @@ impl SessionSteers {
                 let recorded =
                     bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
                 let prompt = PromptFrame {
+                    inventory: Some(&self.inventory),
                     principal: self.principal.as_ref(),
                     delivery: self.delivery_notice,
                     stop: self.stop_notice.as_deref(),
@@ -2394,7 +2393,9 @@ async fn session_turn(
         .lock()
         .remove(&key)
         .map(|PendingNotice(cause)| cause.notice());
+    let inventory = Arc::new(Mutex::new(asset::InventoryUsage::default()));
     let text = PromptFrame {
+        inventory: Some(&inventory),
         principal: principal.as_ref(),
         delivery: delivery_notice,
         stop: stop_notice.as_deref(),
@@ -2422,14 +2423,17 @@ async fn session_turn(
     } else {
         frame(recorded)
     };
-    let assets = Arc::new(SessionAssets::new(
+    let mut assets = SessionAssets::new(
         Arc::clone(&runner.assets),
         asset_access.clone(),
         runner.asset_fetchers.get(&message.transport).cloned(),
         tokio::runtime::Handle::current(),
         images_supported,
-    ));
+    );
+    assets.inventory = Arc::clone(&inventory);
+    let assets = Arc::new(assets);
     let steers = Arc::new(SessionSteers {
+        inventory,
         gate: runner.gate.clone(),
         key: (message.transport.clone(), message.conversation.key()),
         cancellation: cancellation.clone(),
@@ -3843,6 +3847,7 @@ mod inventory_prompt_tests {
             InventoryPath::Turn | InventoryPath::Follow => text,
         };
         let prompt = PromptFrame {
+            inventory: None,
             principal: Some(&principal),
             delivery: Some(delivery),
             stop: Some(&stop),
@@ -3892,6 +3897,7 @@ mod inventory_prompt_tests {
                 - expected_note.len(),
         );
         let prompt = PromptFrame {
+            inventory: None,
             principal: Some(&principal),
             delivery: None,
             stop: None,

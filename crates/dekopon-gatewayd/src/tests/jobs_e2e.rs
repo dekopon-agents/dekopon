@@ -1656,7 +1656,6 @@ pub(super) fn attested(
             } => invocations.push(scope.trigger),
             BrokerRequest::Capabilities { .. }
             | BrokerRequest::Run { .. }
-            | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
             | BrokerRequest::UpcallResult { .. }

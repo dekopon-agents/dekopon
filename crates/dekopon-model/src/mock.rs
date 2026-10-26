@@ -29,6 +29,7 @@ enum Delivery {
     Split(usize),
     Interrupted(usize),
     Stalled {
+        prefix: usize,
         ready: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     },
@@ -73,11 +74,23 @@ impl MockResponse {
         tokio::sync::oneshot::Receiver<()>,
         std::sync::mpsc::Sender<()>,
     ) {
+        self.stalled_after(0)
+    }
+
+    pub(crate) fn stalled_after(
+        self,
+        prefix: usize,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         let (ready, observed) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         (
             Self {
                 delivery: Delivery::Stalled {
+                    prefix,
                     ready,
                     release: released,
                 },
@@ -236,9 +249,22 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        Delivery::Stalled { ready, release } => {
+        Delivery::Stalled {
+            prefix,
+            ready,
+            release,
+        } => {
+            if stream
+                .write_all(&response.body.as_bytes()[..prefix])
+                .is_err()
+            {
+                return;
+            }
             let _receiver_closed = ready.send(());
             let _released_or_dropped = release.recv_timeout(Duration::from_secs(5));
+            if prefix > 0 {
+                let _closed = stream.write_all(&response.body.as_bytes()[prefix..]);
+            }
         }
     }
 }

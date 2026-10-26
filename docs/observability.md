@@ -231,9 +231,12 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | Event | Emitted by | Carries |
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, bounded provider-authored `gen_ai.tool.call.id`, or 1-based `tool_call.position` for an empty id, a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool`, and `rejection.fed_back`, true when the call was answered with the tool shape instead of ending the session (the first turn with a rejection, for an unknown tool or a malformed `bash` call); `warn` when `rejection.fed_back = true`, `error` when false — never the model's own tool name or arguments |
-| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `evicted`, `platform-gone`, `revoked`, `store-failed`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
 | `gateway.asset.content_type_mismatch` | `dekopon-gatewayd` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
+| `gateway.asset.evicted` | `dekopon-gatewayd` | once per successful budget eviction, excluding journal deletion: `asset.origin` (`inbound` or `generated`), numeric `asset.bytes`, `asset.store.bytes`, `asset.store.budget_bytes` |
+| `gateway.asset.refetch` | `dekopon-gatewayd` | once per refetch attempt: `outcome` (`refetched`, `platform-gone`, `revoked`, `unavailable`), numeric `asset.store.bytes`, `asset.store.budget_bytes`; failed re-admission is `unavailable` here and `store-failed` to the model |
+| `gateway.asset.store_failed` | `dekopon-gatewayd` | once per failed store, excluding disabled retention: `reason` (`budget-too-small`, `stored-too-large`, `decoded-too-large`, `all-pinned`, `io`), numeric `asset.bytes`, `asset.store.bytes`, `asset.store.budget_bytes` |
 | `gateway.asset.store_started` | `dekopon-gatewayd` | once after durable store startup has reconciled journal references: `asset.store.path`, filesystem `asset.store.free_bytes`, and configured `asset.store.budget_bytes`; the pin reverts when free bytes are below the budget |
 | `gateway.asset.retention_miss` | `dekopon-gatewayd` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`), plus sanitized storage error cause when applicable; no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
@@ -304,8 +307,12 @@ past a pod restart configures `telemetry`. `RUST_LOG` filters the stdout copy on
 than `info` on the `dekopon_broker::audit` target drops the records from it.
 
 `error` is the broker's own classification — `provider-failure`, `provider-timeout`,
-`storage-quota` — and is the field to alert and group on. `error.code` and `error.message` are the
-provider's own answer, present only when the component returned a typed failure and absent for every
+`storage-quota` — and is the field to alert and group on. Host-call refusals name the fixed reason:
+`byte-limit`, `host-call-limit`, `denied`, `invalid-http-request`, `asset-call-rejected`,
+`monotonic-overflow`, `random-too-large`, or `random-entropy`. The same classification reaches the
+model through `InvocationResult.error`; it contains no request or response content.
+
+`error.code` and `error.message` are the provider's own answer, present only when the component returned a typed failure and absent for every
 host, transport, or storage failure no provider reported. They explain the class rather than
 replacing it: `provider-failure` cannot separate an upstream moderation refusal from a malformed
 argument, and without them the reason a run failed exists nowhere in the trace. Both are
@@ -441,11 +448,10 @@ including disabled trace export, neither ID is fabricated.
 
 ## Trace context across the socket
 
-`InvocationRequest`, `DeliveredTurnRequest`, `run`, and `runCommand` each carry a mandatory W3C
+`InvocationRequest`, `DeliveredTurnRequest`, and `run` each carry a mandatory W3C
 `traceParent`. The shared broker leg fills it from the span that requested the capability or ran the
 command word. For `run`, the broker opens `broker.invocation` beneath that remote parent and a child
-`broker.command_run` for parsing; authorization and execution stay under the invocation. Legacy
-`runCommand` opens `broker.command_run` directly beneath the remote parent, so one trace spans both processes. The trace
+`broker.command_run` for parsing; authorization and execution stay under the invocation. The trace
 identifier inside it is the only correlation identifier the system has: every span the broker opens
 for the call and every audit record it emits sits inside that trace, and the invocation identifier
 extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
@@ -863,7 +869,7 @@ migration is implemented here.
 | `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`, `peak_rss_bytes` (process peak RSS so far in bytes, Linux VmHWM; unrecorded where unavailable); one component load beneath the registry root |
 | `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `run` beneath `broker.invocation`, or per legacy `runCommand` beneath the client's `traceParent`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
+| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `run` beneath `broker.invocation`; `error`, a run the broker could not complete, sets the span status to `Error`, while `failed`, the guest's own decline, does not |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `console-smoke-claim-denied`, `console-real-scope-denied`, `chat-attestation-denied`, `chat-scope-required`, `probe-write`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`, `input` and `input.bytes`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; a `failed` outcome sets the span status to `Error`, described by `error`; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
@@ -950,8 +956,7 @@ resolved inside the broker after authorization and never reaches the guest or th
 `broker.command_run` is the command word's half of `broker.invocation`. `dekopon-brokerd` opens it
 for every `run` beneath `broker.invocation`, whose remote parent is the client's `traceParent`.
 The guest call turns argv into a proposal, and the broker authorizes and executes it within the same
-invocation. Legacy `runCommand` opens the parsing span directly beneath the client's `traceParent`
-and returns the proposal for a separate `invoke`. `outcome` is `proposed`
+invocation. `outcome` is `proposed`
 when the guest returned a capability proposal; `rendered` when the guest answered by itself; `failed` when it declined the argv; and
 `error` when the run did not complete — no provider declares the word, the input passed
 `maxInputBytes`, the guest trapped, or its answer did not decode — whose cause
@@ -1045,7 +1050,7 @@ the refresh failure classes remain part of the migration contract.
 
 Reload outcomes are emitted once per distinct settled raw candidate, identified privately by source paths and bytes, never by a published serving digest. Re-observing the same broken source does not repeat a warn; a distinct edit or repair followed by a break yields another outcome. Operational reload refusal `error` flattens aggregate validation problems before rendering at most eight individual problems of at most 512 bytes each (on UTF-8 boundaries), followed by `and N more` for omitted problems. Flattened problems use each problem's own description, never its nested source chain. An unflattened gateway problem, such as an unreadable or insecure configuration file or a fragment failure, renders its source chain of I/O, file-hygiene and fragment errors, which names paths and reasons but never file bytes. Boot and `check` have independent diagnostic rendering. Owner-configured file paths and fixed hygiene reasons remain actionable; invalid credential names, environment names, endpoint values and vendor diagnostics are not echoed.
 
-`broker_capabilities_refused` records the refusal class, determining policies, canonical subject, agent and attesting peer on the broker side. Session inspection returns a typed unmapped or agent-denied cause only within the peer's attestor namespaces, with an omitted `namespaces` list permitting the unmapped cause for every subject; outside those namespaces the wire refusal remains opaque whether the subject is mapped or not. Other authentication and policy-error refusals remain opaque. A refused `runCommand` also withholds its command surface. The gateway emits its owner-notice audit record only for the typed unmapped session cause. An honored inspection emits no refusal record.
+`broker_capabilities_refused` records the refusal class, determining policies, canonical subject, agent and attesting peer on the broker side. Session inspection returns a typed unmapped or agent-denied cause only within the peer's attestor namespaces, with an omitted `namespaces` list permitting the unmapped cause for every subject; outside those namespaces the wire refusal remains opaque whether the subject is mapped or not. Other authentication and policy-error refusals remain opaque. The gateway emits its owner-notice audit record only for the typed unmapped session cause. An honored inspection emits no refusal record.
 
 A chat-scoped `invoke` and `recordDeliveredTurn` withhold the same fact for the same reason, but
 they are accounted decisions rather than unanswered inspections, so the peer receives a `Denied`
@@ -1402,3 +1407,10 @@ never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.de
 native hosts (`bytes`, `duration_us`); `asset.spool` remains the positional scratch-read lifecycle.
 A send failure leaves a bounded next-turn notice; `dispatched` belongs only to `agent.asset.send`,
 not an asset table field. Broker decisions still record the ordinary asset.send authorization.
+
+Each `accounting.model.turn` outcome also carries numeric `asset.inventory.count` and
+`asset.inventory.bytes` for the fitted inventory notes carried by the request,
+`asset.inventory.omitted` for their omitted entries, and `asset.inventory.referenced` for distinct
+listed attachments used this turn (fetches, provider inputs, or history image preparation).
+The store snapshots on asset eviction, refetch and failure records serve as its gauges; no rollup
+exporter is awaited. These records contain no attachment source, URL or platform identifier.

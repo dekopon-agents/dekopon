@@ -2,7 +2,7 @@
 
 Versioned, length-delimited local broker messages and an unprivileged Unix-socket client.
 
-There is one operation per verb — `capabilities`, `runCommand`, `run`, `invoke`, and
+There is one operation per verb — `capabilities`, `run`, `invoke`, and
 `recordDeliveredTurn`. Whether a caller speaks as its own authenticated peer, on behalf of an external
 subject, or inside a bounded chat scope is one optional `Attestation` field on the operation rather
 than an operation of its own; `scope` distinguishes a chat claim from a subject-only one, and
@@ -32,11 +32,9 @@ refusal, a missing word, an ungranted capability and an invoked proposal with it
 effects. The `broker.command_run` span is a child of `broker.invocation`. A returned transport
 error after submission can mean effects already happened and must not trigger a retry.
 
-`RunCommand` (`runCommand`) remains the legacy parse-only operation. It grants no authority and
-carries no descriptors. `Invoke` remains for gateway-built proposals such as the memory Decider;
-the gateway sends no metadata rows or input asset descriptors. The frame retains its existing
-shape, and the broker still accepts metadata rows from old clients. An unrebuilt console's plain
-commands still run through `RunCommand` plus `Invoke`; its attachment inputs are refused.
+`Invoke` remains for gateway-built proposals such as the memory Decider; the gateway sends no
+metadata rows or input asset descriptors. Its metadata rows are bounded to the same five rows per
+invocation as `Run`. Unknown request operations receive `invalid-request` and the connection ends.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660` sockets, and
 inspect the parent directory in both cases: it must be a server-owned, non-symlink directory,
@@ -147,14 +145,13 @@ agent may act in is written in policy.
 
 ## Command execution refusals
 
-Everything that is not the guest's own answer collapses into one opaque reply. A word no loaded
-provider declares, an input past the host bound, a guest that traps or reaches for a host import,
-and an answer the broker cannot decode all return the stable `provider-error` code with a fixed
-message; the guest's own failure text is provider-controlled and never reaches a caller through this
-path. The broker logs `command.resolve.failed` naming the word, so an operator can tell the cases
-apart from the audit stream a caller cannot read. A provider that simply *declines* the arguments is
-not a failure at all: that is a usage error, and the provider's own message travels back for the
-model to read.
+`Run` answers parsing failures with `Ran`, before invocation authorization begins. A word no
+loaded provider declares returns `RunOutcome::NotFound`. An input past the host bound, a guest that
+traps or reaches for a host import, and an answer the broker cannot decode return
+`RunOutcome::Refused` with code `command-failed` and the fixed message `command word could not be
+run`. The broker logs `command.resolve.failed` naming the word and cause, so an operator can tell
+these cases apart. A provider that simply declines the arguments returns `RunOutcome::Refused`
+with the provider's own failure code and message for the model to read.
 
 Reserved words are unreachable through this path, and what reserves them is the deployment's own
 `capabilities`: every word belonging to the provider a chat-memory `route:` names is refused here
@@ -195,7 +192,6 @@ A failure response carries a stable code and a bounded message. The code is the 
 | `invalid-request` | The request frame could not be decoded, or an attestation was malformed or mismatched to its operation or proposal. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
 | `capacity-exhausted` | A bounded broker resource is full (including the connection limit, which sends one non-blocking refusal frame before closing, or an embedding's non-evicting audit log). No provider work began. | Safe to reassess; a connection permit may become available, but an exhausted audit log needs operator intervention. Do not blindly retry. |
-| `provider-error` | A `runCommand` run did not produce an answer: no loaded provider declares the word, the argv plus piped value exceeded the host's input bound, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word, its arguments, or the piped value; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. A `storage-corrupt` whose message says the storage was reset has already moved that conversation to fresh, empty storage. | Yes under a fresh identifier after correcting or reconciling the storage condition; after a reset, immediately. |
 

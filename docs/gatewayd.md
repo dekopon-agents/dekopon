@@ -493,8 +493,8 @@ and descriptor. Pins last until the response or cancellation. Data URLs in argv,
 value after the first `=`, are refused before submission. The broker parses the command word and
 authorizes its proposal through the existing subject, Cedar, grants, secret-use and HTTP checks.
 An unquoted literal `<word> --help` uses the cached page without a frame or capability-call charge.
-The legacy `RunCommand` operation remains for old clients. Gateway-built proposals use `Invoke`
-with no inventory rows or asset input descriptors; old clients can still send metadata rows.
+Gateway-built proposals use `Invoke` with no inventory rows or asset input descriptors. An
+`Invoke` can carry at most five metadata rows.
 
 A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
 The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
@@ -528,7 +528,7 @@ Disk retention and broker in-flight spool budgets account for actual stored byte
 These limits are separate from model-facing fetch limits. Resolving bytes updates LRU recency.
 Unknown inbound lengths are shown as `size unknown` in the inventory note and as null stored-byte
 counts in metadata rows, not as empty files. Reported or fetched lengths, including a genuine zero,
-remain numeric. Building the inventory never fetches files just to learn their size. Reclaimed files retain their last known length and never refetch or silently substitute older pixels.
+remain numeric. Building the inventory never fetches files just to learn their size. Evicted files retain their last known length; a session-bound use refetches inbound bytes with fresh authorization. Generated files are never regenerated.
 
 Delivery keeps existing native paths: Slack external upload, Discord multipart Create Message,
 Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each upload reads
@@ -704,7 +704,7 @@ what does this say?
 
 The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry an image — Chat Completions types a `tool` message's content as a string, and the Responses API types `function_call_output.output` the same way — the answer arrives as two messages: the tool result says the asset follows, and a `user` message carries the bytes. That shape is the only one both wire formats accept.
 
-Whether a session offers `fetch_chat_asset` is decided once, when it starts: every session whose conversation generation is live and whose gateway retains assets (`assetRetentionBytes` above zero) carries the tool on every turn, including turns with nothing to fetch, so the tool list stays part of the cached request prefix. A file that arrives by steer or from a provider mid-session is fetchable through it. A call that names nothing addressable — no such file, a retired generation, a released file — gets a refusal sentence as its tool result and no bytes.
+Whether a session offers `fetch_chat_asset` is decided once, when it starts: every session whose conversation generation is live and whose gateway retains assets (`assetRetentionBytes` above zero) carries the tool on every turn, including turns with nothing to fetch, so the tool list stays part of the cached request prefix. A file that arrives by steer or from a provider mid-session is fetchable through it. A call that names nothing addressable — no such file, a retired generation, an evicted generated file — gets a refusal sentence as its tool result and no bytes.
 
 - **Numbering follows the exact history audience and live generation.** `chat-asset:5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed arrival lines; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport; one-shot IDs are process-monotonic so expiry cannot alias an old reference.
 - **Every prompt names every attachment that fits**, newest first, with the new ones marked and one omission line naming the oldest range left out for space. A reference line is the only way a model learns a number exists, and one confined to the turn that introduced it goes unreachable as soon as ordinary chatter pushes that turn out of the replayed history window — while its generation is still live. One-shot inventories alone retain files for up to another hour of idleness. The inventory note is not recorded: history keeps each turn's text plus one `[gateway: attached chat-asset:N — name]` line per file that arrived with it, the same line platform recall writes, so replayed turns do not each carry a stale copy of the inventory.
@@ -712,10 +712,10 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
 - **A file that cannot be shown is named anyway.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so, which the model can answer around instead of denying a screenshot that plainly exists.
 - **Only the media types a model can actually accept are offered.** Images: `image/png`, `image/jpeg`, `image/webp`, `image/gif`. Documents: PDF, plain text, Markdown, CSV, HTML, XML, JSON, RTF, and the Word, PowerPoint, and Excel formats. A chat service imposes no allowlist on uploads at all — a 700 MB screen recording is a legal attachment — so the narrow end of that intersection is the one worth enforcing. A spreadsheet is parsed to its first thousand rows per sheet, which is worth knowing before concluding a model ignored the bottom of one.
 - **A route's model has to opt in to images.** `modalities: [image]` on a model entry; the default is text only, because an OpenAI-compatible endpoint is very often a small local model that will either error or invent an answer when handed an image. Documents need no modality: a PDF is a parsed attachment to every endpoint that accepts one at all, so gating it on vision would refuse it to a model perfectly able to read it.
-- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Fetched assets carried in one model request total at most 40 MiB decoded; a crossing fetch refuses and names the unseen ID without discarding earlier images. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session. With retention smaller than the carried request, a crossing fetch can evict its own file from the conversation before refusing; a later retry cannot recover it.
+- **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Fetched assets carried in one model request total at most 40 MiB decoded; a crossing fetch refuses and names the unseen ID without discarding earlier images. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session. With retention smaller than the carried request, a crossing fetch can evict its own file from the conversation before refusing; a later session-bound use can refill an evicted inbound file; generated files cannot be regenerated.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop and re-attaches the token by hand. Both URLs are checked on one rule, at the single place the token is attached: the URL the event supplied and the `location` after it are parsed rather than prefix-matched, and each must name an allowlisted Slack host over HTTPS on the default port with no credentials in the authority. A refused URL fails the fetch before any request is made.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
-- **Gateway-owned disk LRU, weak references.** Uploads fetch once; descriptor-backed outputs join
+- **Gateway-owned disk LRU, weak references.** Uploads download on first use and refill on use after eviction; descriptor-backed outputs join
   the same inventory with capability/invocation provenance. A bounded typed-output note names each
   retained reference; same-session and later-turn edits can address it without carrying bytes in
   the shell, prompt transcript or history. Retention and delivery are separate acts.
@@ -742,18 +742,26 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   digests survive while any conversation still names them. One-shot idle expiry and generation
   retirement release in-memory rows and pins without deleting journal-owned bytes. Fence-less
   inventories still expire when idle. The conversation ceiling no longer evicts asset inventories.
-- **One download per attachment.** A cold attachment downloads in a store-owned task, at most two
+- **Concurrent uses share a download.** A cold or evicted inbound attachment downloads in a store-owned task, at most two
   at a time, under the 60-second fetch deadline. Model fetches and provider inputs that ask for the
   same attachment share that download; when the last of them is cancelled, so is the download, and
-  the attachment can be requested again.
-- **Released is not unfetched.** A reclaimed asset is never silently downloaded again or substituted
-  with an original input. Requested provider inputs are all resolved and pinned before submission;
-  one missing input refuses the entire call. Historical model attachment parts become an explicit
-  gateway-authored release notice at request encoding, letting the model choose its next action.
+  the attachment can be requested again. History refills share one 60-second deadline per request.
+  A platform-gone response is cached on the live row; later uses refuse without another download.
+- **Refill happens on use.** A session-bound use of an evicted inbound attachment downloads it again through
+  the existing platform fetch path, under the live generation and current grant. Generated files
+  are never regenerated. Requested provider inputs are all resolved and pinned before submission;
+  one missing input refuses the entire call. Before request encoding, historical model attachment parts are resolved through the same
+  session-bound path within the request byte budget and pinned through encoding. Parts still
+  missing bytes become an explicit gateway-authored release notice.
   Actual descriptor IO/corruption errors remain errors, not fabricated release notices. Scoped
-  inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
+  inventory state and at most 1024 release tombstones distinguish released, unknown and revoked
   IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
   to avoid reuse after one-shot inventory expiry.
+- **Use refusals name the cause.** Both provider-input refusals and `fetch_chat_asset` tool text
+  name `evicted` for missing generated bytes, `platform-gone` for platform responses 404, 410,
+  401 or 403, `revoked` for a retired access generation, and `store-failed` for a not-stored row
+  or failed re-admission. Other transport failures and timeouts remain `unavailable`; the row
+  stays evicted and a later use retries. Attaching an output remains silent on store failure.
 - **Gateway-private storage.** Store files are 0600 inside 0700 directories owned by the gateway
   UID. The index contains digest, row identity, origin class, state and recency, never attachment
   sources or platform locators. Locators remain in the journal. Reads stay session-bound and the
@@ -762,7 +770,8 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
 - **Storage failures are not successful empty images.** Capacity exhaustion, OS IO categories
   (including disk-full), and changed/truncated length are sanitized failures, never paths or bytes.
   An unlinked file still reads through its original descriptor while a lease owns it. No storage
-  failure triggers an automatic network fallback or paid-call retry. A provider-result spool refusal
+  failure triggers a network fallback or paid-call retry. An evicted inbound attachment is
+  refetched only on session-bound use; resident-only probes never fetch or touch recency. A provider-result spool refusal
   explicitly says the capability already executed and its attachment was not delivered; existing
   complete/partial transport acceptance rules remain in force. Outbound transports transfer all
   reply leases to a trace-contextual blocking task before delivery; reads and normal disposal do
