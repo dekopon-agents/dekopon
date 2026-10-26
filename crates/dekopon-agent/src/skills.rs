@@ -57,7 +57,7 @@ pub(crate) fn read_skill_into(
     reads: &mut SkillReads,
     call: &ModelToolCall,
     model_turn: u32,
-) -> Result<(), PromptError> {
+) -> Result<crate::memory::Outcome, PromptError> {
     let (name, resource) = match skill_arguments(&call.function.name, &call.function.arguments) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -78,7 +78,7 @@ pub(crate) fn read_skill_into(
             call.id.clone(),
             format!("No skill by that name is mounted for this agent. Mounted skills: {mounted}."),
         ));
-        return Ok(());
+        return Ok(crate::memory::Outcome::Refused);
     };
     let (result, resource_path) = match resource {
         None => (render_skill(skill), None),
@@ -97,7 +97,7 @@ pub(crate) fn read_skill_into(
                         resource_listing(skill)
                     ),
                 ));
-                return Ok(());
+                return Ok(crate::memory::Outcome::Refused);
             }
         },
     };
@@ -122,7 +122,7 @@ pub(crate) fn read_skill_into(
         "agent.skill.read"
     );
     messages.push(ModelMessage::tool(call.id.clone(), result));
-    Ok(())
+    Ok(crate::memory::Outcome::Exit(0))
 }
 
 fn refuse(model_turn: u32, call_id: &str, reason: &'static str) {

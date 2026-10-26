@@ -9,8 +9,8 @@ use crate::{
     http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
     model::{
-        AssistantTurn, ClientIdentity, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
-        ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, compact_json_body,
+        AssistantTurn, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
+        ModelFunctionCall, ModelKey, ModelMessage, ModelTool, ModelToolCall, compact_json_body,
         sanitize_diagnostic,
     },
     sse::{SseEvent, decode_transcript},
@@ -33,7 +33,7 @@ pub(crate) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/re
 pub struct CodexClient {
     name: String,
     model: String,
-    identity: ClientIdentity,
+    identity: ModelKey,
     credential: Arc<CredentialFile>,
     http: InferenceHttp,
     endpoint: String,
@@ -88,13 +88,17 @@ impl CodexClient {
     ) -> Result<Self, InferenceError> {
         Ok(Self {
             name: model.clone(),
+            identity: ModelKey::new(crate::model::Backend::Codex, &model),
             model,
-            identity: ClientIdentity::new(),
             credential,
             http: InferenceHttp::new(timeout)?,
             endpoint,
             loopback: false,
         })
+    }
+
+    pub fn model_key(&self) -> crate::model::ModelKey {
+        crate::model::ModelKey::new(crate::model::Backend::Codex, &self.model)
     }
 
     #[must_use]
@@ -106,7 +110,6 @@ impl CodexClient {
     pub fn with_loopback_endpoint(mut self, endpoint: &str) -> Result<Self, InferenceError> {
         self.endpoint = crate::loopback::endpoint(endpoint)?;
         self.loopback = true;
-        self.identity = ClientIdentity::new();
         Ok(self)
     }
 
@@ -169,14 +172,6 @@ impl CodexClient {
         let span = tracing::Span::current();
         span.record("model.stream", true);
         span.record("cache.style", "automatic");
-        for message in request.messages {
-            if let ModelMessage::Assistant { turn } = message
-                && !turn.accepts_client(&self.identity)
-            {
-                record_phase(FailurePhase::BeforeSend);
-                return Err(ProtocolFailure::ContinuationMismatch.into());
-            }
-        }
         let credentials = self.credential(RefreshMode::IfNeeded, control).await?;
         let body = control
             .run(build_request_body(
@@ -762,10 +757,7 @@ impl CodexReducer<'_> {
         Ok(())
     }
 
-    pub(crate) fn finish(
-        mut self,
-        identity: &ClientIdentity,
-    ) -> Result<AssistantTurn, InferenceError> {
+    pub(crate) fn finish(mut self, identity: &ModelKey) -> Result<AssistantTurn, InferenceError> {
         match self.terminal {
             Terminal::Streaming => return Err(ProtocolFailure::MissingTerminal.into()),
             Terminal::Completed => {}
@@ -823,7 +815,7 @@ pub(crate) fn replay_transcript(
         SseEvent::Data(data) => reducer.apply(data, observe),
         SseEvent::Done => Ok(ControlFlow::Break(())),
     })?;
-    reducer.finish(&ClientIdentity::new())
+    reducer.finish(&ModelKey::new(crate::model::Backend::Codex, "transcript"))
 }
 #[expect(
     clippy::wildcard_enum_match_arm,
@@ -1007,9 +999,13 @@ async fn build_request_body<'a>(
                 content: responses_content(message).await?,
             })),
             ModelMessage::Assistant { turn } => {
-                if let Some(items) = turn.codex_items().filter(|items| !items.is_empty()) {
+                if let Some(items) = turn.codex_items().filter(|items| {
+                    !items.is_empty()
+                        && turn
+                            .model_key()
+                            .is_some_and(|key| key.is_for(crate::model::Backend::Codex, model))
+                }) {
                     input.extend(items.iter().map(ResponsesItem::Replay));
-                    continue;
                 }
                 if let Some(content) = message.content().filter(|content| !content.is_empty()) {
                     input.push(ResponsesItem::Message(ResponsesMessage {
@@ -1191,7 +1187,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 reducer
-                    .finish(&ClientIdentity::new())
+                    .finish(&ModelKey::fixture())
                     .unwrap()
                     .content
                     .as_deref(),
@@ -1229,7 +1225,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             reducer
-                .finish(&ClientIdentity::new())
+                .finish(&ModelKey::fixture())
                 .unwrap()
                 .content
                 .as_deref(),
@@ -1280,19 +1276,13 @@ mod tests {
                 .unwrap()
                 .is_break()
         );
-        let turn = reducer.finish(&ClientIdentity::new()).unwrap();
+        let turn = reducer.finish(&ModelKey::fixture()).unwrap();
         assert_eq!(turn.content.as_deref(), Some("firstunindexedagain"));
         let replay = turn.codex_items().unwrap();
-        assert_eq!(replay.len(), 4);
-        assert_eq!(replay[0]["id"], "z");
-        assert_eq!(replay[0]["extra"], true);
-        assert_eq!(replay[0]["content"][0]["text"], "replacement");
         assert_eq!(
-            replay[1],
-            serde_json::json!({"type":"reasoning","id":"a","text":"final"})
+            replay,
+            &[serde_json::json!({"type":"reasoning","id":"a","text":"final"})]
         );
-        assert_eq!(replay[2]["content"][0]["text"], "unindexed");
-        assert_eq!(replay[3]["content"][0]["text"], "again");
     }
 
     #[tokio::test]
@@ -1374,13 +1364,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_public_codex_override_rejects_remote_hosts_and_invalidates_native_replay() {
-        let (_directory, server, client) = fixture(vec![MockResponse::sse(include_str!(
-            "fixtures/codex-tool.sse"
-        ))]);
+    async fn a_public_codex_override_rejects_remote_hosts_and_keeps_model_identity() {
+        let (_directory, server, client) = fixture(vec![
+            MockResponse::sse(include_str!("fixtures/codex-tool.sse")),
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+        ]);
         let first = generate(&client, &control()).await.unwrap();
         let client = client.with_loopback_endpoint(&server.base_url()).unwrap();
-        let error = client
+        let answer = client
             .generate(
                 GenerateRequest {
                     messages: &[crate::model::assistant_message(&first)],
@@ -1391,12 +1382,9 @@ mod tests {
                 &control(),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            InferenceError::Protocol(ProtocolFailure::ContinuationMismatch)
-        ));
-        assert_eq!(server.requests.lock().len(), 1);
+            .unwrap();
+        assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
+        assert_eq!(server.requests.lock().len(), 2);
         assert!(matches!(
             client.with_loopback_endpoint("http://localhost:8000"),
             Err(InferenceError::InvalidRequest(
@@ -1957,13 +1945,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_continuation_cannot_cross_configured_clients() {
+    async fn a_new_client_for_the_same_model_replays_reasoning() {
         let (_directory, _server, client) = fixture(vec![MockResponse::sse(include_str!(
-            "fixtures/codex-answer.sse"
+            "fixtures/codex-tool.sse"
         ))]);
         let turn = generate(&client, &control()).await.unwrap();
-        let (_other_directory, other_server, other) = fixture(Vec::new());
-        let result = other
+        let (_other_directory, other_server, other) = fixture(vec![MockResponse::sse(
+            include_str!("fixtures/codex-answer.sse"),
+        )]);
+        other
             .generate(
                 GenerateRequest {
                     messages: &[crate::model::assistant_message(&turn)],
@@ -1973,14 +1963,27 @@ mod tests {
                 &mut |_| ControlFlow::Continue(()),
                 &control(),
             )
-            .await;
-        assert!(matches!(
-            result,
-            Err(InferenceError::Protocol(
-                ProtocolFailure::ContinuationMismatch
-            ))
-        ));
-        assert!(other_server.requests.lock().is_empty());
+            .await
+            .unwrap();
+        let requests = other_server.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            turn.codex_items().unwrap().len()
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call")
+        );
     }
 
     #[tokio::test]
@@ -2037,7 +2040,7 @@ mod tests {
         assert_eq!(turn.content.as_deref(), Some("firstsecond"));
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].function.arguments, "{}");
-        assert_eq!(turn.codex_items().unwrap().len(), 3);
+        assert!(turn.codex_items().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

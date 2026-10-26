@@ -7,7 +7,7 @@ use crate::{
     error::{FailurePhase, InferenceError, ProtocolFailure, RequestError, TransportFailure},
     http::{InferenceHttp, Progress, record_phase},
     inference::{GenerateRequest, InferenceModel},
-    model::{AssistantTurn, ClientIdentity, ModelMessage, ModelToolCall, compact_json_body},
+    model::{AssistantTurn, ModelKey, ModelMessage, ModelToolCall, compact_json_body},
     openai::{
         ChunkError, FinishReason, OpenAiTool, WireMessage, WireToolCall, complete_turn,
         stream_failure,
@@ -35,7 +35,7 @@ pub struct OpenRouterClient {
     name: String,
     token: Redacted<String>,
     settings: Settings,
-    identity: ClientIdentity,
+    identity: ModelKey,
 }
 
 impl OpenRouterClient {
@@ -59,11 +59,15 @@ impl OpenRouterClient {
             http: InferenceHttp::new(timeout)?,
             endpoint: ENDPOINT.into(),
             name: model.clone(),
+            identity: ModelKey::new(crate::model::Backend::OpenRouter, &model),
             model,
             token: Redacted::new(token),
             settings,
-            identity: ClientIdentity::new(),
         })
+    }
+
+    pub fn model_key(&self) -> crate::model::ModelKey {
+        crate::model::ModelKey::new(crate::model::Backend::OpenRouter, &self.model)
     }
 
     #[must_use]
@@ -74,7 +78,6 @@ impl OpenRouterClient {
 
     pub fn with_loopback_endpoint(mut self, endpoint: &str) -> Result<Self, InferenceError> {
         self.endpoint = crate::loopback::endpoint(endpoint)?;
-        self.identity = ClientIdentity::new();
         Ok(self)
     }
 
@@ -101,10 +104,11 @@ impl OpenRouterClient {
         let mut messages = Vec::with_capacity(request.messages.len());
         for (index, message) in request.messages.iter().enumerate() {
             if let ModelMessage::Assistant { turn } = message {
-                if !turn.accepts_client(&self.identity) {
-                    return Err(ProtocolFailure::ContinuationMismatch.into());
-                }
-                if let Some(native) = turn.openrouter_replay() {
+                if let Some(native) = turn.openrouter_replay().filter(|_| {
+                    turn.model_key().is_some_and(|key| {
+                        key.is_for(crate::model::Backend::OpenRouter, &self.model)
+                    })
+                }) {
                     messages.push(RouterMessage::Native {
                         role: "assistant",
                         content: turn.content.as_deref(),
@@ -371,6 +375,17 @@ pub(crate) struct Replay {
     reasoning: Vec<Value>,
 }
 
+impl Replay {
+    pub(crate) fn opaque_reasoning(
+        &self,
+    ) -> Result<Vec<crate::model::OpaqueReasoning>, serde_json::Error> {
+        self.reasoning
+            .iter()
+            .map(crate::model::OpaqueReasoning::from_value)
+            .collect()
+    }
+}
+
 #[derive(Deserialize)]
 struct RouterChunk {
     id: Option<String>,
@@ -572,7 +587,7 @@ impl RouterStream {
 
     fn finish(
         mut self,
-        identity: &ClientIdentity,
+        identity: &ModelKey,
         secrets: DiagnosticSecrets<'_>,
     ) -> Result<AssistantTurn, InferenceError> {
         let span = tracing::Span::current();

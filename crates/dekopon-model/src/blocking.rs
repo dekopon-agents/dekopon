@@ -34,6 +34,10 @@ impl BlockingModel {
 }
 
 impl ChatModel for BlockingModel {
+    fn model_key(&self) -> crate::model::ModelKey {
+        self.client.model_key()
+    }
+
     fn complete(
         &self,
         messages: &[ModelMessage],

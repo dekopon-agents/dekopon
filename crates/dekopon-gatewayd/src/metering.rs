@@ -460,6 +460,10 @@ impl ChatProviderGovernor {
 }
 
 impl ChatModel for ChatProviderGovernor {
+    fn model_key(&self) -> dekopon_model::model::ModelKey {
+        self.inner.model_key()
+    }
+
     fn complete(
         &self,
         messages: &[ModelMessage],

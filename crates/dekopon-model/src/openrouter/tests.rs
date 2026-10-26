@@ -210,7 +210,7 @@ fn a_large_indexed_stream_completes_with_all_reasoning_and_calls() {
             )
             .unwrap();
     }
-    let turn = stream.finish(&ClientIdentity::new(), secrets).unwrap();
+    let turn = stream.finish(&ModelKey::fixture(), secrets).unwrap();
     assert_eq!(turn.tool_calls.len(), count);
     let replay = turn.openrouter_replay().unwrap();
     assert_eq!(replay.reasoning.len(), count);
@@ -248,7 +248,7 @@ fn indexed_merges_preserve_first_seen_order_and_unindexed_reasoning() {
             secrets,
         )
         .unwrap();
-    let turn = stream.finish(&ClientIdentity::new(), secrets).unwrap();
+    let turn = stream.finish(&ModelKey::fixture(), secrets).unwrap();
     let replay = turn.openrouter_replay().unwrap();
     assert_eq!(
         replay.reasoning,
@@ -1029,24 +1029,22 @@ async fn openrouter_trace_records_requested_controls_and_native_usage_without_pr
 }
 
 #[tokio::test]
-async fn a_public_router_override_rejects_remote_hosts_and_invalidates_native_replay() {
-    let server = MockServer::start(vec![MockResponse::sse(TOOL)]);
+async fn a_public_router_override_rejects_remote_hosts_and_keeps_model_identity() {
+    let server = MockServer::start(vec![MockResponse::sse(TOOL), MockResponse::sse(ANSWER)]);
     let client = client(&server, Settings::default());
     let first = generate(&client, &[]).await.unwrap();
     let client = client.with_loopback_endpoint(&server.base_url()).unwrap();
-    assert!(matches!(
-        generate(&client, &[assistant_message(&first)]).await,
-        Err(InferenceError::Protocol(
-            ProtocolFailure::ContinuationMismatch
-        ))
-    ));
+    let answer = generate(&client, &[assistant_message(&first)])
+        .await
+        .unwrap();
+    assert_eq!(answer.content.as_deref(), Some("done"));
     assert!(matches!(
         client.with_loopback_endpoint("https://openrouter.ai/api/v1/chat/completions"),
         Err(InferenceError::InvalidRequest(
             RequestError::InvalidLoopbackEndpoint
         ))
     ));
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.requests().len(), 2);
     requests_have_only_the_authored_headers(&server);
 }
 

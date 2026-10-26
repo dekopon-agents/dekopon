@@ -48,6 +48,7 @@ use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
 pub mod attachment;
 pub mod improvement;
+pub mod memory;
 pub mod memory_tools;
 pub mod meta;
 pub mod progress;

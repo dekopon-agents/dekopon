@@ -29,6 +29,16 @@ pub enum ModelClient {
     OpenRouter(crate::openrouter::OpenRouterClient),
 }
 
+impl ModelClient {
+    pub fn model_key(&self) -> crate::model::ModelKey {
+        match self {
+            Self::Codex(client) => client.model_key(),
+            Self::OpenRouter(client) => client.model_key(),
+            Self::OpenAiCompatible(client) => client.model_key(),
+        }
+    }
+}
+
 impl InferenceModel for ModelClient {
     async fn generate<'a>(
         &'a self,

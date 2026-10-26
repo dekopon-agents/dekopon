@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod history;
+use crate::memory::{Outcome as RecordedOutcome, RecordBuilder};
 
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
@@ -508,6 +509,7 @@ impl<'a> SessionInputs<'a> {
 
 struct SessionExtensions<'a> {
     exchanges: &'a mut Vec<Exchange>,
+    record: &'a mut RecordBuilder,
     options: &'a CompletionOptions,
     assets: Option<&'a dyn AssetSource>,
     reply_assets: Option<&'a crate::attachment::ReplyAttachments>,
@@ -582,6 +584,11 @@ where
     messages.push(ModelMessage::user(prompt));
 
     let mut exchanges = Vec::new();
+    let mut record = RecordBuilder::new(
+        recorded.unwrap_or(prompt),
+        model.model_key(),
+        dekopon_process::DEFAULT_MAX_OUTPUT_BYTES,
+    );
     let (result, steers) = run_session(
         model,
         runtime,
@@ -589,6 +596,7 @@ where
         limits,
         SessionExtensions {
             exchanges: &mut exchanges,
+            record: &mut record,
             capture_exchanges,
             memory_tools,
             options: &options,
@@ -618,7 +626,8 @@ where
             }
             Ok(_) | Err(_) => ConversationTurn::unanswered(user),
         }
-        .with_exchanges(exchanges),
+        .with_exchanges(exchanges)
+        .with_capture(record.finish()),
     );
     result
 }
@@ -709,6 +718,7 @@ where
 {
     let SessionExtensions {
         exchanges,
+        record,
         options,
         assets,
         reply_assets,
@@ -779,7 +789,11 @@ where
         }
         let model_turns = completed_turns + 1;
         check_cancelled(cancellation)?;
+        let staged = lease.staged.len();
         lease.take(&mut messages, progress, model_turns);
+        for steer in &lease.staged[staged..] {
+            record.steer(steer);
+        }
         let model_span = tracing::info_span!(
             "prompt.model_turn",
             model.turn = model_turns,
@@ -951,12 +965,18 @@ where
         );
         drop(model_entered);
         check_cancelled(cancellation)?;
+        record.assistant(&turn);
         messages.push(assistant_message(&turn));
 
         if turn.tool_calls.is_empty() {
             check_cancelled(cancellation)?;
             let seal = if model_turns < limits.max_steps {
-                let Some(seal) = lease.seal_or_take(&mut messages, progress, model_turns) else {
+                let staged = lease.staged.len();
+                let seal = lease.seal_or_take(&mut messages, progress, model_turns);
+                for steer in &lease.staged[staged..] {
+                    record.steer(steer);
+                }
+                let Some(seal) = seal else {
                     continue;
                 };
                 seal
@@ -1069,6 +1089,7 @@ where
                     call.id.clone(),
                     DECLINE_AFTER_WORK_RESULT.to_owned(),
                 ));
+                record.result(call, &messages, RecordedOutcome::Refused);
             }
             continue;
         }
@@ -1089,42 +1110,58 @@ where
                     model_turns,
                     &mut agent_config_shown,
                 )?;
+                record.result(&call, &messages, RecordedOutcome::Exit(0));
                 continue;
             }
             if call.function.name == SKILL_TOOL_NAME && !skills.is_empty() {
-                skills::read_skill_into(
+                let outcome = skills::read_skill_into(
                     &mut messages,
                     skills,
                     &mut skill_reads,
                     &call,
                     model_turns,
                 )?;
+                record.result(&call, &messages, outcome);
                 continue;
             }
             if call.function.name == IMPROVEMENT_TOOL_NAME {
-                improvement::suggest_improvement_into(
+                let outcome = improvement::suggest_improvement_into(
                     &mut messages,
                     &mut suggestions,
                     &call,
                     model_turns,
                 )?;
+                record.result(&call, &messages, outcome);
                 continue;
             }
             if let Some(memory) = memory_tools
                 && crate::memory_tools::dispatch(&mut messages, memory, &call)?
             {
+                record.result(&call, &messages, RecordedOutcome::Exit(0));
                 continue;
             }
             if call.function.name == WAKE_TOOL_NAME
                 && let Some(registrar) = wakes
             {
-                wake::wake_into(&mut messages, registrar, &call, model_turns)?;
+                let outcome = wake::wake_into(&mut messages, registrar, &call, model_turns)?;
+                record.result(&call, &messages, outcome);
                 continue;
             }
             if call.function.name == ASSET_TOOL_NAME
                 && let Some(source) = assets
             {
-                fetch_asset_into(&mut messages, source, &call, model_turns, &mut asset_bytes)?;
+                let start = messages.len();
+                let outcome =
+                    fetch_asset_into(&mut messages, source, &call, model_turns, &mut asset_bytes)?;
+                if messages[start..]
+                    .iter()
+                    .any(|message| message.parts().is_some())
+                {
+                    let id = asset_argument(&call.function.name, &call.function.arguments)?;
+                    record.exchange(&call, &format!("chat-asset:{id} was shown when it was fetched and is not replayed; call fetch_chat_asset to see it again."), RecordedOutcome::Exit(0));
+                } else {
+                    record.result(&call, &messages[start..], outcome);
+                }
                 continue;
             }
             if call.function.name != SCRIPT_TOOL_NAME {
@@ -1137,6 +1174,7 @@ where
                 );
                 reject_tool_call(model_turns, call.id.as_str(), "unknown-tool", answered);
                 if answered {
+                    record.result(&call, &messages, RecordedOutcome::Refused);
                     continue;
                 }
                 return Err(PromptError::UnknownTool(call.function.name));
@@ -1158,6 +1196,7 @@ where
                         answered,
                     );
                     if answered {
+                        record.result(&call, &messages, RecordedOutcome::Refused);
                         continue;
                     }
                     return Err(error);
@@ -1230,7 +1269,9 @@ where
             check_cancelled(cancellation)?;
             script_calls = script_calls.saturating_add(1);
             capability_invocations = runtime.capability_calls_used();
-            messages.push(ModelMessage::tool(call.id, format_script_outcome(&outcome)));
+            let text = format_script_outcome(&outcome);
+            record.exchange(&call, &text, RecordedOutcome::Exit(outcome.exit_code.get()));
+            messages.push(ModelMessage::tool(call.id, text));
         }
     }
 }
@@ -1597,7 +1638,7 @@ fn fetch_asset_into(
     call: &ModelToolCall,
     model_turn: u32,
     asset_bytes: &mut usize,
-) -> Result<(), PromptError> {
+) -> Result<RecordedOutcome, PromptError> {
     let id = match asset_argument(&call.function.name, &call.function.arguments) {
         Ok(id) => id,
         Err(error) => {
@@ -1633,7 +1674,7 @@ fn fetch_asset_into(
                 "agent.asset.refused"
             );
             messages.push(ModelMessage::tool(call.id.clone(), reason));
-            return Ok(());
+            return Ok(RecordedOutcome::Refused);
         }
     };
     let text = if is_textual(&asset.mime) {
@@ -1641,7 +1682,7 @@ fn fetch_asset_into(
             Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
             Err(error) => {
                 messages.push(ModelMessage::tool(call.id.clone(), error.to_string()));
-                return Ok(());
+                return Ok(RecordedOutcome::Failed);
             }
         }
     } else {
@@ -1662,7 +1703,7 @@ fn fetch_asset_into(
             "agent.asset.refused"
         );
         messages.push(ModelMessage::tool(call.id.clone(), reason));
-        return Ok(());
+        return Ok(RecordedOutcome::Refused);
     }
     *asset_bytes += bytes;
     // Only size and media type are logged, never the bytes or the sender's file name, since the
@@ -1680,7 +1721,7 @@ fn fetch_asset_into(
     );
     if let Some(text) = text {
         messages.push(ModelMessage::tool(call.id.clone(), text));
-        return Ok(());
+        return Ok(RecordedOutcome::Exit(0));
     }
     messages.push(ModelMessage::tool(
         call.id.clone(),
@@ -1702,7 +1743,7 @@ fn fetch_asset_into(
         ContentPart::Text(format!("chat-asset:{id}:")),
         part,
     ]));
-    Ok(())
+    Ok(RecordedOutcome::Exit(0))
 }
 
 fn clamp_textual_asset(mut text: String) -> String {
@@ -2504,6 +2545,13 @@ mod tests {
             ]
         );
         assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
+        let captured = history.turns()[0].captured().unwrap();
+        assert!(
+            matches!(&captured.original[0], crate::memory::Item::User(text) if text.text() == "msg1")
+        );
+        assert!(
+            matches!(&captured.original[1], crate::memory::Item::Steer(text) if text.text() == "msg2")
+        );
     }
 
     #[test]
@@ -2551,6 +2599,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(users, ["msg1\n\n[note 1]", "msg2\n\n[note 2]"]);
         assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
+        let captured = history.turns()[0].captured().unwrap();
+        assert!(
+            matches!(&captured.original[0], crate::memory::Item::User(text) if text.text() == "msg1")
+        );
+        assert!(
+            matches!(&captured.original[1], crate::memory::Item::Steer(text) if text.text() == "msg2")
+        );
     }
 
     #[test]
@@ -2589,6 +2644,13 @@ mod tests {
             ]
         );
         assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
+        let captured = history.turns()[0].captured().unwrap();
+        assert!(
+            matches!(&captured.original[0], crate::memory::Item::User(text) if text.text() == "msg1")
+        );
+        assert!(
+            matches!(&captured.original[2], crate::memory::Item::Steer(text) if text.text() == "msg2")
+        );
         assert_eq!(history.turns()[0].answer(), Some("done"));
     }
 
@@ -3486,6 +3548,47 @@ mod tests {
                 ("assistant", "answer 4".to_owned()),
                 ("user", "ask 5".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_its_captured_exchanges() {
+        use crate::memory::{Item, Outcome};
+        let model = ScriptedModel::new([
+            script_call("one", "echo one"),
+            script_call("two", "echo two"),
+        ]);
+        let mut history = History::default();
+        let result = run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("question", limits(3, 8)),
+            &mut history,
+        );
+        assert!(matches!(result, Err(PromptError::Model(_))));
+        let record = history.turns()[0].captured().unwrap();
+        assert!(matches!(&record.original[0], Item::User(text) if text.text() == "question"));
+        let exchanges = record
+            .original
+            .iter()
+            .filter_map(|item| match item {
+                Item::Exchange(exchange) => Some(exchange),
+                Item::User(_)
+                | Item::Steer(_)
+                | Item::Assistant(_)
+                | Item::Reasoning(_)
+                | Item::Asset(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].call.id.as_str(), "one");
+        assert_eq!(exchanges[1].call.id.as_str(), "two");
+        assert_eq!(exchanges[0].result.outcome, Outcome::Exit(0));
+        assert!(
+            record
+                .original
+                .iter()
+                .all(|item| !matches!(item, Item::Assistant(_)))
         );
     }
 
@@ -4495,6 +4598,66 @@ mod tests {
             }],
             None,
         )
+    }
+
+    #[test]
+    fn recorded_media_fetches_name_the_refetch_while_live_messages_keep_the_media() {
+        use crate::memory::Item;
+        let file = |name: &str, mime: &str| FetchedAsset {
+            name: name.into(),
+            mime: mime.into(),
+            data: dekopon_model::asset::DiskBlob::from_bytes(b"media")
+                .unwrap()
+                .into(),
+        };
+        let assets = FixedAssets(vec![
+            file("image.png", "image/png"),
+            file("doc.pdf", "application/pdf"),
+            text_asset("text-canary"),
+        ]);
+        let model =
+            ScriptedModel::new([asset_call(1), asset_call(2), asset_call(3), answer("done")]);
+        let mut history = History::default();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("fetch", limits(4, 8)).with_assets(&assets),
+            &mut history,
+        )
+        .unwrap();
+        let captured = history.turns()[0].captured().unwrap();
+        let results = captured
+            .original
+            .iter()
+            .filter_map(|item| match item {
+                Item::Exchange(exchange) => Some(exchange.result.text.text()),
+                Item::User(_)
+                | Item::Steer(_)
+                | Item::Assistant(_)
+                | Item::Reasoning(_)
+                | Item::Asset(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            [
+                "chat-asset:1 was shown when it was fetched and is not replayed; call fetch_chat_asset to see it again.",
+                "chat-asset:2 was shown when it was fetched and is not replayed; call fetch_chat_asset to see it again.",
+                "text-canary",
+            ]
+        );
+        let requests = model.observed_messages.lock();
+        let last = requests.last().unwrap();
+        for id in [1, 2] {
+            assert!(last.iter().any(|message| message.content()
+                == Some(format!("chat-asset:{id} follows in the next message.").as_str())));
+        }
+        assert_eq!(
+            last.iter()
+                .filter(|message| message.parts().is_some())
+                .count(),
+            2
+        );
     }
 
     #[test]
