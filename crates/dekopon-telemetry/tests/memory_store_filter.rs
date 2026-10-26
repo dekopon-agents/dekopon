@@ -80,7 +80,7 @@ fn a_memory_store_after_the_detail_probe_reaches_traces_and_logs() {
         .lock()
         .iter()
         .any(|span| span.events.iter().any(|event| event.name == "memory.store"));
-    let log_received = logs.0.lock().iter().any(|body| *body == "memory.store");
+    let log_received = logs.0.lock().contains(&"memory.store");
     assert!(
         trace_received && log_received,
         "memory.store delivery: traces={trace_received}, logs={log_received}"
