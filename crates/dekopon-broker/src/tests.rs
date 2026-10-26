@@ -743,6 +743,10 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         .expect("HTTP")
         .allow_plaintext_loopback = true);
     changes!(|v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").propagate_trace = true);
+    changes!(
+        |v: &mut ExecutionConstraints| v.http.as_mut().expect("HTTP").signed_download =
+            Some(dekopon_capability::SignedDownload::GithubActionsLogsV1)
+    );
     changes!(|v: &mut ExecutionConstraints| v
         .http
         .as_mut()

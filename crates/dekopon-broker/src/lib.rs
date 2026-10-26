@@ -4322,6 +4322,9 @@ fn encode_execution_constraints(
         if http.propagate_trace {
             encoded.boolean("execution.http.propagateTrace", true);
         }
+        if http.signed_download == Some(dekopon_capability::SignedDownload::GithubActionsLogsV1) {
+            encoded.text("execution.http.signedDownload", "github-actions-logs-v1");
+        }
         if !http.request_templates.is_empty() {
             let templates = http.request_templates.iter().collect::<BTreeSet<_>>();
             encoded.number(
