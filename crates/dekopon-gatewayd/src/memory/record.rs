@@ -63,6 +63,15 @@ pub(crate) enum Slot {
     Error(SummaryError),
 }
 
+impl Slot {
+    pub(crate) const fn is_pending(&self) -> bool {
+        match self {
+            Self::Queued | Self::Running => true,
+            Self::Generated(_) | Self::Error(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SummaryError {
@@ -71,6 +80,7 @@ pub(crate) struct SummaryError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) enum SummaryFailure {
     Timeout,
     Refused,

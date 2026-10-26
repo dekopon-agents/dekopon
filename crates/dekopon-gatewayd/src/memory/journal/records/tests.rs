@@ -966,3 +966,154 @@ fn an_unknown_tag_is_refused_before_reading_its_large_payload() {
     ));
     assert!(probe.stream_position().unwrap() <= BUFFER as u64);
 }
+
+#[test]
+fn unknown_nested_span_slot_and_asset_source_fields_are_corrupt() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    record.assets.push(AssetRow {
+        id: 1,
+        at_ms: 1,
+        name: "fixture".to_owned(),
+        mime: "text/plain".to_owned(),
+        size: Some(1),
+        source: Some(crate::asset::AssetSourceRef::Generated {
+            capability: "fixture".to_owned(),
+            invocation: "fixture".to_owned(),
+        }),
+    });
+    record.next_asset_id = 2;
+    journal.append_record(STEM, &record, Vec::new()).unwrap();
+    let path = journal.path(STEM);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let bad_span = raw.replacen("\"User\":{", "\"User\":{\"futureField\":7,", 1);
+    let bad_source = raw.replacen(
+        "\"kind\":\"generated\",",
+        "\"kind\":\"generated\",\"futureField\":7,",
+        1,
+    );
+    let bad_slot = format!(
+        "{raw}{}\n",
+        r#"{"s":{"atMs":2,"record":1,"part":1,"slot":{"Error":{"kind":{"Io":{"kind":"NotFound","futureField":1}},"detail":"x"}}}}"#
+    );
+    for changed in [bad_span, bad_source, bad_slot] {
+        assert_ne!(changed, raw);
+        std::fs::write(&path, &changed).unwrap();
+        assert!(matches!(
+            journal.record_snapshot(STEM, true),
+            Err(JournalError::Corrupt)
+        ));
+        assert!(matches!(
+            journal.rewrite_records(STEM, |_| true),
+            Err(JournalError::Corrupt)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    }
+}
+
+#[test]
+fn boot_overflow_preserves_a_finalized_middle_slot_and_counts_only_pending_slots() {
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let mut second = fixture();
+    second.id = RecordId(2.try_into().unwrap());
+    second.turn = TurnId(2);
+    second.summaries = vec![
+        Slot::Running,
+        Slot::Generated("kept".to_owned()),
+        Slot::Queued,
+    ];
+    journal.append_record(STEM, &second, Vec::new()).unwrap();
+    let boot = journal.load_summary_tasks(1.try_into().unwrap()).unwrap();
+    assert_eq!(boot.tasks.len(), 1);
+    assert_eq!(boot.overflowed, 2);
+    let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
+    let slots = &snapshot.records[1].header.summaries;
+    assert_eq!(slots[1], Slot::Generated("kept".to_owned()));
+    for index in [0, 2] {
+        assert!(
+            matches!(&slots[index], Slot::Error(error) if error.kind == SummaryFailure::Overflow)
+        );
+    }
+}
+
+#[test]
+fn a_pending_chain_error_never_overwrites_a_newly_finalized_slot() {
+    let (_dir, journal) = journal();
+    let record = fixture();
+    journal.append_record(STEM, &record, Vec::new()).unwrap();
+    let stale = journal.record_snapshot(STEM, true).unwrap().unwrap();
+    let head = &stale.records[0].header;
+    let mut line = SlotLine {
+        at_ms: 1,
+        record: record.id,
+        part: 1.try_into().unwrap(),
+        slot: Slot::Generated("kept".to_owned()),
+        subject: Subject::Record,
+    };
+    assert!(
+        journal
+            .write_slot_for(STEM, line.clone(), record.turn)
+            .unwrap()
+    );
+    line.slot = Slot::Error(SummaryError {
+        kind: SummaryFailure::Overflow,
+        detail: "overflow".to_owned(),
+    });
+    assert!(
+        !journal
+            .write_pending_slot_for(STEM, line, head.turn)
+            .unwrap()
+    );
+    let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
+    assert_eq!(
+        snapshot.records[0].header.summaries[0],
+        Slot::Generated("kept".to_owned())
+    );
+}
+
+#[test]
+fn indexed_side_lines_join_the_first_kept_record_after_later_appends_and_a_rewrite() {
+    let (_dir, journal) = journal();
+    for number in 1..=8 {
+        let mut record = fixture();
+        record.id = RecordId(number.try_into().unwrap());
+        journal.append_record(STEM, &record, Vec::new()).unwrap();
+        if number >= 3 {
+            journal
+                .write_pin(
+                    STEM,
+                    PinLine {
+                        at_ms: number,
+                        record: RecordId(3.try_into().unwrap()),
+                        pin: Some(dekopon_agent::memory_tools::Rung::Metadata),
+                        subject: Subject::Record,
+                    },
+                )
+                .unwrap();
+        }
+    }
+    journal
+        .rewrite_records(STEM, |header| header.id.0.get() >= 3)
+        .unwrap();
+    let line = PinLine {
+        at_ms: 9,
+        record: RecordId(3.try_into().unwrap()),
+        pin: None,
+        subject: Subject::Record,
+    };
+    journal.write_pin(STEM, line).unwrap();
+    let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
+    assert_eq!(snapshot.records.len(), 6);
+    assert!(snapshot.records[0].header.pin.is_none());
+    assert!(
+        journal
+            .record_lookup(STEM, RecordId(3.try_into().unwrap()))
+            .unwrap()
+            .unwrap()
+            .records[0]
+            .header
+            .pin
+            .is_none()
+    );
+}

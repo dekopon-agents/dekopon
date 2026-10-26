@@ -52,6 +52,7 @@ pub(crate) struct Span {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) enum Field {
     User {
         original_bytes: u64,
@@ -474,7 +475,7 @@ impl Journal {
     }
 
     pub(crate) fn write_slot(&self, stem: &str, line: SlotLine) -> Result<bool, JournalError> {
-        self.write_record_side(stem, line.record, None, &SummaryLine { s: line })
+        self.write_record_side(stem, line.record, None, None, &SummaryLine { s: line })
     }
 
     pub(crate) fn write_slot_for(
@@ -483,15 +484,36 @@ impl Journal {
         line: SlotLine,
         turn: TurnId,
     ) -> Result<bool, JournalError> {
-        self.write_record_side(stem, line.record, Some(turn), &SummaryLine { s: line })
+        self.write_record_side(
+            stem,
+            line.record,
+            Some(turn),
+            None,
+            &SummaryLine { s: line },
+        )
+    }
+
+    pub(crate) fn write_pending_slot_for(
+        &self,
+        stem: &str,
+        line: SlotLine,
+        turn: TurnId,
+    ) -> Result<bool, JournalError> {
+        self.write_record_side(
+            stem,
+            line.record,
+            Some(turn),
+            Some(line.part),
+            &SummaryLine { s: line },
+        )
     }
 
     pub(crate) fn write_pin(&self, stem: &str, line: PinLine) -> Result<bool, JournalError> {
-        self.write_record_side(stem, line.record, None, &PinEnvelope { p: line })
+        self.write_record_side(stem, line.record, None, None, &PinEnvelope { p: line })
     }
 
     pub(crate) fn write_choice(&self, stem: &str, line: ChoiceLine) -> Result<bool, JournalError> {
-        self.write_record_side(stem, line.record, None, &ChoiceEnvelope { c: line })
+        self.write_record_side(stem, line.record, None, None, &ChoiceEnvelope { c: line })
     }
 
     fn write_record_side(
@@ -499,6 +521,7 @@ impl Journal {
         stem: &str,
         record: RecordId,
         turn: Option<TurnId>,
+        pending: Option<NonZeroU8>,
         line: &impl Serialize,
     ) -> Result<bool, JournalError> {
         let mut bytes = serde_json::to_vec(line).map_err(corrupt)?;
@@ -507,8 +530,17 @@ impl Journal {
         let Some(snapshot) = self.record_lookup(stem, record)? else {
             return Ok(false);
         };
-        if !snapshot.records.iter().any(|head| {
+        let Some(head) = snapshot.records.first().filter(|head| {
             head.header.id == record && turn.is_none_or(|turn| head.header.turn == turn)
+        }) else {
+            return Ok(false);
+        };
+        if pending.is_some_and(|part| {
+            !head
+                .header
+                .summaries
+                .get(usize::from(part.get() - 1))
+                .is_some_and(Slot::is_pending)
         }) {
             return Ok(false);
         }
@@ -702,11 +734,14 @@ fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, 
             if wanted.is_some_and(|wanted| wanted != record) {
                 continue;
             }
-            let head = records
-                .iter_mut()
-                .rev()
-                .find(|head| head.header.id == record)
+            let first = records.first().ok_or(JournalError::Corrupt)?.header.id;
+            let index = record
+                .0
+                .get()
+                .checked_sub(first.0.get())
+                .and_then(|index| usize::try_from(index).ok())
                 .ok_or(JournalError::Corrupt)?;
+            let head = records.get_mut(index).ok_or(JournalError::Corrupt)?;
             side.apply(head, &line)?;
         }
     }
@@ -965,6 +1000,9 @@ fn boot_record(
             });
         } else {
             for index in usize::from(part.get() - 1)..head.header.summaries.len() {
+                if !head.header.summaries[index].is_pending() {
+                    continue;
+                }
                 let part = NonZeroU8::new(
                     u8::try_from(index + 1).map_err(|_invalid| JournalError::Corrupt)?,
                 )

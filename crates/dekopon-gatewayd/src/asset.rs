@@ -67,6 +67,7 @@ impl fmt::Debug for AssetRef {
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
+    deny_unknown_fields,
     tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"

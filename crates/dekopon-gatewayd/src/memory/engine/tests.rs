@@ -183,7 +183,7 @@ async fn summary_errors_map_to_slot_failures() {
             cancel.clone()
         )
         .await,
-        Next::Continue
+        Next::Continue(_)
     ));
     let mut task = task();
     task.part = NonZeroU8::new(2).unwrap();
@@ -197,7 +197,7 @@ async fn summary_errors_map_to_slot_failures() {
             cancel.clone()
         )
         .await,
-        Next::Continue
+        Next::Continue(_)
     ));
     task.part = NonZeroU8::new(3).unwrap();
     assert!(matches!(
@@ -557,7 +557,7 @@ async fn a_summary_cut_before_its_first_codepoint_is_empty() {
             watch::channel(false).1
         )
         .await,
-        Next::Continue
+        Next::Continue(_)
     ));
     assert!(failed(&slots(&journal)[0], SummaryFailure::Empty));
     assert_eq!(script.calls.load(Ordering::Relaxed), 1);
@@ -832,4 +832,161 @@ async fn a_restart_mid_summary_requeues_and_resumes_from_the_original() {
     assert_eq!(script.calls.load(Ordering::Relaxed), 3);
     assert!(script.inputs.lock()[0].contains("a\n🦀\\\"z"));
     owned.shutdown().await;
+}
+
+#[test]
+fn runtime_overflow_preserves_terminal_slots_and_counts_only_changed_slots() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    let old_error = error_slot(SummaryFailure::Timeout, "old failure");
+    record
+        .plan
+        .as_mut()
+        .unwrap()
+        .parts
+        .push(8.try_into().unwrap());
+    record.summaries = vec![
+        Slot::Running,
+        Slot::Generated("kept".to_owned()),
+        Slot::Queued,
+        old_error.clone(),
+    ];
+    journal.append_record(STEM, &record, Vec::new()).unwrap();
+    assert_eq!(
+        mark_later(
+            &journal,
+            &task(),
+            Some(record.turn),
+            SummaryFailure::Overflow,
+            "overflow"
+        )
+        .unwrap(),
+        2
+    );
+    let after = slots(&journal);
+    assert!(failed(&after[0], SummaryFailure::Overflow));
+    assert_eq!(after[1], Slot::Generated("kept".to_owned()));
+    assert!(failed(&after[2], SummaryFailure::Overflow));
+    assert_eq!(after[3], old_error);
+    assert_eq!(
+        mark_later(
+            &journal,
+            &task(),
+            Some(record.turn),
+            SummaryFailure::Overflow,
+            "overflow"
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(slots(&journal), after);
+}
+
+#[tokio::test]
+async fn recovery_skips_a_finalized_middle_part_and_resumes_later_queued_work() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    record.summaries = vec![
+        Slot::Running,
+        Slot::Generated("kept".to_owned()),
+        Slot::Queued,
+    ];
+    journal.append_record(STEM, &record, Vec::new()).unwrap();
+    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    let (resources, script) = resources(
+        Arc::clone(&journal),
+        [Action::Text("first"), Action::Text("third")],
+        true,
+    );
+    let mut owned = JoinSet::new();
+    let sender = spawn(
+        resources,
+        64.try_into().unwrap(),
+        1.try_into().unwrap(),
+        &mut owned,
+    );
+    assert_eq!(boot.tasks.len(), 1);
+    for task in boot.tasks {
+        sender.enqueue(task).await;
+    }
+    wait_for(&journal, |slots| matches!(slots[2], Slot::Generated(_))).await;
+    assert_eq!(
+        slots(&journal),
+        vec![
+            Slot::Generated("first".to_owned()),
+            Slot::Generated("kept".to_owned()),
+            Slot::Generated("third".to_owned())
+        ]
+    );
+    assert_eq!(script.calls.load(Ordering::Relaxed), 2);
+    assert!(script.inputs.lock()[1].contains("Earlier parts:\nfirstkept"));
+    owned.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_continuation_never_bypasses_a_running_middle_part() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    record.summaries = vec![Slot::Queued, Slot::Running, Slot::Queued];
+    journal.append_record(STEM, &record, Vec::new()).unwrap();
+    let (resources, script) = resources(Arc::clone(&journal), [Action::Text("first")], true);
+    let next = run(
+        Arc::new(resources),
+        Queued {
+            task: task(),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .await;
+    assert!(matches!(next, Next::Stop));
+    assert_eq!(slots(&journal)[1..], [Slot::Running, Slot::Queued]);
+    assert_eq!(script.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_transport_content_filter_refusal_stops_the_summary_chain_after_one_call() {
+    use tokio::io::AsyncWriteExt as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/prefix", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let mut server = JoinSet::new();
+    server.spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (path, headers, body) = crate::tests::read_http_request_parts(&mut stream).await.unwrap();
+            assert_eq!(path, "/prefix/chat/completions");
+            assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["model"], "fixture");
+            assert_eq!(body["stream"], true);
+            counted.fetch_add(1, Ordering::Relaxed);
+            let body = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let mut owned = JoinSet::new();
+    let sender = spawn(
+        live_resources(Arc::clone(&journal), &endpoint, 2_000),
+        4.try_into().unwrap(),
+        1.try_into().unwrap(),
+        &mut owned,
+    );
+    sender.enqueue(task()).await;
+    wait_for(&journal, |slots| {
+        slots.iter().all(|slot| !slot.is_pending())
+    })
+    .await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(
+        slots(&journal)
+            .iter()
+            .all(|slot| failed(slot, SummaryFailure::Refused))
+    );
+    owned.shutdown().await;
+    server.shutdown().await;
 }

@@ -65,7 +65,7 @@ pub(crate) struct Sender {
 
 #[derive(Clone, Copy)]
 enum Next {
-    Continue,
+    Continue(NonZeroU8),
     Stop,
 }
 
@@ -156,7 +156,7 @@ async fn dispatch(
                         if let Some(running) = tasks.remove(&id) {
                             let task = running.task;
                             match next {
-                                Next::Continue => if let Some(part) = task.part.get().checked_add(1).and_then(NonZeroU8::new) { sender.enqueue(SlotTask { part, ..task }).await; },
+                                Next::Continue(part) => sender.enqueue(SlotTask { part, ..task }).await,
                                 Next::Stop => {}
                             }
                         }
@@ -235,7 +235,11 @@ fn summarize(
                 None,
                 io_failure(error),
                 "could not read summary input",
-                Next::Continue,
+                task.part
+                    .get()
+                    .checked_add(1)
+                    .and_then(NonZeroU8::new)
+                    .map_or(Next::Stop, Next::Continue),
             );
         }
     };
@@ -246,17 +250,17 @@ fn summarize(
     let Some(plan) = &head.header.plan else {
         return Next::Stop;
     };
-    if !matches!(head.header.summaries.get(part), Some(Slot::Queued)) {
-        return Next::Stop;
+    match head.header.summaries.get(part) {
+        Some(Slot::Queued) => {}
+        Some(Slot::Running) | None => return Next::Stop,
+        Some(Slot::Generated(_) | Slot::Error(_)) => {
+            return next_pending(&head.header.summaries, part + 1);
+        }
     }
     let Some(limit) = plan.parts.get(part) else {
         return Next::Stop;
     };
-    let next = if part + 1 < plan.parts.len() {
-        Next::Continue
-    } else {
-        Next::Stop
-    };
+    let next = next_pending(&head.header.summaries, part + 1);
     match write_slot(journal, task, Slot::Running, expected) {
         Ok(true) => {}
         Ok(false) => return evicted(resources),
@@ -356,6 +360,22 @@ fn summarize(
             next,
         ),
     }
+}
+
+fn next_pending(slots: &[Slot], start: usize) -> Next {
+    for (index, slot) in slots.iter().enumerate().skip(start) {
+        match slot {
+            Slot::Queued => {
+                return u8::try_from(index + 1)
+                    .ok()
+                    .and_then(NonZeroU8::new)
+                    .map_or(Next::Stop, Next::Continue);
+            }
+            Slot::Running => return Next::Stop,
+            Slot::Generated(_) | Slot::Error(_) => {}
+        }
+    }
+    Next::Stop
 }
 
 enum Completed {
@@ -565,17 +585,20 @@ fn mark_later(
     };
     let mut count = 0;
     for part in usize::from(task.part.get() - 1)..head.header.summaries.len() {
+        if !head.header.summaries[part].is_pending() {
+            continue;
+        }
         let part =
             NonZeroU8::new(u8::try_from(part + 1).map_err(|_invalid| JournalError::Corrupt)?)
                 .ok_or(JournalError::Corrupt)?;
-        if write_slot(
-            journal,
-            &SlotTask {
-                part,
-                ..task.clone()
-            },
-            error_slot(kind, detail),
-            Some(head.header.turn),
+        let later = SlotTask {
+            part,
+            ..task.clone()
+        };
+        if journal.write_pending_slot_for(
+            &task.stem,
+            slot_line(&later, error_slot(kind, detail)),
+            head.header.turn,
         )? {
             count += 1;
         }
