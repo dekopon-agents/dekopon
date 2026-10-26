@@ -726,6 +726,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
                     max_response_bytes: 64 * 1024,
                     allow_plaintext_loopback: true,
                     request_templates: Vec::new(),
+                    signed_download: None,
                 }),
                 storage: None,
                 secret_use: None,

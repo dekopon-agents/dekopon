@@ -1,0 +1,91 @@
+package dekopon:asset@0.1.0;
+
+/// Conversation temp files as handles. Bytes never ride JSON; providers read inputs and write
+/// outputs through the host. Only `invoke` has imports — `run-command` is pure.
+interface asset {
+    /// How the stored bytes are represented. `read` always yields decoded bytes.
+    enum encoding {
+        identity,
+        base64,
+    }
+
+    /// Metadata the gateway's conversation table holds for one asset. Never bytes.
+    record info {
+        /// The conversation number (`chat-asset:<N>`); `none` for a handle this invocation
+        /// created and the gateway has not numbered yet.
+        id: option<u64>,
+        content-type: string,
+        encoding: encoding,
+        /// Stored (encoded) length; `none` when the length is not known up front.
+        stored-bytes: option<u64>,
+        /// Whether `read-at` is served. A file is; a stream is not.
+        seekable: bool,
+        /// Where the bytes came from: `chat`, `provider:<name>`, `response`.
+        origin: string,
+        sent: bool,
+    }
+
+    /// Stable classes of asset failure. Fail fast; nothing here is retried.
+    enum error-code {
+        /// `open` of a string the gateway did not pass with this invocation.
+        unknown-reference,
+        /// The invocation's constraints do not grant `attach`, `remove` or `send`.
+        denied,
+        /// `send` when `sends-remaining` reached zero.
+        sends-exhausted,
+        /// `remove` of a handle already marked sent.
+        already-sent,
+        /// `read-at` on a handle whose `info.seekable` is false.
+        not-seekable,
+        /// `attach` of a base64 writer whose content is not canonical base64.
+        invalid-encoding,
+        /// Per-asset or per-invocation byte limit exceeded.
+        too-large,
+        /// The broker's in-flight byte budget or disk is exhausted.
+        over-budget,
+        /// A sixth `attach` in one invocation; a response frame carries at most five descriptors.
+        too-many-assets,
+        /// The asset directory is not configured on this broker.
+        unconfigured,
+        io,
+        internal,
+    }
+
+    /// A bounded asset failure safe to return to a provider.
+    record error {
+        code: error-code,
+        message: string,
+    }
+
+    /// An input the gateway passed, or the spooled body of a streamed HTTP response.
+    resource handle {
+        info: func() -> info;
+        /// Next decoded bytes from this handle's own cursor; an empty list is the end. Single
+        /// pass. Each call costs one host allocation of at most 64 KiB.
+        read: func(len: u32) -> result<list<u8>, error>;
+        /// Decoded bytes at a decoded offset. Only when `info.seekable`; base64 is 4:3 aligned,
+        /// so a file serves any offset without decoding from the start.
+        read-at: func(offset: u64, len: u32) -> result<list<u8>, error>;
+    }
+
+    /// An output under construction: a file in the broker's asset directory.
+    resource writer {
+        /// Sequential append. The SDK's `write_all` chunks a slice into <= 64 KiB host calls;
+        /// each call returns when the host has accepted the chunk and may suspend the guest.
+        write: func(bytes: list<u8>) -> result<_, error>;
+    }
+
+    /// Opens a `chat-asset:<N>` string leaf of THIS invocation's proposal; anything else is
+    /// refused with `unknown-reference`.
+    open: func(reference: string) -> result<handle, error>;
+    /// Allocates an output file. Refused with `unconfigured` when the broker has no
+    /// `assets.rootPath`.
+    allocate: func(content-type: string, encoding: encoding) -> result<writer, error>;
+    /// Joins the conversation's temp files; NOT sent. Consumes the writer.
+    attach: func(w: writer) -> result<handle, error>;
+    /// The conversation's table, metadata only.
+    %list: func() -> list<info>;
+    remove: func(h: borrow<handle>) -> result<_, error>;
+    /// Marks for delivery on this turn's reply; refused without the `asset.send` grant.
+    send: func(h: borrow<handle>) -> result<_, error>;
+}
