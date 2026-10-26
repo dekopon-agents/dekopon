@@ -914,7 +914,7 @@ fn streamed_http_without_assets_still_refuses_before_dispatch() {
     assert!(matches!(
         *failure.error,
         dekopon_broker_host::BrokerHostError::HostCallRejected {
-            reason: "asset-call-rejected",
+            reason: dekopon_broker_host::HostCallRejection::AssetCallRejected,
             ..
         }
     ));
@@ -937,7 +937,7 @@ fn asset_storage_does_not_grant_attachment() {
     assert!(matches!(
         *failure.error,
         dekopon_broker_host::BrokerHostError::HostCallRejected {
-            reason: "asset-call-rejected",
+            reason: dekopon_broker_host::HostCallRejection::AssetCallRejected,
             ..
         }
     ));
@@ -972,7 +972,9 @@ fn asset_storage_does_not_widen_http_methods() {
     assert!(matches!(
         *failure.error,
         dekopon_broker_host::BrokerHostError::HostCallRejected {
-            reason: "denied",
+            reason: dekopon_broker_host::HostCallRejection::Http(
+                dekopon_http_host::PolicyViolation::Denied
+            ),
             ..
         }
     ));
@@ -1058,7 +1060,7 @@ fn input_asset_bytes_and_references_do_not_leak_between_calls() {
     assert!(matches!(
         *failure.error,
         dekopon_broker_host::BrokerHostError::HostCallRejected {
-            reason: "asset-call-rejected",
+            reason: dekopon_broker_host::HostCallRejection::AssetCallRejected,
             ..
         }
     ));
@@ -1128,7 +1130,7 @@ fn input_images_do_not_grant_output_attachment() {
     assert!(matches!(
         *failure.error,
         dekopon_broker_host::BrokerHostError::HostCallRejected {
-            reason: "asset-call-rejected",
+            reason: dekopon_broker_host::HostCallRejection::AssetCallRejected,
             ..
         }
     ));
