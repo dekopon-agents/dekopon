@@ -648,3 +648,5 @@ group- or world-writable, or `dekopon-brokerd` refuses to start.
 - Follow the [PR template](../.github/pull_request_template.md): summary, security impact, validation actually run, and limitations/follow-ups.
 - Use a conventional commit subject where practical.
 - Push the branch, open the PR, and verify the required checks rather than assuming local success implies remote success.
+
+Temporary memory-lab Markdown-only path-filter demonstration.
