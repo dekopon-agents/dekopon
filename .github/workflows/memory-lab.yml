@@ -126,53 +126,44 @@ jobs:
           BASH
       - name: baseline (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'baseline') }}
-        continue-on-error: true
         shell: bash
         env:
           LAB_DEADLINE_SECS: "0.1"
         run: run_scenario baseline
       - name: flood (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'flood') }}
-        continue-on-error: true
         shell: bash
         env:
           LAB_FAULT_DROP_REPORT: "1"
         run: run_scenario flood
       - name: summarizer-hang (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summarizer-hang') }}
-        continue-on-error: true
         shell: bash
         run: run_scenario summarizer-hang
       - name: summarizer-fail (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summarizer-fail') }}
-        continue-on-error: true
         shell: bash
         env:
           LAB_COLLECTOR_IMAGE: "otel/opentelemetry-collector-contrib:lab-ci-intentionally-absent"
         run: run_scenario summarizer-fail
       - name: summarizer-refuse (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summarizer-refuse') }}
-        continue-on-error: true
         shell: bash
         run: run_scenario summarizer-refuse
       - name: unloadable-journal (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'unloadable-journal') }}
-        continue-on-error: true
         shell: bash
         run: run_scenario unloadable-journal
       - name: restart-mid-summary (exploratory)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'restart-mid-summary') }}
-        continue-on-error: true
         shell: bash
         run: run_scenario restart-mid-summary
       - name: summaries-off-vs-on (exploratory)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summaries-off-vs-on') }}
-        continue-on-error: true
         shell: bash
         run: run_scenario summaries-off-vs-on
       - name: config-check (exploratory)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'config-check') }}
-        continue-on-error: true
         shell: bash
         run: run_scenario config-check
       - name: Summarize every scenario and enforce required results
