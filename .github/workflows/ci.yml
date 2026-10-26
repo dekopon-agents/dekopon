@@ -199,7 +199,7 @@ jobs:
           shared-key: workspace-tests-v1
           cache-bin: "false"
           save-if: "false"
-      - name: Fetch exact standalone-provider test fixtures
+      - name: Fetch exact JSONPlaceholder, memory-chat, and gh test fixtures
         run: ci/fetch-external-provider-components.sh examples/providers
       # Keep build and execution on this runner so the test step reuses linked binaries.
       # Retain Cargo's harness: process-per-test nextest scheduling regressed these tests.
@@ -229,7 +229,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: rustup toolchain install
-      - name: Fetch exact standalone-provider test fixtures
+      - name: Fetch exact JSONPlaceholder, memory-chat, and gh test fixtures
         run: ci/fetch-external-provider-components.sh examples/providers
       - name: Test broker-host component boundaries
         run: cargo test -p dekopon-broker-host --test host --all-features --locked
