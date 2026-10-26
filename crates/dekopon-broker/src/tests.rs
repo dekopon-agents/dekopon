@@ -93,6 +93,7 @@ async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
         &set,
         None,
         InvocationOutcome::Failed,
+        None,
         0,
         None,
         None,
@@ -1156,6 +1157,175 @@ fn a_provider_exit_keeps_its_classification_and_carries_its_status_and_stderr() 
             })
         );
     }
+}
+
+#[tokio::test]
+async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
+    use dekopon_broker_host::{BrokerProviderRegistry, Streams, asset::AssetInputs};
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+    use dekopon_test_support::CaptureLayer;
+    use tracing_subscriber::prelude::*;
+
+    fn hex(data: &[u8]) -> String {
+        data.iter().map(|byte| format!("\\{byte:02x}")).collect()
+    }
+
+    fn manifest() -> String {
+        serde_json::to_string(&serde_json::json!({
+            "apiVersion": "dekopon.dev/provider/v1alpha1",
+            "id": "stdio-probe",
+            "description": "Inline standard-stream probe",
+            "commandWords": ["stdioprobe"],
+            "capabilities": [{
+                "id": "stdio-probe.run",
+                "description": "Runs the inline body",
+                "effect": dekopon_capability::EffectKind::ReadOnly,
+                "risk": dekopon_core::RiskLevel::Low,
+                "inputSchema": {"type": "object"}
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn descriptor(offset: u32, length: usize) -> String {
+        hex(&[
+            offset.to_le_bytes(),
+            u32::try_from(length).unwrap().to_le_bytes(),
+        ]
+        .concat())
+    }
+
+    let manifest = manifest();
+    let wat = format!(
+        r#"(component
+        (import "dekopon:stdio/streams@0.1.0" (instance $streams
+            (export "write-error" (type $error (enum "closed")))
+            (export "writer" (type $writer (sub resource)))
+            (export "[method]writer.write" (func (param "self" (borrow $writer)) (param "bytes" (list u8)) (result (result (error $error)))))
+            (export "stdout" (func (result (own $writer))))))
+        (core module $memory
+            (memory (export "memory") 1)
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+        (core instance $memory (instantiate $memory))
+        (alias core export $memory "memory" (core memory $mem))
+        (core func $write (canon lower (func $streams "[method]writer.write") (memory $mem)))
+        (core func $stdout (canon lower (func $streams "stdout")))
+        (core module $provider
+            (import "memory" "memory" (memory 1))
+            (import "streams" "write" (func $write (param i32 i32 i32 i32)))
+            (import "streams" "stdout" (func $stdout (result i32)))
+            (data (i32.const 0) "{descriptor}")
+            (data (i32.const 64) "{manifest}")
+            (data (i32.const 2048) "boom\0a")
+            (data (i32.const 16) "\01\08")
+            (func (export "describe") (result i32) i32.const 0)
+            (func (export "command") (param i32 i32 i32) (result i32) i32.const 0)
+            (func (export "invoke") (param i32 i32 i32 i32) (result i32)
+                call $stdout i32.const 2048 i32.const 5 i32.const 32 call $write
+                i32.const 16))
+        (core instance $provider (instantiate $provider
+            (with "memory" (instance $memory))
+            (with "streams" (instance (export "write" (func $write)) (export "stdout" (func $stdout))))))
+        (func (export "describe") (result string) (canon lift (core func $provider "describe") (memory $mem)))
+        (func (export "invoke") (param "capability" string) (param "input-json" string) (result (result (error u8)))
+            (canon lift (core func $provider "invoke") (memory $mem) (realloc (core func $memory "realloc"))))
+        (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
+            (canon lift (core func $provider "command") (memory $mem) (realloc (core func $memory "realloc")))))"#,
+        descriptor = descriptor(64, manifest.len()),
+        manifest = hex(manifest.as_bytes()),
+    );
+    let mut provider = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut provider, wat.as_bytes()).unwrap();
+    let registry = BrokerProviderRegistry::load([provider.path()], BrokerHostLimits::default())
+        .await
+        .expect("stdout-writing provider loads");
+    let principal: PrincipalId = "caller".parse().unwrap();
+    let capability: CapabilityId = "stdio-probe.run".parse().unwrap();
+    let provider_id: ProviderId = "stdio-probe".parse().unwrap();
+    let world = PolicyWorld::new(
+        [principal.clone()],
+        [(capability.clone(), provider_id.clone())],
+    )
+    .unwrap();
+    let broker = Broker::new(
+        registry,
+        "broker".parse().unwrap(),
+        PolicyEngine::new("permit(principal, action, resource);", &world).unwrap(),
+        ConstraintCatalog::new([(
+            capability.clone(),
+            ConstraintSet {
+                default_secret_use: None,
+                route: CapabilityRoute::Generic,
+                provider: provider_id,
+                effect: EffectKind::ReadOnly,
+                risk: RiskLevel::Low,
+                credential: None,
+                constraints: ExecutionConstraints::default(),
+            },
+        )])
+        .unwrap(),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).unwrap()),
+        BrokerLimits::default(),
+    )
+    .unwrap();
+    let captured = CaptureLayer::workspace();
+    let json = tempfile::NamedTempFile::new().unwrap();
+    let _subscriber = tracing_subscriber::registry()
+        .with(captured.clone())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(std::sync::Mutex::new(json.reopen().unwrap())),
+        )
+        .set_default();
+    let context =
+        AuthenticatedContext::new(principal.clone(), Actor::Service { principal }).unwrap();
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let _result = broker
+        .invoke(
+            &context,
+            None,
+            None,
+            super::InvocationRequest {
+                id: "invoke-exit".parse().unwrap(),
+                capability,
+                trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-01"
+                    .parse()
+                    .unwrap(),
+                input: serde_json::json!({}),
+                secret_use: None,
+            },
+            AssetInputs {
+                streams: Some(Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut output).unwrap();
+    assert_eq!(output, "boom\n");
+    let records = captured.events_where(
+        "dekopon_broker::audit",
+        &[("audit.event", "broker.execution")],
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].field("outcome"), Some("Failed"));
+    let json = std::fs::read(json.path()).unwrap();
+    let records: Vec<serde_json::Value> = json
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .filter(|record: &serde_json::Value| record["fields"]["audit.event"] == "broker.execution")
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["fields"]["process.exit.code"].as_u64(), Some(8));
 }
 
 #[test]
