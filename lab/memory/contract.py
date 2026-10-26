@@ -48,6 +48,10 @@ def verdict_exit(run):
 
 
 def main(args):
+    def interrupted(*_):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, interrupted)
     diagnostic = "--diagnostic" in args
     if len(args) < 2 or args[1] not in report.LABELS:
         print("lab: usage: expected <ref> <scenario> [--profile fake|real|codex] [--diagnostic]", file=sys.stderr)
@@ -67,14 +71,17 @@ def main(args):
                                  env=env, start_new_session=True)
         try:
             status = child.wait(timeout=deadline)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
             os.killpg(child.pid, signal.SIGTERM)
             try:
                 child.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            outcome, reason = "timeout", f"whole-run deadline of {deadline:g}s exceeded"
+            if isinstance(error, KeyboardInterrupt):
+                outcome, reason = "infrastructure", "runner interrupted"
+            else:
+                outcome, reason = "timeout", f"whole-run deadline of {deadline:g}s exceeded"
         else:
             if status == 2:
                 outcome, reason = "usage", "invalid arguments"

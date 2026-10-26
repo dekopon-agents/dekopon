@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import time
 import subprocess
 import tempfile
 import unittest
@@ -44,7 +46,7 @@ class ExitContract(unittest.TestCase):
             shift
             while [ "$1" != --run ]; do shift; done
             run="$2"
-            [ "${STUB_SLEEP:-0}" != 1 ] || sleep 10
+            [ "${STUB_SLEEP:-0}" != 1 ] || { touch "$STUB_ROOT/sleeping"; sleep 10; }
             [ "${STUB_LAB_FAIL:-0}" != 1 ] || exit 1
             cp "$STUB_RECORDED/"* "$run/"
             ;;
@@ -89,6 +91,20 @@ class ExitContract(unittest.TestCase):
 
     def test_the_whole_run_deadline_terminates_a_sleeping_lab(self):
         self.run_lab(3, "lab: timeout: whole-run deadline of 0.5s exceeded", LAB_DEADLINE_SECS="0.5", STUB_SLEEP="1")
+
+    def test_interrupting_a_run_stops_its_child_and_reports_infrastructure(self):
+        child = subprocess.Popen(["bash", str(self.lab / "run.sh"), "main", "summarizer-hang"],
+                                 env=dict(self.env, STUB_SLEEP="1"), stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: child.poll() is not None or child.kill())
+        deadline = time.monotonic() + 10
+        while not (self.root / "sleeping").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue((self.root / "sleeping").exists())
+        child.send_signal(signal.SIGTERM)
+        stdout, stderr = child.communicate(timeout=20)
+        self.assertEqual(child.returncode, 5, stdout + stderr)
+        self.assertEqual(stderr.splitlines()[-1], "lab: infrastructure: runner interrupted")
 
     def test_deleted_reports_are_missing_evidence(self):
         result = subprocess.run(["bash", str(self.lab / "run.sh"), "main", "summarizer-hang"],
