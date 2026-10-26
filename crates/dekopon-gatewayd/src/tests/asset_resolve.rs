@@ -564,9 +564,13 @@ async fn a_platform_refetch_uses_the_full_slack_uri_and_live_grant_once() {
         Handle::current(),
         true,
     );
-    let resolved = session.resolve_input(id).await.unwrap();
-    assert_eq!(resolved.blob.read().unwrap(), b"aaa");
-    assert_eq!(resolved.row.id, id);
+    tokio::task::spawn_blocking(move || {
+        let fetched = session.fetch(id).unwrap();
+        assert_eq!(fetched.data.id(), id);
+        assert_eq!(fetched.data.read().unwrap(), b"aaa");
+    })
+    .await
+    .unwrap();
     assert_eq!(guarded.calls.load(Ordering::SeqCst), 1);
     let request = peer.request_text();
     let target = request

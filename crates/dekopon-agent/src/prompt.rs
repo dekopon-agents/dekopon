@@ -763,7 +763,9 @@ where
     if memory_tools.is_some() {
         model_tools.extend(crate::memory_tools::tools());
     }
-    if assets.is_some_and(AssetSource::offers_fetch) {
+    let request_assets = assets;
+    let assets = assets.filter(|source| source.offers_fetch());
+    if assets.is_some() {
         model_tools.push(asset_tool());
     }
 
@@ -820,7 +822,7 @@ where
         );
         let mut stream = TurnStream::new(model_turns, model_started, progress, cancellation);
         let mut request_messages = messages.clone();
-        let asset_request = assets.map_or_else(AssetRequest::default, |source| {
+        let asset_request = request_assets.map_or_else(AssetRequest::default, |source| {
             source.prepare_request(&mut request_messages)
         });
         let inventory = asset_request.inventory;
