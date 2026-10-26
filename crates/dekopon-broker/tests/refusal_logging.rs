@@ -14,7 +14,7 @@ use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel, TransportId,
 };
 use dekopon_test_support::{CaptureLayer, provider_fixture};
-use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::layer::SubscriberExt as _;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
@@ -160,7 +160,7 @@ fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     clippy::wildcard_enum_match_arm,
@@ -168,7 +168,8 @@ fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
 )]
 async fn every_inspection_refusal_names_its_class_and_its_subject() {
     let captured = CaptureLayer::workspace();
-    tracing_subscriber::registry().with(captured.clone()).init();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
     let (broker, audit) = broker().await;
 
     let narrow = AttestorGrant {
