@@ -112,7 +112,7 @@ one native storage hop. Storage hostname families are compiled, anchored and bou
 families, plaintext, literals, userinfo, fragments, oversized Location headers and additional
 redirects refuse. DNS addresses are validated and pinned, with no production private-address
 exception. Storage transport has no credential binding, inherited headers or trace propagation.
-On the granted 302 path, the signed URL remains native and redacted; traces retain every effect without secret URL bytes. Other API statuses, including 301, 303 and 307, return status and body without following the redirect; any Location header retains its prefix but replaces its query and fragment with `[redacted]`. Ordinary HTTP send and stream keep their existing behavior.
+On the granted 302 path, the signed URL remains native and redacted; traces retain every effect without secret URL bytes. Other API statuses, including 301, 303 and 307, return status and body without following the redirect; any Location header retains its prefix but replaces its query and fragment with `[redacted]`. Ordinary HTTP send and stream apply the same Location redaction and never follow the redirect.
 A byte-zero probe establishes the total before explicit bounded range requests. Before exposing a window, the host scans bounded source context on both sides, retaining scanner overlap across responses so separate offset reads cannot reconstruct a signed query. Context ranges share the existing limits; insufficient budget, refused ranges or incomplete context expose no window. All requests
 consume the invocation's request count and the download sequence retains its deadline. Status,
 headers and body share the response-byte grant; the storage body separately caps at 64 KiB.

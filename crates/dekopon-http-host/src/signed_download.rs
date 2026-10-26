@@ -727,15 +727,15 @@ impl ApiRedactor {
                 .flatten()
                 .filter(|part| !part.is_empty())
             {
-                secrets.push(part.to_vec());
                 for pair in part.split(|byte| *byte == b'&') {
-                    let (_, value) = split_secret_part(pair, b'=');
-                    if let Some(value) = value.filter(|value| !value.is_empty()) {
+                    let (key, value) = split_secret_part(pair, b'=');
+                    let value = value.unwrap_or(pair);
+                    if !value.is_empty() && (key.eq_ignore_ascii_case(b"sig") || value.len() >= 16)
+                    {
                         secrets.push(value.to_vec());
                         secrets.push(percent_encoding::percent_decode(value).collect());
                     }
                 }
-                secrets.push(percent_encoding::percent_decode(part).collect());
             }
         }
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
@@ -828,7 +828,7 @@ fn append_redacted(output: &mut Vec<u8>, bytes: &[u8], maximum: u64) -> Result<(
     Ok(())
 }
 
-fn redact_api_locations(headers: &mut [Header]) {
+pub(super) fn redact_api_locations(headers: &mut [Header]) {
     for header in headers {
         if !header.name.eq_ignore_ascii_case("location") {
             continue;
@@ -1566,11 +1566,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_short_sas_parameter_is_not_scrubbed_from_a_redirect_body() {
+        let body = format!("<html>{} reflected token</html>", "br br br ".repeat(64));
+        let expected = body.replace("token", "[redacted]");
+        let wire = format!(
+            "HTTP/1.1 301 Redirect\r\nLocation: https://productionresultssa1.blob.core.windows.net/log?sp=r&sr=b&SiG=token\r\nx-brown-bird: br\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (uri, ceilings, server) = tls_api(wire.into_bytes()).await;
+        let mut parent = authenticated_api(&uri, ceilings);
+        parent.grant.as_mut().unwrap().max_response_bytes = 1024;
+        let root = tempfile::tempdir().unwrap();
+        let response = parent
+            .signed_download(
+                uri,
+                Window::Tail(64),
+                &AssetDirectory::new(root.path().to_owned(), 1024),
+            )
+            .await
+            .unwrap();
+        match response {
+            DownloadResponse::Api(response) => {
+                assert_eq!(response.status, 301);
+                assert_eq!(response.body, expected.as_bytes());
+                assert!(
+                    response
+                        .headers
+                        .iter()
+                        .any(|header| { header.name == "x-brown-bird" && header.value == b"br" })
+                );
+                assert!(response.headers.iter().any(|header| {
+                    header.name == "location"
+                        && header.value
+                            == b"https://productionresultssa1.blob.core.windows.net/log?[redacted]"
+                }));
+            }
+            DownloadResponse::Storage { .. } => panic!("301 response followed storage"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_signed_redirect_body_substitutes_location_secrets_and_preserves_html() {
         for status in [301, 303, 307] {
             let (response, _) = reflected_api(status).await;
             assert_eq!(response.status, status);
-            assert_eq!(response.body, b"<a href=\"https://productionresultssa1.blob.core.windows.net/log?[redacted]#[redacted]\">download</a> [redacted] [redacted]");
+            assert_eq!(response.body, b"<a href=\"https://productionresultssa1.blob.core.windows.net/log?sig=[redacted]&other=[redacted]#[redacted]\">download</a> [redacted] [redacted]");
         }
     }
 
