@@ -5208,11 +5208,11 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         initiator_user_id: "u9xyz".to_owned(),
         conversation_id: message.conversation.key(),
     });
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &message.conversation.key(),
-        &message.subject,
+        &message.conversation,
+        Some(&message.subject),
     );
 
     let session = tokio::spawn(run_session(
@@ -10874,11 +10874,11 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     sealed_forward.conversation.kind = ConversationKind::Thread;
     sealed_forward.conversation.thread = Some("1700000000.000001".to_owned());
     let route = slack_route(model_config(), window());
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &sealed_forward.conversation.key(),
-        &sealed_forward.subject,
+        &sealed_forward.conversation,
+        Some(&sealed_forward.subject),
     );
     let directory = temporary();
     let broker = ResolvedBroker {
@@ -18586,11 +18586,11 @@ async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
         table.ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
     ));
-    let private_key = ConversationKey::private(
+    let private_key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &second.conversation.key(),
-        &second.subject,
+        &second.conversation,
+        Some(&second.subject),
     );
     assert!(crate::session::seal_conversation(&runner, &route, &second, &private_key).await);
     assert_eq!(
@@ -21941,7 +21941,7 @@ async fn a_failed_seal_leaves_the_stop_notice_for_the_next_turn() {
     route.max_duration = Some(Duration::from_secs(30));
     let mut inbound = message("long question");
     inbound.conversation.kind = ConversationKind::Thread;
-    let stem = ConversationKey::shared(&route.agent, &route.transport, &inbound.conversation.key())
+    let stem = ConversationKey::of(&route.agent, &route.transport, &inbound.conversation, None)
         .journal_stem();
     let marker = journal.path().join(format!(
         "{}.sealed",
@@ -22173,11 +22173,11 @@ async fn append_failure_preserves_the_delivered_reply_without_a_journal_record()
     let runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
     let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
     let inbound = message("question");
-    let stem = ConversationKey::private(
+    let stem = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     )
     .journal_stem();
     fs::write(
@@ -22269,11 +22269,11 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         RecallSource::Platform,
     );
     let inbound = message("do the work");
-    let key = ConversationKey::private(
+    let key = ConversationKey::of(
         &route.agent,
         &route.transport,
-        &inbound.conversation.key(),
-        &inbound.subject,
+        &inbound.conversation,
+        Some(&inbound.subject),
     );
     let driver = HistoryDriver::new(Ok(Vec::new()));
     run_session(

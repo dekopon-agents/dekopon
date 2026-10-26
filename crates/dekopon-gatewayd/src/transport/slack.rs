@@ -3301,11 +3301,11 @@ mod driver_tests {
                 assert!(ingress.assets[0].source.is_none());
                 assert!(history.assets[0].source.is_none());
                 let store = crate::asset::AssetStore::new(2, std::time::Duration::from_secs(60));
-                let key = crate::conversation::ConversationKey::private(
+                let key = crate::conversation::ConversationKey::of(
                     &"reviewer".parse().expect("agent id"),
                     &ingress.transport,
-                    &ingress.conversation.key(),
-                    &ingress.subject,
+                    &ingress.conversation,
+                    Some(&ingress.subject),
                 );
                 let registered =
                     store.assets_for(&key, ingress.assets.clone(), std::time::Instant::now());
