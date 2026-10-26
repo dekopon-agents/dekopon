@@ -17,8 +17,9 @@ use dekopon_agent::{
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
-        CancellationProbe, ConversationTurn, Handoff, History, PromptError, ReplyDisposition, Seal,
-        SessionInputs, Steer, SteerSource, run_prompt_session,
+        CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
+        PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer, SteerSource,
+        run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -1243,6 +1244,7 @@ impl Recall<'_> {
         key: &ConversationKey,
         granted: &[String],
         window: MemoryWindow,
+        facts: &mut Vec<MemoryFact>,
     ) -> Option<RecalledWindow> {
         let span = tracing::Span::current();
         match window.recall {
@@ -1273,6 +1275,9 @@ impl Recall<'_> {
                         })
                     }
                     Ok(Err(error)) => {
+                        facts.push(MemoryFact::RecallFailed {
+                            reason: error.label(),
+                        });
                         tracing::warn!(
                             event = "gateway_recall_failed",
                             source = "journal",
@@ -1282,6 +1287,7 @@ impl Recall<'_> {
                         None
                     }
                     Err(_) => {
+                        facts.push(MemoryFact::RecallFailed { reason: "task" });
                         tracing::warn!(
                             event = "gateway_recall_failed",
                             source = "journal",
@@ -2321,6 +2327,7 @@ async fn session_turn(
     );
 
     let window = route.memory.window();
+    let mut memory_facts = Vec::new();
     let principal = leg.principal().cloned();
     let recall = Recall {
         runner,
@@ -2341,7 +2348,12 @@ async fn session_turn(
                     .conversations
                     .resident(&key, &granted, window, Instant::now())
                 {
-                    Residency::Cold => (recall.window(&key, &granted, window).await, None),
+                    Residency::Cold => (
+                        recall
+                            .window(&key, &granted, window, &mut memory_facts)
+                            .await,
+                        None,
+                    ),
                     Residency::Since(watermark) => (None, recall.delta(window, &watermark).await),
                     Residency::Resident => (None, None),
                 };
@@ -2726,6 +2738,16 @@ async fn session_turn(
     let selection_policy = route.memory_policy.clone().unwrap_or_default();
     let selection_seal = sealed.map(|seal| seal.at);
     let selection_window = window.filter(|window| window.recall == RecallSource::Journal);
+    let recalled_empty = seeded.is_empty();
+    let thread_reply =
+        message
+            .conversation
+            .thread
+            .as_ref()
+            .is_some_and(|thread| match &message.message_id {
+                MessageId::Native(id) | MessageId::Follow(id) => thread != id,
+                MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => false,
+            });
     let model_runtime = tokio::runtime::Handle::current();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -2742,6 +2764,8 @@ async fn session_turn(
                 calls,
             };
             let mut history = seeded;
+            let mut first_shown = None;
+            let mut replay_source = ReplaySource::Conversation;
             if let (Some(journal), Some(window)) = (memory_journal.as_ref(), selection_window) {
                 let policy = &selection_policy;
                 match journal.project(
@@ -2757,16 +2781,66 @@ async fn session_turn(
                         journal::decide(&runtime, &policy.selection, available, evidence)
                     },
                 ) {
-                    Ok(projected) => history = projected,
-                    Err(error) => tracing::warn!(
-                        event = "gateway_recall_failed",
-                        source = "journal",
-                        reason = error.label(),
-                        "gateway.recall.failed"
-                    ),
+                    Ok(projected) => {
+                        history = projected.history;
+                        first_shown = projected.first_shown;
+                        replay_source = projected.source;
+                        memory_facts.extend(projected.facts);
+                    }
+                    Err(error) => {
+                        if !memory_facts.iter().any(|fact| match fact {
+                            MemoryFact::RecallFailed { .. } => true,
+                            MemoryFact::WindowOmission { .. }
+                            | MemoryFact::Omitted { .. }
+                            | MemoryFact::Replaced { .. }
+                            | MemoryFact::GrantBoundary
+                            | MemoryFact::ThreadWithoutMemory
+                            | MemoryFact::Fidelity { .. } => false,
+                        }) {
+                            memory_facts.push(MemoryFact::RecallFailed {
+                                reason: error.label(),
+                            });
+                        }
+                        tracing::warn!(
+                            event = "gateway_recall_failed",
+                            source = "journal",
+                            reason = error.label(),
+                            "gateway.recall.failed"
+                        );
+                    }
                 }
             }
+            if history.is_empty() {
+                if thread_reply && recalled_empty {
+                    memory_facts.push(MemoryFact::ThreadWithoutMemory);
+                }
+            } else {
+                memory_facts.push(MemoryFact::Fidelity {
+                    source: replay_source,
+                });
+            }
+            let memory_notice = MemoryNotice::new(&memory_facts, first_shown);
+            if let Some(notice) = memory_notice.as_ref() {
+                dekopon_telemetry::with_event_string_array(
+                    "memory.notice.kinds",
+                    notice.kinds(),
+                    || {
+                        tracing::info!(
+                            target: "dekopon_gatewayd::audit",
+                            {
+                            audit.event = "gateway.memory.notice",
+                            event = "gateway_memory_notice",
+                            memory.record.first_shown = notice.first_shown(),
+                            memory.records.omitted = notice.omitted(),
+                            memory.notice.bytes = notice.text().len() as u64,
+                            },
+                            "gateway.memory.notice"
+                        );
+                    },
+                );
+            }
             let mut inputs = SessionInputs::new(&text, limits)
+                .with_memory_notice(memory_notice.as_ref())
                 .with_recorded_prompt(&recorded)
                 .with_system(Some(&instructions))
                 .with_skills(&skills)

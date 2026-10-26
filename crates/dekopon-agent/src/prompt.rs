@@ -32,7 +32,9 @@ use crate::{
 };
 
 mod history;
+mod notice;
 use crate::memory::{Outcome as RecordedOutcome, RecordBuilder};
+pub use notice::{MemoryFact, MemoryNotice, OmissionReason, ReplaySource};
 
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
@@ -384,6 +386,7 @@ pub struct SessionInputs<'a> {
     wakes: Option<&'a dyn WakeRegistrar>,
     capture_exchanges: Option<(Option<usize>, Option<usize>)>,
     memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
+    memory_notice: Option<&'a MemoryNotice>,
 }
 
 impl<'a> SessionInputs<'a> {
@@ -409,7 +412,14 @@ impl<'a> SessionInputs<'a> {
             wakes: None,
             capture_exchanges: None,
             memory_tools: None,
+            memory_notice: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_memory_notice(mut self, notice: Option<&'a MemoryNotice>) -> Self {
+        self.memory_notice = notice;
+        self
     }
 
     #[must_use]
@@ -575,6 +585,7 @@ where
         wakes,
         capture_exchanges,
         memory_tools,
+        memory_notice,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -585,8 +596,6 @@ where
         return Err(error);
     }
 
-    // Keep this message order fixed: instructions, skills listing, remembered history, then the
-    // prompt, or prompt caching breaks.
     let mut messages = Vec::new();
     if let Some(system) = system {
         messages.push(ModelMessage::system(system));
@@ -596,6 +605,9 @@ where
     }
     if optional_reply {
         messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
+    }
+    if let Some(notice) = memory_notice {
+        messages.push(ModelMessage::system(notice.text()));
     }
     history.replay_into(&mut messages);
     let options = options.clone().with_stable_prefix(messages.len());

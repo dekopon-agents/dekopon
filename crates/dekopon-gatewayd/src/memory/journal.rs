@@ -2872,7 +2872,7 @@ mod tests {
                 |_available, _evidence| Ok("brief".to_owned()),
             )
             .expect("projection");
-        assert_eq!(projected.turns().len(), 3);
+        assert_eq!(projected.history.turns().len(), 3);
         let selection = |record: &str| {
             let events = capture.events_where(
                 "dekopon_gatewayd",
