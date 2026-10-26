@@ -1159,14 +1159,7 @@ fn a_provider_exit_keeps_its_classification_and_carries_its_status_and_stderr() 
     }
 }
 
-#[tokio::test]
-async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
-    use dekopon_broker_host::{BrokerProviderRegistry, Streams, asset::AssetInputs};
-    use dekopon_capability::EffectKind;
-    use dekopon_core::RiskLevel;
-    use dekopon_test_support::CaptureLayer;
-    use tracing_subscriber::prelude::*;
-
+fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
     fn hex(data: &[u8]) -> String {
         data.iter().map(|byte| format!("\\{byte:02x}")).collect()
     }
@@ -1200,9 +1193,10 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
     let wat = format!(
         r#"(component
         (import "dekopon:stdio/streams@0.1.0" (instance $streams
-            (export "write-error" (type $error (enum "closed")))
+            (type $error (enum "closed"))
+            (export "write-error" (type $write-error (eq $error)))
             (export "writer" (type $writer (sub resource)))
-            (export "[method]writer.write" (func (param "self" (borrow $writer)) (param "bytes" (list u8)) (result (result (error $error)))))
+            (export "[method]writer.write" (func (param "self" (borrow $writer)) (param "bytes" (list u8)) (result (result (error $write-error)))))
             (export "stdout" (func (result (own $writer))))))
         (core module $memory
             (memory (export "memory") 1)
@@ -1237,6 +1231,18 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
     );
     let mut provider = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut provider, wat.as_bytes()).unwrap();
+    provider
+}
+
+#[tokio::test]
+async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
+    use dekopon_broker_host::{BrokerProviderRegistry, Streams, asset::AssetInputs};
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+    use dekopon_test_support::CaptureLayer;
+    use tracing_subscriber::prelude::*;
+
+    let provider = stdout_provider_exiting_eight();
     let registry = BrokerProviderRegistry::load([provider.path()], BrokerHostLimits::default())
         .await
         .expect("stdout-writing provider loads");
