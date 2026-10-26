@@ -33,6 +33,7 @@ const MAPPED_PRINCIPAL: &str = "cpetersen";
 const OTHER_MAPPED_PRINCIPAL: &str = "jortega";
 const GATEWAY_PRINCIPAL: &str = "dekopon-gatewayd";
 const AGENT: &str = "chat-agent";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
 
 fn provider(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1047,6 +1048,7 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                     "[gateway: 4 steps and 4 capability calls per message.]"
                 )
             ),
+            ("system", FIDELITY_NOTICE),
             (
                 "user",
                 "[gateway: authenticated participant: cpetersen]\nwhat broke?"
@@ -1107,6 +1109,7 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
                 )
                 .to_owned(),
             ),
+            ("system".to_owned(), FIDELITY_NOTICE.to_owned()),
             ("user".to_owned(), first_prompt),
             ("assistant".to_owned(), "Two things broke.".to_owned()),
             ("user".to_owned(), second_prompt),
