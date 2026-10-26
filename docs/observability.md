@@ -122,7 +122,7 @@ its `cost_details` land only on `model.complete`, as `usage.cost` and the
 `usage.upstream_inference_*` fields. They are best effort: a non-numeric value is skipped and never
 fails the turn, and unknown members beside them are ignored.
 
-`accounting.http.request` carries the same sanitized set as its span: no URL path or query, no headers, no bodies. `HttpCallEvidence` alone also carries the bounded `X-GitHub-Request-Id` response value as `upstreamRequestId`, except on a signed-download API 302: that response never stores a response-derived request ID, because it may reflect the signed query. Signed-download probe and context-range requests each emit this same accounting event after their bounded body read or failure, including bytes checked but not exposed to the guest. It fires for every attempt, including one refused before
+`accounting.http.request` carries the same sanitized set as its span: no URL path or query, no headers, no bodies. `HttpCallEvidence` alone also carries the bounded `X-GitHub-Request-Id` response value as `upstreamRequestId`, except on signed-download API responses: none stores a response-derived request ID, because any status may reflect the signed query or fragment. Signed-download probe and context-range requests each emit this same accounting event after their bounded body read or failure, including bytes checked but not exposed to the guest. It fires for every attempt, including one refused before
 a destination was resolved, because that attempt consumed a unit of the invocation's request
 budget. A field a record cannot know — a provider's unreported token count, or a method, authority,
 and status on a refusal — is absent rather than zero, so a missing field means "unreported" and

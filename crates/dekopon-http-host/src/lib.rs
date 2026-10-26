@@ -1426,10 +1426,29 @@ impl BufferedHttpClient {
 
         let stream::Head {
             status,
-            headers,
+            mut headers,
             bytes: mut response_bytes,
             body: mut decoded,
         } = self.accept_head(&request.method, response, grant, evidence_index, metadata)?;
+        let mut redactor = match metadata {
+            ResponseMetadata::Ordinary => None,
+            ResponseMetadata::SignedDownload if status != 302 => {
+                Some(signed_download::ApiRedactor::new(&mut headers)?)
+            }
+            ResponseMetadata::SignedDownload => None,
+        };
+        let output_head = headers.iter().fold(16_u64, |total, header| {
+            total.saturating_add((header.name.len() + header.value.len() + 4) as u64)
+        });
+        if output_head > grant.max_response_bytes
+            || (redactor.is_some() && output_head > self.ceilings.max_header_bytes as u64)
+        {
+            return Err(http_error(
+                ErrorCode::ResponseTooLarge,
+                "redacted headers exceed the authorized byte limit",
+            ));
+        }
+        let maximum = grant.max_response_bytes - output_head;
         let mut body = Vec::new();
         while let Some(chunk) = decoded.next().await? {
             response_bytes = response_bytes
@@ -1444,7 +1463,18 @@ impl BufferedHttpClient {
                     "response exceeds the authorized byte limit",
                 ));
             }
-            body.extend_from_slice(&chunk);
+            match &mut redactor {
+                Some(redactor) => {
+                    for bytes in chunk.chunks(stream::CHUNK_BYTES) {
+                        redactor.push(bytes, &mut body, maximum)?;
+                    }
+                }
+                None => body.extend_from_slice(&chunk),
+            }
+        }
+
+        if let Some(redactor) = &mut redactor {
+            redactor.finish(&mut body, maximum)?;
         }
 
         Ok(Response {

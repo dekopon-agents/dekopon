@@ -609,10 +609,9 @@ impl BufferedHttpClient {
             return Err(echoed());
         }
         self.evidence[index].response_bytes = response_bytes;
-        self.evidence[index].upstream_request_id = match (metadata, status) {
-            (super::ResponseMetadata::SignedDownload, 302) => None,
-            (super::ResponseMetadata::Ordinary, _)
-            | (super::ResponseMetadata::SignedDownload, _) => response
+        self.evidence[index].upstream_request_id = match metadata {
+            super::ResponseMetadata::SignedDownload => None,
+            super::ResponseMetadata::Ordinary => response
                 .headers()
                 .get("x-github-request-id")
                 .and_then(|value| {

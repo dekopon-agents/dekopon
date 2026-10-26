@@ -221,9 +221,8 @@ impl BufferedHttpClient {
         if length == 0 || length > WINDOW_BYTES || !api_route(&api_uri) {
             return Err(DownloadError::Denied);
         }
-        let mut api = self.signed_api_request(api_uri).await?;
+        let api = self.signed_api_request(api_uri).await?;
         if api.status != 302 {
-            redact_api_locations(&mut api.headers);
             return Ok(DownloadResponse::Api(api));
         }
         let uri = location(&api.headers)?;
@@ -706,6 +705,127 @@ impl BufferedHttpClient {
             .await
             .map_err(|error| DownloadError::from(self.asset_error(error)))
     }
+}
+
+pub(super) struct ApiRedactor {
+    matcher: aho_corasick::AhoCorasick,
+    pending: Vec<u8>,
+    overlap: usize,
+}
+
+impl ApiRedactor {
+    pub(super) fn new(headers: &mut [Header]) -> Result<Self, HttpError> {
+        let mut secrets = Vec::new();
+        for header in headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("location"))
+        {
+            let (path_query, fragment) = split_secret_part(&header.value, b'#');
+            let (_, query) = split_secret_part(path_query, b'?');
+            for part in [query, fragment]
+                .into_iter()
+                .flatten()
+                .filter(|part| !part.is_empty())
+            {
+                secrets.push(part.to_vec());
+                for pair in part.split(|byte| *byte == b'&') {
+                    let (_, value) = split_secret_part(pair, b'=');
+                    if let Some(value) = value.filter(|value| !value.is_empty()) {
+                        secrets.push(value.to_vec());
+                        secrets.push(percent_encoding::percent_decode(value).collect());
+                    }
+                }
+                secrets.push(percent_encoding::percent_decode(part).collect());
+            }
+        }
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        let overlap = secrets
+            .first()
+            .map_or(0, |secret| secret.len().saturating_sub(1));
+        let matcher = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(&secrets)
+            .map_err(|_error| {
+                super::http_error(
+                    ErrorCode::Internal,
+                    "response redactor could not be constructed",
+                )
+            })?;
+        redact_api_locations(headers);
+        let replacements = vec![b"[redacted]"; secrets.len()];
+        for header in headers {
+            header.name =
+                String::from_utf8(matcher.replace_all_bytes(header.name.as_bytes(), &replacements))
+                    .map_err(|_error| {
+                        super::http_error(ErrorCode::Internal, "redacted header name is not UTF-8")
+                    })?;
+            header.value = matcher.replace_all_bytes(&header.value, &replacements);
+        }
+        Ok(Self {
+            matcher,
+            pending: Vec::new(),
+            overlap,
+        })
+    }
+
+    pub(super) fn push(
+        &mut self,
+        bytes: &[u8],
+        output: &mut Vec<u8>,
+        maximum: u64,
+    ) -> Result<(), HttpError> {
+        self.pending.extend_from_slice(bytes);
+        if self.pending.len() < self.overlap + super::stream::CHUNK_BYTES {
+            return Ok(());
+        }
+        self.render(self.pending.len() - self.overlap, output, maximum)
+    }
+
+    pub(super) fn finish(&mut self, output: &mut Vec<u8>, maximum: u64) -> Result<(), HttpError> {
+        self.render(self.pending.len(), output, maximum)
+    }
+
+    fn render(
+        &mut self,
+        ready: usize,
+        output: &mut Vec<u8>,
+        maximum: u64,
+    ) -> Result<(), HttpError> {
+        let mut consumed = 0;
+        for found in self.matcher.find_iter(&self.pending) {
+            if found.start() >= ready {
+                break;
+            }
+            append_redacted(output, &self.pending[consumed..found.start()], maximum)?;
+            append_redacted(output, b"[redacted]", maximum)?;
+            consumed = found.end();
+        }
+        if consumed < ready {
+            append_redacted(output, &self.pending[consumed..ready], maximum)?;
+            consumed = ready;
+        }
+        self.pending.drain(..consumed);
+        Ok(())
+    }
+}
+
+fn split_secret_part(bytes: &[u8], separator: u8) -> (&[u8], Option<&[u8]>) {
+    match bytes.iter().position(|byte| *byte == separator) {
+        Some(index) => (&bytes[..index], Some(&bytes[index + 1..])),
+        None => (bytes, None),
+    }
+}
+
+fn append_redacted(output: &mut Vec<u8>, bytes: &[u8], maximum: u64) -> Result<(), HttpError> {
+    if (output.len() as u64).saturating_add(bytes.len() as u64) > maximum {
+        return Err(super::http_error(
+            ErrorCode::ResponseTooLarge,
+            "redacted response exceeds the authorized byte limit",
+        ));
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn redact_api_locations(headers: &mut [Header]) {
@@ -1376,6 +1496,121 @@ mod tests {
             server.await.unwrap();
         }
     }
+    #[test]
+    fn signed_api_redaction_preserves_matches_across_every_chunk_boundary() {
+        let source = b"before private-query-long private-query private-fragment after";
+        for split in 0..=source.len() {
+            let mut headers = vec![Header {
+                name: "location".to_owned(),
+                value: b"https://storage.test/log?sig=private-query&other=private-query-long#private-fragment".to_vec(),
+            }];
+            let mut redactor = ApiRedactor::new(&mut headers).unwrap();
+            let mut output = Vec::new();
+            let prefix = vec![b'.'; super::super::stream::CHUNK_BYTES - split];
+            redactor.push(&prefix, &mut output, 131072).unwrap();
+            redactor
+                .push(&source[..split], &mut output, 131072)
+                .unwrap();
+            redactor
+                .push(&source[split..], &mut output, 131072)
+                .unwrap();
+            redactor.finish(&mut output, 131072).unwrap();
+            let mut expected = prefix;
+            expected.extend_from_slice(b"before [redacted] [redacted] [redacted] after");
+            assert_eq!(output, expected);
+            assert!(redactor.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn signed_api_redaction_bounds_substitution_expansion() {
+        let mut headers = vec![Header {
+            name: "location".to_owned(),
+            value: b"https://storage.test/log?sig=x".to_vec(),
+        }];
+        let mut redactor = ApiRedactor::new(&mut headers).unwrap();
+        let mut output = Vec::new();
+        redactor.push(b"xxxx", &mut output, 16).unwrap();
+        assert_eq!(
+            redactor.finish(&mut output, 16).unwrap_err().code,
+            ErrorCode::ResponseTooLarge
+        );
+        assert!(output.len() <= 16);
+    }
+
+    async fn reflected_api(status: u16) -> (Response, Vec<HttpCallEvidence>) {
+        let location = "https://productionresultssa1.blob.core.windows.net/log?sig=private-query&other=private-query-long#private-fragment";
+        let body =
+            format!("<a href=\"{location}\">download</a> private-query-long private-fragment");
+        let wire = format!(
+            "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nx-reflection: private-query-long private-fragment\r\nprivate-fragment: safe\r\nx-github-request-id: private-query\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (uri, ceilings, server) = tls_api(wire.into_bytes()).await;
+        let mut parent = authenticated_api(&uri, ceilings);
+        let root = tempfile::tempdir().unwrap();
+        let result = parent
+            .signed_download(
+                uri,
+                Window::Tail(64),
+                &AssetDirectory::new(root.path().to_owned(), 131072),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(parent.calls, 1);
+        match result {
+            DownloadResponse::Api(response) => (response, parent.evidence),
+            DownloadResponse::Storage { .. } => panic!("non-302 API response followed storage"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_signed_redirect_body_substitutes_location_secrets_and_preserves_html() {
+        for status in [301, 303, 307] {
+            let (response, _) = reflected_api(status).await;
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, b"<a href=\"https://productionresultssa1.blob.core.windows.net/log?[redacted]#[redacted]\">download</a> [redacted] [redacted]");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_signed_redirect_sibling_headers_substitute_location_secrets_longest_first() {
+        let (response, _) = reflected_api(303).await;
+        let reflection = response
+            .headers
+            .iter()
+            .find(|header| header.name == "x-reflection")
+            .unwrap();
+        assert_eq!(reflection.value, b"[redacted] [redacted]");
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|header| header.name == "[redacted]" && header.value == b"safe")
+        );
+        let request_id = response
+            .headers
+            .iter()
+            .find(|header| header.name == "x-github-request-id")
+            .unwrap();
+        assert_eq!(request_id.value, b"[redacted]");
+    }
+
+    #[tokio::test]
+    async fn native_signed_redirect_evidence_never_retains_response_request_ids() {
+        for status in [200, 301, 303, 307, 403] {
+            let (_, evidence) = reflected_api(status).await;
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].upstream_request_id, None);
+            assert!(
+                !serde_json::to_string(&evidence)
+                    .unwrap()
+                    .contains("private-query")
+            );
+        }
+    }
+
     async fn fake_storage(
         data: Vec<u8>,
         count: usize,
