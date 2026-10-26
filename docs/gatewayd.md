@@ -742,10 +742,11 @@ Whether a session offers `fetch_chat_asset` is decided once, when it starts: eve
   digests survive while any conversation still names them. One-shot idle expiry and generation
   retirement release in-memory rows and pins without deleting journal-owned bytes. Fence-less
   inventories still expire when idle. The conversation ceiling no longer evicts asset inventories.
-- **One download per attachment.** A cold attachment downloads in a store-owned task, at most two
+- **Concurrent uses share a download.** A cold or evicted inbound attachment downloads in a store-owned task, at most two
   at a time, under the 60-second fetch deadline. Model fetches and provider inputs that ask for the
   same attachment share that download; when the last of them is cancelled, so is the download, and
-  the attachment can be requested again.
+  the attachment can be requested again. History refills share one 60-second deadline per request.
+  A platform-gone response is cached on the live row; later uses refuse without another download.
 - **Refill happens on use.** A session-bound use of an evicted inbound attachment downloads it again through
   the existing platform fetch path, under the live generation and current grant. Generated files
   are never regenerated. Requested provider inputs are all resolved and pinned before submission;

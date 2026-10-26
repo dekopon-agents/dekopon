@@ -4630,6 +4630,55 @@ mod tests {
     }
 
     #[test]
+    fn request_preparation_receives_the_retained_text_attachment_charge() {
+        struct MeasuredText {
+            source: FixedAssets,
+            charges: Mutex<Vec<usize>>,
+        }
+        impl AssetSource for MeasuredText {
+            fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
+                self.source.fetch(id)
+            }
+            fn offers_fetch(&self) -> bool {
+                true
+            }
+            fn prepare_request(
+                &self,
+                _: &mut [ModelMessage],
+                text_bytes: usize,
+            ) -> super::AssetRequest {
+                self.charges.lock().push(text_bytes);
+                super::AssetRequest::default()
+            }
+        }
+        let source = MeasuredText {
+            source: FixedAssets(vec![
+                text_asset("text attachment"),
+                FetchedAsset {
+                    name: "photo.png".into(),
+                    mime: "image/png".into(),
+                    data: dekopon_model::asset::DiskBlob::from_bytes(b"aaa")
+                        .unwrap()
+                        .into(),
+                },
+            ]),
+            charges: Mutex::new(vec![]),
+        };
+        let model = ScriptedModel::new([asset_call(1), asset_call(2), answer("seen")]);
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("read", limits(3, 2)).with_assets(&source),
+            &mut History::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            *source.charges.lock(),
+            [0, "text attachment".len(), "text attachment".len()]
+        );
+    }
+
+    #[test]
     fn eight_distinct_photos_reach_one_model_request() {
         use dekopon_test_support::CaptureLayer;
         use tracing_subscriber::prelude::*;

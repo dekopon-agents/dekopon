@@ -690,17 +690,19 @@ async fn platform_refusal_codes_name_platform_gone_and_other_codes_stay_retryabl
             Err(BlobError::Reclaimed)
         );
         let gate = Gate::open(b"aaa");
-        assert_eq!(
-            self::session(&store, &access, &gate)
-                .resolve_input(id)
-                .await
-                .unwrap()
-                .blob
-                .read()
-                .unwrap(),
-            b"aaa"
-        );
-        assert_eq!(gate.fetches(), 1);
+        let retry = self::session(&store, &access, &gate)
+            .resolve_input(id)
+            .await;
+        if code == "500" {
+            assert_eq!(retry.unwrap().blob.read().unwrap(), b"aaa");
+            assert_eq!(gate.fetches(), 1);
+        } else {
+            assert_eq!(
+                retry.map(|resolved| resolved.blob).unwrap_err(),
+                ChatAssetRefusal::PlatformGone
+            );
+            assert_eq!(gate.fetches(), 0);
+        }
     }
 }
 
@@ -1160,6 +1162,11 @@ async fn failed_refetch_readmission_names_store_failed_and_does_not_retry_storag
 
 #[tokio::test]
 async fn a_refetch_waiting_for_a_permit_rechecks_revocation_before_the_transport() {
+    use tracing_subscriber::prelude::*;
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let _guard = tracing_subscriber::registry()
+        .with(capture.clone())
+        .set_default();
     let store = store(3);
     let access = access("queued-revocation");
     let id = register(&store, &access, Some(3));
@@ -1177,6 +1184,12 @@ async fn a_refetch_waiting_for_a_permit_rechecks_revocation_before_the_transport
         ChatAssetRefusal::Revoked
     );
     assert_eq!(gate.fetches(), 0);
+    let records = capture.events_where(
+        "dekopon_gatewayd::audit",
+        &[("audit.event", "gateway.asset.refetch")],
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].field("outcome"), Some("revoked"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1190,9 +1203,11 @@ async fn a_larger_refill_cannot_sneak_duplicate_history_images_past_the_request_
     let session = session(&store, &access, &gate);
     tokio::task::spawn_blocking(move || {
         let original = session.fetch(id).unwrap();
+        let text_bytes = 256 * 1024;
         let mut parts = Vec::new();
         for index in 0..5 {
-            let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES - if index == 0 { 3 } else { 0 };
+            let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES
+                - if index == 0 { text_bytes + 3 } else { 0 };
             let carried = register(&store, &access, Some(size as u64));
             drop(
                 store
@@ -1220,8 +1235,11 @@ async fn a_larger_refill_cannot_sneak_duplicate_history_images_past_the_request_
                 data: original.data.clone(),
             });
         }
-        let mut messages = vec![ModelMessage::user_with_parts(parts)];
-        let request = session.prepare_request(&mut messages, 0);
+        let mut messages = vec![
+            ModelMessage::user_with_parts(parts),
+            ModelMessage::tool("text", "t".repeat(text_bytes)),
+        ];
+        let request = session.prepare_request(&mut messages, text_bytes);
         let parts = messages[0].parts().unwrap();
         for part in &parts[5..] {
             match part {
@@ -1236,4 +1254,196 @@ async fn a_larger_refill_cannot_sneak_duplicate_history_images_past_the_request_
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoked_resident_unknown_and_history_uses_emit_no_refetch_record() {
+    use dekopon_model::model::{ContentPart, ModelMessage};
+    use tracing_subscriber::prelude::*;
+    let store = store(3);
+    let access = access("revoked-resident");
+    let id = register(&store, &access, Some(3));
+    drop(store.admit(&access, id, b"aaa").unwrap());
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    tokio::task::spawn_blocking(move || {
+        let image = session.fetch(id).unwrap();
+        let original = vec![ModelMessage::user_with_parts(vec![ContentPart::Image {
+            mime: image.mime,
+            data: image.data,
+        }])];
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        access.fence.as_ref().unwrap().deactivate();
+        for number in [id, 999] {
+            let refusal = session.fetch(number).unwrap_err();
+            assert_eq!(refusal.matches("revoked").count(), 1);
+        }
+        for _ in 0..2 {
+            session.prepare_request(&mut original.clone(), 0);
+        }
+        assert!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd::audit",
+                    &[("audit.event", "gateway.asset.refetch")]
+                )
+                .is_empty()
+        );
+        assert_eq!(gate.fetches(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resident_generated_history_bytes_are_pinned_before_an_earlier_inbound_refill() {
+    use dekopon_model::model::{ContentPart, ModelMessage};
+    let store = store(3);
+    let access = access("preserve-generated");
+    let id = register(&store, &access, Some(3));
+    drop(store.admit(&access, id, b"aaa").unwrap());
+    let gate = Gate::open(b"aaa");
+    let session = session(&store, &access, &gate);
+    tokio::task::spawn_blocking(move || {
+        let inbound = session.fetch(id).unwrap();
+        let (fd, metadata) = received(b"bbb", AssetEncoding::Identity);
+        let generated = session
+            .register(fd, &metadata, "asset.draw", "one")
+            .unwrap();
+        let generated = session.fetch(generated).unwrap();
+        let mut messages = vec![ModelMessage::user_with_parts(vec![
+            ContentPart::Image {
+                mime: inbound.mime,
+                data: inbound.data,
+            },
+            ContentPart::Image {
+                mime: generated.mime,
+                data: generated.data,
+            },
+        ])];
+        let request = session.prepare_request(&mut messages, 0);
+        let parts = messages[0].parts().unwrap();
+        match &parts[1] {
+            ContentPart::Image { data, .. } => assert_eq!(data.read().unwrap(), b"bbb"),
+            ContentPart::Text(_) | ContentPart::File { .. } => {
+                panic!("resident generated image must survive")
+            }
+        }
+        assert!(matches!(&parts[0], ContentPart::Text(text) if text.contains("store-failed")));
+        assert_eq!(request.pins.len(), 1);
+        assert_eq!(gate.fetches(), 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn platform_gone_is_cached_across_later_history_requests() {
+    use dekopon_model::model::{ContentPart, ModelMessage};
+    let store = store(3);
+    let access = access("gone-history");
+    let id = register(&store, &access, Some(3));
+    drop(store.admit(&access, id, b"aaa").unwrap());
+    let service = Arc::new(ServiceFailure::new("404"));
+    let session = SessionAssets::new(
+        Arc::clone(&store),
+        access.clone(),
+        Some(Arc::clone(&service) as Arc<dyn AssetFetcher>),
+        Handle::current(),
+        true,
+    );
+    tokio::task::spawn_blocking(move || {
+        let image = session.fetch(id).unwrap();
+        let original = vec![ModelMessage::user_with_parts(vec![ContentPart::Image { mime: image.mime, data: image.data }])];
+        evict_with_pressure(&store, &access, id);
+        for _ in 0..3 {
+            let mut messages = original.clone();
+            session.prepare_request(&mut messages, 0);
+            assert!(matches!(&messages[0].parts().unwrap()[0], ContentPart::Text(text) if text.contains("platform-gone")));
+        }
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+    }).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn history_refills_share_one_total_fetch_deadline() {
+    use dekopon_model::model::{ContentPart, ModelMessage};
+    let store = store(3);
+    let access = access("history-deadline");
+    let first = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, first);
+    let second = register(&store, &access, Some(3));
+    evict_with_pressure(&store, &access, second);
+    let gate = Gate::stalled(b"aaa");
+    let session = session(&store, &access, &gate);
+    let mut messages = vec![ModelMessage::user_with_parts(
+        [first, second]
+            .into_iter()
+            .map(|id| ContentPart::Image {
+                mime: "image/png".into(),
+                data: session.reference(id, 3),
+            })
+            .collect(),
+    )];
+    let start = tokio::time::Instant::now();
+    let prepare = tokio::task::spawn_blocking(move || session.prepare_request(&mut messages, 0));
+    gate.entered.notified().await;
+    tokio::time::advance(ASSET_FETCH_TIMEOUT).await;
+    let request = prepare.await.unwrap();
+    assert!(request.pins.is_empty());
+    assert_eq!(tokio::time::Instant::now() - start, ASSET_FETCH_TIMEOUT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_larger_history_refill_counts_retained_text_against_the_same_byte_budget() {
+    use dekopon_model::model::{ContentPart, ModelMessage};
+    struct FullSizeImage(AtomicUsize);
+    impl AssetFetcher for FullSizeImage {
+        fn fetch(
+            &self,
+            _: &AssetSourceRef,
+            _: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![b'z'; dekopon_model::asset::MAX_ATTACHMENT_BYTES]) })
+        }
+    }
+    let store = store(64 * 1024 * 1024);
+    let access = access("text-and-refill");
+    let fetcher = Arc::new(FullSizeImage(AtomicUsize::new(0)));
+    let session = SessionAssets::new(
+        Arc::clone(&store),
+        access.clone(),
+        Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
+        Handle::current(),
+        true,
+    );
+    tokio::task::spawn_blocking(move || {
+        let text_bytes = 256 * 1024;
+        let mut parts = Vec::new();
+        let mut smaller = 0;
+        for index in 0..5 {
+            let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES - if index == 4 { text_bytes } else { 0 };
+            let id = register(&store, &access, Some(size as u64));
+            drop(store.admit(&access, id, &vec![index as u8; size]).unwrap());
+            let image = session.fetch(id).unwrap();
+            parts.push(ContentPart::Image { mime: image.mime, data: image.data });
+            smaller = id;
+        }
+        {
+            let mut entries = store.entries.lock();
+            let row = row_mut(&mut entries, &access.key, smaller).unwrap();
+            store.retention.lock().evict((access.key.clone(), smaller), row).unwrap();
+        }
+        let mut messages = vec![ModelMessage::user_with_parts(parts), ModelMessage::tool("text", "t".repeat(text_bytes))];
+        let request = session.prepare_request(&mut messages, text_bytes);
+        let parts = messages[0].parts().unwrap();
+        assert!(matches!(&parts[4], ContentPart::Text(text) if text.contains("40 MiB decoded asset limit")));
+        assert_eq!(request.pins.len(), 4);
+        assert_eq!(messages[1].content().unwrap().len(), text_bytes);
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+    }).await.unwrap();
 }
