@@ -44,7 +44,9 @@ impl CapabilityInvoker for HelpHost {
                 stderr,
                 status,
             } => render_command(streams, &stdout, stderr, status),
-            other => panic!("help must render without proposing effects: {other:?}"),
+            other @ (CommandRunOutcome::Proposed { .. } | CommandRunOutcome::Failed { .. }) => {
+                panic!("help must render without proposing effects: {other:?}");
+            }
         }
     }
 
@@ -86,11 +88,12 @@ fn the_shell_serves_the_released_gh_root_help_whole() {
     let shell = Interpreter::new(Limits::default());
     let help = shell.run("gh --help", &host);
     assert_eq!(help.exit_code.get(), 0, "{}", help.output);
-    assert_eq!(help.output, root);
+    assert_eq!(help.output, root.strip_suffix('\n').unwrap_or(&root));
+    assert_eq!(host.registry.command_word_help().get("gh"), Some(&root));
     assert!(!help.output.contains("[--help truncated"));
     assert!(root.len() <= 2048, "root help is {} bytes", root.len());
     assert!(
-        root.contains("gh pr --help"),
+        root.contains("gh GROUP --help") && root.contains("  pr "),
         "drill-down is discoverable: {root}"
     );
     let drill_down = shell.run("gh pr --help", &host);
@@ -106,7 +109,7 @@ fn the_shell_serves_the_released_gh_root_help_whole() {
         drill_down.output
     );
     println!(
-        "released gh root: {} bytes; shell stdout equals component root; pr checkout exclusion and reason retained",
+        "released gh root: {} bytes; cache equals component root byte-for-byte; shell display omits its terminal LF; pr checkout exclusion and reason retained",
         root.len()
     );
 }
