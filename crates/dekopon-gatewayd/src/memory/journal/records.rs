@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{Journal, JournalError};
 use crate::memory::record::{
-    ArrivedAsset, AssetRow, GrantDigest, RecordId, Slot, SlotLine, Subject, SummaryPlan, TurnId,
-    TurnRecord,
+    ArrivedAsset, AssetRow, AssetSideLine, ChoiceLine, GrantDigest, PinLine, RecordId, Slot,
+    SlotLine, Subject, SummaryPlan, TurnId, TurnRecord,
 };
 
 const BUFFER: usize = 64 * 1024;
@@ -35,6 +35,10 @@ pub(crate) struct Header {
     pub spans: Vec<Span>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arrived: Vec<ArrivedAsset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<dekopon_agent::memory_tools::Rung>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<dekopon_agent::memory_tools::Rung>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,7 +108,9 @@ pub(crate) struct Snapshot {
 pub(crate) struct Head {
     pub header: Header,
     pub body_at: u64,
-    pub asset_lines: Vec<Vec<u8>>,
+    pub asset_lines: Vec<AssetSideLine>,
+    raw_asset_lines: Vec<Vec<u8>>,
+    arrived_raw: Option<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,6 +123,28 @@ struct HeaderLine {
 #[serde(deny_unknown_fields)]
 struct SummaryLine {
     s: SlotLine,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinEnvelope {
+    p: PinLine,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChoiceEnvelope {
+    c: ChoiceLine,
+}
+
+#[derive(Deserialize)]
+struct RawArrivals {
+    #[serde(default)]
+    arrived: Option<Box<serde_json::value::RawValue>>,
+}
+#[derive(Deserialize)]
+struct RawHeaderLine {
+    h: RawArrivals,
 }
 
 fn corrupt(error: serde_json::Error) -> JournalError {
@@ -343,6 +371,8 @@ impl Journal {
             body_len: body.offset,
             spans: body.spans,
             arrived,
+            pin: None,
+            choice: None,
         };
         serde_json::to_writer(&mut file, &HeaderLine { h: header }).map_err(corrupt)?;
         file.write_all(b"\n")?;
@@ -363,21 +393,107 @@ impl Journal {
     }
 
     pub(crate) fn write_slot(&self, stem: &str, line: SlotLine) -> Result<bool, JournalError> {
+        self.write_record_side(stem, line.record, None, &SummaryLine { s: line })
+    }
+
+    pub(crate) fn write_slot_for(
+        &self,
+        stem: &str,
+        line: SlotLine,
+        turn: TurnId,
+    ) -> Result<bool, JournalError> {
+        self.write_record_side(stem, line.record, Some(turn), &SummaryLine { s: line })
+    }
+
+    pub(crate) fn write_pin(&self, stem: &str, line: PinLine) -> Result<bool, JournalError> {
+        self.write_record_side(stem, line.record, None, &PinEnvelope { p: line })
+    }
+
+    pub(crate) fn write_choice(&self, stem: &str, line: ChoiceLine) -> Result<bool, JournalError> {
+        self.write_record_side(stem, line.record, None, &ChoiceEnvelope { c: line })
+    }
+
+    fn write_record_side(
+        &self,
+        stem: &str,
+        record: RecordId,
+        turn: Option<TurnId>,
+        line: &impl Serialize,
+    ) -> Result<bool, JournalError> {
+        let mut bytes = serde_json::to_vec(line).map_err(corrupt)?;
+        bytes.push(b'\n');
         let _lock = self.lock.lock();
         let Some(snapshot) = self.record_snapshot(stem, false)? else {
             return Ok(false);
         };
-        if !snapshot
-            .records
-            .iter()
-            .any(|head| head.header.id == line.record)
-        {
+        if !snapshot.records.iter().any(|head| {
+            head.header.id == record && turn.is_none_or(|turn| head.header.turn == turn)
+        }) {
             return Ok(false);
         }
-        let mut file = OpenOptions::new().append(true).open(self.path(stem))?;
-        serde_json::to_writer(&mut file, &SummaryLine { s: line }).map_err(corrupt)?;
-        file.write_all(b"\n")?;
+        OpenOptions::new()
+            .append(true)
+            .open(self.path(stem))?
+            .write_all(&bytes)?;
         Ok(true)
+    }
+
+    pub(crate) fn rewrite_records(
+        &self,
+        stem: &str,
+        mut keep: impl FnMut(&Header) -> bool,
+    ) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        let Some(snapshot) = self.record_snapshot(stem, true)? else {
+            return Ok(());
+        };
+        let path = self.path(stem);
+        let temporary = path.with_extension("tmp");
+        match std::fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let result = (|| {
+            let mut out = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            for mut head in snapshot.records {
+                if !keep(&head.header) {
+                    continue;
+                }
+                let mut body = SliceReader {
+                    file: &snapshot.file,
+                    offset: head.body_at,
+                    left: head.header.body_len,
+                };
+                if io::copy(&mut body, &mut out)? != head.header.body_len {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                }
+                head.header.arrived.clear();
+                let mut header = serde_json::to_vec(&head.header).map_err(corrupt)?;
+                header.pop();
+                if let Some(arrived) = head.arrived_raw {
+                    header.extend_from_slice(b",\"arrived\":");
+                    header.extend_from_slice(arrived.get().as_bytes());
+                }
+                header.push(b'}');
+                out.write_all(b"{\"h\":")?;
+                out.write_all(&header)?;
+                out.write_all(b"}\n")?;
+                for line in head.raw_asset_lines {
+                    out.write_all(&line)?;
+                }
+            }
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _removed = std::fs::remove_file(temporary);
+        }
+        result
     }
 }
 
@@ -461,10 +577,16 @@ pub(crate) fn scan(file: File, strict: bool) -> Result<Snapshot, JournalError> {
             {
                 return Err(JournalError::Corrupt);
             }
+            let arrived_raw = serde_json::from_slice::<RawHeaderLine>(&line)
+                .map_err(corrupt)?
+                .h
+                .arrived;
             records.push(Head {
                 header,
                 body_at,
                 asset_lines: Vec::new(),
+                raw_asset_lines: Vec::new(),
+                arrived_raw,
             });
         } else if line.starts_with(b"{\"s\":") && body.is_none() {
             let slot = serde_json::from_slice::<SummaryLine>(&line)
@@ -484,8 +606,38 @@ pub(crate) fn scan(file: File, strict: bool) -> Result<Snapshot, JournalError> {
                         .get_mut(part)
                         .ok_or(JournalError::Corrupt)? = slot.slot;
                 }
-                Subject::Asset(_) => head.asset_lines.push(line.clone()),
+                Subject::Asset(_) => {
+                    head.asset_lines.push(AssetSideLine::Slot(slot));
+                    head.raw_asset_lines.push(line.clone());
+                }
             }
+        } else if line.starts_with(b"{\"p\":") && body.is_none() {
+            let pin = serde_json::from_slice::<PinEnvelope>(&line)
+                .map_err(corrupt)?
+                .p;
+            let head = records
+                .iter_mut()
+                .rev()
+                .find(|head| head.header.id == pin.record)
+                .ok_or(JournalError::Corrupt)?;
+            match pin.subject {
+                Subject::Record => head.header.pin = pin.pin,
+                Subject::Asset(_) => {
+                    head.asset_lines.push(AssetSideLine::Pin(pin));
+                    head.raw_asset_lines.push(line.clone());
+                }
+            }
+        } else if line.starts_with(b"{\"c\":") && body.is_none() {
+            let choice = serde_json::from_slice::<ChoiceEnvelope>(&line)
+                .map_err(corrupt)?
+                .c;
+            records
+                .iter_mut()
+                .rev()
+                .find(|head| head.header.id == choice.record)
+                .ok_or(JournalError::Corrupt)?
+                .header
+                .choice = Some(choice.choice);
         } else {
             return Err(JournalError::Corrupt);
         }
