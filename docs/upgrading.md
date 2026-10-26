@@ -8,13 +8,21 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Host-call refusal reasons and durable model identity (0.57.0)
+
+No configuration change and no provider WIT or SDK re-pin. Before upgrading:
+
+- A provider call the host refuses now names its reason instead of `host-call-rejected`: `byte-limit`, `host-call-limit`, `denied`, `invalid-http-request`, `asset-call-rejected`, `monotonic-overflow`, `random-too-large` or `random-entropy`, in the broker's `error` field and in the `InvocationResult.error` the model reads. A dashboard or alert keyed on `host-call-rejected` needs the new labels.
+- Rust callers: `BrokerHostError::HostCallRejected`'s `reason` is a `dekopon_broker_host::HostCallRejection` instead of a `&'static str`, and `BufferedHttpClient::policy_violation()` returns `Option<dekopon_http_host::PolicyViolation>`; match the variants, or call `label()` for the string. Provider tests that compare reason strings move to the variants at their next re-pin.
+- Model continuations are keyed by backend, upstream model and the model the provider reports. When the reported model changes under a continuation, the turn is retried once without opaque reasoning, and no text from the discarded attempt reaches the reply. Captured turns stay in memory; nothing new is stored.
+
 ## RunCommand removed and attachments refetched on use (0.56.0)
 
 No configuration change and no provider WIT or SDK re-pin. Before upgrading:
 
 - Upgrade the broker and its clients together. The legacy `runCommand` broker operation is removed: a 0.56.0 broker answers it `invalid-request`. In-tree gateways and consoles have sent `run` since 0.54.0; an older client's command words all fail. The `provider-error` code goes with it. Rust callers lose `BrokerRequest::RunCommand`, `RequestEnvelope::run_command`, `BrokerClient::run_command` and `ERROR_PROVIDER`; send `run` and match its `RunOutcome`.
 - An `Invoke` carries at most five asset rows, the bound `run` already had; a request with more is refused `invalid-request`.
-- A session-bound use of an evicted inbound attachment downloads it again under the live generation and current grant; generated files are never regenerated. Attachment refusals name `evicted`, `platform-gone`, `revoked` or `store-failed` instead of `reclaimed` and `unauthorized`, in `agent.chat_asset_input.refused` reasons and `fetch_chat_asset` text; a dashboard or alert keyed on the old reasons needs the new ones. The gateway adds `gateway.asset.evicted`, `gateway.asset.refetch` and `gateway.asset.store_failed`.
+- A session-bound use of an evicted inbound attachment downloads it again under the live generation and current grant; generated files are never regenerated. Attachment refusals name `evicted`, `platform-gone`, `revoked` or `store-failed` instead of `reclaimed` and `unauthorized`, in `agent.chat_asset_input.refused` reasons and `fetch_chat_asset` text; a dashboard or alert keyed on the old reasons needs the new ones. Rust callers: `ChatAssetRefusal::Reclaimed` and `Unauthorized` become `Evicted` and `Revoked`; `PlatformGone` and `StoreFailed` are new. The gateway adds `gateway.asset.evicted`, `gateway.asset.refetch` and `gateway.asset.store_failed`.
 
 ## Durable attachment store and per-issue GitHub conversations (0.55.0)
 
