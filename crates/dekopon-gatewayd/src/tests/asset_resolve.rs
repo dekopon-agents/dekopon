@@ -941,6 +941,11 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
     let second = register(&store, &access, Some(3));
     drop(store.admit(&access, first, b"aaa").unwrap());
     drop(store.admit(&access, second, b"bbb").unwrap());
+    let failed = register(&store, &access, Some(7));
+    assert_eq!(
+        store.admit(&access, failed, b"ccccccc"),
+        Err(BlobError::TooLarge)
+    );
     let gate = Gate::open(b"aaa");
     let session = session(&store, &access, &gate);
     let registered = Registered {
@@ -967,6 +972,13 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
         Handle::current()
             .block_on(session.resolve_input(first))
             .unwrap();
+        assert_eq!(
+            Handle::current()
+                .block_on(session.resolve_input(failed))
+                .map(|resolved| resolved.blob)
+                .unwrap_err(),
+            ChatAssetRefusal::StoreFailed
+        );
         let bytes = note.text.len();
         run_prompt_session(
             &model,
@@ -987,7 +999,7 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
             &[("audit.event", "accounting.model.turn")],
         );
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].field("asset.inventory.count"), Some("2"));
+        assert_eq!(records[0].field("asset.inventory.count"), Some("3"));
         assert_eq!(
             records[0].field("asset.inventory.bytes"),
             Some(bytes.to_string().as_str())
@@ -999,7 +1011,7 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
             .iter()
             .find(|event| event.name == "accounting.model.turn")
             .unwrap();
-        assert_eq!(event.numbers.get("asset.inventory.count"), Some(&2));
+        assert_eq!(event.numbers.get("asset.inventory.count"), Some(&3));
         assert_eq!(
             event.numbers.get("asset.inventory.bytes"),
             Some(&(bytes as u64))

@@ -1192,22 +1192,24 @@ impl SessionAssets {
     }
 
     async fn resolve(&self, asset: &AssetRef, recency: Recency) -> Fetched {
-        self.inventory.lock().used.insert(asset.id);
-        let (source, fetcher) = match self.locate(asset, recency)? {
-            Located::Resident(data) => return Ok(data),
-            Located::Remote { source, fetcher } => (source, fetcher),
+        let fetched = match self.locate(asset, recency)? {
+            Located::Resident(data) => Ok(data),
+            Located::Remote { source, fetcher } => match AssetStore::join(
+                &self.store,
+                &self.access,
+                asset.id,
+                source,
+                fetcher,
+                &self.runtime,
+            )? {
+                Download::Ready(data) => Ok(data),
+                Download::Pending(waiter) => waiter.wait().await,
+            },
         };
-        match AssetStore::join(
-            &self.store,
-            &self.access,
-            asset.id,
-            source,
-            fetcher,
-            &self.runtime,
-        )? {
-            Download::Ready(data) => Ok(data),
-            Download::Pending(waiter) => waiter.wait().await,
+        if fetched.is_ok() {
+            self.inventory.lock().used.insert(asset.id);
         }
+        fetched
     }
 }
 
