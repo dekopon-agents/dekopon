@@ -10090,7 +10090,7 @@ where
     }
 }
 
-async fn read_http_request_parts(
+pub(crate) async fn read_http_request_parts(
     stream: &mut tokio::net::TcpStream,
 ) -> Option<(String, String, String)> {
     use tokio::io::AsyncReadExt as _;

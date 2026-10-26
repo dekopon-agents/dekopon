@@ -260,7 +260,9 @@ impl FinishReason {
         };
         tracing::Span::current().record("finish.reason", secrets.sanitize(value));
         if matches!(self, Self::ContentFilter) {
-            return Err(ProviderFailure::new(200, "content_filter").into());
+            let mut failure = ProviderFailure::new(200, value);
+            failure.code = Some(value.to_owned());
+            return Err(failure.into());
         }
         Ok(())
     }
