@@ -8,6 +8,14 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Gateway memory notice, provider exit status and signed-URL redirect redaction (0.59.0)
+
+No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
+
+- The model receives a gateway memory notice when history is omitted, replaced, unavailable or replayed with reduced fidelity, including recall or projection failures. The notice adds prompt text and a `gateway.memory.notice` telemetry record; it adds no stored journal record and changes no stored-data format, prompt-cache key or configuration key. A downgrade to 0.58.0 can read journals written by 0.59.0; notices disappear on downgrade.
+- Operators with dashboards or alerts on `broker.execution` can use the optional integer `process.exit.code` telemetry attribute when a provider exits non-zero; successful calls and other host failures do not carry it.
+- An ordinary HTTP provider that follows a redirect `Location` by hand now sees `?[redacted]` and `#[redacted]` in place of any query and fragment, so it cannot reuse a signed URL from that header. The native signed-download path still follows admitted signed redirects inside the host under its existing grant; it does not expose the signed URL to the provider.
+
 ## Signed downloads and per-thread conversation keys (0.58.0)
 
 No configuration change is required, and existing providers need no re-pin. Before upgrading:
