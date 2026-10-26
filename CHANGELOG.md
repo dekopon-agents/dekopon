@@ -7,6 +7,26 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-10-26
+
+### Added
+
+- Broker-mediated signed downloads with credential-free bounded storage ranges.
+- Signed-download SDK and host bindings, immutable WIT packaging, and bounded native range coverage.
+- Stage bounded asynchronous memory summaries and metering outside reply budgets.
+
+### Changed
+
+- Content-filter refusals retain their provider code.
+- Separate workspace, channel and thread coordinates in conversation history and prompt cache keys.
+- Keep attachment metadata when its byte source is unavailable.
+
+## [dekopon-chart-0.45.0] - 2026-10-26
+
+### Changed
+
+- Chart 0.45.0 targets core v0.58.0 and renders the `v0.58.0` image tag.
+
 ## [0.57.0] - 2026-10-26
 
 ### Changed
