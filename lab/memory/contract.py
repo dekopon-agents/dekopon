@@ -8,7 +8,14 @@ import subprocess
 import sys
 import tempfile
 
-import report
+try:
+    import report
+except Exception:
+    print("lab: missing-evidence: report.py failed", file=sys.stderr)
+    if "--diagnostic" in sys.argv[1:]:
+        print("diagnostic: verdict not enforced")
+        sys.exit(0)
+    sys.exit(4)
 
 CODES = {"pass": 0, "fail": 1, "usage": 2, "timeout": 3,
          "missing-evidence": 4, "infrastructure": 5, "not-applicable": 6, "exploratory": 0}
@@ -95,4 +102,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        result = main(sys.argv[1:])
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"lab: infrastructure: runner could not complete ({type(error).__name__})", file=sys.stderr)
+        result = 5
+    sys.exit(result)

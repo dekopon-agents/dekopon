@@ -99,6 +99,18 @@ class ExitContract(unittest.TestCase):
     def test_a_crashing_report_is_missing_evidence(self):
         self.run_lab(4, "lab: missing-evidence: report.py failed", STUB_REPORT_FAIL="1")
 
+    def test_a_reporter_that_crashes_on_import_is_missing_evidence(self):
+        (self.lab / "report.py").write_text('raise RuntimeError("report failed")\n')
+        self.run_lab(4, "lab: missing-evidence: report.py failed")
+
+    def test_a_missing_shell_is_infrastructure_and_never_behavioural(self):
+        result = subprocess.run([self.env["STUB_PYTHON"], str(self.lab / "contract.py"),
+                                 "main", "baseline"], env=dict(self.env, PATH=str(self.root / "absent")),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 5)
+        self.assertEqual(result.stderr.strip(),
+                         "lab: infrastructure: runner could not complete (FileNotFoundError)")
+
     def test_a_failed_build_is_infrastructure(self):
         self.run_lab(5, "lab: infrastructure: runner exited 5", STUB_CARGO_FAIL="1")
 
