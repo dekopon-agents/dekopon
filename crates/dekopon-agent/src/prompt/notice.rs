@@ -90,7 +90,7 @@ impl MemoryNotice {
                 }
                 MemoryFact::GrantBoundary => "Earlier turns were recorded under a different capability grant and are not shown.\n".into(),
                 MemoryFact::ThreadWithoutMemory => "This message replies in a thread with earlier messages; none are in your memory.\n".into(),
-                MemoryFact::RecallFailed { reason } => format!("Memory could not be read this turn ({reason}); history is in-memory only.\n"),
+                MemoryFact::RecallFailed { reason } => format!("Memory recall or projection failed this turn ({reason}).\n"),
                 MemoryFact::Fidelity => "Replayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n".into(),
             };
             notice.text.push_str(&line);

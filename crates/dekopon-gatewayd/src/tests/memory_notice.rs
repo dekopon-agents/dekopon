@@ -221,7 +221,7 @@ async fn a_corrupt_recall_tells_the_model_even_when_projection_finds_no_file() {
     assert!(
         fixture
             .notice(0)
-            .contains("Memory could not be read this turn (corrupt)")
+            .contains("Memory recall or projection failed this turn (corrupt)")
     );
 }
 
