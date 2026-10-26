@@ -3,15 +3,15 @@
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::StoreState;
 use crate::bindings::dekopon::clock::{monotonic, wall};
+use crate::{HostCallRejection, StoreState};
 
 #[derive(Debug)]
 pub(crate) enum ClockState {
     Granted {
         fixed: Option<SystemTime>,
         origin: Instant,
-        failure: Option<&'static str>,
+        failure: Option<HostCallRejection>,
     },
     Refused {
         attempted: bool,
@@ -31,7 +31,7 @@ impl ClockState {
         }
     }
 
-    pub(crate) const fn failure(&self) -> Option<&'static str> {
+    pub(crate) const fn failure(&self) -> Option<HostCallRejection> {
         match self {
             Self::Granted { failure, .. } => *failure,
             Self::Refused { .. } => None,
@@ -75,7 +75,7 @@ impl monotonic::Host for StoreState {
         let nanos = match u64::try_from(origin.elapsed().as_nanos()) {
             Ok(nanos) => nanos,
             Err(source) => {
-                failure.get_or_insert("monotonic-overflow");
+                failure.get_or_insert(HostCallRejection::MonotonicOverflow);
                 tracing::error!(
                     event = "provider_monotonic_read",
                     status = "overflow",

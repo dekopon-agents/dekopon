@@ -88,6 +88,33 @@ pub(crate) mod bindings {
     });
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostCallRejection {
+    Http(dekopon_http_host::PolicyViolation),
+    MonotonicOverflow,
+    RandomTooLarge,
+    RandomEntropy,
+    AssetCallRejected,
+}
+
+impl HostCallRejection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Http(violation) => violation.label(),
+            Self::MonotonicOverflow => "monotonic-overflow",
+            Self::RandomTooLarge => "random-too-large",
+            Self::RandomEntropy => "random-entropy",
+            Self::AssetCallRejected => "asset-call-rejected",
+        }
+    }
+}
+
+impl fmt::Display for HostCallRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 pub const PROVIDER_WIT: &str = include_str!("../wit/deps/provider.wit");
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
@@ -1338,14 +1365,14 @@ impl BrokerWasmProvider {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
                 capability: capability.clone(),
-                reason,
+                reason: HostCallRejection::Http(reason),
             });
         }
         if store.data().assets.violation().is_some() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
                 capability: capability.clone(),
-                reason: "asset-call-rejected",
+                reason: HostCallRejection::AssetCallRejected,
             });
         }
         if let Some(reason) = store.data().storage.violation() {
@@ -2369,7 +2396,7 @@ pub enum BrokerHostError {
     HostCallRejected {
         provider: ProviderId,
         capability: CapabilityId,
-        reason: &'static str,
+        reason: HostCallRejection,
     },
     #[error(
         "broker rejected storage call {reason} from provider {provider} capability {capability}"
