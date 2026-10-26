@@ -5187,7 +5187,13 @@ fn public_host_error(error: &BrokerHostError) -> &'static str {
         | BrokerHostError::InvalidCommandRun { .. } => "command-rewrite-failed",
         BrokerHostError::Timeout { .. } => "provider-timeout",
         BrokerHostError::PeerDisconnected => "peer-disconnected",
-        BrokerHostError::HostCallRejected { .. } => "host-call-rejected",
+        BrokerHostError::HostCallRejected { reason, .. } => match reason {
+            dekopon_broker_host::HostCallRejection::Http(violation) => violation.label(),
+            dekopon_broker_host::HostCallRejection::MonotonicOverflow
+            | dekopon_broker_host::HostCallRejection::RandomTooLarge
+            | dekopon_broker_host::HostCallRejection::RandomEntropy
+            | dekopon_broker_host::HostCallRejection::AssetCallRejected => reason.label(),
+        },
         BrokerHostError::StorageCallRejected {
             reason: "quota", ..
         } => "storage-quota",

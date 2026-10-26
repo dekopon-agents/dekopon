@@ -547,10 +547,11 @@ impl CodexReducer<'_> {
             .and_then(|response| response.model.as_deref())
         {
             let model = self.secrets.sanitize(model);
-            if self
+            if self.continued_model.as_ref().is_some_and(|expected| {
+                expected != &expected.clone().with_reported(Some(model.clone()))
+            }) || self
                 .reported_model
                 .as_deref()
-                .or(self.continued_model.as_ref().and_then(ModelKey::reported))
                 .is_some_and(|prior| prior != model)
             {
                 return Err(ProtocolFailure::ContinuationMismatch.into());
@@ -2106,6 +2107,68 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|item| item["type"] == "reasoning")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_then_present_reported_identity_retries_without_releasing_discarded_text() {
+        let initial =
+            include_str!("fixtures/codex-tool.sse").replace(",\"model\":\"gpt-test\"", "");
+        let created =
+            serde_json::json!({"type":"response.created","response":{"model":"gpt-test"}});
+        let delta = serde_json::json!({"type":"response.output_text.delta","delta":"discarded"});
+        let completed = serde_json::json!({"type":"response.completed","response":{"status":"completed","model":"gpt-test"}});
+        let changed = format!("data: {created}\n\ndata: {delta}\n\ndata: {completed}\n\n");
+        let replacement =
+            include_str!("fixtures/codex-answer.sse").replace("Echoed hello.", "replacement");
+        let (_directory, server, client) = fixture(vec![
+            MockResponse::sse(&initial),
+            MockResponse::sse(&changed),
+            MockResponse::sse(&replacement),
+        ]);
+        let first = generate(&client, &control()).await.unwrap();
+        assert_eq!(first.model_key().unwrap().reported(), None);
+        let mut seen = String::new();
+        let answer = client
+            .generate(
+                GenerateRequest {
+                    messages: &[
+                        crate::model::assistant_message(&first),
+                        ModelMessage::tool(first.tool_calls[0].id.clone(), "done"),
+                    ],
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
+                &mut |event| {
+                    let TurnEvent::TextDelta(text) = event;
+                    seen.push_str(text.as_str());
+                    ControlFlow::Continue(())
+                },
+                &control(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen, "replacement");
+        assert_eq!(answer.content.as_deref(), Some(seen.as_str()));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        assert!(
+            bodies[1]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        );
+        assert!(
+            bodies[2]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "reasoning")
         );
     }
 

@@ -1224,6 +1224,61 @@ async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_response_over_max_response_bytes_tells_the_model_byte_limit() {
+    dekopon_broker_host::enable_test_component_memoization();
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let body = "x".repeat(512);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let server = LoopbackServer::once(response.as_bytes());
+    let authority = server.authority().to_owned();
+    let mut constraints = loopback_constraints(&authority);
+    constraints
+        .http
+        .as_mut()
+        .expect("HTTP grant")
+        .max_response_bytes = 128;
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
+        catalog([("http-probe.fetch", set("http-probe", constraints))]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
+        BrokerLimits::default(),
+    )
+    .expect("HTTP constraints match the provider and host ceilings");
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-oversized-response",
+            "http-probe.fetch",
+            json!({"uri": format!("http://{authority}/large")}),
+        ),
+    )
+    .await
+    .expect("the host refusal is returned as an invocation result");
+    assert_eq!(result.result.error.as_deref(), Some("byte-limit"));
+    let wire = server.request_text();
+    let mut lines = wire.lines();
+    assert_eq!(lines.next(), Some("GET /large HTTP/1.1"));
+    assert!(lines.any(|line| line.eq_ignore_ascii_case(&format!("host: {authority}"))));
+    assert!(!wire.to_ascii_lowercase().contains("authorization:"));
+    assert!(server.recorded().is_empty());
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn http_audit_contains_only_sanitized_call_metadata() {
     dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(

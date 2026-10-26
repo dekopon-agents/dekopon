@@ -69,7 +69,7 @@ impl HttpState {
         self.client.attempted()
     }
 
-    pub(crate) fn policy_violation(&self) -> Option<&'static str> {
+    pub(crate) fn policy_violation(&self) -> Option<dekopon_http_host::PolicyViolation> {
         self.client.policy_violation()
     }
 
