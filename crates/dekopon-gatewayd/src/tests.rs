@@ -17869,6 +17869,7 @@ mod github_invocation;
 mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+mod participants;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
 #[path = "tests/sealed_handoff.rs"]
