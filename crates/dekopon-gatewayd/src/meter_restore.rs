@@ -224,7 +224,7 @@ pub(crate) fn openobserve_query(stream: &str, window: Window) -> serde_json::Val
     let sql = format!(
         "SELECT histogram(_timestamp, '{} seconds') AS b, agent, model_name, \
          SUM(usage_input_tokens) AS input, SUM(usage_output_tokens) AS output \
-         FROM \"{stream}\" WHERE meter_schema = 1 AND outcome != 'refused' \
+         FROM \"{stream}\" WHERE meter_schema = 1 AND outcome != 'refused' AND (meter_via IS NULL OR meter_via != 'summary') \
          GROUP BY b, agent, model_name ORDER BY b",
         window.bucket.as_secs()
     );
@@ -241,7 +241,7 @@ pub(crate) fn openobserve_query(stream: &str, window: Window) -> serde_json::Val
 
 pub(crate) fn quickwit_query(window: Window) -> serde_json::Value {
     json!({
-        "query": "attributes.meter.schema:1 AND NOT attributes.outcome:refused",
+        "query": "attributes.meter.schema:1 AND NOT attributes.outcome:refused AND NOT attributes.meter.via:summary",
         "max_hits": 0,
         "start_timestamp": window.since.0.div_euclid(1_000),
         "end_timestamp": window.until.0.div_euclid(1_000),

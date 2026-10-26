@@ -39,7 +39,7 @@ pub(crate) struct Gateway {
 }
 
 pub(crate) struct ServingGeneration {
-    routes: Arc<RoutingTable>,
+    pub(crate) routes: Arc<RoutingTable>,
     stop_words: Arc<Vec<String>>,
     proxy: Option<Arc<ModelProxy>>,
     _sources: Option<Arc<config::GatewaySources>>,
@@ -51,6 +51,9 @@ pub(crate) struct ServingGeneration {
 pub(crate) struct CurrentGeneration(Arc<ArcSwap<ServingGeneration>>);
 
 impl CurrentGeneration {
+    pub(crate) fn load(&self) -> Arc<ServingGeneration> {
+        self.0.load_full()
+    }
     pub(crate) fn boot(routes: Arc<RoutingTable>, stop_words: Arc<Vec<String>>) -> Self {
         Self(Arc::new(ArcSwap::from_pointee(ServingGeneration {
             routes,

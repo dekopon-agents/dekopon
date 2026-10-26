@@ -31,6 +31,7 @@ pub struct Metering {
 pub enum Via {
     Agent,
     Proxy,
+    Summary,
 }
 
 impl Via {
@@ -38,6 +39,7 @@ impl Via {
         match self {
             Self::Agent => "agent",
             Self::Proxy => "proxy",
+            Self::Summary => "summary",
         }
     }
 }
@@ -174,6 +176,19 @@ impl Metering {
     #[must_use]
     pub fn has_budgets(&self) -> bool {
         !self.budgets.is_empty()
+    }
+
+    pub fn record_unadmitted(
+        &self,
+        call: &Call,
+        estimate: Estimate,
+        usage: Option<ModelUsage>,
+        text_bytes: usize,
+        outcome: Outcome,
+        error_kind: Option<&str>,
+    ) {
+        let charge = Charge::of(outcome, estimate, &Observed { usage, text_bytes });
+        record(call, estimate, &charge, error_kind);
     }
 
     pub fn admit(self: &Arc<Self>, call: Call, estimate: Estimate) -> Result<Admission, Refusal> {

@@ -1,3 +1,9 @@
+#[expect(
+    dead_code,
+    reason = "v3 journal primitives are staged before the B4 switch"
+)]
+pub(crate) mod records;
+
 mod selection;
 pub(crate) use selection::{Projection, decide};
 mod tools;
@@ -971,7 +977,7 @@ fn encode_line(line: &Line) -> Result<Vec<u8>, JournalError> {
     Ok(encoded)
 }
 
-fn millis(at: SystemTime) -> u64 {
+pub(super) fn millis(at: SystemTime) -> u64 {
     duration_millis(at.duration_since(UNIX_EPOCH).unwrap_or_default())
 }
 
