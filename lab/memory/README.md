@@ -1,13 +1,13 @@
 # Memory lab (not for merge)
 
 Runs the real `dekopon-brokerd` and `dekopon-gatewayd` from any ref, drives scripted
-conversations through the gateway's local transport and collects plain files for hand analysis.
-It lives on the `lab/memory-unify` branch only and is outside every workspace and CI gate.
+conversations through the gateway's local transport and collects evidence and enforces the scenario verdict.
+It lives on the `lab/memory-unify` branch only; CI fetches a pinned harness SHA.
 
 ## Run
 
 ```console
-lab/memory/run.sh <ref> <scenario> [--profile fake|real|codex]
+lab/memory/run.sh <ref> <scenario> [--profile fake|real|codex] [--diagnostic]
 ```
 
 Needs Linux, Docker (a running daemon), the repository's Rust toolchain, Python 3, `setpriv`
@@ -26,9 +26,9 @@ One run:
 4. Starts `dekopon-brokerd` as `lab-broker` and `dekopon-gatewayd` as `lab-gateway`, sharing the
    `lab-ipc` group for the broker socket (users are created on first run).
 5. Runs the scenario, stops the gateway, copies its journal, stops everything and writes
-   `summary.md`.
+   `summary.md` and `verdict.json`.
 
-`python3 lab/memory/report.py <run dir>` rebuilds `summary.md` from the other files.
+`python3 lab/memory/report.py <run dir>` rebuilds `summary.md` and `verdict.json` from the other files.
 
 ## Configuration under test
 
@@ -138,3 +138,53 @@ which is how the overlay is checked without a real endpoint.
 - Debug-build latency and RSS are not release numbers; use `LAB_BUILD=release` for those.
 
 Remove the build worktrees with `git worktree remove lab/memory/.work/src/<sha>`.
+
+## Validation contract
+
+Validation is the default. The exit code comes from `verdict.json`, never from the
+human-readable summary. Every assertion records its name, result (`pass`, `fail`,
+`not-applicable`), numbers and whether it is required. The verdict records the scenario,
+label, outcome and reason. Each run prints one final `lab: <outcome>: <reason>` line on
+stderr; `exit.json` retains that classification even if reporting failed.
+
+| Code | Outcome |
+|---|---|
+| 0 | Every required assertion passed, or explicitly exploratory |
+| 1 | Behavioural failure, produced only by the verdict |
+| 2 | Usage error |
+| 3 | Whole-run wall-clock deadline exceeded |
+| 4 | Missing or unparseable evidence, no turns, or reporter failure |
+| 5 | Infrastructure/runner error, including build, collector, daemon, exception, interrupt, cost cap or turn budget |
+| 6 | A required assertion is not applicable at the tested ref |
+
+`--diagnostic` runs the same collection and reporting, prints
+`diagnostic: verdict not enforced` and puts that line in the summary. It exits zero
+for verdict, timeout and evidence outcomes; infrastructure still exits 5 and usage 2.
+
+Required scenarios: `baseline`, `flood`, `summarizer-hang`, `summarizer-fail`,
+`summarizer-refuse`, `unloadable-journal`. Flood asserts only that every turn got a
+reply. `summarizer-hang` remains required even when main fails it.
+
+Exploratory scenarios: `summaries-off-vs-on` (comparison), `restart-mid-summary`
+(slot resume is not applicable at main), `config-check` (no scenario).
+Their assertions are never required, and a completed exploration says
+`exploratory: not a regression assertion` in stdout, summary and verdict, with an
+`exploratory` outcome rather than `pass`. Missing evidence still fails: in particular,
+`config-check` runs no turns and therefore exits 4 in validation mode.
+
+The full deadline includes fetching, building, collector startup and reporting.
+Defaults in seconds: baseline/flood/summarizer-hang/summaries-off-vs-on 1800;
+summarizer-fail/summarizer-refuse/unloadable-journal/restart-mid-summary 1200;
+config-check 900. Cleanup gets up to 15 additional seconds before forced termination.
+
+Overrides:
+
+- `LAB_DEADLINE_SECS`: positive whole-run deadline, replacing the scenario default.
+- `LAB_COLLECTOR_IMAGE`: replaces the pinned collector image.
+- `LAB_COST_CAP_USD`: passed to the existing `--cost-cap` (default $2 per run).
+- `LAB_FAULT_DROP_REPORT=1`: deletes summary and verdict after reporting. This hook
+  exists only to prove that the CI check fails on missing reports.
+
+Run the self-test beside the lab: `cd lab/memory && python3 -m unittest -v`.
+It needs no Docker, Rust build or network. Recorded run evidence and executable
+commands on PATH exercise the real shell runner, deadline supervisor and reporter.

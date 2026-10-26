@@ -3,29 +3,36 @@ set -Eeuo pipefail
 umask 022
 
 usage() {
-  echo "usage: $0 <ref> <scenario> [--profile fake|real|codex]" >&2
+  echo "usage: $0 <ref> <scenario> [--profile fake|real|codex] [--diagnostic]" >&2
   exit 2
 }
 
+lab="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "${LAB_SUPERVISED:-}" != 1 ]; then
+  exec python3 "$lab/contract.py" "$@"
+fi
+trap 'echo "lab: infrastructure: runner command failed" >&2; exit 5' ERR
 [ "$#" -ge 2 ] || usage
 ref="$1"
 scenario="$2"
 shift 2
 profile=fake
+diagnostic=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --profile) profile="${2:?}"; shift 2 ;;
+    --profile) [ "$#" -ge 2 ] || usage; profile="$2"; shift 2 ;;
+    --diagnostic) diagnostic=true; shift ;;
     *) usage ;;
   esac
 done
 case "$profile" in fake | real | codex) ;; *) usage ;; esac
 if [ "$profile" = real ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
   echo "--profile real reads OPENROUTER_API_KEY from the environment; it is unset" >&2
-  exit 2
+  exit 5
 fi
 if [ "$profile" = codex ] && ! [ -f "${LAB_CODEX_AUTH_JSON:-}" ]; then
   echo "--profile codex reads the auth file named by LAB_CODEX_AUTH_JSON; it is unset or not a file" >&2
-  exit 2
+  exit 5
 fi
 
 lab="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,10 +40,10 @@ repo="$(git -C "$lab" rev-parse --show-toplevel)"
 work="${LAB_WORK:-$lab/.work}"
 build="${LAB_BUILD:-debug}"
 otlp_port="${LAB_OTLP_PORT:-4318}"
-collector_image="otel/opentelemetry-collector-contrib:0.115.1@sha256:d2da12c4336a79758826700be9e21ecf4a9f7d945b7f8a58ba55ee3fa45427c8"
+collector_image="${LAB_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:0.115.1@sha256:d2da12c4336a79758826700be9e21ecf4a9f7d945b7f8a58ba55ee3fa45427c8}"
 
-for command in cargo docker git python3 setpriv; do
-  command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 1; }
+for command in cargo docker git python3 setpriv curl; do
+  command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 5; }
 done
 case "$build" in debug | release) ;; *) echo "LAB_BUILD must be debug or release" >&2; exit 2 ;; esac
 python3 -c "import sys; sys.path.insert(0, '$lab'); import lab; sys.exit('$scenario' not in lab.SCENARIOS)" \
@@ -46,6 +53,13 @@ if ! sha="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")"; then
   git -C "$repo" fetch --quiet origin "$ref"
   sha="$(git -C "$repo" rev-parse --verify "FETCH_HEAD^{commit}")"
 fi
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-${sha:0:8}-$scenario"
+run="$lab/runs/$run_id"
+state="${LAB_STATE_ROOT:-/var/tmp/dekopon-lab}/$run_id"
+mkdir -p "$run" "$state/bin"
+chmod 0755 "$state" "$state/bin"
+printf '%s\n' "$run" >"$LAB_RUN_POINTER"
+echo "run directory: $run"
 src="$work/src/$sha"
 target="$work/target"
 overlay=None
@@ -62,7 +76,7 @@ if [ ! -d "$src" ]; then
   mkdir -p "$work/src"
   git -C "$repo" worktree add --quiet --detach "$src" "$sha"
   if [ "$overlay" != None ]; then
-    git -C "$src" apply "$patch" || { git -C "$repo" worktree remove --force "$src"; echo "the extra-CA overlay does not apply at $sha" >&2; exit 1; }
+    git -C "$src" apply "$patch" || { git -C "$repo" worktree remove --force "$src"; echo "the extra-CA overlay does not apply at $sha" >&2; exit 5; }
     install -m 0644 "$LAB_EXTRA_CA" "$src/crates/dekopon-model/lab-extra-ca.pem"
   fi
 fi
@@ -71,11 +85,6 @@ cargo_flags=(--locked -p dekopon-brokerd -p dekopon-gatewayd --target-dir "$targ
 [ "$build" = release ] && cargo_flags+=(--release)
 (cd "$src" && cargo build "${cargo_flags[@]}")
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-${sha:0:8}-$scenario"
-run="$lab/runs/$run_id"
-state="${LAB_STATE_ROOT:-/var/tmp/dekopon-lab}/$run_id"
-mkdir -p "$run" "$state/bin"
-chmod 0755 "$state" "$state/bin"
 for binary in dekopon-brokerd dekopon-gatewayd; do
   install -m 0755 "$target/$build/$binary" "$state/bin/$binary"
 done
@@ -111,8 +120,8 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'exit 5' INT
+trap 'exit 5' TERM
 
 docker run --detach --name "$container" --network host --user 0 \
   --env "LAB_OTLP_PORT=$otlp_port" \
@@ -132,7 +141,7 @@ curl --silent --fail --output /dev/null --max-time 2 -X POST -H 'Content-Type: a
 python3 - "$run/meta.json" <<PYMETA
 import json, sys
 json.dump({"ref": "$ref", "sha": "$sha", "scenario": "$scenario", "profile": "$profile", "build": "$build",
-           "overlay": $overlay, "started_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "collector_image": "$collector_image",
+           "diagnostic": "$diagnostic" == "true", "overlay": $overlay, "started_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)", "collector_image": "$collector_image",
            "uids": {"broker": $broker_uid, "gateway": $gateway_uid, "ipc_gid": $ipc_gid,
                     "separation": "$separation"}}, open(sys.argv[1], "w"), indent=1)
 PYMETA
@@ -148,12 +157,19 @@ python3 "$lab/lab.py" --run "$run" --state "$state" --bin "$state/bin" --scenari
   --profile "$profile" --otlp "http://127.0.0.1:$otlp_port" \
   --broker-uid "$broker_uid" --gateway-uid "$gateway_uid" --ipc-gid "$ipc_gid" \
   ${LAB_RUST_LOG:+--rust-log "$LAB_RUST_LOG"} ${LAB_REAL_MODEL:+--real-model "$LAB_REAL_MODEL"} \
-  "${codex_flags[@]}" \
+  --cost-cap "${LAB_COST_CAP_USD:-2}" "${codex_flags[@]}" \
   || lab_status=$?
 
 docker stop --time 10 "$container" >/dev/null
 docker logs "$container" >"$run/collector.log" 2>&1
 docker rm "$container" >/dev/null
-python3 "$lab/report.py" "$run"
+if [ "$lab_status" -ne 0 ]; then
+  echo "lab: infrastructure: lab.py exited $lab_status" >&2
+  exit 5
+fi
+python3 "$lab/report.py" "$run" || { echo "lab: missing-evidence: report.py failed" >&2; exit 4; }
+if [ "${LAB_FAULT_DROP_REPORT:-0}" = 1 ]; then
+  rm -f "$run/summary.md" "$run/verdict.json"
+fi
 echo "run directory: $run"
 exit "$lab_status"

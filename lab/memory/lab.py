@@ -568,7 +568,7 @@ def main():
                 sampler.join(timeout=3)
     write_outputs(lab, status)
     print(f"[lab] {status}", flush=True)
-    return 0 if status == "completed" else 1
+    return 0 if status == "completed" else 5
 
 
 def write_outputs(lab, status):

@@ -2,9 +2,48 @@
 import collections
 import csv
 import json
+import math
 import re
 import sys
 from pathlib import Path
+
+LABELS = {name: "required" for name in (
+    "baseline", "flood", "summarizer-hang", "summarizer-fail",
+    "summarizer-refuse", "unloadable-journal")}
+LABELS.update({name: "exploratory" for name in (
+    "restart-mid-summary", "summaries-off-vs-on", "config-check")})
+DEADLINES = {name: seconds for name, seconds in (
+    ("baseline", 1800), ("flood", 1800), ("summarizer-hang", 1800),
+    ("summarizer-fail", 1200), ("summarizer-refuse", 1200),
+    ("unloadable-journal", 1200), ("restart-mid-summary", 1200),
+    ("summaries-off-vs-on", 1800), ("config-check", 900))}
+
+
+def evidence(run):
+    meta = json.loads((run / "meta.json").read_text())
+    if meta["scenario"] not in LABELS or not isinstance(meta["sha"], str):
+        raise ValueError("invalid scenario or SHA")
+    if not math.isfinite(meta["summarizer_timeout_ms"]) or meta["summarizer_timeout_ms"] <= 0:
+        raise ValueError("invalid summarizer timeout")
+    with (run / "latency.csv").open(newline="") as stream:
+        reader = csv.DictReader(stream, strict=True)
+        required = {"kind", "wall_ms", "conversation", "phase", "summary_in_flight"}
+        if not required <= set(reader.fieldnames or []):
+            raise ValueError("invalid latency columns")
+        turns = list(reader)
+    if not turns:
+        raise ValueError("no turns ran")
+    for turn in turns:
+        if None in turn or any(value is None for value in turn.values()):
+            raise ValueError("invalid latency row")
+        wall = float(turn["wall_ms"])
+        if not math.isfinite(wall) or wall < 0 or not turn["kind"] or not turn["conversation"]:
+            raise ValueError("invalid latency value")
+    batches = (run / "traces.jsonl").read_text().splitlines()
+    if not batches or any(not isinstance(json.loads(line), dict) for line in batches):
+        raise ValueError("invalid trace evidence")
+    return meta, turns
+
 
 SLOT = re.compile(r"slot", re.I)
 DROPPED = re.compile(r"drop", re.I)
@@ -80,9 +119,8 @@ def tree_bytes(path):
 
 
 def build(run):
-    meta = json.loads((run / "meta.json").read_text())
+    meta, turns = evidence(run)
     ref8 = meta["sha"][:8]
-    turns = list(csv.DictReader(open(run / "latency.csv", encoding="utf-8"))) if (run / "latency.csv").exists() else []
     gateway = records(run / "gatewayd.stdout.log")
     broker = records(run / "brokerd.stdout.log")
     events = collections.Counter(event_name(row) for row in gateway if event_name(row))
@@ -160,51 +198,88 @@ def build(run):
     if names:
         out.append("- top span names: " + ", ".join(f"{n} {c}" for n, c in names.most_common(8)))
     out += [""]
-    out += verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8)
+    lines, assertions = verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8)
+    out += lines
+    label = LABELS[meta["scenario"]]
+    required = [a for a in assertions if a["required"]]
+    if label == "exploratory":
+        outcome, reason = "exploratory", "exploratory: not a regression assertion"
+        out += [reason, ""]
+    elif any(a["result"] == "fail" for a in required):
+        outcome = "fail"
+        reason = "; ".join(a["name"] for a in required if a["result"] == "fail")
+    elif any(a["result"] == "not-applicable" for a in required):
+        outcome, reason = "not-applicable", f"required assertion not applicable at {ref8}"
+    elif not required:
+        raise ValueError("no required assertions")
+    else:
+        outcome, reason = "pass", "every required assertion passed"
+    if meta.get("diagnostic"):
+        out += ["diagnostic: verdict not enforced", ""]
+    verdict = {"scenario": meta["scenario"], "label": label, "outcome": outcome,
+               "reason": reason, "assertions": assertions, "diagnostic": bool(meta.get("diagnostic"))}
     findings = meta.get("findings") or {}
     if findings:
         out += ["## Findings", ""] + [f"- {key}: {value}" for key, value in findings.items()] + [""]
-    return "\n".join(out)
+    return "\n".join(out), verdict
 
 
 def verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8):
     scenario = meta["scenario"]
     timeout = meta["summarizer_timeout_ms"]
     lines = ["## Verdict", ""]
+    assertions = []
+
+    def assertion(name, passed, **numbers):
+        assertions.append({"name": name, "result": "pass" if passed else "fail",
+                           "numbers": numbers, "required": LABELS[scenario] == "required"})
     lost = [t for t in turns if t["kind"] != "reply"]
     if not turns:
-        return lines + ["- **no turns ran**; see status", ""]
+        raise ValueError("no turns ran")
+    assertion("every turn got a reply", not lost, turns=len(turns), lost=len(lost))
     lines.append(f"- every turn got a reply: {'yes' if not lost else 'NO, ' + str(len(lost)) + ' did not'}")
     if scenario.startswith("summarizer-"):
         waited = [t for t in replies if t["conversation"] == "summary" and float(t["wall_ms"]) >= timeout * 0.8]
         lines.append(f"- summary-route replies that took ≥ 80% of the {timeout} ms summarizer timeout: "
                      f"{len(waited)} of {sum(1 for t in replies if t['conversation'] == 'summary')}"
                      + (" — **replies waited on a summary**" if waited else " — no reply waited on a summary"))
+        assertion("no reply waited on a summary", not waited,
+                  slow=len(waited), threshold_ms=timeout * 0.8,
+                  replies=sum(t["conversation"] == "summary" for t in replies))
         other = [t for t in replies if t["conversation"] != "summary" and float(t["wall_ms"]) >= timeout * 0.8]
         lines.append(f"- other-route replies that slow: {len(other)}")
+        assertion("other routes did not wait on a summary", not other, slow=len(other), threshold_ms=timeout * 0.8)
     if scenario == "restart-mid-summary":
         findings = meta.get("findings", {})
         if not slot_events:
+            assertions.append({"name": "slot resume", "result": "not-applicable", "numbers": {},
+                               "required": LABELS[scenario] == "required"})
+            assertion("slot resume", bool(resumed), resumed=resumed)
             lines.append(f"- slot resume: **not applicable at {ref8}** (no summary slot events or files; "
                          f"the summarizer was re-called {findings.get('summarizer re-called for killed turn after restart')} "
                          "times for the killed turn)")
         else:
             resumed = findings.get("summarizer re-called for killed turn after restart", 0)
+            assertion("slot resume", bool(resumed), resumed=resumed)
             lines.append(f"- slot resume: {'pass' if resumed else 'FAIL'} (summarizer re-called {resumed} times)")
     if scenario == "unloadable-journal":
+        assertion("exactly one reset record", resets == 1, resets=resets)
         lines.append(f"- exactly one reset record: {'pass' if resets == 1 else 'FAIL (' + str(resets) + ')'}")
         after = [t for t in turns if t["phase"] == "after"]
+        assertion("clean start", bool(after) and all(t["kind"] == "reply" for t in after),
+                  turns=len(after), replies=sum(t["kind"] == "reply" for t in after))
         lines.append(f"- clean start: {'pass' if after and all(t['kind'] == 'reply' for t in after) else 'FAIL'}"
                      f" ({sum(1 for t in after if t['kind'] == 'reply')}/{len(after)} replies after boot)")
     if scenario == "flood":
         lines.append("- tool output size: see Findings (the shell caps a script's output)")
-    return lines + [""]
+    return lines + [""], assertions
 
 
 def main():
     run = Path(sys.argv[1])
-    text = build(run)
+    text, verdict = build(run)
     (run / "summary.md").write_text(text + "\n")
+    (run / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     print(text)
 
 
