@@ -221,37 +221,9 @@ impl BufferedHttpClient {
         if length == 0 || length > WINDOW_BYTES || !api_route(&api_uri) {
             return Err(DownloadError::Denied);
         }
-        let span = tracing::info_span!(
-            "http.request",
-            "url.full" = api_uri,
-            "http.request.method" = "GET",
-            "server.address" = tracing::field::Empty,
-            "http.response.status_code" = tracing::field::Empty,
-            "dekopon.http.request.accounted_bytes" = tracing::field::Empty,
-            "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
-            "error.code" = tracing::field::Empty,
-            "error.message" = tracing::field::Empty,
-            outcome = tracing::field::Empty
-        );
-        let index = self.evidence.len();
-        let api = self
-            .send_with_metadata(
-                Request {
-                    method: "GET".to_owned(),
-                    uri: api_uri,
-                    headers: vec![Header {
-                        name: "user-agent".to_owned(),
-                        value: b"dekopon".to_vec(),
-                    }],
-                    body: vec![],
-                },
-                super::ResponseMetadata::SignedDownload,
-            )
-            .instrument(span.clone())
-            .await;
-        self.record_request(&span, index, &api);
-        let api = api.map_err(DownloadError::from)?;
+        let mut api = self.signed_api_request(api_uri).await?;
         if api.status != 302 {
+            redact_api_locations(&mut api.headers);
             return Ok(DownloadResponse::Api(api));
         }
         let uri = location(&api.headers)?;
@@ -379,6 +351,39 @@ impl BufferedHttpClient {
             coverage: Some(coverage),
             body: Some(body),
         })
+    }
+
+    async fn signed_api_request(&mut self, api_uri: String) -> Result<Response, DownloadError> {
+        let span = tracing::info_span!(
+            "http.request",
+            "url.full" = api_uri,
+            "http.request.method" = "GET",
+            "server.address" = tracing::field::Empty,
+            "http.response.status_code" = tracing::field::Empty,
+            "dekopon.http.request.accounted_bytes" = tracing::field::Empty,
+            "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
+            "error.code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+            outcome = tracing::field::Empty
+        );
+        let index = self.evidence.len();
+        let api = self
+            .send_with_metadata(
+                Request {
+                    method: "GET".to_owned(),
+                    uri: api_uri,
+                    headers: vec![Header {
+                        name: "user-agent".to_owned(),
+                        value: b"dekopon".to_vec(),
+                    }],
+                    body: vec![],
+                },
+                super::ResponseMetadata::SignedDownload,
+            )
+            .instrument(span.clone())
+            .await;
+        self.record_request(&span, index, &api);
+        api.map_err(DownloadError::from)
     }
 
     async fn storage_destination(
@@ -700,6 +705,30 @@ impl BufferedHttpClient {
             .finish()
             .await
             .map_err(|error| DownloadError::from(self.asset_error(error)))
+    }
+}
+
+fn redact_api_locations(headers: &mut [Header]) {
+    for header in headers {
+        if !header.name.eq_ignore_ascii_case("location") {
+            continue;
+        }
+        let Some(index) = header
+            .value
+            .iter()
+            .position(|byte| *byte == b'?' || *byte == b'#')
+        else {
+            continue;
+        };
+        let query = header.value.get(index) == Some(&b'?');
+        let fragment = header.value.contains(&b'#');
+        header.value.truncate(index);
+        if query {
+            header.value.extend_from_slice(b"?[redacted]");
+        }
+        if fragment {
+            header.value.extend_from_slice(b"#[redacted]");
+        }
     }
 }
 
@@ -1311,9 +1340,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_signed_api_returns_non_302_redirects_raw_without_following_them() {
-        let location =
-            "https://productionresultssa1.blob.core.windows.net/log?sig=raw-api-location";
+    async fn native_signed_api_redacts_non_302_locations_without_following_them() {
+        let location = "https://productionresultssa1.blob.core.windows.net/log?sig=raw-api-location#private-fragment";
         for status in [301, 303, 307] {
             let response = format!(
                 "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nraw"
@@ -1338,7 +1366,7 @@ mod tests {
                             .headers
                             .iter()
                             .any(|header| header.name == "location"
-                                && header.value == location.as_bytes())
+                                && header.value == b"https://productionresultssa1.blob.core.windows.net/log?[redacted]#[redacted]")
                     );
                 }
                 DownloadResponse::Storage { .. } => panic!("non-302 API response followed storage"),
