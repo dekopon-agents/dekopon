@@ -209,6 +209,14 @@ GitHub Actions are pinned by full commit SHA. Required check names such as `test
 
 Expensive validation runs on pull requests, with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them and a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`; the required `quality (stable)` context aggregates all four lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs `cargo package --workspace --locked --no-verify` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
 
+The optional `memory-lab` workflow runs the pinned memory harness's deterministic fake-profile
+scenarios against the exact pull-request head SHA on `pull_request`, filtered to
+`crates/dekopon-gatewayd/**`, `crates/dekopon-agent/**`, `crates/dekopon-model/**`, `Cargo.lock`,
+`rust-toolchain.toml` and `.github/workflows/memory-lab.yml` (with no base-branch filter);
+it first self-tests the exit contract, then reports required verdicts and exploratory results,
+is not a required context, and also supports `workflow_dispatch` with a dispatch-only real
+profile capped at $2 per scenario using the existing `LAB_OPENROUTER_API_KEY` repository secret.
+
 The chart CI render lane checks that enabling the private VM proxy rejects missing or mismatched
 inline daemon binds and still renders opaque configuration for the candidate check hook. Its
 config-check and configuration-directory renders set `configCheck.broker.workflowsConfigMap`, so
