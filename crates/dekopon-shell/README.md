@@ -54,8 +54,7 @@ truncation marker. `h=$(gh --help)` captures that cached page like any other val
 A direct invoker implements `run` and keeps parsing private to its own leg. `SessionInvoker`
 selects the direct or broker leg before handing over streams. Proposal reports follow the proposal
 into `invoke`, and dropping a refused proposal settles its report as failed. Invokers without a
-broker refuse secret-use proposals. The broker retains the legacy `RunCommand` operation for old
-clients.
+broker refuse secret-use proposals.
 
 A capability that ran and failed reports `<id>: failed: <classification>` at exit `1`, and when
 the broker's classification came from the provider's own typed failure its code and message follow:

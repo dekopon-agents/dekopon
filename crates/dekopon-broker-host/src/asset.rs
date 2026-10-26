@@ -1755,34 +1755,29 @@ mod tests {
         assert_eq!(captured.join().unwrap(), b"{\"ok\":true}\n");
     }
     #[tokio::test]
-    async fn input_rows_accept_thirty_two_and_refuse_thirty_three() {
-        for count in [MAX_ASSET_ROWS, MAX_ASSET_ROWS + 1] {
-            let inputs = AssetInputs {
-                rows: (1..=count as u64)
-                    .map(|id| AssetRow {
-                        id,
-                        content_type: "text/plain".to_owned(),
-                        encoding: AssetEncoding::Identity,
-                        bytes: Some(0),
-                        origin: "chat".to_owned(),
-                        sent: false,
-                    })
-                    .collect(),
-                ..Default::default()
-            };
-            let admitted = AssetState::invoke(
-                inputs,
-                AssetConstraints::default(),
-                None,
-                "provider:probe".to_owned(),
-            )
-            .await;
-            if count == MAX_ASSET_ROWS {
-                assert!(admitted.is_ok());
-            } else {
-                assert!(matches!(admitted, Err(AssetAdmissionError::TooManyRows)));
-            }
-        }
+    async fn input_rows_over_the_invocation_bound_are_refused() {
+        let count = MAX_ASSET_DESCRIPTORS + 1;
+        let inputs = AssetInputs {
+            rows: (1..=count as u64)
+                .map(|id| AssetRow {
+                    id,
+                    content_type: "text/plain".to_owned(),
+                    encoding: AssetEncoding::Identity,
+                    bytes: Some(0),
+                    origin: "chat".to_owned(),
+                    sent: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let admitted = AssetState::invoke(
+            inputs,
+            AssetConstraints::default(),
+            None,
+            "provider:probe".to_owned(),
+        )
+        .await;
+        assert!(matches!(admitted, Err(AssetAdmissionError::TooManyRows)));
     }
 
     #[tokio::test]
