@@ -62,7 +62,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      BASH_ENV: ${{ runner.temp }}/memory-lab.bash
       CANDIDATE: ${{ github.event.pull_request.head.sha || inputs.candidate }}
       PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile || 'fake' }}
       SCENARIOS: ${{ inputs.scenarios || 'baseline flood summarizer-fail' }}
@@ -112,7 +111,8 @@ jobs:
           test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p lab/memory/runs "$RUNNER_TEMP/memory-lab-results"
-          cat >> "$BASH_ENV" <<'BASH'
+          echo "BASH_ENV=$RUNNER_TEMP/memory-lab.bash" >> "$GITHUB_ENV"
+          cat >> "$RUNNER_TEMP/memory-lab.bash" <<'BASH'
           run_scenario() {
             local scenario="$1" status=0
             sudo -E env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
