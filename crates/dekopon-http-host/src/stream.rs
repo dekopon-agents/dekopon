@@ -539,21 +539,6 @@ async fn next_chunk(
         .map_err(|error| map_reqwest_error(&error))
 }
 
-fn redact_location(value: &[u8]) -> Vec<u8> {
-    let end = value.iter().position(|byte| matches!(byte, b'?' | b'#'));
-    let Some(end) = end else {
-        return value.to_vec();
-    };
-    let mut redacted = value[..end].to_vec();
-    if value[end] == b'?' {
-        redacted.extend_from_slice(b"?[redacted]");
-    }
-    if value[end..].contains(&b'#') {
-        redacted.extend_from_slice(b"#[redacted]");
-    }
-    redacted
-}
-
 impl BufferedHttpClient {
     pub(crate) fn accept_head(
         &mut self,
@@ -607,13 +592,15 @@ impl BufferedHttpClient {
             {
                 headers.push(Header {
                     name: name.as_str().to_owned(),
-                    value: if name == reqwest::header::LOCATION {
-                        redact_location(value.as_bytes())
-                    } else {
-                        value.as_bytes().to_vec()
-                    },
+                    value: value.as_bytes().to_vec(),
                 });
             }
+        }
+        match metadata {
+            super::ResponseMetadata::Ordinary => {
+                super::signed_download::redact_api_locations(&mut headers);
+            }
+            super::ResponseMetadata::SignedDownload => {}
         }
         let head = Response {
             status,
