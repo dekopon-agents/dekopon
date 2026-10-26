@@ -402,3 +402,52 @@ fn only_the_askers_native_chat_steer_interrupts_a_mapped_turn() {
     assert!(*model.borrow());
     assert!(!cancellation.is_cancelled());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_subject() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            listing("asker", true),
+            listing("ana", true),
+            ResponseEnvelope::session_refused(&SessionRefusal::Other),
+        ],
+    )
+    .await;
+    let models = InterruptibleModel::new([answer("owner final"), answer("participant final")]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = shared_route();
+    route.limits.max_steps = 1;
+    let task = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        speaker(9, "asker request"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    models.wait_until_entered().await;
+    for (index, text) in [
+        (8, "authorized participant text"),
+        (7, "unchecked participant marker"),
+    ] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            speaker(index, text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    models.release();
+    finish(task).await;
+    assert_eq!(models.requests(), 2);
+    assert_eq!(capability_listings(&mut observed), 2);
+    assert!(
+        !models
+            .prompt(1)
+            .iter()
+            .any(|(_, text)| text.contains("unchecked participant marker")),
+        "the third subject's capability refusal was never requested, but its text reached the model under Ana's leg"
+    );
+}
