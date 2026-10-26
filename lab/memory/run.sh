@@ -62,6 +62,8 @@ chmod 0755 "$state" "$state/bin"
 printf '%s\n' "$run" >"$LAB_RUN_POINTER"
 echo "run directory: $run"
 container="dekopon-lab-otel-$$"
+# Called indirectly by the EXIT trap.
+# shellcheck disable=SC2329
 cleanup() {
   status=$?
   set +e
@@ -165,11 +167,16 @@ python3 "$lab/lab.py" --run "$run" --state "$state" --bin "$state/bin" --scenari
 docker stop --time 10 "$container" >/dev/null
 docker logs "$container" >"$run/collector.log" 2>&1
 docker rm "$container" >/dev/null
+report_status=0
+python3 "$lab/report.py" "$run" || report_status=$?
 if [ "$lab_status" -ne 0 ]; then
   echo "lab: infrastructure: lab.py exited $lab_status" >&2
   exit 5
 fi
-python3 "$lab/report.py" "$run" || { echo "lab: missing-evidence: report.py failed" >&2; exit 4; }
+if [ "$report_status" -ne 0 ]; then
+  echo "lab: missing-evidence: report.py failed" >&2
+  exit 4
+fi
 if [ "${LAB_FAULT_DROP_REPORT:-0}" = 1 ]; then
   rm -f "$run/summary.md" "$run/verdict.json"
 fi
