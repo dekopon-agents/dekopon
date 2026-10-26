@@ -7,6 +7,8 @@
 /examples/providers/jsonplaceholder-provider.wasm.sha256
 /examples/providers/memory-chat-provider.wasm
 /examples/providers/memory-chat-provider.wasm.sha256
+/examples/providers/gh-provider.wasm
+/examples/providers/gh-provider.wasm.sha256
 .DS_Store
 *.swp
 *.swo
