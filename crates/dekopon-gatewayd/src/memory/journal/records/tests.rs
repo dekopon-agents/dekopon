@@ -32,6 +32,7 @@ pub(crate) fn journal() -> (tempfile::TempDir, Arc<Journal>) {
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         Duration::from_secs(3600),
+        64.try_into().unwrap(),
     )
     .unwrap();
     let journal = Arc::new(journal);
@@ -246,6 +247,7 @@ fn reopen(dir: &std::path::Path) -> (Journal, Boot) {
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         Duration::from_secs(3600),
+        64.try_into().unwrap(),
     )
     .unwrap()
 }
@@ -877,4 +879,90 @@ fn a_record_lookup_retains_only_its_header_but_refuses_unknown_side_fields() {
         journal.record_lookup(STEM, record),
         Err(JournalError::Corrupt)
     ));
+}
+
+#[test]
+fn span_kinds_use_the_v3_lowercase_tokens() {
+    assert_eq!(
+        serde_json::to_string(&Kind::Escaped).unwrap(),
+        "\"escaped\""
+    );
+    assert_eq!(serde_json::to_string(&Kind::Raw).unwrap(), "\"raw\"");
+}
+
+#[test]
+fn boot_pending_work_is_bounded_and_overflow_finalizes_later_parts() {
+    let (dir, journal) = journal();
+    for number in 1..=3 {
+        let mut record = fixture();
+        record.id = RecordId(number.try_into().unwrap());
+        record.turn = TurnId(number);
+        record.summaries[0] = Slot::Running;
+        journal.append_record(STEM, &record, Vec::new()).unwrap();
+    }
+    drop(journal);
+    let (journal, boot) = Journal::open_records(
+        dir.path(),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        1.try_into().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(boot.tasks.len(), 1);
+    assert_eq!(boot.tasks[0].record.0.get(), 1);
+    assert_eq!(boot.requeued, 3);
+    assert_eq!(boot.overflowed, 6);
+    let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
+    assert_eq!(snapshot.records[0].header.summaries, vec![Slot::Queued; 3]);
+    assert!(
+        snapshot.records[1..]
+            .iter()
+            .flat_map(|head| &head.header.summaries)
+            .all(
+                |slot| matches!(slot, Slot::Error(error) if error.kind == SummaryFailure::Overflow)
+            )
+    );
+}
+
+#[test]
+fn boot_resets_an_inconsistent_plan_instead_of_leaving_a_loading_marker() {
+    let (dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
+    let mut bytes = read_body(&snapshot, 0);
+    let mut header = snapshot.records[0].header.clone();
+    header.plan.as_mut().unwrap().parts.clear();
+    bytes.extend(serde_json::to_vec(&HeaderLine { h: header }).unwrap());
+    bytes.push(b'\n');
+    std::fs::write(journal.path(STEM), bytes).unwrap();
+    drop(journal);
+    let (_journal, boot) = reopen(dir.path());
+    assert_eq!(boot.reset, 1);
+    assert!(boot.tasks.is_empty());
+    assert!(!dir.path().join("loading.marker").exists());
+}
+
+#[test]
+fn an_unknown_tag_is_refused_before_reading_its_large_payload() {
+    use std::io::Seek as _;
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let path = journal.path(STEM);
+    let mut out = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    out.write_all(b"{\"version\":2,\"user\":\"").unwrap();
+    out.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    out.write_all(b"\"}\n").unwrap();
+    drop(out);
+    let mut probe = File::open(path).unwrap();
+    let reader = probe.try_clone().unwrap();
+    assert!(matches!(
+        scan(reader, true, None),
+        Err(JournalError::Corrupt)
+    ));
+    assert!(probe.stream_position().unwrap() <= BUFFER as u64);
 }

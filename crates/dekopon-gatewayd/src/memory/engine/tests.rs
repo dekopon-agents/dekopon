@@ -217,7 +217,7 @@ async fn summary_errors_map_to_slot_failures() {
     assert!(failed(&slots[1], SummaryFailure::Empty));
     assert_eq!(slots[2], Slot::Running);
     assert_eq!(script.calls.load(Ordering::Relaxed), 3);
-    let boot = journal.load_summary_tasks().unwrap();
+    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
     assert_eq!(boot.requeued, 1);
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.tasks[0].part.get(), 3);
@@ -276,10 +276,12 @@ async fn a_panicked_summary_marks_its_later_parts() {
     let (_dir, journal) = journal();
     let mut first = fixture();
     first.summaries = vec![Slot::Queued; 2];
+    first.plan.as_mut().unwrap().parts.truncate(2);
     journal.append_record(STEM, &first, Vec::new()).unwrap();
     let mut second = fixture();
     second.id = RecordId(2.try_into().unwrap());
     second.summaries = vec![Slot::Queued];
+    second.plan.as_mut().unwrap().parts.truncate(1);
     journal.append_record(STEM, &second, Vec::new()).unwrap();
     let (resources, script) = resources(
         Arc::clone(&journal),
@@ -384,10 +386,12 @@ async fn a_finished_summary_is_joined_at_once_at_concurrency_two() {
     let (_dir, journal) = journal();
     let mut first = fixture();
     first.summaries = vec![Slot::Queued];
+    first.plan.as_mut().unwrap().parts.truncate(1);
     journal.append_record(STEM, &first, Vec::new()).unwrap();
     let mut second = fixture();
     second.id = RecordId(2.try_into().unwrap());
     second.summaries = vec![Slot::Queued; 2];
+    second.plan.as_mut().unwrap().parts.truncate(2);
     journal.append_record(STEM, &second, Vec::new()).unwrap();
     let gate = Gate::new();
     let (resources, script) = resources(
@@ -454,7 +458,7 @@ fn boot_enqueues_only_the_lowest_queued_part() {
             },
         )
         .unwrap();
-    let boot = journal.load_summary_tasks().unwrap();
+    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
     assert_eq!(boot.requeued, 1);
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.tasks[0].part.get(), 2);
@@ -483,7 +487,7 @@ fn a_file_that_crashed_the_last_boot_is_reset_first() {
     let (dir, journal) = journal();
     journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
     std::fs::write(dir.path().join("loading.marker"), STEM).unwrap();
-    let boot = journal.load_summary_tasks().unwrap();
+    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
     assert_eq!(boot.reset, 1);
     assert_eq!(boot.crashed_files, 1);
     assert!(boot.tasks.is_empty());
@@ -746,6 +750,7 @@ async fn shutdown_cancels_a_running_summary_call() {
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         Duration::from_secs(3600),
+        64.try_into().unwrap(),
     )
     .unwrap();
     assert_eq!(boot.requeued, 1);
@@ -787,6 +792,7 @@ async fn a_restart_mid_summary_requeues_and_resumes_from_the_original() {
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         Duration::from_secs(3600),
+        64.try_into().unwrap(),
     )
     .unwrap();
     assert_eq!(boot.requeued, 1);

@@ -430,7 +430,7 @@ fn complete_summary(
         {
             Some(mut text) => {
                 text.truncate(text.floor_char_boundary(limit.get() as usize));
-                if text.is_empty() {
+                if text.trim().is_empty() {
                     error_slot(SummaryFailure::Empty, "summary returned no retained text")
                 } else {
                     Slot::Generated(text)

@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
-    num::{NonZeroU8, NonZeroU64},
+    num::{NonZeroU8, NonZeroU64, NonZeroUsize},
     os::unix::fs::{FileExt, OpenOptionsExt},
     sync::Arc,
 };
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::{Journal, JournalError};
 use crate::memory::record::{
     ArrivedAsset, AssetRow, AssetSideLine, ChoiceLine, GrantDigest, PinLine, RecordId, Slot,
-    SlotLine, Subject, SummaryPlan, TurnId, TurnRecord,
+    SlotLine, Subject, SummaryError, SummaryFailure, SummaryPlan, TurnId, TurnRecord,
 };
 
 const BUFFER: usize = 64 * 1024;
@@ -95,6 +95,7 @@ pub(crate) enum NamedTool {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Kind {
     Escaped,
     Raw,
@@ -607,8 +608,15 @@ fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, 
             if line.len() < 5 {
                 line.extend_from_slice(&buffer[..count.min(5 - line.len())]);
             }
-            if line.len() == 5 && line == b"{\"b\":" {
-                is_body = true;
+            if line.len() == 5 {
+                if line == b"{\"b\":" {
+                    is_body = true;
+                } else if !matches!(
+                    line.as_slice(),
+                    b"{\"h\":" | b"{\"s\":" | b"{\"c\":" | b"{\"p\":"
+                ) {
+                    return Err(JournalError::Corrupt);
+                }
             }
             if !is_body {
                 let already = usize::try_from(offset - at).unwrap_or(usize::MAX);
@@ -642,6 +650,17 @@ fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, 
         if line.starts_with(b"{\"h\":") {
             let header = decode_line::<HeaderLine>(&line)?.h;
             let (body_at, body_len) = body.take().ok_or(JournalError::Corrupt)?;
+            let valid_plan = match &header.plan {
+                Some(plan) => {
+                    !plan.parts.is_empty()
+                        && plan.parts.len() <= usize::from(u8::MAX)
+                        && plan.parts.len() == header.summaries.len()
+                }
+                None => header.summaries.is_empty(),
+            };
+            if !valid_plan {
+                return Err(JournalError::Corrupt);
+            }
             if header.body_len != body_len
                 || header.spans.iter().any(|span| {
                     span.rel_offset
@@ -809,6 +828,7 @@ pub(crate) struct Boot {
     pub reset: u32,
     pub requeued: u32,
     pub crashed_files: u32,
+    pub overflowed: u32,
     pub tasks: Vec<crate::memory::engine::SlotTask>,
 }
 
@@ -818,13 +838,14 @@ impl Journal {
         max_age: std::time::Duration,
         retention: std::time::Duration,
         seal_retention: std::time::Duration,
+        queue: NonZeroUsize,
     ) -> Result<(Self, Boot), JournalError> {
         let journal = Self::create(dir, max_age, retention, seal_retention)?;
-        let boot = journal.load_summary_tasks()?;
+        let boot = journal.load_summary_tasks(queue)?;
         Ok((journal, boot))
     }
 
-    pub(crate) fn load_summary_tasks(&self) -> Result<Boot, JournalError> {
+    pub(crate) fn load_summary_tasks(&self, queue: NonZeroUsize) -> Result<Boot, JournalError> {
         use std::fs;
         let _lock = self.lock.lock();
         let mut boot = Boot::default();
@@ -836,9 +857,9 @@ impl Journal {
                     let path = self.path(&previous);
                     if path.exists() {
                         fs::remove_file(path)?;
-                        boot.reset += 1;
+                        boot.reset = boot.reset.saturating_add(1);
                     }
-                    boot.crashed_files += 1;
+                    boot.crashed_files = boot.crashed_files.saturating_add(1);
                 }
             }
             fs::remove_file(&marker)?;
@@ -885,50 +906,13 @@ impl Journal {
                     Ok(Some(snapshot)) => {
                         let mut append = OpenOptions::new().append(true).open(&path)?;
                         for head in snapshot.records {
-                            let mut lowest = None;
-                            for (part, slot) in head.header.summaries.iter().enumerate() {
-                                let part = NonZeroU8::new(
-                                    u8::try_from(part + 1)
-                                        .map_err(|_invalid| JournalError::Corrupt)?,
-                                )
-                                .ok_or(JournalError::Corrupt)?;
-                                match slot {
-                                    Slot::Running => {
-                                        let line = SlotLine {
-                                            at_ms: super::millis(std::time::SystemTime::now()),
-                                            record: head.header.id,
-                                            part,
-                                            slot: Slot::Queued,
-                                            subject: Subject::Record,
-                                        };
-                                        serde_json::to_writer(
-                                            &mut append,
-                                            &SummaryLine { s: line },
-                                        )
-                                        .map_err(corrupt)?;
-                                        append.write_all(b"\n")?;
-                                        boot.requeued += 1;
-                                        lowest.get_or_insert(part);
-                                    }
-                                    Slot::Queued => {
-                                        lowest.get_or_insert(part);
-                                    }
-                                    Slot::Generated(_) | Slot::Error(_) => {}
-                                }
-                            }
-                            if let Some(part) = lowest {
-                                boot.tasks.push(crate::memory::engine::SlotTask {
-                                    stem: stem.clone(),
-                                    record: head.header.id,
-                                    part,
-                                });
-                            }
+                            boot_record(&mut append, &stem, &head, queue, &mut boot)?;
                         }
                     }
                     Ok(None) => {}
                     Err(_unloadable) => {
                         fs::remove_file(&path)?;
-                        boot.reset += 1;
+                        boot.reset = boot.reset.saturating_add(1);
                     }
                 }
                 fs::remove_file(&marker)?;
@@ -936,6 +920,80 @@ impl Journal {
         }
         Ok(boot)
     }
+}
+
+fn boot_record(
+    append: &mut File,
+    stem: &str,
+    head: &Head,
+    queue: NonZeroUsize,
+    boot: &mut Boot,
+) -> Result<(), JournalError> {
+    let mut lowest = None;
+    let at_ms = super::millis(std::time::SystemTime::now());
+    for (index, slot) in head.header.summaries.iter().enumerate() {
+        let part =
+            NonZeroU8::new(u8::try_from(index + 1).map_err(|_invalid| JournalError::Corrupt)?)
+                .ok_or(JournalError::Corrupt)?;
+        match slot {
+            Slot::Running => {
+                append_boot_slot(
+                    append,
+                    SlotLine {
+                        at_ms,
+                        record: head.header.id,
+                        part,
+                        slot: Slot::Queued,
+                        subject: Subject::Record,
+                    },
+                )?;
+                boot.requeued = boot.requeued.saturating_add(1);
+                lowest.get_or_insert(part);
+            }
+            Slot::Queued => {
+                lowest.get_or_insert(part);
+            }
+            Slot::Generated(_) | Slot::Error(_) => {}
+        }
+    }
+    if let Some(part) = lowest {
+        if boot.tasks.len() < queue.get() {
+            boot.tasks.push(crate::memory::engine::SlotTask {
+                stem: stem.to_owned(),
+                record: head.header.id,
+                part,
+            });
+        } else {
+            for index in usize::from(part.get() - 1)..head.header.summaries.len() {
+                let part = NonZeroU8::new(
+                    u8::try_from(index + 1).map_err(|_invalid| JournalError::Corrupt)?,
+                )
+                .ok_or(JournalError::Corrupt)?;
+                append_boot_slot(
+                    append,
+                    SlotLine {
+                        at_ms,
+                        record: head.header.id,
+                        part,
+                        slot: Slot::Error(SummaryError {
+                            kind: SummaryFailure::Overflow,
+                            detail: "summary queue is full".to_owned(),
+                        }),
+                        subject: Subject::Record,
+                    },
+                )?;
+                boot.overflowed = boot.overflowed.saturating_add(1);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_boot_slot(file: &mut File, line: SlotLine) -> Result<(), JournalError> {
+    let mut bytes = serde_json::to_vec(&SummaryLine { s: line }).map_err(corrupt)?;
+    bytes.push(b'\n');
+    file.write_all(&bytes)?;
+    Ok(())
 }
 
 fn valid_stem(stem: &str) -> bool {
