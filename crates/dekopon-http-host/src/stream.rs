@@ -533,6 +533,21 @@ async fn next_chunk(
         .map_err(|error| map_reqwest_error(&error))
 }
 
+fn redact_location(value: &[u8]) -> Vec<u8> {
+    let end = value.iter().position(|byte| matches!(byte, b'?' | b'#'));
+    let Some(end) = end else {
+        return value.to_vec();
+    };
+    let mut redacted = value[..end].to_vec();
+    if value[end] == b'?' {
+        redacted.extend_from_slice(b"?[redacted]");
+    }
+    if value[end..].contains(&b'#') {
+        redacted.extend_from_slice(b"#[redacted]");
+    }
+    redacted
+}
+
 impl BufferedHttpClient {
     pub(crate) fn accept_head(
         &mut self,
@@ -598,7 +613,11 @@ impl BufferedHttpClient {
             {
                 headers.push(Header {
                     name: name.as_str().to_owned(),
-                    value: value.as_bytes().to_vec(),
+                    value: if name == reqwest::header::LOCATION {
+                        redact_location(value.as_bytes())
+                    } else {
+                        value.as_bytes().to_vec()
+                    },
                 });
             }
         }
@@ -1220,6 +1239,55 @@ mod tests {
         );
         server.join();
         result.map_err(|error| error.code)
+    }
+
+    #[tokio::test]
+    async fn a_signed_location_reaches_the_guest_without_its_query_or_fragment() {
+        for (location, expected) in [
+            (
+                "https://example.blob.core.windows.net/logs/1.txt?sig=SECRET&se=...",
+                "https://example.blob.core.windows.net/logs/1.txt?[redacted]",
+            ),
+            (
+                "https://host/path?sig=SECRET#SECRET",
+                "https://host/path?[redacted]#[redacted]",
+            ),
+            (
+                "https://host/path#SECRET?SECRET",
+                "https://host/path#[redacted]",
+            ),
+            ("https://host/path", "https://host/path"),
+            (
+                "unusual relative path?SECRET#SECRET",
+                "unusual relative path?[redacted]#[redacted]",
+            ),
+            ("/path?", "/path?[redacted]"),
+            ("/path#", "/path#[redacted]"),
+        ] {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            for path in [Path::Send, Path::Stream] {
+                let (headers, _) = fetch(path, "POST", response.as_bytes(), 4096, None)
+                    .await
+                    .expect("redirect headers reach the guest");
+                assert_eq!(
+                    headers
+                        .iter()
+                        .find(|header| header.name == "location")
+                        .unwrap()
+                        .value,
+                    expected.as_bytes()
+                );
+                assert!(headers.iter().all(|header| {
+                    !header.name.contains("SECRET")
+                        && !header
+                            .value
+                            .windows(b"SECRET".len())
+                            .any(|bytes| bytes == b"SECRET")
+                }));
+            }
+        }
     }
 
     fn encoded(encoding: &str, body: &[u8]) -> Vec<u8> {
