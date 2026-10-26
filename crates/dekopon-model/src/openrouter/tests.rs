@@ -210,7 +210,7 @@ fn a_large_indexed_stream_completes_with_all_reasoning_and_calls() {
             )
             .unwrap();
     }
-    let turn = stream.finish(&ClientIdentity::new(), secrets).unwrap();
+    let turn = stream.finish(&ModelKey::fixture(), secrets).unwrap();
     assert_eq!(turn.tool_calls.len(), count);
     let replay = turn.openrouter_replay().unwrap();
     assert_eq!(replay.reasoning.len(), count);
@@ -248,7 +248,7 @@ fn indexed_merges_preserve_first_seen_order_and_unindexed_reasoning() {
             secrets,
         )
         .unwrap();
-    let turn = stream.finish(&ClientIdentity::new(), secrets).unwrap();
+    let turn = stream.finish(&ModelKey::fixture(), secrets).unwrap();
     let replay = turn.openrouter_replay().unwrap();
     assert_eq!(
         replay.reasoning,
@@ -1029,24 +1029,22 @@ async fn openrouter_trace_records_requested_controls_and_native_usage_without_pr
 }
 
 #[tokio::test]
-async fn a_public_router_override_rejects_remote_hosts_and_invalidates_native_replay() {
-    let server = MockServer::start(vec![MockResponse::sse(TOOL)]);
+async fn a_public_router_override_rejects_remote_hosts_and_keeps_model_identity() {
+    let server = MockServer::start(vec![MockResponse::sse(TOOL), MockResponse::sse(ANSWER)]);
     let client = client(&server, Settings::default());
     let first = generate(&client, &[]).await.unwrap();
     let client = client.with_loopback_endpoint(&server.base_url()).unwrap();
-    assert!(matches!(
-        generate(&client, &[assistant_message(&first)]).await,
-        Err(InferenceError::Protocol(
-            ProtocolFailure::ContinuationMismatch
-        ))
-    ));
+    let answer = generate(&client, &[assistant_message(&first)])
+        .await
+        .unwrap();
+    assert_eq!(answer.content.as_deref(), Some("done"));
     assert!(matches!(
         client.with_loopback_endpoint("https://openrouter.ai/api/v1/chat/completions"),
         Err(InferenceError::InvalidRequest(
             RequestError::InvalidLoopbackEndpoint
         ))
     ));
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.requests().len(), 2);
     requests_have_only_the_authored_headers(&server);
 }
 
@@ -1215,4 +1213,160 @@ async fn router_span_tool_options_equal_the_sent_body() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     crate::trace_capture::assert_tool_options(&span, &request_json(&requests[0]));
+}
+
+#[tokio::test]
+async fn a_reported_model_echoing_the_credential_is_redacted_in_the_key() {
+    let body = TOOL.replace("vendor/model", "synthetic-key");
+    let server = MockServer::start(vec![MockResponse::sse(&body)]);
+    let client = client(&server, Settings::default());
+    let turn = generate(&client, &[]).await.unwrap();
+    let key = turn.model_key().unwrap();
+    assert_eq!(key.reported(), Some("[REDACTED]"));
+    assert!(!format!("{key:?}").contains("synthetic-key"));
+    assert!(
+        !serde_json::to_string(key)
+            .unwrap()
+            .contains("synthetic-key")
+    );
+    assert_eq!(client.model_key(), *key);
+}
+
+#[tokio::test]
+async fn unequal_reported_models_under_one_alias_strip_opaque_reasoning() {
+    let server = MockServer::start(vec![
+        MockResponse::sse(TOOL),
+        MockResponse::sse(&TOOL.replace("vendor/model", "reported-b")),
+        MockResponse::sse(ANSWER),
+    ]);
+    let client_a = client(&server, Settings::default());
+    let turn_a = generate(&client_a, &[]).await.unwrap();
+    let client_b = client(&server, Settings::default());
+    let turn_b = generate(&client_b, &[]).await.unwrap();
+    assert_ne!(turn_a.model_key(), turn_b.model_key());
+    assert!(
+        turn_a
+            .model_key()
+            .unwrap()
+            .is_for(crate::model::Backend::OpenRouter, "vendor/model")
+    );
+    generate(&client_b, &[assistant_message(&turn_a)])
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let assistant = &request_json(&requests[2])["messages"][0];
+    assert!(assistant.get("reasoning_details").is_none());
+    assert_eq!(
+        assistant["tool_calls"][0]["function"]["arguments"],
+        turn_a.tool_calls[0].function.arguments
+    );
+}
+
+#[tokio::test]
+async fn a_reported_model_drift_retries_once_without_opaque_reasoning() {
+    let changed = format!("data: {{\"model\":\"reported-b\"}}\n\n{ANSWER}");
+    let server = MockServer::start(vec![
+        MockResponse::sse(TOOL),
+        MockResponse::sse(&changed),
+        MockResponse::sse(&changed),
+    ]);
+    let client = client(&server, Settings::default());
+    let turn = generate(&client, &[]).await.unwrap();
+    let mut events = Vec::new();
+    let answer = client
+        .generate(
+            GenerateRequest {
+                messages: &[assistant_message(&turn)],
+                tools: &[],
+                options: &CompletionOptions::default(),
+            },
+            &mut |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            },
+            &control(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer.model_key().unwrap().reported(), Some("reported-b"));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    let first = request_json(&requests[1]);
+    let retry = request_json(&requests[2]);
+    assert!(first["messages"][0].get("reasoning_details").is_some());
+    assert!(retry["messages"][0].get("reasoning_details").is_none());
+    assert_eq!(
+        retry["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        turn.tool_calls[0].function.arguments
+    );
+    let text: String = events
+        .iter()
+        .map(|event| match event {
+            TurnEvent::TextDelta(text) => text.as_str(),
+        })
+        .collect();
+    assert_eq!(text, "done");
+}
+
+#[tokio::test]
+async fn replayed_reasoning_flushes_pre_model_text_and_streams_before_the_terminal_event() {
+    let before = json!({"choices":[{"delta":{"content":"before "}}]});
+    let identified = json!({"model":"vendor/model","choices":[{"delta":{"content":"after "}}]});
+    let live = json!({"choices":[{"delta":{"content":"live"}}]});
+    let prefix = format!("data: {before}\n\ndata: {identified}\n\ndata: {live}\n\n");
+    let terminal = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    let body = format!("{prefix}data: {terminal}\n\ndata: [DONE]\n\n");
+    let (response, waiting, release) = MockResponse::sse(&body).stalled_after(prefix.len());
+    let server = MockServer::start(vec![MockResponse::sse(TOOL), response]);
+    let client = client(&server, Settings::default());
+    let first = generate(&client, &[]).await.unwrap();
+    let (seen, observed) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut seen = Some(seen);
+        let answer = client
+            .generate(
+                GenerateRequest {
+                    messages: &[
+                        assistant_message(&first),
+                        ModelMessage::tool(first.tool_calls[0].id.clone(), "done"),
+                    ],
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
+                &mut |event| {
+                    let TurnEvent::TextDelta(text) = event;
+                    events.push(text.as_str().to_owned());
+                    if text.as_str() == "live"
+                        && let Some(seen) = seen.take()
+                    {
+                        let _closed = seen.send(());
+                    }
+                    ControlFlow::Continue(())
+                },
+                &control(),
+            )
+            .await;
+        (answer, events)
+    });
+    waiting.await.unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(2), observed).await;
+    release.send(()).unwrap();
+    let (answer, events) = task.await.unwrap();
+    observed
+        .expect("live delta before releasing terminal event")
+        .unwrap();
+    assert_eq!(events, ["before ", "after ", "live"]);
+    assert_eq!(
+        answer.unwrap().content.as_deref(),
+        Some("before after live")
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        request_json(&requests[1])["messages"][0]
+            .get("reasoning_details")
+            .is_some()
+    );
 }

@@ -152,7 +152,7 @@ pub(crate) fn suggest_improvement_into(
     suggestions: &mut Vec<ImprovementSuggestion>,
     call: &ModelToolCall,
     model_turn: u32,
-) -> Result<(), PromptError> {
+) -> Result<crate::memory::Outcome, PromptError> {
     let raw = match raw_suggestion(&call.function.name, &call.function.arguments) {
         Ok(raw) => raw,
         Err(error) => {
@@ -169,7 +169,7 @@ pub(crate) fn suggest_improvement_into(
                  this one was not recorded. Continue with the task."
             ),
         ));
-        return Ok(());
+        return Ok(crate::memory::Outcome::Refused);
     }
     let suggestion = match validate(raw) {
         Ok(suggestion) => suggestion,
@@ -179,7 +179,7 @@ pub(crate) fn suggest_improvement_into(
                 call.id.clone(),
                 format!("Suggestion not recorded: {message} Fix it and call again, or continue."),
             ));
-            return Ok(());
+            return Ok(crate::memory::Outcome::Refused);
         }
     };
     let index = suggestions.len() + 1;
@@ -207,7 +207,7 @@ pub(crate) fn suggest_improvement_into(
              Continue with the task, or finish."
         ),
     ));
-    Ok(())
+    Ok(crate::memory::Outcome::Exit(0))
 }
 
 fn refuse(model_turn: u32, call_id: &str, reason: &'static str) {

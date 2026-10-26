@@ -150,7 +150,7 @@ pub(crate) fn wake_into(
     registrar: &dyn WakeRegistrar,
     call: &ModelToolCall,
     model_turn: u32,
-) -> Result<(), PromptError> {
+) -> Result<crate::memory::Outcome, PromptError> {
     let request = match serde_json::from_str::<WakeCall>(&call.function.arguments) {
         Ok(request) => request,
         Err(source) => {
@@ -197,6 +197,11 @@ pub(crate) fn wake_into(
             .cancel(WakeId(id))
             .map(|()| format!("Cancelled wake {id}.")),
     };
+    let outcome = if result.is_ok() {
+        crate::memory::Outcome::Exit(0)
+    } else {
+        crate::memory::Outcome::Refused
+    };
     let text = match result {
         Ok(text) => text,
         Err(refusal) => {
@@ -214,7 +219,7 @@ pub(crate) fn wake_into(
         }
     };
     messages.push(ModelMessage::tool(call.id.clone(), text));
-    Ok(())
+    Ok(outcome)
 }
 
 fn render(summary: &WakeSummary) -> String {

@@ -61,6 +61,10 @@ impl OpenAiClient {
         })
     }
 
+    pub fn model_key(&self) -> crate::model::ModelKey {
+        crate::model::ModelKey::new(crate::model::Backend::OpenAiCompatible, &self.model)
+    }
+
     #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
@@ -88,11 +92,6 @@ impl OpenAiClient {
             .run(async {
                 let mut messages = Vec::with_capacity(request.messages.len());
                 for message in request.messages {
-                    if let ModelMessage::Assistant { turn } = message
-                        && !turn.is_portable()
-                    {
-                        return Err(ProtocolFailure::ContinuationMismatch.into());
-                    }
                     messages.push(WireMessage::prepare(message).await?);
                 }
                 let tools = request
@@ -148,7 +147,12 @@ impl OpenAiClient {
                 .buffered(control, |bytes| {
                     let response: ChatResponse = serde_json::from_slice(bytes)
                         .map_err(|error| secrets.decode_failure(error))?;
+                    let reported = response
+                        .model
+                        .as_deref()
+                        .map(|model| secrets.sanitize(model));
                     turn_from_response(secrets, response)
+                        .map(|turn| turn.with_model_key(self.model_key().with_reported(reported)))
                 })
                 .await;
         }
@@ -187,8 +191,10 @@ impl OpenAiClient {
             record_phase(crate::error::FailurePhase::ReadingBody);
             return Err(ProtocolFailure::MissingTerminal.into());
         }
+        let reported = state.model.as_deref().map(|model| secrets.sanitize(model));
         state
             .into_turn(secrets)
+            .map(|turn| turn.with_model_key(self.model_key().with_reported(reported)))
             .inspect_err(|_| record_phase(crate::error::FailurePhase::ReadingBody))
     }
 }
@@ -930,7 +936,7 @@ mod tests {
     use crate::diagnostic::DiagnosticSecrets;
     use crate::error::{AuthError, RateLimitError};
     use crate::mock::{MockResponse, MockServer};
-    use crate::model::{ChatModel, ClientIdentity, CompletionOptions, assistant_message};
+    use crate::model::{ChatModel, CompletionOptions, ModelKey, assistant_message};
     use crate::{
         control::TurnControl,
         inference::{GenerateRequest, InferenceModel},
@@ -1075,6 +1081,44 @@ mod tests {
             let body: Value =
                 serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
             crate::trace_capture::assert_tool_options(&span, &body);
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_models_never_retain_the_bearer_token_in_either_response_mode() {
+        for stream in [true, false] {
+            let body = json!({"model":"sk-reviewer-canary","choices":[{"message":{"content":"ok"},"delta":{"content":"ok"},"finish_reason":"stop"}]});
+            let response = if stream {
+                MockResponse::sse(&format!("data: {body}\n\ndata: [DONE]\n\n"))
+            } else {
+                MockResponse::json(body)
+            };
+            let server = MockServer::start(vec![response]);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "configured",
+                Some("sk-reviewer-canary".to_owned()),
+                Duration::from_secs(2),
+            )
+            .unwrap()
+            .with_streaming(stream);
+            let turn = generate(
+                &client,
+                &[],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
+            .await
+            .unwrap();
+            let key = turn.model_key().unwrap();
+            assert_eq!(key.reported(), Some("[REDACTED]"));
+            assert!(!format!("{key:?}").contains("sk-reviewer-canary"));
+            assert!(
+                !serde_json::to_string(key)
+                    .unwrap()
+                    .contains("sk-reviewer-canary")
+            );
         }
     }
 
@@ -1456,13 +1500,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_foreign_native_continuation_is_refused_before_sending() {
-        let server = MockServer::start(Vec::new());
+    async fn foreign_reasoning_is_dropped_without_losing_portable_text() {
+        let server = MockServer::start(vec![MockResponse::sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
         let client =
             OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
         let turn = AssistantTurn::new(Some("portable projection".into()), Vec::new(), None)
-            .with_codex_continuation(Vec::new(), ClientIdentity::new(), None);
-        let error = generate(
+            .with_codex_continuation(
+                vec![json!({"type":"reasoning","encrypted_content":"opaque-canary"})],
+                ModelKey::fixture(),
+                None,
+            );
+        generate(
             &client,
             &[assistant_message(&turn)],
             &[],
@@ -1470,12 +1520,13 @@ mod tests {
             &mut ignored,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            InferenceError::Protocol(crate::error::ProtocolFailure::ContinuationMismatch)
-        ));
-        assert!(server.requests().is_empty());
+        .unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let body: Value =
+            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["messages"][0]["content"], "portable projection");
+        assert!(!requests[0].contains("opaque-canary"));
     }
 
     #[tokio::test]
@@ -2242,7 +2293,7 @@ mod tests {
         )
         .with_codex_continuation(
             vec![json!({"type":"reasoning","encrypted_content":"native-sentinel"})],
-            ClientIdentity::new(),
+            ModelKey::fixture(),
             None,
         );
         let cases = [
