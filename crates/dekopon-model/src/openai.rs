@@ -147,7 +147,10 @@ impl OpenAiClient {
                 .buffered(control, |bytes| {
                     let response: ChatResponse = serde_json::from_slice(bytes)
                         .map_err(|error| secrets.decode_failure(error))?;
-                    let reported = response.model.clone();
+                    let reported = response
+                        .model
+                        .as_deref()
+                        .map(|model| secrets.sanitize(model));
                     turn_from_response(secrets, response)
                         .map(|turn| turn.with_model_key(self.model_key().with_reported(reported)))
                 })
@@ -188,7 +191,7 @@ impl OpenAiClient {
             record_phase(crate::error::FailurePhase::ReadingBody);
             return Err(ProtocolFailure::MissingTerminal.into());
         }
-        let reported = state.model.clone();
+        let reported = state.model.as_deref().map(|model| secrets.sanitize(model));
         state
             .into_turn(secrets)
             .map(|turn| turn.with_model_key(self.model_key().with_reported(reported)))
@@ -1078,6 +1081,44 @@ mod tests {
             let body: Value =
                 serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
             crate::trace_capture::assert_tool_options(&span, &body);
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_models_never_retain_the_bearer_token_in_either_response_mode() {
+        for stream in [true, false] {
+            let body = json!({"model":"sk-reviewer-canary","choices":[{"message":{"content":"ok"},"delta":{"content":"ok"},"finish_reason":"stop"}]});
+            let response = if stream {
+                MockResponse::sse(&format!("data: {body}\n\ndata: [DONE]\n\n"))
+            } else {
+                MockResponse::json(body)
+            };
+            let server = MockServer::start(vec![response]);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "configured",
+                Some("sk-reviewer-canary".to_owned()),
+                Duration::from_secs(2),
+            )
+            .unwrap()
+            .with_streaming(stream);
+            let turn = generate(
+                &client,
+                &[],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
+            .await
+            .unwrap();
+            let key = turn.model_key().unwrap();
+            assert_eq!(key.reported(), Some("[REDACTED]"));
+            assert!(!format!("{key:?}").contains("sk-reviewer-canary"));
+            assert!(
+                !serde_json::to_string(key)
+                    .unwrap()
+                    .contains("sk-reviewer-canary")
+            );
         }
     }
 
