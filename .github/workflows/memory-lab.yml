@@ -62,6 +62,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
+      BASH_ENV: ${{ runner.temp }}/memory-lab.bash
       CANDIDATE: ${{ github.event.pull_request.head.sha || inputs.candidate }}
       PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile || 'fake' }}
       SCENARIOS: ${{ inputs.scenarios || 'baseline flood summarizer-hang summarizer-fail summarizer-refuse unloadable-journal restart-mid-summary summaries-off-vs-on' }}
@@ -79,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PYINPUT'
-          import math, os, re, sys
+          import json, math, os, re, sys
           sys.path.insert(0, 'lab/memory')
           import report
           def reject(reason):
@@ -102,7 +103,7 @@ jobs:
           if not math.isfinite(cap) or not 0 < cap <= 2:
               reject('max_usd must be greater than zero and at most 2')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write('selected= ' + ' '.join(names) + ' \n')
+              out.write('selected=' + json.dumps(names) + '\n')
               out.write('short=' + os.environ['CANDIDATE'][:8] + '\n')
           PYINPUT
           git fetch --no-tags origin "$LAB_HARNESS_SHA"
@@ -124,47 +125,47 @@ jobs:
           }
           BASH
       - name: baseline (required)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' baseline ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'baseline') }}
         continue-on-error: true
         shell: bash
         run: run_scenario baseline
       - name: flood (required)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' flood ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'flood') }}
         continue-on-error: true
         shell: bash
         run: run_scenario flood
       - name: summarizer-hang (required)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summarizer-hang ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summarizer-hang') }}
         continue-on-error: true
         shell: bash
         run: run_scenario summarizer-hang
       - name: summarizer-fail (required)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summarizer-fail ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summarizer-fail') }}
         continue-on-error: true
         shell: bash
         run: run_scenario summarizer-fail
       - name: summarizer-refuse (required)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summarizer-refuse ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summarizer-refuse') }}
         continue-on-error: true
         shell: bash
         run: run_scenario summarizer-refuse
       - name: unloadable-journal (required)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' unloadable-journal ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'unloadable-journal') }}
         continue-on-error: true
         shell: bash
         run: run_scenario unloadable-journal
       - name: restart-mid-summary (exploratory)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' restart-mid-summary ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'restart-mid-summary') }}
         continue-on-error: true
         shell: bash
         run: run_scenario restart-mid-summary
       - name: summaries-off-vs-on (exploratory)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summaries-off-vs-on ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'summaries-off-vs-on') }}
         continue-on-error: true
         shell: bash
         run: run_scenario summaries-off-vs-on
       - name: config-check (exploratory)
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' config-check ') }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(fromJSON(steps.prepare.outputs.selected || '[]'), 'config-check') }}
         continue-on-error: true
         shell: bash
         run: run_scenario config-check
