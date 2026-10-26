@@ -121,6 +121,20 @@ class ExitContract(unittest.TestCase):
         result = self.run_lab(0, "lab: fail: no reply waited on a summary", "--diagnostic")
         self.assertIn("diagnostic: verdict not enforced", result.stdout.splitlines())
 
+    def test_slot_resume_without_slot_evidence_is_exploratory(self):
+        self.meta["scenario"] = "restart-mid-summary"
+        self.record(1)
+        self.run_lab(0, "lab: exploratory: exploratory: not a regression assertion")
+        verdict = json.loads(next((self.lab / "runs").glob("*/verdict.json")).read_text())
+        self.assertEqual(verdict["assertions"][-1]["result"], "not-applicable")
+
+    def test_diagnostic_mode_is_recorded_in_the_human_summary(self):
+        self.meta["diagnostic"] = True
+        self.record(16000)
+        self.run_lab(0, "lab: fail: no reply waited on a summary", "--diagnostic")
+        summary = next((self.lab / "runs").glob("*/summary.md")).read_text()
+        self.assertIn("diagnostic: verdict not enforced", summary.splitlines())
+
     def test_no_turns_are_missing_evidence(self):
         (self.recorded / "latency.csv").write_text("kind,conversation,phase,wall_ms,summary_in_flight\n")
         self.run_lab(4, "lab: missing-evidence: report.py failed")

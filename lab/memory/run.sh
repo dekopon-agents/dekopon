@@ -9,6 +9,7 @@ usage() {
 
 lab="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${LAB_SUPERVISED:-}" != 1 ]; then
+  command -v python3 >/dev/null || { echo "lab: infrastructure: missing required command: python3" >&2; exit 5; }
   exec python3 "$lab/contract.py" "$@"
 fi
 trap 'echo "lab: infrastructure: runner command failed" >&2; exit 5' ERR
@@ -60,6 +61,22 @@ mkdir -p "$run" "$state/bin"
 chmod 0755 "$state" "$state/bin"
 printf '%s\n' "$run" >"$LAB_RUN_POINTER"
 echo "run directory: $run"
+container="dekopon-lab-otel-$$"
+cleanup() {
+  status=$?
+  set +e
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    docker stop --time 10 "$container" >/dev/null
+    docker logs "$container" >"$run/collector.log" 2>&1
+    docker rm "$container" >/dev/null
+  fi
+  rm -rf "$state"
+  exit "$status"
+}
+trap 'cleanup' EXIT
+trap 'exit 5' INT
+trap 'exit 5' TERM
+
 src="$work/src/$sha"
 target="$work/target"
 overlay=None
@@ -107,21 +124,6 @@ else
   separation="one shared UID: the lab is not running as root"
 fi
 
-container="dekopon-lab-otel-$$"
-cleanup() {
-  status=$?
-  set +e
-  if docker container inspect "$container" >/dev/null 2>&1; then
-    docker stop --time 10 "$container" >/dev/null
-    docker logs "$container" >"$run/collector.log" 2>&1
-    docker rm "$container" >/dev/null
-  fi
-  rm -rf "$state"
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 5' INT
-trap 'exit 5' TERM
 
 docker run --detach --name "$container" --network host --user 0 \
   --env "LAB_OTLP_PORT=$otlp_port" \

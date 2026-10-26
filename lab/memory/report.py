@@ -254,7 +254,6 @@ def verdicts(meta, turns, replies, summaries, events, slot_events, resets, ref8)
         if not slot_events:
             assertions.append({"name": "slot resume", "result": "not-applicable", "numbers": {},
                                "required": LABELS[scenario] == "required"})
-            assertion("slot resume", bool(resumed), resumed=resumed)
             lines.append(f"- slot resume: **not applicable at {ref8}** (no summary slot events or files; "
                          f"the summarizer was re-called {findings.get('summarizer re-called for killed turn after restart')} "
                          "times for the killed turn)")
