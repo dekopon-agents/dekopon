@@ -5,7 +5,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 DESTINATION [jsonplaceholder|memory-chat ...]" >&2
+  echo "usage: $0 DESTINATION [jsonplaceholder|memory-chat|gh ...]" >&2
   exit 2
 fi
 
@@ -17,20 +17,22 @@ tracked=$(git -C "$root" ls-files -- \
   examples/providers/jsonplaceholder examples/providers/jsonplaceholder-provider.wasm \
   examples/providers/jsonplaceholder-provider.wasm.sha256 \
   examples/providers/memory-chat examples/providers/memory-chat-provider.wasm \
-  examples/providers/memory-chat-provider.wasm.sha256)
+  examples/providers/memory-chat-provider.wasm.sha256 \
+  examples/providers/gh examples/providers/gh-provider.wasm \
+  examples/providers/gh-provider.wasm.sha256)
 [[ -z "$tracked" ]] || {
   echo 'error: standalone provider source or generated Wasm is tracked in core:' >&2
   printf '%s\n' "$tracked" >&2
   exit 1
 }
 if [[ ${#providers[@]} -eq 0 ]]; then
-  providers=(jsonplaceholder memory-chat)
+  providers=(jsonplaceholder memory-chat gh)
 fi
 
 seen=' '
 for provider in "${providers[@]}"; do
   case "$provider" in
-    jsonplaceholder|memory-chat) ;;
+    jsonplaceholder|memory-chat|gh) ;;
     *)
       echo "error: unknown external provider: $provider" >&2
       exit 2
@@ -94,6 +96,16 @@ fetch_provider() {
       source_ref=refs/tags/v0.3.0
       source_digest=2deb4e8931c025055ec2f7ba96ca124d894093f5
       ;;
+    gh)
+      repository=dekopon-agents/dekopon-provider-gh
+      asset=gh-provider.wasm
+      release=v0.11.1
+      expected_sha=b2abb6a8a2dec689cb345b2b394b41a291d66196b2672a8fd86a014fe5cdee32
+      expected_size=2915587
+      signer=dekopon-agents/provider-workflows/.github/workflows/release.yml
+      source_ref=refs/tags/v0.11.1
+      source_digest=f207a05b35a1080165389d9a46af3bb3dbd7a52e
+      ;;
     memory-chat)
       repository=dekopon-agents/dekopon-provider-memory-chat
       asset=memory-chat-provider.wasm
@@ -115,9 +127,9 @@ fetch_provider() {
   local provider_work="$work/$provider"
   local base="https://github.com/$repository/releases/download/$release"
   mkdir -p "$provider_work"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  curl --user-agent dekopon-fixture-fetch --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     "$base/$asset" --output "$provider_work/$asset"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  curl --user-agent dekopon-fixture-fetch --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     "$base/$asset.sha256" --output "$provider_work/$asset.sha256"
 
   local published actual size
@@ -155,6 +167,7 @@ publish_provider() {
   case "$provider" in
     jsonplaceholder) asset=jsonplaceholder-provider.wasm ;;
     memory-chat) asset=memory-chat-provider.wasm ;;
+    gh) asset=gh-provider.wasm ;;
   esac
 
   local component_temp sidecar_temp

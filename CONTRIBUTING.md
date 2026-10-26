@@ -19,7 +19,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --lock
 cargo machete
 ```
 
-The fetch installs the ignored echo, JSONPlaceholder, and memory-chat fixtures that core tests read. The complete gate list is in [Root workspace](docs/development.md#root-workspace).
+The fetch installs the ignored JSONPlaceholder, memory-chat, and gh fixtures that core tests read. The complete gate list is in [Root workspace](docs/development.md#root-workspace).
 
 Install `cargo-deny` to run the dependency policy:
 
