@@ -534,7 +534,9 @@ fn log_filter<S>(directive: &str) -> impl tracing_subscriber::layer::Filter<S> +
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
+    use tracing::subscriber::Interest;
     use tracing_subscriber::filter::{FilterExt as _, dynamic_filter_fn};
+
     otlp_filter(directive)
         .or(dynamic_filter_fn(|metadata, _| {
             metadata.is_event()
@@ -542,6 +544,13 @@ where
                 && opentelemetry::Context::current()
                     .get::<crate::EventStringArray>()
                     .is_some()
+        })
+        .with_callsite_filter(|metadata| {
+            if metadata.is_event() && metadata.fields().field("audit.event").is_some() {
+                Interest::sometimes()
+            } else {
+                Interest::never()
+            }
         }))
         .and(EnvFilter::new(format!("trace,{EXPORTER_DIAGNOSTICS_OFF}")))
 }
