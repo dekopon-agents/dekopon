@@ -24,6 +24,7 @@ mod clock;
 mod http;
 pub mod provider;
 mod random;
+pub mod signed_download;
 mod spawn;
 mod storage;
 

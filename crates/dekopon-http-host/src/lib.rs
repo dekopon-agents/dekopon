@@ -12,7 +12,9 @@
     )
 )]
 pub mod asset;
+mod signed_download;
 mod stream;
+pub use signed_download::{Coverage, DownloadError, DownloadResponse, Window};
 pub use stream::{
     CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
 };
@@ -1901,6 +1903,7 @@ mod tests {
             allow_plaintext_loopback: true,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         }
     }
 

@@ -672,6 +672,7 @@ fn a_flag_false_http_constraint_set_encodes_as_before_the_field_existed() {
             allow_plaintext_loopback: false,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         }),
         ..ExecutionConstraints::default()
     };
@@ -713,6 +714,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
             allow_plaintext_loopback: false,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         }),
         storage: None,
         secret_use: None,
@@ -990,6 +992,7 @@ fn policy_http_scope_values_are_bounded() {
         allow_plaintext_loopback: false,
         propagate_trace: false,
         request_templates: Vec::new(),
+        signed_download: None,
     };
     assert!(super::validate_set_constraints(&constrain(valid.clone())).is_ok());
 
@@ -1212,6 +1215,7 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         allow_plaintext_loopback: false,
         propagate_trace: false,
         request_templates: Vec::new(),
+        signed_download: None,
     });
     assert!(matches!(
         super::validate_set_constraints(&set),
@@ -1366,6 +1370,7 @@ fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
     );
     let untemplated = HttpConstraints {
         request_templates: Vec::new(),
+        signed_download: None,
         ..every_slot
     };
     assert_eq!(

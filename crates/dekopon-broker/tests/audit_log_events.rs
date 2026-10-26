@@ -110,6 +110,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
             allow_plaintext_loopback: true,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         }),
         storage: None,
         secret_use: None,

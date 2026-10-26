@@ -156,6 +156,14 @@ pub struct HttpConstraints {
     pub propagate_trace: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_templates: Vec<RequestTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_download: Option<SignedDownload>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SignedDownload {
+    GithubActionsLogsV1,
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -988,6 +996,7 @@ mod tests {
             allow_plaintext_loopback: false,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         };
         let cases = [
             (
@@ -1157,6 +1166,7 @@ mod tests {
             allow_plaintext_loopback: true,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         };
 
         http.validate().expect("an exact grant is enforceable");
@@ -1199,6 +1209,7 @@ mod tests {
                 allow_plaintext_loopback: false,
                 propagate_trace: false,
                 request_templates: Vec::new(),
+                signed_download: None,
             }),
             ..ExecutionConstraints::default()
         };

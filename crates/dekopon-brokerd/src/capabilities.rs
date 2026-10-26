@@ -53,6 +53,7 @@ pub struct HttpPatch {
     pub allow_plaintext_loopback: Option<bool>,
     pub propagate_trace: Option<bool>,
     pub request_templates: Option<Vec<RequestTemplate>>,
+    pub signed_download: Option<dekopon_capability::SignedDownload>,
 }
 
 fn deserialize_default_secret_use<'de, D>(
@@ -107,6 +108,7 @@ impl ConstraintsPatch {
                         max_response_bytes: http
                             .max_response_bytes
                             .ok_or_else(|| missing("http.maxResponseBytes"))?,
+                        signed_download: http.signed_download,
                         allow_plaintext_loopback: http.allow_plaintext_loopback.unwrap_or(false),
                         propagate_trace: http.propagate_trace.unwrap_or(false),
                         request_templates: http.request_templates.unwrap_or_default(),
@@ -138,6 +140,7 @@ impl HttpPatch {
                 .allow_plaintext_loopback
                 .or(base.allow_plaintext_loopback),
             propagate_trace: self.propagate_trace.or(base.propagate_trace),
+            signed_download: self.signed_download.or(base.signed_download),
             request_templates: self
                 .request_templates
                 .clone()

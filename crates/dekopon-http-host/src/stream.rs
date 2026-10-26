@@ -639,7 +639,7 @@ impl BufferedHttpClient {
         })
     }
 
-    fn asset_error(&mut self, error: AssetIoError) -> HttpError {
+    pub(super) fn asset_error(&mut self, error: AssetIoError) -> HttpError {
         if matches!(error, AssetIoError::OverBudget) {
             self.asset_over_budget = true;
         }
@@ -699,6 +699,7 @@ mod tests {
                 allow_plaintext_loopback: true,
                 propagate_trace: false,
                 request_templates: Vec::new(),
+                signed_download: None,
             },
             credential,
             HttpHostCeilings::default(),
@@ -1261,6 +1262,7 @@ mod tests {
             allow_plaintext_loopback: false,
             propagate_trace: false,
             request_templates: Vec::new(),
+            signed_download: None,
         };
         let mut client = BufferedHttpClient::authorized(
             grant,
@@ -1454,6 +1456,7 @@ mod tests {
                     allow_plaintext_loopback: false,
                     propagate_trace: false,
                     request_templates: Vec::new(),
+                    signed_download: None,
                 },
                 HttpHostCeilings {
                     loopback_https_pin: Some(pin),
