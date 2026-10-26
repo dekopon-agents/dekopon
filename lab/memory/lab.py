@@ -155,7 +155,8 @@ class Lab:
             "routes": [route("summary", summary_memory),
                        route("plain", {"mode": "persistent", "recall": "journal"}),
                        route("none", {"mode": "persistent", "recall": "none"})],
-            "sessions": {"journal": {"path": str(self.journal)}},
+            "sessions": {"journal": {"path": str(self.journal)},
+                         "assets": {"path": str(self.dirs["gateway"] / "assets")}},
             "shutdownGraceMs": 15000,
             "telemetry": {"endpoint": self.args.otlp, "transport": "http",
                           "serviceName": "lab-gatewayd", "exportTimeoutMs": 5000}})
