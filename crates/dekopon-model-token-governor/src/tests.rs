@@ -711,3 +711,59 @@ fn the_estimate_takes_the_larger_of_the_bytes_and_the_hint() {
     assert_eq!(Estimate::output_reserve(Some(7), true), Tokens(7));
     assert_eq!(Estimate::output_reserve(None, false), Tokens(1_024));
 }
+
+#[test]
+fn a_summary_call_writes_one_meter_record_and_is_never_admitted() {
+    let (metering, _) = metering(100);
+    let (records, _subscriber) = capture();
+    let mut summary = call("astra");
+    summary.via = Via::Summary;
+    let mut guard = Metering::unadmitted(summary, estimate(1_000_000));
+    guard.observe_text(7);
+    guard.finish(
+        Some(ModelUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(20),
+            ..ModelUsage::default()
+        }),
+        7,
+        Outcome::Succeeded,
+        None,
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records.field(0, "meter.via"), "summary");
+    assert_eq!(records.field(0, "usage.input_tokens"), "i64:1000000");
+    assert_eq!(used(&metering), 0);
+    assert!(metering.admit(call("astra"), estimate(10)).is_ok());
+}
+
+#[test]
+fn an_unadmitted_panic_or_cancel_still_records_exactly_once() {
+    let (records, _subscriber) = capture();
+    let panic = std::panic::catch_unwind(|| {
+        let _guard = Metering::unadmitted(
+            Call {
+                via: Via::Summary,
+                ..call("astra")
+            },
+            estimate(10),
+        );
+        panic!("synthetic summary panic");
+    });
+    assert!(panic.is_err());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records.field(0, "outcome"), "failed");
+    assert_eq!(records.field(0, "error.kind"), "panicked");
+    let mut guard = Metering::unadmitted(
+        Call {
+            via: Via::Summary,
+            ..call("astra")
+        },
+        estimate(10),
+    );
+    guard.observe_text(7);
+    drop(guard);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records.field(1, "outcome"), "cancelled");
+    assert_eq!(records.field(1, "meter.via"), "summary");
+}

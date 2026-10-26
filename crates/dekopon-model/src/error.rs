@@ -136,7 +136,7 @@ impl std::fmt::Display for ProviderFailure {
 }
 
 impl ProviderFailure {
-    pub(crate) fn new(status: u16, diagnostic: &str) -> Self {
+    pub fn new(status: u16, diagnostic: &str) -> Self {
         Self {
             phase: FailurePhase::ReadingBody,
             code: None,

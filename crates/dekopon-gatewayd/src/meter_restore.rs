@@ -224,7 +224,7 @@ pub(crate) fn openobserve_query(stream: &str, window: Window) -> serde_json::Val
     let sql = format!(
         "SELECT histogram(_timestamp, '{} seconds') AS b, agent, model_name, \
          SUM(usage_input_tokens) AS input, SUM(usage_output_tokens) AS output \
-         FROM \"{stream}\" WHERE meter_schema = 1 AND outcome != 'refused' \
+         FROM \"{stream}\" WHERE meter_schema = 1 AND outcome != 'refused' AND (meter_via IS NULL OR meter_via != 'summary') \
          GROUP BY b, agent, model_name ORDER BY b",
         window.bucket.as_secs()
     );
@@ -241,7 +241,7 @@ pub(crate) fn openobserve_query(stream: &str, window: Window) -> serde_json::Val
 
 pub(crate) fn quickwit_query(window: Window) -> serde_json::Value {
     json!({
-        "query": "attributes.meter.schema:1 AND NOT attributes.outcome:refused",
+        "query": "attributes.meter.schema:1 AND NOT attributes.outcome:refused AND NOT attributes.meter.via:summary",
         "max_hits": 0,
         "start_timestamp": window.since.0.div_euclid(1_000),
         "end_timestamp": window.until.0.div_euclid(1_000),
@@ -557,6 +557,21 @@ mod tests {
             parse_quickwit(failed.as_bytes()),
             Err(RestoreError::Partial)
         ));
+    }
+
+    #[test]
+    fn restored_ledgers_exclude_summary_calls_in_both_search_backends() {
+        let window = Window::at_boot(UnixMillis(100 * HOUR), Duration::from_secs(3600));
+        let sql = openobserve_query("dekopon", window);
+        let sql = sql["query"]["sql"].as_str().unwrap();
+        assert!(sql.contains("meter_via IS NULL OR meter_via != 'summary'"));
+        let quickwit = quickwit_query(window);
+        assert!(
+            quickwit["query"]
+                .as_str()
+                .unwrap()
+                .contains("NOT attributes.meter.via:summary")
+        );
     }
 
     #[test]

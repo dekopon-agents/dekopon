@@ -20,6 +20,9 @@ the gateway's boot restore drive time with integers.
   holds no guard, so it can live across an `.await`. `Admission::settle` charges what was
   observed, with the estimate filling the gaps, and emits exactly one `meter` log record; an
   `Admission` dropped unsettled settles as cancelled.
+  `Metering::unadmitted` returns a guard that emits one record without reserving or charging
+  a budget. Summary calls use `Via::Summary`; an unfinished guard records cancellation, and
+  an unwinding guard records failure. Restore queries exclude those calls from reply ledgers.
 
 A call costs `input + output` in raw tokens. The estimate is `bytes / 4` plus 1,000 tokens per
 image, raised to the session's last settled input plus the new bytes, and an output reserve.
