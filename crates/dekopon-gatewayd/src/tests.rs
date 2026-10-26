@@ -20716,9 +20716,12 @@ async fn collected_media_never_crosses_a_removed_or_replaced_route() {
             Duration::from_secs(1),
             crate::collection::Collector::new(&[], 4),
         ));
-        for text in ["first", "second"] {
+        for (index, text) in ["first", "second"].into_iter().enumerate() {
             let mut inbound = message(text);
             inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+            inbound.subject = ExternalSubject::telegram("123").unwrap();
+            inbound.conversation.id = "123".into();
+            inbound.message_id = MessageId::Native((index + 1).to_string());
             inbound.native_group = Some("group".into());
             tx.send(TransportEvent::Message(Box::new(inbound)))
                 .await
