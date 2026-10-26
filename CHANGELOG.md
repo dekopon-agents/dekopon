@@ -7,7 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.55.0] - 2026-10-26
+## [0.56.0] - 2026-10-26
+
+### Added
+
+- Refetch evicted inbound attachments on use and measure attachment storage and inventory costs.
+
+### Changed
+
+- Name attachment use refusals as evicted, platform-gone, revoked or store-failed.
+- an Invoke carries at most five asset rows
+
+### Removed
+
+- the RunCommand broker frame
+
+### Fixed
+
+- memory.store and memory.refused events reach OTLP traces and logs again
+
+## [dekopon-chart-0.43.0] - 2026-10-26
+
+### Changed
+
+- Chart 0.43.0 targets core v0.56.0 and renders the `v0.56.0` image tag.
+
+## [0.55.0] - 2026-10-25
 
 ### Added
 
@@ -23,7 +48,7 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - a GitHub delivery refused at session admission is answered 503 instead of 200, and repository-less events such as ping are acknowledged.
 
-## [dekopon-chart-0.42.0] - 2026-10-26
+## [dekopon-chart-0.42.0] - 2026-10-25
 
 ### Added
 

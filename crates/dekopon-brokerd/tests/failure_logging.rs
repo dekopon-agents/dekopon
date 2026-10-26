@@ -17,7 +17,7 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, BrokerResponse, ERROR_INVALID_REQUEST, FrameLimits, RequestEnvelope,
+    Attestation, BrokerClient, BrokerResponse, ERROR_INVALID_REQUEST, FrameLimits,
     ResponseEnvelope, read_frame,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
@@ -216,30 +216,6 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     let oversized = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(oversized.contains("frame-too-large"), "{oversized}");
     assert!(oversized.contains("65536"), "{oversized}");
-
-    let oversized_run = serde_json::to_vec(&RequestEnvelope::run_command(
-        None,
-        "probe".to_owned(),
-        vec!["upper".to_owned(), "x".repeat(128 * 1024)],
-        false,
-        TRACE_PARENT.parse().expect("valid traceparent fixture"),
-    ))
-    .expect("the oversized run frame serializes");
-    assert!(oversized_run.len() > limits().frame.max_frame_bytes);
-    let stdin_code = write_raw(
-        &socket_path,
-        u32::try_from(oversized_run.len()).expect("fixture frame fits"),
-        b"",
-        limits().frame,
-    )
-    .await;
-    assert_eq!(stdin_code, ERROR_INVALID_REQUEST);
-    let oversized_stdin = take_after(&captured, "broker_request_frame_invalid").await;
-    assert!(
-        oversized_stdin.contains("frame-too-large"),
-        "{oversized_stdin}"
-    );
-    assert!(oversized_stdin.contains("65536"), "{oversized_stdin}");
 
     let client = BrokerClient::new(&socket_path, uid, limits().frame).expect("client starts");
     let request = InvocationRequest {
