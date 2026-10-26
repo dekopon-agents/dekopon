@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    num::{NonZeroU8, NonZeroUsize},
+    num::{NonZeroU8, NonZeroU32, NonZeroUsize},
     ops::ControlFlow,
     sync::{
         Arc,
@@ -12,7 +12,7 @@ use std::{
 use dekopon_core::AgentId;
 use dekopon_model::{
     error::InferenceError,
-    model::{CompletionOptions, ModelMessage},
+    model::{ChatModel, CompletionOptions, ModelMessage},
 };
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 use tokio::{
@@ -46,7 +46,6 @@ pub(crate) struct Resources {
     pub journal: Arc<Journal>,
     pub current: CurrentGeneration,
     pub models: Arc<ModelCache>,
-    pub metering: Arc<Metering>,
     pub counts: Arc<Counts>,
 }
 
@@ -218,7 +217,7 @@ fn summarize(
     binding: &Binding,
 ) -> Next {
     let journal = &resources.journal;
-    let loaded = journal.record_snapshot(&task.stem, false);
+    let loaded = journal.record_lookup(&task.stem, task.record);
     let (snapshot, position) = match loaded {
         Ok(Some(snapshot)) => match snapshot
             .records
@@ -230,14 +229,14 @@ fn summarize(
         },
         Ok(None) => return evicted(resources),
         Err(error) => {
-            write_error(
-                journal,
+            return fail(
+                resources,
                 task,
                 None,
                 io_failure(error),
                 "could not read summary input",
+                Next::Continue,
             );
-            return Next::Continue;
         }
     };
     let head = &snapshot.records[position];
@@ -253,8 +252,24 @@ fn summarize(
     let Some(limit) = plan.parts.get(part) else {
         return Next::Stop;
     };
-    if !matches!(write_slot(journal, task, Slot::Running, expected), Ok(true)) {
-        return Next::Stop;
+    let next = if part + 1 < plan.parts.len() {
+        Next::Continue
+    } else {
+        Next::Stop
+    };
+    match write_slot(journal, task, Slot::Running, expected) {
+        Ok(true) => {}
+        Ok(false) => return evicted(resources),
+        Err(error) => {
+            return fail(
+                resources,
+                task,
+                expected,
+                io_failure(error),
+                "could not persist summary start",
+                next,
+            );
+        }
     }
     let current = resources.current.load();
     let Some(model) = current.routes.models.get(&plan.model) else {
@@ -269,28 +284,28 @@ fn summarize(
     };
     let client = match resources.models.client_bound(model, runtime, cancel) {
         Ok(client) => client,
-        Err(_error) => {
-            let _written = mark_later(
-                journal,
+        Err(error) => {
+            return fail(
+                resources,
                 task,
                 expected,
-                SummaryFailure::Unconfigured,
-                "summary model could not be configured",
+                SummaryFailure::ModelFailed,
+                &error.to_string(),
+                next,
             );
-            return Next::Stop;
         }
     };
     let input = match input(&snapshot, head, plan.max_input_bytes.get() as usize) {
         Ok(input) => input,
         Err(error) => {
-            write_error(
-                journal,
+            return fail(
+                resources,
                 task,
                 expected,
                 io_failure(error),
                 "could not read summary input",
+                next,
             );
-            return Next::Continue;
         }
     };
     let previous: String = head.header.summaries[..part]
@@ -300,9 +315,66 @@ fn summarize(
             Slot::Queued | Slot::Running | Slot::Error(_) => None,
         })
         .collect();
+    let Ok(agent) = task
+        .stem
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .parse::<AgentId>()
+    else {
+        return Next::Stop;
+    };
+    let call = Call {
+        agent,
+        model: plan.model.clone(),
+        backend: model.backend(),
+        via: Via::Summary,
+    };
+    let slot = match complete_summary(client.as_ref(), call, input, previous, task.part, *limit) {
+        Completed::Slot(slot) => slot,
+        Completed::Cancelled => return Next::Stop,
+        Completed::Refused => {
+            let _written = mark_later(
+                journal,
+                task,
+                expected,
+                SummaryFailure::Refused,
+                "summary provider refused",
+            );
+            return Next::Stop;
+        }
+    };
+    match write_slot(journal, task, slot, expected) {
+        Ok(true) => next,
+        Ok(false) => evicted(resources),
+        Err(error) => fail(
+            resources,
+            task,
+            expected,
+            io_failure(error),
+            "could not persist summary result",
+            next,
+        ),
+    }
+}
+
+enum Completed {
+    Slot(Slot),
+    Refused,
+    Cancelled,
+}
+
+fn complete_summary(
+    client: &dyn ChatModel,
+    call: Call,
+    input: String,
+    previous: String,
+    part: NonZeroU8,
+    limit: NonZeroU32,
+) -> Completed {
     let instructions = format!(
         "Write only new additive summary information for part {}. Do not repeat earlier parts.",
-        task.part
+        part
     );
     let messages = [
         ModelMessage::system(instructions),
@@ -320,26 +392,17 @@ fn summarize(
         None,
         Tokens::from_bytes(limit.get() as usize),
     );
-    let Ok(agent) = task
-        .stem
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .parse::<AgentId>()
-    else {
-        return Next::Stop;
-    };
-    let call = Call {
-        agent,
-        model: plan.model.clone(),
-        backend: model.backend(),
-        via: Via::Summary,
-    };
+    let mut meter = Metering::unadmitted(call, estimate);
     let result = client.complete(
         &messages,
         &[],
         &CompletionOptions::default(),
-        &mut |_event| ControlFlow::Continue(()),
+        &mut |event| {
+            match event {
+                dekopon_model::TurnEvent::TextDelta(text) => meter.observe_text(text.len()),
+            }
+            ControlFlow::Continue(())
+        },
     );
     let (usage, bytes, outcome, kind) = match &result {
         Ok(turn) => (
@@ -359,9 +422,7 @@ fn summarize(
             Some(error.kind().as_str()),
         ),
     };
-    resources
-        .metering
-        .record_unadmitted(&call, estimate, usage, bytes, outcome, kind);
+    meter.finish(usage, bytes, outcome, kind);
     let slot = match result {
         Ok(turn) => match turn
             .content
@@ -377,7 +438,7 @@ fn summarize(
             }
             None => error_slot(SummaryFailure::Empty, "summary returned no text"),
         },
-        Err(InferenceError::Cancelled) => return Next::Stop,
+        Err(InferenceError::Cancelled) => return Completed::Cancelled,
         Err(InferenceError::DeadlineExceeded) => {
             error_slot(SummaryFailure::Timeout, "summary model deadline exceeded")
         }
@@ -387,31 +448,11 @@ fn summarize(
                 Some("refused" | "content_filter" | "safety")
             ) || error.status == Some(403) =>
         {
-            let _written = mark_later(
-                journal,
-                task,
-                expected,
-                SummaryFailure::Refused,
-                "summary provider refused",
-            );
-            return Next::Stop;
+            return Completed::Refused;
         }
         Err(error) => error_slot(SummaryFailure::ModelFailed, &error.to_string()),
     };
-    match write_slot(journal, task, slot, expected) {
-        Ok(true) => Next::Continue,
-        Ok(false) => evicted(resources),
-        Err(error) => {
-            write_error(
-                journal,
-                task,
-                expected,
-                io_failure(error),
-                "could not persist summary result",
-            );
-            Next::Continue
-        }
-    }
+    Completed::Slot(slot)
 }
 
 fn evicted(resources: &Resources) -> Next {
@@ -475,14 +516,27 @@ fn write_slot(
     }
 }
 
-fn write_error(
-    journal: &Journal,
+fn fail(
+    resources: &Resources,
     task: &SlotTask,
     turn: Option<TurnId>,
     kind: SummaryFailure,
     detail: &str,
-) {
-    let _written = write_slot(journal, task, error_slot(kind, detail), turn);
+    next: Next,
+) -> Next {
+    match write_slot(&resources.journal, task, error_slot(kind, detail), turn) {
+        Ok(false) => evicted(resources),
+        Ok(true) => next,
+        Err(_error) => {
+            tracing::warn!(
+                event = "gateway_memory_summary_write_failed",
+                memory.record.id = task.record.0.get(),
+                memory.summary.part = task.part.get(),
+                "could not persist summary failure"
+            );
+            next
+        }
+    }
 }
 
 fn io_failure(error: JournalError) -> SummaryFailure {
@@ -501,7 +555,7 @@ fn mark_later(
     kind: SummaryFailure,
     detail: &str,
 ) -> Result<u64, JournalError> {
-    let Some(snapshot) = journal.record_snapshot(&task.stem, false)? else {
+    let Some(snapshot) = journal.record_lookup(&task.stem, task.record)? else {
         return Ok(0);
     };
     let Some(head) = snapshot.records.iter().find(|head| {
@@ -511,8 +565,9 @@ fn mark_later(
     };
     let mut count = 0;
     for part in usize::from(task.part.get() - 1)..head.header.summaries.len() {
-        let part = NonZeroU8::new(u8::try_from(part + 1).map_err(|_| JournalError::Corrupt)?)
-            .ok_or(JournalError::Corrupt)?;
+        let part =
+            NonZeroU8::new(u8::try_from(part + 1).map_err(|_invalid| JournalError::Corrupt)?)
+                .ok_or(JournalError::Corrupt)?;
         if write_slot(
             journal,
             &SlotTask {
@@ -529,498 +584,4 @@ fn mark_later(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::journal::records::tests::{fixture, journal};
-    use super::*;
-    use crate::{
-        config::ModelConfig,
-        routes::RoutingTable,
-        session::{ModelFactory, SessionError, SharedModel},
-    };
-    use dekopon_model::model::{AssistantTurn, ChatModel, ModelTool};
-    use parking_lot::Mutex;
-    use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
-
-    async fn run(resources: Arc<Resources>, queued: Queued, cancel: watch::Receiver<bool>) -> Next {
-        super::run(resources, queued, cancel, Arc::default()).await
-    }
-
-    const STEM: &str = "reviewer/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    enum Action {
-        Text(&'static str),
-        Timeout,
-        Cancelled,
-        Refused,
-        Panic,
-        Hold(Arc<Gate>),
-    }
-    struct Script {
-        actions: Mutex<VecDeque<Action>>,
-        calls: AtomicUsize,
-        inputs: Mutex<Vec<String>>,
-    }
-    struct Gate {
-        started: tokio::sync::Notify,
-        released: Mutex<bool>,
-        wake: parking_lot::Condvar,
-    }
-    impl Gate {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                started: tokio::sync::Notify::new(),
-                released: Mutex::new(false),
-                wake: parking_lot::Condvar::new(),
-            })
-        }
-        fn release(&self) {
-            *self.released.lock() = true;
-            self.wake.notify_all();
-        }
-    }
-    impl ChatModel for Script {
-        fn complete(
-            &self,
-            messages: &[ModelMessage],
-            _tools: &[ModelTool],
-            _options: &CompletionOptions,
-            _on_event: &mut (dyn FnMut(dekopon_model::TurnEvent) -> ControlFlow<()> + Send),
-        ) -> Result<AssistantTurn, InferenceError> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            self.inputs.lock().push(
-                messages
-                    .iter()
-                    .filter_map(ModelMessage::content)
-                    .collect::<String>(),
-            );
-            let action = self
-                .actions
-                .lock()
-                .pop_front()
-                .expect("one action per expected call");
-            let text = match action {
-                Action::Text(text) => text,
-                Action::Timeout => return Err(InferenceError::DeadlineExceeded),
-                Action::Cancelled => return Err(InferenceError::Cancelled),
-                Action::Refused => {
-                    return Err(InferenceError::Provider(
-                        dekopon_model::error::ProviderFailure::new(403, "refused"),
-                    ));
-                }
-                Action::Panic => panic!("fake summary panic"),
-                Action::Hold(gate) => {
-                    gate.started.notify_one();
-                    let mut released = gate.released.lock();
-                    while !*released {
-                        if gate
-                            .wake
-                            .wait_for(&mut released, Duration::from_secs(10))
-                            .timed_out()
-                        {
-                            panic!("test did not release its held model");
-                        }
-                    }
-                    "held"
-                }
-            };
-            Ok(AssistantTurn::new(Some(text.to_owned()), Vec::new(), None))
-        }
-    }
-    struct Factory(Arc<Script>);
-    impl ModelFactory for Factory {
-        fn build_bound(
-            &self,
-            _model: &Arc<ModelConfig>,
-            _runtime: tokio::runtime::Handle,
-            _cancel: watch::Receiver<bool>,
-        ) -> Result<SharedModel, SessionError> {
-            Ok(self.0.clone())
-        }
-    }
-    fn resources(
-        journal: Arc<Journal>,
-        actions: impl IntoIterator<Item = Action>,
-        configured: bool,
-    ) -> (Resources, Arc<Script>) {
-        let script = Arc::new(Script {
-            actions: Mutex::new(actions.into_iter().collect()),
-            calls: AtomicUsize::new(0),
-            inputs: Mutex::new(Vec::new()),
-        });
-        let mut routes = RoutingTable::default();
-        if configured {
-            routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":"http://127.0.0.1:9","model":"fixture","timeoutMs":1000})).unwrap()));
-        }
-        (
-            Resources {
-                journal,
-                current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),
-                models: Arc::new(ModelCache::new(Arc::new(Factory(Arc::clone(&script))))),
-                metering: Arc::new(Metering::new(Vec::new(), Metering::system_clock())),
-                counts: Arc::default(),
-            },
-            script,
-        )
-    }
-    fn task() -> SlotTask {
-        SlotTask {
-            stem: STEM.to_owned(),
-            record: fixture().id,
-            part: NonZeroU8::new(1).unwrap(),
-        }
-    }
-    fn slots(journal: &Journal) -> Vec<Slot> {
-        journal
-            .record_snapshot(STEM, true)
-            .unwrap()
-            .unwrap()
-            .records
-            .remove(0)
-            .header
-            .summaries
-    }
-    async fn wait_for(journal: &Journal, predicate: impl Fn(&[Slot]) -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if predicate(&slots(journal)) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .expect("summary state reached");
-    }
-    fn failed(slot: &Slot, kind: SummaryFailure) -> bool {
-        matches!(slot, Slot::Error(error) if error.kind == kind)
-    }
-
-    #[tokio::test]
-    async fn summary_errors_map_to_slot_failures() {
-        let (_dir, journal) = journal();
-        journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-        let (resources, script) = resources(
-            Arc::clone(&journal),
-            [Action::Timeout, Action::Text(""), Action::Cancelled],
-            true,
-        );
-        let resources = Arc::new(resources);
-        let cancel = watch::channel(false).1;
-        assert!(matches!(
-            run(
-                Arc::clone(&resources),
-                Queued {
-                    task: task(),
-                    since: Instant::now()
-                },
-                cancel.clone()
-            )
-            .await,
-            Next::Continue
-        ));
-        let mut task = task();
-        task.part = NonZeroU8::new(2).unwrap();
-        assert!(matches!(
-            run(
-                Arc::clone(&resources),
-                Queued {
-                    task: task.clone(),
-                    since: Instant::now()
-                },
-                cancel.clone()
-            )
-            .await,
-            Next::Continue
-        ));
-        task.part = NonZeroU8::new(3).unwrap();
-        assert!(matches!(
-            run(
-                resources,
-                Queued {
-                    task,
-                    since: Instant::now()
-                },
-                cancel
-            )
-            .await,
-            Next::Stop
-        ));
-        let slots = slots(&journal);
-        assert!(failed(&slots[0], SummaryFailure::Timeout));
-        assert!(failed(&slots[1], SummaryFailure::Empty));
-        assert_eq!(slots[2], Slot::Running);
-        assert_eq!(script.calls.load(Ordering::Relaxed), 3);
-        let boot = journal.load_summary_tasks().unwrap();
-        assert_eq!(boot.requeued, 1);
-        assert_eq!(boot.tasks.len(), 1);
-        assert_eq!(boot.tasks[0].part.get(), 3);
-    }
-
-    #[tokio::test]
-    async fn an_unconfigured_plan_model_stops_its_chain() {
-        let (_dir, journal) = journal();
-        journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-        let (resources, script) = resources(Arc::clone(&journal), [], false);
-        assert!(matches!(
-            run(
-                Arc::new(resources),
-                Queued {
-                    task: task(),
-                    since: Instant::now()
-                },
-                watch::channel(false).1
-            )
-            .await,
-            Next::Stop
-        ));
-        assert!(
-            slots(&journal)
-                .iter()
-                .all(|slot| failed(slot, SummaryFailure::Unconfigured))
-        );
-        assert_eq!(script.calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn a_refused_part_does_not_reopen_its_later_slots() {
-        let (_dir, journal) = journal();
-        journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-        let (resources, script) = resources(Arc::clone(&journal), [Action::Refused], true);
-        let mut owned = JoinSet::new();
-        let sender = spawn(
-            resources,
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
-            &mut owned,
-        );
-        sender.enqueue(task()).await;
-        wait_for(&journal, |slots| {
-            slots
-                .iter()
-                .all(|slot| failed(slot, SummaryFailure::Refused))
-        })
-        .await;
-        assert_eq!(script.calls.load(Ordering::Relaxed), 1);
-        owned.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn a_panicked_summary_marks_its_later_parts() {
-        let (_dir, journal) = journal();
-        let mut first = fixture();
-        first.summaries = vec![Slot::Queued; 2];
-        journal.append_record(STEM, &first, Vec::new()).unwrap();
-        let mut second = fixture();
-        second.id = RecordId(2.try_into().unwrap());
-        second.summaries = vec![Slot::Queued];
-        journal.append_record(STEM, &second, Vec::new()).unwrap();
-        let (resources, script) = resources(
-            Arc::clone(&journal),
-            [Action::Panic, Action::Text("next")],
-            true,
-        );
-        let mut owned = JoinSet::new();
-        let sender = spawn(
-            resources,
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
-            &mut owned,
-        );
-        sender.enqueue(task()).await;
-        sender
-            .enqueue(SlotTask {
-                record: second.id,
-                ..task()
-            })
-            .await;
-        wait_for(&journal, |slots| {
-            slots
-                .iter()
-                .all(|slot| failed(slot, SummaryFailure::Panicked))
-        })
-        .await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
-                if matches!(snapshot.records[1].header.summaries[0], Slot::Generated(_)) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(script.calls.load(Ordering::Relaxed), 2);
-        owned.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn an_overflowed_part_marks_its_later_parts() {
-        let (_dir, journal) = journal();
-        journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-        let (tx, _rx) = mpsc::channel(1);
-        let sender = Sender {
-            queue: tx,
-            journal: Arc::clone(&journal),
-            counts: Arc::default(),
-        };
-        sender.enqueue(task()).await;
-        sender.enqueue(task()).await;
-        assert!(
-            slots(&journal)
-                .iter()
-                .all(|slot| failed(slot, SummaryFailure::Overflow))
-        );
-        assert_eq!(sender.counts.overflowed.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn a_summary_model_serving_no_route_resolves() {
-        let (_dir, journal) = journal();
-        journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-        let (resources, script) = resources(
-            Arc::clone(&journal),
-            [
-                Action::Text("one"),
-                Action::Text("two"),
-                Action::Text("🦀abcdef"),
-            ],
-            true,
-        );
-        let mut owned = JoinSet::new();
-        let sender = spawn(
-            resources,
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(1).unwrap(),
-            &mut owned,
-        );
-        sender.enqueue(task()).await;
-        wait_for(&journal, |slots| {
-            slots.iter().all(|slot| matches!(slot, Slot::Generated(_)))
-        })
-        .await;
-        assert_eq!(
-            slots(&journal),
-            vec![
-                Slot::Generated("one".to_owned()),
-                Slot::Generated("two".to_owned()),
-                Slot::Generated("🦀abcd".to_owned())
-            ]
-        );
-        assert_eq!(script.calls.load(Ordering::Relaxed), 3);
-        assert!(script.inputs.lock()[2].contains("Earlier parts:\nonetwo"));
-        owned.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn a_finished_summary_is_joined_at_once_at_concurrency_two() {
-        let (_dir, journal) = journal();
-        let mut first = fixture();
-        first.summaries = vec![Slot::Queued];
-        journal.append_record(STEM, &first, Vec::new()).unwrap();
-        let mut second = fixture();
-        second.id = RecordId(2.try_into().unwrap());
-        second.summaries = vec![Slot::Queued; 2];
-        journal.append_record(STEM, &second, Vec::new()).unwrap();
-        let gate = Gate::new();
-        let (resources, script) = resources(
-            Arc::clone(&journal),
-            [
-                Action::Hold(Arc::clone(&gate)),
-                Action::Text("part1"),
-                Action::Text("part2"),
-            ],
-            true,
-        );
-        let mut owned = JoinSet::new();
-        let sender = spawn(
-            resources,
-            NonZeroUsize::new(4).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            &mut owned,
-        );
-        sender.enqueue(task()).await;
-        gate.started.notified().await;
-        sender
-            .enqueue(SlotTask {
-                record: second.id,
-                ..task()
-            })
-            .await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
-                if matches!(snapshot.records[1].header.summaries[1], Slot::Generated(_)) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(slots(&journal), vec![Slot::Running]);
-        assert_eq!(script.calls.load(Ordering::Relaxed), 3);
-        gate.release();
-        wait_for(&journal, |slots| matches!(slots[0], Slot::Generated(_))).await;
-        owned.shutdown().await;
-    }
-
-    #[test]
-    fn boot_enqueues_only_the_lowest_queued_part() {
-        let (_dir, journal) = journal();
-        let mut record = fixture();
-        record.summaries = vec![
-            Slot::Generated("done".to_owned()),
-            Slot::Running,
-            Slot::Queued,
-        ];
-        journal.append_record(STEM, &record, Vec::new()).unwrap();
-        journal
-            .write_slot(
-                STEM,
-                SlotLine {
-                    at_ms: 2,
-                    record: record.id,
-                    part: NonZeroU8::new(1).unwrap(),
-                    slot: Slot::Running,
-                    subject: Subject::Asset(1.try_into().unwrap()),
-                },
-            )
-            .unwrap();
-        let boot = journal.load_summary_tasks().unwrap();
-        assert_eq!(boot.requeued, 1);
-        assert_eq!(boot.tasks.len(), 1);
-        assert_eq!(boot.tasks[0].part.get(), 2);
-        assert_eq!(
-            slots(&journal),
-            vec![
-                Slot::Generated("done".to_owned()),
-                Slot::Queued,
-                Slot::Queued
-            ]
-        );
-        assert_eq!(
-            journal
-                .record_snapshot(STEM, true)
-                .unwrap()
-                .unwrap()
-                .records[0]
-                .asset_lines
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn a_file_that_crashed_the_last_boot_is_reset_first() {
-        let (dir, journal) = journal();
-        journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-        std::fs::write(dir.path().join("loading.marker"), STEM).unwrap();
-        let boot = journal.load_summary_tasks().unwrap();
-        assert_eq!(boot.reset, 1);
-        assert_eq!(boot.crashed_files, 1);
-        assert!(boot.tasks.is_empty());
-        assert!(!dir.path().join(format!("{STEM}.jsonl")).exists());
-        assert!(!dir.path().join("loading.marker").exists());
-    }
-}
+mod tests;

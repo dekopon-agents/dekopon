@@ -147,6 +147,67 @@ struct RawHeaderLine {
     h: RawArrivals,
 }
 
+#[cfg(test)]
+thread_local! { static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, JournalError> {
+    #[cfg(test)]
+    DECODED_BYTES.with(|bytes| bytes.set(bytes.get() + line.len()));
+    serde_json::from_slice(line).map_err(corrupt)
+}
+
+enum Side {
+    Slot(SlotLine),
+    Pin(PinLine),
+    Choice(ChoiceLine),
+}
+impl Side {
+    fn decode(line: &[u8]) -> Result<Self, JournalError> {
+        if line.starts_with(b"{\"s\":") {
+            Ok(Self::Slot(decode_line::<SummaryLine>(line)?.s))
+        } else if line.starts_with(b"{\"p\":") {
+            Ok(Self::Pin(decode_line::<PinEnvelope>(line)?.p))
+        } else if line.starts_with(b"{\"c\":") {
+            Ok(Self::Choice(decode_line::<ChoiceEnvelope>(line)?.c))
+        } else {
+            Err(JournalError::Corrupt)
+        }
+    }
+    fn record(&self) -> RecordId {
+        match self {
+            Self::Slot(line) => line.record,
+            Self::Pin(line) => line.record,
+            Self::Choice(line) => line.record,
+        }
+    }
+    fn apply(self, head: &mut Head, raw: &[u8]) -> Result<(), JournalError> {
+        match self {
+            Self::Slot(line) => match line.subject {
+                Subject::Record => {
+                    *head
+                        .header
+                        .summaries
+                        .get_mut(usize::from(line.part.get() - 1))
+                        .ok_or(JournalError::Corrupt)? = line.slot
+                }
+                Subject::Asset(_) => {
+                    head.asset_lines.push(AssetSideLine::Slot(line));
+                    head.raw_asset_lines.push(raw.to_vec());
+                }
+            },
+            Self::Pin(line) => match line.subject {
+                Subject::Record => head.header.pin = line.pin,
+                Subject::Asset(_) => {
+                    head.asset_lines.push(AssetSideLine::Pin(line));
+                    head.raw_asset_lines.push(raw.to_vec());
+                }
+            },
+            Self::Choice(line) => head.header.choice = Some(line.choice),
+        }
+        Ok(())
+    }
+}
+
 fn corrupt(error: serde_json::Error) -> JournalError {
     error
         .io_error_kind()
@@ -321,6 +382,16 @@ impl Journal {
         record: &TurnRecord,
         arrived: Vec<ArrivedAsset>,
     ) -> Result<(), JournalError> {
+        let next_record_id = NonZeroU64::new(
+            record
+                .id
+                .0
+                .get()
+                .checked_add(1)
+                .ok_or(JournalError::Corrupt)?,
+        )
+        .ok_or(JournalError::Corrupt)?;
+        u32::try_from(record.original.len()).map_err(|_invalid| JournalError::Corrupt)?;
         let _lock = self.lock.lock();
         use std::os::unix::fs::DirBuilderExt as _;
         let path = self.path(stem);
@@ -344,22 +415,14 @@ impl Journal {
                 body.write_all(b",")?;
             }
             body.item(
-                u32::try_from(index).map_err(|_| JournalError::Corrupt)?,
+                u32::try_from(index).map_err(|_invalid| JournalError::Corrupt)?,
                 item,
             )?;
         }
         body.write_all(b"]}\n")?;
         let header = Header {
             id: record.id,
-            next_record_id: NonZeroU64::new(
-                record
-                    .id
-                    .0
-                    .get()
-                    .checked_add(1)
-                    .ok_or(JournalError::Corrupt)?,
-            )
-            .ok_or(JournalError::Corrupt)?,
+            next_record_id,
             turn: record.turn,
             at_ms: record.at_ms,
             grant: record.grant.clone(),
@@ -384,12 +447,29 @@ impl Journal {
         stem: &str,
         strict: bool,
     ) -> Result<Option<Snapshot>, JournalError> {
+        self.record_view(stem, strict, None)
+    }
+
+    pub(crate) fn record_lookup(
+        &self,
+        stem: &str,
+        record: RecordId,
+    ) -> Result<Option<Snapshot>, JournalError> {
+        self.record_view(stem, false, Some(record))
+    }
+
+    fn record_view(
+        &self,
+        stem: &str,
+        strict: bool,
+        wanted: Option<RecordId>,
+    ) -> Result<Option<Snapshot>, JournalError> {
         let file = match File::open(self.path(stem)) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        scan(file, strict).map(Some)
+        scan(file, strict, wanted).map(Some)
     }
 
     pub(crate) fn write_slot(&self, stem: &str, line: SlotLine) -> Result<bool, JournalError> {
@@ -423,7 +503,7 @@ impl Journal {
         let mut bytes = serde_json::to_vec(line).map_err(corrupt)?;
         bytes.push(b'\n');
         let _lock = self.lock.lock();
-        let Some(snapshot) = self.record_snapshot(stem, false)? else {
+        let Some(snapshot) = self.record_lookup(stem, record)? else {
             return Ok(false);
         };
         if !snapshot.records.iter().any(|head| {
@@ -497,12 +577,14 @@ impl Journal {
     }
 }
 
-pub(crate) fn scan(file: File, strict: bool) -> Result<Snapshot, JournalError> {
+fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, JournalError> {
     let end = file.metadata()?.len();
     let file = Arc::new(file);
     let mut reader = BufReader::with_capacity(BUFFER, file.as_ref());
     let mut offset = 0_u64;
     let mut body = None;
+    let mut first_id: Option<RecordId> = None;
+    let mut next_id: Option<NonZeroU64> = None;
     let mut records: Vec<Head> = Vec::new();
     let mut line = Vec::new();
     while offset < end {
@@ -558,9 +640,7 @@ pub(crate) fn scan(file: File, strict: bool) -> Result<Snapshot, JournalError> {
             continue;
         }
         if line.starts_with(b"{\"h\":") {
-            let header = serde_json::from_slice::<HeaderLine>(&line)
-                .map_err(corrupt)?
-                .h;
+            let header = decode_line::<HeaderLine>(&line)?.h;
             let (body_at, body_len) = body.take().ok_or(JournalError::Corrupt)?;
             if header.body_len != body_len
                 || header.spans.iter().any(|span| {
@@ -571,16 +651,17 @@ pub(crate) fn scan(file: File, strict: bool) -> Result<Snapshot, JournalError> {
             {
                 return Err(JournalError::Corrupt);
             }
-            if records
-                .last()
-                .is_some_and(|previous| previous.header.next_record_id != header.id.0)
+            if header.id.0.get().checked_add(1) != Some(header.next_record_id.get())
+                || next_id.is_some_and(|next| next != header.id.0)
             {
                 return Err(JournalError::Corrupt);
             }
-            let arrived_raw = serde_json::from_slice::<RawHeaderLine>(&line)
-                .map_err(corrupt)?
-                .h
-                .arrived;
+            first_id.get_or_insert(header.id);
+            next_id = Some(header.next_record_id);
+            if wanted.is_some_and(|wanted| wanted != header.id) {
+                continue;
+            }
+            let arrived_raw = decode_line::<RawHeaderLine>(&line)?.h.arrived;
             records.push(Head {
                 header,
                 body_at,
@@ -588,58 +669,26 @@ pub(crate) fn scan(file: File, strict: bool) -> Result<Snapshot, JournalError> {
                 raw_asset_lines: Vec::new(),
                 arrived_raw,
             });
-        } else if line.starts_with(b"{\"s\":") && body.is_none() {
-            let slot = serde_json::from_slice::<SummaryLine>(&line)
-                .map_err(corrupt)?
-                .s;
-            let head = records
-                .iter_mut()
-                .rev()
-                .find(|head| head.header.id == slot.record)
-                .ok_or(JournalError::Corrupt)?;
-            match slot.subject {
-                Subject::Record => {
-                    let part = usize::from(slot.part.get() - 1);
-                    *head
-                        .header
-                        .summaries
-                        .get_mut(part)
-                        .ok_or(JournalError::Corrupt)? = slot.slot;
-                }
-                Subject::Asset(_) => {
-                    head.asset_lines.push(AssetSideLine::Slot(slot));
-                    head.raw_asset_lines.push(line.clone());
-                }
-            }
-        } else if line.starts_with(b"{\"p\":") && body.is_none() {
-            let pin = serde_json::from_slice::<PinEnvelope>(&line)
-                .map_err(corrupt)?
-                .p;
-            let head = records
-                .iter_mut()
-                .rev()
-                .find(|head| head.header.id == pin.record)
-                .ok_or(JournalError::Corrupt)?;
-            match pin.subject {
-                Subject::Record => head.header.pin = pin.pin,
-                Subject::Asset(_) => {
-                    head.asset_lines.push(AssetSideLine::Pin(pin));
-                    head.raw_asset_lines.push(line.clone());
-                }
-            }
-        } else if line.starts_with(b"{\"c\":") && body.is_none() {
-            let choice = serde_json::from_slice::<ChoiceEnvelope>(&line)
-                .map_err(corrupt)?
-                .c;
-            records
-                .iter_mut()
-                .rev()
-                .find(|head| head.header.id == choice.record)
-                .ok_or(JournalError::Corrupt)?
-                .header
-                .choice = Some(choice.choice);
         } else {
-            return Err(JournalError::Corrupt);
+            if body.is_some() {
+                return Err(JournalError::Corrupt);
+            }
+            let side = Side::decode(&line)?;
+            let record = side.record();
+            if first_id.is_none_or(|first| record < first)
+                || next_id.is_none_or(|next| record.0 >= next)
+            {
+                return Err(JournalError::Corrupt);
+            }
+            if wanted.is_some_and(|wanted| wanted != record) {
+                continue;
+            }
+            let head = records
+                .iter_mut()
+                .rev()
+                .find(|head| head.header.id == record)
+                .ok_or(JournalError::Corrupt)?;
+            side.apply(head, &line)?;
         }
     }
     if strict && body.is_some() {
@@ -676,10 +725,11 @@ pub(crate) fn escaped_text(
                         read_atom_byte(&mut reader, &mut left, byte)?;
                     }
                     let code = u16::from_str_radix(
-                        std::str::from_utf8(&atom[3..7]).map_err(|_| JournalError::Corrupt)?,
+                        std::str::from_utf8(&atom[3..7])
+                            .map_err(|_invalid| JournalError::Corrupt)?,
                         16,
                     )
-                    .map_err(|_| JournalError::Corrupt)?;
+                    .map_err(|_invalid| JournalError::Corrupt)?;
                     if (0xd800..=0xdbff).contains(&code) {
                         for byte in &mut atom[7..13] {
                             read_atom_byte(&mut reader, &mut left, byte)?;
@@ -752,237 +802,7 @@ impl Read for SliceReader<'_> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use dekopon_agent::memory::{Call as CapturedCall, Exchange, ToolResult};
-    use dekopon_model::model::{Backend, OpaqueReasoning};
-    use std::{
-        num::{NonZeroU8, NonZeroU32},
-        time::Duration,
-    };
-
-    pub(crate) fn fixture() -> TurnRecord {
-        TurnRecord {
-            id: RecordId(NonZeroU64::new(1).unwrap()),
-            turn: TurnId(1),
-            at_ms: 1,
-            grant: GrantDigest([0; 8]),
-            model: ModelKey::new(Backend::Codex, "fixture"),
-            original: vec![Item::User(Kept::new("a\n🦀\\\"z", 1024))],
-            summaries: vec![Slot::Queued; 3],
-            plan: Some(SummaryPlan {
-                model: "summary".to_owned(),
-                parts: vec![NonZeroU32::new(8).unwrap(); 3],
-                max_input_bytes: NonZeroU32::new(128 * 1024).unwrap(),
-            }),
-            assets: Vec::new(),
-            next_asset_id: 1,
-        }
-    }
-
-    pub(crate) fn journal() -> (tempfile::TempDir, Arc<Journal>) {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(
-            Journal::open(
-                dir.path(),
-                Duration::from_secs(3600),
-                Duration::from_secs(3600),
-            )
-            .unwrap(),
-        );
-        (dir, journal)
-    }
-
-    #[test]
-    fn body_spans_preserve_the_capture_encoding_and_item_numbers() {
-        let (_dir, journal) = journal();
-        let mut record = fixture();
-        record.original.extend([
-            Item::Asset(1.try_into().unwrap()),
-            Item::Steer(Kept::new("later", 1024)),
-            Item::Asset(2.try_into().unwrap()),
-            Item::Reasoning(Reasoning::Plain(Kept::new("plain", 1024))),
-            Item::Reasoning(Reasoning::Opaque {
-                model: record.model.clone(),
-                bytes: OpaqueReasoning::from_value(
-                    &serde_json::json!({"type":"reasoning","value":"secret\nvalue"}),
-                )
-                .unwrap(),
-            }),
-            Item::Exchange(Exchange {
-                call: CapturedCall {
-                    id: "call".into(),
-                    tool: Tool::Rejected(Kept::new("unknown", 1024)),
-                    arguments: Kept::new("{\"q\":1}", 1024),
-                },
-                result: ToolResult {
-                    outcome: Outcome::Failed,
-                    text: Kept::new("failure", 1024),
-                },
-            }),
-        ]);
-        journal
-            .append_record("reviewer/record", &record, Vec::new())
-            .unwrap();
-        let snapshot = journal
-            .record_snapshot("reviewer/record", true)
-            .unwrap()
-            .unwrap();
-        let head = &snapshot.records[0];
-        let mut body = vec![0; head.header.body_len as usize];
-        snapshot
-            .file
-            .read_exact_at(&mut body, head.body_at)
-            .unwrap();
-        let expected = format!(
-            "{{\"b\":{}}}\n",
-            serde_json::to_string(&record.original).unwrap()
-        );
-        assert_eq!(body, expected.as_bytes());
-        assert!(
-            head.header
-                .spans
-                .iter()
-                .all(|span| ![1, 3].contains(&span.item))
-        );
-        assert_eq!(head.header.spans[1].item, 2);
-        for span in head
-            .header
-            .spans
-            .iter()
-            .filter(|span| matches!(span.kind, Kind::Escaped))
-        {
-            assert!(
-                escaped_text(
-                    &snapshot.file,
-                    head.body_at + span.rel_offset,
-                    span.len,
-                    1024
-                )
-                .is_ok()
-            );
-        }
-        let span = &head.header.spans[0];
-        for cap in 0..15 {
-            let value = escaped_text(
-                &snapshot.file,
-                head.body_at + span.rel_offset,
-                span.len,
-                cap,
-            )
-            .unwrap();
-            assert!(
-                record.original[0]
-                    .clone()
-                    .eq(&Item::User(Kept::new("a\n🦀\\\"z", 1024)))
-            );
-            assert!("a\n🦀\\\"z".starts_with(&value));
-            assert!(value.len() <= cap);
-        }
-    }
-
-    #[test]
-    fn an_r28_slot_line_parses_as_a_record_subject() {
-        let line = SlotLine {
-            at_ms: 2,
-            record: fixture().id,
-            part: NonZeroU8::new(1).unwrap(),
-            slot: Slot::Running,
-            subject: Subject::Record,
-        };
-        let raw = serde_json::to_string(&line).unwrap();
-        assert!(!raw.contains("subject"));
-        assert!(
-            serde_json::from_str::<SlotLine>(&raw)
-                .unwrap()
-                .subject
-                .is_record()
-        );
-    }
-
-    #[test]
-    fn an_asset_slot_does_not_change_record_slots_in_the_walk() {
-        let (_dir, journal) = journal();
-        let record = fixture();
-        journal
-            .append_record("reviewer/record", &record, Vec::new())
-            .unwrap();
-        journal
-            .write_slot(
-                "reviewer/record",
-                SlotLine {
-                    at_ms: 2,
-                    record: record.id,
-                    part: NonZeroU8::new(1).unwrap(),
-                    slot: Slot::Generated("asset only".to_owned()),
-                    subject: Subject::Asset(1.try_into().unwrap()),
-                },
-            )
-            .unwrap();
-        let snapshot = journal
-            .record_snapshot("reviewer/record", true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(snapshot.records[0].header.summaries, vec![Slot::Queued; 3]);
-        assert_eq!(snapshot.records[0].asset_lines.len(), 1);
-    }
-
-    #[test]
-    fn unknown_header_and_slot_fields_are_corrupt() {
-        let (_dir, journal) = journal();
-        let record = fixture();
-        journal
-            .append_record("reviewer/record", &record, Vec::new())
-            .unwrap();
-        let path = journal.path("reviewer/record");
-        let raw = std::fs::read(&path).unwrap();
-        let mut changed = String::from_utf8(raw.clone()).unwrap();
-        changed = changed.replace("\"bodyLen\":", "\"unknown\":true,\"bodyLen\":");
-        std::fs::write(&path, changed).unwrap();
-        assert!(matches!(
-            journal.record_snapshot("reviewer/record", true),
-            Err(JournalError::Corrupt)
-        ));
-        std::fs::write(&path, raw).unwrap();
-        let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        writeln!(
-            file,
-            "{{\"s\":{{\"atMs\":2,\"record\":1,\"part\":1,\"slot\":\"Running\",\"unknown\":true}}}}"
-        )
-        .unwrap();
-        assert!(matches!(
-            journal.record_snapshot("reviewer/record", true),
-            Err(JournalError::Corrupt)
-        ));
-    }
-
-    #[test]
-    fn a_torn_tail_is_skipped_by_an_unlocked_reader() {
-        let (_dir, journal) = journal();
-        journal
-            .append_record("reviewer/record", &fixture(), Vec::new())
-            .unwrap();
-        let path = journal.path("reviewer/record");
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"{\"b\":[\"unfinished\"]}\n{\"h\":{")
-            .unwrap();
-        let before = std::fs::read(&path).unwrap();
-        assert_eq!(
-            journal
-                .record_snapshot("reviewer/record", false)
-                .unwrap()
-                .unwrap()
-                .records
-                .len(),
-            1
-        );
-        assert_eq!(std::fs::read(path).unwrap(), before);
-        assert!(matches!(
-            journal.record_snapshot("reviewer/record", true),
-            Err(JournalError::Corrupt)
-        ));
-    }
-}
+pub(crate) mod tests;
 
 #[derive(Default)]
 pub(crate) struct Boot {
@@ -993,6 +813,17 @@ pub(crate) struct Boot {
 }
 
 impl Journal {
+    pub(crate) fn open_records(
+        dir: &std::path::Path,
+        max_age: std::time::Duration,
+        retention: std::time::Duration,
+        seal_retention: std::time::Duration,
+    ) -> Result<(Self, Boot), JournalError> {
+        let journal = Self::create(dir, max_age, retention, seal_retention)?;
+        let boot = journal.load_summary_tasks()?;
+        Ok((journal, boot))
+    }
+
     pub(crate) fn load_summary_tasks(&self) -> Result<Boot, JournalError> {
         use std::fs;
         let _lock = self.lock.lock();
@@ -1057,7 +888,8 @@ impl Journal {
                             let mut lowest = None;
                             for (part, slot) in head.header.summaries.iter().enumerate() {
                                 let part = NonZeroU8::new(
-                                    u8::try_from(part + 1).map_err(|_| JournalError::Corrupt)?,
+                                    u8::try_from(part + 1)
+                                        .map_err(|_invalid| JournalError::Corrupt)?,
                                 )
                                 .ok_or(JournalError::Corrupt)?;
                                 match slot {

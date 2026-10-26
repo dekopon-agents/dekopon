@@ -139,6 +139,51 @@ struct Observed {
     text_bytes: usize,
 }
 
+/// Records one model call without reserving or charging a reply budget.
+#[must_use]
+pub struct Unadmitted {
+    call: Call,
+    estimate: Estimate,
+    observed: Observed,
+    outcome: Outcome,
+    error_kind: Option<&'static str>,
+}
+
+impl Unadmitted {
+    pub fn observe_text(&mut self, bytes: usize) {
+        self.observed.text_bytes = self.observed.text_bytes.saturating_add(bytes);
+    }
+
+    pub fn finish(
+        mut self,
+        usage: Option<ModelUsage>,
+        text_bytes: usize,
+        outcome: Outcome,
+        error_kind: Option<&'static str>,
+    ) {
+        self.observed.usage = usage;
+        self.observed.text_bytes = self.observed.text_bytes.max(text_bytes);
+        self.outcome = outcome;
+        self.error_kind = error_kind;
+    }
+}
+
+impl Drop for Unadmitted {
+    fn drop(&mut self) {
+        let (outcome, kind) = if std::thread::panicking() {
+            (Outcome::Failed, Some("panicked"))
+        } else {
+            (self.outcome, self.error_kind)
+        };
+        record(
+            &self.call,
+            self.estimate,
+            &Charge::of(outcome, self.estimate, &self.observed),
+            kind,
+        );
+    }
+}
+
 /// Holds no lock guard, so it can live across an `.await`; dropping it unsettled settles it as
 /// cancelled, which is the proxy's client-disconnect path.
 #[must_use]
@@ -178,17 +223,14 @@ impl Metering {
         !self.budgets.is_empty()
     }
 
-    pub fn record_unadmitted(
-        &self,
-        call: &Call,
-        estimate: Estimate,
-        usage: Option<ModelUsage>,
-        text_bytes: usize,
-        outcome: Outcome,
-        error_kind: Option<&str>,
-    ) {
-        let charge = Charge::of(outcome, estimate, &Observed { usage, text_bytes });
-        record(call, estimate, &charge, error_kind);
+    pub fn unadmitted(call: Call, estimate: Estimate) -> Unadmitted {
+        Unadmitted {
+            call,
+            estimate,
+            observed: Observed::default(),
+            outcome: Outcome::Cancelled,
+            error_kind: Some("cancelled"),
+        }
     }
 
     pub fn admit(self: &Arc<Self>, call: Call, estimate: Estimate) -> Result<Admission, Refusal> {

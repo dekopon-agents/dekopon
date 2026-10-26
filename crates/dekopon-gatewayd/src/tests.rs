@@ -22836,3 +22836,18 @@ async fn an_empty_asker_grant_does_not_evict_the_space_window() {
     );
     assert_eq!(driver.replies().len(), 3);
 }
+
+#[tokio::test]
+async fn binding_keeps_unused_models_and_reuses_the_route_model_arc() {
+    let directory = temporary();
+    let mut config = resolved(directory.path(), &document(directory.path())).await;
+    config.models.push(serde_json::from_value(json!({"kind":"openaiCompatible","name":"summary-only","endpoint":"http://127.0.0.1:9","model":"fixture","timeoutMs":1000})).unwrap());
+    let table = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+    assert_eq!(table.models.len(), config.models.len());
+    assert!(table.models.contains_key("summary-only"));
+    let route = table
+        .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+        .unwrap();
+    assert!(Arc::ptr_eq(&table.models[route.model.name()], &route.model));
+    assert_ne!(route.model.name(), "summary-only");
+}

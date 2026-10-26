@@ -560,6 +560,21 @@ mod tests {
     }
 
     #[test]
+    fn restored_ledgers_exclude_summary_calls_in_both_search_backends() {
+        let window = Window::at_boot(UnixMillis(100 * HOUR), Duration::from_secs(3600));
+        let sql = openobserve_query("dekopon", window);
+        let sql = sql["query"]["sql"].as_str().unwrap();
+        assert!(sql.contains("meter_via IS NULL OR meter_via != 'summary'"));
+        let quickwit = quickwit_query(window);
+        assert!(
+            quickwit["query"]
+                .as_str()
+                .unwrap()
+                .contains("NOT attributes.meter.via:summary")
+        );
+    }
+
+    #[test]
     fn the_window_buckets_at_least_a_minute_and_at_most_five_hundred_per_lookback() {
         let boot = UnixMillis(100 * HOUR);
         assert_eq!(
