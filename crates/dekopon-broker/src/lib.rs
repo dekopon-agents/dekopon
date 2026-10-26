@@ -4135,7 +4135,7 @@ where
                     &set,
                     audit_credential,
                     InvocationOutcome::Failed,
-                    provider_exit_status(&failure.error),
+                    Some(&failure.error),
                     duration_ms,
                     Some(error.clone()),
                     detail.clone(),
@@ -5018,7 +5018,7 @@ fn execution_event(
     set: &ConstraintSet,
     credential: Option<&str>,
     outcome: InvocationOutcome,
-    exit_status: Option<std::num::NonZeroU8>,
+    provider_failure: Option<&BrokerHostError>,
     duration_ms: u64,
     error: Option<String>,
     error_detail: Option<ProviderFailureDetail>,
@@ -5054,7 +5054,7 @@ fn execution_event(
         risk: set.risk,
         credential: credential.map(str::to_owned),
         outcome,
-        exit_status,
+        exit_status: provider_failure.and_then(provider_execution_exit_status),
         duration_ms,
         error,
         error_detail,
@@ -5084,6 +5084,70 @@ fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDet
             "signed download redirect refused",
         )),
         _ => None,
+    }
+}
+
+fn provider_execution_exit_status(error: &BrokerHostError) -> Option<std::num::NonZeroU8> {
+    match error {
+        BrokerHostError::ProviderFailure { .. } => provider_exit_status(error),
+        BrokerHostError::PeerDisconnected
+        | BrokerHostError::AssetOverBudget
+        | BrokerHostError::AssetInput { .. }
+        | BrokerHostError::NoProviders
+        | BrokerHostError::InvalidLimit { .. }
+        | BrokerHostError::AuthorizationExceedsHostLimit { .. }
+        | BrokerHostError::InvalidHttpAuthorization
+        | BrokerHostError::MixedHostAuthorization
+        | BrokerHostError::InvalidSecretAuthorization { .. }
+        | BrokerHostError::SecretAuthorizationExceedsHttp
+        | BrokerHostError::SecretCredentialMismatch
+        | BrokerHostError::StorageDisabled
+        | BrokerHostError::MissingStorageGrant
+        | BrokerHostError::UnexpectedStorageGrant
+        | BrokerHostError::StorageGrantMismatch
+        | BrokerHostError::Storage { .. }
+        | BrokerHostError::HttpConfiguration { .. }
+        | BrokerHostError::Engine { .. }
+        | BrokerHostError::Store { .. }
+        | BrokerHostError::Linker { .. }
+        | BrokerHostError::InvalidArtifactSize { .. }
+        | BrokerHostError::InvalidArtifactDigest
+        | BrokerHostError::ArtifactTooLarge { .. }
+        | BrokerHostError::ArtifactSizeMismatch { .. }
+        | BrokerHostError::ArtifactDigestMismatch { .. }
+        | BrokerHostError::ProviderIdentityMismatch { .. }
+        | BrokerHostError::ArtifactMetadata { .. }
+        | BrokerHostError::CompiledArtifactMissing { .. }
+        | BrokerHostError::CompiledArtifact { .. }
+        | BrokerHostError::CacheMaintenance { .. }
+        | BrokerHostError::PrecompileWorker { .. }
+        | BrokerHostError::MemoryBudgetExhausted { .. }
+        | BrokerHostError::Compile { .. }
+        | BrokerHostError::Instantiate { .. }
+        | BrokerHostError::DescribeUsedHostImport { .. }
+        | BrokerHostError::ConflictingProviders { .. }
+        | BrokerHostError::InvalidCommandRun { .. }
+        | BrokerHostError::UnknownCommandWord { .. }
+        | BrokerHostError::MissingCommandExport { .. }
+        | BrokerHostError::CommandExportSignature { .. }
+        | BrokerHostError::CommandInputTooLarge { .. }
+        | BrokerHostError::RunCommand { .. }
+        | BrokerHostError::RunCommandUsedHostImport { .. }
+        | BrokerHostError::Describe { .. }
+        | BrokerHostError::InvalidManifest { .. }
+        | BrokerHostError::Manifest { .. }
+        | BrokerHostError::UnknownCapability { .. }
+        | BrokerHostError::AuthorizedProviderMismatch { .. }
+        | BrokerHostError::ProviderDoesNotImplement { .. }
+        | BrokerHostError::InputNotObject { .. }
+        | BrokerHostError::SerializeInput { .. }
+        | BrokerHostError::InputTooLarge { .. }
+        | BrokerHostError::OutputTooLarge { .. }
+        | BrokerHostError::Timeout { .. }
+        | BrokerHostError::HostCallRejected { .. }
+        | BrokerHostError::StorageCallRejected { .. }
+        | BrokerHostError::Invoke { .. }
+        | BrokerHostError::StdioAdmission { .. } => None,
     }
 }
 

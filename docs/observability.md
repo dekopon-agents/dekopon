@@ -319,6 +319,8 @@ argument, and without them the reason a run failed exists nowhere in the trace. 
 provider-authored, so both are bounded — the code at 128 bytes, the message at 1024, cut on a
 character boundary and suffixed `…[truncated]` like every other bounded value. They are metadata the
 provider wrote about its own refusal, never provider output, which stays a digest.
+The exception is a host-side signed-download redirect refusal: the broker synthesizes
+`error.code=redirect-refused` and `error.message="signed download redirect refused"`.
 
 Nothing here can carry secret bytes. `secret` and `credential` are the symbolic names owner
 configuration already holds, and HTTP evidence carries the sanitized `http.request` fields plus the bounded `X-GitHub-Request-Id` response value. No URL path or query, other header or body is recorded.

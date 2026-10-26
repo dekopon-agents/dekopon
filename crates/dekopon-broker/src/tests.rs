@@ -1790,6 +1790,73 @@ fn naming_a_namespace_leaves_its_owners_conversation_scoped_sets_alone() {
 }
 
 #[test]
+fn a_host_redirect_refusal_records_no_provider_exit_code() {
+    use dekopon_capability::{EffectKind, InvocationOutcome};
+    use dekopon_core::RiskLevel;
+    use dekopon_test_support::CaptureLayer;
+    use tracing_subscriber::prelude::*;
+
+    let failure = BrokerHostError::HostCallRejected {
+        provider: "gh".parse().unwrap(),
+        capability: "gh.actions.logs.read".parse().unwrap(),
+        reason: dekopon_broker_host::HostCallRejection::Http(
+            dekopon_broker_host::PolicyViolation::RedirectRefused,
+        ),
+    };
+    let principal: PrincipalId = "caller".parse().unwrap();
+    let context = AuthenticatedContext::new(
+        principal.clone(),
+        Actor::Service {
+            principal: principal.clone(),
+        },
+    )
+    .unwrap();
+    let set = ConstraintSet {
+        default_secret_use: None,
+        route: CapabilityRoute::Generic,
+        provider: "gh".parse().unwrap(),
+        effect: EffectKind::ReadOnly,
+        risk: RiskLevel::Low,
+        credential: None,
+        constraints: ExecutionConstraints::default(),
+    };
+    let captured = CaptureLayer::workspace();
+    let _subscriber = tracing_subscriber::registry()
+        .with(captured.clone())
+        .set_default();
+    super::emit_audit_event(&super::execution_event(
+        &context,
+        &"invoke-redirect-refused".parse().unwrap(),
+        "0000000000000000000000000000f1c7".parse().unwrap(),
+        &"gh.actions.logs.read".parse().unwrap(),
+        "decision-redirect-refused",
+        &[],
+        "policy-digest",
+        None,
+        &principal,
+        &set,
+        None,
+        InvocationOutcome::Failed,
+        Some(&failure),
+        0,
+        Some(public_host_error(&failure).to_owned()),
+        provider_failure_detail(&failure),
+        Vec::new(),
+        None,
+        None,
+    ));
+    let records = captured.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("audit.event", "broker.execution"),
+            ("invocation.id", "invoke-redirect-refused"),
+        ],
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].field("process.exit.code"), None);
+}
+
+#[test]
 fn terminal_redirect_refusal_keeps_its_safe_label_detail_and_exit_three() {
     let failure = BrokerHostError::HostCallRejected {
         provider: "gh".parse().unwrap(),
