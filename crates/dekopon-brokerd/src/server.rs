@@ -11,7 +11,7 @@ use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, Brok
 use dekopon_broker_host::{UpcallExit, UpcallRequest};
 use dekopon_broker_protocol::{
     Attestation, BrokerRequest, CommandRunOutcome, DescriptorStream, ERROR_BROKER_UNAVAILABLE,
-    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER,
+    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED,
     ERROR_UNAUTHENTICATED, FrameLimits, InvocationRequest, ProtocolError, ProtocolVersion,
     RequestEnvelope, ResponseEnvelope, Streams, TraceParent, write_frame,
 };
@@ -587,47 +587,6 @@ where
                 Err(refusal) => ResponseEnvelope::session_refused(&refusal.session),
             }
         }
-        BrokerRequest::RunCommand {
-            attestation,
-            trace_parent,
-            word,
-            argv,
-            stdin_piped,
-        } => {
-            if !claim_is_valid(attestation.as_ref(), None) {
-                return refuse_invalid_claim(&mut stream, limits).await;
-            }
-            let span = tracing::info_span!(
-                "broker.command_run",
-                word = %word,
-                outcome = tracing::field::Empty,
-                otel.status_code = tracing::field::Empty,
-            );
-            adopt_trace_parent(&span, trace_parent);
-            match broker
-                .run_command(
-                    context,
-                    peer.attestor.as_ref(),
-                    attestation.as_ref(),
-                    &word,
-                    &argv,
-                    stdin_piped,
-                )
-                .instrument(span.clone())
-                .await
-            {
-                Ok(result) => {
-                    span.record("outcome", command_run_outcome(&result));
-                    ResponseEnvelope::command_run(result)
-                }
-                Err(error) => {
-                    span.record("outcome", "error");
-                    span.record("otel.status_code", "error");
-                    span.in_scope(|| report_command_run_failure(&word, &error));
-                    ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
-                }
-            }
-        }
         BrokerRequest::Run {
             attestation,
             invocation,
@@ -1056,7 +1015,6 @@ impl Upcaller<'_> {
             }
             BrokerRequest::Capabilities { .. }
             | BrokerRequest::Run { .. }
-            | BrokerRequest::RunCommand { .. }
             | BrokerRequest::Invoke { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
             | BrokerRequest::PrepareGeneration { .. }
@@ -1256,7 +1214,6 @@ impl ReceivedRequest {
                 streams
             }
             BrokerRequest::Capabilities { .. }
-            | BrokerRequest::RunCommand { .. }
             | BrokerRequest::RecordDeliveredTurn { .. }
             | BrokerRequest::UpcallResult { .. }
             | BrokerRequest::PrepareGeneration { .. }
@@ -1431,6 +1388,51 @@ mod generation_tests {
         assert!(
             matches!(response, BrokerResponse::Error { code, .. } if code == ERROR_UNAUTHENTICATED)
         );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_request_gets_the_existing_unknown_request_refusal() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let active = active.unwrap();
+        for operation in ["runCommand", "unknownOperation"] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let limits = FrameLimits::default();
+            let serve = handle(
+                server,
+                &active.ready.broker,
+                &active.ready.identities,
+                limits,
+                None,
+            );
+            let transact = async {
+                write_frame(&mut client, &serde_json::json!({
+                    "apiVersion": "dekopon.dev/broker/v1alpha2",
+                    "request": {
+                        "operation": operation,
+                        "traceParent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                        "word": "probe",
+                        "argv": ["--help"],
+                        "stdinPiped": false
+                    }
+                }), limits).await.unwrap();
+                let response = read_frame::<_, ResponseEnvelope>(&mut client, limits)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response,
+                    ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid")
+                );
+                let mut byte = [0];
+                assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+            };
+            let (served, ()) = tokio::join!(serve, transact);
+            assert!(matches!(served, Err(ConnectionError::InvalidRequest)));
+        }
     }
 
     #[tokio::test]
