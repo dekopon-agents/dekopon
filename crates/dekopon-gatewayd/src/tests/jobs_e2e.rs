@@ -759,7 +759,7 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    let window = |index: usize| models.prompt(index)[1..].to_vec();
+    let window = |index: usize| models.prompt(index)[2..].to_vec();
     let turns = |pairs: &[(&str, &str)]| {
         pairs
             .iter()

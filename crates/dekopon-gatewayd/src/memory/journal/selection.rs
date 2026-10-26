@@ -3,7 +3,7 @@ use crate::config::{
     MemoryWindow,
     memory::{ResolvedPolicy, RoutineKind, Selection, SelectionMode},
 };
-use dekopon_agent::prompt::{ConversationTurn, History, Representation};
+use dekopon_agent::prompt::{ConversationTurn, History, MemoryFact, OmissionReason, ReplaySource};
 use dekopon_agent::{ShellRuntime, prompt::ScriptRuntime};
 use dekopon_process::{ExitCode, TreeContext};
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandProposal, Streams};
@@ -178,6 +178,24 @@ fn text(line: &Line, id: &str, policy: &ResolvedPolicy) -> Option<String> {
     body(line, id, &crate::memory::generation::version(routine))
 }
 
+fn omitted_bytes(line: &Line, id: &str, policy: &ResolvedPolicy) -> u64 {
+    let Some(routine) = policy.routines.iter().find(|routine| routine.id == id) else {
+        return 0;
+    };
+    let version = crate::memory::generation::version(routine);
+    let (source, shown) = line
+        .representations
+        .iter()
+        .filter(|rep| rep.routine_id == id && rep.version == version && rep.text.is_some())
+        .fold((0_u64, 0_u64), |(source, shown), rep| {
+            (
+                source.max(rep.captured_bytes),
+                shown.saturating_add(rep.text.as_ref().map_or(0, |text| text.len() as u64)),
+            )
+        });
+    source.saturating_sub(shown)
+}
+
 fn eligible_ids(line: &Line, policy: &ResolvedPolicy) -> Vec<String> {
     policy
         .retain
@@ -223,6 +241,8 @@ struct Chosen {
     replacement_bytes: u64,
     pin: Option<String>,
     pin_bytes: usize,
+    omission: Option<OmissionReason>,
+    replaced: Option<u64>,
 }
 
 struct Fitted {
@@ -240,10 +260,60 @@ impl Fitted {
                     && let Some(chosen) = self.chosen.get_mut(&old)
                 {
                     chosen.actual = None;
-                    chosen.reason = "window-fit".to_owned();
+                    chosen.omission = Some(OmissionReason::WindowFit);
+                    chosen.reason = OmissionReason::WindowFit.label().to_owned();
                 }
             }
             self.records.push_back(record);
+        }
+    }
+}
+
+pub(crate) struct Projected {
+    pub history: History,
+    pub facts: Vec<MemoryFact>,
+    pub first_shown: Option<u64>,
+    pub source: ReplaySource,
+}
+
+impl Fitted {
+    fn finish(self, window: MemoryWindow, older: bool, boundary: bool) -> Projected {
+        let first_shown = self.records.iter().find_map(|id| *id);
+        let source = match (
+            first_shown.is_some(),
+            self.records.iter().any(Option::is_none),
+        ) {
+            (true, false) => ReplaySource::Journal,
+            (true, true) => ReplaySource::Mixed,
+            (false, false) | (false, true) => ReplaySource::Conversation,
+        };
+        let mut facts = Vec::new();
+        if let Some(first_shown) = first_shown
+            && (older || self.chosen.keys().any(|id| *id < first_shown))
+        {
+            facts.push(MemoryFact::WindowOmission {
+                first_shown,
+                limits: window.limits,
+            });
+        }
+        if boundary {
+            facts.push(MemoryFact::GrantBoundary);
+        }
+        for (record, chosen) in self.chosen {
+            if let Some(reason) = chosen.omission {
+                facts.push(MemoryFact::Omitted { record, reason });
+            } else if let Some(omitted_bytes) = chosen.replaced {
+                facts.push(MemoryFact::Replaced {
+                    record,
+                    omitted_bytes,
+                });
+            }
+        }
+        Projected {
+            history: self.history,
+            facts,
+            first_shown,
+            source,
         }
     }
 }
@@ -295,6 +365,7 @@ fn envelope(
     text: &str,
     original_id: Option<&str>,
     eligible: &[String],
+    policy: &ResolvedPolicy,
 ) -> ConversationTurn {
     let label = format!(
         "[memory: {}]\n",
@@ -302,11 +373,7 @@ fn envelope(
             "recordId": line.record_id,
             "representationId": id,
             "eligibleRepresentationIds": eligible,
-            "omittedBytes": line
-                .representations
-                .iter()
-                .find(|rep| rep.routine_id == id && rep.text.is_some())
-                .map_or(0, Representation::omitted_bytes),
+            "omittedBytes": omitted_bytes(line, id, policy),
         })
     );
     if Some(id) == original_id
@@ -346,7 +413,7 @@ fn choose(
         pin.as_deref().unwrap_or(choice)
     };
     let eligible = eligible_ids(&line, policy);
-    let wrap = |id: &str, text: String| envelope(&line, id, &text, original_id, &eligible);
+    let wrap = |id: &str, text: String| envelope(&line, id, &text, original_id, &eligible, policy);
     let original = original_id.and_then(|id| text(&line, id, policy).map(|text| wrap(id, text)));
     let mut target = requested;
     let mut replacement = text(&line, requested, policy).map(|text| wrap(requested, text));
@@ -388,15 +455,22 @@ fn choose(
         replacement
     };
     let included = turn.as_ref().is_some_and(|turn| turn.bytes() <= max_bytes);
-    let reason = if turn.is_none() {
-        "representation-unavailable"
+    let omission = if turn.is_none() {
+        Some(OmissionReason::RepresentationUnavailable)
     } else if !included {
-        "record-exceeds-budget"
-    } else if pin.as_deref().is_some_and(|pin| pin != actual) && authority == "decider" {
-        "decider-overrode-pin"
+        Some(OmissionReason::RecordExceedsBudget)
     } else {
-        reason
+        None
     };
+    let reason = match omission {
+        Some(reason) => reason.label(),
+        None if pin.as_deref().is_some_and(|pin| pin != actual) && authority == "decider" => {
+            "decider-overrode-pin"
+        }
+        None => reason,
+    };
+    let replaced =
+        (included && Some(actual) != original_id).then(|| omitted_bytes(&line, actual, policy));
     (
         Chosen {
             requested: requested.to_owned(),
@@ -406,6 +480,8 @@ fn choose(
             replacement_bytes,
             pin,
             pin_bytes,
+            omission,
+            replaced,
         },
         turn.filter(|_| included),
     )
@@ -456,7 +532,7 @@ impl Journal {
         input: Projection<'_>,
         resident: &History,
         mut decide: impl FnMut(&[String], &[Evidence]) -> Result<String, &'static str>,
-    ) -> Result<History, JournalError> {
+    ) -> Result<Projected, JournalError> {
         let Projection {
             window,
             policy,
@@ -468,7 +544,14 @@ impl Journal {
         let now = millis(SystemTime::now());
         let mut persisted = HashSet::new();
         let mut rows = Vec::new();
+        let mut older = false;
+        let mut boundary = false;
         self.tail(&input, |line, eligible| {
+            boundary |= line.grant != input.grant;
+            if rows.len() >= limit {
+                older = eligible;
+                return false;
+            }
             persisted.insert(line.turn_id);
             if eligible {
                 rows.push((
@@ -477,7 +560,7 @@ impl Journal {
                     eligible_ids(&line, policy),
                 ));
             }
-            rows.len() < limit
+            true
         })?;
         let mut unpersisted = unpersisted(resident, &persisted, horizon, sealed_at);
         let mut fitted = Fitted {
@@ -489,7 +572,7 @@ impl Journal {
             unpersisted
                 .into_iter()
                 .for_each(|turn| fitted.push(turn, None));
-            return Ok(fitted.history);
+            return Ok(fitted.finish(window, older, boundary));
         };
         rows.reverse();
         let available: Vec<String> = policy
@@ -568,7 +651,7 @@ impl Journal {
                 "gateway.memory.selection"
             );
         }
-        Ok(fitted.history)
+        Ok(fitted.finish(window, older, boundary))
     }
 }
 
