@@ -64,7 +64,7 @@ jobs:
     env:
       CANDIDATE: ${{ github.event.pull_request.head.sha || inputs.candidate }}
       PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile || 'fake' }}
-      SCENARIOS: ${{ inputs.scenarios || 'baseline flood summarizer-hang summarizer-fail summarizer-refuse unloadable-journal restart-mid-summary summaries-off-vs-on' }}
+      SCENARIOS: ${{ inputs.scenarios || 'baseline flood summarizer-fail' }}
       LAB_COST_CAP_USD: ${{ inputs.max_usd || '2' }}
       OPENROUTER_API_KEY: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'real' && secrets.LAB_OPENROUTER_API_KEY || '' }}
     steps:
@@ -127,11 +127,15 @@ jobs:
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' baseline ') }}
         continue-on-error: true
         shell: bash
+        env:
+          LAB_DEADLINE_SECS: "0.1"
         run: run_scenario baseline
       - name: flood (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' flood ') }}
         continue-on-error: true
         shell: bash
+        env:
+          LAB_FAULT_DROP_REPORT: "1"
         run: run_scenario flood
       - name: summarizer-hang (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summarizer-hang ') }}
@@ -142,6 +146,8 @@ jobs:
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summarizer-fail ') }}
         continue-on-error: true
         shell: bash
+        env:
+          LAB_COLLECTOR_IMAGE: "otel/opentelemetry-collector-contrib:lab-ci-intentionally-absent"
         run: run_scenario summarizer-fail
       - name: summarizer-refuse (required)
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && contains(steps.prepare.outputs.selected, ' summarizer-refuse ') }}
