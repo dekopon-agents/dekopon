@@ -99,9 +99,16 @@ pub enum ErrorCode {
     Internal,
 }
 
+#[derive(Clone, Copy)]
+enum ResponseMetadata {
+    Ordinary,
+    SignedDownload,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyViolation {
     Denied,
+    RedirectRefused,
     HostCallLimit,
     InvalidHttpRequest,
     ByteLimit,
@@ -111,6 +118,7 @@ impl PolicyViolation {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Denied => "denied",
+            Self::RedirectRefused => "redirect-refused",
             Self::HostCallLimit => "host-call-limit",
             Self::InvalidHttpRequest => "invalid-http-request",
             Self::ByteLimit => "byte-limit",
@@ -728,6 +736,8 @@ pub struct BufferedHttpClient {
     evidence: Vec<HttpCallEvidence>,
     resolved: HashMap<String, Vec<SocketAddr>>,
     pinned_client: Option<PinnedClient>,
+    #[cfg(test)]
+    signed_download_destination: Option<signed_download::Destination>,
 }
 
 impl std::fmt::Debug for BufferedHttpClient {
@@ -831,6 +841,8 @@ impl BufferedHttpClient {
             evidence: Vec::new(),
             resolved: HashMap::new(),
             pinned_client: None,
+            #[cfg(test)]
+            signed_download_destination: None,
         })
     }
 
@@ -1076,8 +1088,19 @@ impl BufferedHttpClient {
     }
 
     async fn send_checked(&mut self, request: Request) -> Result<Response, HttpError> {
+        self.send_with_metadata(request, ResponseMetadata::Ordinary)
+            .await
+    }
+
+    async fn send_with_metadata(
+        &mut self,
+        request: Request,
+        metadata: ResponseMetadata,
+    ) -> Result<Response, HttpError> {
         let (prepared, grant, evidence_index) = self.authorize_request(request, None).await?;
-        let response = self.execute(prepared, &grant, evidence_index).await?;
+        let response = self
+            .execute(prepared, &grant, evidence_index, metadata)
+            .await?;
         if self
             .credential
             .as_ref()
@@ -1379,6 +1402,7 @@ impl BufferedHttpClient {
         request: PreparedRequest,
         grant: &HttpConstraints,
         evidence_index: usize,
+        metadata: ResponseMetadata,
     ) -> Result<Response, HttpError> {
         let remaining = self.remaining()?;
         let client = self.pinned_client(&request.host, &request.addresses, remaining)?;
@@ -1405,7 +1429,7 @@ impl BufferedHttpClient {
             headers,
             bytes: mut response_bytes,
             body: mut decoded,
-        } = self.accept_head(&request.method, response, grant, evidence_index)?;
+        } = self.accept_head(&request.method, response, grant, evidence_index, metadata)?;
         let mut body = Vec::new();
         while let Some(chunk) = decoded.next().await? {
             response_bytes = response_bytes

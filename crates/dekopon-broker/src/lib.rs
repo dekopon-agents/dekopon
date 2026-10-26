@@ -5064,6 +5064,16 @@ fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDet
         BrokerHostError::ProviderFailure { stderr, .. } => {
             Some(ProviderFailureDetail::new("provider-exit", stderr))
         }
+        BrokerHostError::HostCallRejected {
+            reason:
+                dekopon_broker_host::HostCallRejection::Http(
+                    dekopon_broker_host::PolicyViolation::RedirectRefused,
+                ),
+            ..
+        } => Some(ProviderFailureDetail::new(
+            "redirect-refused",
+            "signed download redirect refused",
+        )),
         _ => None,
     }
 }
@@ -5071,6 +5081,15 @@ fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDet
 fn provider_exit_status(error: &BrokerHostError) -> Option<std::num::NonZeroU8> {
     if let BrokerHostError::ProviderFailure { status, .. } = error {
         std::num::NonZeroU8::new(*status)
+    } else if let BrokerHostError::HostCallRejected {
+        reason:
+            dekopon_broker_host::HostCallRejection::Http(
+                dekopon_broker_host::PolicyViolation::RedirectRefused,
+            ),
+        ..
+    } = error
+    {
+        std::num::NonZeroU8::new(3)
     } else {
         None
     }

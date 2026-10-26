@@ -363,7 +363,13 @@ impl BufferedHttpClient {
             headers,
             bytes: mut response_bytes,
             mut body,
-        } = self.accept_head(&prepared.method, response, &grant, index)?;
+        } = self.accept_head(
+            &prepared.method,
+            response,
+            &grant,
+            index,
+            super::ResponseMetadata::Ordinary,
+        )?;
         let overlap = self
             .credential
             .as_ref()
@@ -540,6 +546,7 @@ impl BufferedHttpClient {
         response: reqwest::Response,
         grant: &HttpConstraints,
         index: usize,
+        metadata: super::ResponseMetadata,
     ) -> Result<Head, HttpError> {
         let mut codings = response
             .headers()
@@ -602,18 +609,22 @@ impl BufferedHttpClient {
             return Err(echoed());
         }
         self.evidence[index].response_bytes = response_bytes;
-        self.evidence[index].upstream_request_id = response
-            .headers()
-            .get("x-github-request-id")
-            .and_then(|value| {
-                let bytes = value.as_bytes();
-                (1..=64)
-                    .contains(&bytes.len())
-                    .then_some(bytes)
-                    .filter(|bytes| bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)))
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .map(str::to_owned)
-            });
+        self.evidence[index].upstream_request_id = match (metadata, status) {
+            (super::ResponseMetadata::SignedDownload, 302) => None,
+            (super::ResponseMetadata::Ordinary, _)
+            | (super::ResponseMetadata::SignedDownload, _) => response
+                .headers()
+                .get("x-github-request-id")
+                .and_then(|value| {
+                    let bytes = value.as_bytes();
+                    (1..=64)
+                        .contains(&bytes.len())
+                        .then_some(bytes)
+                        .filter(|bytes| bytes.iter().all(|byte| (0x21..=0x7e).contains(byte)))
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .map(str::to_owned)
+                }),
+        };
         Ok(Head {
             status,
             headers: head.headers,

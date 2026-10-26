@@ -56,7 +56,7 @@ mod storage;
 mod test_component_memo;
 use clock::ClockState;
 pub use dekopon_broker_protocol::{Streams, UpcallStdin, UpcallStreams};
-pub use dekopon_http_host::{HttpRequestFacts, RequestAuthorizer};
+pub use dekopon_http_host::{HttpRequestFacts, PolicyViolation, RequestAuthorizer};
 pub use http::{
     BoundCredential, HttpCallEvidence, HttpConfigurationError, HttpInvocation,
     NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts, destinations_cover,

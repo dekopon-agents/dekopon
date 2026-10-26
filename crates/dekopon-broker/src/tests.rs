@@ -1601,3 +1601,26 @@ fn naming_a_namespace_leaves_its_owners_conversation_scoped_sets_alone() {
     .unwrap();
     assert!(catalog.validate_storage_namespaces().is_ok());
 }
+
+#[test]
+fn terminal_redirect_refusal_keeps_its_safe_label_detail_and_exit_three() {
+    let failure = BrokerHostError::HostCallRejected {
+        provider: "gh".parse().unwrap(),
+        capability: "gh.actions.logs.read".parse().unwrap(),
+        reason: dekopon_broker_host::HostCallRejection::Http(
+            dekopon_broker_host::PolicyViolation::RedirectRefused,
+        ),
+    };
+    assert_eq!(public_host_error(&failure), "redirect-refused");
+    assert_eq!(
+        provider_exit_status(&failure).map(std::num::NonZeroU8::get),
+        Some(3)
+    );
+    assert_eq!(
+        provider_failure_detail(&failure),
+        Some(ProviderFailureDetail::new(
+            "redirect-refused",
+            "signed download redirect refused"
+        ))
+    );
+}

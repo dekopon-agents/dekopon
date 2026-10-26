@@ -52,6 +52,21 @@ pub enum DownloadError {
     Internal,
 }
 
+impl DownloadError {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::RedirectRefused => "redirect-refused",
+            Self::RequestLimit => "host-call-limit",
+            Self::Timeout => "timeout",
+            Self::ResponseTooLarge => "response-too-large",
+            Self::Incomplete => "incomplete",
+            Self::Storage => "storage",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 impl From<HttpError> for DownloadError {
     fn from(error: HttpError) -> Self {
         match error.code {
@@ -71,13 +86,24 @@ impl From<HttpError> for DownloadError {
     }
 }
 
-struct Destination {
+pub(super) struct Destination {
     uri: dekopon_core::Redacted<Url>,
     client: reqwest::Client,
     headers: reqwest::header::HeaderMap,
     authority: String,
     request_bytes: u64,
     span: tracing::Span,
+}
+
+#[derive(Default)]
+struct DownloadScan {
+    location: Vec<u8>,
+    credential: Vec<u8>,
+}
+
+enum FetchedRange {
+    Range { coverage: Coverage, body: AssetFile },
+    Status(u16),
 }
 
 impl Destination {
@@ -160,9 +186,8 @@ impl BufferedHttpClient {
         let violation = match &result {
             Ok(_) => None,
             Err(error) => match error {
-                DownloadError::Denied | DownloadError::RedirectRefused => {
-                    Some(super::PolicyViolation::Denied)
-                }
+                DownloadError::Denied => Some(super::PolicyViolation::Denied),
+                DownloadError::RedirectRefused => Some(super::PolicyViolation::RedirectRefused),
                 DownloadError::RequestLimit => Some(super::PolicyViolation::HostCallLimit),
                 DownloadError::ResponseTooLarge => Some(super::PolicyViolation::ByteLimit),
                 DownloadError::Timeout
@@ -182,6 +207,9 @@ impl BufferedHttpClient {
         directory: &AssetDirectory,
     ) -> Result<DownloadResponse, DownloadError> {
         self.attempted = true;
+        if self.credential.is_none() {
+            return Err(DownloadError::Denied);
+        }
         let grant = self.grant.as_ref().ok_or(DownloadError::Denied)?;
         match grant.signed_download {
             Some(SignedDownload::GithubActionsLogsV1) => {}
@@ -207,15 +235,18 @@ impl BufferedHttpClient {
         );
         let index = self.evidence.len();
         let api = self
-            .send_checked(Request {
-                method: "GET".to_owned(),
-                uri: api_uri,
-                headers: vec![Header {
-                    name: "user-agent".to_owned(),
-                    value: b"dekopon".to_vec(),
-                }],
-                body: vec![],
-            })
+            .send_with_metadata(
+                Request {
+                    method: "GET".to_owned(),
+                    uri: api_uri,
+                    headers: vec![Header {
+                        name: "user-agent".to_owned(),
+                        value: b"dekopon".to_vec(),
+                    }],
+                    body: vec![],
+                },
+                super::ResponseMetadata::SignedDownload,
+            )
             .instrument(span.clone())
             .await;
         self.record_request(&span, index, &api);
@@ -237,17 +268,26 @@ impl BufferedHttpClient {
         grant.allow_plaintext_loopback = false;
         let mut ceilings = self.ceilings.clone();
         ceilings.non_public_https = std::sync::Arc::new(Vec::new());
-        let mut destination = Destination::new(uri, grant, ceilings, self.deadline).await?;
-        let probe = self.storage_get(&mut destination, 0, 0).await?;
-        if probe.status().as_u16() != 206 {
-            return storage_status(probe.status().as_u16());
-        }
-        let probe_range = content_range(&probe)?;
-        if probe_range.start != 0 || probe_range.end_exclusive != 1 {
-            return Err(DownloadError::Incomplete);
-        }
-        self.read_storage(probe, &destination, probe_range, directory)
+        let mut destination = self.storage_destination(uri, grant, ceilings).await?;
+        let probe = self
+            .fetch_storage(
+                &mut destination,
+                Coverage {
+                    start: 0,
+                    end_exclusive: 1,
+                    total: 0,
+                },
+                &mut DownloadScan::default(),
+                directory,
+            )
             .await?;
+        let probe_range = match probe {
+            FetchedRange::Range { coverage, body } => {
+                drop(body);
+                coverage
+            }
+            FetchedRange::Status(status) => return storage_status(status),
+        };
         let total = probe_range.total;
         let start = match window {
             Window::Tail(length) => total.saturating_sub(u64::from(length)),
@@ -260,28 +300,181 @@ impl BufferedHttpClient {
             .checked_add(u64::from(length))
             .ok_or(DownloadError::Incomplete)?
             .min(total);
-        let response = self.storage_get(&mut destination, start, end - 1).await?;
-        if response.status().as_u16() != 206 {
-            return storage_status(response.status().as_u16());
+        let coverage = Coverage {
+            start,
+            end_exclusive: end,
+            total,
+        };
+        let overlap = destination
+            .uri
+            .expose()
+            .as_str()
+            .len()
+            .saturating_sub(1)
+            .max(
+                self.credential
+                    .as_ref()
+                    .map_or(0, super::BoundCredential::echo_overlap),
+            );
+        if overlap > WINDOW_BYTES as usize {
+            return Err(DownloadError::Denied);
         }
-        let coverage = content_range(&response)?;
-        if coverage
-            != (Coverage {
-                start,
-                end_exclusive: end,
+        let mut cursor = start.saturating_sub(overlap as u64);
+        let checked_end = end.saturating_add(overlap as u64).min(total);
+        let mut scan = DownloadScan::default();
+        let mut output = directory
+            .allocate()
+            .await
+            .map_err(|error| DownloadError::from(self.asset_error(error)))?;
+        while cursor < checked_end {
+            let segment_end = cursor
+                .saturating_add(u64::from(WINDOW_BYTES))
+                .min(checked_end);
+            let checked = Coverage {
+                start: cursor,
+                end_exclusive: segment_end,
                 total,
-            })
-        {
-            return Err(DownloadError::Incomplete);
+            };
+            match self
+                .fetch_storage(&mut destination, checked, &mut scan, directory)
+                .await?
+            {
+                FetchedRange::Status(status) => return storage_status(status),
+                FetchedRange::Range {
+                    coverage: checked,
+                    body,
+                } => {
+                    let visible_start = start.max(checked.start);
+                    let visible_end = end.min(checked.end_exclusive);
+                    if visible_start < visible_end {
+                        let offset = visible_start - checked.start;
+                        let count = (visible_end - visible_start) as usize;
+                        let bytes = super::asset::AssetReader::output(std::sync::Arc::new(body))
+                            .read(move |file| {
+                                super::read_decoded(
+                                    file,
+                                    super::Representation::Identity,
+                                    offset,
+                                    count,
+                                )
+                                .map_err(Into::into)
+                            })
+                            .await
+                            .map_err(|error| DownloadError::from(self.asset_error(error)))?;
+                        output = output
+                            .write(bytes)
+                            .await
+                            .map_err(|error| DownloadError::from(self.asset_error(error)))?;
+                    }
+                }
+            }
+            cursor = segment_end;
         }
-        let body = self
-            .read_storage(response, &destination, coverage, directory)
-            .await?;
+        let body = output
+            .finish()
+            .await
+            .map_err(|error| DownloadError::from(self.asset_error(error)))?;
         Ok(DownloadResponse::Storage {
             status: 206,
             coverage: Some(coverage),
             body: Some(body),
         })
+    }
+
+    async fn storage_destination(
+        &mut self,
+        uri: Url,
+        grant: HttpConstraints,
+        ceilings: super::HttpHostCeilings,
+    ) -> Result<Destination, DownloadError> {
+        #[cfg(test)]
+        if let Some(destination) = self.signed_download_destination.take() {
+            if destination.uri.expose() != &uri {
+                return Err(DownloadError::RedirectRefused);
+            }
+            return Ok(destination);
+        }
+        Destination::new(uri, grant, ceilings, self.deadline).await
+    }
+
+    async fn fetch_storage(
+        &mut self,
+        destination: &mut Destination,
+        expected: Coverage,
+        scan: &mut DownloadScan,
+        directory: &AssetDirectory,
+    ) -> Result<FetchedRange, DownloadError> {
+        let index = self.evidence.len();
+        let result = self
+            .fetch_storage_checked(destination, expected, scan, directory)
+            .await;
+        self.record_storage_request(&destination.span, index, &result);
+        result
+    }
+
+    async fn fetch_storage_checked(
+        &mut self,
+        destination: &mut Destination,
+        expected: Coverage,
+        scan: &mut DownloadScan,
+        directory: &AssetDirectory,
+    ) -> Result<FetchedRange, DownloadError> {
+        let response = self
+            .storage_get(destination, expected.start, expected.end_exclusive - 1)
+            .await?;
+        let status = response.status().as_u16();
+        if status != 206 {
+            return if (400..600).contains(&status) {
+                Ok(FetchedRange::Status(status))
+            } else {
+                Err(DownloadError::Incomplete)
+            };
+        }
+        let coverage = content_range(&response)?;
+        if coverage.start != expected.start
+            || coverage.end_exclusive != expected.end_exclusive
+            || (expected.total != 0 && coverage.total != expected.total)
+        {
+            return Err(DownloadError::Incomplete);
+        }
+        let body = self
+            .read_storage_checked(response, destination, coverage, scan, directory)
+            .instrument(destination.span.clone())
+            .await?;
+        Ok(FetchedRange::Range { coverage, body })
+    }
+
+    fn record_storage_request<T>(
+        &self,
+        span: &tracing::Span,
+        index: usize,
+        result: &Result<T, DownloadError>,
+    ) {
+        let evidence = self.evidence.get(index);
+        let failure = result.as_ref().err().copied();
+        let outcome = failure.map_or("succeeded", DownloadError::label);
+        span.record("outcome", outcome);
+        if let Some(evidence) = evidence {
+            span.record(
+                "dekopon.http.response.accounted_bytes",
+                evidence.response_bytes,
+            );
+        }
+        if let Some(error) = failure {
+            span.record("error.code", error.label());
+        }
+        span.in_scope(|| {
+            tracing::info!(target: "dekopon_http_host::audit", {
+            audit.event = "accounting.http.request",
+            "http.request.method" = evidence.map(|value| value.method.as_str()),
+            "server.address" = evidence.map(|value| value.authority.as_str()),
+            "http.response.status_code" = evidence.and_then(|value| value.status),
+            "dekopon.http.request.accounted_bytes" = evidence.map(|value| value.request_bytes),
+            "dekopon.http.response.accounted_bytes" = evidence.map(|value| value.response_bytes),
+            "error.code" = failure.map(DownloadError::label),
+            "error.message" = failure.map(tracing::field::display), outcome,
+            }, "accounting.http.request")
+        });
     }
 
     async fn storage_get(
@@ -290,11 +483,6 @@ impl BufferedHttpClient {
         start: u64,
         end: u64,
     ) -> Result<reqwest::Response, DownloadError> {
-        let grant = self.grant.as_ref().ok_or(DownloadError::Denied)?;
-        if self.calls >= grant.max_requests {
-            return Err(DownloadError::RequestLimit);
-        }
-        self.calls += 1;
         let span = tracing::info_span!(
             "http.request",
             "server.address" = destination.uri.expose().host_str(),
@@ -306,6 +494,12 @@ impl BufferedHttpClient {
         );
         destination.span = span.clone();
         async {
+            let grant = self.grant.as_ref().ok_or(DownloadError::Denied)?;
+            if self.calls >= grant.max_requests {
+                return Err(DownloadError::RequestLimit);
+            }
+            self.calls += 1;
+
             let range = format!("bytes={start}-{end}");
             let request_bytes = destination
                 .request_bytes
@@ -346,10 +540,10 @@ impl BufferedHttpClient {
             if let Some(evidence) = self.evidence.last_mut() {
                 evidence.status = Some(status);
             }
+            self.storage_head(&response)?;
             if response.status().is_redirection() {
                 return Err(DownloadError::RedirectRefused);
             }
-            self.storage_head(&response)?;
             Ok(response)
         }
         .instrument(span)
@@ -370,6 +564,7 @@ impl BufferedHttpClient {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn read_storage(
         &mut self,
         response: reqwest::Response,
@@ -378,7 +573,13 @@ impl BufferedHttpClient {
         directory: &AssetDirectory,
     ) -> Result<AssetFile, DownloadError> {
         let result = self
-            .read_storage_checked(response, destination, coverage, directory)
+            .read_storage_checked(
+                response,
+                destination,
+                coverage,
+                &mut DownloadScan::default(),
+                directory,
+            )
             .instrument(destination.span.clone())
             .await;
         destination
@@ -403,6 +604,7 @@ impl BufferedHttpClient {
         mut response: reqwest::Response,
         destination: &Destination,
         coverage: Coverage,
+        scan: &mut DownloadScan,
         directory: &AssetDirectory,
     ) -> Result<AssetFile, DownloadError> {
         let maximum = self
@@ -435,7 +637,6 @@ impl BufferedHttpClient {
             .await
             .map_err(|error| DownloadError::from(self.asset_error(error)))?;
         let mut read = 0_u64;
-        let mut scan = Vec::new();
         let patterns = [
             destination.uri.expose().as_str().as_bytes(),
             destination
@@ -451,7 +652,6 @@ impl BufferedHttpClient {
             .max()
             .unwrap_or(0)
             .saturating_sub(1);
-        let mut credential_scan = Vec::new();
         while let Some(chunk) = timeout_at(self.deadline, response.chunk())
             .await
             .map_err(|_cause| DownloadError::Timeout)?
@@ -469,19 +669,23 @@ impl BufferedHttpClient {
                 return Err(DownloadError::ResponseTooLarge);
             }
             for bytes in chunk.chunks(super::CHUNK_BYTES) {
-                scan.extend_from_slice(bytes);
+                scan.location.extend_from_slice(bytes);
                 if patterns.iter().any(|pattern| {
-                    !pattern.is_empty() && scan.windows(pattern.len()).any(|part| part == *pattern)
+                    !pattern.is_empty()
+                        && scan
+                            .location
+                            .windows(pattern.len())
+                            .any(|part| part == *pattern)
                 }) {
                     return Err(DownloadError::Denied);
                 }
-                let clean = scan.len().saturating_sub(overlap);
-                scan.drain(..clean);
+                let clean = scan.location.len().saturating_sub(overlap);
+                scan.location.drain(..clean);
                 if let Some(credential) = &self.credential {
                     let clean = credential
-                        .scan_stream_chunk(&mut credential_scan, bytes, credential.echo_overlap())
+                        .scan_stream_chunk(&mut scan.credential, bytes, credential.echo_overlap())
                         .ok_or(DownloadError::Denied)?;
-                    credential_scan.drain(..clean);
+                    scan.credential.drain(..clean);
                 }
                 spool = spool
                     .write(bytes.to_vec())
@@ -931,6 +1135,10 @@ mod tests {
                 )
                 .await;
             assert_eq!(result.err(), Some(DownloadError::RedirectRefused));
+            assert_eq!(
+                parent.policy_violation().map(crate::PolicyViolation::label),
+                Some("redirect-refused")
+            );
             assert_eq!(parent.calls, 1);
             assert_eq!(parent.evidence.len(), 1);
             let request = String::from_utf8(server.await.unwrap()).unwrap();
@@ -944,9 +1152,19 @@ mod tests {
             );
             let (uri, ceilings, server) = tls_api(response.into_bytes()).await;
             let authority = Url::parse(&uri).unwrap().authority().to_owned();
-            let mut parent =
-                BufferedHttpClient::authorized(grant(&authority), ceilings, Duration::from_secs(5))
-                    .unwrap();
+            let credential = BoundCredential::bearer(
+                "Bearer",
+                Redacted::new("api-test-credential-sixteen-bytes".to_owned()),
+                vec![authority.clone()],
+            )
+            .unwrap();
+            let mut parent = BufferedHttpClient::authorized_with_credential(
+                grant(&authority),
+                Some(credential),
+                ceilings,
+                Duration::from_secs(5),
+            )
+            .unwrap();
             let root = tempfile::tempdir().unwrap();
             let response = parent
                 .signed_download(
@@ -1019,5 +1237,338 @@ mod tests {
             parent.policy_violation(),
             Some(crate::PolicyViolation::Denied)
         );
+    }
+    fn authenticated_api(uri: &str, ceilings: HttpHostCeilings) -> BufferedHttpClient {
+        let authority = Url::parse(uri).unwrap().authority().to_owned();
+        let credential = BoundCredential::bearer(
+            "Bearer",
+            Redacted::new("api-credential-with-sixteen-bytes".to_owned()),
+            vec![authority.clone()],
+        )
+        .unwrap();
+        BufferedHttpClient::authorized_with_credential(
+            grant(&authority),
+            Some(credential),
+            ceilings,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_signed_api_requires_authentication_before_dispatch() {
+        let (uri, ceilings, server) =
+            tls_api(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec())
+                .await;
+        let authority = Url::parse(&uri).unwrap().authority().to_owned();
+        let mut parent =
+            BufferedHttpClient::authorized(grant(&authority), ceilings, Duration::from_secs(5))
+                .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let result = parent
+            .signed_download(
+                uri,
+                Window::Tail(64),
+                &AssetDirectory::new(root.path().to_owned(), 131072),
+            )
+            .await;
+        assert_eq!(result.err(), Some(DownloadError::Denied));
+        assert_eq!(parent.calls, 0);
+        assert!(parent.evidence.is_empty());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn native_signed_302_never_stores_reflected_request_ids_even_when_the_redirect_is_refused()
+     {
+        for length in [0, 1] {
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://productionresultssa1.blob.core.windows.net/log?sig=private-signed-query\r\nx-github-request-id: sig=private-signed-query\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            );
+            let (uri, ceilings, server) = tls_api(response.into_bytes()).await;
+            let mut parent = authenticated_api(&uri, ceilings);
+            let root = tempfile::tempdir().unwrap();
+            assert!(
+                parent
+                    .signed_download(
+                        uri,
+                        Window::Tail(64),
+                        &AssetDirectory::new(root.path().to_owned(), 131072)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(parent.evidence.len(), 1);
+            assert_eq!(parent.evidence[0].upstream_request_id, None);
+            assert!(
+                !serde_json::to_string(&parent.evidence)
+                    .unwrap()
+                    .contains("private-signed-query")
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_signed_api_returns_non_302_redirects_raw_without_following_them() {
+        let location =
+            "https://productionresultssa1.blob.core.windows.net/log?sig=raw-api-location";
+        for status in [301, 303, 307] {
+            let response = format!(
+                "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nraw"
+            );
+            let (uri, ceilings, server) = tls_api(response.into_bytes()).await;
+            let mut parent = authenticated_api(&uri, ceilings);
+            let root = tempfile::tempdir().unwrap();
+            match parent
+                .signed_download(
+                    uri,
+                    Window::Tail(64),
+                    &AssetDirectory::new(root.path().to_owned(), 131072),
+                )
+                .await
+                .unwrap()
+            {
+                DownloadResponse::Api(response) => {
+                    assert_eq!(response.status, status);
+                    assert_eq!(response.body, b"raw");
+                    assert!(
+                        response
+                            .headers
+                            .iter()
+                            .any(|header| header.name == "location"
+                                && header.value == location.as_bytes())
+                    );
+                }
+                DownloadResponse::Storage { .. } => panic!("non-302 API response followed storage"),
+            }
+            assert_eq!(parent.calls, 1);
+            assert_eq!(parent.policy_violation(), None);
+            server.await.unwrap();
+        }
+    }
+    async fn fake_storage(
+        data: Vec<u8>,
+        count: usize,
+    ) -> (Destination, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let hostname = "productionresultssa1.blob.core.windows.net";
+        let certified = rcgen::generate_simple_self_signed(vec![hostname.to_owned()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(certified.cert.pem().as_bytes()).unwrap(),
+            )
+            .resolve(hostname, address)
+            .build()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 1024];
+                    let length = tls.read(&mut bytes).await.unwrap();
+                    assert_ne!(length, 0);
+                    request.extend_from_slice(&bytes[..length]);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8(request.clone())
+                    .unwrap()
+                    .to_ascii_lowercase();
+                let range = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("range: bytes="))
+                    .unwrap();
+                let (start, end) = range.split_once('-').unwrap();
+                let start = start.parse::<usize>().unwrap();
+                let end = end.parse::<usize>().unwrap();
+                assert!(start <= end && end < data.len());
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data.len(),
+                    end - start + 1
+                );
+                tls.write_all(response.as_bytes()).await.unwrap();
+                tls.write_all(&data[start..=end]).await.unwrap();
+                tls.shutdown().await.unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let uri = Url::parse(&format!("https://{hostname}/log?sig=private-signed-query")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "accept-encoding",
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+        headers.insert(
+            "user-agent",
+            reqwest::header::HeaderValue::from_static("dekopon"),
+        );
+        (
+            Destination {
+                uri: Redacted::new(uri),
+                client,
+                headers,
+                authority: hostname.to_owned(),
+                request_bytes: 256,
+                span: tracing::Span::none(),
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_302_to_storage_preserves_credentials_secrecy_coverage_and_every_accounting_event()
+     {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = dekopon_test_support::CaptureLayer::workspace();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let evidence = async {
+            let (destination, storage) = fake_storage(vec![b'x'; 70000], 3).await;
+            let response = format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nx-github-request-id: sig=private-signed-query\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", destination.uri.expose());
+            let (uri, ceilings, api) = tls_api(response.into_bytes()).await;
+            let mut parent = authenticated_api(&uri, ceilings);
+            parent.grant.as_mut().unwrap().max_requests = 8;
+            parent.signed_download_destination = Some(destination);
+            let root = tempfile::tempdir().unwrap();
+            let result = parent.signed_download(uri, Window::Tail(65536), &AssetDirectory::new(root.path().to_owned(), 131072)).await.unwrap();
+            match result {
+                DownloadResponse::Storage { status, coverage, body } => {
+                    assert_eq!(status, 206);
+                    assert_eq!(coverage, Some(Coverage { start: 4464, end_exclusive: 70000, total: 70000 }));
+                    assert_eq!(body.unwrap().len(), 65536);
+                }
+                DownloadResponse::Api(_) => panic!("302 was not followed"),
+            }
+            let api_request = String::from_utf8(api.await.unwrap()).unwrap();
+            assert!(api_request.contains("authorization: Bearer api-credential-with-sixteen-bytes"));
+            let requests = storage.await.unwrap();
+            assert_eq!(requests.len(), 3);
+            for request in requests {
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(!request.contains("authorization:"));
+                assert!(!request.contains("api-credential-with-sixteen-bytes"));
+                assert!(!request.contains("traceparent:"));
+            }
+            assert_eq!(parent.calls, 4);
+            parent.evidence
+        }.with_subscriber(subscriber).await;
+        let events = capture.events_where(
+            "dekopon_http_host::audit",
+            &[("audit.event", "accounting.http.request")],
+        );
+        assert_eq!(events.len(), 4);
+        for (event, evidence) in events.iter().zip(&evidence) {
+            assert_eq!(
+                event
+                    .field("dekopon.http.response.accounted_bytes")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+                evidence.response_bytes
+            );
+        }
+        assert!(
+            evidence
+                .iter()
+                .all(|call| call.upstream_request_id.is_none())
+        );
+        assert!(!capture.text().contains("private-signed-query"));
+        assert!(
+            !serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("private-signed-query")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_offset_reads_cannot_reconstruct_a_signed_query_from_two_fragments() {
+        let query = b"sig=private-signed-query";
+        for window in [
+            Window::Offset {
+                start: 0,
+                length: 12,
+            },
+            Window::Offset {
+                start: 12,
+                length: 11,
+            },
+        ] {
+            let (destination, storage) = fake_storage(query.to_vec(), 2).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                destination.uri.expose()
+            );
+            let (uri, ceilings, api) = tls_api(response.into_bytes()).await;
+            let mut parent = authenticated_api(&uri, ceilings);
+            parent.grant.as_mut().unwrap().max_requests = 8;
+            parent.signed_download_destination = Some(destination);
+            let root = tempfile::tempdir().unwrap();
+            let result = parent
+                .signed_download(
+                    uri,
+                    window,
+                    &AssetDirectory::new(root.path().to_owned(), 131072),
+                )
+                .await;
+            assert_eq!(result.err(), Some(DownloadError::Denied));
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            assert_eq!(parent.calls, 3);
+            api.await.unwrap();
+            assert_eq!(storage.await.unwrap().len(), 2);
+        }
+    }
+    #[tokio::test]
+    async fn native_signed_windows_are_not_exposed_when_context_exhausts_the_request_budget() {
+        let (destination, storage) = fake_storage(vec![b'x'; 70000], 1).await;
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.uri.expose()
+        );
+        let (uri, ceilings, api) = tls_api(response.into_bytes()).await;
+        let mut parent = authenticated_api(&uri, ceilings);
+        parent.grant.as_mut().unwrap().max_requests = 2;
+        parent.signed_download_destination = Some(destination);
+        let root = tempfile::tempdir().unwrap();
+        let result = parent
+            .signed_download(
+                uri,
+                Window::Tail(65536),
+                &AssetDirectory::new(root.path().to_owned(), 131072),
+            )
+            .await;
+        assert_eq!(result.err(), Some(DownloadError::RequestLimit));
+        assert_eq!(
+            parent.policy_violation(),
+            Some(crate::PolicyViolation::HostCallLimit)
+        );
+        assert_eq!(parent.calls, 2);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        api.await.unwrap();
+        assert_eq!(storage.await.unwrap().len(), 1);
     }
 }
