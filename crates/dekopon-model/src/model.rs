@@ -389,7 +389,6 @@ enum Continuation {
     Codex {
         client: Box<ModelKey>,
         items: Vec<Value>,
-        reported_model: Option<String>,
     },
 }
 
@@ -431,6 +430,10 @@ impl ModelKey {
         self
     }
 
+    pub(crate) fn reported(&self) -> Option<&str> {
+        self.reported.as_ref().map(|model| model.0.as_str())
+    }
+
     pub fn is_for(&self, backend: Backend, upstream: &str) -> bool {
         self.backend == backend && self.upstream.0 == upstream
     }
@@ -441,8 +444,15 @@ impl ModelKey {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 pub struct OpaqueReasoning(Box<serde_json::value::RawValue>);
+
+impl<'de> Deserialize<'de> for OpaqueReasoning {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_value(&value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl Eq for OpaqueReasoning {}
 
@@ -500,12 +510,11 @@ impl AssistantTurn {
         reported_model: Option<String>,
     ) -> Self {
         self.continuation = Continuation::Codex {
-            client: Box::new(client.with_reported(reported_model.clone())),
+            client: Box::new(client.with_reported(reported_model)),
             items: items
                 .into_iter()
                 .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
                 .collect(),
-            reported_model,
         };
         self
     }
@@ -519,6 +528,14 @@ impl AssistantTurn {
         }
     }
 
+    pub(crate) fn has_opaque_reasoning(&self) -> bool {
+        match &self.continuation {
+            Continuation::Portable { .. } => false,
+            Continuation::Codex { items, .. } => !items.is_empty(),
+            Continuation::OpenRouter { state, .. } => state.has_reasoning(),
+        }
+    }
+
     pub fn opaque_reasoning(&self) -> Result<Vec<OpaqueReasoning>, serde_json::Error> {
         match &self.continuation {
             Continuation::Portable { .. } => Ok(Vec::new()),
@@ -529,11 +546,8 @@ impl AssistantTurn {
         }
     }
 
-    pub(crate) fn codex_reported_model(&self) -> Option<&str> {
-        match &self.continuation {
-            Continuation::Portable { .. } | Continuation::OpenRouter { .. } => None,
-            Continuation::Codex { reported_model, .. } => reported_model.as_deref(),
-        }
+    pub(crate) fn without_opaque(&self) -> Self {
+        Self::new(self.content.clone(), self.tool_calls.clone(), self.usage)
     }
 
     pub(crate) fn with_openrouter_continuation(
@@ -654,6 +668,13 @@ pub(crate) fn truncate_diagnostic(mut value: String) -> String {
 #[cfg(test)]
 mod durable_key_tests {
     use super::*;
+
+    #[test]
+    fn opaque_deserialization_uses_the_compact_constructor() {
+        let bytes: OpaqueReasoning = serde_json::from_str("{\n  \"text\":\"a\\nb\"\n}").unwrap();
+        assert_eq!(bytes.bytes(), br#"{"text":"a\nb"}"#);
+        assert!(!bytes.bytes().contains(&b'\n'));
+    }
 
     #[test]
     fn model_keys_survive_serialization_and_distinguish_reported_models() {

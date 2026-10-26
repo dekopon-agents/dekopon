@@ -208,7 +208,7 @@ pub enum ProtocolFailure {
     StreamTooLarge,
     #[error("invalid Responses event: {0}")]
     InvalidEvent(String),
-    #[error("native continuation belongs to another configured client")]
+    #[error("opaque reasoning model identity changed")]
     ContinuationMismatch,
     #[error("invalid event-stream UTF-8: {0}")]
     Utf8(#[source] std::str::Utf8Error),
