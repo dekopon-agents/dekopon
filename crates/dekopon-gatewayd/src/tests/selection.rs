@@ -427,6 +427,20 @@ async fn selected_summary_with_limit(
             "disposed original must stay disposed"
         );
     }
+    let prompt = model.prompt(0);
+    let notice = prompt
+        .iter()
+        .find(|(role, text)| role == "system" && text.starts_with("[gateway: memory]"))
+        .expect("selection notice");
+    if actual == "omitted" {
+        assert!(notice.1.contains(&format!("Omitted {reason}: 1")));
+    } else if actual == "summary" {
+        assert!(
+            notice
+                .1
+                .contains("Replaced with non-original representations:")
+        );
+    }
     let original = format!("status\nok{HEADER}{LABEL}{LOG}");
     if summary_only {
         assert!(
@@ -460,9 +474,9 @@ async fn selected_summary_with_limit(
         );
         assert_eq!(
             model.prompt(0)[if decider_choice == Some("missing") {
-                2
+                3
             } else {
-                1
+                2
             }],
             ("user".to_owned(), format!("{label}{expected}"))
         );
@@ -726,7 +740,7 @@ async fn shorter_bare_check_log_summary_with_larger_envelope_keeps_original() {
         "the longer model-facing label reverses bare-text savings"
     );
     assert_eq!(
-        model.prompt(0)[1..],
+        model.prompt(0)[2..],
         [
             ("user".into(), format!("{original_label}hi")),
             ("assistant".into(), "ok".into()),
@@ -852,7 +866,7 @@ async fn a_selected_omission_never_replays_its_resident_original() {
     )
     .await;
     assert_eq!(
-        model.prompt(0)[1..],
+        model.prompt(0)[2..],
         [(
             "user".into(),
             "[gateway: unmapped participant]\nnext question".into()
@@ -958,7 +972,7 @@ async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
     )
     .await;
     assert_eq!(
-        model.prompt(0)[1..],
+        model.prompt(0)[2..],
         [
             ("user".into(), "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nolder".into()),
             ("assistant".into(), "ok".into()),
@@ -981,7 +995,7 @@ async fn a_lagging_journal_keeps_its_newer_committed_resident_turn_once() {
             .len(),
         1
     );
-    let prompt = &model.prompt(0)[1].1;
+    let prompt = &model.prompt(0)[2].1;
     let (label, body) = prompt
         .split_once("]\n")
         .expect("addressable projected envelope");
@@ -1059,7 +1073,7 @@ async fn a_missing_journal_line_does_not_erase_a_committed_resident_window() {
     )
     .await;
     assert_eq!(
-        model.prompt(0)[1..3],
+        model.prompt(0)[2..4],
         [
             ("user".into(), "unpersisted".into()),
             ("assistant".into(), "ok".into())
@@ -1130,7 +1144,7 @@ async fn journal_projection_fits_newest_whole_turns_without_downgrading() {
     )
     .await;
     assert_eq!(
-        model.prompt(0)[1..],
+        model.prompt(0)[2..],
         [
             ("user".into(), "[memory: {\"recordId\":2,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\nmiddle".into()),
             ("assistant".into(), "b".into()),

@@ -7345,6 +7345,8 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
+
 fn expected_instructions() -> String {
     "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
 }
@@ -7466,6 +7468,7 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             ("user", "[gateway: unmapped participant]\nwhat broke?"),
             ("assistant", "Two things broke."),
             (
@@ -7666,6 +7669,7 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
         models.prompt(2),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             (
                 "user",
                 "[gateway: unmapped participant]\nwhat happened to mine?"
@@ -7713,6 +7717,7 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             ("user", first),
             ("assistant", "The deploy failed."),
             ("user", second),
@@ -7768,6 +7773,7 @@ async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             ("user", &attributed),
             ("assistant", "noted"),
             (
@@ -7838,11 +7844,11 @@ async fn shared_history_keeps_the_participant_label_and_drops_the_inventory_note
     );
     let replayed = models.prompt(1);
     assert_eq!(
-        replayed[1].1,
+        replayed[2].1,
         "[gateway: authenticated participant: simon]\nwhat is this?\n[gateway: attached chat-asset:1 — shot.png]"
     );
     assert!(
-        replayed[3]
+        replayed[4]
             .1
             .starts_with("[gateway: authenticated participant: xavier]\nwho sent it?"),
         "{replayed:?}"
@@ -7882,6 +7888,7 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             ("user", "[gateway:[…]"),
             ("assistant", "ok"),
             (
@@ -7974,7 +7981,7 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
     );
     let second = models.prompt(1);
     assert_eq!(
-        second[1],
+        second[2],
         (
             "user".to_owned(),
             "[gateway: unmapped participant]\nwhat is this?\n[gateway: attached chat-asset:1 — shot.png]".to_owned()
@@ -7982,13 +7989,13 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
         "the recorded turn keeps the arrival and drops the inventory note"
     );
     assert_eq!(
-        second[2],
+        second[3],
         ("assistant".to_owned(), "A screenshot.".to_owned())
     );
-    assert!(second[3].1.starts_with(
+    assert!(second[4].1.starts_with(
         "[gateway: unmapped participant]\nand now?\n\n[gateway: files in this conversation"
     ));
-    assert!(second[3].1.contains("shot.png"), "{second:?}");
+    assert!(second[4].1.contains("shot.png"), "{second:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8075,6 +8082,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             ("user", "[gateway: unmapped participant]\nwhat broke?"),
             (
                 "user",
@@ -17869,6 +17877,8 @@ mod github_invocation;
 mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/memory_notice.rs"]
+mod memory_notice;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
 #[path = "tests/sealed_handoff.rs"]
@@ -18632,6 +18642,7 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
         models.prompt(1),
         transcript(&[
             ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
             (
                 "user",
                 "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\n[gateway: unmapped participant]\nwhat broke?"
@@ -19090,7 +19101,7 @@ async fn recalled_labels(scope: MemoryScope) -> (String, Vec<String>) {
 
     let mut asked = asked.lock().clone();
     asked.sort();
-    (models.prompt(0)[1].1.clone(), asked)
+    (models.prompt(0)[2].1.clone(), asked)
 }
 
 #[tokio::test(flavor = "multi_thread")]

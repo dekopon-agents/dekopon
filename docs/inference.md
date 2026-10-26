@@ -291,6 +291,8 @@ appended only if its generation remains current.
 - any synthetic assistant text for a no-reply decision — there is none, so a declined turn keeps the
   user message alone.
 
+The model is told what is missing or replaced; replayed turns keep requests, final replies and bash exchanges, while reasoning and other tool calls are not kept.
+
 This is conversation continuity, not evidence continuity. The broker audit is where authorized
 effects remain verifiable.
 
