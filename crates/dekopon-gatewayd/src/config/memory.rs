@@ -316,8 +316,9 @@ pub fn resolve_knobs(inputs: &KnobInputs<'_>) -> Result<MemoryKnobs, PolicyProbl
             });
         }
         Some(hot_turns) => hot_turns,
-        None => NonZeroUsize::new(DEFAULT_HOT_TURNS.min(inputs.max_turns))
-            .unwrap_or(NonZeroUsize::MIN),
+        None => {
+            NonZeroUsize::new(DEFAULT_HOT_TURNS.min(inputs.max_turns)).unwrap_or(NonZeroUsize::MIN)
+        }
     };
     let summaries = inputs
         .route

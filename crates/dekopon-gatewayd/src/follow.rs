@@ -308,11 +308,9 @@ impl FollowTable {
             Err(error) => {
                 let last = self.written.lock().get(key).copied();
                 let mut resident = self.resident.lock();
-                if last.is_some_and(|last| {
-                    resident
-                        .get(key)
-                        .is_some_and(|marked| marked.seq == last)
-                }) {
+                if last
+                    .is_some_and(|last| resident.get(key).is_some_and(|marked| marked.seq == last))
+                {
                     resident.remove(key);
                 }
                 Err(error)
@@ -574,6 +572,15 @@ impl<I: CapabilityInvoker> FollowInvoker<I> {
 
 #[cfg(test)]
 impl FollowTable {
+    pub(crate) fn stay_and_write(
+        self: &Arc<Self>,
+        key: &str,
+        now: SystemTime,
+    ) -> Result<(), JournalError> {
+        self.stay(key, now, 0)?.write();
+        Ok(())
+    }
+
     pub(crate) fn writing_for_test(&self) -> bool {
         self.disk.try_lock().is_none()
     }
@@ -908,6 +915,9 @@ mod tests {
         assert_eq!(events[0].field("route"), Some("0"));
         assert!(events[0].field("subject").is_none());
         assert!(events[0].field("conversation").is_none());
+        for pending in std::mem::take(&mut *success.pending_follows().lock()) {
+            pending.write();
+        }
         assert!(matches!(
             FollowTable::load(journal)
                 .unwrap()
@@ -929,7 +939,7 @@ mod tests {
         );
         let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let key = "c".repeat(64);
-        table.stay(&key, SystemTime::now()).unwrap();
+        table.stay_and_write(&key, SystemTime::now()).unwrap();
         let (locked, ready) = tokio::sync::oneshot::channel();
         let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
         let held = Arc::clone(&journal);
@@ -989,20 +999,20 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let now = SystemTime::now();
         let key = "c".repeat(64);
-        table.stay(&key, now).unwrap();
+        table.stay_and_write(&key, now).unwrap();
         table.suspend(&key);
         assert_eq!(table.ticket(&key, now), FollowTicket::Absent);
         assert!(matches!(
-            table.stay(&key, now),
+            table.stay_and_write(&key, now),
             Err(JournalError::Io {
                 kind: io::ErrorKind::PermissionDenied
             })
         ));
         table.leave(&key).unwrap();
-        assert!(table.stay(&key, now).is_ok());
+        assert!(table.stay_and_write(&key, now).is_ok());
     }
 
     #[test]
@@ -1016,10 +1026,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let key = "d".repeat(64);
         let now = SystemTime::now();
-        table.stay(&key, now).unwrap();
+        table.stay_and_write(&key, now).unwrap();
         std::fs::remove_file(dir.path().join(format!("{key}.followed"))).unwrap();
         std::fs::create_dir(dir.path().join(format!("{key}.followed"))).unwrap();
         assert!(matches!(
@@ -1043,8 +1053,8 @@ mod tests {
         let table = Arc::new(FollowTable::load(journal).unwrap());
         let key = "a".repeat(64);
         let other = "b".repeat(64);
-        table.stay(&key, SystemTime::now()).unwrap();
-        table.stay(&other, SystemTime::now()).unwrap();
+        table.stay_and_write(&key, SystemTime::now()).unwrap();
+        table.stay_and_write(&other, SystemTime::now()).unwrap();
         let success = FollowInvoker::new(
             ResultLeg(CapabilityCallResult::Succeeded),
             Some((Arc::clone(&table), key.clone(), 0)),
@@ -1096,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_marker_write_never_activates_a_ticket() {
+    fn a_failed_follow_write_leaves_the_ticket_absent() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1113,11 +1123,20 @@ mod tests {
             ResultLeg(CapabilityCallResult::Succeeded),
             Some((Arc::clone(&table), key.clone(), 0)),
         );
+        let (capture, _guard) = crate::tests::capture_spans();
         assert!(matches!(
             call(&success, "dekopon-provider-follow.stay", json!({})),
-            CapabilityCallResult::Failed { .. }
+            CapabilityCallResult::Succeeded
         ));
+        for pending in std::mem::take(&mut *success.pending_follows().lock()) {
+            pending.write();
+        }
         assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        let refused = capture.events_where(
+            "dekopon_gatewayd",
+            &[("audit.event", "gateway.follow"), ("operation", "refused")],
+        );
+        assert_eq!(refused.len(), 1);
     }
 
     #[test]
@@ -1217,14 +1236,17 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(Arc::clone(&journal)).unwrap();
+        let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let now = SystemTime::now();
         for index in 0..MAX_TICKETS {
             table.resident.lock().insert(
                 format!("{index:064x}"),
-                FollowMarker {
-                    at_ms: millis(now) - 2,
-                    until_ms: millis(now) - 1,
+                Marked {
+                    marker: FollowMarker {
+                        at_ms: millis(now) - 2,
+                        until_ms: millis(now) - 1,
+                    },
+                    seq: MarkerSeq(u64::MAX - index as u64),
                 },
             );
         }
@@ -1239,7 +1261,7 @@ mod tests {
             )
             .unwrap();
         let fresh = "f".repeat(64);
-        table.stay(&fresh, now).unwrap();
+        table.stay_and_write(&fresh, now).unwrap();
         assert!(matches!(
             table.ticket(&fresh, now),
             FollowTicket::Active { .. }
@@ -1261,7 +1283,7 @@ mod tests {
         let key = "b".repeat(64);
         std::fs::write(dir.path().join(format!("{key}.followed")), b"{broken").unwrap();
         let (capture, _guard) = crate::tests::capture_spans();
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let events = capture.events_where("dekopon_gatewayd", &[("event", "gateway_follow")]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].field("reason"), Some("corrupt"));
@@ -1317,7 +1339,8 @@ mod tests {
                 .unwrap();
         }
         let (capture, _guard) = crate::tests::capture_spans();
-        let table = FollowTable::load(journal).expect("valid overflow must not refuse boot");
+        let table =
+            Arc::new(FollowTable::load(journal).expect("valid overflow must not refuse boot"));
         assert_eq!(table.resident.lock().len(), MAX_TICKETS);
         let earliest = format!("{:064x}", MAX_TICKETS / 2);
         let latest = format!("{:064x}", MAX_TICKETS);
@@ -1354,19 +1377,22 @@ mod tests {
             Err(JournalError::Io { .. })
         ));
         std::fs::remove_dir(dir.path().join(format!("{key}.followed"))).unwrap();
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let at = SystemTime::now();
         for index in 0..MAX_TICKETS {
             table.resident.lock().insert(
                 format!("{index:064x}"),
-                FollowMarker {
-                    at_ms: millis(at),
-                    until_ms: millis(at) + 86_400_000,
+                Marked {
+                    marker: FollowMarker {
+                        at_ms: millis(at),
+                        until_ms: millis(at) + 86_400_000,
+                    },
+                    seq: MarkerSeq(u64::MAX - index as u64),
                 },
             );
         }
         assert!(matches!(
-            table.stay(&key, at),
+            table.stay_and_write(&key, at),
             Err(JournalError::Io {
                 kind: io::ErrorKind::OutOfMemory
             })
@@ -1385,11 +1411,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(Arc::clone(&journal)).unwrap();
+        let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         assert_eq!(table.ticket("test", at), FollowTicket::Absent);
         let key = "a".repeat(64);
-        table.stay(&key, at).unwrap();
+        table.stay_and_write(&key, at).unwrap();
         let restarted = FollowTable::load(Arc::clone(&journal)).unwrap();
         std::fs::remove_file(dir.path().join(format!("{key}.followed"))).unwrap();
         assert!(matches!(

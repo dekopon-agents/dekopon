@@ -920,7 +920,7 @@ async fn journal_less_persistent_memory_warns_once_and_has_no_durable_policy() {
         resolved
             .routes
             .iter()
-            .all(|route| route.memory_policy.is_none())
+            .all(|route| route.memory_knobs.is_none())
     );
     let catalog_path = directory.path().join("dekopon.yaml");
     fs::write(&catalog_path, catalog_text(true, Some("reasoning"))).expect("catalog fixture");
@@ -938,79 +938,80 @@ async fn journal_less_persistent_memory_warns_once_and_has_no_durable_policy() {
 }
 
 #[tokio::test]
-async fn policy_resolves_with_route_precedence_and_refuses_invalid_names_before_binding() {
+async fn memory_knobs_resolve_with_route_precedence_and_journal_defaults() {
     let directory = temporary();
     let mut input = document(directory.path());
     input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}, "memory": {
-        "agents": {"reviewer": {"routine": "prefix", "policy": {
-            "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
-            "routines": [{"id": "prefix", "kind": "prefix", "maxBytes": 1024}],
-            "retain": ["prefix"], "selection": {"mode": "agentPreference", "routine": "prefix"}
-        }}}
+        "agents": {"reviewer": {"hotTurns": 3, "summaries": {"parts": [100, 400]},
+            "capture": {"maxItemBytes": 4096}}}
     }});
     let config = load(directory.path(), &input)
         .await
-        .expect("agent policy resolves");
+        .expect("agent knobs resolve");
+    let knobs = config.routes[0].memory_knobs.clone().expect("knobs");
+    assert_eq!(knobs.hot_turns.get(), 3);
+    assert_eq!(knobs.capture_max_item_bytes.get(), 4096);
     assert_eq!(
-        config.routes[0]
-            .memory_policy
+        knobs
+            .summaries
             .as_ref()
-            .expect("policy")
-            .preferred_routine
-            .as_deref(),
-        Some("prefix")
+            .expect("summaries")
+            .parts
+            .iter()
+            .map(|part| part.get())
+            .collect::<Vec<_>>(),
+        [100, 400]
     );
-    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
-        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
-        "routines": [{"id": "original", "kind": "original"}], "retain": ["original"],
-        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original",
-            "backend": "openrouter-luna", "model": "openai/gpt-6-luna-decisions", "requireProbabilities": false}
-    }});
-    let error = load(directory.path(), &input)
-        .await
-        .expect_err("unknown agent preference is refused");
-    assert!(reports(&error, |problem| matches!(
-        problem,
-        ConfigProblem::MemoryPolicy { .. }
-    )));
-    input["sessions"]["memory"]["agents"]["reviewer"]["routine"] = json!("original");
+    assert_eq!(knobs.selection, crate::config::memory::Selection::Ladder);
+    match config.routes[0].memory {
+        MemoryPolicy::Persistent(window) => {
+            assert_eq!(window.limits.max_bytes, 512 * 1024);
+        }
+        MemoryPolicy::OneShot => panic!("persistent route"),
+    }
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "hotTurns": 2, "summaries": "off",
+        "selection": {"decider": {"capability": "decide.choose", "backend": "openrouter-luna",
+            "model": "openai/gpt-6-luna-decisions", "requireProbabilities": false}}});
     let config = load(directory.path(), &input)
         .await
-        .expect("route decider takes precedence");
+        .expect("route knobs take precedence");
+    let knobs = config.routes[0].memory_knobs.clone().expect("knobs");
+    assert_eq!(knobs.hot_turns.get(), 2);
+    assert!(knobs.summaries.is_none());
     assert!(matches!(
-        config.routes[0]
-            .memory_policy
-            .as_ref()
-            .expect("policy")
-            .selection
-            .mode,
-        crate::config::memory::SelectionMode::Decider
+        knobs.selection,
+        crate::config::memory::Selection::Decider(_)
     ));
     let routes =
-        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("bound policy");
-    assert!(matches!(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("bound knobs");
+    assert!(
         routes
             .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .expect("route")
-            .memory_policy
+            .memory_knobs
             .as_ref()
-            .expect("policy")
-            .selection
-            .mode,
-        crate::config::memory::SelectionMode::Decider
-    ));
+            .is_some_and(|knobs| knobs.summaries.is_none())
+    );
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "recall": "none"});
+    let config = load(directory.path(), &input)
+        .await
+        .expect("a route without journal recall");
+    assert!(
+        config.routes[0]
+            .memory_knobs
+            .as_ref()
+            .is_some_and(|knobs| knobs.summaries.is_none()),
+        "records that never replay are never summarized"
+    );
 }
 
 #[tokio::test]
-async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
+async fn summaries_refuse_unknown_and_proxy_only_models_and_parts_past_a_rung() {
     let directory = temporary();
     let mut input = document(directory.path());
-    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
-        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
-        "routines": [{"id": "summary", "kind": "progressiveOneShot", "model": "missing",
-            "parts": [{"id": "short", "maxBytes": 100}, {"id": "long", "maxBytes": 200}]}],
-        "retain": ["summary"], "selection": {"mode": "fixed", "routine": "summary"}
-    }});
+    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
+    input["routes"][0]["memory"] =
+        json!({"mode": "persistent", "summaries": {"model": "missing", "parts": [100, 200]}});
     let error = load(directory.path(), &input)
         .await
         .expect_err("unknown model");
@@ -1028,7 +1029,7 @@ async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
             "name": "proxy-claude", "kind": "anthropic", "model": "claude-sonnet-4-5",
             "apiKeyEnv": "ANTHROPIC_API_KEY"
         }));
-    input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("proxy-claude");
+    input["routes"][0]["memory"]["summaries"]["model"] = json!("proxy-claude");
     let error = load(directory.path(), &input)
         .await
         .expect_err("proxy-only model");
@@ -1038,26 +1039,31 @@ async fn progressive_policy_refuses_unknown_and_proxy_only_models() {
         problem: crate::config::memory::PolicyProblem::ProxyOnlyModel(model), ..
     } if model == "proxy-claude")
     ));
-    input["routes"][0]["memory"]["policy"]["routines"][0]["model"] = json!("local-qwen");
+    input["routes"][0]["memory"]["summaries"]["model"] = json!("local-qwen");
     assert!(
         load(directory.path(), &input).await.is_ok(),
         "known direct model resolves"
     );
-    input["routes"][0]["memory"]["policy"]["routines"][0]["parts"][1]["maxBytes"] = json!(100);
-    let error = load(directory.path(), &input)
-        .await
-        .expect_err("non-increasing cumulative budgets");
-    assert!(reports(&error, |problem| matches!(
-        problem,
-        ConfigProblem::MemoryPolicy {
-            problem: crate::config::memory::PolicyProblem::Invalid("progressive parts"),
-            ..
-        }
-    )));
+    for parts in [
+        json!([]),
+        Value::Array((1..=256).map(|_| json!(10)).collect()),
+    ] {
+        input["routes"][0]["memory"]["summaries"]["parts"] = parts;
+        let error = load(directory.path(), &input)
+            .await
+            .expect_err("parts outside 1..=255");
+        assert!(reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::MemoryPolicy {
+                problem: crate::config::memory::PolicyProblem::Parts,
+                ..
+            }
+        )));
+    }
 }
 
 #[tokio::test]
-async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
+async fn deleted_and_invalid_memory_keys_refuse_at_config_load() {
     let directory = temporary();
     let mut input = document(directory.path());
     input["sessions"] = json!({"memory": {"agents": {"nobody": {}}}});
@@ -1073,99 +1079,46 @@ async fn invalid_memory_policy_and_retention_refuse_at_config_load() {
         load(directory.path(), &input).await,
         Err(ConfigError::Decode { .. })
     ));
-    input["sessions"] = json!({"memory": {"arena": {"sweepIntervalMs": 1000}}});
+    for sessions in [
+        json!({"memory": {"arena": {"maxTransientBytes": 1024}}}),
+        json!({"memory": {"agents": {"reviewer": {"routine": "original"}}}}),
+        json!({"memory": {"agents": {"reviewer": {"policy": {}}}}}),
+    ] {
+        input["sessions"] = sessions;
+        assert!(matches!(
+            load(directory.path(), &input).await,
+            Err(ConfigError::Decode { .. })
+        ));
+    }
+    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {}});
     assert!(matches!(
         load(directory.path(), &input).await,
         Err(ConfigError::Decode { .. })
     ));
-}
-
-#[tokio::test]
-async fn a_decider_selection_requires_its_provider_profile_and_label_safe_routine_ids() {
-    let directory = temporary();
-    let mut input = document(directory.path());
-    input["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
-    input["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
-        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
-        "routines": [{"id": "original", "kind": "original"}, {"id": "head_1.k-b", "kind": "prefix", "maxBytes": 512}],
-        "retain": ["original", "head_1.k-b"],
-        "selection": {"mode": "decider", "decisionCapability": "decide.choose", "fallback": "original",
-            "backend": "openrouter-jev", "model": "typesafe/jev-1.13", "requireProbabilities": true}
-    }});
-    let config = load(directory.path(), &input)
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "maxTurns": 4, "hotTurns": 5});
+    let error = load(directory.path(), &input)
         .await
-        .expect("complete decider profile");
-    let selection = &config.routes[0]
-        .memory_policy
-        .as_ref()
-        .expect("policy")
-        .selection;
-    assert_eq!(selection.backend.as_deref(), Some("openrouter-jev"));
-    assert_eq!(selection.model.as_deref(), Some("typesafe/jev-1.13"));
-    assert_eq!(selection.require_probabilities, Some(true));
-    for key in ["backend", "model", "requireProbabilities"] {
-        let mut missing = input.clone();
-        missing["routes"][0]["memory"]["policy"]["selection"]
-            .as_object_mut()
-            .expect("selection")
-            .remove(key);
-        let error = load(directory.path(), &missing)
-            .await
-            .expect_err("incomplete decider profile");
-        assert!(reports(&error, |problem| matches!(
-            problem,
-            ConfigProblem::MemoryPolicy {
-                problem: crate::config::memory::PolicyProblem::Invalid("selection"),
-                ..
-            }
-        )));
-    }
-    let mut fixed = input.clone();
-    fixed["routes"][0]["memory"]["policy"]["selection"] = json!({"mode": "fixed", "routine": "original",
-        "backend": "openrouter-jev", "model": "typesafe/jev-1.13", "requireProbabilities": false});
-    let error = load(directory.path(), &fixed)
-        .await
-        .expect_err("decider profile outside decider mode");
+        .expect_err("hot window wider than the window");
     assert!(reports(&error, |problem| matches!(
         problem,
         ConfigProblem::MemoryPolicy {
-            problem: crate::config::memory::PolicyProblem::Invalid("selection"),
+            problem: crate::config::memory::PolicyProblem::HotTurns {
+                hot_turns: 5,
+                max_turns: 4
+            },
             ..
         }
     )));
-    for id in ["has space", "a/b", "é", &"x".repeat(129)] {
-        let mut unsafe_id = input.clone();
-        unsafe_id["routes"][0]["memory"]["policy"]["routines"][1]["id"] = json!(id);
-        unsafe_id["routes"][0]["memory"]["policy"]["retain"][1] = json!(id);
-        let error = load(directory.path(), &unsafe_id)
-            .await
-            .expect_err("routine ID outside the label charset");
-        assert!(reports(&error, |problem| matches!(
-            problem,
-            ConfigProblem::MemoryPolicy {
-                problem: crate::config::memory::PolicyProblem::Invalid("routine id"),
-                ..
-            }
-        )));
-    }
-    let mut crowded = input.clone();
-    let routines: Vec<Value> = (0..33)
-        .map(|index| json!({"id": format!("p{index}"), "kind": "prefix", "maxBytes": 64}))
-        .chain([json!({"id": "original", "kind": "original"})])
-        .collect();
-    let retain: Vec<Value> = routines
-        .iter()
-        .map(|routine| routine["id"].clone())
-        .collect();
-    crowded["routes"][0]["memory"]["policy"]["routines"] = Value::Array(routines);
-    crowded["routes"][0]["memory"]["policy"]["retain"] = Value::Array(retain);
-    let error = load(directory.path(), &crowded)
+    input["routes"][0]["memory"] = json!({"mode": "persistent", "selection": {"decider": {
+        "capability": " ", "backend": "b", "model": "m", "requireProbabilities": true}}});
+    let error = load(directory.path(), &input)
         .await
-        .expect_err("more retained routines than decider labels");
+        .expect_err("empty decider capability");
     assert!(reports(&error, |problem| matches!(
         problem,
         ConfigProblem::MemoryPolicy {
-            problem: crate::config::memory::PolicyProblem::Invalid("decider labels"),
+            problem: crate::config::memory::PolicyProblem::Decider("capability"),
             ..
         }
     )));
@@ -2359,15 +2312,14 @@ async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_
     assert_eq!(journal.retention, Duration::from_secs(7 * 86_400));
     assert_eq!(journal.seal_retention, Duration::from_secs(86_400));
     assert!(journal.dir.is_absolute() && journal.dir.ends_with("journal"));
-    let policy = resolved.routes[0]
-        .memory_policy
+    let knobs = resolved.routes[0]
+        .memory_knobs
         .as_ref()
-        .expect("original-only default");
-    assert_eq!(policy.retain, ["original"]);
-    assert!(matches!(
-        policy.selection.mode,
-        crate::config::memory::SelectionMode::Fixed
-    ));
+        .expect("journal defaults");
+    assert_eq!(knobs.hot_turns.get(), 10);
+    assert_eq!(knobs.capture_max_item_bytes.get(), 256 * 1024);
+    assert!(knobs.summaries.is_some(), "summaries are on by default");
+    assert_eq!(knobs.selection, crate::config::memory::Selection::Ladder);
 }
 
 #[tokio::test]
@@ -3695,16 +3647,7 @@ impl ModelScript {
         let messages = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
-        messages
-            .iter()
-            .map(|message| {
-                let value = serde_json::to_value(message).expect("a message serializes");
-                (
-                    value["role"].as_str().unwrap_or_default().to_owned(),
-                    value["content"].as_str().unwrap_or_default().to_owned(),
-                )
-            })
-            .collect()
+        messages.iter().map(message_text).collect()
     }
 }
 
@@ -4403,7 +4346,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         steering: crate::config::Steering::Abort,
         progress_notes: false,
         memory: MemoryPolicy::OneShot,
-        memory_policy: None,
+        memory_knobs: None,
         indicators: fixture_liveness(),
         wakes: false,
         follow: false,
@@ -4420,8 +4363,117 @@ fn timed_route(model: ModelConfig, max_duration: Duration) -> crate::routes::Bou
 fn persistent_route(model: ModelConfig, window: MemoryWindow) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         memory: MemoryPolicy::Persistent(window),
+        memory_knobs: Some(knobs(window)),
         ..route(model)
     }
+}
+
+pub(crate) fn knobs(window: MemoryWindow) -> crate::config::MemoryKnobs {
+    crate::config::MemoryKnobs {
+        hot_turns: std::num::NonZeroUsize::new(window.limits.max_turns.clamp(1, 10))
+            .expect("positive hot window"),
+        summaries: None,
+        capture_max_item_bytes: std::num::NonZeroU32::new(256 * 1024).expect("positive cap"),
+        selection: crate::config::memory::Selection::Ladder,
+    }
+}
+
+pub(crate) fn text_of(text: &dekopon_model::text::Text) -> String {
+    use std::os::unix::fs::FileExt as _;
+    match text {
+        dekopon_model::text::Text::Owned(text) => text.clone(),
+        dekopon_model::text::Text::File { file, offset, len } => {
+            let mut escaped = vec![0; usize::try_from(*len).expect("slice length")];
+            file.read_exact_at(&mut escaped, *offset)
+                .expect("journal slice");
+            let mut quoted = b"\"".to_vec();
+            quoted.extend_from_slice(&escaped);
+            quoted.push(b'"');
+            serde_json::from_slice(&quoted).expect("an escaped JSON string")
+        }
+        dekopon_model::text::Text::Opaque(source) => format!("[opaque {} B]", source.len()),
+    }
+}
+
+/// A request message as role and text, with journal slices read from their file.
+pub(crate) fn message_text(message: &ModelMessage) -> (String, String) {
+    use dekopon_model::replay::ReplayMessage;
+    match message {
+        ModelMessage::Journal { message } => match message {
+            ReplayMessage::User(texts) => ("user".into(), texts.iter().map(text_of).collect()),
+            ReplayMessage::Assistant { content, .. } => (
+                "assistant".into(),
+                content.as_ref().map(text_of).unwrap_or_default(),
+            ),
+            ReplayMessage::Tool { text, .. } => ("tool".into(), text_of(text)),
+        },
+        ModelMessage::System { .. }
+        | ModelMessage::User { .. }
+        | ModelMessage::Assistant { .. }
+        | ModelMessage::ToolResults { .. } => {
+            let value = serde_json::to_value(message).expect("a message serializes");
+            (
+                value["role"].as_str().unwrap_or_default().to_owned(),
+                value["content"].as_str().unwrap_or_default().to_owned(),
+            )
+        }
+    }
+}
+
+pub(crate) fn captured(user: &str, answer: Option<&str>) -> dekopon_agent::prompt::CapturedTurn {
+    use dekopon_agent::memory::{Item, Kept};
+    let mut original = vec![Item::User(Kept::new(user, usize::MAX))];
+    if let Some(answer) = answer {
+        original.push(Item::Assistant(Kept::new(answer, usize::MAX)));
+    }
+    dekopon_agent::prompt::CapturedTurn {
+        original,
+        model: dekopon_model::model::ModelKey::new(
+            dekopon_model::model::Backend::OpenAiCompatible,
+            "model",
+        ),
+    }
+}
+
+pub(crate) fn append_captured(
+    journal: &crate::journal::Journal,
+    stem: &str,
+    grants: &[&str],
+    captured: &dekopon_agent::prompt::CapturedTurn,
+) -> crate::memory::record::RecordId {
+    journal
+        .append(
+            stem,
+            &crate::journal::Entry {
+                at: SystemTime::now(),
+                grant: &crate::memory::record::GrantDigest::of(&granted(grants)),
+                captured,
+                keep: crate::journal::Keep::Everything,
+                plan: None,
+                inventory: &[],
+                next_asset_id: 1,
+            },
+        )
+        .expect("append")
+        .expect("within the agent cap")
+}
+
+/// Splits a v3 journal file into its tagged lines, parsing each as JSON.
+pub(crate) fn journal_lines(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("journal file")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("journal line"))
+        .collect()
+}
+
+pub(crate) fn journal_records(path: &Path) -> Vec<(Value, Value)> {
+    let lines = journal_lines(path);
+    lines
+        .windows(2)
+        .filter(|pair| pair[0].get("b").is_some() && pair[1].get("h").is_some())
+        .map(|pair| (pair[1]["h"].clone(), pair[0]["b"].clone()))
+        .collect()
 }
 
 fn window() -> MemoryWindow {
@@ -4671,6 +4723,7 @@ fn runner_tracking(
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
         journal: None,
+        summaries: None,
         follow: None,
         assets: Arc::new(AssetStore::new(
             max_conversations,
@@ -4726,13 +4779,7 @@ impl InterruptibleModel {
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         self.prompts.lock()[index]
             .iter()
-            .map(|message| {
-                let value = serde_json::to_value(message).expect("message");
-                (
-                    value["role"].as_str().unwrap_or_default().to_owned(),
-                    value["content"].as_str().unwrap_or_default().to_owned(),
-                )
-            })
+            .map(message_text)
             .collect()
     }
 
@@ -5284,15 +5331,15 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         &key,
         &granted(&["memory.chat.recent", "memory.chat.search"]),
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
-    assert_eq!(remembered.history.turns().len(), 1);
+    assert_eq!(remembered.history().turns().len(), 1);
     assert_eq!(
-        remembered.history.turns()[0].user(),
+        remembered.history().turns()[0].user(),
         "[gateway: unmapped participant]\nOK, thanks"
     );
-    assert_eq!(remembered.history.turns()[0].answer(), None);
+    assert_eq!(remembered.history().turns()[0].answer(), None);
     assert!(matches!(
         observed
             .recv()
@@ -7362,7 +7409,7 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
 }
 
 const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
-const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
+const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\n";
 
 fn expected_instructions() -> String {
     "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
@@ -7439,8 +7486,23 @@ fn commit(
 ) {
     let ConversationSeed {
         cache_key, lease, ..
-    } = store.begin(key, granted, window, None, now);
-    lease.commit(window, turn, TakenIn::default(), &cache_key, now);
+    } = store.begin(
+        key,
+        granted,
+        window,
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
+    lease.commit(
+        window,
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn,
+        },
+        TakenIn::default(),
+        &cache_key,
+        now,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8181,11 +8243,11 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         start + Duration::from_secs(899),
     );
     assert_eq!(
-        warm.history.len(),
+        warm.history().len(),
         1,
         "inside the timeout the exchange is replayed"
     );
@@ -8194,11 +8256,11 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         start + Duration::from_secs(900),
     );
     assert!(
-        cold.history.is_empty(),
+        cold.history().is_empty(),
         "past the timeout the next message starts fresh"
     );
     assert_eq!(
@@ -8247,23 +8309,41 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     assert_eq!(store.tracked(), 2, "the ceiling holds");
     assert!(
         store
-            .begin(&keys[1], &allowed, window(), None, now)
-            .history
+            .begin(
+                &keys[1],
+                &allowed,
+                window(),
+                crate::conversation::Seed::Owned(None),
+                now
+            )
+            .history()
             .is_empty(),
         "the least recently used conversation is the one that goes"
     );
     assert_eq!(
         store
-            .begin(&keys[0], &allowed, window(), None, now)
-            .history
+            .begin(
+                &keys[0],
+                &allowed,
+                window(),
+                crate::conversation::Seed::Owned(None),
+                now
+            )
+            .history()
             .len(),
         2,
         "the conversation somebody is still having survives"
     );
     assert_eq!(
         store
-            .begin(&keys[2], &allowed, window(), None, now)
-            .history
+            .begin(
+                &keys[2],
+                &allowed,
+                window(),
+                crate::conversation::Seed::Owned(None),
+                now
+            )
+            .history()
             .len(),
         1
     );
@@ -8307,7 +8387,16 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
                 now,
             );
         }
-        let history = store.begin(&key, &allowed, window, None, now).history;
+        let history = store
+            .begin(
+                &key,
+                &allowed,
+                window,
+                crate::conversation::Seed::Owned(None),
+                now,
+            )
+            .history()
+            .clone();
         assert_eq!(history.len(), 2, "{name} keeps two exchanges");
         assert_eq!(
             history.turns()[0].user(),
@@ -8347,9 +8436,21 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
-    let first = store.begin(&key, &allowed, window(), None, now);
-    let second = store.begin(&key, &allowed, window(), None, now);
-    assert!(first.history.is_empty() && second.history.is_empty());
+    let first = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
+    let second = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
+    assert!(first.history().is_empty() && second.history().is_empty());
     let ConversationSeed {
         cache_key: first_cache_key,
         lease: first_lease,
@@ -8363,23 +8464,35 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
 
     first_lease.commit(
         window(),
-        ConversationTurn::completed("what broke?", "two things"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("what broke?", "two things"),
+        },
         TakenIn::default(),
         &first_cache_key,
         now,
     );
     second_lease.commit(
         window(),
-        ConversationTurn::completed("still there?", "yes"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("still there?", "yes"),
+        },
         TakenIn::default(),
         &second_cache_key,
         now,
     );
 
-    let resumed = store.begin(&key, &allowed, window(), None, now);
-    assert_eq!(resumed.history.len(), 2);
-    assert_eq!(resumed.history.turns()[0].user(), "what broke?");
-    assert_eq!(resumed.history.turns()[1].user(), "still there?");
+    let resumed = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
+    assert_eq!(resumed.history().len(), 2);
+    assert_eq!(resumed.history().turns()[0].user(), "what broke?");
+    assert_eq!(resumed.history().turns()[1].user(), "still there?");
     assert_eq!(first_cache_key, second_cache_key);
     assert_eq!(resumed.cache_key, first_cache_key);
 }
@@ -8457,16 +8570,28 @@ fn shared_history_cannot_cross_agent_transport_or_conversation_boundaries() {
     ] {
         assert!(
             store
-                .begin(&isolated, &allowed, window(), None, now)
-                .history
+                .begin(
+                    &isolated,
+                    &allowed,
+                    window(),
+                    crate::conversation::Seed::Owned(None),
+                    now
+                )
+                .history()
                 .is_empty(),
             "one changed boundary component must start a clean shared conversation"
         );
     }
     assert_eq!(
         store
-            .begin(&origin, &allowed, window(), None, now)
-            .history
+            .begin(
+                &origin,
+                &allowed,
+                window(),
+                crate::conversation::Seed::Owned(None),
+                now
+            )
+            .history()
             .len(),
         1,
         "the exact shared key still reaches its own turn"
@@ -8489,28 +8614,52 @@ fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
         now,
     );
 
-    let stale = store.begin(&key, &wide, window(), None, now + Duration::from_secs(1));
-    let fresh = store.begin(&key, &narrow, window(), None, now + Duration::from_secs(2));
-    assert!(fresh.history.is_empty(), "the changed grant starts clean");
+    let stale = store.begin(
+        &key,
+        &wide,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(1),
+    );
+    let fresh = store.begin(
+        &key,
+        &narrow,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(2),
+    );
+    assert!(fresh.history().is_empty(), "the changed grant starts clean");
     let fresh_cache_key = fresh.cache_key.clone();
     fresh.lease.commit(
         window(),
-        ConversationTurn::completed("fresh question", "fresh answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("fresh question", "fresh answer"),
+        },
         TakenIn::default(),
         &fresh_cache_key,
         now + Duration::from_secs(3),
     );
     stale.lease.commit(
         window(),
-        ConversationTurn::completed("stale question", "stale privileged answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("stale question", "stale privileged answer"),
+        },
         TakenIn::default(),
         &stale.cache_key,
         now + Duration::from_secs(4),
     );
 
-    let resumed = store.begin(&key, &narrow, window(), None, now + Duration::from_secs(5));
-    assert_eq!(resumed.history.len(), 1);
-    assert_eq!(resumed.history.turns()[0].user(), "fresh question");
+    let resumed = store.begin(
+        &key,
+        &narrow,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(5),
+    );
+    assert_eq!(resumed.history().len(), 1);
+    assert_eq!(resumed.history().turns()[0].user(), "fresh question");
     assert_eq!(resumed.cache_key, fresh_cache_key);
 }
 
@@ -8528,21 +8677,36 @@ fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
         ConversationTurn::completed("old question", "old answer"),
         now,
     );
-    let stale = store.begin(&key, &allowed, window(), None, now + Duration::from_secs(1));
+    let stale = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(1),
+    );
     let stale_cache_key = stale.cache_key.clone();
 
     assert!(store.remove(&key, EvictionReason::GrantChanged));
     stale.lease.commit(
         window(),
-        ConversationTurn::completed("late question", "late answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("late question", "late answer"),
+        },
         TakenIn::default(),
         &stale_cache_key,
         now + Duration::from_secs(2),
     );
 
     assert_eq!(store.tracked(), 0);
-    let cold = store.begin(&key, &allowed, window(), None, now + Duration::from_secs(3));
-    assert!(cold.history.is_empty());
+    let cold = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(3),
+    );
+    assert!(cold.history().is_empty());
     assert_eq!(cold.cache_key, stale_cache_key);
 }
 
@@ -8565,7 +8729,7 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
         &first_key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(1),
     );
     let stale_cache_key = stale.cache_key.clone();
@@ -8580,7 +8744,10 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
 
     stale.lease.commit(
         window(),
-        ConversationTurn::completed("late first", "late answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("late first", "late answer"),
+        },
         TakenIn::default(),
         &stale_cache_key,
         now + Duration::from_secs(3),
@@ -8593,10 +8760,10 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
                 &first_key,
                 &allowed,
                 window(),
-                None,
+                crate::conversation::Seed::Owned(None),
                 now + Duration::from_secs(4)
             )
-            .history
+            .history()
             .is_empty(),
         "the evicted generation stays forgotten"
     );
@@ -8606,10 +8773,10 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
                 &second_key,
                 &allowed,
                 window(),
-                None,
+                crate::conversation::Seed::Owned(None),
                 now + Duration::from_secs(4)
             )
-            .history
+            .history()
             .turns()[0]
             .user(),
         "second"
@@ -8634,27 +8801,33 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(899),
     );
     let fresh = store.begin(
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(900),
     );
     let fresh_cache_key = fresh.cache_key.clone();
     fresh.lease.commit(
         window(),
-        ConversationTurn::completed("new", "new answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("new", "new answer"),
+        },
         TakenIn::default(),
         &fresh_cache_key,
         now + Duration::from_secs(900),
     );
     stale.lease.commit(
         window(),
-        ConversationTurn::completed("late old", "late old answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("late old", "late old answer"),
+        },
         TakenIn::default(),
         &stale.cache_key,
         now + Duration::from_secs(901),
@@ -8664,11 +8837,11 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(901),
     );
-    assert_eq!(resumed.history.len(), 1);
-    assert_eq!(resumed.history.turns()[0].user(), "new");
+    assert_eq!(resumed.history().len(), 1);
+    assert_eq!(resumed.history().turns()[0].user(), "new");
     assert_eq!(resumed.cache_key, fresh_cache_key);
 }
 
@@ -8794,7 +8967,7 @@ fn a_cache_key_never_contains_the_raw_subject_or_conversation_id() {
         &key,
         &granted(&["cli-probe.upper"]),
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
 
@@ -8874,11 +9047,20 @@ fn an_evicted_conversation_comes_back_with_the_same_cache_key() {
     let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
 
-    let first = store.begin(&key, &allowed, window(), None, start);
+    let first = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        start,
+    );
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
-        ConversationTurn::completed("what broke?", "two things"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("what broke?", "two things"),
+        },
         TakenIn::default(),
         &first_cache_key,
         start,
@@ -8888,7 +9070,7 @@ fn an_evicted_conversation_comes_back_with_the_same_cache_key() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         start + Duration::from_secs(60),
     );
     assert_eq!(
@@ -8900,11 +9082,11 @@ fn an_evicted_conversation_comes_back_with_the_same_cache_key() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         start + Duration::from_secs(900),
     );
     assert!(
-        cold.history.is_empty(),
+        cold.history().is_empty(),
         "the idle timeout dropped the entry"
     );
     assert_eq!(
@@ -8930,11 +9112,23 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         now,
     );
     let before_grant_change = grant_store
-        .begin(&grant_key, &wider, window(), None, now)
+        .begin(
+            &grant_key,
+            &wider,
+            window(),
+            crate::conversation::Seed::Owned(None),
+            now,
+        )
         .cache_key
         .clone();
     let after_grant_change = grant_store
-        .begin(&grant_key, &allowed, window(), None, now)
+        .begin(
+            &grant_key,
+            &allowed,
+            window(),
+            crate::conversation::Seed::Owned(None),
+            now,
+        )
         .cache_key
         .clone();
     assert_eq!(after_grant_change, before_grant_change);
@@ -8950,12 +9144,24 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         now,
     );
     let before_removal = removed_store
-        .begin(&removed_key, &allowed, window(), None, now)
+        .begin(
+            &removed_key,
+            &allowed,
+            window(),
+            crate::conversation::Seed::Owned(None),
+            now,
+        )
         .cache_key
         .clone();
     assert!(removed_store.remove(&removed_key, EvictionReason::GrantChanged));
     let after_removal = removed_store
-        .begin(&removed_key, &allowed, window(), None, now)
+        .begin(
+            &removed_key,
+            &allowed,
+            window(),
+            crate::conversation::Seed::Owned(None),
+            now,
+        )
         .cache_key
         .clone();
     assert_eq!(after_removal, before_removal);
@@ -8972,7 +9178,13 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         now,
     );
     let before_capacity = capacity_store
-        .begin(&displaced, &allowed, window(), None, now)
+        .begin(
+            &displaced,
+            &allowed,
+            window(),
+            crate::conversation::Seed::Owned(None),
+            now,
+        )
         .cache_key
         .clone();
     commit(
@@ -8988,7 +9200,7 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
             &displaced,
             &allowed,
             window(),
-            None,
+            crate::conversation::Seed::Owned(None),
             now + Duration::from_secs(2),
         )
         .cache_key
@@ -9344,7 +9556,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         pending.deadline().is_none(),
         "without a ticket the not-addressed filter drops it"
     );
-    table.stay(&key, SystemTime::now()).unwrap();
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
     std::fs::remove_file(
         directory
             .path()
@@ -9483,7 +9695,7 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
         &route.conversation,
         &stop.conversation.key(),
     );
-    table.stay(&key, SystemTime::now()).unwrap();
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
     let path = directory
         .path()
         .join("journal")
@@ -12131,7 +12343,13 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let narrow = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
-    let first = conversations.begin(&key, &wide, window(), None, now);
+    let first = conversations.begin(
+        &key,
+        &wide,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     let old_access = first.assets.clone();
     let registered = store.assets_for_access(
         &old_access,
@@ -12142,13 +12360,22 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
-        ConversationTurn::completed("old", "old answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("old", "old answer"),
+        },
         TakenIn::default(),
         &first_cache_key,
         now,
     );
 
-    let stale = conversations.begin(&key, &wide, window(), None, now + Duration::from_secs(1));
+    let stale = conversations.begin(
+        &key,
+        &wide,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(1),
+    );
     assert_eq!(
         stale.cache_key, first_cache_key,
         "another participant with the same grant stays on the shared cache lane"
@@ -12175,7 +12402,13 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
         )
     });
     barrier.wait();
-    let fresh = conversations.begin(&key, &narrow, window(), None, now + Duration::from_secs(2));
+    let fresh = conversations.begin(
+        &key,
+        &narrow,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(2),
+    );
     let _racing_result = racing_publication.join().expect("asset race completes");
 
     assert!(
@@ -12226,13 +12459,22 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     let key = private_conversation_key("dev", "idle-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let first = conversations.begin(&key, &allowed, window(), None, now);
+    let first = conversations.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     let old_access = first.assets.clone();
     store.assets_for_access(&old_access, vec![pending("old.png", "image/png", 10)], now);
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
-        ConversationTurn::completed("old", "old answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("old", "old answer"),
+        },
         TakenIn::default(),
         &first_cache_key,
         now,
@@ -12242,10 +12484,10 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
         &key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(900),
     );
-    assert!(fresh.history.is_empty());
+    assert!(fresh.history().is_empty());
     assert!(
         store
             .get_access(&old_access, 1, now + Duration::from_secs(900))
@@ -12269,7 +12511,13 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let second_key = private_conversation_key("dev", "second-assets", SUBJECT);
     let now = Instant::now();
 
-    let first = conversations.begin(&first_key, &allowed, window(), None, now);
+    let first = conversations.begin(
+        &first_key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     let old_access = first.assets.clone();
     store.assets_for_access(
         &old_access,
@@ -12279,7 +12527,10 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
-        ConversationTurn::completed("first", "first answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("first", "first answer"),
+        },
         TakenIn::default(),
         &first_cache_key,
         now,
@@ -12288,7 +12539,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
         &first_key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(1),
     );
     let in_flight_access = in_flight.assets.clone();
@@ -12323,7 +12574,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
         &first_key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(4),
     );
     let registered = store.assets_for_access(
@@ -12344,7 +12595,13 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
     let second_key = private_conversation_key("dev", "second-live-assets", SUBJECT);
     let now = Instant::now();
 
-    let first = conversations.begin(&first_key, &allowed, window(), None, now);
+    let first = conversations.begin(
+        &first_key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     assert_eq!(
         store
             .assets_for_access(
@@ -12358,7 +12615,10 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
-        ConversationTurn::completed("first", "first answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("first", "first answer"),
+        },
         TakenIn::default(),
         &first_cache_key,
         now,
@@ -12368,7 +12628,7 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
         &second_key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(1),
     );
     store.assets_for_access(
@@ -12380,7 +12640,7 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
         &first_key,
         &allowed,
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(2),
     );
     let replacement = store.assets_for_access(
@@ -12423,7 +12683,13 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let key = private_conversation_key("dev", "removed-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let first = conversations.begin(&key, &allowed, window(), None, now);
+    let first = conversations.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     let old_access = first.assets.clone();
     let registered = store.assets_for_access(
         &old_access,
@@ -12434,7 +12700,10 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
-        ConversationTurn::completed("old", "old answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("old", "old answer"),
+        },
         TakenIn::default(),
         &first_cache_key,
         now,
@@ -12475,7 +12744,13 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
             .is_none()
     );
 
-    let fresh = conversations.begin(&key, &allowed, window(), None, now + Duration::from_secs(1));
+    let fresh = conversations.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now + Duration::from_secs(1),
+    );
     let replacement = store.assets_for_access(
         &fresh.assets,
         vec![pending("new.png", "image/png", 10)],
@@ -12523,13 +12798,22 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
     let key = private_conversation_key("dev", "racing-byte-fetch", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let seed = conversations.begin(&key, &allowed, window(), None, now);
+    let seed = conversations.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     let access = seed.assets.clone();
     store.assets_for_access(&access, vec![pending("retired.png", "image/png", 10)], now);
     let cache_key = seed.cache_key.clone();
     seed.lease.commit(
         window(),
-        ConversationTurn::completed("old", "old answer"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("old", "old answer"),
+        },
         TakenIn::default(),
         &cache_key,
         now,
@@ -16074,7 +16358,7 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay(&key, SystemTime::now()).unwrap();
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
     runner.follow = Some(table);
     let driver = Arc::new(
         RecordingDriver::default()
@@ -16947,7 +17231,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
         &key,
         &granted(&["gpt-image.edit"]),
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
     let registered = store.assets_for_access(&seed.assets, inbound.assets, Instant::now());
@@ -17883,8 +18167,6 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/attribution.rs"]
 mod attribution;
-#[path = "tests/generation.rs"]
-mod generation;
 mod github_burst;
 #[path = "tests/github_http_invocation.rs"]
 mod github_http_invocation;
@@ -17894,6 +18176,8 @@ mod github_invocation;
 mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/memory.rs"]
+mod memory;
 #[path = "tests/memory_notice.rs"]
 mod memory_notice;
 mod participants;
@@ -17901,8 +18185,6 @@ mod participants;
 mod reload_evidence;
 #[path = "tests/sealed_handoff.rs"]
 mod sealed_handoff;
-#[path = "tests/selection.rs"]
-mod selection;
 #[path = "tests/steering.rs"]
 mod steering;
 #[path = "tests/steering_e2e.rs"]
@@ -17935,6 +18217,7 @@ fn journaled_runner(
             )
             .expect("journal"),
         )),
+        summaries: None,
         follow: None,
         assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
         asset_fetchers: HashMap::new(),
@@ -18003,6 +18286,7 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
     );
     let invoker =
         crate::follow::FollowInvoker::new(leg, Some((Arc::clone(&table), key.clone(), 0)));
+    let pending = invoker.pending_follows();
     let result = tokio::task::spawn_blocking(move || {
         let (stdout, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
         let calls = dekopon_process::CallBudget::new(2);
@@ -18044,6 +18328,9 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         "dekopon-provider-follow.stay"
     );
     assert_eq!(invocation.input, json!({}));
+    for follow in std::mem::take(&mut *pending.lock()) {
+        follow.write();
+    }
     assert!(matches!(
         crate::follow::FollowTable::load(journal)
             .unwrap()
@@ -18119,7 +18406,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay(&key, SystemTime::now()).unwrap();
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
     runner.follow = Some(table);
     let driver = Arc::new(RecordingDriver::default());
     let runner = Arc::new(runner);
@@ -18263,7 +18550,7 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
             &route.conversation,
             &inbound.conversation.key(),
         );
-        table.stay(&key, SystemTime::now()).unwrap();
+        table.stay_and_write(&key, SystemTime::now()).unwrap();
         runner.follow = Some(table);
         let driver = Arc::new(RecordingDriver::default());
         tokio::time::timeout(
@@ -18404,7 +18691,7 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
         &inbound.conversation.key(),
     );
     table
-        .stay(&key, SystemTime::now() - Duration::from_secs(3600))
+        .stay_and_write(&key, SystemTime::now() - Duration::from_secs(3600))
         .unwrap();
     let marker = journal_dir.path().join(format!("{key}.followed"));
     let original = fs::read(&marker).unwrap();
@@ -18533,7 +18820,7 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay(&key, SystemTime::now()).unwrap();
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
     runner.follow = Some(Arc::clone(&table));
     let driver = Arc::new(FarewellOrderDriver {
         table: Arc::clone(&table),
@@ -18610,7 +18897,7 @@ async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
         &route.conversation,
         &first.conversation.key(),
     );
-    table.stay(&key, SystemTime::now()).unwrap();
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
     assert!(matches!(
         table.ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
@@ -18662,10 +18949,7 @@ async fn a_journaled_window_survives_a_restart_of_the_gateway() {
         transcript(&[
             ("system", &expected_instructions()),
             ("system", JOURNAL_FIDELITY_NOTICE),
-            (
-                "user",
-                "[memory: {\"recordId\":1,\"representationId\":\"original\",\"eligibleRepresentationIds\":[\"original\"],\"omittedBytes\":0}]\n[gateway: unmapped participant]\nwhat broke?"
-            ),
+            ("user", "[gateway: unmapped participant]\nwhat broke?"),
             ("assistant", "Two things broke."),
             (
                 "user",
@@ -18725,7 +19009,7 @@ async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message(
         );
     }
     assert_eq!(prompt[2], ("user".to_owned(), prompt[2].1.clone()));
-    assert!(prompt[2].1.starts_with("[memory: {\"recordId\":1,"));
+    assert!(prompt[2].1.starts_with("[gateway: unmapped participant]"));
     assert!(prompt[2].1.contains("four photos"));
 }
 
@@ -19055,16 +19339,22 @@ async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
     let window = recall_window(RecallSource::Platform);
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let now = Instant::now();
-    let seed = runner
-        .conversations
-        .begin(&key, &granted(&["cli-probe.upper"]), window, None, now);
+    let seed = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window,
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     seed.lease.commit(
         window,
-        ConversationTurn::completed("asked", "answered"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("asked", "answered"),
+        },
         TakenIn {
             newest: Some("t1".to_owned()),
             steers: vec!["t2".to_owned()],
-            recalled: None,
         },
         &seed.cache_key,
         now,
@@ -19167,150 +19457,31 @@ fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
         store.resident(&key, &allowed, window(), now),
         Residency::Cold
     );
-    let first = store.begin(&key, &allowed, window(), recalled("from disk"), now);
+    let first = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(recalled("from disk")),
+        now,
+    );
     assert!(first.created);
-    assert_eq!(first.history.turns()[0].user(), "from disk");
+    assert_eq!(first.history().turns()[0].user(), "from disk");
     assert_eq!(
         store.resident(&key, &allowed, window(), now),
         Residency::Resident
     );
-    let second = store.begin(&key, &allowed, window(), recalled("ignored"), now);
+    let second = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(recalled("ignored")),
+        now,
+    );
     assert!(!second.created);
-    assert_eq!(second.history.turns()[0].user(), "from disk");
+    assert_eq!(second.history().turns()[0].user(), "from disk");
     assert_eq!(
         store.resident(&key, &allowed, window(), now + window().idle_timeout),
         Residency::Cold
-    );
-}
-
-#[test]
-fn committed_window_repack_keeps_a_live_reader_and_refuses_over_headroom() {
-    let (capture, _guard) = capture_spans();
-    let store = ConversationStore::with_arena_limit(4, 300);
-    let allowed = granted(&["cli-probe.upper"]);
-    let key = private_conversation_key("dev", "dev", SUBJECT);
-    let now = Instant::now();
-    let commit = |text: &str| {
-        let seed = store.begin(&key, &allowed, window(), None, now);
-        assert!(seed.lease.commit(
-            window(),
-            ConversationTurn::completed(text, "ok"),
-            TakenIn::default(),
-            &seed.cache_key,
-            now,
-        ));
-    };
-    commit("one");
-    let old = store.snapshot(&key, &allowed).unwrap();
-    assert!(store.snapshot(&key, &granted(&["different"])).is_none());
-    commit("two");
-    let new = store.snapshot(&key, &allowed).unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(old.read(1).unwrap()).unwrap()["user"],
-        "one"
-    );
-    assert_eq!(new.read(1), old.read(1));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(new.read(2).unwrap()).unwrap()["user"],
-        "two"
-    );
-    commit("three");
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_gatewayd",
-                &[
-                    ("event", "gateway_memory_retention_failed"),
-                    ("reason", "arena-headroom"),
-                ]
-            )
-            .len(),
-        1,
-    );
-    assert_eq!(store.snapshot(&key, &allowed).unwrap().read(3), None);
-    assert_eq!(old.read(1), new.read(1));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(new.read(2).unwrap()).unwrap()["answer"],
-        "ok"
-    );
-}
-
-#[test]
-fn two_conversations_share_the_arena_transient_ceiling() {
-    let (capture, _guard) = capture_spans();
-    let store = ConversationStore::with_arena_limit(4, 100);
-    let allowed = granted(&["cli-probe.upper"]);
-    let now = Instant::now();
-    let a = private_conversation_key("dev", "first", SUBJECT);
-    let b = private_conversation_key("dev", "second", SUBJECT);
-    for key in [&a, &b] {
-        let seed = store.begin(key, &allowed, window(), None, now);
-        assert!(seed.lease.commit(
-            window(),
-            ConversationTurn::completed("one", "ok"),
-            TakenIn::default(),
-            &seed.cache_key,
-            now,
-        ));
-    }
-    assert!(store.snapshot(&a, &allowed).unwrap().read(1).is_some());
-    assert_eq!(store.snapshot(&b, &allowed).unwrap().read(1), None);
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_gatewayd",
-                &[
-                    ("event", "gateway_memory_retention_failed"),
-                    ("reason", "arena-headroom"),
-                ]
-            )
-            .len(),
-        1,
-    );
-}
-
-#[test]
-fn an_evicted_conversations_held_reader_keeps_its_headroom_charge() {
-    let (capture, _guard) = capture_spans();
-    let store = ConversationStore::with_arena_limit(4, 100);
-    let allowed = granted(&["cli-probe.upper"]);
-    let now = Instant::now();
-    let a = private_conversation_key("dev", "first", SUBJECT);
-    let b = private_conversation_key("dev", "second", SUBJECT);
-    let c = private_conversation_key("dev", "third", SUBJECT);
-    let commit = |key: &_| {
-        let seed = store.begin(key, &allowed, window(), None, now);
-        assert!(seed.lease.commit(
-            window(),
-            ConversationTurn::completed("one", "ok"),
-            TakenIn::default(),
-            &seed.cache_key,
-            now,
-        ));
-    };
-    commit(&a);
-    let held = store.snapshot(&a, &allowed).unwrap();
-    assert!(store.remove(&a, EvictionReason::Capacity));
-    commit(&b);
-    assert_eq!(store.snapshot(&b, &allowed).unwrap().read(1), None);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(held.read(1).unwrap()).unwrap()["user"],
-        "one"
-    );
-    drop(held);
-    commit(&c);
-    assert!(store.snapshot(&c, &allowed).unwrap().read(1).is_some());
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_gatewayd",
-                &[
-                    ("event", "gateway_memory_retention_failed"),
-                    ("reason", "arena-headroom"),
-                ]
-            )
-            .len(),
-        1,
     );
 }
 
@@ -19322,26 +19493,42 @@ fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it
     let now = Instant::now();
     let turn = |text: &str| ConversationTurn::completed(text, "ok");
 
-    let first = store.begin(&key, &allowed, window(), None, now);
+    let first = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     first.lease.commit(
         window(),
-        turn("asked"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: turn("asked"),
+        },
         TakenIn {
             newest: Some("t1".to_owned()),
             steers: vec!["t2".to_owned()],
-            recalled: None,
         },
         &first.cache_key,
         now,
     );
-    let woken = store.begin(&key, &allowed, window(), None, now);
+    let woken = store.begin(
+        &key,
+        &allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     woken.lease.commit(
         window(),
-        turn("a wake"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: turn("a wake"),
+        },
         TakenIn {
             newest: None,
             steers: vec!["t3".to_owned()],
-            recalled: None,
         },
         &woken.cache_key,
         now,
@@ -19363,14 +19550,22 @@ fn a_follow_up_commit_keeps_earlier_steers_and_never_moves_the_watermark_back() 
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let now = Instant::now();
     let commit = |newest: &str, steers: &[&str]| {
-        let seed = store.begin(&key, &allowed, window(), None, now);
+        let seed = store.begin(
+            &key,
+            &allowed,
+            window(),
+            crate::conversation::Seed::Owned(None),
+            now,
+        );
         seed.lease.commit(
             window(),
-            ConversationTurn::completed(newest, "ok"),
+            crate::conversation::Commit::Owned {
+                recalled: None,
+                turn: ConversationTurn::completed(newest, "ok"),
+            },
             TakenIn {
                 newest: Some(newest.to_owned()),
                 steers: steers.iter().map(|id| (*id).to_owned()).collect(),
-                recalled: None,
             },
             &seed.cache_key,
             now,
@@ -19394,12 +19589,19 @@ fn resident_since(runner: &SessionRunner, after: &str) {
     let window = recall_window(RecallSource::Platform);
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let now = Instant::now();
-    let seed = runner
-        .conversations
-        .begin(&key, &granted(&["cli-probe.upper"]), window, None, now);
+    let seed = runner.conversations.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window,
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     seed.lease.commit(
         window,
-        ConversationTurn::completed("asked", "answered"),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn: ConversationTurn::completed("asked", "answered"),
+        },
         TakenIn {
             newest: Some(after.to_owned()),
             ..TakenIn::default()
@@ -20471,9 +20673,13 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         .jobs
         .admit(owner.clone(), anchor, None, Arc::from("still running"))
         .unwrap();
-    let asset_seed = runner
-        .conversations
-        .begin(&private, &grant, window(), None, now);
+    let asset_seed = runner.conversations.begin(
+        &private,
+        &grant,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    );
     let access = asset_seed.assets.clone();
     let arriving =
         runner
@@ -20543,8 +20749,15 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
             let history = runner
                 .conversations
-                .begin(key, &grant, window(), None, now)
-                .history;
+                .begin(
+                    key,
+                    &grant,
+                    window(),
+                    crate::conversation::Seed::Owned(None),
+                    now,
+                )
+                .history()
+                .clone();
             assert_eq!(history.turns()[0].user(), text);
         }
         assert_eq!(other.len(), 2);
@@ -22189,7 +22402,7 @@ async fn cancelling_a_first_journaled_turn_reclaims_its_downloaded_upload() {
         &key,
         &granted(&["cli-probe.upper"]),
         window(),
-        None,
+        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
     assert!(!seed.created);
@@ -22237,7 +22450,7 @@ async fn cancelling_a_first_journaled_turn_reclaims_its_downloaded_upload() {
             .unwrap()
             .recall(
                 &key.journal_stem(),
-                &crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
+                &crate::memory::record::GrantDigest::of(&granted(&["cli-probe.upper"])),
                 recall_window(RecallSource::Journal),
                 SystemTime::now()
             )
@@ -22346,12 +22559,8 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         answer("done again"),
     ]);
     let runner = journaled_runner(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
-    let mut route = persistent_route(model_config(), recall_window(RecallSource::Platform));
-    route.memory_policy = Some(crate::config::ResolvedPolicy::default());
-    crate::memory::generation::report_policy(
-        route.memory_policy.as_ref().unwrap(),
-        RecallSource::Platform,
-    );
+    let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    crate::memory::generation::report_policy(&route);
     let inbound = message("do the work");
     let key = ConversationKey::of(
         &route.agent,
@@ -22372,63 +22581,60 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         &key,
         &granted(&["cli-probe.upper"]),
         route.memory.window().expect("persistent window"),
-        None,
+        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
-    let turn = remembered.history.turns().first().expect("committed turn");
-    assert!(
-        turn.exchanges().is_empty(),
-        "the resident window excludes durable tool bytes"
-    );
+    let crate::conversation::Window::Owned(history) = &remembered.window else {
+        panic!("a platform route keeps an owned window");
+    };
+    let turn = history.turns().first().expect("committed turn");
     assert_eq!(
         turn.user(),
         "[gateway: authenticated participant: xavier]\ndo the work"
     );
     assert_eq!(turn.answer(), Some("done"));
-    let bytes = fs::read_to_string(
-        journal_dir
-            .path()
-            .join(key.journal_stem())
-            .with_extension("jsonl"),
-    )
-    .expect("platform exchanges persist");
-    let line: Value = serde_json::from_str(bytes.trim()).expect("versioned turn");
-    assert_eq!(
-        line["exchanges"][0]["request"][0]["text"],
-        "printf result-sentinel"
+    let path = journal_dir
+        .path()
+        .join(key.journal_stem())
+        .with_extension("jsonl");
+    let bytes = fs::read_to_string(&path).expect("platform exchanges persist");
+    let records = journal_records(&path);
+    let (header, body) = &records[0];
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert!(
+        body[0]["exchange"]["call"]["arguments"]["text"]
+            .as_str()
+            .is_some_and(|arguments| arguments.contains("printf result-sentinel"))
     );
-    let version =
-        crate::memory::generation::version(&route.memory_policy.as_ref().unwrap().routines[0]);
-    let tools = crate::journal::JournalMemoryTools {
-        journal: runner.journal.as_ref().unwrap(),
-        stem: key.journal_stem(),
-        grant: crate::journal::grant_digest(&granted(&["cli-probe.upper"])),
-        versions: [("original".to_owned(), version)].into(),
-    };
-    let read = dekopon_agent::memory_tools::MemoryTools::read(
-        &tools,
-        line["recordId"].as_u64().unwrap(),
-        "original",
-        None,
+    assert!(header["plan"].is_null());
+    assert_eq!(header["summaries"], json!([]));
+    let tools = crate::memory::journal::JournalMemoryTools::new(
+        runner.journal.as_ref().unwrap(),
+        key.journal_stem(),
+        crate::memory::journal::tools::Admission {
+            grant: crate::memory::record::GrantDigest::of(&granted(&["cli-probe.upper"])),
+            horizon_ms: 0,
+            sealed_at_ms: None,
+        },
     );
-    assert!(read.contains("[request] printf result-sentinel"), "{read}");
+    let record = header["id"].as_u64().unwrap();
+    let read = dekopon_agent::memory_tools::MemoryTools::read(&tools, record, "native", None)
+        .expect("the record is readable");
+    assert!(read.contains("[request] "), "{read}");
+    assert!(read.contains("printf result-sentinel"), "{read}");
     assert!(read.contains("[result]"), "{read}");
-    assert!(read.contains("result-sentinel"), "{read}");
-    assert!(read.contains("outcome: success, exit: Some(0)"), "{read}");
+    assert!(read.contains("[tool: bash, outcome: exit 0]"), "{read}");
     assert!(!read.contains("do the work"));
     assert!(!read.contains("done"));
-    let refused = dekopon_agent::memory_tools::MemoryTools::read(
-        &tools,
-        line["recordId"].as_u64().unwrap(),
-        "missing",
-        None,
-    );
-    assert!(
-        refused.contains("eligible representation IDs: original"),
-        "{refused}"
-    );
-    assert!(line["user"].is_null());
-    assert!(line["answer"].is_null());
+    let refused = dekopon_agent::memory_tools::MemoryTools::read(&tools, record, "missing", None);
+    assert!(matches!(
+        refused,
+        Err(dekopon_agent::memory_tools::MemoryRefusal::UnknownRepresentation { ref available })
+            if available == &[
+                dekopon_agent::memory_tools::Rung::Native,
+                dekopon_agent::memory_tools::Rung::Metadata
+            ]
+    ));
     assert!(!bytes.contains("do the work"));
     assert!(!bytes.contains("done"));
     run_session(
@@ -22443,7 +22649,7 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         &[("event", "gateway_memory_policy"), ("recall", "platform")],
     );
     assert_eq!(policy.len(), 1);
-    assert_eq!(policy[0].field("mode"), Some("fixed"));
+    assert_eq!(policy[0].field("memory.selection"), Some("ladder"));
     assert!(!format!("{policy:?}").contains("do the work"));
 }
 

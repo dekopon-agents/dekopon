@@ -242,7 +242,13 @@ pub(crate) struct ChoiceLine {
 }
 
 #[derive(Clone, Debug)]
-#[expect(dead_code, reason = "07 reads asset lines; this build only carries them")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "07 reads asset lines; this build only carries them"
+    )
+)]
 pub(crate) enum AssetSideLine {
     Slot(SlotLine),
     Pin(PinLine),

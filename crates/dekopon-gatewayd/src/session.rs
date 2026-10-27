@@ -1203,6 +1203,9 @@ impl Recall<'_> {
                 match recalled {
                     Ok(Ok(recalled)) => {
                         span.record("conversation.recall_source", "journal");
+                        if recalled.grant_boundary {
+                            facts.push(MemoryFact::GrantBoundary);
+                        }
                         tracing::info!(
                             event = "gateway_recalled",
                             source = "journal",
@@ -1832,24 +1835,30 @@ async fn run_admitted(
         record_admission(&message, "started", 0, None);
     }
     let cancellation = admission.cancellation();
-    let Ended { outcome, deferred } = session(runner, route, &message, driver, cancellation.clone())
-        .instrument(tracing::info_span!(
-            "gateway.session",
-            generation.digest = digest,
-            agent = %route.agent,
-            gen_ai.agent.name = %route.agent,
-            gen_ai.operation.name = "invoke_agent",
-            conversation.kind = message.conversation.kind.as_str(),
-            conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
-            conversation.id = message.conversation.id.as_str(),
-            conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
-            conversation.turns = tracing::field::Empty,
-            conversation.bytes = tracing::field::Empty,
-            conversation.recall_source = tracing::field::Empty,
-            conversation.recalled_turns = tracing::field::Empty,
-            conversation.carried_assets = tracing::field::Empty,
-        ))
-        .await;
+    let Ended { outcome, deferred } = session(
+        runner,
+        route,
+        &message,
+        driver,
+        cancellation.clone(),
+    )
+    .instrument(tracing::info_span!(
+        "gateway.session",
+        generation.digest = digest,
+        agent = %route.agent,
+        gen_ai.agent.name = %route.agent,
+        gen_ai.operation.name = "invoke_agent",
+        conversation.kind = message.conversation.kind.as_str(),
+        conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
+        conversation.id = message.conversation.id.as_str(),
+        conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
+        conversation.turns = tracing::field::Empty,
+        conversation.bytes = tracing::field::Empty,
+        conversation.recall_source = tracing::field::Empty,
+        conversation.recalled_turns = tracing::field::Empty,
+        conversation.carried_assets = tracing::field::Empty,
+    ))
+    .await;
     let span = tracing::Span::current();
     span.record("outcome", outcome.label());
     if outcome.is_error() {
@@ -2871,9 +2880,7 @@ async fn session_turn(
                     }
                 }
                 (Window::Journal { .. }, _) => (Vec::new(), None, ReplaySource::Journal),
-                (Window::Owned(history), _) => {
-                    (history.replay(), None, ReplaySource::Conversation)
-                }
+                (Window::Owned(history), _) => (history.replay(), None, ReplaySource::Conversation),
             };
             if prior.is_empty() {
                 if thread_reply && recalled_empty {
@@ -2925,14 +2932,15 @@ async fn session_turn(
                     memory_stem,
                     Admission {
                         grant: memory_grant,
-                        horizon_ms: journal_age.unwrap_or(0).max(
-                            memory_window.map_or(0, |window| {
+                        horizon_ms: journal_age.unwrap_or(0).max(memory_window.map_or(
+                            0,
+                            |window| {
                                 journal::millis(SystemTime::now()).saturating_sub(
                                     u64::try_from(window.forget_after.as_millis())
                                         .unwrap_or(u64::MAX),
                                 )
-                            }),
-                        ),
+                            },
+                        )),
                         sealed_at_ms: memory_seal.map(journal::millis),
                     },
                 )
@@ -2998,8 +3006,10 @@ async fn session_turn(
                         &key,
                         message,
                         &mut progress,
-                        &cancellation,
-                        deferred,
+                        StoppedTurn {
+                            cancellation: &cancellation,
+                            deferred,
+                        },
                     )
                     .await
                     .into();
@@ -3048,8 +3058,10 @@ async fn session_turn(
             &key,
             message,
             &mut progress,
-            &cancellation,
-            deferred,
+            StoppedTurn {
+                cancellation: &cancellation,
+                deferred,
+            },
         )
         .await
         .into();
@@ -3080,7 +3092,8 @@ async fn session_turn(
                 ),
             },
         });
-        if lease.commit(window, commit, taken, &cache_key, Instant::now()) && runner.journal.is_some()
+        if lease.commit(window, commit, taken, &cache_key, Instant::now())
+            && runner.journal.is_some()
         {
             deferred.record = Some(PostReply {
                 key: key.clone(),
@@ -3449,15 +3462,23 @@ fn remember_stop(runner: &SessionRunner, key: &ConversationKey, cause: StopCause
     Terminal::Stopped(cause)
 }
 
+struct StoppedTurn<'a> {
+    cancellation: &'a SessionCancellation,
+    deferred: Deferred,
+}
+
 async fn stopped(
     runner: &SessionRunner,
     route: &BoundRoute,
     key: &ConversationKey,
     message: &InboundMessage,
     progress: &mut ProgressPolicy,
-    cancellation: &SessionCancellation,
-    deferred: Deferred,
+    turn: StoppedTurn<'_>,
 ) -> MessageOutcome {
+    let StoppedTurn {
+        cancellation,
+        deferred,
+    } = turn;
     tracing::info!(
         event = "gateway_session_cancelled",
         "gateway.session.cancelled"

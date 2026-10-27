@@ -36,10 +36,10 @@ mod notice;
 use crate::memory::{Outcome as RecordedOutcome, RecordBuilder};
 pub use notice::{MemoryFact, MemoryNotice, OmissionReason, ReplaySource};
 
+pub use crate::memory::{CapturedTurn, Item};
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
-pub use crate::memory::{CapturedTurn, Item};
 pub use history::{
     ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits, RawAnswer,
 };
@@ -2006,6 +2006,8 @@ mod tests {
     use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun, ScriptOutcome};
     use serde_json::{Value, json};
 
+    use crate::memory::{Exchange, Kept, Outcome};
+    use crate::memory_tools::MemoryRefusal;
     use crate::meta::{
         AgentConfigView, EffectiveCapabilityView, MemoryConfigView, SessionConfigView,
     };
@@ -2015,13 +2017,13 @@ mod tests {
 
     use super::{
         AGENT_CONFIG_ALREADY_SHOWN, AGENT_CONFIG_TOOL_NAME, ASSET_TOOL_NAME, AssetSource,
-        BAD_SCRIPT_ARGUMENTS_FEEDBACK, CancellationProbe, ConversationTurn,
+        BAD_SCRIPT_ARGUMENTS_FEEDBACK, CancellationProbe, CapturedTurn, ConversationTurn,
         DECLINE_AFTER_WORK_RESULT, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS,
-        FetchedAsset, Handoff, History, HistoryLimits, IMPROVEMENT_TOOL_NAME,
+        FetchedAsset, Handoff, History, HistoryLimits, IMPROVEMENT_TOOL_NAME, Item,
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
-        PromptLimits, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME, SKILL_TOOL_NAME,
-        ScriptRuntime, Seal, SessionInputs, Steer, SteerSource, agent_config_tool, asset_argument,
-        format_script_outcome, reject_tool_call, run_prompt, run_prompt_session,
+        PromptLimits, PromptOutcome, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME,
+        SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource, agent_config_tool,
+        asset_argument, format_script_outcome, reject_tool_call, run_prompt, run_prompt_session,
         run_prompt_with_history, run_prompt_with_history_and_options, script_argument, script_tool,
         unknown_tool_feedback,
     };
@@ -2218,12 +2220,14 @@ mod tests {
         let runtime = RecordingRuntime::new(0);
         let mut history = History::default();
         for prompt in ["msg1", "msg2"] {
-            run_prompt_session(
-                &model,
-                &runtime,
-                SessionInputs::new(prompt, limits(1, 1)).with_system(Some("rules")),
-                &mut history,
-            )
+            remember(&mut history, |prior| {
+                run_prompt_session(
+                    &model,
+                    &runtime,
+                    SessionInputs::new(prompt, limits(1, 1)).with_system(Some("rules")),
+                    prior,
+                )
+            })
             .expect("answered");
         }
         let seen = model.seen.lock();
@@ -2246,14 +2250,13 @@ mod tests {
     fn a_pre_cancelled_session_never_reaches_the_model_or_history() {
         let model = ScriptedModel::new([answer("too late")]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
-        let error = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("stop", limits(2, 2)).with_cancellation(&Cancelled),
-            &mut history,
-        )
-        .expect_err("cancellation is a terminal session outcome");
+            &[],
+        );
+        let error = result.expect_err("cancellation is a terminal session outcome");
 
         assert!(matches!(error, PromptError::Cancelled));
         assert!(
@@ -2261,9 +2264,10 @@ mod tests {
             "no model request starts after cancellation"
         );
         assert_eq!(
-            history.len(),
-            1,
-            "the prompt loop records an unanswered turn"
+            captured
+                .expect("the prompt loop captures an unanswered turn")
+                .original,
+            [Item::User(Kept::new("stop", usize::MAX))]
         );
     }
 
@@ -2513,8 +2517,9 @@ mod tests {
             SessionInputs::new("msg1", limits(1, 4))
                 .with_steering(&steers)
                 .with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("session answers");
         let labels = sink.labels();
         assert_eq!(labels[0], "steered 1");
@@ -2531,16 +2536,15 @@ mod tests {
     fn an_aborted_call_keeps_its_step_number_and_finishes_once() {
         let model = SteeringModel::new([answer("discarded"), answer("done")], SteerMode::Abort);
         let (sink, progress) = recording_sink();
-        let mut history = History::default();
-        let outcome = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("msg1", limits(1, 4))
                 .with_steering(model.steers.as_ref())
                 .with_progress(progress),
-            &mut history,
-        )
-        .expect("abort does not spend the only step");
+            &[],
+        );
+        let outcome = result.expect("abort does not spend the only step");
         assert_eq!(outcome.answer, "done");
         assert_eq!(outcome.model_turns, 1);
         assert_eq!(
@@ -2560,67 +2564,76 @@ mod tests {
                 "finished Answered turns=1 calls=0"
             ]
         );
-        assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
-        let captured = history.turns()[0].captured().unwrap();
-        assert!(
-            matches!(&captured.original[0], crate::memory::Item::User(text) if text.text() == "msg1")
+        let captured = captured.expect("an answered session is captured");
+        assert_eq!(
+            captured.original,
+            [
+                Item::User(kept("msg1")),
+                Item::Steer(kept("msg2")),
+                Item::Assistant(kept("done"))
+            ]
         );
-        assert!(
-            matches!(&captured.original[1], crate::memory::Item::Steer(text) if text.text() == "msg2")
+        assert_eq!(
+            ConversationTurn::from_captured(&captured, Some("done")).user(),
+            "msg1\n\nmsg2"
         );
     }
 
     #[test]
-    fn history_keeps_the_recorded_text_while_the_model_reads_the_noted_prompt() {
-        struct OneSteer(Mutex<Option<Steer>>);
-        impl SteerSource for OneSteer {
+    fn a_notice_is_never_captured() {
+        struct OneHandoff(Mutex<Vec<Steer>>);
+        impl SteerSource for OneHandoff {
             fn take(&self) -> Vec<Steer> {
-                self.0.lock().take().into_iter().collect()
+                std::mem::take(&mut *self.0.lock())
             }
 
             fn seal_or_take(&self) -> Handoff {
-                match self.0.lock().take() {
-                    Some(steer) => Handoff::Steers(vec![steer]),
-                    None => Handoff::Sealed(Seal::Sealed { leftover: 0 }),
+                let steers = self.take();
+                if steers.is_empty() {
+                    Handoff::Sealed(Seal::Sealed { leftover: 0 })
+                } else {
+                    Handoff::Steers(steers)
                 }
             }
 
             fn seal(&self) -> Seal {
                 Seal::Sealed {
-                    leftover: usize::from(self.0.lock().is_some()),
+                    leftover: self.0.lock().len(),
                 }
             }
         }
-        let steer = OneSteer(Mutex::new(Some(Steer::Person {
-            prompt: "msg2\n\n[note 2]".to_owned(),
-            recorded: "msg2".to_owned(),
-        })));
+        let steer = OneHandoff(Mutex::new(vec![
+            Steer::Notice("[notice]".to_owned()),
+            Steer::Person {
+                prompt: "msg2\n\n[note 2]".to_owned(),
+                recorded: "msg2".to_owned(),
+            },
+        ]));
         let model = ScriptedModel::new([answer("done")]);
-        let mut history = History::default();
 
-        run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("msg1\n\n[note 1]", limits(1, 4))
                 .with_recorded_prompt("msg1")
                 .with_steering(&steer),
-            &mut history,
-        )
-        .expect("session answers");
+            &[],
+        );
+        result.expect("session answers");
 
         let users = model.observed_messages.lock()[0]
             .iter()
             .filter(|message| message.role() == "user")
             .map(|message| message.content().unwrap_or_default().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(users, ["msg1\n\n[note 1]", "msg2\n\n[note 2]"]);
-        assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
-        let captured = history.turns()[0].captured().unwrap();
-        assert!(
-            matches!(&captured.original[0], crate::memory::Item::User(text) if text.text() == "msg1")
-        );
-        assert!(
-            matches!(&captured.original[1], crate::memory::Item::Steer(text) if text.text() == "msg2")
+        assert_eq!(users, ["msg1\n\n[note 1]", "[notice]", "msg2\n\n[note 2]"]);
+        assert_eq!(
+            captured.expect("an answered session is captured").original,
+            [
+                Item::User(kept("msg1")),
+                Item::Steer(kept("msg2")),
+                Item::Assistant(kept("done"))
+            ]
         );
     }
 
@@ -2628,16 +2641,15 @@ mod tests {
     fn a_boundary_steer_follows_the_draft_before_the_only_finished_event() {
         let model = SteeringModel::new([answer("draft"), answer("done")], SteerMode::Boundary);
         let (sink, progress) = recording_sink();
-        let mut history = History::default();
-        let outcome = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("msg1", limits(2, 4))
                 .with_steering(model.steers.as_ref())
                 .with_progress(progress),
-            &mut history,
-        )
-        .expect("the queued steer prevents the draft from finishing");
+            &[],
+        );
+        let outcome = result.expect("the queued steer prevents the draft from finishing");
         assert_eq!(outcome.answer, "done");
         assert_eq!(outcome.model_turns, 2);
         assert_eq!(
@@ -2659,15 +2671,15 @@ mod tests {
                 "finished Answered turns=2 calls=0"
             ]
         );
-        assert_eq!(history.turns()[0].user(), "msg1\n\nmsg2");
-        let captured = history.turns()[0].captured().unwrap();
-        assert!(
-            matches!(&captured.original[0], crate::memory::Item::User(text) if text.text() == "msg1")
+        assert_eq!(
+            captured.expect("an answered session is captured").original,
+            [
+                Item::User(kept("msg1")),
+                Item::Assistant(kept("draft")),
+                Item::Steer(kept("msg2")),
+                Item::Assistant(kept("done"))
+            ]
         );
-        assert!(
-            matches!(&captured.original[2], crate::memory::Item::Steer(text) if text.text() == "msg2")
-        );
-        assert_eq!(history.turns()[0].answer(), Some("done"));
     }
 
     #[test]
@@ -2681,8 +2693,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("msg1", limits(2, 4)).with_steering(model.steers.as_ref()),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("the cancelled proposal is discarded");
         assert_eq!(outcome.script_calls, 0);
         assert!(runtime.scripts.lock().is_empty());
@@ -2705,8 +2718,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("msg1", limits(2, 4)).with_steering(steers.as_ref()),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("script work is not interrupted");
         assert_eq!(outcome.script_calls, 1);
         assert_eq!(outcome.capability_invocations, 1);
@@ -2747,8 +2761,9 @@ mod tests {
                 .with_steering(model.steers.as_ref())
                 .with_cancellation(&probe)
                 .with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect_err("a session stop is not a model interruption");
         assert!(matches!(error, PromptError::Cancelled));
         assert_eq!(
@@ -2767,14 +2782,13 @@ mod tests {
     #[test]
     fn the_last_answer_leaves_pending_steers_for_a_follow_up() {
         let model = SteeringModel::new([answer("done")], SteerMode::Boundary);
-        let mut history = History::default();
-        let outcome = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("msg1", limits(1, 4)).with_steering(model.steers.as_ref()),
-            &mut history,
-        )
-        .expect("the final step answers");
+            &[],
+        );
+        let outcome = result.expect("the final step answers");
         assert_eq!(outcome.answer, "done");
         assert_eq!(
             model.steers.take(),
@@ -2783,7 +2797,10 @@ mod tests {
                 recorded: "msg2".to_owned()
             }]
         );
-        assert_eq!(history.turns()[0].user(), "msg1");
+        assert_eq!(
+            captured.expect("an answered session is captured").original,
+            [Item::User(kept("msg1")), Item::Assistant(kept("done"))]
+        );
     }
 
     #[test]
@@ -2828,8 +2845,9 @@ mod tests {
                 .with_steering(model.0.steers.as_ref())
                 .with_optional_reply()
                 .with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("replacement declines");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         let mut text = dekopon_model::ModelText::default();
@@ -2853,8 +2871,9 @@ mod tests {
             SessionInputs::new("msg1", limits(2, 4))
                 .with_steering(model.steers.as_ref())
                 .with_optional_reply(),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("decline does not drain a pending steer");
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         assert_eq!(
@@ -2876,8 +2895,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("go", limits(4, 8)).with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("the scripted session answers");
 
         assert_eq!(outcome.answer, "done");
@@ -2905,15 +2925,17 @@ mod tests {
             &watched,
             &runtime,
             SessionInputs::new("go", limits(4, 8)).with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("the watched session answers");
         let without_sink = run_prompt_session(
             &unwatched,
             &RecordingRuntime::new(1),
             SessionInputs::new("go", limits(4, 8)),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("the unwatched session answers");
 
         assert_eq!(with_sink, without_sink);
@@ -2935,8 +2957,9 @@ mod tests {
             SessionInputs::new("go", limits(2, 4))
                 .with_cancellation(&probe)
                 .with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect_err("an interrupted turn ends the session");
 
         assert!(
@@ -2968,8 +2991,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("go", limits(2, 4)).with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("a streamed turn answers like any other");
 
         assert_eq!(outcome.answer, "Hello there");
@@ -3001,8 +3025,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("go", limits(2, 4)).with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("passing the bound is not a failure");
 
         assert_eq!(
@@ -3026,8 +3051,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("go", limits(1, 4)).with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect_err("one turn that asks for a tool cannot answer");
 
         assert!(
@@ -3050,8 +3076,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("go", limits(0, 4)).with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect_err("a zero-step session is refused");
 
         assert!(matches!(error, PromptError::ZeroSteps), "{error}");
@@ -3070,8 +3097,9 @@ mod tests {
             SessionInputs::new("go", limits(2, 4))
                 .with_optional_reply()
                 .with_progress(progress),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("a decline is a completed session");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
@@ -3125,6 +3153,77 @@ mod tests {
         )
     }
 
+    fn exchanges(captured: &CapturedTurn) -> Vec<&Exchange> {
+        captured
+            .original
+            .iter()
+            .filter_map(|item| match item {
+                Item::Exchange(exchange) => Some(exchange),
+                Item::User(_)
+                | Item::Steer(_)
+                | Item::Assistant(_)
+                | Item::Reasoning(_)
+                | Item::Asset(_) => None,
+            })
+            .collect()
+    }
+
+    fn only_exchange(captured: &CapturedTurn) -> &Exchange {
+        match exchanges(captured)[..] {
+            [exchange] => exchange,
+            ref other => panic!("expected one captured exchange, got {}", other.len()),
+        }
+    }
+
+    fn assert_unanswered(captured: &CapturedTurn, user: &str) {
+        assert_eq!(captured.original[0], Item::User(kept(user)));
+        assert_eq!(
+            captured
+                .original
+                .iter()
+                .filter(|item| match item {
+                    Item::User(_) => true,
+                    Item::Steer(_)
+                    | Item::Assistant(_)
+                    | Item::Reasoning(_)
+                    | Item::Exchange(_)
+                    | Item::Asset(_) => false,
+                })
+                .count(),
+            1
+        );
+        assert!(captured.original.iter().all(|item| match item {
+            Item::Assistant(_) => false,
+            Item::User(_)
+            | Item::Steer(_)
+            | Item::Reasoning(_)
+            | Item::Exchange(_)
+            | Item::Asset(_) => true,
+        }));
+        assert!(!ConversationTurn::from_captured(captured, None).is_answered());
+    }
+
+    fn kept(text: &str) -> Kept {
+        Kept::new(text, usize::MAX)
+    }
+
+    fn remember(
+        history: &mut History,
+        run: impl FnOnce(&[ModelMessage]) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>),
+    ) -> Result<PromptOutcome, PromptError> {
+        let (result, captured) = run(&history.replay());
+        if let Some(captured) = &captured {
+            let answer = match &result {
+                Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
+                    Some(outcome.answer.as_str())
+                }
+                Ok(_) | Err(_) => None,
+            };
+            history.record(ConversationTurn::from_captured(captured, answer));
+        }
+        result
+    }
+
     fn conversation(count: usize) -> Vec<ConversationTurn> {
         (1..=count)
             .map(|index| {
@@ -3143,8 +3242,7 @@ mod tests {
     }
 
     fn assert_window_is_well_formed(history: &History) {
-        let mut messages = Vec::new();
-        history.replay_into(&mut messages);
+        let messages = history.replay();
 
         let expected = history
             .turns()
@@ -3202,14 +3300,14 @@ mod tests {
         let model = ScriptedModel::new([first, answer("done")]);
         let runtime = RecordingRuntime::new(0);
         let observer = UsageRecorder::default();
-        let mut history = History::default();
 
         run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("run it", limits(3, 4)).with_usage_observer(&observer),
-            &mut history,
+            &[],
         )
+        .0
         .expect("session succeeds");
 
         assert_eq!(*observer.0.lock(), vec![Some(expected), None]);
@@ -3229,7 +3327,7 @@ mod tests {
     fn a_seeded_conversation_reaches_the_model_ahead_of_the_new_prompt() {
         let model = ScriptedModel::new([answer("Two.")]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::from_turns(HistoryLimits::default(), conversation(2));
+        let history = History::from_turns(HistoryLimits::default(), conversation(2));
 
         run_prompt_with_history(
             &model,
@@ -3237,8 +3335,9 @@ mod tests {
             "and now?",
             Some("Be terse."),
             limits(2, 32),
-            &mut history,
+            &history.replay(),
         )
+        .0
         .expect("prompt session succeeds");
 
         assert_eq!(
@@ -3263,14 +3362,16 @@ mod tests {
             let model = ScriptedModel::new([answer(&format!("answer {exchange}"))]);
             let runtime = RecordingRuntime::new(0);
 
-            run_prompt_with_history(
-                &model,
-                &runtime,
-                &format!("ask {exchange}"),
-                Some(system),
-                limits(2, 32),
-                &mut history,
-            )
+            remember(&mut history, |prior| {
+                run_prompt_with_history(
+                    &model,
+                    &runtime,
+                    &format!("ask {exchange}"),
+                    Some(system),
+                    limits(2, 32),
+                    prior,
+                )
+            })
             .expect("prompt session succeeds");
 
             let request = model.first_request();
@@ -3290,9 +3391,12 @@ mod tests {
 
         assert_eq!(history.len(), 3);
         assert_window_is_well_formed(&history);
-        let mut replayed = Vec::new();
-        history.replay_into(&mut replayed);
-        assert!(replayed.iter().all(|message| message.role() != "system"));
+        assert!(
+            history
+                .replay()
+                .iter()
+                .all(|message| message.role() != "system")
+        );
     }
 
     #[test]
@@ -3305,14 +3409,9 @@ mod tests {
         let runtime = RecordingRuntime::new(1);
         let mut history = History::default();
 
-        run_prompt_with_history(
-            &model,
-            &runtime,
-            "do the work",
-            None,
-            limits(8, 32),
-            &mut history,
-        )
+        remember(&mut history, |prior| {
+            run_prompt_with_history(&model, &runtime, "do the work", None, limits(8, 32), prior)
+        })
         .expect("prompt session succeeds");
 
         assert!(!model.tool_messages().is_empty());
@@ -3328,8 +3427,9 @@ mod tests {
             "and again",
             None,
             limits(2, 32),
-            &mut history,
+            &history.replay(),
         )
+        .0
         .expect("prompt session succeeds");
 
         assert_eq!(
@@ -3362,19 +3462,29 @@ mod tests {
             }
         }
         let model = ScriptedModel::new([script_call("call-1", "echo 🦀"), answer("noted")]);
-        let mut history = History::default();
-        run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &FailedScript,
-            SessionInputs::new("try", limits(3, 2)).with_exchange_capture(None, None),
-            &mut history,
-        )
-        .expect("the failed script is an answerable outcome");
-        let exchange = &history.turns()[0].exchanges()[0];
-        assert_eq!(exchange.request[0].text.as_deref(), Some("echo 🦀"));
-        assert_eq!(exchange.result[0].text.as_deref(), Some("failure: 🦀"));
-        assert_eq!(exchange.exit_status, Some(1));
-        assert_eq!(exchange.outcome, "failure");
+            SessionInputs::new("try", limits(3, 2)),
+            &[],
+        );
+        let outcome = result.expect("the failed script is an answerable outcome");
+        let captured = captured.expect("an answered session is captured");
+        let exchange = only_exchange(&captured);
+        assert_eq!(exchange.call.id.as_str(), "call-1");
+        assert_eq!(
+            exchange.call.arguments,
+            kept(&json!({ "command": "echo 🦀" }).to_string())
+        );
+        assert!(exchange.result.text.text().contains("failure: 🦀"));
+        assert_eq!(exchange.result.outcome, Outcome::Exit(1));
+        let history = History::from_turns(
+            HistoryLimits::default(),
+            [ConversationTurn::from_captured(
+                &captured,
+                Some(&outcome.answer),
+            )],
+        );
         let next = ScriptedModel::new([answer("done")]);
         run_prompt_with_history(
             &next,
@@ -3382,8 +3492,9 @@ mod tests {
             "what happened?",
             None,
             limits(2, 2),
-            &mut history,
+            &history.replay(),
         )
+        .0
         .expect("later turn answers");
         assert_eq!(
             next.first_roles(),
@@ -3394,37 +3505,32 @@ mod tests {
             ]
         );
         assert!(next.tool_messages().is_empty());
-        let retained = &history.turns()[0].exchanges()[0];
-        assert_eq!(retained.request[0].text.as_deref(), Some("echo 🦀"));
-        assert_eq!(retained.result[0].text.as_deref(), Some("failure: 🦀"));
-        assert_eq!(retained.exit_status, Some(1));
     }
 
     #[test]
     fn capture_bounds_do_not_resurrect_a_script_result() {
         let model = ScriptedModel::new([script_call("call-1", "abc🦀"), answer("done")]);
-        let mut history = History::default();
-        run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
-            SessionInputs::new("try", limits(3, 2)).with_exchange_capture(Some(4), Some(4)),
-            &mut history,
-        )
-        .expect("turn answers");
-        let exchange = &history.turns()[0].exchanges()[0];
-        assert_eq!(exchange.request[0].text.as_deref(), Some("abc"));
-        assert_eq!(exchange.result[0].text.as_deref(), Some("ran "));
-        assert_eq!(exchange.result[0].captured_bytes, 4);
+            SessionInputs::new("try", limits(3, 2)).with_capture_cap(4),
+            &[],
+        );
+        result.expect("turn answers");
+        let captured = captured.expect("an answered session is captured");
+        let exchange = only_exchange(&captured);
+        assert_eq!(exchange.result.text.text().len(), 4);
+        assert!(exchange.result.text.original_bytes() > 4);
     }
 
     #[test]
     fn a_prefix_omits_whole_utf8_characters_and_counts_bytes() {
-        let original = super::Representation::original("ab🦀z", "v1");
-        let prefix = super::Representation::prefix("ab🦀z", 5, "short", "v1");
-        assert_eq!(original.text.as_deref(), Some("ab🦀z"));
-        assert_eq!(original.omitted_bytes(), 0);
-        assert_eq!(prefix.text.as_deref(), Some("ab"));
-        assert_eq!(prefix.omitted_bytes(), 5);
+        let original = Kept::new("ab🦀z", usize::MAX);
+        let prefix = Kept::new("ab🦀z", 5);
+        assert_eq!(original.text(), "ab🦀z");
+        assert_eq!(original.original_bytes(), 7);
+        assert_eq!(prefix.text(), "ab");
+        assert_eq!(prefix.original_bytes(), 7);
     }
 
     #[test]
@@ -3532,14 +3638,16 @@ mod tests {
 
         for exchange in 1..=4 {
             let model = ScriptedModel::new([answer(&format!("answer {exchange}"))]);
-            run_prompt_with_history(
-                &model,
-                &RecordingRuntime::new(0),
-                &format!("ask {exchange}"),
-                None,
-                limits(2, 32),
-                &mut history,
-            )
+            remember(&mut history, |prior| {
+                run_prompt_with_history(
+                    &model,
+                    &RecordingRuntime::new(0),
+                    &format!("ask {exchange}"),
+                    None,
+                    limits(2, 32),
+                    prior,
+                )
+            })
             .expect("prompt session succeeds");
         }
 
@@ -3551,8 +3659,9 @@ mod tests {
             "ask 5",
             None,
             limits(2, 32),
-            &mut history,
+            &history.replay(),
         )
+        .0
         .expect("prompt session succeeds");
 
         assert_eq!(
@@ -3569,33 +3678,20 @@ mod tests {
 
     #[test]
     fn a_failed_turn_keeps_its_captured_exchanges() {
-        use crate::memory::{Item, Outcome};
         let model = ScriptedModel::new([
             script_call("one", "echo one"),
             script_call("two", "echo two"),
         ]);
-        let mut history = History::default();
-        let result = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("question", limits(3, 8)),
-            &mut history,
+            &[],
         );
         assert!(matches!(result, Err(PromptError::Model(_))));
-        let record = history.turns()[0].captured().unwrap();
+        let record = captured.expect("a failed session is captured");
         assert!(matches!(&record.original[0], Item::User(text) if text.text() == "question"));
-        let exchanges = record
-            .original
-            .iter()
-            .filter_map(|item| match item {
-                Item::Exchange(exchange) => Some(exchange),
-                Item::User(_)
-                | Item::Steer(_)
-                | Item::Assistant(_)
-                | Item::Reasoning(_)
-                | Item::Asset(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let exchanges = exchanges(&record);
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].call.id.as_str(), "one");
         assert_eq!(exchanges[1].call.id.as_str(), "two");
@@ -3615,23 +3711,17 @@ mod tests {
             script_call("call-2", "echo two"),
         ]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
-
-        let error = run_prompt_with_history(
-            &model,
-            &runtime,
-            "loop forever",
-            None,
-            limits(2, 32),
-            &mut history,
-        )
-        .expect_err("an answerless session must terminate");
+        let (result, captured) =
+            run_prompt_with_history(&model, &runtime, "loop forever", None, limits(2, 32), &[]);
+        let error = result.expect_err("an answerless session must terminate");
 
         assert!(matches!(error, PromptError::MaxSteps { maximum: 2 }));
-        assert_eq!(history.len(), 1);
-        assert_eq!(history.turns()[0].user(), "loop forever");
-        assert_eq!(history.turns()[0].answer(), None);
-        assert!(!history.turns()[0].is_answered());
+        let captured = captured.expect("a failed session is captured");
+        assert_unanswered(&captured, "loop forever");
+        let history = History::from_turns(
+            HistoryLimits::default(),
+            [ConversationTurn::from_captured(&captured, None)],
+        );
         assert_window_is_well_formed(&history);
 
         let retry = ScriptedModel::new([answer("sorry about that")]);
@@ -3641,8 +3731,9 @@ mod tests {
             "try again",
             None,
             limits(2, 32),
-            &mut history,
+            &history.replay(),
         )
+        .0
         .expect("prompt session succeeds");
 
         assert_eq!(
@@ -3659,43 +3750,35 @@ mod tests {
     fn a_broken_model_connection_still_remembers_what_it_was_asked() {
         let model = ScriptedModel::new([]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
-
-        let error = run_prompt_with_history(
-            &model,
-            &runtime,
-            "ask something",
-            None,
-            limits(2, 32),
-            &mut history,
-        )
-        .expect_err("a model failure ends the session");
+        let (result, captured) =
+            run_prompt_with_history(&model, &runtime, "ask something", None, limits(2, 32), &[]);
+        let error = result.expect_err("a model failure ends the session");
 
         assert!(matches!(error, PromptError::Model(_)));
-        assert_eq!(history.len(), 1);
-        assert_eq!(history.turns()[0].user(), "ask something");
-        assert!(!history.turns()[0].is_answered());
+        assert_unanswered(
+            &captured.expect("a failed session is captured"),
+            "ask something",
+        );
     }
 
     #[test]
     fn a_zero_step_session_records_nothing() {
         let model = ScriptedModel::new([]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::from_turns(HistoryLimits::default(), conversation(1));
+        let history = History::from_turns(HistoryLimits::default(), conversation(1));
 
-        let error = run_prompt_with_history(
+        let (result, captured) = run_prompt_with_history(
             &model,
             &runtime,
             "nothing",
             None,
             limits(0, 32),
-            &mut history,
-        )
-        .expect_err("a zero-step session is a usage error");
+            &history.replay(),
+        );
+        let error = result.expect_err("a zero-step session is a usage error");
 
         assert!(matches!(error, PromptError::ZeroSteps));
-        assert_eq!(history.len(), 1);
-        assert_eq!(history.turns()[0].user(), "ask 1");
+        assert_eq!(captured, None);
     }
 
     #[test]
@@ -3763,7 +3846,6 @@ mod tests {
             observed: Mutex::new(Vec::new()),
         };
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let outcome = run_prompt_with_history_and_options(
             &model,
@@ -3771,9 +3853,10 @@ mod tests {
             "ask",
             Some("Be terse."),
             limits(4, 32),
-            &mut history,
+            &[],
             &CompletionOptions::default().with_prompt_cache_key("lane-7"),
         )
+        .0
         .expect("prompt session succeeds");
 
         assert_eq!(outcome.model_turns, 3);
@@ -3794,7 +3877,6 @@ mod tests {
             observed: Mutex::new(Vec::new()),
         };
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         run_prompt_with_history(
             &observer,
@@ -3802,8 +3884,9 @@ mod tests {
             "ask",
             Some("Be terse."),
             limits(2, 32),
-            &mut history,
+            &[],
         )
+        .0
         .expect("prompt session succeeds");
 
         assert_eq!(*observer.observed.lock(), vec![None]);
@@ -3824,8 +3907,9 @@ mod tests {
                     &model,
                     &runtime,
                     SessionInputs::new("go", limits(1, 1)).with_agent("reviewer"),
-                    &mut History::default(),
+                    &[],
                 )
+                .0
             },
         );
         with_agent.expect("prompt session succeeds");
@@ -3844,8 +3928,9 @@ mod tests {
                     &model,
                     &runtime,
                     SessionInputs::new("go", limits(1, 1)),
-                    &mut History::default(),
+                    &[],
                 )
+                .0
             },
         );
         without_agent.expect("prompt session succeeds");
@@ -3879,8 +3964,9 @@ mod tests {
                     &model,
                     &runtime,
                     SessionInputs::new("go", limits(3, 4)),
-                    &mut History::default(),
+                    &[],
                 )
+                .0
             },
         )
         .expect("extra arguments do not end the session");
@@ -3925,8 +4011,9 @@ mod tests {
                         &model,
                         &RecordingRuntime::new(0),
                         SessionInputs::new("go", limits(2, 4)),
-                        &mut History::default(),
+                        &[],
                     )
+                    .0
                 },
             );
             if id.is_empty() {
@@ -4077,7 +4164,7 @@ mod tests {
             if enabled {
                 inputs = inputs.with_progress_notes();
             }
-            run_prompt_session(&model, &runtime, inputs, &mut History::default()).unwrap();
+            run_prompt_session(&model, &runtime, inputs, &[]).0.unwrap();
             let tools = model.observed_tools.lock();
             let script = tools[0]
                 .iter()
@@ -4474,15 +4561,15 @@ mod tests {
         ]);
         let runtime = RecordingRuntime::new(0);
         let config = agent_config();
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("what is your configuration?", limits(4, 32))
                 .with_agent_config(&config),
-            &mut history,
+            &[],
         )
+        .0
         .expect("meta inspection succeeds");
 
         assert_eq!(outcome.answer, "Here is the configuration table.");
@@ -4524,14 +4611,14 @@ mod tests {
         ]);
         let runtime = RecordingRuntime::new(0);
         let config = agent_config();
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("inspect twice", limits(3, 32)).with_agent_config(&config),
-            &mut history,
+            &[],
         )
+        .0
         .expect("repeated inspection succeeds");
 
         assert_eq!(outcome.script_calls, 0);
@@ -4557,14 +4644,14 @@ mod tests {
         ]);
         let runtime = RecordingRuntime::new(0);
         let config = agent_config();
-        let mut history = History::default();
 
         run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("inspect on two turns", limits(4, 32)).with_agent_config(&config),
-            &mut history,
+            &[],
         )
+        .0
         .expect("repeated inspection succeeds");
 
         let messages = model.observed_messages.lock();
@@ -4628,7 +4715,6 @@ mod tests {
 
     #[test]
     fn recorded_media_fetches_name_the_refetch_while_live_messages_keep_the_media() {
-        use crate::memory::Item;
         let file = |name: &str, mime: &str| FetchedAsset {
             name: name.into(),
             mime: mime.into(),
@@ -4643,26 +4729,17 @@ mod tests {
         ]);
         let model =
             ScriptedModel::new([asset_call(1), asset_call(2), asset_call(3), answer("done")]);
-        let mut history = History::default();
-        run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("fetch", limits(4, 8)).with_assets(&assets),
-            &mut history,
-        )
-        .unwrap();
-        let captured = history.turns()[0].captured().unwrap();
-        let results = captured
-            .original
-            .iter()
-            .filter_map(|item| match item {
-                Item::Exchange(exchange) => Some(exchange.result.text.text()),
-                Item::User(_)
-                | Item::Steer(_)
-                | Item::Assistant(_)
-                | Item::Reasoning(_)
-                | Item::Asset(_) => None,
-            })
+            &[],
+        );
+        result.unwrap();
+        let captured = captured.unwrap();
+        let results = exchanges(&captured)
+            .into_iter()
+            .map(|exchange| exchange.result.text.text())
             .collect::<Vec<_>>();
         assert_eq!(
             results,
@@ -4731,13 +4808,13 @@ mod tests {
                 scripted: ScriptedModel::new([asset_call(1), answer("done")]),
                 assets: &assets,
             };
-            let mut history = History::default();
             run_prompt_session(
                 &model,
                 &RecordingRuntime::new(0),
                 SessionInputs::new("check", limits(2, 2)).with_assets(&assets),
-                &mut history,
+                &[],
             )
+            .0
             .unwrap();
             for turn in ["1", "2"] {
                 let prompts = capture.events_where(
@@ -4808,8 +4885,9 @@ mod tests {
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("read", limits(3, 2)).with_assets(&source),
-            &mut History::default(),
+            &[],
         )
+        .0
         .unwrap();
         assert_eq!(
             *source.charges.lock(),
@@ -4837,13 +4915,13 @@ mod tests {
             .collect();
         let assets = FixedAssets(photos);
         let model = ScriptedModel::new((1..=8).map(asset_call).chain([answer("seen")]));
-        let mut history = History::default();
         run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("look at each photo", limits(10, 32)).with_assets(&assets),
-            &mut history,
+            &[],
         )
+        .0
         .unwrap();
         let requests = model.observed_messages.lock();
         let last = requests.last().unwrap();
@@ -4905,13 +4983,13 @@ mod tests {
             .collect();
         let assets = FixedAssets(photos);
         let model = ScriptedModel::new((1..=9).map(asset_call).chain([answer("seen")]));
-        let mut history = History::default();
         run_prompt_session(
             &model,
             &RecordingRuntime::new(0),
             SessionInputs::new("look at each photo", limits(11, 32)).with_assets(&assets),
-            &mut history,
+            &[],
         )
+        .0
         .unwrap();
         let requests = model.observed_messages.lock();
         let last = requests.last().unwrap();
@@ -4955,14 +5033,14 @@ mod tests {
         let model = ScriptedModel::new([asset_call(1), answer("It is a log line.")]);
         let runtime = RecordingRuntime::new(0);
         let assets = FixedAssets(vec![text_asset("2026-08-20 request failed\n")]);
-        let mut history = History::default();
 
         run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("what is in the file?", limits(3, 32)).with_assets(&assets),
-            &mut history,
+            &[],
         )
+        .0
         .expect("asset session succeeds");
 
         assert_eq!(
@@ -4993,14 +5071,14 @@ mod tests {
         let model = ScriptedModel::new([asset_call(1), answer("The file was too large to read.")]);
         let runtime = RecordingRuntime::new(0);
         let assets = FixedAssets(vec![text_asset(&text)]);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("what is in the file?", limits(3, 32)).with_assets(&assets),
-            &mut history,
+            &[],
         )
+        .0
         .expect("an oversized asset is an outcome, not a failed session");
 
         assert_eq!(outcome.answer, "The file was too large to read.");
@@ -5020,14 +5098,14 @@ mod tests {
         }))]);
         let runtime = RecordingRuntime::new(0);
         let config = agent_config();
-        let mut history = History::default();
 
         let error = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("inspect", limits(1, 32)).with_agent_config(&config),
-            &mut history,
+            &[],
         )
+        .0
         .expect_err("meta tool has no arguments");
 
         assert!(matches!(
@@ -5041,23 +5119,22 @@ mod tests {
     fn an_optional_thread_continuation_can_decline_without_an_answer() {
         let model = ScriptedModel::new([decline(json!({}))]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
-
-        let outcome = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("OK, thanks", limits(2, 4)).with_optional_reply(),
-            &mut history,
-        )
-        .expect("declining an optional continuation succeeds");
+            &[],
+        );
+        let outcome = result.expect("declining an optional continuation succeeds");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
         assert!(outcome.answer.is_empty());
         assert_eq!(outcome.model_turns, 1);
         assert!(runtime.scripts.lock().is_empty());
-        assert_eq!(history.len(), 1);
-        assert_eq!(history.turns()[0].user(), "OK, thanks");
-        assert_eq!(history.turns()[0].answer(), None);
+        assert_unanswered(
+            &captured.expect("a declined session is captured"),
+            "OK, thanks",
+        );
 
         let tools = model.observed_tools.lock();
         assert_eq!(
@@ -5079,14 +5156,14 @@ mod tests {
     fn required_replies_are_not_offered_the_decline_tool_or_instruction() {
         let model = ScriptedModel::new([answer("You are welcome.")]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("thanks", limits(2, 4)),
-            &mut history,
+            &[],
         )
+        .0
         .expect("an ordinary prompt answers");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Send);
@@ -5122,14 +5199,14 @@ mod tests {
             None,
         )]);
         let runtime = RecordingRuntime::new(1);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("conversation moved on", limits(2, 4)).with_optional_reply(),
-            &mut history,
+            &[],
         )
+        .0
         .expect("the no-reply decision is terminal");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
@@ -5151,14 +5228,14 @@ mod tests {
             answer("I completed the capability call."),
         ]);
         let runtime = RecordingRuntime::new(1);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("maybe do this", limits(4, 4)).with_optional_reply(),
-            &mut history,
+            &[],
         )
+        .0
         .expect("the model reports work instead of hiding it");
 
         assert_eq!(outcome.disposition, ReplyDisposition::Send);
@@ -5179,20 +5256,18 @@ mod tests {
             decline(json!({})),
         ]);
         let runtime = RecordingRuntime::new(1);
-        let mut history = History::default();
-
-        let error = run_prompt_session(
+        let (result, captured) = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("maybe do this", limits(2, 4)).with_optional_reply(),
-            &mut history,
-        )
-        .expect_err("work cannot disappear behind a final-turn decline");
+            &[],
+        );
+        let error = result.expect_err("work cannot disappear behind a final-turn decline");
 
         assert!(matches!(error, PromptError::UnreportedCapabilityWork));
-        assert_eq!(
-            history.turns().last().and_then(ConversationTurn::answer),
-            None
+        assert_unanswered(
+            &captured.expect("a failed session is captured"),
+            "maybe do this",
         );
     }
 
@@ -5200,14 +5275,14 @@ mod tests {
     fn the_decline_tool_rejects_model_supplied_fields() {
         let model = ScriptedModel::new([decline(json!({"message": "secret"}))]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let error = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("optional", limits(1, 4)).with_optional_reply(),
-            &mut history,
+            &[],
         )
+        .0
         .expect_err("the decline tool has no model-controlled payload");
 
         assert!(matches!(
@@ -5762,7 +5837,6 @@ mod tests {
             answer("Reviewed."),
         ]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
@@ -5770,8 +5844,9 @@ mod tests {
             SessionInputs::new("review PR 7", limits(5, 2))
                 .with_system(Some("Be concise."))
                 .with_skills(&skills),
-            &mut history,
+            &[],
         )
+        .0
         .expect("skill reads are recoverable model turns");
 
         assert_eq!(outcome.answer, "Reviewed.");
@@ -5843,14 +5918,14 @@ mod tests {
             answer("Working without it."),
         ]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("review", limits(4, 2)).with_skills(&skills),
-            &mut history,
+            &[],
         )
+        .0
         .expect("a wrong name is recoverable");
 
         assert_eq!(outcome.answer, "Working without it.");
@@ -5878,14 +5953,14 @@ mod tests {
             |id: &str| tool_call(id, SKILL_TOOL_NAME, json!({"name": "pull-request-review"}));
         let model = ScriptedModel::new([read("read-1"), read("read-2")]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let error = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("review", limits(3, 2)).with_system(Some("Be concise.")),
-            &mut history,
+            &[],
         )
+        .0
         .expect_err("a tool that was never offered is unknown");
 
         assert!(matches!(error, PromptError::UnknownTool(name) if name == SKILL_TOOL_NAME));
@@ -5904,19 +5979,23 @@ mod tests {
     fn one_shot_offers_no_memory_tools_and_journal_session_dispatches_reads() {
         struct LocalMemory;
         impl crate::memory_tools::MemoryTools for LocalMemory {
-            fn read(&self, id: u64, representation: &str, range: Option<(u64, u64)>) -> String {
+            fn read(
+                &self,
+                id: u64,
+                representation: &str,
+                range: Option<(u64, u64)>,
+            ) -> Result<String, MemoryRefusal> {
                 assert_eq!((id, representation, range), (7, "summary", Some((0, 4))));
-                "text".into()
+                Ok("text".into())
             }
-            fn set_pin(&self, _: u64, _: &str) -> String {
-                "pinned".into()
+            fn set_pin(&self, _: u64, _: &str) -> Result<String, MemoryRefusal> {
+                Ok("pinned".into())
             }
-            fn clear_pin(&self, _: Option<u64>) -> String {
-                "cleared".into()
+            fn clear_pin(&self, _: Option<u64>) -> Result<String, MemoryRefusal> {
+                Ok("cleared".into())
             }
         }
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
         let one_shot = ScriptedModel::new([
             tool_call(
                 "read-1",
@@ -5933,8 +6012,9 @@ mod tests {
             &one_shot,
             &runtime,
             SessionInputs::new("hi", limits(2, 2)),
-            &mut history,
+            &[],
         )
+        .0
         .expect_err("not offered");
         assert!(matches!(error, PromptError::UnknownTool(name) if name == "read_memory_record"));
         assert!(one_shot.observed_tools.lock()[0].iter().all(|tool| {
@@ -5953,8 +6033,9 @@ mod tests {
             &model,
             &runtime,
             SessionInputs::new("hi", limits(2, 2)).with_memory_tools(&LocalMemory),
-            &mut History::default(),
+            &[],
         )
+        .0
         .expect("read");
         assert_eq!(last_tool_results(&model), vec!["text"]);
         assert!(
@@ -5974,14 +6055,14 @@ mod tests {
             json!({"name": "pull-request-review", "page": 2}),
         )]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let error = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("review", limits(2, 2)).with_skills(&skills),
-            &mut history,
+            &[],
         )
+        .0
         .expect_err("an unexpected field is malformed model output");
 
         assert!(matches!(
@@ -6015,14 +6096,14 @@ mod tests {
             answer("Done."),
         ]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("do the thing", limits(6, 2)),
-            &mut history,
+            &[],
         )
+        .0
         .expect("suggestions never fail a session");
 
         assert_eq!(outcome.answer, "Done.");
@@ -6070,14 +6151,14 @@ mod tests {
             answer("Carrying on."),
         ]);
         let runtime = RecordingRuntime::new(0);
-        let mut history = History::default();
 
         let outcome = run_prompt_session(
             &model,
             &runtime,
             SessionInputs::new("do the thing", limits(3, 2)),
-            &mut history,
+            &[],
         )
+        .0
         .expect("a refused suggestion is a tool result");
 
         assert_eq!(outcome.answer, "Carrying on.");

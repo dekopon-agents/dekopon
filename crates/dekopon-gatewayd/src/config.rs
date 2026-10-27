@@ -29,11 +29,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub(crate) mod memory;
-pub use memory::{MemoryKnobs, MemorySettings, ResolvedSettings};
 use memory::{
     CaptureConfig, JournalRecall, KnobInputs, KnobOverrides, PolicyProblem, SelectionConfig,
     SummariesConfig, resolve_knobs, resolve_settings,
 };
+pub use memory::{MemoryKnobs, MemorySettings, ResolvedSettings};
 
 use crate::{
     progress::{KeepAlive, ProgressDetail, Templates},

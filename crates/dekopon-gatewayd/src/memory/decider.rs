@@ -155,14 +155,20 @@ pub(crate) fn decide<I: CapabilityInvoker>(
         .ok_or("invalid-response")
 }
 
-
 pub(crate) fn evidence(records: &[Head], now_ms: u64) -> Vec<Evidence> {
     records
         .iter()
         .map(|head| {
             let outcome = head.header.spans.iter().find_map(|span| match span.field {
                 Field::Result { outcome, .. } => Some(outcome),
-                _ => None,
+                Field::User { .. }
+                | Field::Steer { .. }
+                | Field::Assistant { .. }
+                | Field::Plain { .. }
+                | Field::Opaque { .. }
+                | Field::CallId
+                | Field::RejectedTool
+                | Field::Arguments { .. } => None,
             });
             let bash = head.header.spans.iter().any(|span| {
                 matches!(
@@ -186,7 +192,10 @@ pub(crate) fn evidence(records: &[Head], now_ms: u64) -> Vec<Evidence> {
                 },
                 exit_status: match outcome {
                     Some(dekopon_agent::memory::Outcome::Exit(code)) => Some(code),
-                    Some(dekopon_agent::memory::Outcome::Refused | dekopon_agent::memory::Outcome::Failed)
+                    Some(
+                        dekopon_agent::memory::Outcome::Refused
+                        | dekopon_agent::memory::Outcome::Failed,
+                    )
                     | None => None,
                 },
                 age_ms: now_ms.saturating_sub(head.header.at_ms),
@@ -217,7 +226,10 @@ pub(crate) fn choose<I: CapabilityInvoker>(
     tracing::info!(
         event = "gateway_memory_choice",
         memory.record.id = record.header.id.0.get(),
-        choice = chosen.map(|rung| rung.to_string()).as_deref().unwrap_or("none"),
+        choice = chosen
+            .map(|rung| rung.to_string())
+            .as_deref()
+            .unwrap_or("none"),
         reason = match &outcome {
             Ok(_) if chosen.is_some() => "decider",
             Ok(_) => "invalid-choice",

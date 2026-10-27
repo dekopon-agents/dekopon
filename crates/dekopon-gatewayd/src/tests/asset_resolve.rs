@@ -350,7 +350,7 @@ async fn an_idle_one_shot_releases_its_bytes_before_a_live_resident_is_evicted()
 async fn five_generated_base64_images_spend_their_decoded_length_against_the_model_budget() {
     use super::retention_tests::{FetchScript, NoScripts};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+    use dekopon_agent::prompt::{PromptLimits, SessionInputs, run_prompt_session};
     use tracing_subscriber::prelude::*;
 
     let store = store(64 * 1024 * 1024);
@@ -391,8 +391,9 @@ async fn five_generated_base64_images_spend_their_decoded_length_against_the_mod
                 },
             )
             .with_assets(session.as_ref()),
-            &mut History::default(),
+            &[],
         )
+        .0
         .unwrap();
         let charged = raw.len().to_string();
         for id in 1..=5_u64 {
@@ -886,8 +887,9 @@ async fn encoding_a_history_image_refills_bytes_or_reports_platform_gone() {
                     },
                 )
                 .with_assets(&session),
-                &mut dekopon_agent::prompt::History::default(),
+                &[],
             )
+            .0
             .unwrap();
             assert_eq!(model.calls.load(Ordering::SeqCst), 3);
             let text = peer.request_text();
@@ -940,7 +942,7 @@ async fn encoding_a_history_image_refills_bytes_or_reports_platform_gone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
-    use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+    use dekopon_agent::prompt::{PromptLimits, SessionInputs, run_prompt_session};
     use tracing_subscriber::prelude::*;
     let store = store(6);
     let access = access("inventory-metrics");
@@ -998,8 +1000,9 @@ async fn inventory_accounting_matches_the_fitted_note_and_distinct_uses() {
                 },
             )
             .with_assets(&session),
-            &mut History::default(),
+            &[],
         )
+        .0
         .unwrap();
         let records = capture.events_where(
             "dekopon_agent::audit",

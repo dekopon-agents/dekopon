@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
 use dekopon_agent::prompt::{
-    AssetSource, FetchedAsset, History, PromptLimits, ScriptRuntime, SessionInputs,
-    run_prompt_session,
+    AssetSource, ConversationTurn, FetchedAsset, History, PromptLimits, ScriptRuntime,
+    SessionInputs, run_prompt_session,
 };
 use dekopon_model::{
     asset::DiskBlob,
@@ -120,8 +120,9 @@ async fn the_same_prompt_loop_executes_one_synthetic_tool_and_replays_each_nativ
                     },
                 )
                 .with_system(Some("Synthetic offline proof.")),
-                &mut History::default(),
+                &[],
             )
+            .0
             .unwrap();
             (outcome, runtime.0.into_inner())
         })
@@ -354,7 +355,7 @@ data: [DONE]
             };
             let mut history = History::default();
             for prompt in ["Look at chat-asset:1", "What did you see?"] {
-                run_prompt_session(
+                let (result, captured) = run_prompt_session(
                     &bridge,
                     &runtime,
                     SessionInputs::new(
@@ -365,9 +366,13 @@ data: [DONE]
                         },
                     )
                     .with_assets(&assets),
-                    &mut history,
-                )
-                .unwrap();
+                    &history.replay(),
+                );
+                let outcome = result.unwrap();
+                history.record(ConversationTurn::from_captured(
+                    &captured.unwrap(),
+                    Some(&outcome.answer),
+                ));
             }
             assert_eq!(*runtime.runtime.0.lock(), ["release image"]);
         })
@@ -569,8 +574,9 @@ data: [DONE]
             )
             .with_assets(&ImageAssets::default())
             .with_steering(&model.mailbox),
-            &mut History::default(),
+            &[],
         )
+        .0
         .unwrap();
         assert_eq!(outcome.answer, "seen");
         assert_eq!(model.calls.load(Ordering::SeqCst), 3);

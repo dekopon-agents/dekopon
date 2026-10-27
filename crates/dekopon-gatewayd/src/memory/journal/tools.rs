@@ -11,7 +11,6 @@ use crate::memory::record::{GrantDigest, PinLine, RecordId, Slot, Subject};
 
 const MAX_READ_BYTES: u64 = 16 * 1024;
 
-
 #[derive(Clone, Debug)]
 pub(crate) struct Admission {
     pub grant: GrantDigest,
@@ -42,7 +41,10 @@ impl<'a> JournalMemoryTools<'a> {
         self.queued.into_inner()
     }
 
-    fn lookup(&self, record_id: u64) -> Result<(Head, std::sync::Arc<std::fs::File>), MemoryRefusal> {
+    fn lookup(
+        &self,
+        record_id: u64,
+    ) -> Result<(Head, std::sync::Arc<std::fs::File>), MemoryRefusal> {
         let id = NonZeroU64::new(record_id)
             .map(RecordId)
             .ok_or(MemoryRefusal::RecordUnknown)?;
@@ -177,9 +179,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
         let (head, file) = self.lookup(record_id)?;
         let text = match Self::rung(&head, representation_id)? {
             Rung::Native => {
-                let total = record_text(&file, &head, None)
-                    .map_err(storage)?
-                    .total;
+                let total = record_text(&file, &head, None).map_err(storage)?.total;
                 let (start, end) = window(total, range)?;
                 let selected = record_text(&file, &head, Some((start, end)))
                     .map_err(storage)?

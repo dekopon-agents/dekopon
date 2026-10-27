@@ -172,13 +172,11 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
                 let _written = journal.write_choice(&stem, choice);
             }
             journal.maintain(&stem, SystemTime::now(), next_asset_id);
-            appended
-                .filter(|_| planned)
-                .map(|record| SlotTask {
-                    stem,
-                    record,
-                    part: NonZeroU8::MIN,
-                })
+            appended.filter(|_| planned).map(|record| SlotTask {
+                stem,
+                record,
+                part: NonZeroU8::MIN,
+            })
         })
     })
     .await;

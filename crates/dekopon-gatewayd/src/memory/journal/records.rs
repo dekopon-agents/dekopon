@@ -919,7 +919,10 @@ pub(crate) fn record_text(
                 tool = Some(String::from_utf8_lossy(&name).into_owned());
                 continue;
             }
-            Field::User { .. } | Field::Steer { .. } | Field::Assistant { .. } | Field::Plain { .. } => {
+            Field::User { .. }
+            | Field::Steer { .. }
+            | Field::Assistant { .. }
+            | Field::Plain { .. } => {
                 if !first {
                     window.push(b"\n");
                 }
@@ -930,7 +933,15 @@ pub(crate) fn record_text(
                 }
                 let name = match named {
                     NamedTool::Rejected => tool.take().unwrap_or_default(),
-                    named => tool_name(*named).to_owned(),
+                    named @ (NamedTool::Bash
+                    | NamedTool::ReadSkill
+                    | NamedTool::FetchChatAsset
+                    | NamedTool::ReadMemoryRecord
+                    | NamedTool::SetMemoryPin
+                    | NamedTool::ClearMemoryPin
+                    | NamedTool::InspectAgentConfig
+                    | NamedTool::SuggestImprovement
+                    | NamedTool::Wake) => tool_name(*named).to_owned(),
                 };
                 let outcome = head
                     .header
@@ -938,7 +949,15 @@ pub(crate) fn record_text(
                     .iter()
                     .find_map(|other| match other.field {
                         Field::Result { outcome, .. } if other.item == span.item => Some(outcome),
-                        _ => None,
+                        Field::User { .. }
+                        | Field::Steer { .. }
+                        | Field::Assistant { .. }
+                        | Field::Plain { .. }
+                        | Field::Opaque { .. }
+                        | Field::CallId
+                        | Field::RejectedTool
+                        | Field::Arguments { .. }
+                        | Field::Result { .. } => None,
                     });
                 let outcome = match outcome {
                     Some(Outcome::Exit(code)) => format!("exit {code}"),
@@ -950,7 +969,9 @@ pub(crate) fn record_text(
             Field::Result { .. } => window.push(b"\n[result] "),
         }
         first = false;
-        decode_escaped(file, offset, span.len, &mut buffer, &mut |bytes| window.push(bytes))?;
+        decode_escaped(file, offset, span.len, &mut buffer, &mut |bytes| {
+            window.push(bytes)
+        })?;
     }
     Ok(RecordText {
         total: window.total,
@@ -1030,13 +1051,21 @@ pub(crate) fn decode_escaped(
                             None
                         }
                         (Some(high), 0xdc00..=0xdfff) => char::from_u32(
-                            0x10000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(code) - 0xdc00),
+                            0x10000
+                                + ((u32::from(high) - 0xd800) << 10)
+                                + (u32::from(code) - 0xdc00),
                         ),
                         (None, code) => char::from_u32(u32::from(code)),
                         (Some(_), _) => return Err(JournalError::Corrupt),
                     }
                     .map_or_else(
-                        || if high.is_some() { Ok(None) } else { Err(JournalError::Corrupt) },
+                        || {
+                            if high.is_some() {
+                                Ok(None)
+                            } else {
+                                Err(JournalError::Corrupt)
+                            }
+                        },
                         |character| Ok(Some(character)),
                     )?
                 }

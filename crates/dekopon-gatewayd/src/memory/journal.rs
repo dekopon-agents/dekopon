@@ -96,6 +96,7 @@ pub(crate) struct Recalled {
     pub snapshot: Option<Snapshot>,
     pub assets: Vec<RecalledAsset>,
     pub next_asset_id: u64,
+    pub grant_boundary: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -465,6 +466,7 @@ impl Journal {
                     snapshot: None,
                     assets: Vec::new(),
                     next_asset_id: 1,
+                    grant_boundary: false,
                 });
             }
             Err(error) => return Err(failed(error.into())),
@@ -473,18 +475,14 @@ impl Journal {
             .records
             .iter()
             .rev()
-            .take_while(|head| {
-                admits(
-                    &head.header,
-                    grant,
-                    horizon_ms.max(age_horizon_ms),
-                    seal_ms,
-                )
-            })
+            .take_while(|head| admits(&head.header, grant, horizon_ms.max(age_horizon_ms), seal_ms))
             .count();
-        snapshot
+        let grant_boundary = snapshot
             .records
-            .drain(..snapshot.records.len() - admitted);
+            .len()
+            .checked_sub(admitted + 1)
+            .is_some_and(|index| snapshot.records[index].header.grant != *grant);
+        snapshot.records.drain(..snapshot.records.len() - admitted);
         let (assets, next_asset_id) = snapshot.records.last().map_or((Vec::new(), 1), |newest| {
             let assets = newest
                 .header
@@ -515,6 +513,7 @@ impl Journal {
             snapshot: Some(snapshot),
             assets,
             next_asset_id,
+            grant_boundary,
         })
     }
 
@@ -658,7 +657,8 @@ impl Journal {
         let _lock = self.lock.lock();
         let _assets = AssetSync(self);
         let maintained = (|| -> Result<(), JournalError> {
-            self.sweep(now, false)?;
+            // File mtimes are wall-clock, so the directory sweep never runs on a caller's clock.
+            self.sweep(SystemTime::now(), false)?;
             let path = self.path(stem);
             let horizon = millis(now).saturating_sub(duration_millis(self.age_for(stem)));
             match sweep_file(&path, horizon) {
@@ -748,7 +748,7 @@ impl Journal {
         for (index, last_cut) in cut {
             let path = &files[index].0;
             records::rewrite_path(path, |header| header.id > last_cut)?;
-            if fs::metadata(path).map_or(false, |metadata| metadata.len() == 0) {
+            if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
                 remove(path);
             }
         }
@@ -986,7 +986,8 @@ fn read_seal_file(path: &Path) -> Result<SystemTime, JournalError> {
     if bytes.len() as u64 > MAX_SEAL_BYTES {
         return Err(JournalError::Corrupt);
     }
-    let seal = serde_json::from_slice::<Seal>(&bytes).map_err(|_malformed| JournalError::Corrupt)?;
+    let seal =
+        serde_json::from_slice::<Seal>(&bytes).map_err(|_malformed| JournalError::Corrupt)?;
     UNIX_EPOCH
         .checked_add(Duration::from_millis(seal.at_ms))
         .ok_or(JournalError::Corrupt)

@@ -10,7 +10,7 @@ use std::{
 };
 
 use dekopon_agent::prompt::{
-    CancellationProbe, History, PromptError, PromptLimits, ScriptRuntime as _, SessionInputs,
+    CancellationProbe, PromptError, PromptLimits, ScriptRuntime as _, SessionInputs,
     run_prompt_session,
 };
 use dekopon_model::{
@@ -166,7 +166,6 @@ async fn a_callback_only_double_without_a_transport_watch_waits_for_its_own_dead
     let session = {
         let (model, runtime, stop) = (Arc::clone(&model), Arc::clone(&runtime), Arc::clone(&stop));
         tokio::task::spawn_blocking(move || {
-            let mut history = History::default();
             run_prompt_session(
                 model.as_ref(),
                 runtime.as_ref(),
@@ -178,8 +177,9 @@ async fn a_callback_only_double_without_a_transport_watch_waits_for_its_own_dead
                     },
                 )
                 .with_cancellation(stop.as_ref()),
-                &mut history,
+                &[],
             )
+            .0
         })
     };
 

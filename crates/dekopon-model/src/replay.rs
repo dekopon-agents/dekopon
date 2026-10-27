@@ -65,7 +65,9 @@ pub(crate) fn json_len(value: &(impl Serialize + ?Sized)) -> usize {
 fn text_len(text: &Text) -> usize {
     match text {
         Text::Owned(text) => json_len(text.as_str()),
-        Text::File { len, .. } => usize::try_from(*len).unwrap_or(usize::MAX).saturating_add(2),
+        Text::File { len, .. } => usize::try_from(*len)
+            .unwrap_or(usize::MAX)
+            .saturating_add(2),
         Text::Opaque(source) => usize::try_from(source.len()).unwrap_or(usize::MAX),
     }
 }
@@ -75,7 +77,10 @@ impl ReplayMessage {
     pub fn encoded_len(&self) -> usize {
         let skeleton = 32;
         match self {
-            Self::User(texts) => texts.iter().map(text_len).fold(skeleton, usize::saturating_add),
+            Self::User(texts) => texts
+                .iter()
+                .map(text_len)
+                .fold(skeleton, usize::saturating_add),
             Self::Tool { id, text } => skeleton
                 .saturating_add(json_len(id))
                 .saturating_add(text_len(text)),

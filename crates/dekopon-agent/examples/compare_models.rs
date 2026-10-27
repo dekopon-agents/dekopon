@@ -1,8 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-use dekopon_agent::prompt::{
-    History, PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session,
-};
+use dekopon_agent::prompt::{PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session};
 use dekopon_model::{
     blocking::BlockingModel,
     codex::CodexClient,
@@ -173,8 +171,9 @@ fn main() -> Result<(), ExampleError> {
             .with_system(Some(
                 "Tools return fixed synthetic data; no script or external effect is executed.",
             )),
-            &mut History::default(),
+            &[],
         )
+        .0
     }))??;
     println!("{}", outcome.answer);
     Ok(())

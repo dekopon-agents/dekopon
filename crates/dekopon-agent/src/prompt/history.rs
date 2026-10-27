@@ -227,4 +227,3 @@ impl History {
         self.turns.drain(..dropped);
     }
 }
-

@@ -255,6 +255,16 @@ pub(crate) struct ConversationSeed<'a> {
     pub created: bool,
 }
 
+#[cfg(test)]
+impl ConversationSeed<'_> {
+    pub(crate) fn history(&self) -> &History {
+        match &self.window {
+            Window::Owned(history) => history,
+            Window::Journal { .. } => panic!("a journal-recall slot keeps no owned window"),
+        }
+    }
+}
+
 pub(crate) struct ConversationLease<'a> {
     store: &'a ConversationStore,
     key: ConversationKey,

@@ -2012,6 +2012,14 @@ mod retention_tests {
     use dekopon_agent::attachment::{ChatAssetInputs, GeneratedAssetStore, ReplyAttachments};
     use serde_json::json;
 
+    fn test_grant() -> crate::memory::record::GrantDigest {
+        crate::memory::record::GrantDigest::of(&["grant".to_owned()])
+    }
+
+    fn other_grant() -> crate::memory::record::GrantDigest {
+        crate::memory::record::GrantDigest::of(&["other-grant".to_owned()])
+    }
+
     fn access(name: &str) -> AssetAccess {
         AssetAccess::persistent(
             ConversationKey::private(
@@ -2021,7 +2029,7 @@ mod retention_tests {
                 &"tel.15550000001".parse().unwrap(),
             ),
             1,
-            Arc::new(AssetFence::new().with_grant("grant".into())),
+            Arc::new(AssetFence::new().with_grant(test_grant().hex())),
         )
     }
     fn register(store: &AssetStore, access: &AssetAccess) -> u64 {
@@ -2132,7 +2140,7 @@ mod retention_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_crossing_fetch_preserves_the_real_store_images_at_both_retention_budgets() {
-        use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+        use dekopon_agent::prompt::{PromptLimits, SessionInputs, run_prompt_session};
         use dekopon_model::model::ContentPart;
         use tracing_subscriber::prelude::*;
 
@@ -2189,8 +2197,9 @@ mod retention_tests {
                         },
                     )
                     .with_assets(&session),
-                    &mut History::default(),
+                    &[],
                 )
+                .0
                 .unwrap();
                 let last = model.last.lock();
                 let images: Vec<_> = last
@@ -2246,7 +2255,7 @@ mod retention_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_text_fetch_cannot_cross_the_model_request_byte_limit() {
-        use dekopon_agent::prompt::{History, PromptLimits, SessionInputs, run_prompt_session};
+        use dekopon_agent::prompt::{PromptLimits, SessionInputs, run_prompt_session};
         use tracing_subscriber::prelude::*;
 
         let store = store(64 * 1024 * 1024);
@@ -2296,8 +2305,9 @@ mod retention_tests {
                     },
                 )
                 .with_assets(&session),
-                &mut History::default(),
+                &[],
             )
+            .0
             .unwrap();
             let last = model.last.lock();
             assert_eq!(
@@ -2371,20 +2381,27 @@ mod retention_tests {
         inventory: &[AssetRef],
         at: SystemTime,
     ) {
+        let grant = if *access.key.grant == test_grant().hex() {
+            test_grant()
+        } else {
+            other_grant()
+        };
+        let stem = access.key.conversation.journal_stem();
         journal
             .append(
-                &access.key.conversation.journal_stem(),
+                &stem,
                 &crate::memory::journal::Entry {
                     at,
-                    grant: &access.key.grant,
-                    turn: &dekopon_agent::prompt::ConversationTurn::completed("file", "seen"),
+                    grant: &grant,
+                    captured: &crate::tests::captured("file", Some("seen")),
+                    keep: crate::memory::journal::Keep::Everything,
+                    plan: None,
                     inventory,
                     next_asset_id: access.next_asset_id(),
-                    prepared: None,
                 },
-                durable_window(),
             )
             .unwrap();
+        journal.maintain(&stem, at, access.next_asset_id());
     }
 
     fn generated_row(store: &AssetStore, access: &AssetAccess) -> u64 {
@@ -2470,7 +2487,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &access.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )
@@ -2557,15 +2574,15 @@ mod retention_tests {
                 &access.key.conversation.journal_stem(),
                 &crate::memory::journal::Entry {
                     at: SystemTime::now(),
-                    grant: &access.key.grant,
-                    turn: &dekopon_agent::prompt::ConversationTurn::completed("file", "seen"),
+                    grant: &test_grant(),
+                    captured: &crate::tests::captured("file", Some("seen")),
+                    keep: crate::memory::journal::Keep::Everything,
+                    plan: None,
                     inventory: &store.inventory(&access),
                     next_asset_id: access.next_asset_id(),
-                    prepared: None,
                 },
-                durable_window(),
             ),
-            Ok(())
+            Ok(Some(_))
         ));
         assert!(
             capture
@@ -2597,7 +2614,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &access.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )
@@ -2739,7 +2756,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &first.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )
@@ -2765,7 +2782,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &second.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )
@@ -2803,7 +2820,7 @@ mod retention_tests {
         store.attach_journal(&journal).unwrap();
         let first = access("first");
         let mut second = AssetAccess::one_shot(access("second").key.conversation);
-        second.key.grant = Arc::new("grant".into());
+        second.key.grant = Arc::new(test_grant().hex());
         let now = SystemTime::now();
         for access in [&first, &second] {
             let id = register(&store, access);
@@ -2982,7 +2999,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &access.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )
@@ -3115,7 +3132,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &access.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )
@@ -3152,7 +3169,7 @@ mod retention_tests {
         let second = AssetAccess::persistent(
             first.key.conversation.clone(),
             2,
-            Arc::new(AssetFence::new().with_grant("other-grant".into())),
+            Arc::new(AssetFence::new().with_grant(other_grant().hex())),
         );
         let old = register(&store, &first);
         let new = register(&store, &second);
@@ -3265,7 +3282,7 @@ mod retention_tests {
         let recalled = journal
             .recall(
                 &access.key.conversation.journal_stem(),
-                "grant",
+                &test_grant(),
                 durable_window(),
                 SystemTime::now(),
             )

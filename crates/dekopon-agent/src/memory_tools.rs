@@ -59,9 +59,15 @@ pub enum MemoryRefusal {
     RecordIneligible,
     #[error("record unavailable: storage error")]
     Storage { kind: io::ErrorKind },
-    #[error("representation unavailable: unknown representation; eligible representation IDs: {}", ids(available))]
+    #[error(
+        "representation unavailable: unknown representation; eligible representation IDs: {}",
+        ids(available)
+    )]
     UnknownRepresentation { available: Vec<Rung> },
-    #[error("representation unavailable: missing, discarded or not generated; eligible representation IDs: {}", ids(available))]
+    #[error(
+        "representation unavailable: missing, discarded or not generated; eligible representation IDs: {}",
+        ids(available)
+    )]
     RepresentationUnavailable { available: Vec<Rung> },
     #[error("range unavailable: select at most 16384 UTF-8 bytes (0..{len})")]
     Range { len: u64 },

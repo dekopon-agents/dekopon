@@ -79,7 +79,11 @@ fn ladder_start(head: &Head) -> Rung {
     if let Some(pin) = head.header.pin.filter(|pin| ladder(head).contains(pin)) {
         return pin;
     }
-    if let Some(choice) = head.header.choice.filter(|choice| ladder(head).contains(choice)) {
+    if let Some(choice) = head
+        .header
+        .choice
+        .filter(|choice| ladder(head).contains(choice))
+    {
         return choice;
     }
     generated(head)
@@ -116,7 +120,15 @@ fn tool_lines(head: &Head) -> String {
                 .iter()
                 .find_map(|other| match other.field {
                     Field::Arguments { tool, .. } if other.item == span.item => Some(tool),
-                    _ => None,
+                    Field::User { .. }
+                    | Field::Steer { .. }
+                    | Field::Assistant { .. }
+                    | Field::Plain { .. }
+                    | Field::Opaque { .. }
+                    | Field::CallId
+                    | Field::RejectedTool
+                    | Field::Arguments { .. }
+                    | Field::Result { .. } => None,
                 })
                 .unwrap_or(NamedTool::Rejected);
             let outcome = match outcome {
@@ -284,7 +296,10 @@ fn native(
                     opaque_dropped += 1;
                 }
             }
-            Field::CallId | Field::RejectedTool | Field::Arguments { .. } | Field::Result { .. } => {
+            Field::CallId
+            | Field::RejectedTool
+            | Field::Arguments { .. }
+            | Field::Result { .. } => {
                 let mut id = None;
                 let mut name = None;
                 let mut arguments = None;
@@ -306,15 +321,17 @@ fn native(
                             if name.is_none() {
                                 name = Some(tool_label(*tool).to_owned());
                             }
-                            arguments = Some(if span.len <= left && is_object(file, offset, span.len)? {
-                                left -= span.len;
-                                bytes = bytes.saturating_add(span.len);
-                                slice(file, head, span.rel_offset, span.len)?
-                            } else {
-                                let cut = serde_json::json!({ "cut": original_bytes }).to_string();
-                                bytes = bytes.saturating_add(cut.len() as u64);
-                                Text::Owned(cut)
-                            });
+                            arguments =
+                                Some(if span.len <= left && is_object(file, offset, span.len)? {
+                                    left -= span.len;
+                                    bytes = bytes.saturating_add(span.len);
+                                    slice(file, head, span.rel_offset, span.len)?
+                                } else {
+                                    let cut =
+                                        serde_json::json!({ "cut": original_bytes }).to_string();
+                                    bytes = bytes.saturating_add(cut.len() as u64);
+                                    Text::Owned(cut)
+                                });
                         }
                         Field::Result { .. } => {
                             let text = slice(file, head, span.rel_offset, span.len)?
@@ -363,7 +380,9 @@ fn cost(head: &Head, rung: Option<Rung>, native_bytes: u64) -> u64 {
     match rung {
         None => 0,
         Some(Rung::Native) => native_bytes,
-        Some(rung @ (Rung::Summary(_) | Rung::Metadata)) => envelope_text(head, rung).len() as u64 + 1,
+        Some(rung @ (Rung::Summary(_) | Rung::Metadata)) => {
+            envelope_text(head, rung).len() as u64 + 1
+        }
     }
 }
 
@@ -408,7 +427,10 @@ pub(crate) fn project(input: &ProjectionInput<'_>) -> Result<Projected, JournalE
     let budget = input.max_bytes as u64;
     let shown = rungs.iter().filter(|rung| rung.is_some()).count();
     let mut repacked = false;
-    if total(&rungs) > budget || shown > input.max_turns.saturating_mul(2) || records.len() >= input.max_turns.saturating_mul(2) {
+    if total(&rungs) > budget
+        || shown > input.max_turns.saturating_mul(2)
+        || records.len() >= input.max_turns.saturating_mul(2)
+    {
         repacked = true;
         rungs = records
             .iter()
@@ -439,12 +461,7 @@ pub(crate) fn project(input: &ProjectionInput<'_>) -> Result<Projected, JournalE
     let mut counts = RungCounts::default();
     let mut opaque_dropped = 0;
     let mut bytes = 0;
-    for (index, ((head, rung), native)) in records
-        .iter()
-        .zip(&rungs)
-        .zip(natives)
-        .enumerate()
-    {
+    for (index, ((head, rung), native)) in records.iter().zip(&rungs).zip(natives).enumerate() {
         prior.push(Prior {
             record: head.header.id,
             rung: *rung,

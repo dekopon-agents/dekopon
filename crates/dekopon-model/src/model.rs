@@ -236,9 +236,10 @@ impl ModelMessage {
     pub fn encoded_len(&self) -> usize {
         match self {
             Self::Journal { message } => message.encoded_len(),
-            Self::System { .. } | Self::User { .. } | Self::Assistant { .. } | Self::ToolResults { .. } => {
-                crate::replay::json_len(self.for_metering().as_ref())
-            }
+            Self::System { .. }
+            | Self::User { .. }
+            | Self::Assistant { .. }
+            | Self::ToolResults { .. } => crate::replay::json_len(self.for_metering().as_ref()),
         }
     }
 
