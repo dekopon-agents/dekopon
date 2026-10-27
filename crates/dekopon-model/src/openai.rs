@@ -1039,10 +1039,9 @@ mod tests {
             if let Some(inner) = error
                 .downcast_ref::<std::io::Error>()
                 .and_then(std::io::Error::get_ref)
+                && unknown_issuer(inner)
             {
-                if unknown_issuer(inner) {
-                    return true;
-                }
+                return true;
             }
             error.source().is_some_and(unknown_issuer)
         }

@@ -3504,6 +3504,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_ca_limits_match_broker_ca_limits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::tests::temporary();
+        let ca = root.path().join("roots.pem");
+        let provider = root.path().join("provider.wasm");
+        std::fs::write(&provider, b"component fixture").unwrap();
+        let broker = root.path().join("broker.yaml");
+        let pem = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        for (count, size) in [(8, 65_536), (9, 65_536), (1, 65_537)] {
+            let mut padded = pem.clone();
+            padded.extend(std::iter::repeat_n('\n', size - pem.len()));
+            std::fs::write(&ca, padded).unwrap();
+            let paths = vec![&ca; count];
+            let config = serde_json::json!({
+                "apiVersion": "dekopon.dev/brokerd/v1alpha1",
+                "socketPath": root.path().join("broker.sock"),
+                "providers": [provider],
+                "identities": [{"uid": crate::current_uid(), "principal": "caller",
+                    "actor": {"type": "agent", "agent": "model-ca-test"}}],
+                "http": {"extraCABundles": paths},
+            });
+            std::fs::write(&broker, serde_json::to_vec(&config).unwrap()).unwrap();
+            std::fs::set_permissions(&broker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let broker_accepts =
+                match dekopon_brokerd::telemetry_settings(&broker, crate::current_uid()).await {
+                    Ok(_) => true,
+                    Err(dekopon_brokerd::BrokerdError::Config(
+                        dekopon_brokerd::ConfigError::InvalidHttpsConfiguration,
+                    )) => false,
+                    Err(error) => panic!("broker fixture failed: {error:?}"),
+                };
+            let gateway = resolved(&format!(
+                "{TAIL}extraCABundles: {}\n",
+                serde_json::to_string(&paths).unwrap()
+            ));
+            assert_eq!(gateway.is_ok(), broker_accepts);
+        }
+    }
+
+    #[tokio::test]
     async fn model_ca_check_is_path_only_for_files_and_fragments() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("gateway.yaml");
@@ -3532,12 +3575,11 @@ mod tests {
                     assert!(resolved.unwrap().models[0].ca_bundles().is_empty());
                 } else {
                     assert!(resolved.is_none());
-                    assert!(errors.iter().any(|error| match error {
-                        ConfigError::Invalid { problems, .. } => problems.iter().any(
+                    assert!(errors.iter().any(|error| matches!(error,
+                        ConfigError::Invalid { problems, .. } if problems.iter().any(
                             |problem| matches!(problem, super::ConfigProblem::ModelCaBundlePath)
-                        ),
-                        _ => false,
-                    }));
+                        )
+                    )));
                 }
             }
         }
