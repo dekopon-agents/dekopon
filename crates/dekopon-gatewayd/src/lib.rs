@@ -18,6 +18,8 @@ mod cache_key;
 mod collection;
 mod config;
 mod conversation;
+#[cfg(feature = "fauxlack")]
+pub mod fauxlack;
 mod follow;
 mod gateway;
 mod jobs;
@@ -100,8 +102,24 @@ pub async fn telemetry_settings(
     Ok(config::load(config_path, uid).await?.telemetry)
 }
 
+#[cfg(test)]
 async fn boot_candidate(config_path: &Path) -> Result<(Candidate, Prepared), GatewaydError> {
-    let (candidate, report) = load_candidate(config_path, None, config::LoadMode::Boot, None).await;
+    boot_candidate_with_service(config_path, &config::InProcess::default()).await
+}
+
+async fn boot_candidate_with_service(
+    config_path: &Path,
+    service: &config::InProcess,
+) -> Result<(Candidate, Prepared), GatewaydError> {
+    let (candidate, report) = load_candidate_with_service(
+        config_path,
+        None,
+        config::LoadMode::Boot,
+        None,
+        None,
+        service,
+    )
+    .await;
     let Some((candidate, prepared)) = candidate.and_then(|mut candidate| {
         candidate
             .prepared
@@ -120,11 +138,46 @@ async fn boot_candidate(config_path: &Path) -> Result<(Candidate, Prepared), Gat
     Ok((candidate, prepared))
 }
 
+pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
+where
+    F: Future<Output = ()> + Send,
+{
+    run_with_service(
+        config_path.as_ref(),
+        shutdown,
+        &config::InProcess::default(),
+    )
+    .await
+}
+
+#[cfg(feature = "fauxlack")]
+pub async fn run_fauxlack<F>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    fauxlack: fauxlack::Fauxlack,
+) -> Result<(), GatewaydError>
+where
+    F: Future<Output = ()> + Send,
+{
+    run_with_service(
+        config_path.as_ref(),
+        shutdown,
+        &config::InProcess {
+            fauxlack: Some(fauxlack),
+        },
+    )
+    .await
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "gateway boot owns resident transports and reload owners until shutdown"
 )]
-pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
+async fn run_with_service<F>(
+    config_path: &Path,
+    shutdown: F,
+    service: &config::InProcess,
+) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -134,7 +187,7 @@ where
             transports: built_transports,
             generation,
         },
-    ) = boot_candidate(config_path.as_ref()).await?;
+    ) = boot_candidate_with_service(config_path, service).await?;
     let config = &candidate.config;
 
     let broker_client = BrokerClient::new(
@@ -280,7 +333,7 @@ where
         Arc::new(drivers),
     )
     .with_reload_owners(
-        config_path.as_ref().to_path_buf(),
+        config_path.to_path_buf(),
         candidate,
         broker_digest,
         gateway::ResidentModels {
@@ -529,9 +582,24 @@ pub(crate) async fn load_candidate_against(
     probe: Option<(&ProbeScope, &probe::Vendor)>,
     active: Option<(&ResolvedConfig, &config::GatewaySources, &RoutingTable)>,
 ) -> (Option<Candidate>, CheckReport) {
+    let service = active
+        .map(|(config, _, _)| config.service.clone())
+        .unwrap_or_default();
+    load_candidate_with_service(config_path, catalog_path, mode, probe, active, &service).await
+}
+
+async fn load_candidate_with_service(
+    config_path: &Path,
+    catalog_path: Option<&Path>,
+    mode: config::LoadMode,
+    probe: Option<(&ProbeScope, &probe::Vendor)>,
+    active: Option<(&ResolvedConfig, &config::GatewaySources, &RoutingTable)>,
+    service: &config::InProcess,
+) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let before_config = config::source_snapshot(config_path, None, current_uid()).await;
-    let (mut config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
+    let (mut config, refusals) =
+        config::load_reporting_with_service(config_path, current_uid(), mode, service).await;
     report
         .problems
         .extend(refusals.into_iter().map(GatewaydError::from));
@@ -738,7 +806,7 @@ fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
             ..
         } => vec![app_secret_env, verify_token_env, access_token_env],
         TransportConfig::GithubWebhook { secret_env, .. } => vec![secret_env],
-        TransportConfig::Local { .. } => Vec::new(),
+        TransportConfig::Fauxlack { .. } | TransportConfig::Local { .. } => Vec::new(),
     }
 }
 
@@ -973,7 +1041,8 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, G
         .iter()
         .filter_map(|spec| match spec {
             TransportConfig::WhatsappCloudApi { bind, .. } => Some(*bind),
-            TransportConfig::GithubWebhook { .. }
+            TransportConfig::Fauxlack { .. }
+            | TransportConfig::GithubWebhook { .. }
             | TransportConfig::SlackSocketMode { .. }
             | TransportConfig::DiscordGateway { .. }
             | TransportConfig::TelegramLongPoll { .. }
@@ -1049,6 +1118,28 @@ fn build_transport(
         settings
     };
     Ok(match spec {
+        TransportConfig::Fauxlack {
+            name, server, bot, ..
+        } => {
+            #[cfg(feature = "fauxlack")]
+            {
+                let service = config
+                    .service
+                    .fauxlack
+                    .as_ref()
+                    .ok_or(TransportError::Response)?;
+                Box::new(transport::fauxlack::FauxlackTransport::new(
+                    name.clone(),
+                    service.server(server),
+                    bot.clone(),
+                ))
+            }
+            #[cfg(not(feature = "fauxlack"))]
+            {
+                let _ = (name, server, bot);
+                return Err(TransportError::Response);
+            }
+        }
         TransportConfig::GithubWebhook {
             name,
             secret_env,

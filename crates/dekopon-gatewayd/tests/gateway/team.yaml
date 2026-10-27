@@ -1,0 +1,16 @@
+servers:
+  - id: acme
+    users:
+      - { id: ualice, name: Alice }
+      - { id: ubob, name: Bob }
+      - { id: ucarol, name: Carol }
+      - { id: udekopon, name: dekopon, bot: true }
+      - { id: uhelper, name: helper, bot: true }
+    channels:
+      - { id: cteam, name: team, members: [ualice, ubob, ucarol, udekopon, uhelper] }
+      - { id: crandom, name: random, members: [ualice, ubob] }
+    directMessages:
+      - { id: dalice, members: [ualice, udekopon] }
+    files:
+      - { name: notes.txt, snippet: deploy at 5 }
+      - { name: chart.png, image: { mime: image/png, base64: iVBORw0KGgppaXR0eSBwaXhlbHM= } }

@@ -136,6 +136,10 @@ pub struct ExternalSubject {
 }
 
 impl ExternalSubject {
+    pub fn fauxlack(server: &str, id: &str) -> Result<Self, SubjectError> {
+        format!("fauxlack.{server}.{id}").parse()
+    }
+
     pub fn slack(team: &str, user: &str) -> Result<Self, SubjectError> {
         let tenant = normalize_segment(SubjectService::Slack, SubjectSegment::Tenant, team)?;
         let subject = normalize_segment(SubjectService::Slack, SubjectSegment::Subject, user)?;
@@ -408,6 +412,23 @@ pub enum SubjectError {
 #[cfg(test)]
 mod tests {
     use super::{ExternalSubject, SubjectError, SubjectService};
+
+    #[test]
+    fn fauxlack_constructor_uses_the_canonical_subject_parser() {
+        for (server, id) in [
+            ("acme", "ualice"),
+            ("acme", "cteam"),
+            ("ACME", "ualice"),
+            ("acme", "bad-id"),
+            ("", "u"),
+            ("acme", ""),
+        ] {
+            assert_eq!(
+                ExternalSubject::fauxlack(server, id),
+                format!("fauxlack.{server}.{id}").parse()
+            );
+        }
+    }
 
     #[test]
     fn github_owner_and_repo_are_bounded_canonical_segments() {

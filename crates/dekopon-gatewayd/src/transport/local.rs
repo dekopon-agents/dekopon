@@ -415,7 +415,8 @@ impl LocalDriver {
     fn connection(target: &LivenessTarget) -> Result<u64, TransportError> {
         match target {
             LivenessTarget::Local { connection } => Ok(*connection),
-            LivenessTarget::Slack { .. }
+            LivenessTarget::Fauxlack { .. }
+            | LivenessTarget::Slack { .. }
             | LivenessTarget::Discord { .. }
             | LivenessTarget::Telegram { .. }
             | LivenessTarget::WhatsApp { .. } => Err(TransportError::Response),

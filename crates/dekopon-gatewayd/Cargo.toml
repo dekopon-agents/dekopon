@@ -13,6 +13,9 @@ keywords = ["agents", "daemon", "slack", "llm", "orchestration"]
 categories = ["command-line-utilities", "network-programming"]
 include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
+[features]
+fauxlack = []
+
 [dependencies]
 parking_lot.workspace = true
 arc-swap.workspace = true
