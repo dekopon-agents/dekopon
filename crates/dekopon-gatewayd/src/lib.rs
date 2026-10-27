@@ -531,10 +531,18 @@ pub(crate) async fn load_candidate_against(
 ) -> (Option<Candidate>, CheckReport) {
     let mut report = CheckReport::default();
     let before_config = config::source_snapshot(config_path, None, current_uid()).await;
-    let (config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
+    let (mut config, refusals) = config::load_reporting(config_path, current_uid(), mode).await;
     report
         .problems
         .extend(refusals.into_iter().map(GatewaydError::from));
+    if probe.is_some()
+        && mode == config::LoadMode::Check
+        && let Some(candidate) = &mut config
+        && let Err(error) = candidate.load_model_ca_bundles()
+    {
+        report.problems.push(error.into());
+        config = None;
+    }
     let catalog_path = catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()));
     let catalog = match catalog_path {
         Some(path) => match LocalCatalog::load(path) {
@@ -621,6 +629,7 @@ pub(crate) async fn load_candidate_against(
             match (before_config, after_config, after_catalog) {
                 (Ok(before), Ok(after), Ok(catalog_after)) if before == after => {
                     let sources = config::GatewaySources {
+                        ca_bundles: config.ca_sources.clone(),
                         config: after,
                         catalog: catalog_after,
                     };
@@ -923,6 +932,7 @@ mod openrouter_startup_tests {
     #[test]
     fn missing_and_blank_openrouter_credentials_are_startup_problems_not_config_problems() {
         let model = config::ModelConfig::Openrouter {
+            ca_bundles: Default::default(),
             name: "router".into(),
             model: "vendor/model".into(),
             api_key_env: "OPENROUTER_API_KEY".into(),

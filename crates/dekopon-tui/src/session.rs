@@ -316,6 +316,7 @@ pub async fn connect(
 #[must_use]
 pub fn smoke_claim() -> ChatScopeClaim {
     ChatScopeClaim {
+        participant: None,
         transport: "console-smoke".parse().unwrap_or_else(|_| unreachable!()),
         kind: ChatTransportKind::Local,
         conversation: Conversation {
@@ -546,6 +547,7 @@ pub fn build_model(
                 &options.model,
                 Some(&path),
                 options.model_timeout,
+                &[],
             )?)
         }
         ModelChoice::OpenAiCompatible {
@@ -566,6 +568,7 @@ pub fn build_model(
                 &options.model,
                 bearer,
                 options.model_timeout,
+                &[],
             )?)
         }
     };

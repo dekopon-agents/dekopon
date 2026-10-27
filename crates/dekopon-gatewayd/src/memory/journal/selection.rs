@@ -157,7 +157,7 @@ pub(crate) fn decide<I: CapabilityInvoker>(
         limits: runtime.limits,
         calls: runtime.calls.clone(),
     };
-    let result = decider.run_script("memory_decide");
+    let result = decider.run_script("memory_decide", None);
     if result.exit_code != ExitCode::SUCCESS {
         return Err("invocation-failed");
     }

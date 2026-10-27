@@ -186,6 +186,7 @@ fn claim_for(conversation: &str) -> Attestation {
             .expect("subject"),
         "reviewer".parse::<AgentId>().expect("agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
             conversation: slack_conversation(conversation),
@@ -206,6 +207,7 @@ fn local_claim(transport: &str, conversation: &str) -> Attestation {
         "slack.t0123abc.u9xyz".parse().expect("subject"),
         "reviewer".parse().expect("agent"),
         ChatScopeClaim {
+            participant: None,
             transport: transport.parse().expect("transport"),
             kind: ChatTransportKind::Local,
             conversation: Conversation {

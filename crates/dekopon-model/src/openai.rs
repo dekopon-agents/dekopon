@@ -32,6 +32,7 @@ impl OpenAiClient {
         model: impl Into<String>,
         bearer_token: Option<String>,
         timeout: Duration,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
         if timeout.is_zero() {
             return Err(RequestError::ZeroTimeout.into());
@@ -52,7 +53,7 @@ impl OpenAiClient {
             return Err(RequestError::InsecureBearer.into());
         }
         Ok(Self {
-            http: InferenceHttp::new(timeout)?,
+            http: InferenceHttp::new(timeout, extra_ca_bundles)?,
             endpoint: completion_url(&endpoint),
             name: model.clone(),
             model,
@@ -936,7 +937,7 @@ mod tests {
         replay_transcript, turn_from_response,
     };
     use crate::diagnostic::DiagnosticSecrets;
-    use crate::error::{AuthError, RateLimitError};
+    use crate::error::{AuthError, RateLimitError, TransportFailure};
     use crate::mock::{MockResponse, MockServer};
     use crate::model::{ChatModel, CompletionOptions, ModelKey, assistant_message};
     use crate::{
@@ -967,6 +968,98 @@ mod tests {
             .await
     }
 
+    #[tokio::test]
+    async fn extra_ca_bundles_trust_a_generated_issuer_for_model_requests() {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .signed_by(&key, &ca)
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "https://localhost:{}/v1",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert!(acceptor.accept(stream).await.is_err());
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(stream).await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() <= 16_384);
+                }
+                assert!(request.starts_with(b"POST /v1/chat/completions HTTP/1.1\r\n"));
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"trusted"},"finish_reason":"stop"}]}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }).await.unwrap();
+        });
+        let request = vec![ModelMessage::user("hello")];
+        let options = CompletionOptions::default();
+        let untrusted = OpenAiClient::new(&endpoint, "fixture", None, Duration::from_secs(2), &[])
+            .unwrap()
+            .with_streaming(false);
+        let error = generate(&untrusted, &request, &[], &options, &mut |_| {
+            ControlFlow::Continue(())
+        })
+        .await
+        .unwrap_err();
+        let InferenceError::Transport(TransportFailure::Http { source, .. }) = error else {
+            panic!("expected typed HTTP transport failure");
+        };
+        fn unknown_issuer(error: &(dyn std::error::Error + 'static)) -> bool {
+            if let Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            )) = error.downcast_ref::<rustls::Error>()
+            {
+                return true;
+            }
+            if let Some(inner) = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                && unknown_issuer(inner)
+            {
+                return true;
+            }
+            error.source().is_some_and(unknown_issuer)
+        }
+        assert!(unknown_issuer(&source));
+        let bundles = [dekopon_core::Redacted::new(ca.pem())];
+        let trusted =
+            OpenAiClient::new(&endpoint, "fixture", None, Duration::from_secs(2), &bundles)
+                .unwrap()
+                .with_streaming(false);
+        let turn = generate(&trusted, &request, &[], &options, &mut |_| {
+            ControlFlow::Continue(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(turn.content.as_deref(), Some("trusted"));
+        server.await.unwrap();
+    }
+
     async fn wire_messages(messages: &[ModelMessage]) -> Vec<WireMessage<'_>> {
         let mut wire = Vec::new();
         for message in messages {
@@ -985,10 +1078,15 @@ mod tests {
             };
             let (reply, ready, release) = reply.stalled();
             let server = MockServer::start(vec![reply]);
-            let client =
-                OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                    .unwrap()
-                    .with_streaming(stream);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "fixture",
+                None,
+                Duration::from_secs(2),
+                &[],
+            )
+            .unwrap()
+            .with_streaming(stream);
             let (cancel, watch) = tokio::sync::watch::channel(false);
             let control = TurnControl::new(watch, Duration::from_secs(2)).unwrap();
             let options = CompletionOptions::default();
@@ -1020,10 +1118,15 @@ mod tests {
             let (reply, _ready, release) = reply.header("x-request-id", "req-deadline").stalled();
             let server = MockServer::start(vec![reply]);
             let trace = crate::trace_capture::TraceCapture::default();
-            let client =
-                OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                    .unwrap()
-                    .with_streaming(stream);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "fixture",
+                None,
+                Duration::from_secs(2),
+                &[],
+            )
+            .unwrap()
+            .with_streaming(stream);
             let control =
                 TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(1))
                     .unwrap();
@@ -1065,10 +1168,15 @@ mod tests {
                 )
             };
             let server = MockServer::start(vec![response]);
-            let client =
-                OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                    .unwrap()
-                    .with_streaming(stream);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "fixture",
+                None,
+                Duration::from_secs(2),
+                &[],
+            )
+            .unwrap()
+            .with_streaming(stream);
             let (result, span) = crate::trace_capture::exported_model_span(generate(
                 &client,
                 &[],
@@ -1101,6 +1209,7 @@ mod tests {
                 "configured",
                 Some("sk-reviewer-canary".to_owned()),
                 Duration::from_secs(2),
+                &[],
             )
             .unwrap()
             .with_streaming(stream);
@@ -1144,6 +1253,7 @@ mod tests {
                     "requested-model",
                     Some("trace-credential-sentinel".into()),
                     Duration::from_secs(2),
+                    &[],
                 )
                 .unwrap()
                 .with_streaming(stream)
@@ -1206,9 +1316,15 @@ mod tests {
         let body = json!({"choices":[{"message":{"content":"x".repeat(bytes - empty.to_string().len())}}]});
         assert_eq!(body.to_string().len(), bytes);
         let server = MockServer::start(vec![MockResponse::json(body)]);
-        let client = OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(5))
-            .unwrap()
-            .with_streaming(false);
+        let client = OpenAiClient::new(
+            server.base_url(),
+            "fixture",
+            None,
+            Duration::from_secs(5),
+            &[],
+        )
+        .unwrap()
+        .with_streaming(false);
         generate(
             &client,
             &[],
@@ -1249,10 +1365,15 @@ mod tests {
                     response
                 };
                 let server = MockServer::start(vec![response]);
-                let client =
-                    OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                        .unwrap()
-                        .with_streaming(stream);
+                let client = OpenAiClient::new(
+                    server.base_url(),
+                    "fixture",
+                    None,
+                    Duration::from_secs(2),
+                    &[],
+                )
+                .unwrap()
+                .with_streaming(stream);
                 let error = generate(
                     &client,
                     &[],
@@ -1290,10 +1411,15 @@ mod tests {
             let server = MockServer::start(vec![
                 body.interrupted_at(1).header("x-request-id", "req-io"),
             ]);
-            let client =
-                OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                    .unwrap()
-                    .with_streaming(stream);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "fixture",
+                None,
+                Duration::from_secs(2),
+                &[],
+            )
+            .unwrap()
+            .with_streaming(stream);
             let error = generate(
                 &client,
                 &[],
@@ -1326,6 +1452,7 @@ mod tests {
                 "fixture",
                 Some(token.to_owned()),
                 Duration::from_secs(2),
+                &[],
             )
             .unwrap()
             .with_streaming(stream);
@@ -1390,10 +1517,15 @@ mod tests {
                     MockResponse::json(body)
                 };
                 let server = MockServer::start(vec![reply]);
-                let client =
-                    OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                        .unwrap()
-                        .with_streaming(stream);
+                let client = OpenAiClient::new(
+                    server.base_url(),
+                    "fixture",
+                    None,
+                    Duration::from_secs(2),
+                    &[],
+                )
+                .unwrap()
+                .with_streaming(stream);
                 let error = generate(
                     &client,
                     &[],
@@ -1424,10 +1556,15 @@ mod tests {
             (true, MockResponse::sse("data: [DONE]\n\n")),
         ] {
             let server = MockServer::start(vec![reply]);
-            let client =
-                OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                    .unwrap()
-                    .with_streaming(stream);
+            let client = OpenAiClient::new(
+                server.base_url(),
+                "fixture",
+                None,
+                Duration::from_secs(2),
+                &[],
+            )
+            .unwrap()
+            .with_streaming(stream);
             let error = generate(
                 &client,
                 &[],
@@ -1468,10 +1605,15 @@ mod tests {
                     MockResponse::json(body)
                 };
                 let server = MockServer::start(vec![reply]);
-                let client =
-                    OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2))
-                        .unwrap()
-                        .with_streaming(stream);
+                let client = OpenAiClient::new(
+                    server.base_url(),
+                    "fixture",
+                    None,
+                    Duration::from_secs(2),
+                    &[],
+                )
+                .unwrap()
+                .with_streaming(stream);
                 let result = generate(
                     &client,
                     &[],
@@ -1506,8 +1648,14 @@ mod tests {
         let server = MockServer::start(vec![MockResponse::sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         )]);
-        let client =
-            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let client = OpenAiClient::new(
+            server.base_url(),
+            "fixture",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .unwrap();
         let turn = AssistantTurn::new(Some("portable projection".into()), Vec::new(), None)
             .with_codex_continuation(
                 vec![json!({"type":"reasoning","encrypted_content":"opaque-canary"})],
@@ -1540,8 +1688,14 @@ mod tests {
         let mut body = format!("data: {delta}\n\n").repeat(DELTAS);
         body.push_str(&format!("data: {last}\n\ndata: [DONE]\n\n"));
         let server = MockServer::start(vec![MockResponse::sse(&body).split(64)]);
-        let client =
-            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let client = OpenAiClient::new(
+            server.base_url(),
+            "fixture",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .unwrap();
         let (turn, span) = crate::trace_capture::exported_model_span(generate(
             &client,
             &[],
@@ -1600,8 +1754,14 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"second"}}]}"#,
         ]);
         let server = MockServer::start(vec![MockResponse::sse(&body)]);
-        let client =
-            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let client = OpenAiClient::new(
+            server.base_url(),
+            "fixture",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .unwrap();
         let mut observe = |_| ControlFlow::Break(());
         let (result, span) = crate::trace_capture::exported_model_span(generate(
             &client,
@@ -1622,8 +1782,14 @@ mod tests {
     async fn a_deadline_exceeded_call_exports_an_error_status_without_a_description() {
         let (reply, _ready, release) = MockResponse::sse("data: [DONE]\n\n").stalled();
         let server = MockServer::start(vec![reply]);
-        let client =
-            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let client = OpenAiClient::new(
+            server.base_url(),
+            "fixture",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .unwrap();
         let control = TurnControl::new(
             tokio::sync::watch::channel(false).1,
             Duration::from_millis(200),
@@ -1652,8 +1818,14 @@ mod tests {
             "[DONE]",
         ]);
         let server = MockServer::start(vec![MockResponse::sse(&body).split(1)]);
-        let client =
-            OpenAiClient::new(server.base_url(), "fixture", None, Duration::from_secs(2)).unwrap();
+        let client = OpenAiClient::new(
+            server.base_url(),
+            "fixture",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .unwrap();
         let turn = generate(
             &client,
             &[],
@@ -1695,6 +1867,7 @@ mod tests {
                 "fixture",
                 Some(token.to_owned()),
                 Duration::from_secs(2),
+                &[],
             )
             .unwrap()
             .with_streaming(stream);
@@ -1732,6 +1905,7 @@ mod tests {
             "fixture",
             Some(token.to_owned()),
             Duration::from_secs(2),
+            &[],
         )
         .unwrap();
         let (cancel, watch) = tokio::sync::watch::channel(false);
@@ -1784,8 +1958,14 @@ mod tests {
             429,
             json!({"error": {"message": "Rate limit reached for gpt-test", "type": "rate_limit"}}),
         )]);
-        let model = OpenAiClient::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
-            .expect("model client");
+        let model = OpenAiClient::new(
+            server.base_url(),
+            "gpt-test",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .expect("model client");
 
         let error = generate(
             &model,
@@ -1809,8 +1989,14 @@ mod tests {
         let server = MockServer::start(vec![MockResponse::json(
             json!({"choices": [{"message": {"role": "assistant", "content": "hello"}}]}),
         )]);
-        let model = OpenAiClient::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
-            .expect("model client");
+        let model = OpenAiClient::new(
+            server.base_url(),
+            "gpt-test",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .expect("model client");
         assert!(
             model.stream,
             "streaming is the default for a compatible endpoint"
@@ -1858,6 +2044,7 @@ mod tests {
                 "fixture",
                 Some(token.to_owned()),
                 Duration::from_secs(2),
+                &[],
             )
             .unwrap();
             let trace = crate::trace_capture::TraceCapture::default();
@@ -1890,6 +2077,7 @@ mod tests {
             "test-model",
             Some("secret".to_owned()),
             Duration::from_secs(1),
+            &[],
         )
         .err()
         .expect("remote bearer tokens require TLS");
@@ -1906,6 +2094,7 @@ mod tests {
                 "test-model",
                 Some("secret".to_owned()),
                 Duration::from_secs(1),
+                &[],
             )
             .err()
             .unwrap_or_else(|| panic!("{disguised} connects to a remote host in plaintext"));
@@ -1923,6 +2112,7 @@ mod tests {
                     "test-model",
                     Some("local-secret".to_owned()),
                     Duration::from_secs(1),
+                    &[]
                 )
                 .is_ok(),
                 "{loopback} is a loopback endpoint"
@@ -1934,6 +2124,7 @@ mod tests {
                 "test-model",
                 Some("secret".to_owned()),
                 Duration::from_secs(1),
+                &[]
             )
             .is_ok()
         );
@@ -2817,8 +3008,14 @@ mod tests {
             r#"{"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}"#,
             "[DONE]",
         ]))]);
-        let model = OpenAiClient::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
-            .expect("model client");
+        let model = OpenAiClient::new(
+            server.base_url(),
+            "gpt-test",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .expect("model client");
         let mut events = Vec::new();
         let mut sink = |event: TurnEvent| -> ControlFlow<()> {
             events.push(event);
@@ -2861,9 +3058,15 @@ mod tests {
             "choices": [{"message": {"content": "Merged already."}}],
             "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
         }))]);
-        let model = OpenAiClient::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
-            .expect("model client")
-            .with_streaming(false);
+        let model = OpenAiClient::new(
+            server.base_url(),
+            "gpt-test",
+            None,
+            Duration::from_secs(2),
+            &[],
+        )
+        .expect("model client")
+        .with_streaming(false);
         let mut events = Vec::new();
         let mut sink = |event: TurnEvent| -> ControlFlow<()> {
             events.push(event);

@@ -2115,7 +2115,7 @@ mod retention_tests {
     pub(super) struct NoScripts;
 
     impl dekopon_agent::prompt::ScriptRuntime for NoScripts {
-        fn run_script(&self, _: &str) -> dekopon_shell::ScriptOutcome {
+        fn run_script(&self, _: &str, _participant: Option<&str>) -> dekopon_shell::ScriptOutcome {
             panic!("this model only fetches chat assets")
         }
         fn capability_calls_used(&self) -> u32 {

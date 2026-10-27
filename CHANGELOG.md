@@ -7,6 +7,51 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.61.1] - 2026-10-27
+
+### Fixed
+
+- Bash calls with as on unmapped routes now run as the asker instead of failing with an unknown participant handle.
+
+## [dekopon-chart-0.48.1] - 2026-10-27
+
+### Changed
+
+- Chart 0.48.1 targets core v0.61.1 and renders the `v0.61.1` image tag.
+
+## [0.61.0] - 2026-10-27
+
+### Added
+
+- the bash tool's as argument runs a script under a participant's handle
+- Accept fauxlack subjects, chat scopes and delivery identities with mapped space authorization.
+
+## [dekopon-chart-0.48.0] - 2026-10-27
+
+### Changed
+
+- Chart 0.48.0 targets core v0.61.0 and renders the `v0.61.0` image tag.
+
+### Fixed
+
+- The Helm console defaults to the Dekopon image and follows the daemon tag or digest unless explicitly overridden.
+
+## [0.60.0] - 2026-10-27
+
+### Added
+
+- Gateway model clients can trust explicit extraCABundles alongside public roots.
+
+### Changed
+
+- in a mapped channel, every authorized participant's message steers the running turn
+
+## [dekopon-chart-0.47.0] - 2026-10-27
+
+### Changed
+
+- Chart 0.47.0 targets core v0.60.0 and renders the `v0.60.0` image tag.
+
 ## [0.59.0] - 2026-10-26
 
 ### Added

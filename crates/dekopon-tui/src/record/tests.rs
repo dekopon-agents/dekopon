@@ -68,7 +68,7 @@ impl ScriptRuntime for FixedRuntime<'_> {
         2
     }
 
-    fn run_script(&self, _script: &str) -> ScriptOutcome {
+    fn run_script(&self, _script: &str, _participant: Option<&str>) -> ScriptOutcome {
         self.invoker.invoke(
             CommandProposal::new("gh.issue.list", json!({"state": "open"}), None),
             sink(),
@@ -128,7 +128,7 @@ fn reports_a_script_and_every_call_inside_it_in_order() {
     let invoker = RecordingInvoker::new(FixedInvoker, sender.clone(), sequence.clone());
     let runtime = RecordingRuntime::new(FixedRuntime { invoker: &invoker }, sender, sequence);
 
-    let outcome = runtime.run_script("gh issue list");
+    let outcome = runtime.run_script("gh issue list", None);
     assert_eq!(
         outcome.capability_calls, 2,
         "the outcome must pass through unchanged"

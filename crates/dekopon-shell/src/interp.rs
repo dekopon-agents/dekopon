@@ -220,9 +220,9 @@ mod pump_tests {
     }
 }
 
-fn stage_compound_span(command: &Command) -> Option<tracing::Span> {
+fn stage_compound_span(command: &Command, participant: Option<&str>) -> Option<tracing::Span> {
     matches!(command, Command::Compound { .. })
-        .then(|| telemetry::command_span("{ ...; }", CommandKind::Compound, 0))
+        .then(|| telemetry::command_span("{ ...; }", CommandKind::Compound, 0, participant))
 }
 
 fn record_compound_outcome(span: Option<&tracing::Span>, executed: &Result<Executed, FatalError>) {
@@ -1384,7 +1384,7 @@ impl<'a> Evaluator<'a> {
                 Arc::clone(&meters[producers.len()]),
             );
             let compound_span = (!producers.is_empty())
-                .then(|| stage_compound_span(last))
+                .then(|| stage_compound_span(last, self.invoker.participant_handle()))
                 .flatten();
             if let Some(span) = &compound_span {
                 telemetry::record_compound_stage(span);
@@ -1518,7 +1518,8 @@ impl<'a> Evaluator<'a> {
                         setup.position.index,
                         setup.meter,
                     );
-                    let compound_span = stage_compound_span(command);
+                    let compound_span =
+                        stage_compound_span(command, stage.invoker.participant_handle());
                     if let Some(span) = &compound_span {
                         telemetry::record_compound_stage(span);
                     }
@@ -2351,7 +2352,12 @@ impl<'a> Evaluator<'a> {
             (CommandKind::of(&resolution), Some(resolution))
         };
         self.counters.charge(kind);
-        let span = telemetry::command_span(command, kind, arguments.len());
+        let span = telemetry::command_span(
+            command,
+            kind,
+            arguments.len(),
+            self.invoker.participant_handle(),
+        );
         let _entered = span.enter();
         let traced = !span.is_disabled();
         if traced {

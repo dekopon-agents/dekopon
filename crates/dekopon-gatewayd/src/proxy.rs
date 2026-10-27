@@ -395,6 +395,7 @@ pub(crate) mod tests {
             PathBuf::from("/tmp/gatewayd.yaml"),
             &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
             501,
+            crate::config::LoadMode::Boot,
         )
     }
 

@@ -69,7 +69,7 @@ happened. None of this turn's tool calls ran.";
 /// Returns no Result because a script failure is an outcome the model recovers from, like a nonzero
 /// exit code, not a reason to end the session.
 pub trait ScriptRuntime {
-    fn run_script(&self, script: &str) -> ScriptOutcome;
+    fn run_script(&self, script: &str, participant: Option<&str>) -> ScriptOutcome;
 
     fn capability_calls_used(&self) -> u32;
 
@@ -1282,7 +1282,7 @@ where
                     "agent.tool.script"
                 );
                 check_cancelled(cancellation)?;
-                let outcome = runtime.run_script(&script);
+                let outcome = runtime.run_script(&script, arguments.participant.as_deref());
                 tracing::info!(
                     target: "dekopon_agent::audit",
                     {
@@ -1542,6 +1542,10 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
                 "command": {
                     "type": "string",
                     "description": "The script to run. Multiple lines are expected and encouraged."
+                },
+                "as": {
+                    "type": "string",
+                    "description": "One authenticated participant handle from this turn (for example p2). Omit to use the asker. Applies only in mapped channels; ignored on unmapped routes."
                 }
             },
             "required": ["command"],
@@ -1856,6 +1860,8 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
 #[derive(Deserialize)]
 struct BashArguments {
     command: String,
+    #[serde(default, rename = "as")]
+    participant: Option<String>,
     #[serde(flatten)]
     ignored: BTreeMap<String, IgnoredAny>,
 }
@@ -1897,7 +1903,7 @@ fn script_argument(tool: &str, arguments: &str) -> Result<BashArguments, PromptE
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
 `{\"command\":\"cap --list\"}`; provider command words are not separate model \
-tools. Returns the script's combined output followed by an \
+tools. Optional `as`: current participant handle in mapped channels; ignored on unmapped routes; default: asker. Returns the script's combined output followed by an \
 `[exit code: N]` trailer.
 
 - Capabilities are reached only through this tool. Do the whole job in one script; send another \
@@ -2163,7 +2169,7 @@ mod tests {
     }
 
     impl ScriptRuntime for RecordingRuntime {
-        fn run_script(&self, script: &str) -> ScriptOutcome {
+        fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
             let mut calls = self.calls.lock();
             let remaining = self.max_calls.saturating_sub(*calls);
             self.scripts.lock().push(script.to_owned());
@@ -3397,7 +3403,7 @@ mod tests {
                 0
             }
 
-            fn run_script(&self, _: &str) -> ScriptOutcome {
+            fn run_script(&self, _: &str, _participant: Option<&str>) -> ScriptOutcome {
                 ScriptOutcome {
                     output: "failure: 🦀".into(),
                     exit_code: ExitCode::FAILURE,
@@ -4079,7 +4085,7 @@ mod tests {
             0
         }
 
-        fn run_script(&self, script: &str) -> ScriptOutcome {
+        fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
             panic!("this fixture's runtime never runs a script: {script}")
         }
 
@@ -4446,6 +4452,16 @@ mod tests {
         );
         assert!(truncated.output.starts_with("1\n"), "{truncated:?}");
         assert!(truncated.output.ends_with("10"), "{truncated:?}");
+    }
+
+    #[test]
+    fn unmapped_route_schema_describes_as_as_ignored() {
+        let tool = script_tool(&[], &BTreeMap::new());
+        assert_eq!(
+            tool.parameters["properties"]["as"]["description"],
+            "One authenticated participant handle from this turn (for example p2). Omit to use the asker. Applies only in mapped channels; ignored on unmapped routes."
+        );
+        assert!(tool.description.contains("ignored on unmapped routes"));
     }
 
     #[test]
@@ -5603,7 +5619,7 @@ mod tests {
             u32::try_from(self.calls.load(AtomicOrdering::Relaxed)).unwrap_or(u32::MAX)
         }
 
-        fn run_script(&self, script: &str) -> ScriptOutcome {
+        fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
             let dispatched = Arc::clone(&self.dispatched);
             let script = script.to_owned();
             let output = self.handle.block_on(async move {

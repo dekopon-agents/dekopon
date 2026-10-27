@@ -28,7 +28,7 @@ impl ScriptRuntime for SyntheticRuntime {
         0
     }
 
-    fn run_script(&self, script: &str) -> ScriptOutcome {
+    fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
         self.0.lock().push(script.to_owned());
         ScriptOutcome {
             output: "synthetic-result".into(),
@@ -82,7 +82,7 @@ async fn the_same_prompt_loop_executes_one_synthetic_tool_and_replays_each_nativ
         let timeout = Duration::from_secs(5);
         let client = match dialect {
             Dialect::Codex => ModelClient::Codex(
-                CodexClient::new("gpt-test", Some(&credential), timeout)
+                CodexClient::new("gpt-test", Some(&credential), timeout, &[])
                     .unwrap()
                     .with_loopback_endpoint(&server.url())
                     .unwrap(),
@@ -93,6 +93,7 @@ async fn the_same_prompt_loop_executes_one_synthetic_tool_and_replays_each_nativ
                     "fake-key".into(),
                     timeout,
                     Settings::default(),
+                    &[],
                 )
                 .unwrap()
                 .with_loopback_endpoint(&server.url())
@@ -285,7 +286,7 @@ async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_defin
         fn capability_calls_used(&self) -> u32 {
             self.runtime.capability_calls_used()
         }
-        fn run_script(&self, script: &str) -> ScriptOutcome {
+        fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
             assert_eq!(script, "release image");
             match self.ending {
                 ImageEnd::Released => self.image.blob.reclaim().unwrap(),
@@ -293,7 +294,7 @@ async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_defin
                     *self.image.refusal.lock() = Some(BlobError::Unauthorized)
                 }
             }
-            self.runtime.run_script(script)
+            self.runtime.run_script(script, _participant)
         }
         fn command_words(&self) -> Vec<String> {
             vec!["synthetic".into()]
@@ -332,7 +333,7 @@ data: [DONE]
         ));
         let retained = Arc::clone(&image);
         let timeout = Duration::from_secs(5);
-        let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout)
+        let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout, &[])
             .unwrap()
             .with_streaming(true);
         let (_sender, receiver) = tokio::sync::watch::channel(false);
@@ -537,7 +538,7 @@ data: [DONE]
     let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"seen\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     let server = LoopbackServer::sequence([response(call), response(answer)]);
     let timeout = Duration::from_secs(5);
-    let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout)
+    let client = OpenAiClient::new(server.url(), "scripted-model", None, timeout, &[])
         .unwrap()
         .with_streaming(true);
     let (cancel, receiver) = tokio::sync::watch::channel(false);

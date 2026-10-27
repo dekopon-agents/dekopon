@@ -8,6 +8,34 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## The bash tool's as is inert on unmapped routes (0.61.1)
+
+No configuration change or provider re-pin is required. In 0.61.0, any `as` value on an unmapped
+route made the bash tool fail with "Unknown participant handle". In 0.61.1, the gateway ignores
+it, runs the script as the asker, and records `tool_call.ignored_arguments = "as"` with
+`reason = "unmapped-route"`. Mapped routes keep their existing participant selection and
+unknown-handle refusal.
+
+Upgrading from 0.61.0 needs only a binary swap. For a downgrade from 0.61.1 to 0.60.0, revert both
+daemons together: the older broker rejects participant-bearing claims. Existing journal text
+remains readable, but stored fauxlack subjects, chat scopes or delivery identities prevent that
+rollback, as described in the 0.61.0 entry below.
+
+## Participant handles, fauxlack vocabulary and the console image default (0.61.0)
+
+No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
+
+- The bash tool's optional `as` argument selects an authenticated participant's turn-local handle in a mapped channel; omitting it uses the asker. Upgrade the broker before the gateway sends the optional `ChatScopeClaim.participant` wire field: 0.60.0 rejects it through `deny_unknown_fields`. The chart runs broker and gateway from one image in one pod, with the broker ready before the gateway starts; the console uses the same image by default. `broker.decision` adds `participant.handle`. Handle attribution changes text in the existing journal records and prompts, not journal or persisted session-state formats, prompt-cache keys or configuration keys. A downgrade to 0.60.0 reads that stored text, but cannot accept participant-bearing claims from a 0.61.0 gateway; revert both daemons together.
+- Fauxlack subjects, chat scopes and delivery identities are new vocabulary that older readers reject. No deployed client sends them. A downgrade cannot read a store holding those values; keep them out of stored data if rollback to 0.60.0 is needed.
+- Chart 0.48.0 defaults the console to the daemon image. Existing explicit console tag or digest overrides still win, using `console.image.repository`, and render the same image reference byte for byte. Operators with that override need do nothing; they may remove it to follow the daemon image. A repository alone does not override the default when both console tag and digest are empty.
+
+## Participant steering in mapped channels and model extraCABundles (0.60.0)
+
+No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
+
+- In a mapped channel or thread with shared conversation memory (or one-shot memory), every authorized participant's message now steers the running turn instead of waiting for a separate turn. Operators who relied on only the first participant steering should expect other authorized participants to redirect that turn; broker authorization still applies to each participant, and the initiating participant retains tool authority and delivery ownership. Participant messages enter the existing stored steer records with their own principal attribution; participant-join capability notices are prompt-only. This changes journal contents, not journal formats, persisted session-state formats, prompt-cache keys or configuration keys. A downgrade to 0.59.0 reads what 0.60.0 wrote and restores the earlier steering behavior.
+- To trust additional model endpoint CAs, opt in with the gateway configuration's top-level `extraCABundles` list of absolute PEM bundle paths and mount those files read-only into the gateway. These roots supplement public roots for inference clients; omitting the key or setting `[]` leaves defaults unchanged. The deployed configuration sets none, so this setting has no effect there. Deploy the supporting gateway before adding the key, and remove it before downgrading to 0.59.0, which rejects it. Boot and reload read the bundles; running sessions retain their original trust.
+
 ## Gateway memory notice, provider exit status and signed-URL redirect redaction (0.59.0)
 
 No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
@@ -70,8 +98,9 @@ No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
 ## Console joins the workspace (0.52.0)
 
 `dekopon-console` now ships with core in release archives and both stock and memory-optimized
-Dekopon images. Point the deployment's `console.image` at `ghcr.io/dekopon-agents/dekopon` with
-the matching release tag and selected variant. Chart values and templates are unchanged.
+Dekopon images. The chart default now matches the main Dekopon image, including its selected
+variant or digest pin, when `console.image.tag` and `console.image.digest` are empty. Explicit
+console tags or digests use `console.image.repository`, defaulting to `ghcr.io/dekopon-agents/dekopon`.
 `brew install dekopon-agents/tap/dekopon-console` keeps its existing name; its formula now
 installs the console from the Dekopon release. The `dekopon` formula continues to own only the
 daemon executables. No configuration, CLI flag, environment key or broker frame migration is needed.
@@ -842,7 +871,8 @@ Nothing changes unless `OTEL_EXPORTER_OTLP_CERTIFICATE` is set. When it is, both
 PEM file at startup and trust its roots beside WebPKI for OTLP export over gRPC and HTTP; a path
 that cannot be read or holds no certificate refuses startup, so mount the file before rolling. On
 Kubernetes, chart 0.11.0's `otlp.caBundle: {configMap, key}` mounts it into both containers and
-sets the variable. This is separate from the broker's `http.extraCABundles`, which still covers
+sets the variable. Gateway inference has a separate opt-in `extraCABundles` list (see
+[gateway configuration](gatewayd.md#extra-model-ca-bundles)). This is separate from the broker's `http.extraCABundles`, which still covers
 provider HTTPS only.
 
 ## Provider HTTPS and owner settings (0.20.0)

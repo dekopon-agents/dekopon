@@ -806,7 +806,7 @@ async fn dispatch_in_context(
                         invoker: LegHandle(Arc::new(leg.with_cancel_signal(signal))),
                         limits,
                         calls: CallBudget::new(limits.max_capability_calls),
-                    }.run_script(&line);
+                    }.run_script(&line, None);
                     tracing::info!(target: "dekopon_tui::audit", output = outcome.output.as_str(), exit_code = outcome.exit_code.get(), "console manual output");
                     if sender
                         .send(SessionEvent::ShellFinished(ShellEntry {

@@ -45,6 +45,7 @@ impl CodexClient {
         model: impl Into<String>,
         auth_path: Option<&Path>,
         timeout: Duration,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
         let model = model.into();
         Self::validate(&model, timeout)?;
@@ -55,6 +56,7 @@ impl CodexClient {
             Arc::new(credential),
             timeout,
             RESPONSES_URL.to_owned(),
+            extra_ca_bundles,
         )
     }
 
@@ -64,10 +66,17 @@ impl CodexClient {
         model: impl Into<String>,
         credential: Arc<CredentialFile>,
         timeout: Duration,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
         let model = model.into();
         Self::validate(&model, timeout)?;
-        Self::configured(model, credential, timeout, RESPONSES_URL.to_owned())
+        Self::configured(
+            model,
+            credential,
+            timeout,
+            RESPONSES_URL.to_owned(),
+            extra_ca_bundles,
+        )
     }
 
     fn validate(model: &str, timeout: Duration) -> Result<(), InferenceError> {
@@ -85,13 +94,14 @@ impl CodexClient {
         credential: Arc<CredentialFile>,
         timeout: Duration,
         endpoint: String,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
         Ok(Self {
             name: model.clone(),
             identity: parking_lot::RwLock::new(ModelKey::new(crate::model::Backend::Codex, &model)),
             model,
             credential,
-            http: InferenceHttp::new(timeout)?,
+            http: InferenceHttp::new(timeout, extra_ca_bundles)?,
             endpoint,
             loopback: false,
         })
@@ -119,6 +129,7 @@ impl CodexClient {
         auth_path: Option<&Path>,
         timeout: Duration,
         endpoints: crate::chatgpt::ChatGptEndpoints,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
         let model = model.into();
         Self::validate(&model, timeout)?;
@@ -126,7 +137,13 @@ impl CodexClient {
         let endpoint = endpoints.responses.clone();
         let credential = CredentialFile::with_endpoints(&path, timeout, endpoints)
             .map_err(AuthError::Credential)?;
-        Self::configured(model, Arc::new(credential), timeout, endpoint)
+        Self::configured(
+            model,
+            Arc::new(credential),
+            timeout,
+            endpoint,
+            extra_ca_bundles,
+        )
     }
 
     async fn credential(
@@ -1156,6 +1173,7 @@ mod tests {
             Some(&directory.path().join("auth.json")),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .unwrap();
         (directory, server, client)
@@ -1682,7 +1700,8 @@ mod tests {
             CodexClient::new(
                 "fixture",
                 Some(&directory.path().join("absent.json")),
-                Duration::ZERO
+                Duration::ZERO,
+                &[]
             ),
             Err(InferenceError::InvalidRequest(RequestError::ZeroTimeout))
         ));
@@ -1695,7 +1714,8 @@ mod tests {
             CodexClient::new(
                 " ",
                 Some(&directory.path().join("absent.json")),
-                Duration::from_secs(1)
+                Duration::from_secs(1),
+                &[]
             ),
             Err(InferenceError::InvalidRequest(RequestError::EmptyModel))
         ));
@@ -1809,6 +1829,7 @@ mod tests {
                     Some(&directory.path().join("auth.json")),
                     Duration::from_secs(2),
                     endpoints,
+                    &[],
                 )
                 .unwrap(),
             ));

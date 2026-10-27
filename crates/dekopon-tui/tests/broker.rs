@@ -254,7 +254,7 @@ async fn console_shell_runs_provider_child_through_real_broker() {
             limits: Limits::default(),
             calls: CallBudget::new(4),
         }
-        .run_script("probe upper --text parent")
+        .run_script("probe upper --text parent", None)
     })
     .await
     .expect("console script task");
@@ -643,14 +643,14 @@ async fn console_shell_and_model_script_register_real_broker_asset_with_zero_exi
                     limits: Limits::default(),
                     calls: CallBudget::new(4),
                 }
-                .run_script("asset-fixture")
+                .run_script("asset-fixture", None)
             } else {
                 ShellRuntime {
                     invoker: broker,
                     limits: Limits::default(),
                     calls: CallBudget::new(4),
                 }
-                .run_script("asset-fixture")
+                .run_script("asset-fixture", None)
             }
         })
         .await

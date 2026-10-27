@@ -76,7 +76,7 @@ impl ScriptRuntime for BlockedRuntime {
         self.outcome.capability_calls
     }
 
-    fn run_script(&self, script: &str) -> ScriptOutcome {
+    fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
         self.scripts.lock().push(script.to_owned());
         self.entered.notify_one();
         if let Some(receiver) = self.release_signal.lock().take() {
