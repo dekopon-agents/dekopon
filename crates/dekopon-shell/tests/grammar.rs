@@ -11,6 +11,9 @@ use dekopon_shell::{
     JobControl, JobRefusal, JobSeed, ScriptOutcome,
 };
 
+#[path = "grammar/ifs.rs"]
+mod ifs;
+
 const PROBE: &str = "probe";
 
 const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
@@ -61,6 +64,7 @@ impl Fixture {
                 stderr: String::new(),
                 status: 0,
             }),
+            ["args", args @ ..] => proposal("fixture.argv", json!(args)),
             ["list"] => proposal("fixture.list", json!({})),
             ["null"] => proposal("fixture.null", json!({})),
             ["fetch"] => proposal("http-probe.fetch", json!({})),
@@ -95,6 +99,7 @@ impl CapabilityInvoker for Fixture {
             "cli-probe.upper".to_owned(),
             "fixture.object".to_owned(),
             "fixture.list".to_owned(),
+            "fixture.argv".to_owned(),
             "fixture.null".to_owned(),
             "http-probe.fetch".to_owned(),
             "policy.denied".to_owned(),
@@ -210,6 +215,7 @@ impl CapabilityInvoker for Fixture {
                 },
             },
             "fixture.object" => streams.reply(&input),
+            "fixture.argv" => streams.reply(&Value::Null),
             "fixture.list" => streams.reply(&json!(["a", "b"])),
             "fixture.null" => streams.reply(&Value::Null),
             "policy.denied" => CapabilityCallResult::Denied {

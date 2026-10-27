@@ -48,7 +48,7 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
         global_charges: BTreeMap::new(),
         buffer_charges: BTreeMap::new(),
         frames: vec![Frame {
-            locals: BTreeMap::from([("n".into(), Value::from(0))]),
+            locals: BTreeMap::from([("n".into(), Some(Value::from(0)))]),
             positional: Vec::new(),
             local_charges: BTreeMap::new(),
             _positional_charges: Vec::new(),

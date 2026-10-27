@@ -5,7 +5,9 @@
 use crate::interp::telemetry::StageObservation;
 use dekopon_process::pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome};
 use dekopon_process::{CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, TreeContext};
+mod ifs;
 mod nesting;
+use ifs::{Action, Boundary, Ifs, Kind};
 
 use std::{
     cmp::Ordering,
@@ -339,7 +341,7 @@ impl StderrCapture {
 
 #[derive(Debug, Default)]
 struct Frame {
-    locals: BTreeMap<String, Value>,
+    locals: BTreeMap<String, Option<Value>>,
     positional: Vec<Value>,
     local_charges: BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
     _positional_charges: Vec<dekopon_process::RetainedBytes>,
@@ -349,6 +351,7 @@ struct SavedVariable {
     name: String,
     value: Option<Value>,
     charge: Option<Vec<dekopon_process::RetainedBytes>>,
+    local: Option<usize>,
 }
 
 pub(crate) fn run(
@@ -528,7 +531,7 @@ enum ExpansionOutput {
 
 struct FieldExpansion<'a> {
     fields: &'a mut Vec<String>,
-    separated: &'a mut bool,
+    separated: &'a mut Boundary,
 }
 
 struct Evaluator<'a> {
@@ -569,7 +572,7 @@ pub(crate) struct JobScope {
     buffers: Arc<BTreeMap<String, Vec<u8>>>,
     functions: BTreeMap<String, Arc<Program>>,
     function_names: BTreeSet<String>,
-    frames: Vec<(BTreeMap<String, Value>, Vec<Value>)>,
+    frames: Vec<(BTreeMap<String, Option<Value>>, Vec<Value>)>,
     options: ShellOptions,
     last_status: ExitCode,
 }
@@ -742,34 +745,32 @@ impl<'a> Evaluator<'a> {
     fn lookup(&self, name: &str) -> Option<&Value> {
         for frame in self.frames.iter().rev() {
             if let Some(value) = frame.locals.get(name) {
-                return Some(value);
+                return value.as_ref();
             }
         }
         self.globals.get(name)
     }
 
     fn assign(&mut self, name: &str, mut result: CommandResult) -> Result<(), LimitExceeded> {
-        if !self
-            .frames
-            .iter()
-            .any(|frame| frame.locals.contains_key(name))
-        {
-            self.unshare_globals()?;
-        }
-        let (values, charges) = match self
+        if let Some(frame) = self
             .frames
             .iter_mut()
             .rev()
             .find(|frame| frame.locals.contains_key(name))
         {
-            Some(frame) => (&mut frame.locals, &mut frame.local_charges),
-            None => (Arc::make_mut(&mut self.globals), &mut self.global_charges),
-        };
-        values.remove(name);
-        charges.remove(name);
-        retain_value(&self.budget, &result.value, &mut result.retained)?;
-        values.insert(name.to_owned(), result.value);
-        charges.insert(name.to_owned(), result.retained);
+            frame.locals.remove(name);
+            frame.local_charges.remove(name);
+            retain_value(&self.budget, &result.value, &mut result.retained)?;
+            frame.locals.insert(name.to_owned(), Some(result.value));
+            frame.local_charges.insert(name.to_owned(), result.retained);
+        } else {
+            self.unshare_globals()?;
+            Arc::make_mut(&mut self.globals).remove(name);
+            self.global_charges.remove(name);
+            retain_value(&self.budget, &result.value, &mut result.retained)?;
+            Arc::make_mut(&mut self.globals).insert(name.to_owned(), result.value);
+            self.global_charges.insert(name.to_owned(), result.retained);
+        }
         Ok(())
     }
 
@@ -795,19 +796,19 @@ impl<'a> Evaluator<'a> {
 
     fn save_variable(&mut self, name: &str) -> SavedVariable {
         let value = self.lookup(name).cloned();
-        let charge = self
+        let local = self
             .frames
-            .iter_mut()
-            .rev()
-            .find(|frame| frame.locals.contains_key(name))
-            .map_or_else(
-                || self.global_charges.remove(name),
-                |frame| frame.local_charges.remove(name),
-            );
+            .iter()
+            .rposition(|frame| frame.locals.contains_key(name));
+        let charge = match local {
+            Some(index) => self.frames[index].local_charges.remove(name),
+            None => self.global_charges.remove(name),
+        };
         SavedVariable {
             name: name.to_owned(),
             value,
             charge,
+            local,
         }
     }
 
@@ -816,49 +817,42 @@ impl<'a> Evaluator<'a> {
             name,
             value,
             charge,
+            local,
         } = saved;
-        let in_frame = self
-            .frames
-            .iter()
-            .any(|frame| frame.locals.contains_key(&name));
-        if !in_frame
-            && Arc::strong_count(&self.globals) > 1
-            && self.globals.get(&name) == value.as_ref()
-        {
+        if let Some(index) = local {
+            if let Some(frame) = self.frames.get_mut(index) {
+                frame.locals.insert(name.clone(), value);
+                frame.local_charges.remove(&name);
+                if let Some(charge) = charge {
+                    frame.local_charges.insert(name, charge);
+                }
+            }
+        } else {
+            if self.globals.get(&name) != value.as_ref() {
+                let globals = Arc::make_mut(&mut self.globals);
+                globals.remove(&name);
+                if let Some(value) = value {
+                    globals.insert(name.clone(), value);
+                }
+            }
+            self.global_charges.remove(&name);
             if let Some(charge) = charge {
                 self.global_charges.insert(name, charge);
             }
-            return;
-        }
-        let (values, charges) = match self
-            .frames
-            .iter_mut()
-            .rev()
-            .find(|frame| frame.locals.contains_key(&name))
-        {
-            Some(frame) => (&mut frame.locals, &mut frame.local_charges),
-            None => (Arc::make_mut(&mut self.globals), &mut self.global_charges),
-        };
-        values.remove(&name);
-        charges.remove(&name);
-        if let Some(value) = value {
-            values.insert(name.clone(), value);
-        }
-        if let Some(charge) = charge {
-            charges.insert(name, charge);
         }
     }
 
-    fn declare_local(&mut self, name: &str, value: Value) -> Result<(), LimitExceeded> {
+    fn declare_local(&mut self, name: &str, value: Option<Value>) -> Result<(), LimitExceeded> {
         if let Some(frame) = self.frames.last_mut() {
             frame.locals.remove(name);
             frame.local_charges.remove(name);
-            let charge = self.budget.charge_value_bytes(value_bytes(&value))?;
+            let charge = self
+                .budget
+                .charge_value_bytes(value.as_ref().map_or(0, value_bytes))?;
             frame.locals.insert(name.to_owned(), value);
             frame.local_charges.insert(name.to_owned(), vec![charge]);
-            return Ok(());
         }
-        self.assign(name, CommandResult::value(value))
+        Ok(())
     }
 
     fn positional(&self) -> &[Value] {
@@ -1125,18 +1119,14 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
     ) -> Result<CommandResult, CommandFailure> {
         let mut names = arguments;
-        if names.first().is_some_and(|first| first == "-r") {
+        let raw = names.first().is_some_and(|first| first == "-r");
+        if raw {
             names = &names[1..];
         }
         if let Some(flag) = names.first().filter(|first| first.starts_with('-')) {
             return Err(CommandFailure::usage(format!(
-                "read: option {flag:?} is not supported; this shell has only `read [-r] NAME...`"
+                "read: option {flag:?} is not supported; this shell has only `read [-r] [NAME...]`"
             )));
-        }
-        if names.is_empty() {
-            return Err(CommandFailure::usage(
-                "read: needs at least one variable name to bind",
-            ));
         }
         for name in names {
             if !is_variable_name(name) {
@@ -1145,26 +1135,63 @@ impl<'a> Evaluator<'a> {
                 )));
             }
         }
-
-        let line = match input {
-            StageInput::Piped(mut reader) => reader.read_line(self.budget.tree())?,
-            StageInput::Inherited => match self.stdin.last_mut() {
+        let mut piped = match input {
+            StageInput::Piped(reader) => Some(reader),
+            StageInput::Inherited => None,
+        };
+        let mut text = String::new();
+        let mut protected = Vec::new();
+        let mut retained = self.budget.charge_value_bytes(0)?;
+        let mut escaped = false;
+        let mut terminated = false;
+        loop {
+            self.budget.charge_step()?;
+            let line = match piped.as_mut().or_else(|| self.stdin.last_mut()) {
                 Some(reader) => reader.read_line(self.budget.tree())?,
                 None => None,
-            },
-        };
-        let Some(line) = line else {
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        };
-        let line = String::from_utf8(line.bytes)
-            .map_err(|_not_utf8| CommandFailure::failed("read: input is not valid UTF-8 text"))?;
-
-        let fields = split_read_fields(&line, names.len());
-        for (index, name) in names.iter().enumerate() {
-            let field = fields.get(index).copied().unwrap_or_default();
-            self.assign(name, CommandResult::value(Value::String(field.to_owned())))?;
+            };
+            let Some(line) = line else { break };
+            let (bytes, _charges) = line.into_parts();
+            let line = std::str::from_utf8(&bytes).map_err(|_not_utf8| {
+                CommandFailure::failed("read: input is not valid UTF-8 text")
+            })?;
+            retained.grow(line.len() as u64)?;
+            for character in line.chars() {
+                if escaped {
+                    escaped = false;
+                    if character == '\n' {
+                        continue;
+                    }
+                    retained.grow(size_of::<std::ops::Range<usize>>() as u64)?;
+                    protected.push(text.len()..text.len() + character.len_utf8());
+                    text.push(character);
+                } else if !raw && character == '\\' {
+                    escaped = true;
+                } else if character == '\n' {
+                    terminated = true;
+                } else {
+                    text.push(character);
+                }
+            }
+            if terminated || !line.ends_with('\n') {
+                break;
+            }
         }
-        Ok(CommandResult::status(ExitCode::SUCCESS))
+        if names.is_empty() {
+            self.assign("REPLY", CommandResult::value(Value::String(text)))?;
+        } else {
+            let ifs = self.ifs()?;
+            let fields = ifs.read_fields(&text, &protected, names.len(), &mut self.budget)?;
+            for (index, name) in names.iter().enumerate() {
+                let field = fields.get(index).copied().unwrap_or_default();
+                self.assign(name, CommandResult::value(Value::String(field.to_owned())))?;
+            }
+        }
+        Ok(CommandResult::status(if terminated {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }))
     }
 
     fn apply_set_options(&mut self, arguments: &[String]) -> Result<(), CommandFailure> {
@@ -1516,17 +1543,17 @@ impl<'a> Evaluator<'a> {
         self.script_stdin && self.stdin.len() == 1
     }
 
-    fn snapshot(
-        &mut self,
-        writer: PipeWriter<StageObservation>,
-    ) -> Result<Evaluator<'a>, LimitExceeded> {
+    fn copy_frames(&self) -> Result<Vec<Frame>, LimitExceeded> {
         let mut frames = Vec::with_capacity(self.frames.len());
         for frame in &self.frames {
             let mut local_charges = BTreeMap::new();
             for (name, value) in &frame.locals {
                 local_charges.insert(
                     name.clone(),
-                    vec![self.budget.charge_value_bytes(value_bytes(value))?],
+                    vec![
+                        self.budget
+                            .charge_value_bytes(value.as_ref().map_or(0, value_bytes))?,
+                    ],
                 );
             }
             let positional_charges = frame
@@ -1541,6 +1568,14 @@ impl<'a> Evaluator<'a> {
                 _positional_charges: positional_charges,
             });
         }
+        Ok(frames)
+    }
+
+    fn snapshot(
+        &mut self,
+        writer: PipeWriter<StageObservation>,
+    ) -> Result<Evaluator<'a>, LimitExceeded> {
+        let frames = self.copy_frames()?;
         Ok(Evaluator {
             invoker: self.invoker,
             budget: self.budget.fork(),
@@ -1577,7 +1612,7 @@ impl<'a> Evaluator<'a> {
 
     fn adopt(
         &mut self,
-        frames: Vec<(BTreeMap<String, Value>, Vec<Value>)>,
+        frames: Vec<(BTreeMap<String, Option<Value>>, Vec<Value>)>,
     ) -> Result<(), LimitExceeded> {
         for (name, value) in self.globals.iter() {
             let charge = self.budget.charge_value_bytes(value_bytes(value))?;
@@ -1592,7 +1627,10 @@ impl<'a> Evaluator<'a> {
             for (name, value) in &locals {
                 local_charges.insert(
                     name.clone(),
-                    vec![self.budget.charge_value_bytes(value_bytes(value))?],
+                    vec![
+                        self.budget
+                            .charge_value_bytes(value.as_ref().map_or(0, value_bytes))?,
+                    ],
                 );
             }
             let positional_charges = positional
@@ -3131,9 +3169,9 @@ impl<'a> Evaluator<'a> {
                 for argument in arguments {
                     match argument.split_once('=') {
                         Some((name, text)) => {
-                            self.declare_local(name, value::scalar_from_token(text))?;
+                            self.declare_local(name, Some(value::scalar_from_token(text)))?;
                         }
-                        None => self.declare_local(argument, Value::String(String::new()))?,
+                        None => self.declare_local(argument, None)?,
                     }
                 }
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
@@ -3161,13 +3199,19 @@ impl<'a> Evaluator<'a> {
                 }
             }
             "unset" => {
-                self.unshare_globals()?;
                 for name in arguments {
-                    Arc::make_mut(&mut self.globals).remove(name);
-                    self.global_charges.remove(name);
-                    for frame in &mut self.frames {
-                        frame.locals.remove(name);
+                    if let Some(frame) = self
+                        .frames
+                        .iter_mut()
+                        .rev()
+                        .find(|frame| frame.locals.contains_key(name))
+                    {
+                        frame.locals.insert(name.clone(), None);
                         frame.local_charges.remove(name);
+                    } else {
+                        self.unshare_globals()?;
+                        Arc::make_mut(&mut self.globals).remove(name);
+                        self.global_charges.remove(name);
                     }
                 }
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
@@ -3298,7 +3342,10 @@ impl<'a> Evaluator<'a> {
             };
             let Some(line) = line else { break };
             self.budget.charge_step()?;
-            let (bytes, _charges) = line.into_parts();
+            let (mut bytes, _charges) = line.into_parts();
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+            }
             let text = match String::from_utf8(bytes) {
                 Ok(text) => text,
                 Err(_) => {
@@ -3408,7 +3455,7 @@ impl<'a> Evaluator<'a> {
         output: ExpansionOutput,
     ) -> Result<Vec<String>, CommandFailure> {
         let mut fields = Vec::new();
-        let mut separated = true;
+        let mut separated = Boundary::Start;
         for part in &word.parts {
             self.expand_unquoted_part(part, &mut fields, &mut separated, output)?;
         }
@@ -3419,7 +3466,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         part: &WordPart,
         fields: &mut Vec<String>,
-        separated: &mut bool,
+        separated: &mut Boundary,
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         Ok(match part {
@@ -3523,7 +3570,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         parameter: &Parameter,
         fields: &mut Vec<String>,
-        separated: &mut bool,
+        separated: &mut Boundary,
     ) -> Result<Value, CommandFailure> {
         match parameter {
             Parameter::Named {
@@ -3540,17 +3587,18 @@ impl<'a> Evaluator<'a> {
                     ExpansionOutput::Unsplit,
                 )
             }),
-            Parameter::AllPositional => {
+            Parameter::AllPositional | Parameter::AllPositionalJoined => {
                 let values = self.positional().to_vec();
                 for (index, value) in values.iter().enumerate() {
-                    *separated |= index > 0;
+                    if index > 0 {
+                        *separated = Boundary::Start;
+                    }
                     self.split_expansion(fields, separated, value)?;
                 }
                 Ok(Value::Array(values))
             }
             Parameter::Named { length: true, .. }
             | Parameter::Positional(_)
-            | Parameter::AllPositionalJoined
             | Parameter::PositionalCount
             | Parameter::LastStatus
             | Parameter::LastJob => {
@@ -3588,7 +3636,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         word: &Word,
         fields: &mut Vec<String>,
-        separated: &mut bool,
+        separated: &mut Boundary,
     ) -> Result<Value, CommandFailure> {
         if let [WordPart::CommandSubstitution(_)] = word.parts.as_slice() {
             let result = self.assignment_value(word)?;
@@ -3641,20 +3689,59 @@ impl<'a> Evaluator<'a> {
         Ok(Value::String(text))
     }
 
+    fn ifs(&self) -> Result<Ifs, LimitExceeded> {
+        match self.lookup("IFS") {
+            Some(value) => Ifs::new(&display(value), &self.budget),
+            None => Ifs::new(" \t\n", &self.budget),
+        }
+    }
+
+    fn ifs_join(&mut self, values: &[Value]) -> Result<String, LimitExceeded> {
+        let separator = self.lookup("IFS").map_or_else(
+            || " ".to_owned(),
+            |value| {
+                display(value)
+                    .chars()
+                    .next()
+                    .map_or_else(String::new, |first| first.to_string())
+            },
+        );
+        let bytes = values
+            .iter()
+            .map(value_bytes)
+            .sum::<u64>()
+            .saturating_mul(12)
+            + (values.len().saturating_sub(1) * separator.len()) as u64;
+        let mut charge = self.budget.charge_value_bytes(bytes)?;
+        let text = values
+            .iter()
+            .map(display)
+            .collect::<Vec<_>>()
+            .join(&separator);
+        charge.shrink(charge.bytes().saturating_sub(text.len() as u64));
+        self.expansion_charges.push(charge);
+        Ok(text)
+    }
+
     fn split_expansion(
         &mut self,
         fields: &mut Vec<String>,
-        separated: &mut bool,
+        separated: &mut Boundary,
         value: &Value,
     ) -> Result<(), CommandFailure> {
         match value {
             Value::String(text) => self.split_text(fields, separated, text)?,
-            Value::Null
-            | Value::Bool(_)
-            | Value::Number(_)
-            | Value::Array(_)
-            | Value::Object(_) => {
-                append_unsplit_value(fields, separated, value);
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        *separated = Boundary::Start;
+                    }
+                    self.split_text(fields, separated, &display(item))?;
+                }
+            }
+            Value::Null => {}
+            Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+                self.split_text(fields, separated, &display(value))?;
             }
         }
         Ok(())
@@ -3663,20 +3750,32 @@ impl<'a> Evaluator<'a> {
     fn split_text(
         &mut self,
         fields: &mut Vec<String>,
-        separated: &mut bool,
+        separated: &mut Boundary,
         text: &str,
     ) -> Result<(), CommandFailure> {
         self.budget.charge_step()?;
-        for chunk in text.split_inclusive([' ', '\t', '\n']) {
-            let field = chunk.trim_end_matches([' ', '\t', '\n']);
-            if !field.is_empty() {
-                self.budget.charge_step()?;
-                let bytes = (field.len() + size_of::<String>()) as u64;
-                self.expansion_charges
-                    .push(self.budget.charge_value_bytes(bytes)?);
-                append_field(fields, separated, field);
+        let ifs = self.ifs()?;
+        for (kind, range) in ifs.scan(text, &[]) {
+            match separated.accept(kind) {
+                action @ (Action::Append | Action::Start | Action::Empty) => {
+                    self.budget.charge_step()?;
+                    let field = if kind == Kind::Delimiter {
+                        ""
+                    } else {
+                        &text[range]
+                    };
+                    self.expansion_charges.push(
+                        self.budget
+                            .charge_value_bytes((field.len() + size_of::<String>()) as u64)?,
+                    );
+                    match action {
+                        Action::Append => append(fields, field),
+                        Action::Start | Action::Empty => fields.push(field.to_owned()),
+                        Action::Separate => {}
+                    }
+                }
+                Action::Separate => {}
             }
-            *separated |= field.len() != chunk.len();
         }
         Ok(())
     }
@@ -3686,7 +3785,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
-        self.expand_preserved_fields(parts, ExpansionOutput::Legacy)
+        self.expand_preserved_fields(parts, ExpansionOutput::Unsplit)
     }
 
     #[expect(
@@ -3776,13 +3875,10 @@ impl<'a> Evaluator<'a> {
                 .cloned()
                 .unwrap_or(Value::Null),
             Parameter::AllPositional => Value::Array(self.positional().to_vec()),
-            Parameter::AllPositionalJoined => Value::String(
-                self.positional()
-                    .iter()
-                    .map(display)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
+            Parameter::AllPositionalJoined => {
+                let values = self.positional().to_vec();
+                Value::String(self.ifs_join(&values)?)
+            }
             Parameter::PositionalCount => Value::from(self.positional().len()),
             Parameter::LastStatus => Value::from(self.last_status.get()),
             Parameter::LastJob => self
@@ -3913,7 +4009,12 @@ impl<'a> Evaluator<'a> {
                 }
                 Index::All => {}
                 Index::AllJoined => {
-                    value = Value::String(value::to_lines(&value).join(" "));
+                    let values = match value {
+                        Value::Array(items) => items,
+                        Value::Null => Vec::new(),
+                        scalar => vec![scalar],
+                    };
+                    value = Value::String(self.ifs_join(&values)?);
                 }
             }
         }
@@ -3997,9 +4098,32 @@ impl<'a> Evaluator<'a> {
 
     fn run_substitution(&mut self, program: &Program) -> Result<CommandResult, CommandFailure> {
         let (flow, mut captured) = self.nested(|this| {
+            let frames = this.copy_frames()?;
+            let saved_frames = std::mem::replace(&mut this.frames, frames);
+            let globals = Arc::clone(&this.globals);
+            let buffers = Arc::clone(&this.buffers);
+            let global_charges = std::mem::take(&mut this.global_charges);
+            let buffer_charges = std::mem::take(&mut this.buffer_charges);
+            let shared_charges = std::mem::take(&mut this.shared_charges);
+            let functions = this.functions.clone();
+            let function_names = this.function_names.clone();
+            let options = this.options;
+            let last_status = this.last_status;
             this.captures.push(Vec::new());
             let flow = this.execute_program(program);
             let captured = this.captures.pop().unwrap_or_default();
+            this.frames = saved_frames;
+            this.globals = globals;
+            this.buffers = buffers;
+            this.global_charges = global_charges;
+            this.buffer_charges = buffer_charges;
+            this.shared_charges = shared_charges;
+            this.functions = functions;
+            this.function_names = function_names;
+            this.options = options;
+            let status = this.last_status;
+            this.last_status = last_status;
+            this.last_substitution_status = status;
             Ok::<_, CommandFailure>((flow, captured))
         })?;
         let flow = flow.map_err(CommandFailure::Fatal)?;
@@ -4017,7 +4141,7 @@ impl<'a> Evaluator<'a> {
         }
         let mut result = CommandResult {
             value,
-            status: self.last_status,
+            status: self.last_substitution_status,
             suppress_newline: false,
             retained,
         };
@@ -4093,22 +4217,6 @@ fn splits_inside_quotes(parameter: &Parameter) -> bool {
         } => !*length && matches!(indices.last(), Some(Index::All)),
         _ => false,
     }
-}
-
-fn split_read_fields(line: &str, count: usize) -> Vec<&str> {
-    let mut fields = Vec::with_capacity(count);
-    let mut rest = line.trim_start();
-    while fields.len() + 1 < count && !rest.is_empty() {
-        match rest.find(char::is_whitespace) {
-            Some(offset) => {
-                fields.push(&rest[..offset]);
-                rest = rest[offset..].trim_start();
-            }
-            None => break,
-        }
-    }
-    fields.push(rest);
-    fields
 }
 
 fn is_variable_name(name: &str) -> bool {
@@ -4466,11 +4574,13 @@ fn append(fields: &mut Vec<String>, text: &str) {
     }
 }
 
-fn append_unsplit_value(fields: &mut Vec<String>, separated: &mut bool, value: &Value) {
+fn append_unsplit_value(fields: &mut Vec<String>, separated: &mut Boundary, value: &Value) {
     match value {
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
-                *separated |= index > 0;
+                if index > 0 {
+                    *separated = Boundary::Start;
+                }
                 append_field(fields, separated, &display(item));
             }
         }
@@ -4484,13 +4594,12 @@ fn append_unsplit_value(fields: &mut Vec<String>, separated: &mut bool, value: &
     }
 }
 
-fn append_field(fields: &mut Vec<String>, separated: &mut bool, text: &str) {
-    if *separated {
-        fields.push(text.to_owned());
-    } else {
-        append(fields, text);
+fn append_field(fields: &mut Vec<String>, separated: &mut Boundary, text: &str) {
+    match separated.accept(Kind::Text) {
+        Action::Append => append(fields, text),
+        Action::Start => fields.push(text.to_owned()),
+        Action::Empty | Action::Separate => {}
     }
-    *separated = false;
 }
 
 #[expect(
