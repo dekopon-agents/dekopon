@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-10-27
+
+### Added
+
+- the bash tool's as argument runs a script under a participant's handle
+- Accept fauxlack subjects, chat scopes and delivery identities with mapped space authorization.
+
+## [dekopon-chart-0.48.0] - 2026-10-27
+
+### Changed
+
+- Chart 0.48.0 targets core v0.61.0 and renders the `v0.61.0` image tag.
+
+### Fixed
+
+- The Helm console defaults to the Dekopon image and follows the daemon tag or digest unless explicitly overridden.
+
 ## [0.60.0] - 2026-10-27
 
 ### Added
