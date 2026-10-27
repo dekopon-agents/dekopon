@@ -116,10 +116,18 @@ fn declared_imports(set: ImportSet) -> BTreeSet<String> {
 }
 
 fn check_imports(declared: ImportSet, component: BTreeSet<String>) -> Result<(), ConformanceError> {
-    let allowed = declared_imports(declared);
+    let mut allowed = declared_imports(declared);
+    if declared.contains(ImportSet::HTTP) {
+        allowed.insert("dekopon:http/signed-download@0.1.0".to_owned());
+    }
     let mut required = allowed.clone();
     if declared.contains(ImportSet::HTTP) {
         required.remove(ASSET_IMPORT);
+        required.remove("dekopon:http/signed-download@0.1.0");
+        if component.contains("dekopon:http/signed-download@0.1.0") {
+            required.remove("dekopon:http/client@1.1.0");
+            required.insert(ASSET_IMPORT.to_owned());
+        }
     }
     if required.is_subset(&component) && component.is_subset(&allowed) {
         Ok(())

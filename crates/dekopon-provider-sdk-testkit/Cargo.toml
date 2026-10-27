@@ -19,9 +19,9 @@ hyper.workspace = true
 hyper-util.workspace = true
 dekopon-broker-protocol.workspace = true
 tempfile.workspace = true
-dekopon-broker-host.workspace = true
-dekopon-provider-sdk.workspace = true
-dekopon-http-host.workspace = true
+dekopon-broker-host = { workspace = true, features = ["native-test"] }
+dekopon-provider-sdk = { workspace = true, features = ["native-test"] }
+dekopon-http-host = { workspace = true, features = ["native-test"] }
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde_json.workspace = true

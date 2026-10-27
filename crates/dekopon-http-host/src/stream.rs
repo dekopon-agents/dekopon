@@ -1599,4 +1599,54 @@ mod tests {
         }
         server.await.unwrap();
     }
+
+    #[cfg(feature = "native-test")]
+    #[tokio::test]
+    async fn a_streamed_request_under_the_test_transport_is_denied_before_any_connection() {
+        let script = |host: &str| {
+            (
+                host.to_owned(),
+                crate::Response {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+            )
+        };
+        let transport =
+            crate::test_transport::Transport::new(script("127.0.0.1"), script("storage.test"), 3);
+        let mut client = BufferedHttpClient::authorized(
+            HttpConstraints {
+                allowed_hosts: vec!["127.0.0.1".to_owned()],
+                allowed_methods: vec!["POST".to_owned()],
+                max_requests: 1,
+                max_request_bytes: 64 * 1024,
+                max_response_bytes: 1024,
+                allow_plaintext_loopback: false,
+                propagate_trace: false,
+                request_templates: Vec::new(),
+                signed_download: None,
+            },
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_test_transport(transport.clone());
+        let root = tempfile::tempdir().unwrap();
+        let error = client
+            .stream(
+                StreamedRequest {
+                    method: "POST".to_owned(),
+                    uri: "https://127.0.0.1/stream".to_owned(),
+                    headers: vec![],
+                    body: vec![Part::Literal(b"{}".to_vec())],
+                },
+                &AssetDirectory::new(root.path().to_owned(), 1),
+            )
+            .await
+            .err()
+            .expect("streaming has no scripted transport");
+        assert_eq!(error.code, crate::ErrorCode::Denied);
+        assert!(transport.requests().is_empty());
+    }
 }

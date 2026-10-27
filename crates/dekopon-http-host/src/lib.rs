@@ -14,6 +14,8 @@
 pub mod asset;
 mod signed_download;
 mod stream;
+#[cfg(feature = "native-test")]
+pub mod test_transport;
 pub use signed_download::{Coverage, DownloadError, DownloadResponse, Window};
 pub use stream::{
     CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
@@ -736,6 +738,8 @@ pub struct BufferedHttpClient {
     evidence: Vec<HttpCallEvidence>,
     resolved: HashMap<String, Vec<SocketAddr>>,
     pinned_client: Option<PinnedClient>,
+    #[cfg(feature = "native-test")]
+    test_transport: Option<test_transport::Transport>,
     #[cfg(test)]
     signed_download_destination: Option<signed_download::Destination>,
 }
@@ -841,6 +845,8 @@ impl BufferedHttpClient {
             evidence: Vec::new(),
             resolved: HashMap::new(),
             pinned_client: None,
+            #[cfg(feature = "native-test")]
+            test_transport: None,
             #[cfg(test)]
             signed_download_destination: None,
         })
@@ -849,6 +855,12 @@ impl BufferedHttpClient {
     #[must_use]
     pub fn with_chat_slots(mut self, slots: ChatSlotValues) -> Self {
         self.slots = slots;
+        self
+    }
+
+    #[cfg(feature = "native-test")]
+    pub fn with_test_transport(mut self, transport: test_transport::Transport) -> Self {
+        self.test_transport = Some(transport);
         self
     }
 
@@ -985,7 +997,13 @@ impl BufferedHttpClient {
                 "secret-bearing request path uses prohibited encoding or separators",
             ));
         }
+        #[cfg(feature = "native-test")]
+        let guest = request.clone();
         let mut prepared = self.prepare(request, &grant, streamed).await?;
+        #[cfg(feature = "native-test")]
+        if let Some(transport) = &self.test_transport {
+            transport.guest(guest);
+        }
         tracing::Span::current().record("url.full", prepared.url.as_str());
         // Credential injection happens strictly after every guest-facing check, and its binding is
         // narrower than the grant and fails closed: an allowed-but-unbound destination is refused
@@ -1320,6 +1338,27 @@ impl BufferedHttpClient {
             }
         }
 
+        #[cfg(feature = "native-test")]
+        if let Some(transport) = &self.test_transport {
+            if streamed.is_some() {
+                return Err(http_error(
+                    ErrorCode::Denied,
+                    "streamed requests have no test script",
+                ));
+            }
+            transport.admit(&url)?;
+            return Ok(PreparedRequest {
+                method,
+                url,
+                headers,
+                body: request.body,
+                host,
+                authority,
+                addresses: Vec::new(),
+                request_bytes,
+            });
+        }
+
         // DNS resolution is cached for this context's lifetime, but every cached address is still
         // validated on each call, so caching narrows latency, not what may be reached.
         let addresses = if let Some(addresses) = self.resolved.get(&authority) {
@@ -1405,24 +1444,40 @@ impl BufferedHttpClient {
         metadata: ResponseMetadata,
     ) -> Result<Response, HttpError> {
         let remaining = self.remaining()?;
-        let client = self.pinned_client(&request.host, &request.addresses, remaining)?;
+        #[cfg(feature = "native-test")]
+        let scripted = self.test_transport.as_ref().map(|transport| {
+            transport.response(
+                &request.method,
+                &request.url,
+                &request.headers,
+                &request.body,
+            )
+        });
+        #[cfg(not(feature = "native-test"))]
+        let scripted: Option<Result<reqwest::Response, HttpError>> = None;
+        let response = match scripted {
+            Some(response) => response?,
+            None => {
+                let client = self.pinned_client(&request.host, &request.addresses, remaining)?;
 
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", which \
+                #[allow(
+                    clippy::map_err_ignore,
+                    reason = "`tokio::time::error::Elapsed` carries only \"deadline has elapsed\", which \
                       the Timeout message already states"
-        )]
-        let response = timeout(
-            remaining,
-            client
-                .request(request.method.clone(), request.url)
-                .headers(request.headers)
-                .body(request.body)
-                .send(),
-        )
-        .await
-        .map_err(|_| http_error(ErrorCode::Timeout, "HTTP request timed out"))?
-        .map_err(|error| map_reqwest_error(&error))?;
+                )]
+                timeout(
+                    remaining,
+                    client
+                        .request(request.method.clone(), request.url)
+                        .headers(request.headers)
+                        .body(request.body)
+                        .send(),
+                )
+                .await
+                .map_err(|_| http_error(ErrorCode::Timeout, "HTTP request timed out"))?
+                .map_err(|error| map_reqwest_error(&error))?
+            }
+        };
 
         let stream::Head {
             status,

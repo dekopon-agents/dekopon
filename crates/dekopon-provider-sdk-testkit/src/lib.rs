@@ -4,7 +4,10 @@
 
 mod assets;
 mod conformance;
+mod signed_download;
 mod typed;
+
+pub use dekopon_http_host::test_transport::ObservedRequest;
 
 pub use conformance::{ConformanceError, conformance};
 pub use dekopon_broker_host::BrokerHostLimits;

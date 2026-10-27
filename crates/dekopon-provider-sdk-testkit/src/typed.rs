@@ -82,7 +82,7 @@ impl HttpScript {
 
 const UNEXPECTED_CHILD: &str = "unexpected child script";
 const CHILD_INPUT_LIMIT: u64 = 1024 * 1024;
-const HTTP_BYTES: usize = 64 * 1024;
+pub(crate) const HTTP_BYTES: usize = 64 * 1024;
 
 /// One scripted child: the script the provider must run next, and how that child behaves.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -119,6 +119,7 @@ pub struct Run<P: Provider> {
     slots: ChatSlotValues,
     templates: Vec<RequestTemplate>,
     http: Option<Result<ScriptServer, HarnessError>>,
+    signed: Option<crate::signed_download::Scenario>,
     assets: Option<AssetConstraints>,
     input_assets: Vec<InputAsset>,
     stdin: Option<Vec<u8>>,
@@ -142,6 +143,7 @@ impl<P: Provider> Harness<P> {
             slots: ChatSlotValues::default(),
             templates: Vec::new(),
             http: None,
+            signed: None,
             assets: None,
             input_assets: Vec::new(),
             stdin: None,
@@ -237,8 +239,26 @@ impl<P: Provider> Run<P> {
         self
     }
 
+    /// Scripts an API 302 and bounded storage ranges through the real signed-download host.
+    #[must_use]
+    pub fn signed_download(
+        mut self,
+        api: HttpScript,
+        storage: HttpScript,
+        max_requests: u32,
+    ) -> Self {
+        self.http = None;
+        self.signed = Some(crate::signed_download::Scenario::new(
+            api,
+            storage,
+            max_requests,
+        ));
+        self
+    }
+
     #[must_use]
     pub fn http(mut self, script: HttpScript) -> Self {
+        self.signed = None;
         self.http = Some(serve_https(script));
         self
     }
@@ -264,9 +284,25 @@ impl<P: Provider> Run<P> {
         self
     }
 
+    /// Returns a snapshot function that retains signed-request evidence even after a refused call.
+    pub fn requests(&self) -> impl Fn() -> Vec<crate::ObservedRequest> + use<P> {
+        let transport = self
+            .signed
+            .as_ref()
+            .map(|scenario| scenario.transport.clone());
+        move || {
+            transport
+                .as_ref()
+                .map_or_else(Vec::new, |transport| transport.requests())
+        }
+    }
+
     /// The exact scripted origin to pass to the provider input.
     #[must_use]
     pub fn origin(&self) -> Option<&str> {
+        if let Some(signed) = &self.signed {
+            return Some(&signed.origin);
+        }
         self.http
             .as_ref()
             .and_then(|server| server.as_ref().ok())
@@ -284,7 +320,11 @@ impl<P: Provider> Run<P> {
     pub fn call(self, capability: &str, input: Value) -> Result<ComponentOutput, HarnessError> {
         let component = self.component.canonicalize()?;
         let registry = cached_registry::<P>(component, self.limits.clone())?;
-        let fixtures = Fixtures::new(self.assets.as_ref(), self.input_assets)?;
+        let signed_assets = self.signed.as_ref().map(|_| AssetConstraints::default());
+        let fixtures = Fixtures::new(
+            self.assets.as_ref().or(signed_assets.as_ref()),
+            self.input_assets,
+        )?;
         let mut assets = fixtures
             .as_ref()
             .map(|fixtures| fixtures.inputs(&input))
@@ -295,14 +335,22 @@ impl<P: Provider> Run<P> {
             clock: self.clock,
             settings: self.settings.as_ref().map(Value::to_string),
             loopback_https_pin: None,
+            http_transport: None,
+            credential: None,
         };
         let mut http = None;
         let mut server = None;
         if let Some(script) = self.http {
             let started = script?;
             imports.loopback_https_pin = Some(started.pin.clone());
-            http = Some(started.constraints(self.templates));
+            http = Some(started.constraints(self.templates.clone()));
             server = Some(started);
+        }
+        if let Some(signed) = self.signed {
+            signed.validate()?;
+            http = Some(signed.constraints(self.templates));
+            imports.credential = Some(signed.credential()?);
+            imports.http_transport = Some(signed.transport);
         }
         let proposal = ProposedInvocation::new(
             "typed-testkit-call".parse::<InvocationId>()?,
@@ -356,27 +404,7 @@ impl<P: Provider> Run<P> {
         assets.upcalls = Some(upcalls);
         let children = self.children;
         let (result, captured, fed, children) = runtime().block_on(async {
-            let close_after = self.close_stdout_after;
-            let (closed, ready) = tokio::sync::oneshot::channel();
-            let capture = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                if close_after == Some(0) {
-                    drop(stdout);
-                    closed.send(()).map_err(|_cancelled| {
-                        std::io::Error::other("stdout reader startup cancelled")
-                    })?;
-                    return Ok::<_, std::io::Error>(Vec::new());
-                }
-                closed.send(()).map_err(|_cancelled| {
-                    std::io::Error::other("stdout reader startup cancelled")
-                })?;
-                let mut bytes = Vec::new();
-                let limit = close_after
-                    .unwrap_or(16 * 1024 * 1024 + 1)
-                    .min(16 * 1024 * 1024 + 1);
-                stdout.take(limit as u64).read_to_end(&mut bytes)?;
-                Ok::<_, std::io::Error>(bytes)
-            });
+            let (capture, ready) = capture_stdout(stdout, self.close_stdout_after);
             ready
                 .await
                 .map_err(|_closed| HarnessError::Fixture("stdout reader startup"))?;
@@ -432,6 +460,36 @@ impl<P: Provider> Run<P> {
             children,
         })
     }
+}
+
+fn capture_stdout(
+    stdout: std::os::unix::net::UnixStream,
+    close_after: Option<usize>,
+) -> (
+    tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (closed, ready) = tokio::sync::oneshot::channel();
+    let capture = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        if close_after == Some(0) {
+            drop(stdout);
+            closed
+                .send(())
+                .map_err(|_cancelled| std::io::Error::other("stdout reader startup cancelled"))?;
+            return Ok::<_, std::io::Error>(Vec::new());
+        }
+        closed
+            .send(())
+            .map_err(|_cancelled| std::io::Error::other("stdout reader startup cancelled"))?;
+        let mut bytes = Vec::new();
+        let limit = close_after
+            .unwrap_or(16 * 1024 * 1024 + 1)
+            .min(16 * 1024 * 1024 + 1);
+        stdout.take(limit as u64).read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    (capture, ready)
 }
 
 async fn answer_children(
@@ -547,7 +605,7 @@ impl Drop for ScriptServer {
     }
 }
 
-fn validate_response(response: &Response) -> Result<(), HarnessError> {
+pub(crate) fn validate_response(response: &Response) -> Result<(), HarnessError> {
     hyper::StatusCode::from_u16(response.status)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let expected_length = response.body.len().to_string();
@@ -675,6 +733,7 @@ pub struct Native<P: Provider> {
     monotonic: u64,
     entropy: Option<Vec<u8>>,
     http: Option<HttpScript>,
+    signed: Option<crate::signed_download::Scenario>,
     stdin: Option<Vec<u8>>,
     requests: Arc<Mutex<Vec<Request>>>,
     scripts: VecDeque<ChildScript>,
@@ -690,6 +749,7 @@ impl<P: Provider> Default for Native<P> {
             monotonic: 0,
             entropy: None,
             http: None,
+            signed: None,
             stdin: None,
             requests: Arc::new(Mutex::new(Vec::new())),
             scripts: VecDeque::new(),
@@ -715,8 +775,26 @@ impl<P: Provider> Native<P> {
         self.settings = Some(settings);
         self
     }
+    /// Scripts an API 302 and bounded storage ranges through the real signed-download host.
+    #[must_use]
+    pub fn signed_download(
+        mut self,
+        api: HttpScript,
+        storage: HttpScript,
+        max_requests: u32,
+    ) -> Self {
+        self.http = None;
+        self.signed = Some(crate::signed_download::Scenario::new(
+            api,
+            storage,
+            max_requests,
+        ));
+        self
+    }
+
     #[must_use]
     pub fn http(mut self, script: HttpScript) -> Self {
+        self.signed = None;
         self.http = Some(script);
         self
     }
@@ -762,6 +840,9 @@ impl<P: Provider> Native<P> {
             entropy: self.entropy.clone(),
             entropy_cursor: 0,
             http: self.http.clone(),
+            signed: self.signed.as_ref().map(|scenario| scenario.fresh()),
+            download_client: None,
+            download_assets: None,
             requests: Arc::clone(&self.requests),
             scripts: Arc::clone(&scripts),
             children: Arc::clone(&self.children),
@@ -810,18 +891,63 @@ impl std::io::Write for Captured {
 }
 
 struct FakePort {
+    download_client: Option<dekopon_http_host::BufferedHttpClient>,
+    download_assets: Option<Fixtures>,
     clock: Option<SystemTime>,
     settings: Option<String>,
     monotonic: u64,
     entropy: Option<Vec<u8>>,
     entropy_cursor: usize,
     http: Option<HttpScript>,
+    signed: Option<crate::signed_download::Scenario>,
     requests: Arc<Mutex<Vec<Request>>>,
     scripts: Arc<Mutex<VecDeque<ChildScript>>>,
     children: Arc<Mutex<Vec<ChildRun>>>,
 }
 
 impl Port for FakePort {
+    fn signed_download(
+        &mut self,
+        request: &dekopon_provider_sdk::signed_download::Request,
+    ) -> Result<
+        dekopon_provider_sdk::signed_download::Response,
+        dekopon_provider_sdk::signed_download::DownloadError,
+    > {
+        use dekopon_provider_sdk::signed_download as sdk;
+        let denied = || sdk::DownloadError {
+            code: sdk::ErrorCode::Denied,
+        };
+        let scenario = self.signed.as_ref().ok_or_else(denied)?;
+        if self.download_client.is_none() {
+            self.download_client = Some(scenario.client().map_err(|_error| denied())?);
+            self.download_assets = Fixtures::new(Some(&AssetConstraints::default()), vec![])
+                .map_err(|_error| denied())?;
+        }
+        let client = self.download_client.as_mut().ok_or_else(denied)?;
+        let directory = &self.download_assets.as_ref().ok_or_else(denied)?.directory;
+        let window = match request.window {
+            sdk::Window::Tail(length) => dekopon_http_host::Window::Tail(length),
+            sdk::Window::Offset(window) => dekopon_http_host::Window::Offset {
+                start: window.start,
+                length: window.length,
+            },
+        };
+        let before = scenario.transport.requests().len();
+        let result =
+            runtime().block_on(client.signed_download(request.api_uri.clone(), window, directory));
+        self.requests.lock().extend(
+            scenario
+                .transport
+                .requests()
+                .into_iter()
+                .skip(before)
+                .map(|request| crate::signed_download::guest_request(request.guest)),
+        );
+        result
+            .map_err(crate::signed_download::error)
+            .and_then(crate::signed_download::response)
+    }
+
     fn spawn(&mut self, script: &str, stdin: NativeChildStdin) -> NativeChild {
         let Some(expected) = self
             .scripts

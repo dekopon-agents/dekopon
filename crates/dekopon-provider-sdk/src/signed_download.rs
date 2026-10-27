@@ -40,9 +40,15 @@ pub fn download(request: &Request) -> Result<Response, DownloadError> {
 }
 
 /// Native callers have no broker invocation and therefore no signed-download authority.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native-test")))]
 pub fn download(_request: &Request) -> Result<Response, DownloadError> {
     Err(DownloadError {
         code: ErrorCode::Denied,
     })
+}
+
+/// Routes native tests through their scoped port when test support is enabled.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-test"))]
+pub fn download(request: &Request) -> Result<Response, DownloadError> {
+    crate::provider::native_signed_download(request)
 }

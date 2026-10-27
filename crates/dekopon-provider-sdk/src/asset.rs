@@ -115,41 +115,109 @@ impl From<wit::Error> for AssetError {
 
 /// A single-pass input or spooled HTTP response. Dropping it releases the host resource.
 #[derive(Debug)]
-pub struct Handle(wit::Handle);
+pub struct Handle(HandleBacking);
+
+#[derive(Debug)]
+enum HandleBacking {
+    Wit(wit::Handle),
+    #[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
+    Native {
+        bytes: Vec<u8>,
+        cursor: std::cell::Cell<usize>,
+    },
+}
 
 impl Handle {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn as_inner(&self) -> &wit::Handle {
-        &self.0
+        match &self.0 {
+            HandleBacking::Wit(handle) => handle,
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn from_inner(handle: wit::Handle) -> Self {
-        Self(handle)
+        Self(HandleBacking::Wit(handle))
+    }
+
+    /// Owns a bounded native test response; dropping the handle releases its bytes.
+    #[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
+    pub fn from_test_bytes(bytes: Vec<u8>) -> Result<Self, AssetError> {
+        if bytes.len() > CHUNK_BYTES {
+            return Err(AssetError {
+                code: AssetErrorCode::TooLarge,
+                message: "native test response exceeds 64 KiB".to_owned(),
+            });
+        }
+        Ok(Self(HandleBacking::Native {
+            bytes,
+            cursor: std::cell::Cell::new(0),
+        }))
+    }
+
+    fn wit(&self) -> Result<&wit::Handle, AssetError> {
+        match &self.0 {
+            HandleBacking::Wit(handle) => Ok(handle),
+            #[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
+            HandleBacking::Native { .. } => Err(AssetError {
+                code: AssetErrorCode::Denied,
+                message: "native response is read-only".to_owned(),
+            }),
+        }
+    }
+
+    fn read_bytes(&self, offset: Option<u64>, len: u32) -> Result<Vec<u8>, AssetError> {
+        match &self.0 {
+            HandleBacking::Wit(handle) => match offset {
+                Some(offset) => handle.read_at(offset, len).map_err(Into::into),
+                None => handle.read(len).map_err(Into::into),
+            },
+            #[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
+            HandleBacking::Native { bytes, cursor } => {
+                let start = offset
+                    .map_or(cursor.get(), |offset| {
+                        usize::try_from(offset).unwrap_or(usize::MAX)
+                    })
+                    .min(bytes.len());
+                let end = start.saturating_add(len as usize).min(bytes.len());
+                if offset.is_none() {
+                    cursor.set(end);
+                }
+                Ok(bytes[start..end].to_vec())
+            }
+        }
     }
 
     /// Returns metadata, never asset bytes.
     pub fn info(&self) -> Info {
-        self.0.info()
+        match &self.0 {
+            HandleBacking::Wit(handle) => handle.info(),
+            #[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
+            HandleBacking::Native { bytes, .. } => Info {
+                id: None,
+                content_type: "text/plain".to_owned(),
+                encoding: Encoding::Identity,
+                stored_bytes: Some(bytes.len() as u64),
+                seekable: true,
+                origin: "logs".to_owned(),
+                sent: false,
+            },
+        }
     }
 
     /// Reads at most 64 KiB of decoded bytes from this handle's cursor. Zero means EOF.
     pub fn read(&self, buffer: &mut [u8]) -> Result<usize, AssetError> {
-        read_into(buffer, |len| self.0.read(len).map_err(Into::into))
+        read_into(buffer, |len| self.read_bytes(None, len))
     }
 
     /// Reads at most 64 KiB of decoded bytes at a decoded offset, without moving the cursor.
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, AssetError> {
-        read_into(buffer, |len| {
-            self.0.read_at(offset, len).map_err(Into::into)
-        })
+        read_into(buffer, |len| self.read_bytes(Some(offset), len))
     }
 
     /// Reads the remaining decoded bytes, reserving the stored length when known.
     pub fn read_all(&self) -> Result<Vec<u8>, AssetError> {
-        read_all_with(self.info().stored_bytes, |len| {
-            self.0.read(len).map_err(Into::into)
-        })
+        read_all_with(self.info().stored_bytes, |len| self.read_bytes(None, len))
     }
 }
 
@@ -165,7 +233,9 @@ impl Writer {
 }
 
 pub(crate) fn open(reference: &str) -> Result<Handle, AssetError> {
-    wit::open(reference).map(Handle).map_err(Into::into)
+    wit::open(reference)
+        .map(|handle| Handle(HandleBacking::Wit(handle)))
+        .map_err(Into::into)
 }
 
 pub(crate) fn allocate(content_type: &str, encoding: Encoding) -> Result<Writer, AssetError> {
@@ -175,7 +245,9 @@ pub(crate) fn allocate(content_type: &str, encoding: Encoding) -> Result<Writer,
 }
 
 pub(crate) fn attach(writer: Writer) -> Result<Handle, AssetError> {
-    wit::attach(writer.0).map(Handle).map_err(Into::into)
+    wit::attach(writer.0)
+        .map(|handle| Handle(HandleBacking::Wit(handle)))
+        .map_err(Into::into)
 }
 
 pub(crate) fn list() -> Vec<Info> {
@@ -183,11 +255,11 @@ pub(crate) fn list() -> Vec<Info> {
 }
 
 pub(crate) fn remove(handle: &Handle) -> Result<(), AssetError> {
-    wit::remove(&handle.0).map_err(Into::into)
+    wit::remove(handle.wit()?).map_err(Into::into)
 }
 
 pub(crate) fn send(handle: &Handle) -> Result<(), AssetError> {
-    wit::send(&handle.0).map_err(Into::into)
+    wit::send(handle.wit()?).map_err(Into::into)
 }
 
 fn read_into(

@@ -1215,6 +1215,7 @@ dependencies = [
  "http-body",
  "opentelemetry",
  "opentelemetry_sdk",
+ "parking_lot",
  "percent-encoding",
  "rcgen",
  "reqwest",
