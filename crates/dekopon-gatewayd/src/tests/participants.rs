@@ -697,6 +697,64 @@ async fn unmapped_shared_routes_expose_no_selectable_participant_handle() {
     assert!(observed.try_recv().is_err());
 }
 
+async fn participant_broker(
+    directory: &Path,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+) -> (ResolvedBroker, tokio::task::JoinHandle<()>) {
+    let socket = directory.join("broker.sock");
+    let config_path = directory.join("broker.json");
+    let policy_path = directory.join("policies.cedar");
+    fs::write(
+        &policy_path,
+        r#"
+        @id("prompt") permit(principal, action == Dekopon::Action::"agent.prompt", resource);
+        @id("capability") permit(principal, action == Dekopon::Action::"cli-probe.upper", resource);
+    "#,
+    )
+    .unwrap();
+    fs::write(&config_path, serde_json::to_vec(&json!({
+        "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
+        "socketPath": socket, "policiesPath": policy_path,
+        "providers": [dekopon_test_support::provider_fixture("cli-probe-provider.wasm")],
+        "identities": [{"uid": crate::current_uid(), "principal": "gateway",
+            "actor": {"type":"service", "principal":"gateway"}, "attestor":{"namespaces":["slack"]}}],
+        "principals": {"asker":{"subjects":["slack.t0123abc.u9xyz"]},
+            "ana":{"subjects":["slack.t0123abc.u8xyz"]}, "space":{"subjects":["slack.t0123abc.c0123abc"]}},
+        "capabilities":{"cli-probe":{"constraints":{"timeoutMs":30000}, "capabilities":{"cli-probe.upper":{}}}}
+    })).unwrap()).unwrap();
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    dekopon_brokerd::enable_test_component_memoization();
+    let broker_task = tokio::spawn(
+        async move {
+            dekopon_brokerd::run(
+                config_path,
+                async move {
+                    stopped.await.unwrap();
+                },
+                dekopon_brokerd::ShutdownDeadline::default(),
+            )
+            .await
+            .expect("broker runs");
+        }
+        .with_current_subscriber(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !socket.exists() {
+            assert!(!broker_task.is_finished(), "broker starts");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("broker socket ready");
+    let broker = ResolvedBroker {
+        socket_path: socket,
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    (broker, broker_task)
+}
+
 #[tokio::test]
 async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_decisions() {
     use opentelemetry::trace::TracerProvider as _;
@@ -725,54 +783,8 @@ async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_de
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("participant-ids")))
         .set_default();
     let directory = temporary();
-    let socket = directory.path().join("broker.sock");
-    let config_path = directory.path().join("broker.json");
-    let policy_path = directory.path().join("policies.cedar");
-    fs::write(
-        &policy_path,
-        r#"
-        @id("prompt") permit(principal, action == Dekopon::Action::"agent.prompt", resource);
-        @id("capability") permit(principal, action == Dekopon::Action::"cli-probe.upper", resource);
-    "#,
-    )
-    .unwrap();
-    fs::write(&config_path, serde_json::to_vec(&json!({
-        "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
-        "socketPath": socket, "policiesPath": policy_path,
-        "providers": [dekopon_test_support::provider_fixture("cli-probe-provider.wasm")],
-        "identities": [{"uid": crate::current_uid(), "principal": "gateway",
-            "actor": {"type":"service", "principal":"gateway"}, "attestor":{"namespaces":["slack"]}}],
-        "principals": {"asker":{"subjects":["slack.t0123abc.u9xyz"]},
-            "ana":{"subjects":["slack.t0123abc.u8xyz"]}, "space":{"subjects":["slack.t0123abc.c0123abc"]}},
-        "capabilities":{"cli-probe":{"constraints":{"timeoutMs":30000}, "capabilities":{"cli-probe.upper":{}}}}
-    })).unwrap()).unwrap();
-    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
-    dekopon_brokerd::enable_test_component_memoization();
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    let broker_task = tokio::spawn(
-        dekopon_brokerd::run(
-            config_path,
-            async move {
-                stopped.await.unwrap();
-            },
-            dekopon_brokerd::ShutdownDeadline::default(),
-        )
-        .with_current_subscriber(),
-    );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !socket.exists() {
-            assert!(!broker_task.is_finished(), "broker starts");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("broker socket ready");
-    let broker = ResolvedBroker {
-        socket_path: socket,
-        server_uid: crate::current_uid(),
-        frame: FrameLimits::default(),
-    };
+    let (broker, broker_task) = participant_broker(directory.path(), stopped).await;
     let mut second = script_call("probe upper --text participant");
     second.tool_calls[0].function.arguments =
         json!({"command":"probe upper --text participant","as":"p2"}).to_string();
@@ -808,7 +820,7 @@ async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_de
     models.release();
     finish(task).await;
     stop.send(()).unwrap();
-    broker_task.await.unwrap().unwrap();
+    finish(broker_task).await;
     provider.force_flush().unwrap();
     let decisions = capture.events_where(
         "dekopon_broker::audit",
