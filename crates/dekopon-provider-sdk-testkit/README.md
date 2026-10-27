@@ -57,7 +57,7 @@ on `file` to check bytes. Files remain readable until their last owner drops.
 The temporary directory is removed when the call finishes, including on failure;
 compiled component caching never retains a test's directory or grants. The
 existing broker ceilings apply, with a 40 MiB temporary storage budget per call.
-Without either asset builder method, asset storage remains absent; without
+Without either asset builder method or a signed-download scenario (which creates temporary storage itself), asset storage remains absent; without
 `.assets(...)`, attachment, removal and send grants remain absent. Storage alone
 (`AssetConstraints::default()`) does not allow attachment, removal or sending.
 The HTTPS script still grants only its exact origin, method and one request.

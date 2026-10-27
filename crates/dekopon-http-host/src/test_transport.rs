@@ -5,14 +5,18 @@ use reqwest::{Method, Url, header::HeaderMap};
 
 use crate::{ErrorCode, Header, HttpError, Request, Response, http_error};
 
+/// One request the scripted transport served.
 #[derive(Clone, Debug)]
 pub struct ObservedRequest {
+    /// The request as the guest built it, before the host injected any credential or range.
     pub guest: Request,
+    /// The request as the host transmitted it, including injected credentials and headers.
     pub sent: Request,
 }
 
 #[derive(Debug)]
 struct State {
+    api_consumed: bool,
     guest: Option<Request>,
     requests: Vec<ObservedRequest>,
 }
@@ -30,6 +34,7 @@ impl Transport {
             scripts: Arc::new([api, storage]),
             maximum,
             state: Arc::new(Mutex::new(State {
+                api_consumed: false,
                 guest: None,
                 requests: Vec::new(),
             })),
@@ -68,12 +73,19 @@ impl Transport {
         body: &[u8],
     ) -> Result<reqwest::Response, HttpError> {
         self.admit(url)?;
-        let (_, script) = self
+        let (index, (_, script)) = self
             .scripts
             .iter()
-            .find(|(host, _)| Some(host.as_str()) == url.host_str())
+            .enumerate()
+            .find(|(_, (host, _))| Some(host.as_str()) == url.host_str())
             .ok_or_else(|| http_error(ErrorCode::Denied, "destination has no test script"))?;
         let mut state = self.state.lock();
+        if index == 0 && std::mem::replace(&mut state.api_consumed, true) {
+            return Err(http_error(
+                ErrorCode::Denied,
+                "test API script already consumed",
+            ));
+        }
         if state.requests.len() >= self.maximum as usize {
             return Err(http_error(
                 ErrorCode::HostCallLimit,
@@ -130,5 +142,58 @@ impl Transport {
             .body(bytes.to_vec())
             .map(reqwest::Response::from)
             .map_err(|_error| http_error(ErrorCode::Protocol, "invalid test response"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use dekopon_capability::HttpConstraints;
+
+    use super::*;
+    use crate::{BufferedHttpClient, HttpHostCeilings};
+
+    fn script(host: &str, status: u16) -> (String, Response) {
+        (
+            host.to_owned(),
+            Response {
+                status,
+                headers: Vec::new(),
+                body: b"body".to_vec(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_api_script_answers_once_per_transport() {
+        let transport = Transport::new(script("api.test", 302), script("storage.test", 200), 6);
+        let mut client = BufferedHttpClient::authorized(
+            HttpConstraints {
+                allowed_hosts: vec!["api.test".to_owned()],
+                allowed_methods: vec!["GET".to_owned()],
+                max_requests: 6,
+                max_request_bytes: 64 * 1024,
+                max_response_bytes: 64 * 1024,
+                allow_plaintext_loopback: false,
+                propagate_trace: false,
+                request_templates: Vec::new(),
+                signed_download: None,
+            },
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_test_transport(transport.clone());
+        let get = || Request {
+            method: "GET".to_owned(),
+            uri: "https://api.test/log".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(client.send(get()).await.unwrap().status, 302);
+        let error = client.send(get()).await.expect_err("api script is spent");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(transport.requests().len(), 1);
     }
 }

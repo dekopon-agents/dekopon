@@ -1340,6 +1340,12 @@ impl BufferedHttpClient {
 
         #[cfg(feature = "native-test")]
         if let Some(transport) = &self.test_transport {
+            if streamed.is_some() {
+                return Err(http_error(
+                    ErrorCode::Denied,
+                    "streamed requests have no test script",
+                ));
+            }
             transport.admit(&url)?;
             return Ok(PreparedRequest {
                 method,
@@ -1349,7 +1355,7 @@ impl BufferedHttpClient {
                 host,
                 authority,
                 addresses: Vec::new(),
-                request_bytes: streamed.map_or(request_bytes, |lengths| lengths.total),
+                request_bytes,
             });
         }
 
