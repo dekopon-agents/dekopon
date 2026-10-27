@@ -29,10 +29,18 @@ struct Input {
 struct Probe;
 struct Fetch;
 #[derive(Debug)]
-struct Failed;
+enum Failed {
+    Download(signed::DownloadError),
+    Asset(dekopon_provider_sdk::asset::AssetError),
+    Output(std::io::Error),
+}
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("signed download failed")
+        match self {
+            Self::Download(error) => write!(f, "signed download failed: {:?}", error.code),
+            Self::Asset(error) => error.fmt(f),
+            Self::Output(error) => error.fmt(f),
+        }
     }
 }
 impl Failure for Failed {
@@ -64,16 +72,18 @@ impl Capability for Fetch {
             api_uri: input.uri,
             window: signed::Window::Tail(input.bytes),
         })
-        .map_err(|_| Failed)?
+        .map_err(Failed::Download)?
         {
             signed::Response::Storage { status, body, .. } => {
                 let body = body
                     .map(|body| body.read_all())
                     .transpose()
-                    .map_err(|_| Failed)?;
-                writeln!(out, "{}", json!({"status": status, "bytes": body})).map_err(|_| Failed)
+                    .map_err(Failed::Asset)?;
+                writeln!(out, "{}", json!({"status": status, "bytes": body})).map_err(Failed::Output)
             }
-            signed::Response::Api(_) => Err(Failed),
+            signed::Response::Api(_) => Err(Failed::Download(signed::DownloadError {
+                code: signed::ErrorCode::Incomplete,
+            })),
         }
     }
 }

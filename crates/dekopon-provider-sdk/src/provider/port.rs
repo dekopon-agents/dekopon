@@ -151,6 +151,18 @@ pub(crate) fn spawn(script: &str, stdin: NativeChildStdin) -> NativeChild {
     })
 }
 
+#[cfg(feature = "native-test")]
+pub(crate) fn signed_download(
+    request: &crate::signed_download::Request,
+) -> Result<crate::signed_download::Response, crate::signed_download::DownloadError> {
+    CURRENT.with(|current| match current.borrow_mut().as_mut() {
+        Some(port) => port.signed_download(request),
+        None => Err(crate::signed_download::DownloadError {
+            code: crate::signed_download::ErrorCode::Denied,
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,16 +221,4 @@ mod tests {
         });
         assert!(std::panic::catch_unwind(now_unix_millis).is_err());
     }
-}
-
-#[cfg(feature = "native-test")]
-pub(crate) fn signed_download(
-    request: &crate::signed_download::Request,
-) -> Result<crate::signed_download::Response, crate::signed_download::DownloadError> {
-    CURRENT.with(|current| match current.borrow_mut().as_mut() {
-        Some(port) => port.signed_download(request),
-        None => Err(crate::signed_download::DownloadError {
-            code: crate::signed_download::ErrorCode::Denied,
-        }),
-    })
 }

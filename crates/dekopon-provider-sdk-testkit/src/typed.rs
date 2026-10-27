@@ -404,27 +404,7 @@ impl<P: Provider> Run<P> {
         assets.upcalls = Some(upcalls);
         let children = self.children;
         let (result, captured, fed, children) = runtime().block_on(async {
-            let close_after = self.close_stdout_after;
-            let (closed, ready) = tokio::sync::oneshot::channel();
-            let capture = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                if close_after == Some(0) {
-                    drop(stdout);
-                    closed.send(()).map_err(|_cancelled| {
-                        std::io::Error::other("stdout reader startup cancelled")
-                    })?;
-                    return Ok::<_, std::io::Error>(Vec::new());
-                }
-                closed.send(()).map_err(|_cancelled| {
-                    std::io::Error::other("stdout reader startup cancelled")
-                })?;
-                let mut bytes = Vec::new();
-                let limit = close_after
-                    .unwrap_or(16 * 1024 * 1024 + 1)
-                    .min(16 * 1024 * 1024 + 1);
-                stdout.take(limit as u64).read_to_end(&mut bytes)?;
-                Ok::<_, std::io::Error>(bytes)
-            });
+            let (capture, ready) = capture_stdout(stdout, self.close_stdout_after);
             ready
                 .await
                 .map_err(|_closed| HarnessError::Fixture("stdout reader startup"))?;
@@ -480,6 +460,36 @@ impl<P: Provider> Run<P> {
             children,
         })
     }
+}
+
+fn capture_stdout(
+    stdout: std::os::unix::net::UnixStream,
+    close_after: Option<usize>,
+) -> (
+    tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (closed, ready) = tokio::sync::oneshot::channel();
+    let capture = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        if close_after == Some(0) {
+            drop(stdout);
+            closed.send(()).map_err(|_cancelled| {
+                std::io::Error::other("stdout reader startup cancelled")
+            })?;
+            return Ok::<_, std::io::Error>(Vec::new());
+        }
+        closed.send(()).map_err(|_cancelled| {
+            std::io::Error::other("stdout reader startup cancelled")
+        })?;
+        let mut bytes = Vec::new();
+        let limit = close_after
+            .unwrap_or(16 * 1024 * 1024 + 1)
+            .min(16 * 1024 * 1024 + 1);
+        stdout.take(limit as u64).read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    (capture, ready)
 }
 
 async fn answer_children(
