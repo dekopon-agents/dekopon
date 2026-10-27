@@ -342,6 +342,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     let root = temporary();
     let path = write_config(root.path(), &document(root.path()));
     let before = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -354,6 +355,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["telemetry"] = serde_json::Value::Null;
     write_config(root.path(), &edited);
     let after = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -368,6 +370,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["telemetry"] = serde_json::Value::Null;
     write_config(root.path(), &edited);
     let equivalent = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -380,6 +383,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["sessions"]["maxConcurrent"] = json!(config::SessionsConfig::default().max_concurrent);
     write_config(root.path(), &edited);
     let explicit_default = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -392,6 +396,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["futureLive"] = json!(true);
     write_config(root.path(), &edited);
     let unknown = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -408,6 +413,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
         .await
         .expect("05 indicator schema resolves");
     let indicators = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -1199,6 +1205,7 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
 fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
     let variable = "DEKOPON_GATEWAYD_TEST_MODEL_KEY_4F1A62";
     let model = |api_key_env: Option<&str>| ModelConfig::OpenaiCompatible {
+        ca_bundles: Vec::new(),
         name: "fast".to_owned(),
         endpoint: "http://127.0.0.1:8080/v1/chat/completions".to_owned(),
         model: "qwen3".to_owned(),
@@ -3244,6 +3251,7 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
         PathBuf::from("/tmp/dekopon-gatewayd.json"),
         &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/1000")), None),
         501,
+        crate::config::LoadMode::Boot,
     )
     .expect("discovery resolves");
 
@@ -4432,6 +4440,7 @@ fn shared_window() -> MemoryWindow {
 
 fn model_config() -> ModelConfig {
     ModelConfig::OpenaiCompatible {
+        ca_bundles: Vec::new(),
         name: "local-qwen".to_owned(),
         endpoint: "http://127.0.0.1:1/v1".to_owned(),
         model: "qwen3".to_owned(),
@@ -21213,6 +21222,7 @@ fn active_routes(config: &crate::ResolvedConfig) -> RoutingTable {
 async fn gateway_sources(config: &crate::ResolvedConfig) -> config::GatewaySources {
     let catalog = LocalCatalog::load(&config.catalog_path).unwrap();
     config::GatewaySources {
+        ca_bundles: config.ca_sources.clone(),
         config: config::source_snapshot(&config.source, None, crate::current_uid())
             .await
             .unwrap(),

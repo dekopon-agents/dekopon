@@ -769,3 +769,110 @@ async fn boot_never_echoes_auth_file_content() {
         assert!(rendered.contains(&format!("`{field}`")), "{rendered}");
     }
 }
+
+#[tokio::test]
+async fn replacing_a_model_ca_at_the_same_path_activates_new_client_trust() {
+    use crate::session::ModelFactory as _;
+    use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
+    use dekopon_test_support::BrokerFixture;
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let first = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .unwrap()
+        .cert
+        .pem();
+    let second = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .unwrap()
+        .cert
+        .pem();
+    let ca = root.path().join("roots.pem");
+    fs::write(&ca, &first).unwrap();
+    let mut config = document(root.path());
+    config["broker"]["serverUid"] = json!(crate::current_uid());
+    config["extraCABundles"] = json!([ca]);
+    let path = write_config(root.path(), &config);
+    let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
+    let sources = gateway_sources(&candidate.config).await;
+    let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
+    let mut gateway = crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path.clone(), candidate, "b".repeat(64))
+    .unwrap();
+    let original = gateway.generation_for_test();
+    let before = gateway.digest_for_test();
+    let original_model = original.routes.models.values().next().unwrap();
+    let factory = crate::session::ConfiguredModels::default();
+    let runtime = tokio::runtime::Handle::current();
+    let cancel = tokio::sync::watch::channel(false).1;
+    let _old = factory
+        .build_bound(original_model, runtime.clone(), cancel.clone())
+        .unwrap();
+    let old_client = factory.bound_client_for_test(original_model).unwrap();
+    assert_eq!(original_model.ca_bundles()[0].expose(), &first);
+    let (capture, _guard) = capture_spans();
+    fs::write(&ca, &second).unwrap();
+    assert!(
+        !sources
+            .still_current(
+                &path,
+                &root.path().join("dekopon.yaml"),
+                crate::current_uid()
+            )
+            .await
+            .unwrap()
+    );
+    let mut broker = BrokerFixture::answering(
+        root.path(),
+        [ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Generation {
+                digest: "b".repeat(64),
+                outcome: GenerationOutcome::Active,
+            },
+        }],
+    );
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+    assert_ne!(gateway.digest_for_test(), before);
+    let current = gateway.generation_for_test();
+    let model = current.routes.models.values().next().unwrap();
+    assert_eq!(model.ca_bundles()[0].expose(), &second);
+    assert_eq!(original_model.ca_bundles()[0].expose(), &first);
+    let _new = factory.build_bound(model, runtime, cancel).unwrap();
+    assert!(!Arc::ptr_eq(
+        &old_client,
+        &factory.bound_client_for_test(model).unwrap()
+    ));
+    let applied = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].field("categories"), Some("extraCABundles"));
+    let debug = format!(
+        "{:?}",
+        gateway_sources(
+            &crate::config::load(&path, crate::current_uid())
+                .await
+                .unwrap()
+        )
+        .await
+    );
+    assert!(!debug.contains("BEGIN CERTIFICATE"));
+    fs::write(ca, "SENTINEL-BAD-PEM").unwrap();
+    let active = gateway.digest_for_test();
+    gateway.reconcile().await;
+    assert_eq!(gateway.digest_for_test(), active);
+    let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
+    assert_eq!(refused.len(), 1);
+    assert!(!format!("{refused:?}").contains("SENTINEL"));
+}

@@ -27,16 +27,30 @@ pub(crate) struct InferenceHttp {
 }
 
 impl InferenceHttp {
-    pub(crate) fn new(timeout: Duration) -> Result<Self, InferenceError> {
+    pub(crate) fn new(
+        timeout: Duration,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
+    ) -> Result<Self, InferenceError> {
         if timeout.is_zero() {
             return Err(RequestError::ZeroTimeout.into());
         }
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .use_rustls_tls()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .connect_timeout(timeout.min(Duration::from_secs(10)))
+            .connect_timeout(timeout.min(Duration::from_secs(10)));
+        for pem in extra_ca_bundles {
+            let certificates = reqwest::Certificate::from_pem_bundle(pem.expose().as_bytes())
+                .map_err(|_| RequestError::InvalidCaBundle)?;
+            if certificates.is_empty() {
+                return Err(RequestError::InvalidCaBundle.into());
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder
             .build()
             .map_err(|source| http_failure(FailurePhase::BeforeSend, None, source))?;
         Ok(Self { client })
@@ -492,7 +506,7 @@ mod tests {
             500,
             serde_json::Value::String("x".repeat(bytes - 2)),
         )]);
-        let http = InferenceHttp::new(Duration::from_secs(2)).unwrap();
+        let http = InferenceHttp::new(Duration::from_secs(2), &[]).unwrap();
         let control =
             TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2)).unwrap();
         use tracing::instrument::WithSubscriber as _;
@@ -548,7 +562,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let _refused = acceptor.accept(stream).await;
         });
-        let http = InferenceHttp::new(Duration::from_secs(2)).unwrap();
+        let http = InferenceHttp::new(Duration::from_secs(2), &[]).unwrap();
         let control =
             TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2)).unwrap();
         let (result, span) = crate::trace_capture::exported_model_span(http.generation(
