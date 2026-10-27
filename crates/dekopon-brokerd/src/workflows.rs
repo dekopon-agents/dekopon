@@ -310,6 +310,7 @@ pub(crate) async fn run(
             subject: file.subject.clone(),
             agent: file.agent.clone(),
             scope: Some(ChatScopeClaim {
+                participant: None,
                 transport: file.scope.transport.clone(),
                 kind: file.scope.transport_kind,
                 conversation: conversation(

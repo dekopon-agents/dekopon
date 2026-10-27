@@ -105,7 +105,7 @@ impl ScriptRuntime for SyntheticRuntime {
         0
     }
 
-    fn run_script(&self, _script: &str) -> ScriptOutcome {
+    fn run_script(&self, _script: &str, _participant: Option<&str>) -> ScriptOutcome {
         ScriptOutcome {
             output: "synthetic: no script was executed".into(),
             exit_code: ExitCode::SUCCESS,

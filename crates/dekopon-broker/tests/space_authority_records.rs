@@ -88,6 +88,7 @@ async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
 
 fn slack_scope() -> ChatScopeClaim {
     ChatScopeClaim {
+        participant: None,
         transport: "chat".parse().expect("transport"),
         kind: ChatTransportKind::Slack,
         conversation: Conversation {
@@ -155,6 +156,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     tracing_subscriber::registry().with(captured.clone()).init();
     let (broker, audit) = broker_fixture().await;
     let github = ChatScopeClaim {
+        participant: None,
         transport: "github".parse().expect("transport"),
         kind: ChatTransportKind::Github,
         conversation: Conversation {
@@ -314,4 +316,34 @@ async fn participant_capability_lookups_do_not_record_effect_decisions() {
         only(&captured, "effect-after-lookups").field("principal"),
         Some("asker")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn participant_handles_are_recorded_without_selecting_the_authorizing_principal() {
+    use tracing::instrument::WithSubscriber as _;
+    let (broker, audit) = broker_fixture().await;
+    let captured = CaptureLayer::workspace();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(captured.clone()));
+    for (id, subject, handle, expected_principal) in [
+        ("asker-p2", "slack.team.user", "p2", "asker"),
+        ("participant-p1", "slack.team.other", "p1", "participant"),
+    ] {
+        let mut scope = slack_scope();
+        scope.participant = Some(handle.to_owned());
+        let claim = Attestation::for_chat(
+            subject.parse().unwrap(),
+            "test-agent".parse().unwrap(),
+            scope,
+        );
+        assert_refused(&broker, &audit, id, claim, "policy-denied")
+            .with_subscriber(dispatch.clone())
+            .await;
+        let record = only(&captured, id);
+        assert_eq!(record.field("participant.handle"), Some(handle));
+        assert_eq!(record.field("principal"), Some(expected_principal));
+        assert_eq!(record.field("subject"), Some(subject));
+        assert_eq!(record.field("delivery.id"), Some("1712345678.000101"));
+        assert_eq!(record.field("space.id"), Some("space"));
+        assert_eq!(record.field("decision.allowed"), Some("false"));
+    }
 }

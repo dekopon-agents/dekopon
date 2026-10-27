@@ -86,6 +86,7 @@ fn agent() -> dekopon_core::AgentId {
 
 fn scope() -> ChatScopeClaim {
     ChatScopeClaim {
+        participant: None,
         transport: "scientist-slack".parse().expect("valid transport fixture"),
         kind: ChatTransportKind::Slack,
         conversation: conversation(
@@ -900,6 +901,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     }
 
     let oversized = ChatScopeClaim {
+        participant: None,
         conversation: conversation(
             ConversationKind::Channel,
             Some("t0123abc"),
@@ -1422,6 +1424,7 @@ fn a_selector_matches_kind_container_and_id_but_never_a_thread() {
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let slack = ChatScopeClaim {
+        participant: None,
         transport: "scientist-slack".parse().expect("transport"),
         kind: ChatTransportKind::Slack,
         conversation: conversation(
@@ -1458,6 +1461,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     );
 
     let discord = ChatScopeClaim {
+        participant: None,
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Channel, Some("999"), "123", None),
@@ -1465,6 +1469,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         trigger: Trigger::Message,
     };
     let discord_thread = ChatScopeClaim {
+        participant: None,
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Thread, Some("999"), "123", Some("456")),
@@ -1496,6 +1501,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }
 
     let telegram = ChatScopeClaim {
+        participant: None,
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
         conversation: conversation(ConversationKind::Thread, None, "-1001", Some("42")),
@@ -1536,6 +1542,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }
 
     let telegram_max = ChatScopeClaim {
+        participant: None,
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
         conversation: conversation(
@@ -1558,6 +1565,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     );
 
     let whatsapp = ChatScopeClaim {
+        participant: None,
         transport: "support-whatsapp".parse().expect("transport"),
         kind: ChatTransportKind::Whatsapp,
         conversation: conversation(
@@ -1598,6 +1606,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }
 
     let local = ChatScopeClaim {
+        participant: None,
         transport: "dev".parse().expect("transport"),
         kind: ChatTransportKind::Local,
         conversation: conversation(ConversationKind::DirectMessage, None, "conversation", None),
@@ -1900,6 +1909,7 @@ fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
             subject(),
             agent(),
             ChatScopeClaim {
+                participant: None,
                 conversation: conversation(
                     ConversationKind::Channel,
                     Some("t0123abc"),
@@ -2738,4 +2748,22 @@ fn space_grants_are_optional_and_an_empty_space_remains_present() {
     let mut expected = serde_json::to_value(&old).expect("value");
     expected["response"]["space"] = serde_json::json!([]);
     assert_eq!(serde_json::to_value(space).expect("space answer"), expected);
+}
+
+#[test]
+fn chat_participant_is_optional_and_only_canonical_ordinals_are_bounded() {
+    let original = json!({"transport":"chat", "kind":"slack", "conversation":{"kind":"channel", "container":"team", "id":"channel"}, "trigger":"message"});
+    let absent: ChatScopeClaim = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(absent.participant, None);
+    assert_eq!(serde_json::to_value(&absent).unwrap(), original);
+    let mut with_handle = original;
+    with_handle["participant"] = json!("p2");
+    let claim: ChatScopeClaim = serde_json::from_value(with_handle.clone()).unwrap();
+    assert!(claim.is_bounded());
+    assert_eq!(serde_json::to_value(&claim).unwrap(), with_handle);
+    for handle in ["ana", "p0", "p02", "p-1", "p2\n"] {
+        let mut claim = claim.clone();
+        claim.participant = Some(handle.to_owned());
+        assert!(!claim.is_bounded());
+    }
 }

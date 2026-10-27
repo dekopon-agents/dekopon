@@ -169,7 +169,7 @@ fn recording_preserves_descriptor_pipeline_reports_lifecycle_and_shared_budget()
         events,
         sequence,
     );
-    let outcome = runtime.run_script("probe produce | probe consume");
+    let outcome = runtime.run_script("probe produce | probe consume", None);
     assert_eq!(outcome.exit_code.get(), 0, "{}", outcome.output);
     assert!(
         outcome.output.contains("HELLO\n"),
@@ -183,7 +183,7 @@ fn recording_preserves_descriptor_pipeline_reports_lifecycle_and_shared_budget()
         2,
         "owned reports survived observation"
     );
-    let second = runtime.run_script("probe produce");
+    let second = runtime.run_script("probe produce", None);
     assert_ne!(
         second.exit_code.get(),
         0,
@@ -226,7 +226,7 @@ fn recording_forwards_cancellation_before_a_provider_effect() {
         limits: Limits::default(),
         calls: CallBudget::new(2),
     }
-    .run_script("probe produce");
+    .run_script("probe produce", None);
     assert_eq!(outcome.exit_code.get(), 130);
     assert_eq!(probe.effects.load(Ordering::SeqCst), 0);
 }

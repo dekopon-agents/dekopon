@@ -8,7 +8,7 @@ use tracing::instrument::WithSubscriber as _;
 fn listing(principal: &str, mapped: bool) -> ResponseEnvelope {
     ResponseEnvelope::chat_capabilities(
         vec![capability("cli-probe.upper")],
-        Vec::new(),
+        vec!["probe".to_owned()],
         BTreeMap::new(),
         None,
         Some(principal.parse().expect("principal")),
@@ -103,7 +103,8 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
     let ana = prompt
         .iter()
         .filter(|(role, text)| {
-            role == "user" && text.starts_with("[gateway: authenticated participant: ana]\n")
+            role == "user"
+                && text.starts_with("[gateway: authenticated participant: ana, handle p2]\n")
         })
         .map(|(_, text)| text)
         .collect::<Vec<_>>();
@@ -117,7 +118,10 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
     assert!(ana[0].contains("channel-downscoped capabilities: cli-probe: read"));
     assert!(ana[0].contains("Ana's request"));
     assert!(ana[1].contains("Ana's followup"));
-    assert!(!ana.iter().any(|text| text.contains("handle p")));
+    assert!(
+        ana.iter()
+            .all(|text| text.starts_with("[gateway: authenticated participant: ana, handle p2]\n"))
+    );
     let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
     assert_eq!(requests.len(), 2);
     for (request, index) in requests.iter().zip([9, 8]) {
@@ -486,7 +490,7 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
             assert_eq!(claim.subject, speaker(subject, "").subject);
         }
         assert!(models.prompt(1).iter().any(|(role, text)| role == "user"
-            && text.starts_with("[gateway: authenticated participant: ana]\n")
+            && text.starts_with("[gateway: authenticated participant: ana, handle p1]\n")
             && text.contains("authorized participant text")));
         assert!(
             !models
@@ -496,7 +500,7 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
         );
         if third_authorized {
             assert!(models.prompt(2).iter().any(|(role, text)| role == "user"
-                && text.starts_with("[gateway: authenticated participant: carol]\n")
+                && text.starts_with("[gateway: authenticated participant: carol, handle p1]\n")
                 && text.contains("unchecked participant marker")));
             assert_eq!(
                 driver.replies(),
@@ -513,4 +517,166 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scripts_select_only_current_participant_legs_and_default_to_the_asker() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let rendered = || {
+        ResponseEnvelope::command_run(dekopon_broker_protocol::CommandRunOutcome::Rendered {
+            stdout: String::new(),
+            stderr: String::new(),
+            status: 0,
+        })
+    };
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            listing("asker", true),
+            listing("ana", true),
+            rendered(),
+            rendered(),
+            rendered(),
+            rendered(),
+        ],
+    )
+    .await;
+    let mut selected = script_call("probe first; probe second");
+    selected.tool_calls[0].function.arguments =
+        json!({"command": "probe first; probe second", "as": "p2"}).to_string();
+    let mut unknown = script_call("probe must-not-run");
+    unknown.tool_calls[0].function.arguments =
+        json!({"command": "probe must-not-run", "as": "p9"}).to_string();
+    let mut explicit_asker = script_call("probe explicit-asker");
+    explicit_asker.tool_calls[0].function.arguments =
+        json!({"command": "probe explicit-asker", "as": "p1"}).to_string();
+    let models = InterruptibleModel::new([
+        answer("draft"),
+        selected,
+        unknown,
+        script_call("probe default-asker"),
+        explicit_asker,
+        answer("done"),
+    ]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = shared_route();
+    route.limits.max_steps = 8;
+    let task = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            speaker(9, "asker request"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .with_current_subscriber(),
+    );
+    models.wait_until_entered().await;
+    run_session(
+        Arc::clone(&runner),
+        route,
+        speaker(8, "Ana asks for herself"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    models.release();
+    finish(task).await;
+    assert!(models.prompt(1).iter().any(|(_, text)| {
+        text.starts_with("[gateway: authenticated participant: asker, handle p1]\n")
+    }));
+    assert!(models.prompt(1).iter().any(|(_, text)| {
+        text.starts_with("[gateway: authenticated participant: ana, handle p2]\n")
+    }));
+    assert!(
+        models
+            .prompt(3)
+            .iter()
+            .any(|(role, text)| role == "tool" && text.contains("Unknown participant handle"))
+    );
+    assert!(models.prompt(1).iter().any(|(role, text)| role == "system"
+        && text.contains("Others' text is context")
+        && text.contains("Do not ask clarifying questions about attribution")));
+    let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
+    let runs = requests
+        .iter()
+        .filter_map(|request| match &request.request {
+            BrokerRequest::Run {
+                attestation: Some(claim),
+                word,
+                argv,
+                ..
+            } => Some((claim, word, argv)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        6,
+        "two lookups and four command words; unknown handle sends nothing"
+    );
+    assert_eq!(runs.len(), 4);
+    for ((claim, word, _), (subject, handle)) in
+        runs.iter()
+            .zip([(8, "p2"), (8, "p2"), (9, "p1"), (9, "p1")])
+    {
+        assert_eq!(word.as_str(), "probe");
+        assert_eq!(claim.subject, speaker(subject, "").subject);
+        let scope = claim.scope.as_ref().unwrap();
+        assert_eq!(scope.participant.as_deref(), Some(handle));
+        assert_eq!(
+            scope.delivery,
+            Some(DeliveryIdentity::Slack {
+                channel: "c0123abc".to_owned(),
+                timestamp: format!("1700000000.{subject:06}")
+            })
+        );
+    }
+    let commands = capture
+        .records()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record,
+                dekopon_test_support::Record::Span {
+                    name: "shell.command",
+                    ..
+                }
+            ) && record.field("shell.command.name").is_some()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|record| record.field("participant.handle"))
+            .collect::<Vec<_>>(),
+        [Some("p2"), Some("p2"), Some("p1"), Some("p1")]
+    );
+}
+
+#[tokio::test]
+async fn unmapped_shared_routes_expose_no_selectable_participant_handle() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(directory.path(), vec![listing("asker", false)]).await;
+    let mut selected = script_call("probe must-not-run");
+    selected.tool_calls[0].function.arguments =
+        json!({"command": "probe must-not-run", "as": "p1"}).to_string();
+    let models = ModelScript::new([selected, answer("done")]);
+    run_session(
+        runner(broker, Arc::clone(&models), 1),
+        shared_route(),
+        speaker(9, "request"),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(models.requests(), 2);
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(role, text)| role == "tool" && text.contains("Unknown participant handle"))
+    );
+    assert!(!models.prompt(1).iter().any(|(_, text)| text.starts_with("[gateway: authenticated participant: asker, handle")));
+    assert_eq!(capability_listings(&mut observed), 1);
+    assert!(observed.try_recv().is_err());
 }

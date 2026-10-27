@@ -168,6 +168,7 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                 "slack.t0123abc.u9xyz".parse().unwrap(),
                 "reviewer".parse().unwrap(),
                 ChatScopeClaim {
+                    participant: None,
                     transport: "scientist-slack".parse().unwrap(),
                     kind: ChatTransportKind::Slack,
                     conversation: Conversation {
@@ -294,6 +295,7 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
             subject,
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
+                participant: None,
                 transport: "scientist-slack".parse().unwrap(),
                 kind: ChatTransportKind::Slack,
                 conversation: Conversation {
@@ -433,6 +435,7 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
             "slack.t0123abc.u9xyz".parse().unwrap(),
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
+                participant: None,
                 transport: "scientist-slack".parse().unwrap(),
                 kind: ChatTransportKind::Slack,
                 conversation: Conversation {
@@ -536,6 +539,7 @@ async fn a_discord_thread_claim_derives_its_parent_channels_space_key() {
             "discord.123".parse().unwrap(),
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
+                participant: None,
                 transport: "scientist-discord".parse().unwrap(),
                 kind: ChatTransportKind::Discord,
                 conversation: Conversation {

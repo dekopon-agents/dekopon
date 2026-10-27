@@ -28,7 +28,7 @@ impl ScriptRuntime for SyntheticRuntime {
         0
     }
 
-    fn run_script(&self, script: &str) -> ScriptOutcome {
+    fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
         self.0.lock().push(script.to_owned());
         ScriptOutcome {
             output: "synthetic-result".into(),
@@ -285,7 +285,7 @@ async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_defin
         fn capability_calls_used(&self) -> u32 {
             self.runtime.capability_calls_used()
         }
-        fn run_script(&self, script: &str) -> ScriptOutcome {
+        fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
             assert_eq!(script, "release image");
             match self.ending {
                 ImageEnd::Released => self.image.blob.reclaim().unwrap(),
@@ -293,7 +293,7 @@ async fn two_message_trace_reconstructs_requests_with_images_and_unbounded_defin
                     *self.image.refusal.lock() = Some(BlobError::Unauthorized)
                 }
             }
-            self.runtime.run_script(script)
+            self.runtime.run_script(script, _participant)
         }
         fn command_words(&self) -> Vec<String> {
             vec!["synthetic".into()]

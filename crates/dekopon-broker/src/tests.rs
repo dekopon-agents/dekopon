@@ -1483,6 +1483,7 @@ fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
     let scope =
         |kind, conversation_kind, container: Option<&str>, id: &str, thread: Option<&str>| {
             ChatScopeClaim {
+                participant: None,
                 transport: "family-chat".parse().expect("transport"),
                 kind,
                 conversation: Conversation {

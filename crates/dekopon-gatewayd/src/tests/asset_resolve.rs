@@ -823,7 +823,7 @@ impl dekopon_agent::prompt::ScriptRuntime for HistoryPressure {
     fn capability_calls_used(&self) -> u32 {
         0
     }
-    fn run_script(&self, script: &str) -> dekopon_shell::ScriptOutcome {
+    fn run_script(&self, script: &str, _participant: Option<&str>) -> dekopon_shell::ScriptOutcome {
         assert_eq!(script, "evict");
         evict_with_pressure(&self.store, &self.access, self.id);
         dekopon_shell::ScriptOutcome {

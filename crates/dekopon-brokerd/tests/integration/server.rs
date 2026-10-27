@@ -307,6 +307,7 @@ async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
         subject(),
         agent("chat-agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "scientist-slack".parse().expect("transport"),
             kind: ChatTransportKind::Slack,
             conversation: Conversation {
@@ -1198,6 +1199,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
             ExternalSubject::github("owner", repo).unwrap(),
             agent("chat-agent"),
             ChatScopeClaim {
+                participant: None,
                 transport: "github".parse().unwrap(),
                 kind: ChatTransportKind::Github,
                 conversation: Conversation {
@@ -1269,6 +1271,7 @@ async fn mismatched_smoke_delivery_reaches_broker_denial_not_duplicate_socket_ca
         subject(),
         agent("chat-agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "console-smoke".parse().expect("transport"),
             kind: ChatTransportKind::Local,
             conversation: Conversation {
@@ -1917,6 +1920,7 @@ async fn real_broker_probe_child_and_probe_started_job_refuse_write_on_same_leg(
             subject(),
             agent("chat-agent"),
             ChatScopeClaim {
+                participant: None,
                 transport: "scientist-slack".parse().unwrap(),
                 kind: ChatTransportKind::Slack,
                 conversation: Conversation {
@@ -2000,6 +2004,7 @@ async fn real_broker_refuses_probe_and_job_child_writes_during_spawn_upcalls() {
             subject(),
             agent("chat-agent"),
             ChatScopeClaim {
+                participant: None,
                 transport: "scientist-slack".parse().unwrap(),
                 kind: ChatTransportKind::Slack,
                 conversation: Conversation {
@@ -2614,6 +2619,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
         subject(),
         agent("chat-agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "scientist-slack".parse().unwrap(),
             kind: ChatTransportKind::Slack,
             conversation: Conversation {

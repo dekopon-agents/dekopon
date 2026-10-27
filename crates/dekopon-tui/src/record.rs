@@ -340,7 +340,7 @@ impl<R: ScriptRuntime> ScriptRuntime for RecordingRuntime<R> {
         self.inner.capability_calls_used()
     }
 
-    fn run_script(&self, script: &str) -> ScriptOutcome {
+    fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
         let sequence = self.sequence.next();
         emit(
             &self.events,
@@ -350,7 +350,7 @@ impl<R: ScriptRuntime> ScriptRuntime for RecordingRuntime<R> {
             },
         );
         let started = Instant::now();
-        let outcome = self.inner.run_script(script);
+        let outcome = self.inner.run_script(script, _participant);
         emit(
             &self.events,
             SessionEvent::ScriptFinished(Box::new(ScriptRun {
