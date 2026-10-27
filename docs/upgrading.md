@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Participant steering in mapped channels and model extraCABundles (0.60.0)
+
+No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
+
+- In a mapped channel or thread with shared conversation memory (or one-shot memory), every authorized participant's message now steers the running turn instead of waiting for a separate turn. Operators who relied on only the first participant steering should expect other authorized participants to redirect that turn; broker authorization still applies to each participant, and the initiating participant retains tool authority and delivery ownership. Participant messages enter the existing stored steer records with their own principal attribution; participant-join capability notices are prompt-only. This changes journal contents, not journal formats, persisted session-state formats, prompt-cache keys or configuration keys. A downgrade to 0.59.0 reads what 0.60.0 wrote and restores the earlier steering behavior.
+- To trust additional model endpoint CAs, opt in with the gateway configuration's top-level `extraCABundles` list of absolute PEM bundle paths and mount those files read-only into the gateway. These roots supplement public roots for inference clients; omitting the key or setting `[]` leaves defaults unchanged. The deployed configuration sets none, so this setting has no effect there. Deploy the supporting gateway before adding the key, and remove it before downgrading to 0.59.0, which rejects it. Boot and reload read the bundles; running sessions retain their original trust.
+
 ## Gateway memory notice, provider exit status and signed-URL redirect redaction (0.59.0)
 
 No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
