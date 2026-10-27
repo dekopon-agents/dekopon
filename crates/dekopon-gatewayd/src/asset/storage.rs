@@ -18,7 +18,8 @@ pub(super) enum Refill {
 impl Refill {
     pub(super) fn of(source: &AssetSourceRef) -> Self {
         match source {
-            AssetSourceRef::Slack { .. }
+            AssetSourceRef::Fauxlack { .. }
+            | AssetSourceRef::Slack { .. }
             | AssetSourceRef::Discord { .. }
             | AssetSourceRef::Telegram { .. }
             | AssetSourceRef::WhatsApp { .. } => Self::Platform,

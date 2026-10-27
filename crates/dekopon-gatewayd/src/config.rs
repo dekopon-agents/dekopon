@@ -370,6 +370,13 @@ pub struct BrokerConfig {
     rename_all_fields = "camelCase"
 )]
 pub enum TransportConfig {
+    Fauxlack {
+        name: String,
+        server: String,
+        bot: String,
+        #[serde(default, rename = "indicators", deserialize_with = "null_as_default")]
+        liveness: LivenessConfig,
+    },
     SlackSocketMode {
         name: String,
         app_token_env: String,
@@ -464,7 +471,8 @@ impl TransportConfig {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::SlackSocketMode { name, .. }
+            Self::Fauxlack { name, .. }
+            | Self::SlackSocketMode { name, .. }
             | Self::DiscordGateway { name, .. }
             | Self::WhatsappCloudApi { name, .. }
             | Self::GithubWebhook { name, .. }
@@ -476,6 +484,7 @@ impl TransportConfig {
     #[must_use]
     pub const fn chat_kind(&self) -> ChatTransportKind {
         match self {
+            Self::Fauxlack { .. } => ChatTransportKind::Fauxlack,
             Self::SlackSocketMode { .. } => ChatTransportKind::Slack,
             Self::DiscordGateway { .. } => ChatTransportKind::Discord,
             Self::WhatsappCloudApi { .. } => ChatTransportKind::Whatsapp,
@@ -488,6 +497,7 @@ impl TransportConfig {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
+            Self::Fauxlack { .. } => "fauxlack",
             Self::SlackSocketMode { .. } => "slackSocketMode",
             Self::DiscordGateway { .. } => "discordGateway",
             Self::WhatsappCloudApi { .. } => "whatsappCloudApi",
@@ -1039,8 +1049,41 @@ impl ResolvedBroker {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InProcess {
+    #[cfg(feature = "fauxlack")]
+    pub(crate) fauxlack: Option<crate::fauxlack::Fauxlack>,
+}
+
+impl InProcess {
+    fn validate(&self, transports: &[TransportConfig], problems: &mut Vec<ConfigProblem>) {
+        let mut attached = BTreeSet::new();
+        for transport in transports {
+            if let TransportConfig::Fauxlack {
+                name, server, bot, ..
+            } = transport
+            {
+                if !attached.insert((server, bot)) {
+                    problems.push(ConfigProblem::FauxlackDuplicate {
+                        name: name.clone(),
+                        server: server.clone(),
+                        bot: bot.clone(),
+                    });
+                }
+                #[cfg(feature = "fauxlack")]
+                if let Some(service) = &self.fauxlack {
+                    service.validate(name, server, bot, problems);
+                    continue;
+                }
+                problems.push(ConfigProblem::FauxlackService { name: name.clone() });
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ResolvedConfig {
+    pub(crate) service: InProcess,
     pub source: PathBuf,
     pub catalog_path: PathBuf,
     pub broker: ResolvedBroker,
@@ -1125,21 +1168,30 @@ pub async fn load_in(
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "decode constructs only Decode; other ConfigError variants cannot arise here"
-)]
 pub(crate) async fn load_reporting(
     path: &Path,
     expected_uid: u32,
     mode: LoadMode,
+) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
+    load_reporting_with_service(path, expected_uid, mode, &InProcess::default()).await
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "decode constructs only Decode; other ConfigError variants cannot arise here"
+)]
+pub(crate) async fn load_reporting_with_service(
+    path: &Path,
+    expected_uid: u32,
+    mode: LoadMode,
+    service: &InProcess,
 ) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
     let path = match absolute(path) {
         Ok(path) => path,
         Err(error) => return (None, vec![error]),
     };
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
-        return load_directory(path, expected_uid, mode).await;
+        return load_directory(path, expected_uid, mode, service).await;
     }
     let resolved = async {
         let config =
@@ -1152,12 +1204,13 @@ pub(crate) async fn load_reporting(
                     other => other,
                 }
             })?;
-        resolve(
+        resolve_with_service(
             config,
             path,
             &BrokerSocketDiscovery::from_process(None),
             expected_uid,
             mode,
+            service,
         )
     }
     .await;
@@ -1178,6 +1231,7 @@ async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
     mode: LoadMode,
+    service: &InProcess,
 ) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
     let paths = match scan_gateway_directory(&directory, expected_uid) {
         Ok(paths) => paths,
@@ -1238,12 +1292,13 @@ async fn load_directory(
             return (None, refusals);
         }
     };
-    match resolve(
+    match resolve_with_service(
         config,
         first,
         &BrokerSocketDiscovery::from_process(None),
         expected_uid,
         mode,
+        service,
     ) {
         Ok(mut resolved) => {
             resolved.model_files.extend(model_files);
@@ -1969,17 +2024,36 @@ fn model_ca_bundles(
     (bundles.into(), sources)
 }
 
+#[cfg(test)]
+pub(crate) fn resolve(
+    config: GatewaydConfig,
+    source: PathBuf,
+    discovery: &BrokerSocketDiscovery,
+    current_uid: u32,
+    mode: LoadMode,
+) -> Result<ResolvedConfig, ConfigError> {
+    resolve_with_service(
+        config,
+        source,
+        discovery,
+        current_uid,
+        mode,
+        &InProcess::default(),
+    )
+}
+
 #[expect(
     clippy::too_many_lines,
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-pub(crate) fn resolve(
+fn resolve_with_service(
     mut config: GatewaydConfig,
     source: PathBuf,
     discovery: &BrokerSocketDiscovery,
     current_uid: u32,
     mode: LoadMode,
+    service: &InProcess,
 ) -> Result<ResolvedConfig, ConfigError> {
     let base = source
         .parent()
@@ -2009,6 +2083,7 @@ pub(crate) fn resolve(
         problems.push(ConfigProblem::NoRoutes);
     }
 
+    service.validate(&config.transports, &mut problems);
     let mut transports_incomplete = config.transports.is_empty();
     let mut transport_names = BTreeSet::new();
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
@@ -2041,7 +2116,8 @@ pub(crate) fn resolve(
                 github_binds.push((name.clone(), *bind));
                 Some((*bind, "/webhooks/github"))
             }
-            TransportConfig::SlackSocketMode { .. }
+            TransportConfig::Fauxlack { .. }
+            | TransportConfig::SlackSocketMode { .. }
             | TransportConfig::DiscordGateway { .. }
             | TransportConfig::TelegramLongPoll { .. }
             | TransportConfig::Local { .. } => None,
@@ -2052,7 +2128,8 @@ pub(crate) fn resolve(
             problems.push(ConfigProblem::ConflictingWebhookMount { name: name.clone() });
         }
         let indicators = match &transport {
-            TransportConfig::SlackSocketMode { liveness, .. }
+            TransportConfig::Fauxlack { liveness, .. }
+            | TransportConfig::SlackSocketMode { liveness, .. }
             | TransportConfig::DiscordGateway { liveness, .. }
             | TransportConfig::TelegramLongPoll { liveness, .. }
             | TransportConfig::WhatsappCloudApi { liveness, .. }
@@ -2070,6 +2147,17 @@ pub(crate) fn resolve(
             });
         }
         transports.push(match transport {
+            TransportConfig::Fauxlack {
+                name,
+                server,
+                bot,
+                liveness,
+            } => TransportConfig::Fauxlack {
+                name,
+                server,
+                bot,
+                liveness,
+            },
             TransportConfig::GithubWebhook {
                 name,
                 bind,
@@ -2745,6 +2833,7 @@ pub(crate) fn resolve(
     match (frame, socket_path, telemetry) {
         (Some(frame), Some(socket_path), Some(telemetry)) if problems.is_empty() => {
             Ok(ResolvedConfig {
+                service: service.clone(),
                 ca_sources,
                 extra_ca_bundles: config.extra_ca_bundles,
                 model_files: config
@@ -2790,7 +2879,8 @@ fn resolve_liveness(
     index: usize,
 ) -> ResolvedLiveness {
     let config = match transport {
-        TransportConfig::SlackSocketMode { liveness, .. }
+        TransportConfig::Fauxlack { liveness, .. }
+        | TransportConfig::SlackSocketMode { liveness, .. }
         | TransportConfig::DiscordGateway { liveness, .. }
         | TransportConfig::TelegramLongPoll { liveness, .. }
         | TransportConfig::WhatsappCloudApi { liveness, .. }
@@ -3148,6 +3238,20 @@ fn resolve_directory(path: &Path) -> io::Result<PathBuf> {
 
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    #[error("transport {name}: kind fauxlack needs an in-process fauxlack service")]
+    FauxlackService { name: String },
+    #[error("transport {name}: unknown fauxlack server {server}")]
+    FauxlackServer { name: String, server: String },
+    #[error("transport {name}: unknown fauxlack bot {bot}")]
+    FauxlackBot { name: String, bot: String },
+    #[error("transport {name}: fauxlack user {bot} needs bot: true")]
+    FauxlackNotBot { name: String, bot: String },
+    #[error("transport {name}: duplicate fauxlack attachment {server}/{bot}")]
+    FauxlackDuplicate {
+        name: String,
+        server: String,
+        bot: String,
+    },
     #[error("extraCABundles permits at most eight files")]
     ModelCaBundleCount,
     #[error("extraCABundles requires absolute paths")]

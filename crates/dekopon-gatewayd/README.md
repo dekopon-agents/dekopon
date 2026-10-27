@@ -7,7 +7,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
   polling, a raw-body-HMAC-authenticated text/image WhatsApp Cloud API webhook with pinned Graph
   replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;
-  it expects operator-owned TLS termination and exact-path routing.
+  it expects operator-owned TLS termination and exact-path routing. The optional `fauxlack` feature
+  adds a credential-free in-process service for disposable Rust tests, booted only by `run_fauxlack`.
 - **Connection recovery** — all five adapters share a composable receive/connection extension:
   30-second attempts, 500 ms exponential backoff capped at 60 seconds plus up to 249 ms jitter,
   ten failures per episode, reset only after five continuously connected minutes. Healthy peers
@@ -21,7 +22,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   @-mentioned. In Slack Agent mode, fresh authorization claims that exact sender/thread so later
   unmentioned follow-ups can continue; every other ambient channel message remains ignored.
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
-  that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
+  that a model opens on demand. Feature-only fauxlack also reads manifest files from its world. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
 - **WhatsApp photo bursts** — collect until 5000ms of quiet, bounded by 15000ms from the first
   receipt by default. Photos arriving during the sender's run become ordinary steers after
@@ -33,7 +34,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Asset handles** — exact proposal references carry read-only descriptors, never expanded bytes.
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
-  notices. Slack/Discord/local accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
+  notices. Slack/Discord/local and feature-only fauxlack accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
   WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/gatewayd.md#asset-handles-and-delivery).
 - **Indicators** — layered `sessions`/transport/conversation-kind/route settings default off;
   after fresh authorization, `progress: auto` prefers native status, then typing. Working

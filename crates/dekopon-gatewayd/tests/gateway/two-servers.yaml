@@ -1,0 +1,13 @@
+servers:
+  - id: acme
+    users:
+      - {id: ualice, name: Alice}
+      - {id: udekopon, name: dekopon, bot: true}
+    channels:
+      - {id: cteam, name: team, members: [ualice, udekopon]}
+  - id: globex
+    users:
+      - {id: ualice, name: Alice}
+      - {id: udekopon, name: dekopon, bot: true}
+    channels:
+      - {id: cteam, name: team, members: [ualice, udekopon]}
