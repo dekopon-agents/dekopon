@@ -122,7 +122,16 @@ pub(crate) async fn probe(
             ProbeScope::Every => None,
             ProbeScope::ChangedFrom(path) => {
                 match config::load_in(path, crate::current_uid(), config::LoadMode::Check).await {
-                    Ok((against, _)) => Some(against),
+                    Ok((mut against, _)) => match against.load_model_ca_bundles() {
+                        Ok(()) => Some(against),
+                        Err(source) => {
+                            report.warnings.push(CheckWarning::Baseline {
+                                path: path.clone(),
+                                source,
+                            });
+                            None
+                        }
+                    },
                     Err(source) => {
                         report.warnings.push(CheckWarning::Baseline {
                             path: path.clone(),
@@ -236,8 +245,14 @@ async fn probe_openrouter(
 ) -> Result<(), ProbeError> {
     let name = model.name();
     let token = model_credential(name, api_key_env, (vendor.environment)(api_key_env))?;
-    let mut client =
-        OpenRouterClient::new(model.vendor_model(), token, timeout, settings)?.with_name(name);
+    let mut client = OpenRouterClient::new(
+        model.vendor_model(),
+        token,
+        timeout,
+        settings,
+        model.ca_bundles(),
+    )?
+    .with_name(name);
     if let Some(endpoint) = &vendor.openrouter_endpoint {
         client = client.with_loopback_endpoint(endpoint)?;
     }

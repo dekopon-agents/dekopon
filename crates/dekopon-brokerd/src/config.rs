@@ -24,6 +24,7 @@ use dekopon_core::{
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
+use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::Deserialize;
 
 use crate::{capabilities::ProviderCapabilities, lock_watch::LoadedLock};
@@ -1207,7 +1208,11 @@ async fn resolve(
             return Err(ConfigError::InvalidHttpsConfiguration);
         }
         let pem = std::fs::read(path).map_err(|_error| ConfigError::InvalidHttpsConfiguration)?;
-        if reqwest::Certificate::from_pem_bundle(&pem).map_or(true, |certs| certs.is_empty()) {
+        let mut roots = rustls::RootCertStore::empty();
+        let certificates = CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>();
+        if certificates.map_or(true, |certs| {
+            certs.is_empty() || certs.into_iter().any(|cert| roots.add(cert).is_err())
+        }) {
             return Err(ConfigError::InvalidHttpsConfiguration);
         }
         extra_ca_bundles.push(pem);

@@ -35,6 +35,7 @@ libc.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustix.workspace = true
+rustls.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -52,7 +53,6 @@ dekopon-process.workspace = true
 dekopon-agent.workspace = true
 dekopon-shell.workspace = true
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { workspace = true, features = ["test-util"] }
 dekopon-test-support = { path = "../dekopon-test-support" }
 axum.workspace = true

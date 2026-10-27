@@ -52,6 +52,12 @@ Slack event
 
 The broker authorization leg is new for every Slack message. Neither remembered text nor a prompt cache key enters Cedar policy or grants a capability.
 
+Gateway operators can add explicit PEM roots beside public WebPKI roots with the
+optional top-level [`extraCABundles`](gatewayd.md#extra-model-ca-bundles) list. Its empty
+default leaves trust unchanged; the same list covers OpenRouter, OpenAI-compatible
+and Codex inference. Files are read at boot and reload, including same-path replacements;
+plain `check` validates paths without reading them. This does not change model credentials.
+
 ## Streaming and interruption
 
 The prompt loop stays synchronous: `ChatModel::complete` takes a callback,

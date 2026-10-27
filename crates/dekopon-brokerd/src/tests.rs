@@ -451,6 +451,47 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
 }
 
 #[tokio::test]
+async fn ca_bundles_refuse_malformed_der_at_boot_and_reload() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let ca = directory.path().join("roots.pem");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .unwrap();
+    let mut document = provider_config(uid, json!(["cli-probe.wasm"]));
+    document["http"] = json!({"extraCABundles": [ca]});
+    write_config(&path, &document);
+    let malformed = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    let valid = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .unwrap()
+        .cert
+        .pem();
+    for pem in [malformed.to_owned(), format!("{valid}{malformed}")] {
+        fs::write(&ca, pem).unwrap();
+        assert!(
+            config::load_in(&path, uid, config::LoadMode::Check)
+                .await
+                .is_ok()
+        );
+        for mode in [
+            config::LoadMode::Boot,
+            config::LoadMode::Reload {
+                locked_providers: None,
+                provider_lock: None,
+            },
+        ] {
+            assert!(matches!(
+                config::load_in(&path, uid, mode).await,
+                Err(config::ConfigError::InvalidHttpsConfiguration)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn plaintext_hosts_are_validated_at_startup() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");

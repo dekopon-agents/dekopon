@@ -177,6 +177,10 @@ fn serving_digest(
         hasher.update((effective.len() as u64).to_be_bytes());
         hasher.update(effective);
     }
+    for (path, digest) in &candidate.sources.ca_bundles {
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(digest.bytes());
+    }
     Ok(hasher
         .finalize()
         .iter()

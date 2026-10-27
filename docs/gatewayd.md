@@ -257,6 +257,35 @@ or the session ends; individual tool completions do not clear it. At a keep-aliv
 than twice its ETA (or 120 seconds without an ETA) is cleared before rendering; the ETA never counts down.
 A transport with liveness off or no active progress message still records an opted-in note.
 
+### Extra model CA bundles
+
+The optional top-level `extraCABundles` list applies to OpenRouter, OpenAI-compatible
+and ChatGPT subscription inference clients together:
+
+```yaml
+extraCABundles:
+  - /var/run/dekopon-trust/model-roots.pem
+```
+
+Omitting it or setting `[]` preserves public WebPKI trust alone. Each entry must be an
+absolute path to a regular file containing a valid, nonempty PEM certificate bundle;
+at most eight files, each 1–65,536 bytes, are accepted. Boot and reload read the files;
+`check` checks only path shape and count, while explicit `check --probe` also reads them
+for its model request. Replacing a bundle at the same path activates a new serving
+generation; sessions already running retain their original client trust.
+
+These roots supplement public roots without granting network access. A listed CA lets
+whoever holds its private key impersonate model endpoints to this gateway. No ambient
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, system trust store or proxy is consulted; redirects
+and existing timeouts are unchanged. This setting covers inference, not subscription
+OAuth refresh, OTLP export or the OCI provider manager.
+
+Mount the public PEM file read-only into the gateway at the configured absolute path
+using an operator-supplied volume mount in the rendered Deployment; the chart has no
+generic gateway extra-mount value. Deploy a gateway binary supporting this key before
+adding it to configuration: older binaries reject the unknown field. Existing broker
+CA configuration remains independent.
+
 ### OpenRouter model settings
 
 The tag is exactly `kind: openrouter`, not `openRouter`. `name`, nonblank `model`, `apiKeyEnv`

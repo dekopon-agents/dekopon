@@ -42,6 +42,7 @@ libc.workspace = true
 mime = "0.3.17"
 reqwest = { workspace = true, features = ["multipart"] }
 rustix.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -57,7 +58,6 @@ tracing-subscriber.workspace = true
 dekopon-provider-sdk.workspace = true
 schemars.workspace = true
 rcgen.workspace = true
-rustls.workspace = true
 tokio-rustls.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

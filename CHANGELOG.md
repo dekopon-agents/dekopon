@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-10-27
+
+### Added
+
+- Gateway model clients can trust explicit extraCABundles alongside public roots.
+
+### Changed
+
+- in a mapped channel, every authorized participant's message steers the running turn
+
+## [dekopon-chart-0.47.0] - 2026-10-27
+
+### Changed
+
+- Chart 0.47.0 targets core v0.60.0 and renders the `v0.60.0` image tag.
+
 ## [0.59.0] - 2026-10-26
 
 ### Added
