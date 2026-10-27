@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.61.1] - 2026-10-27
+
+### Fixed
+
+- Bash calls with as on unmapped routes now run as the asker instead of failing with an unknown participant handle.
+
+## [dekopon-chart-0.48.1] - 2026-10-27
+
+### Changed
+
+- Chart 0.48.1 targets core v0.61.1 and renders the `v0.61.1` image tag.
+
 ## [0.61.0] - 2026-10-27
 
 ### Added
