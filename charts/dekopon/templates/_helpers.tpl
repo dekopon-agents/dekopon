@@ -59,8 +59,10 @@ container-image workflow publishes under the Git tag and the Git tag carries the
 {{- with .Values.console.image -}}
 {{- if .digest -}}
 {{- printf "%s@%s" .repository .digest -}}
+{{- else if .tag -}}
+{{- printf "%s:%s" .repository .tag -}}
 {{- else -}}
-{{- printf "%s:%s" .repository (required "console.image.tag or console.image.digest is required with console.enabled" .tag) -}}
+{{- include "dekopon.image" $ -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

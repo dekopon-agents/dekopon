@@ -559,7 +559,7 @@ configCheck:
 console:
   enabled: false
   image:
-    repository: ghcr.io/dekopon-agents/dekopon-console
+    repository: ghcr.io/dekopon-agents/dekopon
     tag: ""
     digest: ""
     pullPolicy: IfNotPresent
