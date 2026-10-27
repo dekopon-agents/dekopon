@@ -98,6 +98,10 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: bounded_runtime, which shuts it down within exit_timeout; bound: the daemon's one runtime, one worker per core"
+)]
 fn bounded_runtime<T>(
     exit_timeout: Duration,
     body: impl Future<Output = T>,

@@ -25,7 +25,7 @@ use dekopon_model::{
         settings::{Routing, Settings},
     },
 };
-use dekopon_process::{CallBudget, Limits, TreeContext};
+use dekopon_process::{CallBudget, Limits, ShellThreads, TreeContext};
 use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, ScriptOutcome, Streams,
 };
@@ -810,6 +810,7 @@ fn session<I: CapabilityInvoker + Send + 'static>(
             invoker,
             limits: Limits::default(),
             calls: CallBudget::new(limits.max_capability_calls),
+            threads: ShellThreads::new(16, runtime.handle().clone()),
         },
         scripts: Mutex::new(Vec::new()),
     };
@@ -999,6 +1000,10 @@ fn run() -> Result<u32, EvalError> {
         install_trace(path)?;
     }
     let client = Arc::new(build_client(&arguments)?);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: this evaluation run, which drops it on return; bound: the example's one runtime"
+    )]
     let runtime = tokio::runtime::Runtime::new().map_err(EvalError::Runtime)?;
     let mut rows =
         std::io::BufWriter::new(std::fs::File::create(&arguments.out).map_err(EvalError::Rows)?);
@@ -1045,6 +1050,10 @@ fn run() -> Result<u32, EvalError> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests build runtimes freely; production sites carry their own expectation"
+)]
 mod tests {
     use super::*;
     use dekopon_model::model::{ModelFunctionCall, ModelToolCall};
@@ -1103,28 +1112,56 @@ mod tests {
 
     #[test]
     fn the_canned_words_answer_like_providers_do() {
-        let view = dekopon_shell::run("gh pr view 12", &EvalInvoker);
+        let view = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("gh pr view 12", &EvalInvoker);
         assert_eq!(view.exit_code, ExitCode::SUCCESS, "{view:?}");
         assert!(view.output.contains("Stream provider stdout"), "{view:?}");
 
-        let help = dekopon_shell::run("gh --help", &EvalInvoker);
+        let help = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("gh --help", &EvalInvoker);
         assert_eq!(help.exit_code, ExitCode::SUCCESS, "{help:?}");
         assert!(help.output.contains("Usage: gh pr"), "{help:?}");
 
-        let missing = dekopon_shell::run("gh pr view 13", &EvalInvoker);
+        let missing = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("gh pr view 13", &EvalInvoker);
         assert_eq!(missing.exit_code, ExitCode::FAILURE, "{missing:?}");
 
-        let ungranted = dekopon_shell::run("gh pr merge 12", &EvalInvoker);
+        let ungranted = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("gh pr merge 12", &EvalInvoker);
         assert_eq!(ungranted.exit_code, ExitCode::NOT_FOUND, "{ungranted:?}");
         assert!(ungranted.output.contains("gh.pr.merge"), "{ungranted:?}");
 
-        let denied = dekopon_shell::run("gh pr close 12", &EvalInvoker);
+        let denied = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("gh pr close 12", &EvalInvoker);
         assert_eq!(denied.exit_code, ExitCode::DENIED, "{denied:?}");
 
-        let usage = dekopon_shell::run("wiki search Dekopon", &EvalInvoker);
+        let usage = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("wiki search Dekopon", &EvalInvoker);
         assert_eq!(usage.exit_code, ExitCode::SYNTAX, "{usage:?}");
 
-        let unknown = dekopon_shell::run("wikipedia_page --title x", &EvalInvoker);
+        let unknown = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("wikipedia_page --title x", &EvalInvoker);
         assert_eq!(unknown.exit_code, ExitCode::NOT_FOUND, "{unknown:?}");
     }
 
@@ -1305,7 +1342,11 @@ mod tests {
             .scripts
             .iter()
             .map(|script| {
-                let outcome = dekopon_shell::run(script, invoker);
+                let outcome = dekopon_shell::Interpreter::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_test_support::shell_threads(),
+                )
+                .run(script, invoker);
                 (*script, outcome.exit_code.get(), outcome.output)
             })
             .collect::<Vec<_>>();

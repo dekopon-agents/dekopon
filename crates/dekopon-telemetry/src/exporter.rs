@@ -298,6 +298,10 @@ fn signal_endpoint(base: &str, signal: &str) -> String {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "owner: the exporter's OnceLock; bound: one client and its one runtime thread per exporter"
+)]
 struct OtlpHttpClient(reqwest::blocking::Client);
 
 /// Redirects are disabled so the ingest credential header can't follow a redirect to an unnamed
@@ -320,6 +324,11 @@ fn otlp_client_from(
 }
 
 impl OtlpHttpClient {
+    #[expect(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "owner: this call, which joins the one builder thread before returning; bound: one thread, not a shell thread, so not ShellThreads"
+    )]
     fn new(timeout: Duration, ca_certificate: Option<&[u8]>) -> Result<Self, TelemetryError> {
         let client = std::thread::scope(|scope| {
             std::thread::Builder::new()

@@ -1,7 +1,7 @@
 //! In its own test binary behind one async mutex, since tracing checks interest against one global
 //! dispatcher a sibling test could disable, and interleaved loads there look like a double
 //! instantiation.
-
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::unwrap_used)]
 
 mod fixture;

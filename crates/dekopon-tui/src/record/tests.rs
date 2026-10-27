@@ -94,7 +94,11 @@ impl ScriptRuntime for FixedRuntime<'_> {
 }
 
 fn tree() -> TreeContext {
-    TreeContext::new(Limits::default(), CallBudget::new(4))
+    TreeContext::new(
+        Limits::default(),
+        CallBudget::new(4),
+        dekopon_test_support::shell_threads(),
+    )
 }
 
 fn sink() -> Streams {

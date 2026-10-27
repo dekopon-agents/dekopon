@@ -52,6 +52,10 @@ pub(crate) fn cached_registry<P: Provider>(
     Ok(loaded)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: the testkit's process-wide OnceLock; bound: one runtime per test process, ended with it"
+)]
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

@@ -13,6 +13,8 @@ use std::{
     time::Instant,
 };
 
+const IFS_TEST: dekopon_process::ThreadName = dekopon_process::ThreadName::new("sh-ifs-test");
+
 fn bash(script: &str) -> Vec<Vec<Vec<u8>>> {
     let prefix = r#"[[ ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} == 5.2 ]] || exit 98
 shopt -s lastpipe
@@ -38,8 +40,13 @@ probe() { [[ $1 == args ]] || return 99; shift; printf '%s\0' "$#"; for arg in "
                 .expect("Bash output");
             bytes
         };
-        let out = scope.spawn(move || collect(Box::new(stdout)));
-        let err = scope.spawn(move || collect(Box::new(stderr)));
+        let [out, err] = super::shell_threads().reserve().unwrap();
+        let out = out
+            .spawn(scope, IFS_TEST, move || collect(Box::new(stdout)))
+            .unwrap();
+        let err = err
+            .spawn(scope, IFS_TEST, move || collect(Box::new(stderr)))
+            .unwrap();
         let status = loop {
             if let Some(status) = child.try_wait().expect("Bash status") {
                 break status;
@@ -86,7 +93,7 @@ fn compare(script: &str) {
 fn compare_pair(script: &str, reference: &str, context: &str) -> bool {
     let expected = bash(reference);
     let fixture = Fixture::default();
-    let result = Interpreter::new(Limits::default()).run(script, &fixture);
+    let result = Interpreter::new(Limits::default(), super::shell_threads()).run(script, &fixture);
     let actual: Vec<Vec<Vec<u8>>> = fixture
         .calls
         .lock()
@@ -360,8 +367,12 @@ fn continued_reads_obey_the_shared_value_budget() {
             .write_all(b"12345678\\\n".repeat(lines).as_slice())
             .expect("continued input lines");
         drop(writer);
-        let tree = dekopon_process::TreeContext::new(limits, dekopon_process::CallBudget::new(1));
-        let outcome = Interpreter::new(limits).run_child(
+        let tree = dekopon_process::TreeContext::new(
+            limits,
+            dekopon_process::CallBudget::new(1),
+            super::shell_threads(),
+        );
+        let outcome = Interpreter::new(limits, super::shell_threads()).run_child(
             "read x; echo \"$x\"",
             Some(stdin),
             &Fixture::default(),

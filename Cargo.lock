@@ -1131,6 +1131,7 @@ dependencies = [
  "clap",
  "dekopon-config",
  "dekopon-core",
+ "dekopon-process",
  "dekopon-telemetry",
  "dekopon-tui",
  "opentelemetry_sdk",
@@ -1403,6 +1404,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1478,6 +1480,7 @@ dependencies = [
  "dekopon-protocol",
  "dekopon-shell",
  "dekopon-telemetry",
+ "dekopon-test-support",
  "futures-util",
  "opentelemetry-proto",
  "parking_lot",

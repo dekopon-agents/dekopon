@@ -1,6 +1,9 @@
 use crate::interp::telemetry::StageObservation;
 use dekopon_process::pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome};
-use dekopon_process::{CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, TreeContext};
+use dekopon_process::{
+    CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, ShellThreads, ThreadName, ThreadPermit,
+    TreeContext,
+};
 mod ifs;
 mod nesting;
 use ifs::{Action, Boundary, Ifs, Kind};
@@ -216,7 +219,11 @@ impl Builtin {
 
 /// Each non-final stage thread reserves this much stack, charged against retained bytes until its
 /// join, so the default budget admits sixteen concurrent producers.
-const STAGE_STACK_BYTES: usize = 2 * 1024 * 1024;
+const STAGE_STACK_BYTES: usize = ShellThreads::STACK_BYTES;
+
+const STAGE_THREAD: ThreadName = ThreadName::new("sh-stage");
+const CALL_THREAD: ThreadName = ThreadName::new("sh-call");
+const FEED_THREAD: ThreadName = ThreadName::new("sh-feed");
 
 #[derive(Clone, Copy)]
 struct StagePosition {
@@ -227,6 +234,7 @@ struct StagePosition {
 struct StageSetup {
     position: StagePosition,
     meter: Arc<telemetry::StageMeter>,
+    permit: ThreadPermit,
 }
 
 /// Ends when upstream ends, the provider stops reading or `finished` is set once the call has
@@ -277,20 +285,23 @@ mod pump_tests {
         });
         let (socket, peer) = UnixStream::pair().unwrap();
         let (done, finished) = mpsc::channel();
+        let [permit] = budget.tree().shell_threads().reserve().unwrap();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                pump_stdin(
-                    &mut PipeReader::from_bytes(
-                        vec![b'x'; 1024 * 1024],
-                        None,
-                        crate::interp::telemetry::stage_read,
-                    ),
-                    socket,
-                    &budget,
-                    &AtomicBool::new(false),
-                );
-                done.send(()).unwrap();
-            });
+            permit
+                .spawn(scope, ThreadName::new("sh-feed-test"), || {
+                    pump_stdin(
+                        &mut PipeReader::from_bytes(
+                            vec![b'x'; 1024 * 1024],
+                            None,
+                            crate::interp::telemetry::stage_read,
+                        ),
+                        socket,
+                        &budget,
+                        &AtomicBool::new(false),
+                    );
+                    done.send(()).unwrap();
+                })
+                .unwrap();
             let result = finished.recv_timeout(Duration::from_secs(3));
             drop(peer);
             assert!(
@@ -439,6 +450,7 @@ pub(crate) fn run(
     prev: Option<&str>,
     invoker: &dyn CapabilityInvoker,
     limits: Limits,
+    threads: &ShellThreads,
 ) -> ScriptOutcome {
     run_with_tree(
         script,
@@ -446,8 +458,12 @@ pub(crate) fn run(
         None,
         invoker,
         limits,
-        &TreeContext::new(limits, CallBudget::new(limits.max_capability_calls))
-            .with_cancel(invoker.cancel_signals()),
+        &TreeContext::new(
+            limits,
+            CallBudget::new(limits.max_capability_calls),
+            threads.clone(),
+        )
+        .with_cancel(invoker.cancel_signals()),
     )
 }
 
@@ -690,32 +706,36 @@ pub(crate) struct JobScope {
     last_status: ExitCode,
 }
 
+pub(crate) fn fatal_message(fatal: &FatalError) -> String {
+    match fatal {
+        FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
+            "dekopon-shell: step budget exhausted after {maximum} steps; the script is doing too much work or looping without progress"
+        ),
+        FatalError::Limit(LimitExceeded::RecursionDepth { maximum }) => format!(
+            "dekopon-shell: function calls, `$( )` substitutions, `${{ }}` expansions and compound commands (`if`, `for`, `while`, `case`, `{{ }}`, `[[ ]]`) nested deeper than {maximum} levels while running; replace recursion with a loop, or move inner results into variables first"
+        ),
+        FatalError::Limit(LimitExceeded::Deadline { timeout_ms }) => {
+            format!("dekopon-shell: script exceeded its {timeout_ms}ms deadline")
+        }
+        FatalError::Limit(LimitExceeded::CapabilityCalls { maximum }) => {
+            format!("dekopon-shell: the turn's capability-call budget of {maximum} is spent")
+        }
+        FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
+            "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
+        ),
+        FatalError::Limit(LimitExceeded::ShellThreads { maximum }) => format!(
+            "dekopon-shell: all {maximum} shell threads this process allows are busy; run fewer pipeline stages or provider calls at once, or retry later"
+        ),
+        FatalError::Limit(LimitExceeded::Cancelled) => "dekopon-shell: script cancelled".to_owned(),
+        FatalError::Unsupported(reason) | FatalError::Assertion(reason) => {
+            format!("dekopon-shell: {reason}")
+        }
+    }
+}
+
 impl<'a> Evaluator<'a> {
     fn report_fatal(&mut self, fatal: &FatalError) -> ExitCode {
-        let message = match fatal {
-            FatalError::Limit(LimitExceeded::Steps { maximum }) => format!(
-                "dekopon-shell: step budget exhausted after {maximum} steps; the script is doing too much work or looping without progress"
-            ),
-            FatalError::Limit(LimitExceeded::RecursionDepth { maximum }) => format!(
-                "dekopon-shell: function calls, `$( )` substitutions, `${{ }}` expansions and compound commands (`if`, `for`, `while`, `case`, `{{ }}`, `[[ ]]`) nested deeper than {maximum} levels while running; replace recursion with a loop, or move inner results into variables first"
-            ),
-            FatalError::Limit(LimitExceeded::Deadline { timeout_ms }) => {
-                format!("dekopon-shell: script exceeded its {timeout_ms}ms deadline")
-            }
-            FatalError::Limit(LimitExceeded::CapabilityCalls { maximum }) => {
-                format!("dekopon-shell: the turn's capability-call budget of {maximum} is spent")
-            }
-            FatalError::Limit(LimitExceeded::ValueBytes { maximum }) => format!(
-                "dekopon-shell: script tried to hold more than {maximum} bytes of values in variables, buffers, and substitutions"
-            ),
-            FatalError::Limit(LimitExceeded::Cancelled) => {
-                "dekopon-shell: script cancelled".to_owned()
-            }
-            FatalError::Unsupported(reason) | FatalError::Assertion(reason) => {
-                format!("dekopon-shell: {reason}")
-            }
-        };
-        self.output.push_block(&message);
+        self.output.push_block(&fatal_message(fatal));
         telemetry::fatal_exit_code(fatal)
     }
 
@@ -1427,14 +1447,23 @@ impl<'a> Evaluator<'a> {
             return Ok((ExitCode::SUCCESS, None));
         };
 
+        let permits = self
+            .budget
+            .tree()
+            .shell_threads()
+            .reserve_many(producers.len())?;
         let pipeline_id = telemetry::next_pipeline();
         let meters = (0..pipeline.commands.len())
             .map(|_| Arc::new(telemetry::StageMeter::default()))
             .collect::<Vec<_>>();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: execute_pipeline, which joins every stage before returning; bound: one ShellThreads permit per producer, reserved for the whole pipeline"
+        )]
         let (outcomes, diagnostics, executed, last_trace) = thread::scope(|scope| {
             let mut input = StageInput::Inherited;
             let mut running = Vec::with_capacity(producers.len());
-            for (index, command) in producers.iter().enumerate() {
+            for ((index, command), permit) in producers.iter().enumerate().zip(permits) {
                 let (writer, reader) = pipe::pipe(
                     Some(Arc::clone(&meters[index + 1])),
                     Some(Arc::clone(&meters[index])),
@@ -1450,6 +1479,7 @@ impl<'a> Evaluator<'a> {
                             index,
                         },
                         meter: Arc::clone(&meters[index]),
+                        permit,
                     },
                     command,
                     stage_input,
@@ -1562,11 +1592,13 @@ impl<'a> Evaluator<'a> {
     where
         'a: 'env,
     {
+        let StageSetup {
+            position,
+            meter,
+            permit,
+        } = setup;
         let refused = |reason: &dyn std::fmt::Display| Stage::Refused {
-            message: format!(
-                "dekopon-shell: pipeline stage {}: {reason}",
-                setup.position.index
-            ),
+            message: format!("dekopon-shell: pipeline stage {}: {reason}", position.index),
         };
         let stack = match self.budget.charge_value_bytes(STAGE_STACK_BYTES as u64) {
             Ok(stack) => stack,
@@ -1588,58 +1620,52 @@ impl<'a> Evaluator<'a> {
         };
         let span = tracing::Span::current();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
-        let spawned = thread::Builder::new()
-            .name(format!("dekopon-shell-stage-{}", setup.position.index))
-            .stack_size(STAGE_STACK_BYTES)
-            .spawn_scoped(scope, move || {
-                tracing::dispatcher::with_default(&dispatcher, || {
-                    let _entered = span.enter();
-                    let _stage_trace = telemetry::StageTrace::enter(
-                        setup.position.pipeline,
-                        setup.position.index,
-                        setup.meter,
-                    );
-                    let compound_span =
-                        stage_compound_span(command, stage.invoker.participant_handle());
-                    if let Some(span) = &compound_span {
-                        telemetry::record_compound_stage(span);
-                    }
-                    let _entered_compound = compound_span.as_ref().map(tracing::Span::enter);
-                    let inherited = enclosing.is_some();
-                    if let Some(reader) = enclosing {
-                        stage.stdin.push(reader);
-                    }
-                    let status = (|| {
-                        let executed = stage
-                            .tested(true, |stage| stage.execute_command(command, input, false));
-                        record_compound_outcome(compound_span.as_ref(), &executed);
-                        let executed = executed?;
-                        match executed {
-                            Executed::Result(result) => {
-                                let status = result.status;
-                                stage.emit(result)?;
-                                Ok(status)
-                            }
-                            Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => Ok(status),
-                            Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
-                                Ok(stage.last_status)
-                            }
+        let spawned = permit.spawn(scope, STAGE_THREAD, move || {
+            tracing::dispatcher::with_default(&dispatcher, || {
+                let _entered = span.enter();
+                let _stage_trace =
+                    telemetry::StageTrace::enter(position.pipeline, position.index, meter);
+                let compound_span =
+                    stage_compound_span(command, stage.invoker.participant_handle());
+                if let Some(span) = &compound_span {
+                    telemetry::record_compound_stage(span);
+                }
+                let _entered_compound = compound_span.as_ref().map(tracing::Span::enter);
+                let inherited = enclosing.is_some();
+                if let Some(reader) = enclosing {
+                    stage.stdin.push(reader);
+                }
+                let status = (|| {
+                    let executed =
+                        stage.tested(true, |stage| stage.execute_command(command, input, false));
+                    record_compound_outcome(compound_span.as_ref(), &executed);
+                    let executed = executed?;
+                    match executed {
+                        Executed::Result(result) => {
+                            let status = result.status;
+                            stage.emit(result)?;
+                            Ok(status)
                         }
-                    })();
-                    stage.stdout = None;
-                    let enclosing = if inherited { stage.stdin.pop() } else { None };
-                    let diagnostics = stage
-                        .stderr_capture
-                        .pop()
-                        .map(StderrCapture::finish)
-                        .unwrap_or_default();
-                    StageOutcome {
-                        status,
-                        diagnostics,
-                        enclosing,
+                        Executed::Flow(Flow::Exit(status) | Flow::Return(status)) => Ok(status),
+                        Executed::Flow(Flow::Normal | Flow::Break(_) | Flow::Continue(_)) => {
+                            Ok(stage.last_status)
+                        }
                     }
-                })
-            });
+                })();
+                stage.stdout = None;
+                let enclosing = if inherited { stage.stdin.pop() } else { None };
+                let diagnostics = stage
+                    .stderr_capture
+                    .pop()
+                    .map(StderrCapture::finish)
+                    .unwrap_or_default();
+                StageOutcome {
+                    status,
+                    diagnostics,
+                    enclosing,
+                }
+            })
+        });
         match spawned {
             Ok(handle) => Stage::Running {
                 handle,
@@ -3098,6 +3124,7 @@ impl<'a> Evaluator<'a> {
             stdin: provider_stdin,
             stdout: OwnedFd::from(provider_stdout),
         };
+        let (call_permit, feed) = self.call_permits(feed)?;
         self.budget.charge_capability_call()?;
         let invoker = self.invoker;
         let tree = self.budget.tree().clone();
@@ -3105,18 +3132,31 @@ impl<'a> Evaluator<'a> {
         let span = tracing::Span::current();
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         let finished = AtomicBool::new(false);
-        let (result, copied, unread) = thread::scope(|scope| {
-            let call = scope.spawn(|| {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: this call, which joins the call and feeder threads before returning; bound: their ShellThreads permits"
+        )]
+        let joined = thread::scope(|scope| {
+            let call = call_permit.spawn(scope, CALL_THREAD, || {
                 tracing::dispatcher::with_default(&dispatcher, || {
                     span.in_scope(|| invoker.run(call, streams, &tree))
                 })
-            });
-            let feeder = feed.map(|(mut reader, socket, inherited)| {
+            })?;
+            let feeder = feed.and_then(|((mut reader, socket, inherited), permit)| {
                 let (feeder_budget, finished) = (&feeder_budget, &finished);
-                scope.spawn(move || {
-                    pump_stdin(&mut reader, socket, feeder_budget, finished);
-                    inherited.then_some(reader)
-                })
+                permit
+                    .spawn(scope, FEED_THREAD, move || {
+                        pump_stdin(&mut reader, socket, feeder_budget, finished);
+                        inherited.then_some(reader)
+                    })
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            event = "shell_feeder_unstarted",
+                            error = %error,
+                            "shell.feeder.unstarted"
+                        );
+                    })
+                    .ok()
             });
             let copied = self.copy_stdin(StageInput::Piped(output), capture_output, sink);
             let result = call.join();
@@ -3128,8 +3168,17 @@ impl<'a> Evaluator<'a> {
                 Some(Ok(unread)) => unread,
                 None => None,
             };
-            (result, copied, unread)
+            Ok::<_, std::io::Error>((result, copied, unread))
         });
+        let (result, copied, unread) = match joined {
+            Ok(joined) => joined,
+            Err(error) => {
+                self.budget.refund_capability_call();
+                return Err(CommandFailure::failed(format!(
+                    "{capability}: failed: its call thread could not start: {error}"
+                )));
+            }
+        };
         if let (Some(slot), Some(reader)) = (self.stdin.last_mut(), unread) {
             *slot = reader;
         }
@@ -3181,6 +3230,23 @@ impl<'a> Evaluator<'a> {
         }
         copied.status = status;
         Ok(copied)
+    }
+
+    fn call_permits<F>(
+        &self,
+        feed: Option<F>,
+    ) -> Result<(ThreadPermit, Option<(F, ThreadPermit)>), LimitExceeded> {
+        let threads = self.budget.tree().shell_threads();
+        Ok(match feed {
+            Some(feed) => {
+                let [call, feeder] = threads.reserve()?;
+                (call, Some((feed, feeder)))
+            }
+            None => {
+                let [call] = threads.reserve()?;
+                (call, None)
+            }
+        })
     }
 
     fn run_control_word(
@@ -5279,3 +5345,5 @@ fn arithmetic(
 
 #[cfg(test)]
 mod nesting_tests;
+#[cfg(test)]
+mod thread_tests;

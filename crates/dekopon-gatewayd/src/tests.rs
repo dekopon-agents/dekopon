@@ -4681,6 +4681,7 @@ fn runner_tracking(
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
+        shell_threads: dekopon_test_support::shell_threads(),
     })
 }
 
@@ -17942,6 +17943,7 @@ fn journaled_runner(
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
+        shell_threads: dekopon_test_support::shell_threads(),
     })
 }
 
@@ -18012,7 +18014,11 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
                 stdin: None,
                 stdout: std::os::fd::OwnedFd::from(stdout),
             },
-            &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), calls),
+            &dekopon_process::TreeContext::new(
+                dekopon_process::Limits::default(),
+                calls,
+                dekopon_test_support::shell_threads(),
+            ),
         )
     })
     .await
