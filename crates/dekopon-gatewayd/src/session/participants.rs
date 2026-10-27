@@ -86,7 +86,9 @@ impl SessionGate {
                         queued.receipts.finish(MessageOutcome::Steered);
                         continue;
                     }
-                    record_admission(&queued.message, "queued", remaining.len() + 1, None);
+                    queued.message.receive_span.in_scope(|| {
+                        record_admission(&queued.message, "queued", remaining.len() + 1, None);
+                    });
                 }
                 remaining.push_back(queued);
             }

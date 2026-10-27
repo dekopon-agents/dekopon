@@ -310,19 +310,34 @@ async fn overflow_participants_are_authorized_and_refused_before_text_is_injecte
 #[test]
 fn mapping_resolution_promotes_pending_messages_and_keeps_unmapped_routes_queued() {
     for mapped in [true, false] {
+        let (capture, _guard) = capture_spans();
+        let asker_receipt = tracing::info_span!(parent: None, "gateway.asker.receipt");
+        let session = tracing::info_span!(parent: &asker_receipt, "gateway.session");
+        let queued_receipt = tracing::info_span!(parent: None, "gateway.queued.receipt");
         let gate = SessionGate::new(1);
         let route = shared_route();
-        let first = speaker(9, "first");
+        let mut first = speaker(9, "first");
+        first.receive_span = asker_receipt;
         let key = (first.transport.clone(), first.conversation.key());
         let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
         else {
             panic!("first admitted")
         };
+        let mut second = speaker(8, "second");
+        second.receive_span = queued_receipt;
         assert!(matches!(
-            gate.admit(&route, speaker(8, "second"), Dispositions(Vec::new())),
+            gate.admit(&route, second, Dispositions(Vec::new())),
             Admit::Queued
         ));
-        gate.resolve_mapping(&key, &admission.cancellation(), mapped);
+        session.in_scope(|| gate.resolve_mapping(&key, &admission.cancellation(), mapped));
+        let admissions = capture.events_where(
+            "dekopon_gatewayd::audit",
+            &[("audit.event", "gateway.admission"), ("outcome", "queued")],
+        );
+        assert_eq!(admissions.len(), usize::from(!mapped));
+        if !mapped {
+            assert_eq!(admissions[0].parent(), Some("gateway.queued.receipt"));
+        }
         assert_eq!(gate.take_steers(&key).len(), usize::from(mapped));
         assert_eq!(admission.next_or_release().is_some(), !mapped);
     }
