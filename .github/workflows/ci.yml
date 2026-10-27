@@ -418,7 +418,15 @@ jobs:
       # the cold verify rebuild; release.yml still verifies before publishing.
       - name: Package every publishable crate
         if: ${{ needs.changes.outputs.run_package != 'false' }}
-        run: cargo package --workspace --locked --no-verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t crates < <(grep -Ev '^[[:space:]]*(#|$)' .github/release-crates.txt)
+          args=()
+          for crate in "${crates[@]}"; do
+            args+=(-p "$crate")
+          done
+          cargo package --locked --no-verify "${args[@]}"
       - name: Test package-cache cleanup
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: .github/scripts/prepare-package-cache.sh
