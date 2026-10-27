@@ -68,6 +68,8 @@ use crate::{
     wake::{Anchor, SessionWakes},
 };
 
+mod participants;
+
 pub(crate) const UNMAPPED_REPLY: &str =
     "I only talk to the Lange family. I've let my owner know you stopped by.";
 
@@ -487,6 +489,8 @@ struct Running {
     steering: Steering,
     aborts: u8,
     received_at: tokio::time::Instant,
+    mapping: participants::Mapping,
+    authorizing: usize,
     steers: VecDeque<InboundMessage>,
     follow_ups: VecDeque<FollowUp>,
 }
@@ -499,13 +503,22 @@ impl Running {
             steering: route.steering,
             aborts: 0,
             received_at: message.received_at,
+            mapping: participants::Mapping::for_turn(route, message),
+            authorizing: 0,
             steers: VecDeque::new(),
             follow_ups: VecDeque::new(),
         }
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FollowUpKind {
+    Turn,
+    MappingPending,
+}
+
 pub(crate) struct FollowUp {
+    kind: FollowUpKind,
     pub route: BoundRoute,
     pub message: InboundMessage,
     pub receipts: Dispositions,
@@ -649,7 +662,7 @@ impl SessionGate {
                 record_admission(&message, MessageOutcome::Busy.label(), 0, Some("saturated"));
                 return Admit::Saturated(message, receipts);
             };
-            let depth = running.steers.len() + running.follow_ups.len();
+            let depth = running.steers.len() + running.follow_ups.len() + running.authorizing;
             if let MessageId::Github(incoming) = &mut message.message_id
                 && let Some(tail) = running.follow_ups.back_mut()
                 && let MessageId::Github(batch) = &mut tail.message.message_id
@@ -673,9 +686,21 @@ impl SessionGate {
                 );
                 return Admit::Full(message, receipts);
             }
+            let participant = message.subject != running.subject
+                && participants::native_chat(&message)
+                && match running.mapping {
+                    participants::Mapping::Mapped => true,
+                    participants::Mapping::Pending | participants::Mapping::Unmapped => false,
+                };
+            if participant && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
+            {
+                running.steers.push_back(message);
+                return Admit::Steered(receipts);
+            }
             if message.subject == running.subject
                 && match message.message_id {
-                    MessageId::Native(_) | MessageId::Job { .. } => true,
+                    MessageId::Native(_) => participants::native_chat(&message),
+                    MessageId::Job { .. } => true,
                     MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => false,
                 }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
@@ -695,8 +720,18 @@ impl SessionGate {
                 }
                 return Admit::Steered(receipts);
             }
-            record_admission(&message, MessageOutcome::Queued.label(), depth + 1, None);
+            let kind = if running.mapping == participants::Mapping::Pending
+                && participants::native_chat(&message)
+                && message.subject != running.subject
+                && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
+            {
+                FollowUpKind::MappingPending
+            } else {
+                record_admission(&message, MessageOutcome::Queued.label(), depth + 1, None);
+                FollowUpKind::Turn
+            };
             running.follow_ups.push_back(FollowUp {
+                kind,
                 route: route.clone(),
                 message,
                 receipts,
@@ -903,12 +938,16 @@ impl SessionAdmission {
                 };
                 if folds {
                     let mut grouped = Vec::new();
-                    while let Some(next) = running.steers.pop_front_if(|steer| folds_in(steer)) {
+                    while let Some(next) = running
+                        .steers
+                        .pop_front_if(|steer| folds_in(steer) && steer.subject == message.subject)
+                    {
                         grouped.push(next);
                     }
                     fold(&mut message, grouped);
                 }
                 leftovers.push(FollowUp {
+                    kind: FollowUpKind::Turn,
                     route: (*self.route).clone(),
                     receipts: crate::collection::Dispositions(message.constituents.clone()),
                     message,
@@ -940,6 +979,8 @@ impl SessionAdmission {
                 running.cancellation = SessionCancellation::new();
                 running.steering = next.route.steering;
                 running.aborts = 0;
+                running.mapping = participants::Mapping::for_turn(&next.route, &next.message);
+                running.authorizing = 0;
                 running.received_at = next.message.received_at;
                 self.cancellation = running.cancellation.clone();
                 *self.route = next.route.clone();
@@ -1903,6 +1944,7 @@ struct SessionSteers {
     delivery_notice: Option<&'static str>,
     stop_notice: Option<String>,
     principal: Option<PrincipalId>,
+    participants: Option<participants::Drain>,
     received_at: tokio::time::Instant,
     inventory: Arc<Mutex<asset::InventoryUsage>>,
     raw_texts: Mutex<Vec<String>>,
@@ -1911,10 +1953,22 @@ struct SessionSteers {
 
 impl SteerSource for SessionSteers {
     fn take(&self) -> Vec<Steer> {
-        self.stage(self.gate.take_steers(&self.key))
+        match &self.participants {
+            Some(drain) => match drain.take(participants::DrainMode::Take) {
+                participants::Batch::Steers(steers) => steers.stage(self),
+                participants::Batch::Sealed(_) => Vec::new(),
+            },
+            None => self.stage(self.gate.take_steers(&self.key)),
+        }
     }
 
     fn seal_or_take(&self) -> Handoff {
+        if let Some(drain) = &self.participants {
+            return match drain.take(participants::DrainMode::SealOrTake) {
+                participants::Batch::Steers(steers) => Handoff::Steers(steers.stage(self)),
+                participants::Batch::Sealed(seal) => Handoff::Sealed(seal),
+            };
+        }
         match self.gate.seal_or_take(&self.key, &self.cancellation) {
             Taken::Steers(steers) => Handoff::Steers(self.stage(steers)),
             Taken::Sealed(seal) => Handoff::Sealed(seal),
@@ -1928,45 +1982,70 @@ impl SteerSource for SessionSteers {
 
 impl SessionSteers {
     fn stage(&self, steers: Vec<InboundMessage>) -> Vec<Steer> {
+        self.stage_participants(
+            steers
+                .into_iter()
+                .map(|message| participants::Authorized {
+                    message,
+                    principal: self.principal.clone(),
+                    join: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn stage_participants(&self, steers: Vec<participants::Authorized>) -> Vec<Steer> {
         steers
             .into_iter()
-            .map(|mut steer| {
-                match &steer.message_id {
-                    MessageId::Job { .. } => return Steer::Notice(steer.text),
-                    MessageId::Native(id) => self.taken.lock().push(id.clone()),
-                    MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => {}
-                }
-                self.taken.lock().append(&mut steer.folded);
-                let seconds = steer
-                    .received_at
-                    .saturating_duration_since(self.received_at)
-                    .as_secs();
-                let text = bound_inbound(&format!(
-                    "[gateway: sent while you were working, +{seconds}s]\n{}",
-                    steer.text
-                ));
-                let registered =
-                    self.store
-                        .assets_for_access(&self.access, steer.assets, Instant::now());
-                let recorded =
-                    bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
-                let prompt = PromptFrame {
-                    inventory: Some(&self.inventory),
-                    principal: self.principal.as_ref(),
-                    delivery: self.delivery_notice,
-                    stop: self.stop_notice.as_deref(),
-                }
-                .inventory(
-                    &text,
-                    &registered,
-                    self.images_supported,
-                    self.text_reader,
-                    InventoryPath::Steer,
-                );
-                let recorded = attributed_prompt(self.principal.as_ref(), &recorded);
-                self.raw_texts.lock().push(steer.text);
-                Steer::Person { prompt, recorded }
-            })
+            .map(
+                |participants::Authorized {
+                     mut message,
+                     principal,
+                     join,
+                 }| {
+                    let steer = &mut message;
+                    match &steer.message_id {
+                        MessageId::Job { .. } => {
+                            return Steer::Notice(std::mem::take(&mut steer.text));
+                        }
+                        MessageId::Native(id) => self.taken.lock().push(id.clone()),
+                        MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => {}
+                    }
+                    self.taken.lock().append(&mut steer.folded);
+                    let seconds = steer
+                        .received_at
+                        .saturating_duration_since(self.received_at)
+                        .as_secs();
+                    let text = bound_inbound(&format!(
+                        "[gateway: sent while you were working, +{seconds}s]\n{}",
+                        steer.text
+                    ));
+                    let registered = self.store.assets_for_access(
+                        &self.access,
+                        std::mem::take(&mut steer.assets),
+                        Instant::now(),
+                    );
+                    let recorded =
+                        bound_inbound(&format!("{text}{}", asset::arrival_markers(&registered)));
+                    let prompt = PromptFrame {
+                        inventory: Some(&self.inventory),
+                        principal: principal.as_ref(),
+                        delivery: self.delivery_notice,
+                        stop: self.stop_notice.as_deref(),
+                    }
+                    .inventory(
+                        &text,
+                        &registered,
+                        self.images_supported,
+                        self.text_reader,
+                        InventoryPath::Steer,
+                    );
+                    let prompt = participants::with_join(prompt, join.as_deref());
+                    let recorded = attributed_prompt(principal.as_ref(), &recorded);
+                    self.raw_texts.lock().push(std::mem::take(&mut steer.text));
+                    Steer::Person { prompt, recorded }
+                },
+            )
             .collect()
     }
 
@@ -1994,10 +2073,15 @@ async fn session(
         route,
         message,
         driver,
-        cancellation,
+        cancellation.clone(),
         &mut publication,
     )
     .await;
+    runner.gate.resolve_mapping(
+        &(message.transport.clone(), message.conversation.key()),
+        &cancellation,
+        false,
+    );
     drop(publication);
     runner.assets.finish_publications().await;
     ended
@@ -2219,6 +2303,15 @@ async fn session_turn(
         }
         return MessageOutcome::Unauthorized.into();
     }
+    let mapped_participants = participants::Mapping::for_turn(route, message)
+        == participants::Mapping::Pending
+        && leg.space_grants().is_some();
+    runner.gate.resolve_mapping(
+        &(message.transport.clone(), message.conversation.key()),
+        &cancellation,
+        mapped_participants,
+    );
+    let asker_join = mapped_participants.then(|| participants::join_line(&leg));
     let granted = space_grants.map_or(granted, |grants| {
         grants.iter().map(ToString::to_string).collect()
     });
@@ -2427,6 +2520,9 @@ async fn session_turn(
             InventoryPath::Turn
         },
     );
+    let text = participants::with_join(text, asker_join.as_deref());
+    let (participant_drain, participant_requests) =
+        participants::channel(mapped_participants, &cancellation);
     let frame = |text: String| {
         let text = match &delivery_notice {
             Some(note) => bound_inbound(&format!("{note}\n{text}")),
@@ -2460,6 +2556,7 @@ async fn session_turn(
         delivery_notice,
         stop_notice,
         principal: principal.clone(),
+        participants: participant_drain,
         received_at: message.received_at,
         raw_texts: Mutex::new(Vec::new()),
         taken: Mutex::new(message.folded.clone()),
@@ -2594,6 +2691,21 @@ async fn session_turn(
             })
         })
         .flatten();
+    let leg = Arc::new(leg);
+    let participant_worker = participants::Worker::start(
+        participant_requests,
+        participants::Inputs {
+            broker: runner.broker.clone(),
+            route: route.clone(),
+            gate: runner.gate.clone(),
+            key: (message.transport.clone(), message.conversation.key()),
+            cancellation: cancellation.clone(),
+            asker: message.subject.clone(),
+            leg: Arc::clone(&leg),
+            calls: calls.clone(),
+            progress: Arc::clone(&progress_sink),
+        },
+    );
     let invoker = crate::follow::FollowInvoker::new(
         leg,
         if matches!(
@@ -2792,6 +2904,7 @@ async fn session_turn(
     })
     .await;
 
+    participant_worker.finish().await;
     let (outcome, turn, images) = match result.map_err(TaskFailure::from) {
         Ok(session) => session,
         Err(failure) => {
@@ -3366,7 +3479,7 @@ fn chat_claim_for(
         .transport
         .parse()
         .map_err(SessionError::TransportId)?;
-    Ok(Attestation::for_chat(
+    let mut claim = Attestation::for_chat(
         subject,
         route.agent.clone(),
         ChatScopeClaim {
@@ -3376,7 +3489,14 @@ fn chat_claim_for(
             delivery: None,
             trigger: message.message_id.trigger(),
         },
-    ))
+    );
+    if let MessageId::Native(id) | MessageId::Follow(id) = &message.message_id {
+        let delivery = delivery_identity(message, id, &claim);
+        if let Some(scope) = &mut claim.scope {
+            scope.delivery = delivery;
+        }
+    }
+    Ok(claim)
 }
 
 async fn record_delivered_turn(
