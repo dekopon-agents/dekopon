@@ -1,8 +1,8 @@
 # Dekopon Helm chart
 
-Chart `0.48.1` targets application `v0.61.1`.
+Chart `0.49.0` targets application `v0.62.0`.
 With empty `image.tag` and `image.digest`, the chart renders
-`ghcr.io/dekopon-agents/dekopon:v0.61.1`; a set `image.digest` wins over the tag.
+`ghcr.io/dekopon-agents/dekopon:v0.62.0`; a set `image.digest` wins over the tag.
 With `console.enabled: true` and empty `console.image.tag` and `console.image.digest`,
 the console uses the main image, including its tag, variant, or digest. An explicit console tag
 or digest uses `console.image.repository`, which defaults to `ghcr.io/dekopon-agents/dekopon`.
