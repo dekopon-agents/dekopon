@@ -887,9 +887,10 @@ impl Journal {
                 _ => false,
             };
             if stale && remove(&path) {
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == FOLLOW_EXTENSION)
+                if records
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == FOLLOW_EXTENSION)
                 {
                     tracing::info!(
                         audit.event = "gateway.follow",

@@ -23384,6 +23384,60 @@ async fn dispatch_racing_an_expiry_sweep_records_exactly_one_follow_leave() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn recall_then_dispatch_records_exactly_one_follow_leave() {
+    let fixture = SlackFollowFixture::new().await;
+    fixture
+        .table
+        .stay(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+        .unwrap();
+    let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let gateway = crate::gateway::Gateway::new(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+    );
+    let (capture, _guard) = capture_spans();
+    fixture
+        .journal
+        .recall(&"e".repeat(64), "other-grant", window(), SystemTime::now())
+        .unwrap();
+    assert!(fixture.journal.load_follow(1024).unwrap().is_empty());
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Lapsed
+    );
+    let mut incoming = owned_slack_message("later", true);
+    incoming.transport = "scientist-slack".to_owned();
+    let mut sessions = tokio::task::JoinSet::new();
+    gateway.dispatch(
+        &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
+        incoming,
+    );
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
+            )
+            .len(),
+        1
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() {
     use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
