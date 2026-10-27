@@ -42,7 +42,7 @@ impl InferenceHttp {
             .connect_timeout(timeout.min(Duration::from_secs(10)));
         for pem in extra_ca_bundles {
             let certificates = reqwest::Certificate::from_pem_bundle(pem.expose().as_bytes())
-                .map_err(|_| RequestError::InvalidCaBundle)?;
+                .map_err(|_error| RequestError::InvalidCaBundle)?;
             if certificates.is_empty() {
                 return Err(RequestError::InvalidCaBundle.into());
             }

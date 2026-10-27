@@ -21276,6 +21276,56 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
 }
 
 #[tokio::test]
+async fn model_ca_only_changes_reprobe_otherwise_unchanged_models() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let ca = root.path().join("roots.pem");
+    let generate_ca = || {
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .unwrap()
+            .cert
+            .pem()
+    };
+    fs::write(&ca, generate_ca()).unwrap();
+    let mut document = document(root.path());
+    document["extraCABundles"] = json!([ca]);
+    document["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(openrouter_model("router", "vendor/accepted", 5_000));
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
+    let sources = gateway_sources(&active).await;
+    for changed in [false, true] {
+        if changed {
+            fs::write(&ca, generate_ca()).unwrap();
+        }
+        let (candidate, report) = crate::load_candidate_against(
+            &path,
+            None,
+            config::LoadMode::Boot,
+            Some((&crate::ProbeScope::Every, &environment)),
+            Some((&active, &sources, &active_routes)),
+        )
+        .await;
+        assert!(candidate.is_some(), "{report:?}");
+        assert!(report.problems.is_empty());
+        assert_eq!(vendor.asked.lock().len(), usize::from(changed));
+    }
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/accepted"]);
+}
+
+#[tokio::test]
 async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_repair_does() {
     let vendor = spawn_fake_vendor();
     let environment = crate::probe::Vendor {

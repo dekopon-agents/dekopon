@@ -535,13 +535,13 @@ pub(crate) async fn load_candidate_against(
     report
         .problems
         .extend(refusals.into_iter().map(GatewaydError::from));
-    if probe.is_some() && mode == config::LoadMode::Check {
-        if let Some(candidate) = &mut config {
-            if let Err(error) = candidate.load_model_ca_bundles() {
-                report.problems.push(error.into());
-                config = None;
-            }
-        }
+    if probe.is_some()
+        && mode == config::LoadMode::Check
+        && let Some(candidate) = &mut config
+        && let Err(error) = candidate.load_model_ca_bundles()
+    {
+        report.problems.push(error.into());
+        config = None;
     }
     let catalog_path = catalog_path.or(config.as_ref().map(|config| config.catalog_path.as_path()));
     let catalog = match catalog_path {
