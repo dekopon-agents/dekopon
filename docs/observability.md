@@ -263,7 +263,7 @@ this file does not mention, so a rename lands here in the same change.
 
 Every event's OpenTelemetry name is a stable dotted name, never prose or a source location: an
 audit record is named by its `audit.event`, and an operational event by its `event` with each `_`
-read as `.` (`gateway_memory_deviation` is named `gateway.memory.deviation`), or by its own dotted
+read as `.` (`gateway_memory_projection` is named `gateway.memory.projection`), or by its own dotted
 name such as `provider.load.finished`. Both fields stay on the record for log queries.
 
 A span's status is only what its own code sets through `otel.status_code`: an `error` field on an
@@ -780,10 +780,24 @@ Every successful recall that seeds a window logs `gateway_recalled` at info with
 (messages a resident window's watermark read added; 0 on a cold recall). A watermark read that
 finds nothing new logs nothing. A failed one logs `gateway_recall_failed` at warn with
 `source` and `reason`; the message runs without what it would have added.
-`gateway_memory_policy` reports the effective selection mode, recall source, retained routine count and capture bounds once per journal-backed persistent route at startup, without conversation or payload text. A failed progressive part emits `gateway_memory_deviation` with a bounded configured routine ID and `reason="generation-failed"`; it does not change a reply already delivered. A stale conversation generation cannot publish its result and emits `gateway_memory_retention_failed` with `reason="stale-generation"`. A turn whose encoded record exceeds its agent's byte cap is not retained and evicts nothing: `gateway_memory_retention_failed` with `reason="agent-byte-cap"` and `encoded_bytes`. Neither event carries source text or a conversation coordinate.
-`gateway.memory.notice` (`event="gateway_memory_notice"`) is emitted once on `gateway.session` when a request carries a memory notice: `memory.notice.kinds` is a native array of closed-enum labels, `memory.record.first_shown` is a u64 when known, `memory.records.omitted` is the u64 count of individually known omitted records inside the scanned window (older records beyond it are not counted), and `memory.notice.bytes` is the u64 rendered size, capped at 1024 bytes. `window-omission` reports that eligible older records exist without scanning them; `omitted`, `replaced`, `grant-boundary`, `thread-without-memory`, `recall-failed` and `fidelity` describe the same facts sent to the model.
+`gateway_memory_policy` reports, once per journal-backed persistent route at startup, the recall source, `memory.hot_turns`, `memory.summaries.parts` (0 when summaries are off), `memory.capture.max_item_bytes` and `memory.selection` (`ladder` or `decider`), without conversation or payload text. A turn whose record exceeds its agent's byte cap is not retained and evicts nothing: `gateway_memory_retention_failed` with `reason="agent-byte-cap"` and `encoded_bytes`; it carries no source text or conversation coordinate.
 
-`gateway_memory_selection` names the requested and actual historical representation, opaque record ID, effective policy mode, authority, bounded reason, optional pin and its byte cost, and exact model-facing original and replacement envelope byte counts. `savings_bytes` is signed original minus replacement; zero or negative savings are not compression. A fixed or fallback replacement, including the fallback for a decider choice missing on one record, that saves no bytes leaves the original in the prompt with `reason="kept-original: no-saving"` when retained; if it was deliberately disposed, the replacement is sent with `reason="kept-replacement: original-unavailable"` and its signed cost. A pin or explicit choice can also expand it. An oversized pinned turn is omitted with `reason="record-exceeds-budget"`; a decider's eligible choice may override a pin. No conversation text is emitted by this event.
+The journal and its summary engine emit these records, none of which carries conversation text except the bounded summary on `memory.summarize`:
+
+| Record | Kind | Attributes |
+|---|---|---|
+| `meter` | the existing log, once per summary call | `via = "summary"`; never admitted, and skipped when a ledger is restored |
+| `memory.summarize` | span per summary slot task, one event per transition | `memory.record.id`, `memory.summary.part`, `memory.summary.from` and `memory.summary.to` (`queued`, `running`, `generated`, `error`), `memory.summary.failure` (`timeout`, `refused`, `model-failed`, `empty`, `overflow`, `panicked`, `io`, `unconfigured`), `io.kind` (only for `io`), `gen_ai.request.model`, `gen_ai.response.model`, `memory.summary.bytes`, `memory.summary.text` (bounded), `memory.summary.queue_wait_ms` |
+| `gateway_memory_published` | log per record appended after delivery | `memory.record.id`, `memory.record.bytes`, `memory.record.items`, `memory.slots.queued` |
+| `gateway_memory_pin_dropped` | log | `memory.record.id`, `memory.pin.reason` (`record-gone` or `turn-not-persisted`) |
+| `gateway_memory_summary_dropped` | log | `memory.record.id`, `memory.summary.part`, `memory.summary.failure` (`overflow` or `evicted`) |
+| `gateway_memory_choice` | log per decider invocation | `memory.record.id`, `choice` (`summary-<n>`, `metadata` or `none`), `reason` (`decider`, `invalid-choice`, `not-granted`, `refused`, `invocation-failed`, `invalid-response`, `invalid-request`) |
+| `gateway_memory_projection` | log per journal-recall turn | `memory.record.ids` (native array), `memory.rung.native`, `memory.rung.summary`, `memory.rung.metadata`, `memory.omitted`, `memory.opaque.dropped`, `memory.repacked`, `memory.bytes` |
+| `gateway_memory_startup` | log at boot | `memory.journals.reset`, `memory.slots.requeued`, `memory.slots.enqueued`, `memory.slots.overflowed`, `memory.boot.crashed_files` |
+
+A journal file the current binary cannot load (an earlier format, a malformed line, or the file a crashed start was loading) is deleted, never migrated, and counted in `memory.journals.reset`.
+`gateway.memory.notice` (`event="gateway_memory_notice"`) is emitted once on `gateway.session` when a request carries a memory notice: `memory.notice.kinds` is a native array of closed-enum labels, `memory.record.first_shown` is a u64 when known, `memory.records.omitted` is the u64 count of individually known omitted records inside the scanned window (older records beyond it are not counted), and `memory.notice.bytes` is the u64 rendered size, capped at 1024 bytes. `window-omission` reports that eligible older records exist beyond the scanned window; `omitted`, `grant-boundary`, `thread-without-memory`, `recall-failed` and `fidelity` describe the same facts sent to the model.
+
 `gateway_conversation_unresolved` is the debug-level record of why a conversation could not be
 placed, and the cause behind `drop.reason = conversation-unresolved`. On Discord, where the
 conversation is a guild channel, `cause` is `rest-cooldown`, `request`, `status`, `timeout`, `body`,

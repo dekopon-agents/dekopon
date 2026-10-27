@@ -287,20 +287,25 @@ stored beside the conversation drops the entry and closes its attachment generat
 route participants with different grant vectors reset the window between them. The new exchange is
 appended only if its generation remains current.
 
-### What history drops
+### What history keeps and drops
 
-- model reasoning, including encrypted replay items;
-- function/tool calls;
-- scripts and capability outputs;
-- system instructions, which are supplied fresh from the catalog;
-- the gateway's fixed failure sentence; and
-- any synthetic assistant text for a no-reply decision — there is none, so a declined turn keeps the
-  user message alone.
+A journal-recall persistent route keeps one record per turn: the turn's original items (the
+user text, consumed steers, assistant text, reasoning, and every tool call with the result the
+model received) and a slot for each summary part. A background engine fills the slots
+best-effort, after the reply. No reply waits for it, and a summary that fails is recorded as
+failed, never faked. Provider reasoning that only its own model can read is replayed only to
+that model.
 
-The model is told what is missing or replaced; journal replay retains captured bash exchanges, while platform and resident replay keep request and final reply text only, and neither keeps reasoning or other tool calls.
+The newest `hotTurns` records replay verbatim. Older records replay as their deepest
+generated summary, or verbatim if none exists yet. When the window is short, the oldest
+record steps down (summary, metadata, a counted omission), so a turn is shortened, never
+silently lost.
 
-This is conversation continuity, not evidence continuity. The broker audit is where authorized
-effects remain verifiable.
+History drops system instructions (supplied fresh), the gateway's fixed failure sentence,
+opaque reasoning bound for another model, and records written under a different grant.
+Routes that do not recall from the journal store only tool exchanges, and platform-recall
+routes replay chat messages only. This is conversation continuity, not
+evidence continuity. The broker audit is where authorized effects remain verifiable.
 
 ### Memory never becomes authority
 
