@@ -635,18 +635,19 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
         assert_eq!(claim.subject, speaker(subject, "").subject);
         let scope = claim.scope.as_ref().unwrap();
         assert_eq!(scope.participant.as_deref(), Some(handle));
-        if scope.trigger == dekopon_broker_protocol::Trigger::Job {
-            assert_eq!(scope.delivery, None);
-        } else {
-            assert_eq!(
-                scope.delivery,
-                Some(DeliveryIdentity::Slack {
-                    channel: "c0123abc".to_owned(),
-                    timestamp: format!("1700000000.{subject:06}")
-                })
-            );
-        }
+        assert_eq!(
+            scope.delivery,
+            Some(DeliveryIdentity::Slack {
+                channel: "c0123abc".to_owned(),
+                timestamp: format!("1700000000.{subject:06}")
+            })
+        );
     }
+    assert_eq!(
+        runs[4].0.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Job
+    );
+
     let commands = capture
         .records()
         .into_iter()

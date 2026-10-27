@@ -5,7 +5,7 @@ use std::{
 };
 
 use dekopon_agent::{BrokerLeg, current_trace_parent};
-use dekopon_broker_protocol::{TraceParent, Trigger};
+use dekopon_broker_protocol::{DeliveryIdentity, TraceParent, Trigger};
 use dekopon_core::AgentId;
 use dekopon_process::{
     CancelHandle, CancelSignal, ExitCode, JobId, JobOutcome, JobState, JobSummary, JobWait,
@@ -533,6 +533,7 @@ pub(crate) struct JobContext {
     limits: ShellLimits,
     origin: Origin,
     participant: Option<String>,
+    participant_delivery: Option<DeliveryIdentity>,
 }
 
 impl JobContext {
@@ -543,6 +544,12 @@ impl JobContext {
         broker: ResolvedBroker,
         limits: ShellLimits,
     ) -> Self {
+        let participant_delivery = match &message.message_id {
+            MessageId::Native(id) | MessageId::Follow(id) => {
+                crate::session::delivery_identity(message, id, &anchor.claim(Trigger::Job))
+            }
+            MessageId::Job { .. } | MessageId::Wake { .. } | MessageId::Github(_) => None,
+        };
         Self {
             jobs,
             owner: JobOwner::of(message),
@@ -552,6 +559,7 @@ impl JobContext {
             limits,
             origin: Origin::Turn,
             participant: None,
+            participant_delivery,
         }
     }
 
@@ -589,6 +597,7 @@ impl JobContext {
             limits,
             origin: Origin::Tree(Trigger::Probe),
             participant: None,
+            participant_delivery: None,
         }
     }
 
@@ -614,6 +623,9 @@ impl JobContext {
         let mut claim = self.anchor.claim(self.trigger());
         if let Some(scope) = &mut claim.scope {
             scope.participant = self.participant.clone();
+            if self.participant.is_some() {
+                scope.delivery = self.participant_delivery.clone();
+            }
         }
         let leg = self
             .runtime
