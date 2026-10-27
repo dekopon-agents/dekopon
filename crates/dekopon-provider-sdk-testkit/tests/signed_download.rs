@@ -79,7 +79,8 @@ impl Capability for Fetch {
                     .map(|body| body.read_all())
                     .transpose()
                     .map_err(Failed::Asset)?;
-                writeln!(out, "{}", json!({"status": status, "bytes": body})).map_err(Failed::Output)
+                writeln!(out, "{}", json!({"status": status, "bytes": body}))
+                    .map_err(Failed::Output)
             }
             signed::Response::Api(_) => Err(Failed::Download(signed::DownloadError {
                 code: signed::ErrorCode::Incomplete,

@@ -474,14 +474,14 @@ fn capture_stdout(
         use std::io::Read;
         if close_after == Some(0) {
             drop(stdout);
-            closed.send(()).map_err(|_cancelled| {
-                std::io::Error::other("stdout reader startup cancelled")
-            })?;
+            closed
+                .send(())
+                .map_err(|_cancelled| std::io::Error::other("stdout reader startup cancelled"))?;
             return Ok::<_, std::io::Error>(Vec::new());
         }
-        closed.send(()).map_err(|_cancelled| {
-            std::io::Error::other("stdout reader startup cancelled")
-        })?;
+        closed
+            .send(())
+            .map_err(|_cancelled| std::io::Error::other("stdout reader startup cancelled"))?;
         let mut bytes = Vec::new();
         let limit = close_after
             .unwrap_or(16 * 1024 * 1024 + 1)
