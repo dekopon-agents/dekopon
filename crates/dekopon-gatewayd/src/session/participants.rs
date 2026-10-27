@@ -298,6 +298,7 @@ pub(super) struct Inputs {
     pub cancellation: SessionCancellation,
     pub asker: ExternalSubject,
     pub table: Option<Arc<Mutex<Table>>>,
+    pub identifiers: IdSequence,
     pub assets: Arc<SessionAssets>,
     pub attachments: Arc<ReplyAttachments>,
     pub jobs: Arc<crate::jobs::Jobs>,
@@ -507,6 +508,7 @@ async fn open(inputs: &Inputs, message: &InboundMessage) -> Result<BrokerLeg, Se
     }
     let leg = result?;
     let mut leg = leg
+        .with_identifiers(inputs.identifiers.clone())
         .with_cancel_signal(inputs.cancellation.signal())
         .with_provider_attachments(Arc::clone(&inputs.attachments))
         .with_chat_asset_inputs(ChatAssetInputs::new(

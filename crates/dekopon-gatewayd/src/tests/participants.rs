@@ -696,3 +696,162 @@ async fn unmapped_shared_routes_expose_no_selectable_participant_handle() {
     assert_eq!(capability_listings(&mut observed), 1);
     assert!(observed.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_decisions() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing::Instrument as _;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let _subscriber = tracing_subscriber::registry()
+        .with(capture.clone())
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("participant-ids")))
+        .set_default();
+    let directory = temporary();
+    let socket = directory.path().join("broker.sock");
+    let config_path = directory.path().join("broker.json");
+    let policy_path = directory.path().join("policies.cedar");
+    fs::write(
+        &policy_path,
+        r#"
+        @id("prompt") permit(principal, action == Dekopon::Action::"agent.prompt", resource);
+        @id("capability") permit(principal, action == Dekopon::Action::"cli-probe.upper", resource);
+    "#,
+    )
+    .unwrap();
+    fs::write(&config_path, serde_json::to_vec(&json!({
+        "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
+        "socketPath": socket, "policiesPath": policy_path,
+        "providers": [dekopon_test_support::provider_fixture("cli-probe-provider.wasm")],
+        "identities": [{"uid": crate::current_uid(), "principal": "gateway",
+            "actor": {"type":"service", "principal":"gateway"}, "attestor":{"namespaces":["slack"]}}],
+        "principals": {"asker":{"subjects":["slack.t0123abc.u9xyz"]},
+            "ana":{"subjects":["slack.t0123abc.u8xyz"]}, "space":{"subjects":["slack.t0123abc.c0123abc"]}},
+        "capabilities":{"cli-probe":{"constraints":{"timeoutMs":30000}, "capabilities":{"cli-probe.upper":{}}}}
+    })).unwrap()).unwrap();
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    dekopon_brokerd::enable_test_component_memoization();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let broker_task = tokio::spawn(
+        dekopon_brokerd::run(
+            config_path,
+            async move {
+                stopped.await.unwrap();
+            },
+            dekopon_brokerd::ShutdownDeadline::default(),
+        )
+        .with_current_subscriber(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !socket.exists() {
+            assert!(!broker_task.is_finished(), "broker starts");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("broker socket ready");
+    let broker = ResolvedBroker {
+        socket_path: socket,
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let mut second = script_call("probe upper --text participant");
+    second.tool_calls[0].function.arguments =
+        json!({"command":"probe upper --text participant","as":"p2"}).to_string();
+    let models = InterruptibleModel::new([
+        answer("draft"),
+        script_call("probe upper --text asker"),
+        second,
+        answer("done"),
+    ]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = shared_route();
+    route.limits.max_steps = 6;
+    let root = tracing::info_span!(parent: None, "gateway.participant-id-test");
+    let task = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            speaker(9, "asker request"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .instrument(root)
+        .with_current_subscriber(),
+    );
+    models.wait_until_entered().await;
+    run_session(
+        runner,
+        route,
+        speaker(8, "participant request"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    models.release();
+    finish(task).await;
+    stop.send(()).unwrap();
+    broker_task.await.unwrap().unwrap();
+    provider.force_flush().unwrap();
+    let decisions = capture.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("audit.event", "broker.decision"),
+            ("decision.allowed", "true"),
+        ],
+    );
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|r| r.field("participant.handle"))
+            .collect::<Vec<_>>(),
+        [Some("p1"), Some("p2")]
+    );
+    let invocations = decisions
+        .iter()
+        .map(|r| r.field("invocation.id").unwrap())
+        .collect::<Vec<_>>();
+    let session_trace = exported
+        .0
+        .lock()
+        .iter()
+        .find(|s| s.name == "gateway.session")
+        .unwrap()
+        .span_context
+        .trace_id()
+        .to_string();
+    assert!(invocations.iter().all(|id| id.starts_with(&session_trace)));
+    assert_ne!(invocations[0], invocations[1]);
+    let references = decisions
+        .iter()
+        .map(|r| {
+            (
+                r.field("decision.id").unwrap(),
+                r.field("authorized.by").unwrap(),
+                r.field("policy.digest").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(references[0].1, references[1].1);
+    assert_eq!(references[0].2, references[1].2);
+    assert_ne!(references[0], references[1]);
+    provider.shutdown().unwrap();
+}

@@ -233,7 +233,7 @@ Prompt injection is not defended against, and this is the change that matters to
 
 On a `oneShot` route an instruction embedded in a pull-request body, an issue comment, or a fetched page reaches the model and dies with the session that read it. Authorized participant steers join that session; the next session starts from an empty prompt, so its blast radius is one session's proposals.
 
-The companion handle change makes a participant’s authority spendable during any turn they speak in, bounded by that participant ∩ space. Text may still persuade the model to spend within that envelope for someone else; attribution records the pairing rather than proving the model’s purpose. Until that change lands, scripts use the asker’s leg.
+On a mapped channel a participant’s authority is spendable during any turn they speak in, bounded by that participant ∩ space. Scripts default to the asker’s handle and can select another current participant’s handle with `as`. Text may still persuade the model to spend within that envelope for someone else; attribution records the pairing rather than proving the model’s purpose.
 
 With history it stays. The injected text — or the model's own answer restating it — sits in the prompt for the rest of that conversation, up to `maxTurns`, up to `maxBytes`, up to the idle timeout, and every subsequent turn in that conversation is evaluated with it present. A person who asks three follow-ups after the poisoned message is asking all three with the injection in scope.
 

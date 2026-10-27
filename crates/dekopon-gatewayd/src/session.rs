@@ -2233,6 +2233,8 @@ async fn session_turn(
             return MessageOutcome::Failed.into();
         }
     };
+    let identifiers = IdSequence::for_session();
+    let leg = leg.with_identifiers(identifiers.clone());
     let space_grants = match route.memory {
         MemoryPolicy::Persistent(MemoryWindow {
             scope: MemoryScope::SharedConversation,
@@ -2720,6 +2722,7 @@ async fn session_turn(
             key: (message.transport.clone(), message.conversation.key()),
             cancellation: cancellation.clone(),
             asker: message.subject.clone(),
+            identifiers: identifiers.clone(),
             table: participant_table.clone(),
             assets: Arc::clone(&assets),
             attachments: Arc::clone(&attachments),
@@ -3216,6 +3219,7 @@ async fn session_turn(
                 claim,
                 steers.user_text(&message.text),
                 DeliveredAnswer::accepted_by_transport(answer),
+                &identifiers,
             )
             .await;
         }
@@ -3532,6 +3536,7 @@ async fn record_delivered_turn(
     claim: Attestation,
     user: String,
     assistant: DeliveredAnswer,
+    identifiers: &IdSequence,
 ) {
     let MessageId::Native(message_id) = &message.message_id else {
         tracing::debug!(
@@ -3550,7 +3555,6 @@ async fn record_delivered_turn(
         return;
     };
     let result: Result<(), MemoryRecordFailure> = async {
-        let identifiers = IdSequence::for_session();
         let client = runner
             .broker
             .leg_client()

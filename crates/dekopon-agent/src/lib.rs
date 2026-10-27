@@ -376,6 +376,12 @@ impl BrokerLeg {
     }
 
     #[must_use]
+    pub fn with_identifiers(mut self, identifiers: IdSequence) -> Self {
+        self.identifiers = identifiers;
+        self
+    }
+
+    #[must_use]
     pub fn with_participant(mut self, participant: &str) -> Self {
         if let Some(scope) = self
             .attestation
@@ -1203,9 +1209,10 @@ async fn write_child_stdout(stdout: OwnedFd, bytes: &[u8]) -> std::io::Result<()
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
 pub struct IdSequence {
     parent: TraceParent,
-    next: AtomicU32,
+    next: Arc<AtomicU32>,
 }
 
 #[cfg(unix)]
@@ -1214,7 +1221,7 @@ impl IdSequence {
     pub fn for_session() -> Self {
         Self {
             parent: session_trace_parent(),
-            next: AtomicU32::new(1),
+            next: Arc::new(AtomicU32::new(1)),
         }
     }
 
