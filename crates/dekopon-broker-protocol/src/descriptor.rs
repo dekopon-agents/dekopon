@@ -184,6 +184,7 @@ impl DescriptorStream {
         };
         if let Some(error) = error {
             self.receive_error = Some(error);
+            descriptors.pop().map(std::mem::forget);
             return Err(io::Error::other("invalid broker frame descriptors"));
         }
         self.received.extend(descriptors);
