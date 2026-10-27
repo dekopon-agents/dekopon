@@ -488,6 +488,10 @@ identifiers (`slack.t0123abc.u9xyz`), never the chat message that prompted the i
 records the claimed subject and its `outcome` with no `via`, because no attested context was
 derived.
 
+Broker decision records also accept `transport.kind = fauxlack` and
+`delivery.kind = fauxlack` for disposable chat tests, with the same asker and mapped-space
+verdicts and conversation coordinates as Slack. Published transports do not produce these values.
+
 ## Gateway spans
 
 `dekopon-gatewayd` opens a message's trace in the transport that received it and wraps the routed message in
@@ -495,7 +499,7 @@ two further spans of its own:
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
+| `transport.receive` | `transport.kind` (`fauxlack`, `slack`, `discord`, `telegram`, `whatsapp`, `github`, `local`), `message.id`, `drop.reason`, `mention.roles`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `follow-inactive`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only); `failed` and `reply-failed` set the span status to `Error`. A message that waited behind the conversation's running turn links that turn's `gateway.message` |
 | `gateway.session` | `agent`, `generation.digest`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg, the model session and the terminal reply, and ends once that reply's delivery is recorded |
 | `memory.persist` | no fields; a child of `gateway.message` opened after `gateway.session` ends, for every turn the journal records, including a declined turn and a reply that failed to deliver; it wraps the memory routines' summary `model.complete` calls and the journal append |
