@@ -31,6 +31,8 @@ pub struct DescriptorStream {
     pub(crate) descriptor_limit: usize,
     #[cfg(test)]
     pub(crate) receive_capacity: usize,
+    #[cfg(test)]
+    pub(crate) delivered_inodes: Vec<u64>,
 }
 
 impl DescriptorStream {
@@ -44,6 +46,8 @@ impl DescriptorStream {
             descriptor_limit: MAX_DESCRIPTORS_PER_FRAME,
             #[cfg(test)]
             receive_capacity: MAX_KERNEL_DESCRIPTORS_PER_MESSAGE,
+            #[cfg(test)]
+            delivered_inodes: Vec::new(),
         }
     }
 
@@ -149,6 +153,13 @@ impl DescriptorStream {
                 descriptors.extend(rights);
             }
         }
+        #[cfg(test)]
+        self.delivered_inodes.extend(
+            descriptors
+                .iter()
+                .filter_map(|descriptor| rustix::fs::fstat(descriptor).ok())
+                .map(|stat| stat.st_ino),
+        );
         // macOS has no MSG_CMSG_CLOEXEC, so every received descriptor must be secured before it is
         // exposed.
         #[cfg(not(target_os = "linux"))]

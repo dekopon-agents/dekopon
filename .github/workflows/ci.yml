@@ -262,6 +262,7 @@ jobs:
         with:
           shared-key: macos-descriptors-v1
           cache-bin: "false"
+          save-if: "false"
       - name: Test broker-protocol descriptor passing
         run: cargo test -p dekopon-broker-protocol --all-features --locked
 

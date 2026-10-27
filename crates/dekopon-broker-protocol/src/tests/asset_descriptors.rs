@@ -258,12 +258,19 @@ fn a_truncated_descriptor_receive_is_refused_and_leaves_none_open() {
                 .map(|metadata| metadata.ino())
                 .filter(|inode| sent.contains(inode))
                 .collect();
-            let undelivered: BTreeSet<_> =
-                sent[sent.len() - open.len()..].iter().copied().collect();
+            let delivered: BTreeSet<_> = reader.delivered_inodes.iter().copied().collect();
+            let undelivered: BTreeSet<_> = sent
+                .iter()
+                .copied()
+                .filter(|inode| !delivered.contains(inode))
+                .collect();
+            assert!(!delivered.is_empty() && !undelivered.is_empty());
             assert!(
-                !open.contains(&sent[0]) && open == undelivered,
-                "delivered descriptors left open: sent {sent:?}, open {open:?}"
+                open.is_disjoint(&delivered),
+                "delivered descriptors left open: delivered {delivered:?}, open {open:?}"
             );
+            #[cfg(target_os = "macos")]
+            assert_eq!(open, undelivered);
             #[cfg(target_os = "linux")]
             assert!(open.is_empty());
         });
