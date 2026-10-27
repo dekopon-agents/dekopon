@@ -131,32 +131,6 @@ impl Serialize for DataUrl<'_> {
     }
 }
 
-struct ByteCounter(usize);
-
-impl std::io::Write for ByteCounter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.saturating_add(buffer.len());
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Counts bytes first to size the buffer exactly, since ureq's default doubling-Vec serialization
-/// allocated 89.5 MB for a 44.7 MB request body, the largest single allocation in the image path.
-pub(crate) fn compact_json_body<T>(body: &T) -> Result<Vec<u8>, serde_json::Error>
-where
-    T: Serialize + ?Sized,
-{
-    let mut counter = ByteCounter(0);
-    serde_json::to_writer(&mut counter, body)?;
-    let mut buffer = Vec::with_capacity(counter.0);
-    serde_json::to_writer(&mut buffer, body)?;
-    Ok(buffer)
-}
-
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -177,9 +151,23 @@ pub enum ModelMessage {
         content: String,
         tool_call_id: ToolCallId,
     },
+    #[serde(untagged)]
+    Journal {
+        message: crate::replay::ReplayMessage,
+    },
 }
 
 impl ModelMessage {
+    pub(crate) fn admits_opaque(&self, identity: &ModelKey) -> bool {
+        match self {
+            Self::Assistant { turn } => {
+                turn.model_key() == Some(identity) && turn.has_opaque_reasoning()
+            }
+            Self::Journal { message } => message.admits_opaque(identity),
+            Self::System { .. } | Self::User { .. } | Self::ToolResults { .. } => false,
+        }
+    }
+
     pub fn for_metering(&self) -> Cow<'_, Self> {
         match self {
             Self::User {
@@ -205,7 +193,8 @@ impl ModelMessage {
                 content: MessageContent::Text(_),
             }
             | Self::Assistant { .. }
-            | Self::ToolResults { .. } => Cow::Borrowed(self),
+            | Self::ToolResults { .. }
+            | Self::Journal { .. } => Cow::Borrowed(self),
         }
     }
 
@@ -237,7 +226,8 @@ impl ModelMessage {
                 content: MessageContent::Text(_),
             }
             | Self::Assistant { .. }
-            | Self::ToolResults { .. } => Cow::Borrowed(self),
+            | Self::ToolResults { .. }
+            | Self::Journal { .. } => Cow::Borrowed(self),
         }
     }
 
@@ -277,6 +267,7 @@ impl ModelMessage {
     #[must_use]
     pub const fn role(&self) -> &'static str {
         match self {
+            Self::Journal { message } => message.role(),
             Self::System { .. } => "system",
             Self::User { .. } => "user",
             Self::Assistant { .. } => "assistant",
@@ -287,6 +278,7 @@ impl ModelMessage {
     #[must_use]
     pub fn content(&self) -> Option<&str> {
         match self {
+            Self::Journal { message } => message.content(),
             Self::System { content } | Self::ToolResults { content, .. } => Some(content),
             Self::User { content } => content.as_text(),
             Self::Assistant { turn } => turn.content.as_deref(),

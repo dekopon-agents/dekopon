@@ -303,13 +303,16 @@ impl Journal {
     pub fn seal(&self, stem: &str, at: SystemTime) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         let _assets = AssetSync(self);
+        let path = self.seal_path(stem);
+        let temporary = path.with_extension("sealed.tmp");
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
-            .open(self.seal_path(stem))?;
+            .open(&temporary)?;
         serde_json::to_writer(&mut file, &Seal { at_ms: millis(at) }).map_err(io::Error::from)?;
+        std::fs::rename(temporary, path)?;
         Ok(())
     }
 
@@ -318,8 +321,6 @@ impl Journal {
         stem: &str,
         forget_after: Duration,
     ) -> Result<Option<SealedConversation>, JournalError> {
-        let _lock = self.lock.lock();
-        let _assets = AssetSync(self);
         self.read_seal(stem, forget_after)
     }
 
@@ -463,21 +464,14 @@ impl Journal {
         let mut bytes = Vec::new();
         file.take(MAX_SEAL_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_SEAL_BYTES {
-            remove(&path);
             return Err(JournalError::Corrupt);
         }
         match serde_json::from_slice::<Seal>(&bytes) {
             Ok(seal) => match UNIX_EPOCH.checked_add(Duration::from_millis(seal.at_ms)) {
                 Some(at) => Ok(Some(SealedConversation { at })),
-                None => {
-                    remove(&path);
-                    Err(JournalError::Corrupt)
-                }
+                None => Err(JournalError::Corrupt),
             },
-            Err(_) => {
-                remove(&path);
-                Err(JournalError::Corrupt)
-            }
+            Err(_) => Err(JournalError::Corrupt),
         }
     }
 
@@ -2538,7 +2532,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_seal_is_removed() {
+    fn a_corrupt_seal_is_refused_without_mutating_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -2548,11 +2542,11 @@ mod tests {
             journal.sealed(&stem, RETENTION),
             Err(JournalError::Corrupt)
         ));
-        assert!(!path.exists());
+        assert!(path.exists());
     }
 
     #[test]
-    fn an_oversized_seal_is_removed() {
+    fn an_oversized_seal_is_refused_without_mutating_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
         let stem = key().journal_stem();
@@ -2564,7 +2558,7 @@ mod tests {
             journal.sealed(&stem, RETENTION),
             Err(JournalError::Corrupt)
         ));
-        assert!(!path.exists());
+        assert!(path.exists());
     }
 
     #[test]

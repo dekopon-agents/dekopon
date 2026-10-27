@@ -1250,10 +1250,12 @@ name = "dekopon-model"
 version = "0.62.0"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
  "dekopon-core",
  "dekopon-model-token-governor",
  "futures-util",
  "http",
+ "http-body",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",

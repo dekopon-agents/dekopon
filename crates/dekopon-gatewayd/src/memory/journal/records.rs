@@ -1,3 +1,5 @@
+mod walk;
+
 use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
@@ -610,6 +612,45 @@ impl Journal {
     }
 }
 
+fn validate_header(header: &Header, body_len: u64) -> Result<(), JournalError> {
+    let valid_plan = match &header.plan {
+        Some(plan) => {
+            !plan.parts.is_empty()
+                && plan.parts.len() <= usize::from(u8::MAX)
+                && plan.parts.len() == header.summaries.len()
+        }
+        None => header.summaries.is_empty(),
+    };
+    if !valid_plan
+        || header.body_len != body_len
+        || body_len < 8
+        || header.spans.iter().any(|span| {
+            span.rel_offset
+                .checked_add(span.len)
+                .is_none_or(|end| end > body_len)
+        })
+        || header.id.0.get().checked_add(1) != Some(header.next_record_id.get())
+    {
+        return Err(JournalError::Corrupt);
+    }
+    Ok(())
+}
+
+impl Journal {
+    pub(crate) fn record_window(
+        &self,
+        stem: &str,
+        limit: NonZeroUsize,
+    ) -> Result<Option<Snapshot>, JournalError> {
+        let file = match File::open(self.path(stem)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        walk::window(file, limit).map(Some)
+    }
+}
+
 fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, JournalError> {
     let end = file.metadata()?.len();
     let file = Arc::new(file);
@@ -682,29 +723,8 @@ fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, 
         if line.starts_with(b"{\"h\":") {
             let header = decode_line::<HeaderLine>(&line)?.h;
             let (body_at, body_len) = body.take().ok_or(JournalError::Corrupt)?;
-            let valid_plan = match &header.plan {
-                Some(plan) => {
-                    !plan.parts.is_empty()
-                        && plan.parts.len() <= usize::from(u8::MAX)
-                        && plan.parts.len() == header.summaries.len()
-                }
-                None => header.summaries.is_empty(),
-            };
-            if !valid_plan {
-                return Err(JournalError::Corrupt);
-            }
-            if header.body_len != body_len
-                || header.spans.iter().any(|span| {
-                    span.rel_offset
-                        .checked_add(span.len)
-                        .is_none_or(|end| end > body_len)
-                })
-            {
-                return Err(JournalError::Corrupt);
-            }
-            if header.id.0.get().checked_add(1) != Some(header.next_record_id.get())
-                || next_id.is_some_and(|next| next != header.id.0)
-            {
+            validate_header(&header, body_len)?;
+            if next_id.is_some_and(|next| next != header.id.0) {
                 return Err(JournalError::Corrupt);
             }
             first_id.get_or_insert(header.id);

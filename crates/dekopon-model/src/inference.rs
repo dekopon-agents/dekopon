@@ -120,7 +120,10 @@ pub(crate) async fn retry_opaque(
     progress: &mut crate::http::Progress,
 ) -> Result<AssistantTurn, InferenceError> {
     let identity = model.resolved_key();
-    let admitted = request.messages.iter().any(|message| matches!(message, ModelMessage::Assistant { turn } if turn.model_key() == Some(&identity) && turn.has_opaque_reasoning()));
+    let admitted = request
+        .messages
+        .iter()
+        .any(|message| message.admits_opaque(&identity));
     let mut stream = ReplayStream {
         verified: !admitted,
         held: String::new(),
@@ -150,6 +153,9 @@ pub(crate) async fn retry_opaque(
                 ModelMessage::Assistant { turn } => {
                     crate::model::assistant_message(&turn.without_opaque())
                 }
+                ModelMessage::Journal { message } => ModelMessage::Journal {
+                    message: message.without_opaque(),
+                },
                 ModelMessage::System { .. }
                 | ModelMessage::User { .. }
                 | ModelMessage::ToolResults { .. } => message.clone(),
