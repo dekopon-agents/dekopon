@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-10-27
+
+### Added
+
+- dekopon-provider-sdk-testkit can script one signed download redirect for providers that import dekopon:http/signed-download
+- An in-process fauxlack chat service supports disposable multi-participant gateway tests behind the fauxlack feature.
+
+### Fixed
+
+- Shell expansions and read honor the scoped IFS value, including empty fields, quoted joins and escaped input.
+
+## [dekopon-chart-0.49.0] - 2026-10-27
+
+### Changed
+
+- Chart 0.49.0 targets core v0.62.0 and renders the `v0.62.0` image tag.
+
 ## [0.61.1] - 2026-10-27
 
 ### Fixed

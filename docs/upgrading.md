@@ -8,6 +8,33 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Shell IFS handling in the bash tool (0.62.0)
+
+No configuration change or provider re-pin is required for existing deployments. Unquoted
+parameter expansions and command substitutions now split using the scoped `IFS`: unset uses
+space, tab and newline; empty disables splitting; nonwhite delimiters preserve leading and
+adjacent empty fields. Quoted `$*` and `${NAME[*]}` join with the first IFS character, while
+quoted `$@` and `${NAME[@]}` preserve element boundaries. Function-local and command-prefix
+IFS assignments follow their scope rather than changing the enclosing value.
+
+Named `read` uses the current IFS, leaves the remainder in the last name, and binds missing
+fields to empty values. With no names it assigns the unsplit line to `REPLY`. Default `read`
+removes backslash quoting and joins backslash-newline continuations; `read -r` preserves
+backslashes. `IFS= read -r line` preserves input text for that command. Bash combinations
+that would produce invalid UTF-8 fail explicitly instead of producing invalid shell values.
+Review scripts that depended on the former whitespace-only splitting or inert `read -r`.
+
+The in-process fauxlack service is behind the off-by-default `fauxlack` feature and is absent
+from the release image. Its new transport configuration is for embedded tests, not an operator
+migration. The signed-download changes in #792 extend the testkit and its test-only host
+transport; they require no production provider, WIT or grant changes.
+
+Upgrade with a binary swap. Reverting both daemons from 0.62.0 to 0.61.1 is revert-safe for
+existing deployment configuration and stored data: these changes add no production wire or
+persisted-state format. Scripts using the corrected IFS and read behavior revert to the old
+semantics; a test configuration using the new fauxlack transport must be removed before
+running 0.61.1, whose transport enum does not accept it.
+
 ## The bash tool's as is inert on unmapped routes (0.61.1)
 
 No configuration change or provider re-pin is required. In 0.61.0, any `as` value on an unmapped
