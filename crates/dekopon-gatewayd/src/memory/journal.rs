@@ -461,18 +461,7 @@ impl Journal {
         {
             return Ok(None);
         }
-        let mut bytes = Vec::new();
-        file.take(MAX_SEAL_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_SEAL_BYTES {
-            return Err(JournalError::Corrupt);
-        }
-        match serde_json::from_slice::<Seal>(&bytes) {
-            Ok(seal) => match UNIX_EPOCH.checked_add(Duration::from_millis(seal.at_ms)) {
-                Some(at) => Ok(Some(SealedConversation { at })),
-                None => Err(JournalError::Corrupt),
-            },
-            Err(_) => Err(JournalError::Corrupt),
-        }
+        parse_seal(file).map(Some)
     }
 
     pub fn recall(
@@ -873,7 +862,29 @@ impl Journal {
             let stale = match path.extension() {
                 Some(extension) if extension == SEAL_EXTENSION => {
                     let modified = entry.metadata()?.modified()?;
-                    seal_cutoff.is_some_and(|limit| modified < limit)
+                    if seal_cutoff.is_some_and(|limit| modified < limit) {
+                        true
+                    } else {
+                        match File::open(&path)
+                            .map_err(JournalError::from)
+                            .and_then(parse_seal)
+                        {
+                            Err(JournalError::Corrupt) => {
+                                remove(&path);
+                                tracing::warn!(
+                                    event = "gateway_journal_reset",
+                                    reason = "corrupt",
+                                    "gateway.journal.reset"
+                                );
+                                false
+                            }
+                            Err(JournalError::Io {
+                                kind: io::ErrorKind::NotFound,
+                            }) => false,
+                            Err(error) => return Err(error),
+                            Ok(_) => false,
+                        }
+                    }
                 }
                 Some(extension) if extension == FOLLOW_EXTENSION => {
                     read_follow_marker(&path)?.is_some_and(|marker| marker.until_ms <= millis(now))
@@ -930,6 +941,19 @@ fn read_follow_marker(path: &Path) -> io::Result<Option<FollowMarker>> {
     Ok(serde_json::from_slice::<FollowMarker>(&bytes)
         .ok()
         .filter(|marker| marker.at_ms < marker.until_ms))
+}
+
+fn parse_seal(file: File) -> Result<SealedConversation, JournalError> {
+    let mut bytes = Vec::new();
+    file.take(MAX_SEAL_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SEAL_BYTES {
+        return Err(JournalError::Corrupt);
+    }
+    let seal = serde_json::from_slice::<Seal>(&bytes).map_err(|_invalid| JournalError::Corrupt)?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(seal.at_ms))
+        .map(|at| SealedConversation { at })
+        .ok_or(JournalError::Corrupt)
 }
 
 fn remove(path: &Path) {
@@ -2559,6 +2583,30 @@ mod tests {
             Err(JournalError::Corrupt)
         ));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_corrupt_seal_survives_an_unlocked_read_and_is_removed_by_maintenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(dir.path(), RETENTION, RETENTION).expect("open");
+        let corrupt = journal.seal_path(&key().journal_stem());
+        let mut oversized = br#"{"atMs":1}"#.to_vec();
+        oversized.resize((MAX_SEAL_BYTES + 1) as usize, b' ');
+        let oversized_path = journal.seal_path("oversized");
+        let valid = journal.seal_path("valid");
+        fs::write(&corrupt, b"not a marker").unwrap();
+        fs::write(&oversized_path, oversized).unwrap();
+        fs::write(&valid, br#"{"atMs":1}"#).unwrap();
+        assert!(journal.sealed(&key().journal_stem(), RETENTION).is_err());
+        assert!(corrupt.exists());
+        journal.expire(SystemTime::now()).unwrap();
+        assert!(!corrupt.exists());
+        assert!(!oversized_path.exists());
+        assert!(valid.exists());
+        fs::write(&corrupt, b"not a marker").unwrap();
+        drop(journal);
+        Journal::open(dir.path(), RETENTION, RETENTION).expect("reopen");
+        assert!(!corrupt.exists());
     }
 
     #[test]
