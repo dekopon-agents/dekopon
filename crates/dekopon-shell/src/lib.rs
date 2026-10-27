@@ -309,6 +309,10 @@ pub fn render_run(call: RunCall, parsed: Option<CommandRun>, streams: Streams) -
 }
 
 pub trait CapabilityInvoker: Send + Sync {
+    fn participant_handle(&self) -> Option<&str> {
+        None
+    }
+
     fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
         Vec::new()
     }
@@ -370,6 +374,10 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 }
 
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
+    fn participant_handle(&self) -> Option<&str> {
+        self.as_ref().participant_handle()
+    }
+
     fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
         self.as_ref().cancel_signals()
     }

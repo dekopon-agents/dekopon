@@ -5,7 +5,7 @@ use std::{
 };
 
 use dekopon_agent::{BrokerLeg, current_trace_parent};
-use dekopon_broker_protocol::{TraceParent, Trigger};
+use dekopon_broker_protocol::{DeliveryIdentity, TraceParent, Trigger};
 use dekopon_core::AgentId;
 use dekopon_process::{
     CancelHandle, CancelSignal, ExitCode, JobId, JobOutcome, JobState, JobSummary, JobWait,
@@ -532,6 +532,8 @@ pub(crate) struct JobContext {
     runtime: tokio::runtime::Handle,
     limits: ShellLimits,
     origin: Origin,
+    participant: Option<String>,
+    participant_delivery: Option<DeliveryIdentity>,
 }
 
 impl JobContext {
@@ -542,6 +544,12 @@ impl JobContext {
         broker: ResolvedBroker,
         limits: ShellLimits,
     ) -> Self {
+        let participant_delivery = match &message.message_id {
+            MessageId::Native(id) | MessageId::Follow(id) => {
+                crate::session::delivery_identity(message, id, &anchor.claim(Trigger::Job))
+            }
+            MessageId::Job { .. } | MessageId::Wake { .. } | MessageId::Github(_) => None,
+        };
         Self {
             jobs,
             owner: JobOwner::of(message),
@@ -550,7 +558,14 @@ impl JobContext {
             runtime: tokio::runtime::Handle::current(),
             limits,
             origin: Origin::Turn,
+            participant: None,
+            participant_delivery,
         }
+    }
+
+    pub(crate) fn with_participant(mut self, handle: Option<&str>) -> Self {
+        self.participant = handle.map(str::to_owned);
+        self
     }
 
     #[cfg(test)]
@@ -581,6 +596,8 @@ impl JobContext {
             runtime,
             limits,
             origin: Origin::Tree(Trigger::Probe),
+            participant: None,
+            participant_delivery: None,
         }
     }
 
@@ -603,12 +620,16 @@ impl JobContext {
                 );
             })
             .ok()?;
+        let mut claim = self.anchor.claim(self.trigger());
+        if let Some(scope) = &mut claim.scope {
+            scope.participant = self.participant.clone();
+            if self.participant.is_some() {
+                scope.delivery = self.participant_delivery.clone();
+            }
+        }
         let leg = self
             .runtime
-            .block_on(BrokerLeg::connect(
-                client,
-                Some(self.anchor.claim(self.trigger())),
-            ))
+            .block_on(BrokerLeg::connect(client, Some(claim)))
             .inspect_err(|error| {
                 tracing::warn!(
                     event = "gateway_job_leg_unavailable",

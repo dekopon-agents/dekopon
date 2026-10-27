@@ -35,7 +35,8 @@ fn synthetic_records_have_live_traces_and_process_scoped_identity() {
     assert_ne!(first.id, other.id);
     let nonce = |turn: &dekopon_broker_protocol::DeliveredTurnRequest| match &turn.delivery {
         dekopon_broker_protocol::DeliveryIdentity::Local { boot_nonce, .. } => boot_nonce.clone(),
-        dekopon_broker_protocol::DeliveryIdentity::Slack { .. }
+        dekopon_broker_protocol::DeliveryIdentity::Fauxlack { .. }
+        | dekopon_broker_protocol::DeliveryIdentity::Slack { .. }
         | dekopon_broker_protocol::DeliveryIdentity::Discord { .. }
         | dekopon_broker_protocol::DeliveryIdentity::Telegram { .. }
         | dekopon_broker_protocol::DeliveryIdentity::Whatsapp { .. }

@@ -342,6 +342,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     let root = temporary();
     let path = write_config(root.path(), &document(root.path()));
     let before = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -354,6 +355,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["telemetry"] = serde_json::Value::Null;
     write_config(root.path(), &edited);
     let after = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -368,6 +370,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["telemetry"] = serde_json::Value::Null;
     write_config(root.path(), &edited);
     let equivalent = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -380,6 +383,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["sessions"]["maxConcurrent"] = json!(config::SessionsConfig::default().max_concurrent);
     write_config(root.path(), &edited);
     let explicit_default = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -392,6 +396,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
     edited["futureLive"] = json!(true);
     write_config(root.path(), &edited);
     let unknown = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -408,6 +413,7 @@ async fn snapshot_classifies_resident_changes_separately_from_models_and_indicat
         .await
         .expect("05 indicator schema resolves");
     let indicators = config::GatewaySources {
+        ca_bundles: Default::default(),
         config: config::source_snapshot(&path, None, crate::current_uid())
             .await
             .unwrap(),
@@ -1199,6 +1205,7 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
 fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
     let variable = "DEKOPON_GATEWAYD_TEST_MODEL_KEY_4F1A62";
     let model = |api_key_env: Option<&str>| ModelConfig::OpenaiCompatible {
+        ca_bundles: Default::default(),
         name: "fast".to_owned(),
         endpoint: "http://127.0.0.1:8080/v1/chat/completions".to_owned(),
         model: "qwen3".to_owned(),
@@ -1963,6 +1970,7 @@ async fn authorize_github_fixture(
         inbound.subject,
         "reviewer".parse().unwrap(),
         ChatScopeClaim {
+            participant: None,
             transport: inbound.transport.parse().unwrap(),
             kind: inbound.transport_kind,
             conversation: inbound.conversation,
@@ -3244,6 +3252,7 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
         PathBuf::from("/tmp/dekopon-gatewayd.json"),
         &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/1000")), None),
         501,
+        crate::config::LoadMode::Boot,
     )
     .expect("discovery resolves");
 
@@ -4432,6 +4441,7 @@ fn shared_window() -> MemoryWindow {
 
 fn model_config() -> ModelConfig {
     ModelConfig::OpenaiCompatible {
+        ca_bundles: Default::default(),
         name: "local-qwen".to_owned(),
         endpoint: "http://127.0.0.1:1/v1".to_owned(),
         model: "qwen3".to_owned(),
@@ -4490,6 +4500,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
         inbound.subject.clone(),
         "reviewer".parse().expect("agent"),
         dekopon_broker_protocol::ChatScopeClaim {
+            participant: None,
             transport: "support-whatsapp".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
             conversation: inbound.conversation.clone(),
@@ -17880,6 +17891,7 @@ mod jobs_burn_in;
 mod jobs_e2e;
 #[path = "tests/memory_notice.rs"]
 mod memory_notice;
+mod participants;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
 #[path = "tests/sealed_handoff.rs"]
@@ -17952,6 +17964,7 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         message.subject.clone(),
         route.agent.clone(),
         dekopon_broker_protocol::ChatScopeClaim {
+            participant: None,
             transport: message.transport.parse().unwrap(),
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
@@ -20715,9 +20728,12 @@ async fn collected_media_never_crosses_a_removed_or_replaced_route() {
             Duration::from_secs(1),
             crate::collection::Collector::new(&[], 4),
         ));
-        for text in ["first", "second"] {
+        for (index, text) in ["first", "second"].into_iter().enumerate() {
             let mut inbound = message(text);
             inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+            inbound.subject = ExternalSubject::telegram("123").unwrap();
+            inbound.conversation.id = "123".into();
+            inbound.message_id = MessageId::Native((index + 1).to_string());
             inbound.native_group = Some("group".into());
             tx.send(TransportEvent::Message(Box::new(inbound)))
                 .await
@@ -21213,6 +21229,7 @@ fn active_routes(config: &crate::ResolvedConfig) -> RoutingTable {
 async fn gateway_sources(config: &crate::ResolvedConfig) -> config::GatewaySources {
     let catalog = LocalCatalog::load(&config.catalog_path).unwrap();
     config::GatewaySources {
+        ca_bundles: config.ca_sources.clone(),
         config: config::source_snapshot(&config.source, None, crate::current_uid())
             .await
             .unwrap(),
@@ -21263,6 +21280,56 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
         crate::GatewaydError::Probe(problem) if problem.model == "router"
     )));
     assert_eq!(vendor.asked.lock().as_slice(), ["vendor/refused"]);
+}
+
+#[tokio::test]
+async fn model_ca_only_changes_reprobe_otherwise_unchanged_models() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: probe_environment,
+    };
+    let root = temporary();
+    fs::write(
+        root.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .unwrap();
+    let ca = root.path().join("roots.pem");
+    let generate_ca = || {
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .unwrap()
+            .cert
+            .pem()
+    };
+    fs::write(&ca, generate_ca()).unwrap();
+    let mut document = document(root.path());
+    document["extraCABundles"] = json!([ca]);
+    document["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(openrouter_model("router", "vendor/accepted", 5_000));
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let active_routes = active_routes(&active);
+    let sources = gateway_sources(&active).await;
+    for changed in [false, true] {
+        if changed {
+            fs::write(&ca, generate_ca()).unwrap();
+        }
+        let (candidate, report) = crate::load_candidate_against(
+            &path,
+            None,
+            config::LoadMode::Boot,
+            Some((&crate::ProbeScope::Every, &environment)),
+            Some((&active, &sources, &active_routes)),
+        )
+        .await;
+        assert!(candidate.is_some(), "{report:?}");
+        assert!(report.problems.is_empty());
+        assert_eq!(vendor.asked.lock().len(), usize::from(changed));
+    }
+    assert_eq!(vendor.asked.lock().as_slice(), ["vendor/accepted"]);
 }
 
 #[tokio::test]

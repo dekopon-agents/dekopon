@@ -108,7 +108,7 @@ A chat claim carries a fully redacted bounded scope over configured transport ID
 canonical channel, and canonical conversation. Bounded string deserializers reject an oversized
 field while decoding, and `Attestation` renders as `[REDACTED]` whatever shape it holds.
 `RecordDeliveredTurn` carries a tagged service-specific `DeliveryIdentity` whose Slack
-channel/timestamp, Discord channel/snowflake, Telegram chat/topic/message, WhatsApp
+channel/timestamp, fauxlack channel/message (`{"kind":"fauxlack","channel":"cteam","message":"m1"}`), Discord channel/snowflake, Telegram chat/topic/message, WhatsApp
 WABA/phone-number/canonical message ID, or local transport/conversation/boot nonce is checked by
 the broker against the scope it resolves from the claim; a mismatch is a denied `invalid-turn`.
 Under the reserved `console-smoke` claim the broker substitutes its derived local transport and

@@ -229,9 +229,15 @@ impl ScriptCounters {
     }
 }
 
-pub(crate) fn command_span(name: &str, kind: CommandKind, argument_count: usize) -> tracing::Span {
+pub(crate) fn command_span(
+    name: &str,
+    kind: CommandKind,
+    argument_count: usize,
+    participant: Option<&str>,
+) -> tracing::Span {
     tracing::info_span!(
         "shell.command",
+        participant.handle = participant,
         shell.command.name = name,
         shell.command.kind = kind.label(),
         shell.command.argument_count = argument_count,

@@ -257,6 +257,35 @@ or the session ends; individual tool completions do not clear it. At a keep-aliv
 than twice its ETA (or 120 seconds without an ETA) is cleared before rendering; the ETA never counts down.
 A transport with liveness off or no active progress message still records an opted-in note.
 
+### Extra model CA bundles
+
+The optional top-level `extraCABundles` list applies to OpenRouter, OpenAI-compatible
+and ChatGPT subscription inference clients together:
+
+```yaml
+extraCABundles:
+  - /var/run/dekopon-trust/model-roots.pem
+```
+
+Omitting it or setting `[]` preserves public WebPKI trust alone. Each entry must be an
+absolute path to a regular file containing a valid, nonempty PEM certificate bundle;
+at most eight files, each 1–65,536 bytes, are accepted. Boot and reload read the files;
+`check` checks only path shape and count, while explicit `check --probe` also reads them
+for its model request. Replacing a bundle at the same path activates a new serving
+generation; sessions already running retain their original client trust.
+
+These roots supplement public roots without granting network access. A listed CA lets
+whoever holds its private key impersonate model endpoints to this gateway. No ambient
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, system trust store or proxy is consulted; redirects
+and existing timeouts are unchanged. This setting covers inference, not subscription
+OAuth refresh, OTLP export or the OCI provider manager.
+
+Mount the public PEM file read-only into the gateway at the configured absolute path
+using an operator-supplied volume mount in the rendered Deployment; the chart has no
+generic gateway extra-mount value. Deploy a gateway binary supporting this key before
+adding it to configuration: older binaries reject the unknown field. Existing broker
+CA configuration remains independent.
+
 ### OpenRouter model settings
 
 The tag is exactly `kind: openrouter`, not `openRouter`. `name`, nonblank `model`, `apiKeyEnv`
@@ -454,8 +483,9 @@ are never split. There is at most one collecting batch per compatible actor key 
 most `sessions.maxConcurrent` batches, independently of execution permits.
 
 At quiet expiry or the hard deadline, whichever comes first, the batch attempts normal admission.
-For a running conversation with mailbox room, the same sender's batch becomes a steer; another
-sender's batch queues as a follow-up. After cancellation or the turn's seal, both queue.
+For a running conversation with mailbox room, batches follow the session’s steering rule:
+on mapped shared or one-shot channels another authorized native-chat participant joins the turn;
+elsewhere the same sender steers and another sender queues. After cancellation or the turn’s seal, both queue.
 Steers and follow-ups share a 100-item mailbox. A full mailbox or exhausted execution capacity
 makes a batch eligible for a busy reply even when `replyOnBusy` is false, subject to the bounded
 refusal-reply capacity and transport delivery.
@@ -465,7 +495,8 @@ maximum (15 seconds by default); Telegram waits its fixed 3 seconds. Queueing, i
 transport time remain additional; collection does not guarantee that every group member joins one turn.
 
 New turns receive fresh broker authorization and generation selection after admission; a same-sender
-steer joins the running turn's existing leg and asset access. Collection itself does
+steer joins the running turn's existing leg and asset access. Other participants on a mapped
+shared or one-shot channel receive fresh authorization before joining its asset access. Collection itself does
 not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
 reply target and native delivery identity; other message IDs are not fabricated into an album ID.
 An authenticated stop removes only that actor's pending work and preserves the existing ownership
@@ -953,6 +984,12 @@ Unmatched messages are ignored with a debug-level `gateway_message_ignored { rea
 
 Every kind but `directMessage` — a group DM and a thread included — initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match or the bot's managed role in `mention_roles` on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Telegram and Slack Classic retain that rule on every message; an invited Discord channel/thread route with a live follow ticket accepts unmentioned messages after its bounded debounce. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. A continuation starting a new turn is authorized again and may decline to post; a same-sender steer joins the running leg. All non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
 
+The shared subject vocabulary accepts test-only `fauxlack.<tenant>.u<id>` people and
+`fauxlack.<tenant>.c<id>` spaces. The shared chat-scope kind `fauxlack` supports all four
+conversation kinds, with the container equal to the subject tenant. Channel and thread
+scopes require an `m<n>` thread; DM scopes have no thread. The published gateway has no
+fauxlack transport configuration or service. Mappings and broker grants remain required.
+
 ### Being available in a channel is not authority
 
 A route matching every channel widens no authority whatsoever, and an operator reading "available in all channels" must not read it as "available to everyone". Every session opens an attested broker leg naming the sender's canonical subject; the broker maps that subject to a principal, requires policy permitting `agent.prompt` for it, and refuses an unmapped sender before any model call is made. A catch-all route changes *where* the mapped people can reach the bot. It does not change who they are, and somebody the owner never mapped gets the same refusal in a catch-all channel that they would have got in a named one.
@@ -1159,14 +1196,18 @@ jobs in that conversation, including when no turn is active.
 
 ## Sessions
 
-Each admitted turn runs one session; same-sender messages can steer that turn, while other senders
-and wakes get their own follow-up sessions. On a `oneShot` route (`memory: { mode: oneShot }`) each
+Each admitted turn runs one session. In a mapped channel with shared or one-shot scope, every
+authorized participant’s admitted native chat message can steer that turn. Messages left queued
+at the final model step start later turns, each freshly authorized under its own subject; messages
+from different subjects are never folded together. A consumed steer never runs again.
+Only the asker interrupts or stops it. DMs, private scope, and unmapped routes retain same-sender
+steering and other-sender follow-ups; wakes and GitHub deliveries remain separate turns. On a `oneShot` route (`memory: { mode: oneShot }`) each
 session starts without prior history; the `persistent` clauses in steps 4 and 5 describe replay:
 
-1. **Admission.** A process-wide semaphore bounds concurrent work. The per-`(transport, conversation)` map is checked first: the same sender steers a running turn; other senders, wakes, and input arriving after cancellation or the turn's seal queue as follow-ups. Together steers and follow-ups hold at most 100 items, so a conversation holds at most 100 bounded messages and the gateway at most that times `sessions.maxConcurrent`. Only a full mailbox (`busy.cause = same-conversation`) or lack of a permit for a new conversation (`saturated`) refuses admission. A refusal is eligible for `I'm busy — try again shortly.` when `replyOnBusy` is set; a collected batch is eligible regardless. Sending still requires a free refusal-reply permit and successful transport delivery. Follow-ups run inline under the existing permit, with their own route, subject, fresh cancellation, broker leg and receipt trace. A conversation with a steady stream of messages keeps its permit until its mailbox is empty.
+1. **Admission.** A process-wide semaphore bounds concurrent work. The per-`(transport, conversation)` map is checked first: the running session learns mapped status from the asker’s fresh broker space downscope. In a mapped shared or one-shot channel, other native-chat participants join after fresh authorization; messages arriving while that first lookup is pending wait for its result. Every other route keeps same-sender steering and other-sender follow-ups. Wakes, GitHub deliveries, and input arriving after cancellation or the turn’s seal queue as follow-ups. Together steers and follow-ups hold at most 100 items, so a conversation holds at most 100 bounded messages and the gateway at most that times `sessions.maxConcurrent`. Only a full mailbox (`busy.cause = same-conversation`) or lack of a permit for a new conversation (`saturated`) refuses admission. A refusal is eligible for `I'm busy — try again shortly.` when `replyOnBusy` is set; a collected batch is eligible regardless. Sending still requires a free refusal-reply permit and successful transport delivery. Follow-ups run inline under the existing permit, with their own route, subject, fresh cancellation, broker leg and receipt trace. A conversation with a steady stream of messages keeps its permit until its mailbox is empty.
 2. **Authorization.** A sealed thread is first refused with outcome `sealed`: an addressed turn gets the fixed sealed-thread sentence; a follow turn posts nothing. Other sessions open an attested broker leg with `capabilities(subject, agent, scope)`. A broker-confirmed unmapped sender emits the owner notice on every refusal and is eligible for the fixed Lange-family reply under the reply cooldown. A mapped principal denied this agent, or an empty grant with principal attribution, gets the named permission reply described in [Routing](#routing). Other authentication failures and legacy refusals without typed cause or principal attribution retain `You're not authorized to use this agent.` A follow turn posts nothing. **No model call or session progress starts** on either refusal. Queued or steered input may already have received its admission acknowledgment, which does not signify authorization.
 3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing, apart from an opted-in progress note. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
-4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. Every person-originated turn's user text starts with a gateway-authored participant label naming the sender's broker principal in every scope, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered only where the route wrote `inspectAgentConfig: true`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt, followed by the chat-memory note when memory is granted, a note that the chat shows only PNG and JPEG on WhatsApp and Telegram, and one line the gateway renders from the route's limits: `[gateway: N steps, M capability calls and W minutes per message.]`, the minutes only when `maxDurationMs` is set. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. Every session also offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-process`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
+4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. Every person-originated turn's user text starts with a gateway-authored participant label naming the sender's broker principal in every scope, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime executes scripts on the asker’s attested leg by default; on mapped channels, `as` selects one current participant’s leg for the whole script. The credential-free `inspect_agent_config` view is built from the asker’s fresh leg and offered only where the route wrote `inspectAgentConfig: true`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt, followed by the chat-memory note when memory is granted, a note that the chat shows only PNG and JPEG on WhatsApp and Telegram, and one line the gateway renders from the route's limits: `[gateway: N steps, M capability calls and W minutes per message.]`, the minutes only when `maxDurationMs` is set. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. Every session also offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-process`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. On required turns, with a progress message up and no streamed answer, model failures, empty answers, step limits, and lost tasks remove that message before posting the fixed line as a fresh reply; cancellations keep the existing in-place delivery. Streamed partial answers on required turns retain their appended stop or failure line. Follow turns post no fixed failure line or partial answer, except the fixed unreported-work warning when a worked turn declines on its final step. A failed follow turn leaves no stop notice; cancellation still may leave one. An inherited Slack Agent continuation or an authorized Discord follow turn may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On a required turn's failure the sender gets the applicable fixed cause line above, or the `failed` template (`The agent could not complete this request.` by default); a follow turn instead stays silent unless capability work went unreported on its final step, when it posts the fixed audit warning but remains failed. A `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **Fixed stop/failure lines, the one-shot stop notice and attachment bytes are never stored in history.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 `steering: abort` is the route default: a same-sender message interrupts only the in-flight model
@@ -1250,7 +1291,14 @@ The conversation identity is the transport-minted conversation's own key — `id
 
 Choosing shared scope on a broad Discord channel can disclose one participant's prior prompt and the agent's answer to every other mapped participant who can invoke that route there. Treat that as an explicit audience expansion, not as a convenience toggle.
 
-Every person-originated turn, including a direct message, steer, or follow in any scope, opens with:
+On mapped channels, retained participants’ person-originated messages open with:
+
+```text
+[gateway: authenticated participant: <principal>, handle pN]
+<existing user text>
+```
+
+On other routes and for authorized overflow participants without a retained leg, the attribution is handle-free:
 
 ```text
 [gateway: authenticated participant: <principal>]
@@ -1290,9 +1338,45 @@ Without a journal, intermediate commands and output are lost across sessions. Wi
 
 Neither eviction runs on a timer. There is no sweeper task and no shutdown hook: the idle timeout is checked by the lookup that would otherwise have used the entry, and the ceiling is enforced by the write that would otherwise have exceeded it. Closing a conversation generation makes its asset metadata and byte source immediately inaccessible through every stale session; the independently bounded asset map may retain that inert metadata until its next operation prunes it. The live window dies with the process; eligible journal records survive a restart independently of window eviction.
 
+### Participant legs
+
+A mapped channel is one shared stream, with capabilities “done under the most accurately identified
+conversants identity” (owner, 2026-10-22). A native-chat message reaching admission is authorized
+before injection; this does not widen which unmentioned messages a transport ingests. Unauthorized
+or empty participant legs drop the message with one `gateway.admission` refusal record. The first
+line is `[gateway: authenticated participant: <principal>, handle pN]`, followed by one join line per
+participant summarizing read versus write by provider from their broker answer and channel downscope.
+Display names and other message text remain outside the authenticated line.
+
+The session retains at most eight legs including the asker. Later participants still connect and
+receive a fresh capability answer; an authorized temporary leg closes before its attributed text
+joins, while a refusal exposes nothing. An overflow message has one admission record carrying
+`participant-limit`. Join lookups belong to the asker’s turn trace, not participant effect decisions.
+Every retained leg carries its opening message’s delivery coordinate; the asker’s carries the turn’s
+starting message. The delivered turn remains the asker’s, with authorized steer texts appended.
+Messages still queued when the final model step ends start later turns with their own participant
+as the asker. Every such turn opens a fresh leg and gets the normal capability answer; an
+unauthorized leftover is refused before inference. Folding combines messages only from one subject.
+
+Each retained leg receives a gateway-minted handle: `p1` for the asker, then `p2` through `p8`
+by first authorized appearance. The table dies with the turn. Overflow text has no handle.
+The `bash` tool accepts an optional `as` string, for example
+`{"command":"probe upper --text hello","as":"p2"}`. Every command word in that script runs on
+that participant’s leg; omitting `as` uses the asker. An unknown handle is a tool error with no
+broker call. Unmapped routes, DMs and private scope mint no handles and refuse `as` selection.
+All legs share the session call budget and cancellation, and close with the session.
+The broker authorizes the selected participant ∩ channel on every frame. Its decision records
+include `participant.handle` and that leg’s opening delivery coordinate; the label is never an
+identity or policy key. The gateway’s `shell.command` spans carry the same handle.
+
+The mapped-channel frame treats others’ text as context: act on what the turn’s owner asked or
+endorsed, or what a participant asked for themselves under their own handle; say whose idea was
+acted on and under whose handle. Do not ask clarifying questions about attribution. Handles in
+replayed history grant no authority in the current turn.
+
 ### Authorization is never cached
 
-Every new turn opens a fresh attested broker leg and gets a fresh chat-scoped `capabilities` answer, exactly as step 2 describes; same-sender steers use the running turn's leg. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
+Every new turn opens a fresh attested broker leg and gets a fresh chat-scoped `capabilities` answer, exactly as step 2 describes. On mapped shared or one-shot channels, another participant’s admitted native chat message gets the same fresh authorization before its text or assets reach the model; subsequent messages reuse a retained leg during that turn. Other routes keep same-sender steering on the running leg. Persistence changes nothing here: no grant is remembered, no decision is carried forward, and history is prompt text rather than authorization input.
 
 The granted capability set is additionally **stored with the conversation** and compared at each new turn. Any difference drops the history and attachment generation and starts a fresh conversation; an empty grant removes the entry outright and closes the same asset fence. The reason is narrow and specific: output and attachment references from a session with a broad grant are sitting in the retained state, and if the owner then narrows what that subject may reach, an unchecked entry would keep replaying or fetching them after the capability that produced them was taken away. Invalidation costs a cache miss on the first new turn after a policy change, which is the right price — a narrowed grant is precisely when replaying old output is wrong. This comparison remains conservative on a shared route: if two participants receive different capability identifier sets, moving between them resets the shared transcript and inventory rather than carrying state produced under the other set. Sharing never promotes either participant to the other's grant.
 
@@ -1308,7 +1392,7 @@ The default is 15 minutes, which resolves toward the person because the user-vis
 
 ### The prompt cache key
 
-Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Sharing a key grants nothing: each new session opens a fresh attested leg; steers share only their running session's leg.
+Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Sharing a key grants nothing: each new session opens a fresh attested leg; authorized steers share the running session’s bounded participant table; scripts select one current participant’s handle, defaulting to the asker.
 
 **It is a keyed HMAC, so nobody outside the gateway can recompute it.** The key is `gatewayd-conversation-` or `gatewayd-route-` followed by the first 32 hex digits of HMAC-SHA256, under a 32-byte gateway-held secret, over a domain-separation prefix and the length-prefixed fields below. Without the secret a provider cannot recompute a key or test a guessed subject against one, phone numbers included. The same conversation names the same lane after an idle or capacity eviction or a grant change, so the provider's sticky routing lands it where its instructions and tools prefix is already cached.
 
@@ -1401,7 +1485,7 @@ HTTP success status before accepting `ok: true`; Slack also validates channel an
 timestamp, Telegram validates message/chat/topic and replies inside the topic, Discord validates
 every split message and treats a later failure as partial, and local acknowledges only after
 `write_all` and `flush`. The hidden request carries a tagged service-specific inbound delivery
-identity, and the broker checks its channel/topic/transport fields against the attested scope before
+identity (including fauxlack channel/message vocabulary for disposable tests), and the broker checks its channel/topic/transport fields against the attested scope before
 namespace creation, preventing cross-transport aliases. Local identities include a 128-bit
 OS-random boot nonce, connection, and sequence, so restarts do not collide.
 
@@ -1632,7 +1716,7 @@ Spans follow [`observability.md`](observability.md):
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
+| `transport.receive` | `transport.kind` (`fauxlack`, `slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 

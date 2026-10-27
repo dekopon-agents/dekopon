@@ -28,13 +28,21 @@ fn only(captured: &CaptureLayer, id: &str) -> Record {
 
 async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let mappings = [
+        ("fauxlack.team.uasker", "asker"),
+        ("fauxlack.team.cchannel", "space"),
         ("slack.team.user", "asker"),
+        ("slack.team.other", "participant"),
         ("slack.team.channel", "space"),
         ("github.owner.repo", "repo"),
     ]
     .map(|(subject, id)| (subject.parse().expect("subject"), principal(id)));
     let world = PolicyWorld::new(
-        [principal("asker"), principal("space"), principal("repo")],
+        [
+            principal("asker"),
+            principal("participant"),
+            principal("space"),
+            principal("repo"),
+        ],
         [(
             "cli-probe.reverse".parse().expect("capability"),
             "cli-probe".parse().expect("provider"),
@@ -82,6 +90,7 @@ async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
 
 fn slack_scope() -> ChatScopeClaim {
     ChatScopeClaim {
+        participant: None,
         transport: "chat".parse().expect("transport"),
         kind: ChatTransportKind::Slack,
         conversation: Conversation {
@@ -95,6 +104,23 @@ fn slack_scope() -> ChatScopeClaim {
             channel: "channel".into(),
             timestamp: "1712345678.000101".into(),
         }),
+    }
+}
+
+fn fauxlack_scope() -> ChatScopeClaim {
+    ChatScopeClaim {
+        kind: ChatTransportKind::Fauxlack,
+        conversation: Conversation {
+            kind: ConversationKind::Thread,
+            container: Some("team".into()),
+            id: "cchannel".into(),
+            thread: Some("m1".into()),
+        },
+        delivery: Some(DeliveryIdentity::Fauxlack {
+            channel: "cchannel".into(),
+            message: "m2".into(),
+        }),
+        ..slack_scope()
     }
 }
 
@@ -149,6 +175,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     tracing_subscriber::registry().with(captured.clone()).init();
     let (broker, audit) = broker_fixture().await;
     let github = ChatScopeClaim {
+        participant: None,
         transport: "github".parse().expect("transport"),
         kind: ChatTransportKind::Github,
         conversation: Conversation {
@@ -165,6 +192,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
 
     for (id, form, scope) in [
         ("channel-denial", "slack.team.user", slack_scope()),
+        ("fauxlack-denial", "fauxlack.team.uasker", fauxlack_scope()),
         ("repository-denial", "github.owner.repo", github),
     ] {
         let claim = Attestation::for_chat(
@@ -197,6 +225,26 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     ] {
         assert_eq!(record.field(field), Some(value), "{field}: {record:?}");
     }
+    let record = only(&captured, "fauxlack-denial");
+    for (field, value) in [
+        ("decision.allowed", "false"),
+        ("principal", "asker"),
+        ("principal.kind", "person"),
+        ("space.id", "space"),
+        ("asker.allowed", "true"),
+        ("space.allowed", "false"),
+        ("decision.denied_by", "space"),
+        ("transport.id", "chat"),
+        ("transport.kind", "fauxlack"),
+        ("conversation.kind", "thread"),
+        ("conversation.container", "team"),
+        ("conversation.id", "cchannel"),
+        ("conversation.thread", "m1"),
+        ("delivery.kind", "fauxlack"),
+        ("delivery.id", "m2"),
+    ] {
+        assert_eq!(record.field(field), Some(value), "{field}: {record:?}");
+    }
     let repository = only(&captured, "repository-denial");
     assert_eq!(repository.field("principal.kind"), Some("repository"));
     assert_eq!(repository.field("turn.started_by"), Some("message"));
@@ -214,23 +262,36 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivery_for_another_transport_is_refused() {
     let (broker, audit) = broker_fixture().await;
-    let mut scope = slack_scope();
-    scope.delivery = Some(DeliveryIdentity::Github {
-        delivery: "delivery-1".into(),
-    });
-    let claim = Attestation::for_chat(
-        "slack.team.user".parse().expect("subject"),
-        "test-agent".parse().expect("agent"),
-        scope,
-    );
-    assert_refused(
-        &broker,
-        &audit,
-        "invalid-delivery",
-        claim,
-        "attestation-denied",
-    )
-    .await;
+    for (id, subject, mut scope, delivery) in [
+        (
+            "invalid-delivery",
+            "slack.team.user",
+            slack_scope(),
+            DeliveryIdentity::Github {
+                delivery: "delivery-1".into(),
+            },
+        ),
+        (
+            "fauxlack-wrong-delivery",
+            "fauxlack.team.uasker",
+            fauxlack_scope(),
+            slack_scope().delivery.unwrap(),
+        ),
+        (
+            "slack-fauxlack-delivery",
+            "slack.team.user",
+            slack_scope(),
+            fauxlack_scope().delivery.unwrap(),
+        ),
+    ] {
+        scope.delivery = Some(delivery);
+        let claim = Attestation::for_chat(
+            subject.parse().expect("subject"),
+            "test-agent".parse().expect("agent"),
+            scope,
+        );
+        assert_refused(&broker, &audit, id, claim, "attestation-denied").await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,6 +299,16 @@ async fn a_space_subject_cannot_be_an_attested_sender() {
     let (broker, audit) = broker_fixture().await;
     for (id, form, reason) in [
         ("attested-space", "slack.team.channel", "attestation-denied"),
+        (
+            "fauxlack-attested-space",
+            "fauxlack.team.cchannel",
+            "attestation-denied",
+        ),
+        (
+            "fauxlack-unmapped-space",
+            "fauxlack.team.cother",
+            "unmapped-subject",
+        ),
         ("unmapped-space", "slack.team.cother", "unmapped-subject"),
     ] {
         let claim = Attestation::for_subject(
@@ -245,5 +316,97 @@ async fn a_space_subject_cannot_be_an_attested_sender() {
             "test-agent".parse().expect("agent"),
         );
         assert_refused(&broker, &audit, id, claim, reason).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn participant_capability_lookups_do_not_record_effect_decisions() {
+    use tracing::instrument::WithSubscriber as _;
+
+    let (broker, audit) = broker_fixture().await;
+    let captured = CaptureLayer::workspace();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(captured.clone()));
+    let gateway = AuthenticatedContext::new(
+        principal("gateway"),
+        Actor::Service {
+            principal: principal("gateway"),
+        },
+    )
+    .expect("gateway");
+    tracing::dispatcher::with_default(&dispatch, || {
+        let turn = tracing::info_span!("gateway.session", turn.owner = "asker");
+        let _turn = turn.enter();
+        for subject in ["slack.team.user", "slack.team.other"] {
+            let claim = Attestation::for_chat(
+                subject.parse().unwrap(),
+                "test-agent".parse().unwrap(),
+                slack_scope(),
+            );
+            broker
+                .session_surface(
+                    &gateway,
+                    Some(&AttestorGrant { namespaces: None }),
+                    Some(&claim),
+                )
+                .unwrap_or_else(|refusal| panic!("lookup refused: {}", refusal.reason));
+        }
+    });
+    assert!(audit.records().is_empty());
+    assert!(
+        captured
+            .events_where(
+                "dekopon_broker::audit",
+                &[("audit.event", "broker.decision")]
+            )
+            .is_empty()
+    );
+    let claim = Attestation::for_chat(
+        "slack.team.user".parse().unwrap(),
+        "test-agent".parse().unwrap(),
+        slack_scope(),
+    );
+    assert_refused(
+        &broker,
+        &audit,
+        "effect-after-lookups",
+        claim,
+        "policy-denied",
+    )
+    .with_subscriber(dispatch)
+    .await;
+    assert_eq!(audit.records().len(), 1);
+    assert_eq!(
+        only(&captured, "effect-after-lookups").field("principal"),
+        Some("asker")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn participant_handles_are_recorded_without_selecting_the_authorizing_principal() {
+    use tracing::instrument::WithSubscriber as _;
+    let (broker, audit) = broker_fixture().await;
+    let captured = CaptureLayer::workspace();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(captured.clone()));
+    for (id, subject, handle, expected_principal) in [
+        ("asker-p2", "slack.team.user", "p2", "asker"),
+        ("participant-p1", "slack.team.other", "p1", "participant"),
+    ] {
+        let mut scope = slack_scope();
+        scope.participant = Some(handle.to_owned());
+        let claim = Attestation::for_chat(
+            subject.parse().unwrap(),
+            "test-agent".parse().unwrap(),
+            scope,
+        );
+        assert_refused(&broker, &audit, id, claim, "policy-denied")
+            .with_subscriber(dispatch.clone())
+            .await;
+        let record = only(&captured, id);
+        assert_eq!(record.field("participant.handle"), Some(handle));
+        assert_eq!(record.field("principal"), Some(expected_principal));
+        assert_eq!(record.field("subject"), Some(subject));
+        assert_eq!(record.field("delivery.id"), Some("1712345678.000101"));
+        assert_eq!(record.field("space.id"), Some("space"));
+        assert_eq!(record.field("decision.allowed"), Some("false"));
     }
 }

@@ -76,7 +76,11 @@ struct SteeringTool {
 }
 
 impl ScriptRuntime for SteeringTool {
-    fn run_script(&self, _script: &str) -> dekopon_shell::ScriptOutcome {
+    fn run_script(
+        &self,
+        _script: &str,
+        _participant: Option<&str>,
+    ) -> dekopon_shell::ScriptOutcome {
         assert!(matches!(
             admit(&self.gate, &self.route, native(SUBJECT, "older", "older")),
             Admit::Steered(_)

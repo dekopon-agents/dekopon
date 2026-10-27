@@ -104,6 +104,19 @@ impl Conversation {
         let container = self.container.as_deref();
         let thread = self.thread.as_deref();
         match kind {
+            ChatTransportKind::Fauxlack => {
+                subject.service() == SubjectService::Fauxlack
+                    && container == subject.tenant()
+                    && lowercase_token(&self.id)
+                    && match self.kind {
+                        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+                            thread.is_none()
+                        }
+                        ConversationKind::Channel | ConversationKind::Thread => {
+                            thread.is_some_and(canonical_fauxlack_message)
+                        }
+                    }
+            }
             ChatTransportKind::Slack => {
                 subject.service() == SubjectService::Slack
                     && container.is_some_and(lowercase_token)
@@ -186,7 +199,13 @@ impl ChatTransportKind {
     #[must_use]
     pub const fn produces(self, kind: ConversationKind) -> bool {
         match (self, kind) {
-            (Self::Slack, _) | (Self::Local, _) => true,
+            (
+                Self::Fauxlack | Self::Slack | Self::Local,
+                ConversationKind::DirectMessage
+                | ConversationKind::GroupDirectMessage
+                | ConversationKind::Channel
+                | ConversationKind::Thread,
+            ) => true,
             (
                 Self::Discord,
                 ConversationKind::DirectMessage
@@ -402,7 +421,7 @@ fn thread_form(transport: ChatTransportKind, value: &str) -> bool {
 fn canonical_id_for(transport: ChatTransportKind, value: &str) -> bool {
     bounded_scope_part(value)
         && match transport {
-            ChatTransportKind::Slack => lowercase_token(value),
+            ChatTransportKind::Fauxlack | ChatTransportKind::Slack => lowercase_token(value),
             ChatTransportKind::Discord => canonical_unsigned_decimal(value),
             ChatTransportKind::Telegram => canonical_signed_decimal(value),
             ChatTransportKind::Whatsapp => canonical_meta_decimal(value),
@@ -414,7 +433,7 @@ fn canonical_id_for(transport: ChatTransportKind, value: &str) -> bool {
 fn canonical_container_for(transport: ChatTransportKind, value: &str) -> bool {
     bounded_scope_part(value)
         && match transport {
-            ChatTransportKind::Slack => lowercase_token(value),
+            ChatTransportKind::Fauxlack | ChatTransportKind::Slack => lowercase_token(value),
             ChatTransportKind::Discord => canonical_unsigned_decimal(value),
             ChatTransportKind::Whatsapp => canonical_whatsapp_container(value),
             ChatTransportKind::Github => {
@@ -472,6 +491,12 @@ pub(crate) fn canonical_slack_timestamp(value: &str) -> bool {
             && seconds.bytes().all(|byte| byte.is_ascii_digit())
             && fraction.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+pub(crate) fn canonical_fauxlack_message(value: &str) -> bool {
+    value
+        .strip_prefix('m')
+        .is_some_and(canonical_unsigned_decimal)
 }
 
 pub(crate) fn canonical_unsigned_decimal(value: &str) -> bool {

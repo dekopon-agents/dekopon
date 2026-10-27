@@ -418,7 +418,15 @@ jobs:
       # the cold verify rebuild; release.yml still verifies before publishing.
       - name: Package every publishable crate
         if: ${{ needs.changes.outputs.run_package != 'false' }}
-        run: cargo package --workspace --locked --no-verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t crates < <(grep -Ev '^[[:space:]]*(#|$)' .github/release-crates.txt)
+          args=()
+          for crate in "${crates[@]}"; do
+            args+=(-p "$crate")
+          done
+          cargo package --locked --no-verify "${args[@]}"
       - name: Test package-cache cleanup
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: .github/scripts/prepare-package-cache.sh
@@ -583,6 +591,24 @@ jobs:
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set console.enabled=true --set console.image.tag=v0.1.0 \
             --set console.subject=discord.1 > "$RUNNER_TEMP/console.yaml"
+          assert_console_image() {
+            expected=$1
+            shift
+            helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml --set console.enabled=true "$@" > "$RUNNER_TEMP/console-image.yaml"
+            actual=$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | select(.name == "console") | .image' "$RUNNER_TEMP/console-image.yaml")
+            test "$actual" = "$expected"
+          }
+          for args in "" "--set image.tag=v0.59.0-wasmtime-optimization" "--set image.digest=sha256:main"; do
+            # shellcheck disable=SC2086
+            helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml $args > "$RUNNER_TEMP/main-image.yaml"
+            main_image=$(yq 'select(.kind == "Deployment") | .spec.template.spec.initContainers[] | select(.name == "broker") | .image' "$RUNNER_TEMP/main-image.yaml")
+            # shellcheck disable=SC2086
+            assert_console_image "$main_image" $args
+          done
+          assert_console_image ghcr.io/dekopon-agents/dekopon:console-tag --set console.image.tag=console-tag --set image.digest=sha256:main
+          assert_console_image ghcr.io/dekopon-agents/dekopon@sha256:console --set console.image.digest=sha256:console --set image.tag=main-tag
+          assert_console_image example.com/console:console-tag --set console.image.repository=example.com/console --set console.image.tag=console-tag
+          assert_console_image ghcr.io/dekopon-agents/dekopon-console@sha256:console --set console.image.repository=ghcr.io/dekopon-agents/dekopon-console --set console.image.digest=sha256:console --set console.image.tag=ignored
           helm template dekopon charts/dekopon \
             -f charts/dekopon/ci/values-config-directory.yaml \
             --set configCheck.enabled=true \
