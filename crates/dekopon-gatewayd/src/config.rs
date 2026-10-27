@@ -24,6 +24,7 @@ use dekopon_core::{
     read_trusted_file,
 };
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
+use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -1948,7 +1949,11 @@ fn model_ca_bundles(
             problems.push(ConfigProblem::ModelCaBundleSize);
             continue;
         }
-        if reqwest::Certificate::from_pem_bundle(&pem).map_or(true, |certs| certs.is_empty()) {
+        let mut roots = rustls::RootCertStore::empty();
+        let certificates = CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>();
+        if certificates.map_or(true, |certs| {
+            certs.is_empty() || certs.into_iter().any(|cert| roots.add(cert).is_err())
+        }) {
             problems.push(ConfigProblem::ModelCaBundlePem);
             continue;
         }
@@ -3465,9 +3470,18 @@ mod tests {
         let empty = root.path().join("empty");
         let large = root.path().join("large");
         let invalid = root.path().join("invalid");
+        let malformed = root.path().join("malformed");
+        let mixed = root.path().join("mixed");
         std::fs::write(&empty, []).unwrap();
         std::fs::write(&large, vec![0; 65_537]).unwrap();
         std::fs::write(&invalid, "SENTINEL-NOT-A-CERTIFICATE").unwrap();
+        let malformed_pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        std::fs::write(&malformed, malformed_pem).unwrap();
+        let valid = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        std::fs::write(&mixed, format!("{valid}{malformed_pem}")).unwrap();
         for (paths, expected) in [
             (
                 vec![PathBuf::from("relative.pem")],
@@ -3482,6 +3496,8 @@ mod tests {
             (vec![empty], ConfigProblem::ModelCaBundleSize),
             (vec![large], ConfigProblem::ModelCaBundleSize),
             (vec![invalid], ConfigProblem::ModelCaBundlePem),
+            (vec![malformed], ConfigProblem::ModelCaBundlePem),
+            (vec![mixed], ConfigProblem::ModelCaBundlePem),
             (
                 vec![root.path().join("missing"); 9],
                 ConfigProblem::ModelCaBundleCount,

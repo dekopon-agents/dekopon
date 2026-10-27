@@ -868,11 +868,21 @@ async fn replacing_a_model_ca_at_the_same_path_activates_new_client_trust() {
         .await
     );
     assert!(!debug.contains("BEGIN CERTIFICATE"));
-    fs::write(ca, "SENTINEL-BAD-PEM").unwrap();
+    fs::write(
+        ca,
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let error = crate::config::load(&path, crate::current_uid())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConfigError::Invalid { problems, .. }
+        if problems.iter().any(|problem| matches!(problem, ConfigProblem::ModelCaBundlePem))));
     let active = gateway.digest_for_test();
     gateway.reconcile().await;
     assert_eq!(gateway.digest_for_test(), active);
+    assert!(Arc::ptr_eq(&current, &gateway.generation_for_test()));
     let refused = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
     assert_eq!(refused.len(), 1);
-    assert!(!format!("{refused:?}").contains("SENTINEL"));
+    assert!(!format!("{refused:?}").contains("AAAA"));
 }
