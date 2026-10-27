@@ -790,11 +790,11 @@ mod tests {
     fn substitution_arguments_keep_their_charges_until_the_command_finishes() {
         let invoker = RecordingInvoker::default();
         let limits = Limits {
-            max_value_bytes: 96,
+            max_value_bytes: 512,
             ..Limits::default()
         };
         let tree = TreeContext::new(limits, CallBudget::new(4));
-        let word = "\"$(printf 12345678901234567890123456789012)\"";
+        let word = format!("\"$(printf {})\"", "x".repeat(256));
         let interpreter = Interpreter::new(limits);
         let failed = interpreter.run_with_tree(&format!("gh-extra {word} {word}"), &invoker, &tree);
         assert_eq!(failed.exit_code, ExitCode::SYNTAX, "{}", failed.output);
@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn substitution_refunds_trailing_line_feeds_before_the_next_capture() {
         let limits = Limits {
-            max_value_bytes: 128,
+            max_value_bytes: 256,
             ..Limits::default()
         };
         let tree = TreeContext::new(limits, CallBudget::new(1));

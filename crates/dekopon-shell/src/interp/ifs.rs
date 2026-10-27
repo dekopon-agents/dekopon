@@ -2,7 +2,7 @@ use std::{collections::HashSet, ops::Range};
 
 use dekopon_process::{LimitExceeded, RetainedBytes};
 
-use crate::limits::Budget;
+use crate::{builtins::CommandFailure, limits::Budget};
 
 pub(super) struct Ifs {
     delimiters: HashSet<char>,
@@ -16,9 +16,10 @@ pub(super) enum Kind {
     Delimiter,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Boundary {
     Start,
+    ArrayStart,
     Text,
     Whitespace,
     Delimiter,
@@ -37,21 +38,23 @@ impl Boundary {
             Kind::Text => {
                 let action = match self {
                     Self::Text => Action::Append,
-                    Self::Start | Self::Whitespace | Self::Delimiter => Action::Start,
+                    Self::Start | Self::ArrayStart | Self::Whitespace | Self::Delimiter => {
+                        Action::Start
+                    }
                 };
                 *self = Self::Text;
                 action
             }
             Kind::Whitespace => {
                 match self {
-                    Self::Text => *self = Self::Whitespace,
+                    Self::Text | Self::ArrayStart => *self = Self::Whitespace,
                     Self::Start | Self::Whitespace | Self::Delimiter => {}
                 }
                 Action::Separate
             }
             Kind::Delimiter => {
                 let action = match self {
-                    Self::Start | Self::Delimiter => Action::Empty,
+                    Self::Start | Self::ArrayStart | Self::Delimiter => Action::Empty,
                     Self::Text | Self::Whitespace => Action::Separate,
                 };
                 *self = Self::Delimiter;
@@ -68,6 +71,28 @@ impl Ifs {
             delimiters: text.chars().collect(),
             _charge: charge,
         })
+    }
+
+    pub(super) fn check_quoted(&self, text: &str) -> Result<(), CommandFailure> {
+        let mut bytes = [false; 256];
+        for character in &self.delimiters {
+            let mut encoded = [0; 4];
+            for byte in character.encode_utf8(&mut encoded).bytes() {
+                bytes[usize::from(byte)] = true;
+            }
+        }
+        for character in text.chars().filter(|character| !character.is_ascii()) {
+            let mut encoded = [0; 4];
+            if character
+                .encode_utf8(&mut encoded)
+                .bytes()
+                .skip(1)
+                .any(|byte| bytes[usize::from(byte)])
+            {
+                return Err(super::invalid_ifs_utf8());
+            }
+        }
+        Ok(())
     }
 
     fn kind(&self, character: char) -> Kind {
@@ -116,13 +141,13 @@ impl Ifs {
         })
     }
 
-    pub(super) fn read_fields<'a>(
+    pub(super) fn read_fields(
         &self,
-        text: &'a str,
+        text: &str,
         protected: &[Range<usize>],
         count: usize,
         budget: &mut Budget,
-    ) -> Result<Vec<&'a str>, LimitExceeded> {
+    ) -> Result<ReadFields, LimitExceeded> {
         let mut boundary = Boundary::Start;
         let mut ranges: Vec<Range<usize>> = Vec::new();
         let mut retained = budget.charge_value_bytes(0)?;
@@ -131,6 +156,8 @@ impl Ifs {
             if kind != Kind::Whitespace {
                 end = range.end;
             }
+            let partial_delimiter = kind == Kind::Delimiter && boundary == Boundary::Whitespace;
+            let delimiter = range.clone();
             match boundary.accept(kind) {
                 Action::Start | Action::Empty => {
                     budget.charge_step()?;
@@ -148,6 +175,14 @@ impl Ifs {
                 }
                 Action::Separate => {}
             }
+            if partial_delimiter {
+                for offset in 1..delimiter.len() {
+                    budget.charge_step()?;
+                    retained.grow(size_of::<Range<usize>>() as u64)?;
+                    let start = delimiter.start + offset;
+                    ranges.push(start..start);
+                }
+            }
         }
         if ranges.len() > count {
             ranges.truncate(count);
@@ -155,6 +190,24 @@ impl Ifs {
                 last.end = end;
             }
         }
-        Ok(ranges.into_iter().map(|range| &text[range]).collect())
+        Ok(ReadFields {
+            ranges,
+            _charge: retained,
+        })
+    }
+}
+
+pub(super) struct ReadFields {
+    ranges: Vec<Range<usize>>,
+    _charge: RetainedBytes,
+}
+
+impl ReadFields {
+    pub(super) fn get<'a>(&self, text: &'a str, index: usize) -> Result<&'a str, CommandFailure> {
+        match self.ranges.get(index) {
+            None => Ok(""),
+            Some(range) if range.is_empty() => Ok(""),
+            Some(range) => text.get(range.clone()).ok_or_else(super::invalid_ifs_utf8),
+        }
     }
 }

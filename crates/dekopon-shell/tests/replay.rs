@@ -322,12 +322,43 @@ fn xavier_and_jobs() -> [Recipe; 6] {
     ]
 }
 
+fn ifs_recipes() -> [Recipe; 3] {
+    [
+        Recipe {
+            name: "custom IFS preserves empty provider arguments",
+            script: "IFS=,; targets='one,,three,'; gh $targets",
+            calls: vec![call("gh", &["one", "", "three"], None)],
+            output: "ok",
+        },
+        Recipe {
+            name: "read prefix IFS leaves the caller's splitting intact",
+            script: "printf '%s\n' ' left,right,,tail ' | { IFS=, read -r first rest; gh \"$first\" \"$rest\"; }; v='a b'; gh $v",
+            calls: vec![
+                call("gh", &[" left", "right,,tail "], None),
+                call("gh", &["a", "b"], None),
+            ],
+            output: "ok\nok",
+        },
+        Recipe {
+            name: "quoted positional joins preserve provider argument boundaries",
+            script: "f() { IFS=:; gh \"$*\" \"$@\"; }; f 'one two' '' three",
+            calls: vec![call(
+                "gh",
+                &["one two::three", "one two", "", "three"],
+                None,
+            )],
+            output: "ok",
+        },
+    ]
+}
+
 #[test]
 fn deployed_recipes_run_offline_with_exact_arguments_stdin_and_order() {
     for case in nestedset_and_gylmar()
         .into_iter()
         .chain(ville_and_whatsapp())
         .chain(xavier_and_jobs())
+        .chain(ifs_recipes())
     {
         let replay = Replay {
             calls: Mutex::default(),

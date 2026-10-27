@@ -1968,7 +1968,6 @@ fn a_piped_read_is_its_own_one_shot_source() {
 #[test]
 fn read_refuses_what_it_does_not_implement() {
     for (script, expected) in [
-        ("echo a | read", "needs at least one variable name"),
         ("echo a | read -d ,", "option \"-d\" is not supported"),
         ("echo a | read 1bad", "is not a valid variable name"),
     ] {
@@ -3965,22 +3964,22 @@ fn unquoted_strings_and_substitutions_split_every_default_ifs_character() {
 }
 
 #[test]
-fn array_elements_keep_whitespace_when_expanded_unquoted() {
+fn unquoted_array_elements_split_using_ifs() {
     for expansion in ["$v", "${v[@]}"] {
         let script = format!(
             r#"v=$(printf '["a b","c d"]' | jq '.'); f() {{ echo $#; for word in "$@"; do echo "<$word>"; done; }}; f {expansion}"#
         );
-        assert_eq!(output(&script), "2\n<a b>\n<c d>", "{expansion}");
+        assert_eq!(output(&script), "4\n<a>\n<b>\n<c>\n<d>", "{expansion}");
     }
 }
 
 #[test]
-fn assigning_ifs_does_not_configure_field_splitting() {
+fn assigning_ifs_configures_field_splitting() {
     assert_eq!(
         output(
             r#"IFS=,; v=' a,b  c '; f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f $v"#
         ),
-        "2\n<a,b>\n<c>"
+        "2\n< a>\n<b  c >"
     );
 }
 
@@ -4054,10 +4053,10 @@ fn split_fields_are_charged_to_the_value_budget() {
 }
 
 #[test]
-fn quoted_modifier_words_keep_their_existing_substitution_text() {
+fn quoted_modifier_words_preserve_substitution_newlines() {
     assert_eq!(
         output(r#"echo "${x:-pre$(printf 'a\nb')post}""#),
-        "prea bpost"
+        "prea\nbpost"
     );
 }
 

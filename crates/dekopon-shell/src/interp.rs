@@ -567,12 +567,17 @@ struct Evaluator<'a> {
     jobs: ScriptJobs,
 }
 
+struct ScopedFrame {
+    locals: BTreeMap<String, Option<Value>>,
+    positional: Vec<Value>,
+}
+
 pub(crate) struct JobScope {
     globals: Arc<BTreeMap<String, Value>>,
     buffers: Arc<BTreeMap<String, Vec<u8>>>,
     functions: BTreeMap<String, Arc<Program>>,
     function_names: BTreeSet<String>,
-    frames: Vec<(BTreeMap<String, Option<Value>>, Vec<Value>)>,
+    frames: Vec<ScopedFrame>,
     options: ShellOptions,
     last_status: ExitCode,
 }
@@ -1183,7 +1188,7 @@ impl<'a> Evaluator<'a> {
             let ifs = self.ifs()?;
             let fields = ifs.read_fields(&text, &protected, names.len(), &mut self.budget)?;
             for (index, name) in names.iter().enumerate() {
-                let field = fields.get(index).copied().unwrap_or_default();
+                let field = fields.get(&text, index)?;
                 self.assign(name, CommandResult::value(Value::String(field.to_owned())))?;
             }
         }
@@ -1610,10 +1615,7 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    fn adopt(
-        &mut self,
-        frames: Vec<(BTreeMap<String, Option<Value>>, Vec<Value>)>,
-    ) -> Result<(), LimitExceeded> {
+    fn adopt(&mut self, frames: Vec<ScopedFrame>) -> Result<(), LimitExceeded> {
         for (name, value) in self.globals.iter() {
             let charge = self.budget.charge_value_bytes(value_bytes(value))?;
             self.global_charges.insert(name.clone(), vec![charge]);
@@ -1622,7 +1624,7 @@ impl<'a> Evaluator<'a> {
             let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
             self.buffer_charges.insert(name.clone(), vec![charge]);
         }
-        for (locals, positional) in frames {
+        for ScopedFrame { locals, positional } in frames {
             let mut local_charges = BTreeMap::new();
             for (name, value) in &locals {
                 local_charges.insert(
@@ -1656,7 +1658,10 @@ impl<'a> Evaluator<'a> {
             frames: self
                 .frames
                 .iter()
-                .map(|frame| (frame.locals.clone(), frame.positional.clone()))
+                .map(|frame| ScopedFrame {
+                    locals: frame.locals.clone(),
+                    positional: frame.positional.clone(),
+                })
                 .collect(),
             options: self.options,
             last_status: self.last_status,
@@ -3589,12 +3594,7 @@ impl<'a> Evaluator<'a> {
             }),
             Parameter::AllPositional | Parameter::AllPositionalJoined => {
                 let values = self.positional().to_vec();
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        *separated = Boundary::Start;
-                    }
-                    self.split_expansion(fields, separated, value)?;
-                }
+                self.split_elements(fields, separated, &values)?;
                 Ok(Value::Array(values))
             }
             Parameter::Named { length: true, .. }
@@ -3660,6 +3660,9 @@ impl<'a> Evaluator<'a> {
                     self.expand_unquoted_part(part, fields, separated, ExpansionOutput::Value)?
                 }
             };
+            if matches!(part, WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_)) {
+                self.ifs()?.check_quoted(&display(&value))?;
+            }
             if word.parts.len() == 1 {
                 return Ok(value);
             }
@@ -3696,8 +3699,8 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn ifs_join(&mut self, values: &[Value]) -> Result<String, LimitExceeded> {
-        let separator = self.lookup("IFS").map_or_else(
+    fn ifs_separator(&self) -> String {
+        self.lookup("IFS").map_or_else(
             || " ".to_owned(),
             |value| {
                 display(value)
@@ -3705,7 +3708,35 @@ impl<'a> Evaluator<'a> {
                     .next()
                     .map_or_else(String::new, |first| first.to_string())
             },
-        );
+        )
+    }
+
+    fn split_elements(
+        &mut self,
+        fields: &mut Vec<String>,
+        separated: &mut Boundary,
+        values: &[Value],
+    ) -> Result<(), CommandFailure> {
+        let separator = self.ifs_separator();
+        let ifs = self.ifs()?;
+        if *separated == Boundary::Start {
+            *separated = Boundary::ArrayStart;
+        }
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                if separator.is_empty() {
+                    *separated = Boundary::Start;
+                } else {
+                    self.split_text_with(fields, separated, &separator, &ifs)?;
+                }
+            }
+            self.split_text_with(fields, separated, &display(value), &ifs)?;
+        }
+        Ok(())
+    }
+
+    fn ifs_join(&mut self, values: &[Value]) -> Result<String, LimitExceeded> {
+        let separator = self.ifs_separator();
         let bytes = values
             .iter()
             .map(value_bytes)
@@ -3731,14 +3762,7 @@ impl<'a> Evaluator<'a> {
     ) -> Result<(), CommandFailure> {
         match value {
             Value::String(text) => self.split_text(fields, separated, text)?,
-            Value::Array(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
-                        *separated = Boundary::Start;
-                    }
-                    self.split_text(fields, separated, &display(item))?;
-                }
-            }
+            Value::Array(items) => self.split_elements(fields, separated, items)?,
             Value::Null => {}
             Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
                 self.split_text(fields, separated, &display(value))?;
@@ -3753,9 +3777,21 @@ impl<'a> Evaluator<'a> {
         separated: &mut Boundary,
         text: &str,
     ) -> Result<(), CommandFailure> {
-        self.budget.charge_step()?;
         let ifs = self.ifs()?;
+        self.split_text_with(fields, separated, text, &ifs)
+    }
+
+    fn split_text_with(
+        &mut self,
+        fields: &mut Vec<String>,
+        separated: &mut Boundary,
+        text: &str,
+        ifs: &Ifs,
+    ) -> Result<(), CommandFailure> {
+        self.budget.charge_step()?;
         for (kind, range) in ifs.scan(text, &[]) {
+            let partial_delimiter = kind == Kind::Delimiter && *separated == Boundary::Whitespace;
+            let delimiter_bytes = range.len();
             match separated.accept(kind) {
                 action @ (Action::Append | Action::Start | Action::Empty) => {
                     self.budget.charge_step()?;
@@ -3775,6 +3811,15 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 Action::Separate => {}
+            }
+            // Bash 5.2 consumes one byte of a nonwhite delimiter following IFS whitespace.
+            if partial_delimiter {
+                for _ in 1..delimiter_bytes {
+                    self.budget.charge_step()?;
+                    self.expansion_charges
+                        .push(self.budget.charge_value_bytes(size_of::<String>() as u64)?);
+                    fields.push(String::new());
+                }
             }
         }
         Ok(())
@@ -3819,6 +3864,12 @@ impl<'a> Evaluator<'a> {
                         Value::Null => Vec::new(),
                         scalar => vec![scalar],
                     };
+                    if let Parameter::Named { .. } = parameter {
+                        let ifs = self.ifs()?;
+                        for element in &elements {
+                            ifs.check_quoted(&display(element))?;
+                        }
+                    }
                     let mut elements = elements.iter().map(display);
                     let Some(first) = elements.next() else {
                         if parts.len() == 1 {
@@ -3896,7 +3947,15 @@ impl<'a> Evaluator<'a> {
         mut split: Option<FieldExpansion<'_>>,
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
-        let (value, bound) = self.select_parameter(name, indices)?;
+        let (value, bound) = self.select_parameter(
+            name,
+            indices,
+            if split.is_some() {
+                ExpansionOutput::Fields
+            } else {
+                output
+            },
+        )?;
         if self.options.nounset && !bound && *modifier == Modifier::None {
             return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
                 "{name}: unbound variable, and `set -u` is on"
@@ -3995,6 +4054,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         name: &str,
         indices: &[Index],
+        output: ExpansionOutput,
     ) -> Result<(Value, bool), CommandFailure> {
         let mut bound = self.lookup(name).is_some();
         let mut value = self.lookup(name).cloned().unwrap_or(Value::Null);
@@ -4008,11 +4068,15 @@ impl<'a> Evaluator<'a> {
                     bound = !value.is_null();
                 }
                 Index::All => {}
+                Index::AllJoined if matches!(output, ExpansionOutput::Fields) => {}
                 Index::AllJoined => {
                     let values = match value {
                         Value::Array(items) => items,
                         Value::Null => Vec::new(),
-                        scalar => vec![scalar],
+                        scalar @ (Value::Bool(_)
+                        | Value::Number(_)
+                        | Value::String(_)
+                        | Value::Object(_)) => vec![scalar],
                     };
                     value = Value::String(self.ifs_join(&values)?);
                 }
@@ -4225,6 +4289,10 @@ fn is_variable_name(name: &str) -> bool {
         .next()
         .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn invalid_ifs_utf8() -> CommandFailure {
+    unsupported_option("IFS: Bash would produce a field that is not valid UTF-8")
 }
 
 fn unsupported_option(message: impl Into<String>) -> CommandFailure {

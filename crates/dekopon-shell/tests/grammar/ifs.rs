@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-fn bash(script: &str) -> Vec<Vec<String>> {
+fn bash(script: &str) -> Vec<Vec<Vec<u8>>> {
     let prefix = r#"[[ ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} == 5.2 ]] || exit 98
 shopt -s lastpipe
 set +m
@@ -64,10 +64,7 @@ probe() { [[ $1 == args ]] || return 99; shift; printf '%s\0' "$#"; for arg in "
             .expect("numeric count");
         calls.push(
             (0..count)
-                .map(|_| {
-                    String::from_utf8(parts.next().expect("argument bytes").to_vec())
-                        .expect("UTF-8 argument")
-                })
+                .map(|_| parts.next().expect("argument bytes").to_vec())
                 .collect(),
         );
     }
@@ -78,8 +75,7 @@ fn compare(script: &str) {
     compare_pair(script, script, "named regression");
 }
 
-fn compare_pair(script: &str, reference: &str, context: &str) {
-    let expected = bash(reference);
+fn capture(script: &str, context: &str) -> Vec<Vec<Vec<u8>>> {
     let fixture = Fixture::default();
     let result = Interpreter::new(Limits::default()).run(script, &fixture);
     assert_eq!(
@@ -87,22 +83,25 @@ fn compare_pair(script: &str, reference: &str, context: &str) {
         ExitCode::SUCCESS,
         "{context}: {script}: {result:?}"
     );
-    let actual: Vec<Vec<String>> = fixture
+    fixture
         .calls
         .lock()
         .iter()
-        .filter_map(|(capability, args)| {
-            (capability == "fixture.argv").then(|| {
-                args.as_array()
-                    .expect("argv")
-                    .iter()
-                    .map(|arg| arg.as_str().expect("text").to_owned())
-                    .collect()
-            })
+        .filter(|(capability, _)| capability == "fixture.argv")
+        .map(|(_, args)| {
+            args.as_array()
+                .expect("argv")
+                .iter()
+                .map(|arg| arg.as_str().expect("text").as_bytes().to_vec())
+                .collect()
         })
-        .collect();
+        .collect()
+}
+
+fn compare_pair(script: &str, reference: &str, context: &str) {
     assert_eq!(
-        actual, expected,
+        capture(script, context),
+        bash(reference),
         "{context}: exact argument counts and UTF-8 bytes: {script}"
     );
 }
@@ -110,7 +109,14 @@ fn compare_pair(script: &str, reference: &str, context: &str) {
 #[test]
 fn selected_default_literals_split_but_command_literals_and_quoted_defaults_do_not() {
     let script = r#"IFS=,; unset x; probe args ${x:-a,b}; probe args a,b; probe args ${x:-"a,b"}"#;
-    assert_eq!(bash(script), vec![vec!["a", "b"], vec!["a,b"], vec!["a,b"]]);
+    assert_eq!(
+        bash(script),
+        vec![
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![b"a,b".to_vec()],
+            vec![b"a,b".to_vec()]
+        ]
+    );
     compare(script);
 }
 
@@ -164,6 +170,8 @@ fn generated_ifs_expansions_reads_and_scopes_match_real_bash() {
         "a", "b", " ", "\t", "\n", ",", ":", ";", "é", "💠", "\\", "'", "\r", "\u{b}",
     ];
     let mut cases = 0;
+    let mut preserved_quoted_text = 0;
+    eprintln!("IFS corpus seed={SEED:#x}; generated scenarios=4096");
     for (policy, ifs) in policies.iter().enumerate() {
         for form in 0..32 {
             for edge in 0..8 {
@@ -252,14 +260,73 @@ fn generated_ifs_expansions_reads_and_scopes_match_real_bash() {
                 };
                 let context =
                     format!("seed={SEED:#x} case={cases} policy={policy} form={form} edge={edge}");
-                compare_pair(
-                    &format!("{actual_prefix}{body}"),
-                    &format!("{bash_prefix}{body}"),
-                    &context,
-                );
+                let script = format!("{actual_prefix}{body}");
+                let reference = format!("{bash_prefix}{body}");
+                let actual = capture(&script, &context);
+                let expected = bash(&reference);
+                if actual != expected
+                    && (form == 17 || form == 31)
+                    && separator.chars().next().is_some_and(|c| c.len_utf8() > 1)
+                {
+                    // Bash 5.2.37 splits UTF-8 continuation bytes in protected text with multibyte IFS.
+                    let intact = if form == 17 {
+                        vec![vec![
+                            value.as_bytes().to_vec(),
+                            Vec::new(),
+                            b"tail ,\xc3\xa9".to_vec(),
+                        ]]
+                    } else {
+                        let mut words = bash(&format!("{setup}probe args ${{missing:-a,b:é}}"));
+                        words[0].extend(["a,b:é".as_bytes().to_vec(), "a,b:é".as_bytes().to_vec()]);
+                        words
+                    };
+                    assert_eq!(actual, intact, "{context}: {script}");
+                    eprintln!(
+                        "{context}: deliberate quoted UTF-8 preservation; Bash={expected:?}; shell={actual:?}"
+                    );
+                    preserved_quoted_text += 1;
+                } else {
+                    assert_eq!(
+                        actual, expected,
+                        "{context}: exact argument counts and bytes: {script}"
+                    );
+                }
                 cases += 1;
             }
         }
     }
+    eprintln!(
+        "IFS corpus: {cases} scenarios; {} exact Bash agreements; {preserved_quoted_text} deliberate quoted UTF-8 preservations",
+        cases - preserved_quoted_text
+    );
+    assert!(cases - preserved_quoted_text >= 2000);
     assert_eq!(cases, 4096, "fixed generated corpus size; seed={SEED:#x}");
+}
+
+#[test]
+fn quoted_arrays_preserve_utf8_despite_the_bash_5_2_37_multibyte_ifs_defect() {
+    let expected = vec![vec![Vec::new(), Vec::new(), b"tail ,\xc3\xa9".to_vec()]];
+    let observed = bash("IFS='é'; arr=('' '' 'tail ,é'); probe args \"${arr[@]}\"");
+    let corrupted = vec![vec![Vec::new(), Vec::new(), b"tail ,\xc3".to_vec()]];
+    assert!(
+        observed == expected || observed == corrupted,
+        "unrecognized Bash result: {observed:?}"
+    );
+    eprintln!("Bash quoted array bytes: {observed:?}; preserved UTF-8: {expected:?}");
+    let script = r#"IFS='é'; arr=$(printf '%s' '["","","tail ,é"]'); probe args "${arr[@]}""#;
+    assert_eq!(capture(script, "quoted UTF-8 array"), expected);
+}
+
+#[test]
+fn protected_default_words_preserve_utf8_despite_the_bash_5_2_37_multibyte_ifs_defect() {
+    let script = r#"IFS='é'; probe args ${missing:-"a,b:é"}"#;
+    let observed = bash(script);
+    let expected = vec![vec![b"a,b:\xc3\xa9".to_vec()]];
+    let corrupted = vec![vec![b"a,b:\xc3".to_vec()]];
+    assert!(
+        observed == expected || observed == corrupted,
+        "unrecognized Bash result: {observed:?}"
+    );
+    eprintln!("Bash protected default bytes: {observed:?}; preserved UTF-8: {expected:?}");
+    assert_eq!(capture(script, "protected UTF-8 default"), expected);
 }
