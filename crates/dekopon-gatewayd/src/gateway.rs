@@ -453,7 +453,7 @@ impl Gateway {
                             let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
                             match table.ticket(&key, SystemTime::now()) {
                                 follow::FollowTicket::Active { .. } => self.start_session(&mut sessions, &generation, message),
-                                follow::FollowTicket::Lapsed => self.leave_follow(&mut sessions, &mut follow_pending, key, route.route_index, follow::LeaveCause::Lapse),
+                                follow::FollowTicket::Lapsed => message.receive_span.in_scope(|| self.leave_follow(&mut sessions, &mut follow_pending, key, route.route_index, follow::LeaveCause::Lapse)),
                                 follow::FollowTicket::Absent => {},
                             }
                         }

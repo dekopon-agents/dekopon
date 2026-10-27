@@ -704,6 +704,8 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 
 On a `follow: true` channel/thread route, a successful broker-authorized no-argument
 `dekopon-provider-follow.stay` opens one ticket shared by every speaker in the exact thread.
+With a journal, the gateway initializes resident follow state even when every route starts with
+follow disabled, so enabling the first follow route through reload needs no restart.
 Slack must deliver `message.channels`/`message.groups` events with `channels:history`/`groups:history`;
 configuration cannot verify installed app scopes. Both example manifests subscribe to these events.
 Unmentioned replies enter the same bounded follow batches described below, ahead of Agent

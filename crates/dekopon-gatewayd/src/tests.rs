@@ -22998,6 +22998,7 @@ async fn fauxlack_config_parses_but_check_refuses_it_without_a_service_in_every_
 
 struct SlackFollowFixture {
     directory: tempfile::TempDir,
+    journal: Arc<crate::journal::Journal>,
     routes: Arc<RoutingTable>,
     generation: crate::gateway::CurrentGeneration,
     table: Arc<crate::follow::FollowTable>,
@@ -23025,7 +23026,7 @@ impl SlackFollowFixture {
             )
             .unwrap(),
         );
-        let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+        let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
         let route = &config.routes[0];
         let key = crate::follow::follow_key(
             &route.transport,
@@ -23038,6 +23039,7 @@ impl SlackFollowFixture {
         generation.set_follow(Some(Arc::clone(&table)));
         Self {
             directory,
+            journal,
             routes,
             generation,
             table,
@@ -23307,4 +23309,225 @@ async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_auth
         mention.subject,
         ExternalSubject::slack(TEAM, "u8other").unwrap()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_racing_an_expiry_sweep_records_exactly_one_follow_leave() {
+    let fixture = SlackFollowFixture::new().await;
+    fixture
+        .table
+        .stay(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+        .unwrap();
+    let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let gateway = crate::gateway::Gateway::new(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+    );
+    let (capture, _guard) = capture_spans();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held = Arc::clone(&fixture.journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _lock = held.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(8))
+            .expect("release journal I/O");
+    });
+    ready.await.unwrap();
+    let sweeping = Arc::clone(&fixture.table);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let sweep = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            sweeping.stay(&"f".repeat(64), SystemTime::now())
+        })
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !fixture.table.sweeping_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the sweep collected the expired key and reached journal removal");
+    let mut incoming = owned_slack_message("later", true);
+    incoming.transport = "scientist-slack".to_owned();
+    let mut sessions = tokio::task::JoinSet::new();
+    gateway.dispatch(
+        &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
+        incoming,
+    );
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    sweep.await.unwrap().unwrap();
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() {
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("follow-expiry-test")))
+        .set_default();
+    let fixture = SlackFollowFixture::new().await;
+    fixture.table.stay(&fixture.key, SystemTime::now()).unwrap();
+    let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let received =
+        crate::transport::receive_span(dekopon_broker_protocol::ChatTransportKind::Slack);
+    let expected = received.context().span().span_context().clone();
+    assert!(expected.is_valid());
+    let mut incoming = owned_slack_message("later", true);
+    incoming.transport = "scientist-slack".to_owned();
+    incoming.receive_span = received.clone();
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(TransportEvent::Message(Box::new(incoming)))
+        .await
+        .unwrap();
+    let shutdown = async {
+        while sender.capacity() != 1 {
+            tokio::task::yield_now().await;
+        }
+        fixture
+            .table
+            .stay(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(
+            fixture.table.ticket(&fixture.key, SystemTime::now()),
+            crate::follow::FollowTicket::Absent
+        );
+    };
+    serve(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+        receiver,
+        shutdown,
+        Duration::from_secs(2),
+        crate::collection::Collector::new(&[], 4),
+    )
+    .await;
+    drop(received);
+    provider.force_flush().unwrap();
+    {
+        let spans = exported.0.lock();
+        let leaves: Vec<_> = spans
+            .iter()
+            .flat_map(|span| {
+                span.events
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.attributes.iter().any(|item| {
+                            item.key.as_str() == "audit.event"
+                                && item.value.to_string() == "gateway.follow"
+                        })
+                    })
+                    .map(move |_| span.span_context.clone())
+            })
+            .collect();
+        assert_eq!(leaves, [expected]);
+    }
+    provider.shutdown().unwrap();
+}
+
+#[test]
+fn startup_expiry_records_a_follow_lapse_once() {
+    let directory = temporary();
+    let now = SystemTime::now();
+    let journal = crate::journal::Journal::open(
+        directory.path(),
+        Duration::from_secs(604800),
+        Duration::from_secs(604800),
+    )
+    .unwrap();
+    let key = "f".repeat(64);
+    journal
+        .write_follow(
+            &key,
+            crate::journal::FollowMarker {
+                at_ms: 1,
+                until_ms: 2,
+            },
+        )
+        .unwrap();
+    drop(journal);
+    let (capture, _guard) = capture_spans();
+    for _ in 0..2 {
+        let journal = crate::journal::Journal::open_at(
+            directory.path(),
+            Duration::from_secs(604800),
+            Duration::from_secs(604800),
+            now,
+        )
+        .unwrap();
+        assert!(journal.load_follow(1024).unwrap().is_empty());
+    }
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() {
+    let fixture = SlackFollowFixture::new().await;
+    let table = crate::load_follow_table(&Some(Arc::clone(&fixture.journal)), false)
+        .await
+        .unwrap()
+        .expect("journal-backed gateways retain follow state even when all routes start disabled");
+    table.stay(&fixture.key, SystemTime::now()).unwrap();
+    assert!(matches!(
+        table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Active { .. }
+    ));
 }

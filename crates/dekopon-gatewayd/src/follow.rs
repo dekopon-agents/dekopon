@@ -161,6 +161,8 @@ pub(crate) struct FollowTable {
     resident: Mutex<HashMap<String, FollowMarker>>,
     writer: Mutex<HashSet<String>>,
     disk: Mutex<()>,
+    #[cfg(test)]
+    sweeping: AtomicBool,
 }
 
 impl FollowTable {
@@ -169,6 +171,8 @@ impl FollowTable {
             resident: Mutex::new(journal.load_follow(MAX_TICKETS)?.into_iter().collect()),
             writer: Mutex::new(HashSet::new()),
             disk: Mutex::new(()),
+            #[cfg(test)]
+            sweeping: AtomicBool::new(false),
             journal,
         })
     }
@@ -208,14 +212,19 @@ impl FollowTable {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for old in lapsed {
+            #[cfg(test)]
+            self.sweeping.store(true, Ordering::Release);
             self.journal.remove_follow(&old)?;
-            self.resident.lock().remove(&old);
-            tracing::info!(
-                audit.event = "gateway.follow",
-                operation = "banished",
-                cause = "lapse",
-                "gateway.follow"
-            );
+            #[cfg(test)]
+            self.sweeping.store(false, Ordering::Release);
+            if self.resident.lock().remove(&old).is_some() {
+                tracing::info!(
+                    audit.event = "gateway.follow",
+                    operation = "banished",
+                    cause = "lapse",
+                    "gateway.follow"
+                );
+            }
         }
         {
             let writer = self.writer.lock();
@@ -499,6 +508,10 @@ impl<I: CapabilityInvoker> FollowInvoker<I> {
 
 #[cfg(test)]
 impl FollowTable {
+    pub(crate) fn sweeping_for_test(&self) -> bool {
+        self.sweeping.load(Ordering::Acquire)
+    }
+
     pub(crate) fn writing_for_test(&self) -> bool {
         self.disk.try_lock().is_none()
     }

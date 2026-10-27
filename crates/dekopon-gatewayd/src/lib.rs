@@ -450,7 +450,7 @@ async fn load_follow_table(
     journal: &Option<Arc<journal::Journal>>,
     enabled: bool,
 ) -> Result<Option<Arc<follow::FollowTable>>, GatewaydError> {
-    if !enabled {
+    if !enabled && journal.is_none() {
         return Ok(None);
     }
     let journal = Arc::clone(journal.as_ref().ok_or(GatewaydError::Journal {
