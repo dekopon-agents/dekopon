@@ -51,7 +51,7 @@ impl GrepConfig {
                 .arg(Arg::new("input")),
             arguments,
             "grep",
-            super::stream::TextStream::Grep.help(),
+            crate::builtins::Builtin::Grep.help(),
         )?;
         let pattern = matches
             .get_one::<String>("pattern")
@@ -111,13 +111,10 @@ mod tests {
     use dekopon_process::ExitCode;
     use serde_json::{Value, json};
 
-    use crate::builtins::{
-        CommandResult,
-        text::stream::{TextStream, run_test},
-    };
+    use crate::builtins::{Builtin, CommandResult, text::stream::run_test};
 
     fn grep(arguments: &[&str], input: Value) -> CommandResult {
-        run_test(TextStream::Grep, arguments, input).expect("grep runs")
+        run_test(Builtin::Grep, arguments, input).expect("grep runs")
     }
 
     #[test]
@@ -153,7 +150,7 @@ mod tests {
 
     #[test]
     fn unsupported_flags_are_rejected_by_name() {
-        let failure = run_test(TextStream::Grep, &["-o", "a"], json!("a"))
+        let failure = run_test(Builtin::Grep, &["-o", "a"], json!("a"))
             .expect_err("only-matching is not implemented");
         assert!(format!("{failure:?}").contains("-o"), "{failure:?}");
     }
@@ -185,14 +182,14 @@ mod tests {
     #[test]
     fn without_the_e_flag_a_regex_is_still_refused_by_name() {
         let failure =
-            run_test(TextStream::Grep, &["[0-9]"], json!("a1")).expect_err("literal by default");
+            run_test(Builtin::Grep, &["[0-9]"], json!("a1")).expect_err("literal by default");
         let message = format!("{failure:?}");
         assert!(message.contains("literal text"), "{message}");
     }
 
     #[test]
     fn an_uncompilable_e_pattern_fails_rather_than_matching_nothing() {
-        let failure = run_test(TextStream::Grep, &["-E", "a("], json!("a("))
+        let failure = run_test(Builtin::Grep, &["-E", "a("], json!("a("))
             .expect_err("an unclosed group is not a literal");
         assert!(
             format!("{failure:?}").contains("closing ')'"),

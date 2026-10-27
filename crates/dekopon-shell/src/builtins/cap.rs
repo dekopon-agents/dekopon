@@ -1,64 +1,51 @@
 use serde_json::{Value, json};
 
-use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
+use super::{BuiltinContext, CommandFailure, CommandResult};
 
-const USAGE: &str = "usage: cap --list | cap --describe <capability> (what this session was \
+pub(super) const USAGE: &str = "usage: cap --list | cap --describe <capability> (what this session was \
                      granted — run `<word> --help` to use it)";
 
-pub(crate) struct Cap;
+pub(crate) fn cap(
+    context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    let Some((first, rest)) = arguments.split_first() else {
+        return Err(CommandFailure::usage(format!("cap: {USAGE}")));
+    };
 
-impl Builtin for Cap {
-    fn name(&self) -> &'static str {
-        "cap"
-    }
-
-    fn help(&self) -> &'static str {
-        USAGE
-    }
-
-    fn run(
-        &self,
-        context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let Some((first, rest)) = arguments.split_first() else {
-            return Err(CommandFailure::usage(format!("cap: {USAGE}")));
-        };
-
-        match first.as_str() {
-            "--list" | "-l" => {
-                if !rest.is_empty() {
-                    return Err(CommandFailure::usage(format!(
-                        "cap: --list takes no arguments; {USAGE}"
-                    )));
-                }
-                let mut granted = context.invoker.granted();
-                granted.sort();
-                Ok(CommandResult::value(Value::Array(
-                    granted.into_iter().map(Value::String).collect(),
-                )))
+    match first.as_str() {
+        "--list" | "-l" => {
+            if !rest.is_empty() {
+                return Err(CommandFailure::usage(format!(
+                    "cap: --list takes no arguments; {USAGE}"
+                )));
             }
-            "--describe" | "-d" => {
-                let [capability] = rest else {
-                    return Err(CommandFailure::usage(format!(
-                        "cap: --describe takes exactly one capability identifier; {USAGE}"
-                    )));
-                };
-                let Some(description) = context.invoker.describe(capability) else {
-                    return Err(CommandFailure::failed(format!(
-                        "cap: {capability}: no description is available; try `cap --list`"
-                    )));
-                };
-                Ok(CommandResult::value(json!({
-                    "capability": description.capability,
-                    "description": description.description,
-                })))
-            }
-            other => Err(CommandFailure::usage(format!(
-                "cap: unexpected argument {other:?}; {USAGE}"
-            ))),
+            let mut granted = context.invoker.granted();
+            granted.sort();
+            Ok(CommandResult::value(Value::Array(
+                granted.into_iter().map(Value::String).collect(),
+            )))
         }
+        "--describe" | "-d" => {
+            let [capability] = rest else {
+                return Err(CommandFailure::usage(format!(
+                    "cap: --describe takes exactly one capability identifier; {USAGE}"
+                )));
+            };
+            let Some(description) = context.invoker.describe(capability) else {
+                return Err(CommandFailure::failed(format!(
+                    "cap: {capability}: no description is available; try `cap --list`"
+                )));
+            };
+            Ok(CommandResult::value(json!({
+                "capability": description.capability,
+                "description": description.description,
+            })))
+        }
+        other => Err(CommandFailure::usage(format!(
+            "cap: unexpected argument {other:?}; {USAGE}"
+        ))),
     }
 }
 
@@ -75,7 +62,7 @@ mod tests {
     };
     use dekopon_process::Limits;
 
-    use super::Cap;
+    use super::cap as Cap;
 
     #[derive(Default)]
     struct Fixture {
@@ -119,7 +106,7 @@ mod tests {
     #[test]
     fn list_enumerates_granted_capabilities_in_order() {
         for flag in ["--list", "-l"] {
-            let result = run_builtin_with_invoker(&Cap, &[flag], &Fixture::default())
+            let result = run_builtin_with_invoker(Cap, &[flag], &Fixture::default())
                 .expect("cap --list runs");
             assert_eq!(
                 result.value,
@@ -132,9 +119,8 @@ mod tests {
     #[test]
     fn describe_prints_the_identifier_and_description_only() {
         for flag in ["--describe", "-d"] {
-            let result =
-                run_builtin_with_invoker(&Cap, &[flag, "alpha.write"], &Fixture::default())
-                    .expect("cap --describe runs");
+            let result = run_builtin_with_invoker(Cap, &[flag, "alpha.write"], &Fixture::default())
+                .expect("cap --describe runs");
             assert_eq!(
                 result.value,
                 json!({"capability": "alpha.write", "description": "Writes alpha"}),
@@ -146,7 +132,7 @@ mod tests {
     #[test]
     fn describing_a_capability_with_no_description_names_it() {
         let failure =
-            run_builtin_with_invoker(&Cap, &["--describe", "missing.one"], &Fixture::default())
+            run_builtin_with_invoker(Cap, &["--describe", "missing.one"], &Fixture::default())
                 .expect_err("nothing describes it");
         let CommandFailure::Status { message, status } = failure else {
             panic!("a missing description must stay recoverable");
@@ -197,7 +183,7 @@ mod tests {
             ),
         ] {
             let message = usage_message(
-                run_builtin_with_invoker(&Cap, arguments, &fixture)
+                run_builtin_with_invoker(Cap, arguments, &fixture)
                     .expect_err("malformed usage is refused"),
             );
             assert!(message.contains(cause), "{arguments:?}: {message}");

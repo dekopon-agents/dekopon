@@ -139,7 +139,6 @@ use serde_json::Value;
 
 mod ast;
 mod builtins;
-mod dispatch;
 mod interp;
 mod job;
 pub use job::{JobControl, JobRefusal, JobSeed};

@@ -23,39 +23,6 @@ const MAX_NESTING_DEPTH: u32 = 64;
 
 const MAX_ARITHMETIC_TOKENS: usize = 4_096;
 
-pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
-    ("eval", "`eval` is not supported; write the command out"),
-    (
-        "exec",
-        "`exec` is excluded: this shell never replaces a process image and has no processes to replace",
-    ),
-    (
-        "source",
-        "`source` is excluded: there is no filesystem to read scripts from",
-    ),
-    (
-        ".",
-        "`.` (source) is excluded: there is no filesystem to read scripts from",
-    ),
-    ("trap", "`trap` is excluded: this shell has no signals"),
-    (
-        "fg",
-        "`fg` is excluded: jobs run detached and report when they finish; use `wait %N`",
-    ),
-    (
-        "bg",
-        "`bg` is excluded: jobs run detached and report when they finish; use `wait %N`",
-    ),
-    (
-        "declare",
-        "`declare` is excluded: arrays and maps are real JSON values here, so `declare -A` has nothing to declare",
-    ),
-    (
-        "export",
-        "`export` is excluded: there is no process environment to export into",
-    ),
-];
-
 pub(crate) const RESERVED_WORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "case", "esac",
     "until", "select", "function", "[[", "]]",
@@ -425,10 +392,8 @@ impl<'a> Parser<'a> {
                 format!("{name:?} is not a valid function name"),
             ));
         }
-        if let Some((_, reason)) = REJECTED_COMMANDS
-            .iter()
-            .find(|(rejected, _)| *rejected == name)
-        {
+        if let Some(rejected) = crate::builtins::RejectedCommand::lookup(&name) {
+            let reason = rejected.reason();
             return Err(ParseError::syntax(
                 line,
                 format!("cannot define a function named {name:?}: {reason}"),
