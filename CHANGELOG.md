@@ -7,6 +7,24 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-10-26
+
+### Added
+
+- Models receive a gateway memory notice when conversation history is omitted, replaced, unavailable, or replayed with reduced fidelity.
+- Memory notices report recall or projection failures without assuming which history source was sent.
+- broker.execution records process.exit.code when a provider exits non-zero.
+
+### Fixed
+
+- Ordinary provider HTTP no longer returns a redirect Location's query or fragment, which can carry a signed URL's credential.
+
+## [dekopon-chart-0.46.0] - 2026-10-26
+
+### Changed
+
+- Chart 0.46.0 targets core v0.59.0 and renders the `v0.59.0` image tag.
+
 ## [0.58.0] - 2026-10-26
 
 ### Added
