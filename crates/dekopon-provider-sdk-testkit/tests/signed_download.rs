@@ -186,7 +186,7 @@ fn assert_requests(requests: &[ObservedRequest]) {
 #[test]
 fn real_component_downloads_one_redirect_with_probe_and_window() {
     let (api, storage) = scripts(bytes());
-    let run = Harness::<Probe>::get(component()).signed_download([api], storage, 3);
+    let run = Harness::<Probe>::get(component()).signed_download(api, storage, 3);
     let requests = run.requests();
     let output = run
         .call("http-probe.fetch", serde_json::to_value(input()).unwrap())
@@ -199,9 +199,9 @@ fn real_component_downloads_one_redirect_with_probe_and_window() {
     assert_requests(&requests());
 }
 #[test]
-fn native_download_records_every_request_in_order() {
+fn native_single_api_script_download_records_every_request_in_order() {
     let (api, storage) = scripts(bytes());
-    let native = Native::<Probe>::new().signed_download([api], storage, 3);
+    let native = Native::<Probe>::new().signed_download(api, storage, 3);
     let output = native.call(
         "http-probe.fetch",
         &serde_json::to_string(&input()).unwrap(),
@@ -239,7 +239,7 @@ fn real_component_does_not_follow_a_storage_redirect() {
         ],
         body: vec![],
     });
-    let run = Harness::<Probe>::get(component()).signed_download([api], storage, 4);
+    let run = Harness::<Probe>::get(component()).signed_download(api, storage, 4);
     let requests = run.requests();
     let error = run
         .call("http-probe.fetch", serde_json::to_value(input()).unwrap())
@@ -259,7 +259,7 @@ fn real_component_does_not_follow_a_storage_redirect() {
 #[test]
 fn real_component_request_cap_refuses_window_after_probe() {
     let (api, storage) = scripts(bytes());
-    let run = Harness::<Probe>::get(component()).signed_download([api], storage, 2);
+    let run = Harness::<Probe>::get(component()).signed_download(api, storage, 2);
     let requests = run.requests();
     let error = run
         .call("http-probe.fetch", serde_json::to_value(input()).unwrap())

@@ -80,6 +80,15 @@ impl HttpScript {
     }
 }
 
+impl IntoIterator for HttpScript {
+    type Item = Self;
+    type IntoIter = std::iter::Once<Self>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self)
+    }
+}
+
 const UNEXPECTED_CHILD: &str = "unexpected child script";
 const CHILD_INPUT_LIMIT: u64 = 1024 * 1024;
 pub(crate) const HTTP_BYTES: usize = 64 * 1024;
