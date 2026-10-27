@@ -215,14 +215,9 @@ impl Ifs {
             let mut field = cursor.word(text);
             if index + 1 == count && cursor.offset(text.len()) < text.len() {
                 let mut end = text.len();
-                let mut escaped = protected.iter().rev().peekable();
                 for (offset, character) in text.char_indices().rev() {
-                    while escaped.peek().is_some_and(|range| range.start > offset) {
-                        escaped.next();
-                    }
                     if !matches!(character, ' ' | '\t' | '\n')
                         || self.kind(character) != Kind::Whitespace
-                        || escaped.peek().is_some_and(|range| range.contains(&offset))
                     {
                         break;
                     }

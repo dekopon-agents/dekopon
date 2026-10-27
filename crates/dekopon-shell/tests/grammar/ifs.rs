@@ -571,3 +571,75 @@ fn prefix_bindings_do_not_authorize_top_level_return() {
     );
     compare("f() { IFS=: return 7; probe args unreachable; }; f; probe args \"$?\"");
 }
+
+#[test]
+fn generated_initial_ifs_round_trips_match_real_bash() {
+    let mut cases = 0;
+    for setup in [
+        "IFS=$IFS;",
+        "saved=$IFS; IFS=,; IFS=$saved;",
+        "saved=$IFS; unset IFS; IFS=$saved;",
+        "saved=\"$IFS\"; IFS=é; IFS=\"$saved\";",
+    ] {
+        for value in ["", " ", "\t", "\n", "a b", "a\tb", "a\nb", " a,é:\tb\n "] {
+            for body in [
+                "probe args $v",
+                "probe args $(printf '%s' \"$v\")",
+                "f() { probe args \"$*\" $*; }; f \"$v\" '' tail",
+                "printf '%s\\n' \"$v\" | { read a b; probe args \"$a\" \"$b\"; }",
+            ] {
+                let script = format!("{setup}v={}; probe args \"$IFS\"; {body}", quote(value));
+                assert!(!compare_pair(
+                    &script,
+                    &script,
+                    &format!("initial IFS round-trip case={cases}")
+                ));
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 128);
+    eprintln!("Initial IFS corpus: {cases} exact Bash agreements");
+}
+
+#[test]
+fn generated_escaped_read_remainders_match_real_bash() {
+    let mut cases = 0;
+    for ifs in [None, Some(""), Some(" "), Some("\t"), Some(" ,")] {
+        let setup = ifs.map_or_else(
+            || "unset IFS;".to_owned(),
+            |ifs| format!("IFS={};", quote(ifs)),
+        );
+        for value in [
+            "a\\ ", "a b\\ ", "x a b\\ ", "a\\ b\\ ", "a b\\  ", "a b \\ ", "a b\\\t", "a,b\\ ",
+            "a,b\\,",
+        ] {
+            for count in 0..=4 {
+                let names = ["a", "b", "c", "d"][..count].join(" ");
+                let args = if count == 0 {
+                    "\"$REPLY\"".to_owned()
+                } else {
+                    names
+                        .split(' ')
+                        .map(|name| format!("\"${name}\""))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                for option in ["", "-r"] {
+                    let script = format!(
+                        "{setup}printf '%s\\n' {} | {{ read {option} {names}; probe args {args}; }}",
+                        quote(value)
+                    );
+                    assert!(!compare_pair(
+                        &script,
+                        &script,
+                        &format!("escaped read remainder case={cases}")
+                    ));
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 450);
+    eprintln!("Escaped read corpus: {cases} exact Bash agreements");
+}

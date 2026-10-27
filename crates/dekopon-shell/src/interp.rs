@@ -1,7 +1,3 @@
-//! The evaluator never reads the host process environment, so a script variable comes only from the
-//! script's own assignments, and reading something like an API key by name sees it as unset, not
-//! the host's real value.
-
 use crate::interp::telemetry::StageObservation;
 use dekopon_process::pipe::{self, PipeReader, PipeWriter, ReadOutcome, WriteOutcome};
 use dekopon_process::{CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, TreeContext};
@@ -46,6 +42,8 @@ use telemetry::CommandKind;
 #[cfg(test)]
 mod local_snapshot_tests;
 pub(crate) mod telemetry;
+
+const DEFAULT_IFS: &str = " \t\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
@@ -403,6 +401,7 @@ pub(crate) fn run_with_tree(
         globals: Arc::new(
             prev.map(|prev| ("PREV".to_owned(), Value::String(prev.to_owned())))
                 .into_iter()
+                .chain([("IFS".to_owned(), Value::String(DEFAULT_IFS.to_owned()))])
                 .collect(),
         ),
         global_charges: BTreeMap::new(),
@@ -4165,7 +4164,7 @@ impl<'a> Evaluator<'a> {
     fn ifs(&self) -> Result<Ifs, LimitExceeded> {
         match self.lookup("IFS") {
             Some(value) => Ifs::new(&display(value), &self.budget),
-            None => Ifs::new(" \t\n", &self.budget),
+            None => Ifs::new(DEFAULT_IFS, &self.budget),
         }
     }
 
