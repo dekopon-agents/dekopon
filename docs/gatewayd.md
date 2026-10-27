@@ -1363,7 +1363,11 @@ by first authorized appearance. The table dies with the turn. Overflow text has 
 The `bash` tool accepts an optional `as` string, for example
 `{"command":"probe upper --text hello","as":"p2"}`. Every command word in that script runs on
 that participant’s leg; omitting `as` uses the asker. An unknown handle is a tool error with no
-broker call. Unmapped routes, DMs and private scope mint no handles and refuse `as` selection.
+broker call on mapped routes. Unmapped routes, including DMs, private scope and GitHub,
+mint no handles: any supplied `as` is ignored and the script runs on the asker's leg.
+The shared model-facing schema describes `as` as applying only in mapped channels.
+Ignored selection is traced with `tool_call.ignored_arguments = "as"` and
+`reason = "unmapped-route"`, never as an error.
 All legs share the session call budget and cancellation, and close with the session.
 The broker authorizes the selected participant ∩ channel on every frame. Its decision records
 include `participant.handle` and that leg’s opening delivery coordinate; the label is never an

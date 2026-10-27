@@ -62,14 +62,22 @@ impl<I: dekopon_shell::CapabilityInvoker> dekopon_agent::prompt::ScriptRuntime f
         let Some(name) = participant else {
             return self.asker.run_script(script, None);
         };
-        let selected = self.table.as_ref().and_then(|table| {
+        let Some(table) = self.table.as_ref() else {
+            tracing::info!(
+                tool_call.ignored_arguments = "as",
+                reason = "unmapped-route",
+                "Ignoring participant selection on an unmapped route"
+            );
+            return self.asker.run_script(script, None);
+        };
+        let selected = {
             table
                 .lock()
                 .entries
                 .iter()
                 .find(|entry| entry.handle.0 == name)
                 .map(|entry| (entry.handle, Arc::clone(&entry.leg)))
-        });
+        };
         match selected {
             Some((Handle::ASKER, _)) => self.asker.run_script(script, None),
             Some((_, leg)) => ShellRuntime { invoker: leg, limits: self.asker.limits, calls: self.asker.calls.clone() }.run_script(script, None),

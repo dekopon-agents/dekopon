@@ -1545,7 +1545,7 @@ fn script_tool(command_words: &[String], help: &BTreeMap<String, String>) -> Mod
                 },
                 "as": {
                     "type": "string",
-                    "description": "One authenticated participant handle from this turn (for example p2). Omit to use the asker. Available only on mapped channels."
+                    "description": "One authenticated participant handle from this turn (for example p2). Omit to use the asker. Applies only in mapped channels; ignored on unmapped routes."
                 }
             },
             "required": ["command"],
@@ -1903,7 +1903,7 @@ fn script_argument(tool: &str, arguments: &str) -> Result<BashArguments, PromptE
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
 `{\"command\":\"cap --list\"}`; provider command words are not separate model \
-tools. Optional `as` selects one current participant handle for the whole script; default: asker. Returns the script's combined output followed by an \
+tools. Optional `as` selects one current participant handle for the whole script in mapped channels; ignored on unmapped routes; default: asker. Returns the script's combined output followed by an \
 `[exit code: N]` trailer.
 
 - Capabilities are reached only through this tool. Do the whole job in one script; send another \
@@ -4452,6 +4452,16 @@ mod tests {
         );
         assert!(truncated.output.starts_with("1\n"), "{truncated:?}");
         assert!(truncated.output.ends_with("10"), "{truncated:?}");
+    }
+
+    #[test]
+    fn unmapped_route_schema_describes_as_as_ignored() {
+        let tool = script_tool(&[], &BTreeMap::new());
+        assert_eq!(
+            tool.parameters["properties"]["as"]["description"],
+            "One authenticated participant handle from this turn (for example p2). Omit to use the asker. Applies only in mapped channels; ignored on unmapped routes."
+        );
+        assert!(tool.description.contains("ignored on unmapped routes"));
     }
 
     #[test]

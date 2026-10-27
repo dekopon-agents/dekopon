@@ -671,12 +671,45 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
 }
 
 #[tokio::test]
-async fn unmapped_shared_routes_expose_no_selectable_participant_handle() {
+async fn mapped_route_call_with_an_unknown_handle_still_fails() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), vec![listing("asker", false)]).await;
+    let (broker, mut observed) = stub_broker(directory.path(), vec![listing("asker", true)]).await;
     let mut selected = script_call("probe must-not-run");
     selected.tool_calls[0].function.arguments =
-        json!({"command": "probe must-not-run", "as": "p1"}).to_string();
+        json!({"command": "probe must-not-run", "as": "p9"}).to_string();
+    let models = ModelScript::new([selected, answer("done")]);
+    run_session(
+        runner(broker, Arc::clone(&models), 1),
+        shared_route(),
+        speaker(9, "request"),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert!(models.prompt(1).iter().any(|(role, text)| role == "tool"
+        && text == "Unknown participant handle: use a handle in this turn's authenticated attribution lines.\n[exit code: 2]"));
+    assert_eq!(capability_listings(&mut observed), 1);
+    assert!(observed.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn unmapped_route_call_with_as_runs_as_the_asker_and_exits_zero() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            listing("asker", false),
+            ResponseEnvelope::command_run(dekopon_broker_protocol::CommandRunOutcome::Rendered {
+                stdout: "asker output".to_owned(),
+                stderr: String::new(),
+                status: 0,
+            }),
+        ],
+    )
+    .await;
+    let mut selected = script_call("probe asker");
+    selected.tool_calls[0].function.arguments =
+        json!({"command": "probe asker", "as": "p9"}).to_string();
     let models = ModelScript::new([selected, answer("done")]);
     run_session(
         runner(broker, Arc::clone(&models), 1),
@@ -690,11 +723,38 @@ async fn unmapped_shared_routes_expose_no_selectable_participant_handle() {
         models
             .prompt(1)
             .iter()
-            .any(|(role, text)| role == "tool" && text.contains("Unknown participant handle"))
+            .any(|(role, text)| role == "tool" && text == "asker output\n[exit code: 0]")
     );
     assert!(!models.prompt(1).iter().any(|(_, text)| text.starts_with("[gateway: authenticated participant: asker, handle")));
-    assert_eq!(capability_listings(&mut observed), 1);
+    assert!(matches!(
+        observed.try_recv().expect("asker lookup").request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    let request = observed.try_recv().expect("asker command");
+    let BrokerRequest::Run {
+        attestation: Some(claim),
+        ..
+    } = request.request
+    else {
+        panic!("command expected")
+    };
+    assert_eq!(claim.subject, speaker(9, "").subject);
+    assert_eq!(claim.scope.unwrap().participant, None);
     assert!(observed.try_recv().is_err());
+    assert!(
+        capture
+            .records()
+            .iter()
+            .any(
+                |record| record.field("tool_call.ignored_arguments") == Some("as")
+                    && matches!(
+                        record,
+                        dekopon_test_support::Record::Event { level: "INFO", .. }
+                    )
+                    && record.field("reason") == Some("unmapped-route")
+                    && record.field("error").is_none()
+            )
+    );
 }
 
 async fn participant_broker(
