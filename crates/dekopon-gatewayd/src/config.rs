@@ -24,6 +24,7 @@ use dekopon_core::{
     read_trusted_file,
 };
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
+use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -331,6 +332,8 @@ pub struct GatewaydConfig {
     pub broker: BrokerConfig,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
+    #[serde(default, rename = "extraCABundles")]
+    pub extra_ca_bundles: Vec<PathBuf>,
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub stop_words: Option<Vec<String>>,
@@ -504,6 +507,8 @@ impl TransportConfig {
 )]
 pub enum ModelConfig {
     OpenaiCompatible {
+        #[serde(skip)]
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         endpoint: String,
         model: String,
@@ -518,6 +523,8 @@ pub enum ModelConfig {
         modalities: Vec<Modality>,
     },
     Openrouter {
+        #[serde(skip)]
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         model: String,
         api_key_env: String,
@@ -532,6 +539,8 @@ pub enum ModelConfig {
         cache: Option<dekopon_model::openrouter::settings::Cache>,
     },
     ChatgptSubscription {
+        #[serde(skip)]
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         model: String,
         #[serde(default)]
@@ -543,6 +552,8 @@ pub enum ModelConfig {
         modalities: Vec<Modality>,
     },
     Anthropic {
+        #[serde(skip)]
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         model: String,
         api_key_env: String,
@@ -560,6 +571,24 @@ pub enum Modality {
 }
 
 impl ModelConfig {
+    pub(crate) fn ca_bundles(&self) -> &[dekopon_core::Redacted<String>] {
+        match self {
+            Self::OpenaiCompatible { ca_bundles, .. }
+            | Self::Openrouter { ca_bundles, .. }
+            | Self::ChatgptSubscription { ca_bundles, .. }
+            | Self::Anthropic { ca_bundles, .. } => ca_bundles,
+        }
+    }
+
+    fn set_ca_bundles(&mut self, bundles: &Arc<[dekopon_core::Redacted<String>]>) {
+        match self {
+            Self::OpenaiCompatible { ca_bundles, .. }
+            | Self::Openrouter { ca_bundles, .. }
+            | Self::ChatgptSubscription { ca_bundles, .. }
+            | Self::Anthropic { ca_bundles, .. } => *ca_bundles = Arc::clone(bundles),
+        }
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
@@ -1018,6 +1047,8 @@ pub struct ResolvedConfig {
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
     pub(crate) model_files: BTreeMap<String, PathBuf>,
+    pub(crate) ca_sources: BTreeMap<PathBuf, RawCandidate>,
+    pub(crate) extra_ca_bundles: Vec<PathBuf>,
     pub routes: Vec<ResolvedRoute>,
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
@@ -1032,6 +1063,23 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
+    pub(crate) fn load_model_ca_bundles(&mut self) -> Result<(), ConfigError> {
+        let mut problems = Vec::new();
+        let (bundles, sources) =
+            model_ca_bundles(&self.extra_ca_bundles, LoadMode::Boot, &mut problems);
+        if !problems.is_empty() {
+            return Err(ConfigError::Invalid {
+                path: self.source.clone(),
+                problems,
+            });
+        }
+        for model in &mut self.models {
+            model.set_ca_bundles(&bundles);
+        }
+        self.ca_sources = sources;
+        Ok(())
+    }
+
     pub(crate) fn emit_effective_indicators(&self) {
         for (index, route) in self.routes.iter().enumerate() {
             for (kind, resolved) in &route.indicators {
@@ -1109,6 +1157,7 @@ pub(crate) async fn load_reporting(
             path,
             &BrokerSocketDiscovery::from_process(None),
             expected_uid,
+            mode,
         )
     }
     .await;
@@ -1128,7 +1177,7 @@ const MERGE_RULES: MergeRules = MergeRules {
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
-    _mode: LoadMode,
+    mode: LoadMode,
 ) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
     let paths = match scan_gateway_directory(&directory, expected_uid) {
         Ok(paths) => paths,
@@ -1194,6 +1243,7 @@ async fn load_directory(
         first,
         &BrokerSocketDiscovery::from_process(None),
         expected_uid,
+        mode,
     ) {
         Ok(mut resolved) => {
             resolved.model_files.extend(model_files);
@@ -1281,6 +1331,10 @@ impl std::fmt::Debug for RawCandidate {
 }
 
 impl RawCandidate {
+    pub(crate) fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     pub(crate) fn of(
         config: Result<&SourceSnapshot, &ConfigError>,
         catalog: Option<Result<&SourceSnapshot, &ConfigError>>,
@@ -1323,6 +1377,7 @@ impl RawCandidate {
 pub(crate) struct GatewaySources {
     pub(crate) config: SourceSnapshot,
     pub(crate) catalog: SourceSnapshot,
+    pub(crate) ca_bundles: BTreeMap<PathBuf, RawCandidate>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -1338,6 +1393,26 @@ impl GatewaySources {
         catalog_path: &Path,
         uid: u32,
     ) -> Result<bool, ConfigError> {
+        for (path, digest) in &self.ca_bundles {
+            use tokio::io::AsyncReadExt as _;
+            let pem = async {
+                let mut pem = Vec::new();
+                tokio::fs::File::open(path)
+                    .await?
+                    .take(65_537)
+                    .read_to_end(&mut pem)
+                    .await?;
+                Ok::<_, io::Error>(pem)
+            }
+            .await
+            .map_err(|error| ConfigError::Invalid {
+                path: config_path.to_path_buf(),
+                problems: vec![ConfigProblem::ModelCaBundleRead { kind: error.kind() }],
+            })?;
+            if &ca_digest(&pem) != digest {
+                return Ok(false);
+            }
+        }
         if self.config != source_snapshot(config_path, None, uid).await? {
             return Ok(false);
         }
@@ -1362,6 +1437,7 @@ impl GatewaySources {
         let new = merged_mapping(&next.config)?;
         let classified = [
             ("models", "models"),
+            ("extraCABundles", "extraCABundles"),
             ("routes", "routes"),
             ("stopWords", "stopWords"),
             ("catalogPath", "catalog"),
@@ -1400,7 +1476,9 @@ impl GatewaySources {
                 continue;
             }
             match category {
-                "models" | "routes" | "stopWords" | "catalog" => changes.swap.push(category),
+                "models" | "routes" | "stopWords" | "catalog" | "extraCABundles" => {
+                    changes.swap.push(category)
+                }
                 "transports" | "sessions" => {
                     let (resident_before, indicators_before) = split_indicators(before, category);
                     let (resident_after, indicators_after) = split_indicators(after, category);
@@ -1417,6 +1495,9 @@ impl GatewaySources {
                 "apiVersion" => return Err(ConfigError::UnclassifiedSource),
                 _ => return Err(ConfigError::UnclassifiedSource),
             }
+        }
+        if self.ca_bundles != next.ca_bundles && !changes.swap.contains(&"extraCABundles") {
+            changes.swap.push("extraCABundles");
         }
         if self.catalog != next.catalog && !changes.swap.contains(&"catalog") {
             changes.swap.push("catalog");
@@ -1811,16 +1892,94 @@ fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
         .map_err(|source| ConfigError::CurrentDirectory { source })
 }
 
+fn ca_digest(pem: &[u8]) -> RawCandidate {
+    use sha2::{Digest as _, Sha256};
+    RawCandidate(Sha256::digest(pem).into())
+}
+
+fn model_ca_bundles(
+    paths: &[PathBuf],
+    mode: LoadMode,
+    problems: &mut Vec<ConfigProblem>,
+) -> (
+    Arc<[dekopon_core::Redacted<String>]>,
+    BTreeMap<PathBuf, RawCandidate>,
+) {
+    if paths.len() > 8 {
+        problems.push(ConfigProblem::ModelCaBundleCount);
+        return (Arc::default(), BTreeMap::new());
+    }
+    let mut bundles = Vec::new();
+    let mut sources = BTreeMap::new();
+    for path in paths {
+        if !path.is_absolute() {
+            problems.push(ConfigProblem::ModelCaBundlePath);
+            continue;
+        }
+        match mode {
+            LoadMode::Check => continue,
+            LoadMode::Boot => {}
+        }
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                problems.push(ConfigProblem::ModelCaBundleRead { kind: error.kind() });
+                continue;
+            }
+        };
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 65_536 {
+            problems.push(ConfigProblem::ModelCaBundleSize);
+            continue;
+        }
+        let pem = match (|| {
+            use std::io::Read as _;
+            let mut pem = Vec::new();
+            std::fs::File::open(path)?
+                .take(65_537)
+                .read_to_end(&mut pem)?;
+            Ok::<_, io::Error>(pem)
+        })() {
+            Ok(pem) => pem,
+            Err(error) => {
+                problems.push(ConfigProblem::ModelCaBundleRead { kind: error.kind() });
+                continue;
+            }
+        };
+        if pem.is_empty() || pem.len() > 65_536 {
+            problems.push(ConfigProblem::ModelCaBundleSize);
+            continue;
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        let certificates = CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>();
+        if certificates.map_or(true, |certs| {
+            certs.is_empty() || certs.into_iter().any(|cert| roots.add(cert).is_err())
+        }) {
+            problems.push(ConfigProblem::ModelCaBundlePem);
+            continue;
+        }
+        let digest = ca_digest(&pem);
+        match String::from_utf8(pem) {
+            Ok(pem) => {
+                sources.insert(path.clone(), digest);
+                bundles.push(dekopon_core::Redacted::new(pem));
+            }
+            Err(_) => problems.push(ConfigProblem::ModelCaBundlePem),
+        }
+    }
+    (bundles.into(), sources)
+}
+
 #[expect(
     clippy::too_many_lines,
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
 pub(crate) fn resolve(
-    config: GatewaydConfig,
+    mut config: GatewaydConfig,
     source: PathBuf,
     discovery: &BrokerSocketDiscovery,
     current_uid: u32,
+    mode: LoadMode,
 ) -> Result<ResolvedConfig, ConfigError> {
     let base = source
         .parent()
@@ -1835,6 +1994,10 @@ pub(crate) fn resolve(
     };
 
     let mut problems = Vec::new();
+    let (bundles, ca_sources) = model_ca_bundles(&config.extra_ca_bundles, mode, &mut problems);
+    for model in &mut config.models {
+        model.set_ca_bundles(&bundles);
+    }
 
     if config.transports.is_empty() {
         problems.push(ConfigProblem::NoTransports);
@@ -2582,6 +2745,8 @@ pub(crate) fn resolve(
     match (frame, socket_path, telemetry) {
         (Some(frame), Some(socket_path), Some(telemetry)) if problems.is_empty() => {
             Ok(ResolvedConfig {
+                ca_sources,
+                extra_ca_bundles: config.extra_ca_bundles,
                 model_files: config
                     .models
                     .iter()
@@ -2983,6 +3148,16 @@ fn resolve_directory(path: &Path) -> io::Result<PathBuf> {
 
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    #[error("extraCABundles permits at most eight files")]
+    ModelCaBundleCount,
+    #[error("extraCABundles requires absolute paths")]
+    ModelCaBundlePath,
+    #[error("could not read extraCABundles file ({kind:?})")]
+    ModelCaBundleRead { kind: io::ErrorKind },
+    #[error("extraCABundles requires regular files of 1 to 65,536 bytes")]
+    ModelCaBundleSize,
+    #[error("extraCABundles requires nonempty PEM certificate bundles")]
+    ModelCaBundlePem,
     #[error("sessions.assets.path is required with sessions.journal")]
     AssetsRequired,
     #[error("sessions.assets requires sessions.journal")]
@@ -3249,7 +3424,7 @@ mod tests {
     use dekopon_broker_protocol::BrokerSocketDiscovery;
 
     use super::{
-        ConfigError, DEFAULT_SCRIPT_TIMEOUT_MS, Duration, LivenessMode, ModelConfig,
+        ConfigError, DEFAULT_SCRIPT_TIMEOUT_MS, Duration, LivenessMode, LoadMode, ModelConfig,
         ProgressDetail, ProgressSurface, SeenReaction, resolve,
     };
     use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
@@ -3264,6 +3439,167 @@ mod tests {
          \x20   model: q\n\
          \x20   timeoutMs: 1000\n\
          \x20   classes: [reasoning]\n";
+
+    #[test]
+    fn model_ca_bundle_defaults_and_authored_fields_are_strict() {
+        let absent = resolved(TAIL).unwrap();
+        let empty = resolved(&format!("{TAIL}extraCABundles: []\n")).unwrap();
+        assert!(absent.extra_ca_bundles.is_empty());
+        assert!(absent.ca_sources.is_empty());
+        assert_eq!(absent.models, empty.models);
+        for key in ["extraCaBundles", "unknown"] {
+            assert!(matches!(
+                super::decode(format!("{PREAMBLE}{TAIL}{key}: []\n").as_bytes()),
+                Err(ConfigError::Decode { .. })
+            ));
+        }
+        let authored_internal = PREAMBLE.replace(
+            "kind: openaiCompatible",
+            "kind: openaiCompatible\n    caBundles: []",
+        );
+        assert!(matches!(
+            super::decode(format!("{authored_internal}{TAIL}").as_bytes()),
+            Err(ConfigError::Decode { .. })
+        ));
+    }
+
+    #[test]
+    fn model_ca_bundles_refuse_invalid_files_with_typed_problems() {
+        use super::ConfigProblem;
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        let large = root.path().join("large");
+        let invalid = root.path().join("invalid");
+        let malformed = root.path().join("malformed");
+        let mixed = root.path().join("mixed");
+        std::fs::write(&empty, []).unwrap();
+        std::fs::write(&large, vec![0; 65_537]).unwrap();
+        std::fs::write(&invalid, "SENTINEL-NOT-A-CERTIFICATE").unwrap();
+        let malformed_pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        std::fs::write(&malformed, malformed_pem).unwrap();
+        let valid = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        std::fs::write(&mixed, format!("{valid}{malformed_pem}")).unwrap();
+        for (paths, expected) in [
+            (
+                vec![PathBuf::from("relative.pem")],
+                ConfigProblem::ModelCaBundlePath,
+            ),
+            (
+                vec![root.path().join("missing")],
+                ConfigProblem::ModelCaBundleRead {
+                    kind: std::io::ErrorKind::NotFound,
+                },
+            ),
+            (vec![empty], ConfigProblem::ModelCaBundleSize),
+            (vec![large], ConfigProblem::ModelCaBundleSize),
+            (vec![invalid], ConfigProblem::ModelCaBundlePem),
+            (vec![malformed], ConfigProblem::ModelCaBundlePem),
+            (vec![mixed], ConfigProblem::ModelCaBundlePem),
+            (
+                vec![root.path().join("missing"); 9],
+                ConfigProblem::ModelCaBundleCount,
+            ),
+        ] {
+            let list = serde_json::to_string(&paths).unwrap();
+            let error = resolved(&format!(
+                "{TAIL}extraCABundles: {list}\nsessions: {{maxConcurrent: 0}}\n"
+            ))
+            .unwrap_err();
+            let ConfigError::Invalid { problems, .. } = error else {
+                panic!("typed config error expected");
+            };
+            assert!(problems.len() >= 2);
+            assert!(problems.iter().any(
+                |problem| std::mem::discriminant(problem) == std::mem::discriminant(&expected)
+            ));
+            assert!(!format!("{problems:?}").contains("SENTINEL"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_ca_limits_match_broker_ca_limits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::tests::temporary();
+        let ca = root.path().join("roots.pem");
+        let provider = root.path().join("provider.wasm");
+        std::fs::write(&provider, b"component fixture").unwrap();
+        let broker = root.path().join("broker.yaml");
+        let pem = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        for (count, size) in [(8, 65_536), (9, 65_536), (1, 65_537)] {
+            let mut padded = pem.clone();
+            padded.extend(std::iter::repeat_n('\n', size - pem.len()));
+            std::fs::write(&ca, padded).unwrap();
+            let paths = vec![&ca; count];
+            let config = serde_json::json!({
+                "apiVersion": "dekopon.dev/brokerd/v1alpha1",
+                "socketPath": root.path().join("broker.sock"),
+                "providers": [provider],
+                "identities": [{"uid": crate::current_uid(), "principal": "caller",
+                    "actor": {"type": "agent", "agent": "model-ca-test"}}],
+                "http": {"extraCABundles": paths},
+            });
+            std::fs::write(&broker, serde_json::to_vec(&config).unwrap()).unwrap();
+            std::fs::set_permissions(&broker, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let broker_accepts =
+                match dekopon_brokerd::telemetry_settings(&broker, crate::current_uid()).await {
+                    Ok(_) => true,
+                    Err(dekopon_brokerd::BrokerdError::Config(
+                        dekopon_brokerd::ConfigError::InvalidHttpsConfiguration,
+                    )) => false,
+                    Err(error) => panic!("broker fixture failed: {error:?}"),
+                };
+            let gateway = resolved(&format!(
+                "{TAIL}extraCABundles: {}\n",
+                serde_json::to_string(&paths).unwrap()
+            ));
+            assert_eq!(gateway.is_ok(), broker_accepts);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_ca_check_is_path_only_for_files_and_fragments() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("gateway.yaml");
+        let directory = root.path().join("fragments");
+        std::fs::create_dir(&directory).unwrap();
+        let absent = root.path().join("missing.pem");
+        for path in [config, directory] {
+            let file = if path.is_dir() {
+                path.join("gateway.yaml")
+            } else {
+                path.clone()
+            };
+            for (bundle, accepted) in [
+                (absent.as_path(), true),
+                (std::path::Path::new("relative.pem"), false),
+            ] {
+                std::fs::write(
+                    &file,
+                    format!("{PREAMBLE}{TAIL}extraCABundles: [{}]\n", bundle.display()),
+                )
+                .unwrap();
+                let (resolved, errors) =
+                    super::load_reporting(&path, crate::current_uid(), LoadMode::Check).await;
+                if accepted {
+                    assert!(errors.is_empty(), "{errors:?}");
+                    assert!(resolved.unwrap().models[0].ca_bundles().is_empty());
+                } else {
+                    assert!(resolved.is_none());
+                    assert!(errors.iter().any(|error| matches!(error,
+                        ConfigError::Invalid { problems, .. } if problems.iter().any(
+                            |problem| matches!(problem, super::ConfigProblem::ModelCaBundlePath)
+                        )
+                    )));
+                }
+            }
+        }
+    }
 
     #[test]
     fn durable_assets_require_a_journal_and_a_separate_resolvable_path() {
@@ -3353,6 +3689,7 @@ mod tests {
             PathBuf::from("/tmp/gatewayd.yaml"),
             &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
             501,
+            LoadMode::Boot,
         )
     }
 
@@ -3946,7 +4283,8 @@ routes:
                 authored,
                 PathBuf::from("/tmp/gateway.yaml"),
                 &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
-                501
+                501,
+                LoadMode::Boot
             )
             .is_ok()
         );
@@ -4022,6 +4360,7 @@ routes:
             PathBuf::from("/tmp/gateway.yaml"),
             &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
             501,
+            LoadMode::Boot,
         )
         .unwrap_err();
         let ConfigError::Invalid { problems, .. } = error else {
@@ -4065,6 +4404,7 @@ routes:
                 PathBuf::from("/tmp/gateway.yaml"),
                 &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
                 501,
+                LoadMode::Boot,
             )
             .unwrap_err();
             let ConfigError::Invalid { problems, .. } = error else {

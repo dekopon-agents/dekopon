@@ -1186,7 +1186,7 @@ mod tests {
     fn missing_credentials_point_to_the_operator_auth_command() {
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("missing-auth.json");
-        let error = match CodexClient::new("gpt-test", Some(&path), Duration::from_secs(1)) {
+        let error = match CodexClient::new("gpt-test", Some(&path), Duration::from_secs(1), &[]) {
             Ok(_) => panic!("missing credentials must fail"),
             Err(error) => error,
         };
@@ -1745,6 +1745,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
         let messages = vec![ModelMessage::user("hello")];
@@ -1888,6 +1889,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
 
@@ -1979,6 +1981,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
         let tools = vec![ModelTool {
@@ -2071,6 +2074,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
 
@@ -2125,6 +2129,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
         save_credentials(
@@ -2186,6 +2191,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
         save_credentials(
@@ -2236,6 +2242,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
 
@@ -2334,6 +2341,7 @@ mod tests {
             Some(&path),
             Duration::from_secs(2),
             ChatGptEndpoints::local(&server.base_url()),
+            &[],
         )
         .expect("model client");
 
@@ -2422,9 +2430,14 @@ mod tests {
         .expect("save credentials");
         let mut endpoints = ChatGptEndpoints::local(&server.base_url());
         endpoints.responses = format!("{}/responses", server.base_url());
-        let model =
-            CodexClient::with_endpoints("gpt-test", Some(&path), Duration::from_secs(2), endpoints)
-                .expect("model client");
+        let model = CodexClient::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            endpoints,
+            &[],
+        )
+        .expect("model client");
 
         let turn = generate_turn(
             &model,

@@ -916,7 +916,7 @@ fn codex_client(
     timeout: Duration,
 ) -> Result<CodexClient, InferenceError> {
     let credential = CredentialFile::open(auth_file, timeout).map_err(AuthError::Credential)?;
-    CodexClient::with_credential(model, Arc::new(credential), timeout)
+    CodexClient::with_credential(model, Arc::new(credential), timeout, &[])
 }
 
 fn build_client(arguments: &Arguments) -> Result<ModelClient, EvalError> {
@@ -939,7 +939,7 @@ fn build_client(arguments: &Arguments) -> Result<ModelClient, EvalError> {
                 ..Settings::default()
             };
             ModelClient::OpenRouter(
-                OpenRouterClient::new(&arguments.model, token, MODEL_TIMEOUT, settings)?
+                OpenRouterClient::new(&arguments.model, token, MODEL_TIMEOUT, settings, &[])?
                     .with_name(&arguments.label),
             )
         }
@@ -1373,6 +1373,7 @@ mod tests {
                 "fake-key".into(),
                 timeout,
                 Settings::default(),
+                &[],
             )
             .unwrap()
             .with_loopback_endpoint(&server.url())
