@@ -339,20 +339,31 @@ fn adjacent_empty_ifs_fields_spend_the_step_budget() {
 
 #[test]
 fn continued_reads_obey_the_shared_value_budget() {
+    use std::io::Write as _;
+
     for (lines, expected) in [(3, ExitCode::SUCCESS), (1000, ExitCode::SYNTAX)] {
-        let script = format!(
-            r"i=0; while [[ $i -lt {lines} ]]; do printf '12345678\\\n'; i=$((i+1)); done | {{ read x; :; }}"
-        );
-        let outcome = run_with(
-            &script,
-            Limits {
-                max_value_bytes: 1024,
-                ..Limits::default()
-            },
+        let limits = Limits {
+            max_value_bytes: 1024,
+            ..Limits::default()
+        };
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().expect("script stdin");
+        let stdin = dekopon_shell::ChildStdin::adopt(reader).expect("adopt script stdin");
+        writer
+            .write_all(b"12345678\\\n".repeat(lines).as_slice())
+            .expect("continued input lines");
+        drop(writer);
+        let tree = dekopon_process::TreeContext::new(limits, dekopon_process::CallBudget::new(1));
+        let outcome = Interpreter::new(limits).run_child(
+            "read x; echo \"$x\"",
+            Some(stdin),
+            &Fixture::default(),
+            &tree,
         );
         assert_eq!(outcome.exit_code, expected, "{outcome:?}");
         if expected == ExitCode::SYNTAX {
             assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+        } else {
+            assert_eq!(outcome.output, "12345678".repeat(lines));
         }
     }
 }
