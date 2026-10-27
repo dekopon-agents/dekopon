@@ -72,41 +72,62 @@ fn text_len(text: &Text) -> usize {
     }
 }
 
+fn joined_len(texts: &[Text]) -> usize {
+    texts.iter().fold(2, |total, text| {
+        total.saturating_add(text_len(text).saturating_sub(2))
+    })
+}
+
+fn list_len(items: impl Iterator<Item = usize>) -> usize {
+    items.enumerate().fold(0, |total, (index, len)| {
+        total
+            .saturating_add(len)
+            .saturating_add(usize::from(index > 0))
+    })
+}
+
 impl ReplayMessage {
-    /// The chat-completions encoding's size from slice lengths alone; no slice is read.
+    /// The chat-completions encoding's exact size, every reasoning item admitted and no cache
+    /// marker, from slice lengths alone; no slice is read.
     pub fn encoded_len(&self) -> usize {
-        let skeleton = 32;
-        match self {
-            Self::User(texts) => texts
-                .iter()
-                .map(text_len)
-                .fold(skeleton, usize::saturating_add),
-            Self::Tool { id, text } => skeleton
-                .saturating_add(json_len(id))
-                .saturating_add(text_len(text)),
+        let open = br#"{"role":"#.len() + json_len(self.role()) + br#","content":"#.len();
+        let body = match self {
+            Self::User(texts) => joined_len(texts),
+            Self::Tool { id, text } => joined_len(std::slice::from_ref(text))
+                .saturating_add(br#","tool_call_id":"#.len())
+                .saturating_add(json_len(id)),
             Self::Assistant {
                 content,
                 calls,
                 reasoning,
             } => {
-                let calls = calls.iter().fold(0_usize, |total, call| {
-                    total
-                        .saturating_add(64)
-                        .saturating_add(json_len(&call.id))
-                        .saturating_add(json_len(call.name.as_str()))
-                        .saturating_add(text_len(&call.arguments))
-                });
-                let reasoning = reasoning.iter().fold(0_usize, |total, item| {
-                    total
-                        .saturating_add(1)
-                        .saturating_add(usize::try_from(item.value.len()).unwrap_or(usize::MAX))
-                });
-                skeleton
-                    .saturating_add(content.as_ref().map_or(4, text_len))
-                    .saturating_add(calls)
-                    .saturating_add(reasoning)
+                let content = content.as_ref().map_or(b"null".len(), text_len);
+                let calls = if calls.is_empty() {
+                    0
+                } else {
+                    list_len(calls.iter().map(|call| {
+                        br#"{"id":,"type":"function","function":{"name":,"arguments":}}"#
+                            .len()
+                            .saturating_add(json_len(&call.id))
+                            .saturating_add(json_len(call.name.as_str()))
+                            .saturating_add(text_len(&call.arguments))
+                    }))
+                    .saturating_add(br#","tool_calls":[]"#.len())
+                };
+                let reasoning = if reasoning.is_empty() {
+                    0
+                } else {
+                    list_len(
+                        reasoning
+                            .iter()
+                            .map(|item| usize::try_from(item.value.len()).unwrap_or(usize::MAX)),
+                    )
+                    .saturating_add(br#","reasoning_details":[]"#.len())
+                };
+                content.saturating_add(calls).saturating_add(reasoning)
             }
-        }
+        };
+        open.saturating_add(body).saturating_add(1)
     }
 
     pub const fn role(&self) -> &'static str {
@@ -408,6 +429,190 @@ mod tests {
                 "{\"path\":\"é\"}"
             );
             assert_eq!(body["messages"][2]["content"], "result\n\\é");
+        }
+    }
+
+    fn shapes(
+        mut text: impl FnMut(&str) -> Text,
+        reasoning: crate::body::OpaqueSource,
+        key: &crate::model::ModelKey,
+    ) -> Vec<ReplayMessage> {
+        let call = |id: &str, arguments: Text| ReplayCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments,
+        };
+        vec![
+            ReplayMessage::User(vec![
+                text("user\né"),
+                Text::Owned("plain \"quoted\"".to_owned()),
+                text("tail\\"),
+            ]),
+            ReplayMessage::Assistant {
+                content: Some(text("answer\n")),
+                calls: vec![
+                    call("call-1", text("{\"path\":\"é\"}")),
+                    call("call-2", Text::Owned("{\"cut\":12}".to_owned())),
+                ],
+                reasoning: vec![
+                    super::ReplayReasoning {
+                        model: key.clone(),
+                        value: reasoning,
+                    },
+                    super::ReplayReasoning {
+                        model: key.clone(),
+                        value: crate::body::OpaqueSource::owned(b"{\"x\":1}"),
+                    },
+                ],
+            },
+            ReplayMessage::Assistant {
+                content: None,
+                calls: vec![call("call-3", text("[1,2]"))],
+                reasoning: Vec::new(),
+            },
+            ReplayMessage::Assistant {
+                content: Some(Text::Owned("only text".to_owned())),
+                calls: Vec::new(),
+                reasoning: Vec::new(),
+            },
+            ReplayMessage::Tool {
+                id: "call-1".into(),
+                text: text("result\n\\é"),
+            },
+            ReplayMessage::Tool {
+                id: "call-3".into(),
+                text: Text::Owned(String::new()),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn estimates_never_read_a_slice() {
+        use crate::{
+            body::{JsonBody, OpaqueSource},
+            model::{Backend, ModelKey},
+        };
+        let key = ModelKey::new(Backend::OpenRouter, "alias");
+        let raw = br#"{"type":"reasoning.encrypted","data":"opaque"}"#;
+        let mut reasoning = tempfile::tempfile().unwrap();
+        reasoning.write_all(raw).unwrap();
+        let mut files = vec![Arc::new(reasoning)];
+        let sliced = shapes(
+            |source| {
+                let text = slice(source);
+                if let Text::File { file, .. } = &text {
+                    files.push(Arc::clone(file));
+                }
+                text
+            },
+            OpaqueSource::File {
+                file: Arc::clone(&files[0]),
+                offset: 0,
+                len: raw.len() as u64,
+            },
+            &key,
+        );
+        for file in &files {
+            file.set_len(0).unwrap();
+        }
+        let owned = shapes(
+            |source| Text::Owned(source.to_owned()),
+            OpaqueSource::owned(raw),
+            &key,
+        );
+        for (sliced, owned) in sliced.into_iter().zip(owned) {
+            let mut body = JsonBody::default();
+            owned.chat(&mut body, Some(&key), None).unwrap();
+            let encoded = crate::body::collect(&body.finish()).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
+            assert_eq!(owned.encoded_len(), encoded.len());
+            assert_eq!(
+                ModelMessage::Journal { message: sliced }.encoded_len(),
+                encoded.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cut_texts_encode_valid_json_on_every_body() {
+        let whole = slice("ab\né");
+        for (limit, expected) in [(3, "ab"), (5, "ab\n")] {
+            let cut = whole.prefix(limit).unwrap();
+            let shown = "{\"cut\":17}";
+            let messages = [
+                ModelMessage::Journal {
+                    message: ReplayMessage::User(vec![cut.clone()]),
+                },
+                ModelMessage::Journal {
+                    message: ReplayMessage::Assistant {
+                        content: Some(cut.clone()),
+                        calls: vec![
+                            ReplayCall {
+                                id: "call-1".into(),
+                                name: "bash".into(),
+                                arguments: cut.clone(),
+                            },
+                            ReplayCall {
+                                id: "call-2".into(),
+                                name: "bash".into(),
+                                arguments: Text::Owned(shown.to_owned()),
+                            },
+                        ],
+                        reasoning: Vec::new(),
+                    },
+                },
+                ModelMessage::Journal {
+                    message: ReplayMessage::Tool {
+                        id: "call-1".into(),
+                        text: cut.clone(),
+                    },
+                },
+                ModelMessage::Journal {
+                    message: ReplayMessage::Tool {
+                        id: "call-2".into(),
+                        text: cut,
+                    },
+                },
+            ];
+            let options = CompletionOptions::default();
+            let codex = crate::codex::request_body_json("gpt-test", &messages, &[], &options)
+                .await
+                .unwrap();
+            assert_eq!(codex["input"][0]["content"][0]["text"], expected);
+            assert_eq!(codex["input"][1]["content"][0]["text"], expected);
+            assert_eq!(codex["input"][2]["arguments"], expected);
+            assert_eq!(codex["input"][3]["arguments"], shown);
+            assert_eq!(codex["input"][4]["output"], expected);
+            assert_eq!(codex["input"][5]["output"], expected);
+            let openai = crate::openai::request_body_json(&messages).await;
+            let router = crate::openrouter::OpenRouterClient::new(
+                "gpt-test",
+                "synthetic-test-token".to_owned(),
+                Duration::from_secs(1),
+                Default::default(),
+                &[],
+            )
+            .unwrap()
+            .prepare(crate::inference::GenerateRequest {
+                messages: &messages,
+                tools: &[],
+                options: &options,
+            })
+            .await
+            .unwrap();
+            let router: serde_json::Value = serde_json::from_slice(&router).unwrap();
+            for body in [openai, router] {
+                assert_eq!(body["messages"][0]["content"], expected);
+                assert_eq!(body["messages"][1]["content"], expected);
+                let calls = &body["messages"][1]["tool_calls"];
+                assert_eq!(calls[0]["function"]["arguments"], expected);
+                assert_eq!(calls[1]["function"]["arguments"], shown);
+                assert_eq!(body["messages"][2]["content"], expected);
+                assert_eq!(body["messages"][3]["content"], expected);
+            }
+            let rendered: serde_json::Value =
+                serde_json::from_str(codex["input"][3]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(rendered, serde_json::json!({"cut": 17}));
         }
     }
 

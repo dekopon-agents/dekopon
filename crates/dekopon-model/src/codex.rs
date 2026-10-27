@@ -2497,4 +2497,159 @@ mod tests {
         .unwrap();
         assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
     }
+
+    const SOURCES: [&str; 4] = ["user\né", "answer\n\\é", "{\"path\":\"é\"}", "result\n\\é"];
+
+    fn journal_file(path: &std::path::Path, sources: &[String]) -> Vec<crate::text::Text> {
+        let mut bytes = Vec::new();
+        let mut spans = Vec::new();
+        for source in sources {
+            let encoded = serde_json::to_vec(source).unwrap();
+            spans.push((bytes.len() as u64 + 1, encoded.len() as u64 - 2));
+            bytes.extend_from_slice(&encoded);
+            bytes.push(b'\n');
+        }
+        std::fs::write(path, &bytes).unwrap();
+        let file = std::sync::Arc::new(std::fs::File::open(path).unwrap());
+        spans
+            .into_iter()
+            .map(|(offset, len)| crate::text::Text::File {
+                file: std::sync::Arc::clone(&file),
+                offset,
+                len,
+            })
+            .collect()
+    }
+
+    fn journal_turn(texts: Vec<crate::text::Text>) -> Vec<ModelMessage> {
+        use crate::replay::{ReplayCall, ReplayMessage};
+        let [user, answer, arguments, output] = <[_; 4]>::try_from(texts).unwrap();
+        vec![
+            ModelMessage::Journal {
+                message: ReplayMessage::User(vec![user]),
+            },
+            ModelMessage::Journal {
+                message: ReplayMessage::Assistant {
+                    content: Some(answer),
+                    calls: vec![ReplayCall {
+                        id: "call-1".into(),
+                        name: "bash".into(),
+                        arguments,
+                    }],
+                    reasoning: Vec::new(),
+                },
+            },
+            ModelMessage::Journal {
+                message: ReplayMessage::Tool {
+                    id: "call-1".into(),
+                    text: output,
+                },
+            },
+            ModelMessage::user("current"),
+        ]
+    }
+
+    fn sources() -> Vec<String> {
+        let mut sources: Vec<String> = SOURCES.iter().map(|source| (*source).to_owned()).collect();
+        sources[3].push_str(&"x\n".repeat(80 * 1024));
+        sources
+    }
+
+    fn wire_body(request: &str) -> &str {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let length: usize = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|value| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        assert_eq!(body.len(), length);
+        body
+    }
+
+    async fn send_turn(
+        client: &CodexClient,
+        messages: &[ModelMessage],
+    ) -> Result<AssistantTurn, InferenceError> {
+        client
+            .generate(
+                GenerateRequest {
+                    messages,
+                    tools: &[],
+                    options: &CompletionOptions::default(),
+                },
+                &mut |_| ControlFlow::Continue(()),
+                &control(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_compaction_between_projection_and_send_keeps_the_body_exact() {
+        let (directory, server, client) = fixture(vec![MockResponse::sse(include_str!(
+            "fixtures/codex-answer.sse"
+        ))]);
+        let path = directory.path().join("journal.jsonl");
+        let sources = sources();
+        let messages = journal_turn(journal_file(&path, &sources));
+        let replacement = directory.path().join("journal.jsonl.tmp");
+        std::fs::write(&replacement, b"{\"b\":[]}\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        send_turn(&client, &messages).await.unwrap();
+
+        let owned = journal_turn(sources.into_iter().map(crate::text::Text::Owned).collect());
+        let expected = request_body_json("gpt-test", &owned, &[], &CompletionOptions::default())
+            .await
+            .unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let sent: serde_json::Value = serde_json::from_str(wire_body(&requests[0])).unwrap();
+        assert_eq!(sent, expected);
+    }
+
+    #[tokio::test]
+    async fn a_retry_rebuilds_the_chunked_body() {
+        let (directory, server, client) = fixture(vec![
+            MockResponse::failure(401, serde_json::json!({"error":"expired"})),
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+        ]);
+        write_credential(&directory, "rotated", u64::MAX);
+        let path = directory.path().join("journal.jsonl");
+        let messages = journal_turn(journal_file(&path, &sources()));
+        send_turn(&client, &messages).await.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(wire_body(&requests[0]), wire_body(&requests[1]));
+        drop(server);
+
+        let (refusal, refused, release) =
+            MockResponse::failure(401, serde_json::json!({"error":"expired"}))
+                .held_before_headers();
+        let (directory, server, client) = fixture(vec![
+            refusal,
+            MockResponse::sse(include_str!("fixtures/codex-answer.sse")),
+        ]);
+        write_credential(&directory, "rotated", u64::MAX);
+        let path = directory.path().join("journal.jsonl");
+        let messages = journal_turn(journal_file(&path, &sources()));
+        let (result, ()) = tokio::join!(send_turn(&client, &messages), async {
+            refused.await.unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            release.send(()).unwrap();
+        });
+        let Err(InferenceError::Transport(crate::error::TransportFailure::Body(error))) = result
+        else {
+            panic!("typed body failure: {result:?}");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(server.requests().len(), 1);
+    }
 }
