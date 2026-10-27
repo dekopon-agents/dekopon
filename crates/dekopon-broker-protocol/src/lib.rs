@@ -319,6 +319,8 @@ pub struct ChatScopeClaim {
     pub trigger: Trigger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
 }
 
 impl fmt::Debug for ChatScopeClaim {
@@ -331,6 +333,12 @@ impl ChatScopeClaim {
     #[must_use]
     pub fn is_bounded(&self) -> bool {
         self.conversation.is_bounded()
+            && self.participant.as_deref().is_none_or(|handle| {
+                handle
+                    .strip_prefix('p')
+                    .and_then(|n| n.parse::<u8>().ok())
+                    .is_some_and(|n| n > 0 && handle == format!("p{n}"))
+            })
     }
 }
 

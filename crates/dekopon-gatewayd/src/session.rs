@@ -1989,6 +1989,7 @@ impl SessionSteers {
                     message,
                     principal: self.principal.clone(),
                     join: None,
+                    handle: None,
                 })
                 .collect(),
         )
@@ -2002,6 +2003,7 @@ impl SessionSteers {
                      mut message,
                      principal,
                      join,
+                     handle,
                  }| {
                     let steer = &mut message;
                     match &steer.message_id {
@@ -2040,8 +2042,12 @@ impl SessionSteers {
                         self.text_reader,
                         InventoryPath::Steer,
                     );
+                    let prompt = participants::with_handle(prompt, handle);
                     let prompt = participants::with_join(prompt, join.as_deref());
-                    let recorded = attributed_prompt(principal.as_ref(), &recorded);
+                    let recorded = participants::with_handle(
+                        attributed_prompt(principal.as_ref(), &recorded),
+                        handle,
+                    );
                     self.raw_texts.lock().push(std::mem::take(&mut steer.text));
                     Steer::Person { prompt, recorded }
                 },
@@ -2231,6 +2237,8 @@ async fn session_turn(
             return MessageOutcome::Failed.into();
         }
     };
+    let identifiers = IdSequence::for_session();
+    let leg = leg.with_identifiers(identifiers.clone());
     let space_grants = match route.memory {
         MemoryPolicy::Persistent(MemoryWindow {
             scope: MemoryScope::SharedConversation,
@@ -2311,6 +2319,7 @@ async fn session_turn(
         &cancellation,
         mapped_participants,
     );
+    let asker_handle = mapped_participants.then_some(participants::Handle::ASKER);
     let asker_join = mapped_participants.then(|| participants::join_line(&leg));
     let granted = space_grants.map_or(granted, |grants| {
         grants.iter().map(ToString::to_string).collect()
@@ -2451,6 +2460,7 @@ async fn session_turn(
             .as_ref()
             .map(|memory| memory.prompt_note.as_str()),
         assets_note,
+        mapped_participants.then_some(participants::FRAME),
         Some(limits_line(limits, route.max_duration).as_str()),
     ]
     .into_iter()
@@ -2520,6 +2530,7 @@ async fn session_turn(
             InventoryPath::Turn
         },
     );
+    let text = participants::with_handle(text, asker_handle);
     let text = participants::with_join(text, asker_join.as_deref());
     let (participant_drain, participant_requests) =
         participants::channel(mapped_participants, &cancellation);
@@ -2528,7 +2539,7 @@ async fn session_turn(
             Some(note) => bound_inbound(&format!("{note}\n{text}")),
             None => text,
         };
-        attributed_prompt(principal.as_ref(), &text)
+        participants::with_handle(attributed_prompt(principal.as_ref(), &text), asker_handle)
     };
     let recorded = if is_follow {
         attributed_prompt(principal.as_ref(), &recorded)
@@ -2637,17 +2648,20 @@ async fn session_turn(
         .job_timeout
         .zip(Anchor::for_job(message, &route.agent))
     {
-        leg = leg.with_job_control(Arc::new(JobContext::for_turn(
-            Arc::clone(&runner.jobs),
-            message,
-            anchor,
-            runner.broker.clone(),
-            ShellLimits {
-                max_capability_calls: limits.max_capability_calls,
-                timeout,
-                ..ShellLimits::default()
-            },
-        )));
+        leg = leg.with_job_control(Arc::new(
+            JobContext::for_turn(
+                Arc::clone(&runner.jobs),
+                message,
+                anchor,
+                runner.broker.clone(),
+                ShellLimits {
+                    max_capability_calls: limits.max_capability_calls,
+                    timeout,
+                    ..ShellLimits::default()
+                },
+            )
+            .with_participant(asker_handle.map(participants::Handle::as_str)),
+        ));
     }
     drop(sink);
     let wakes = route
@@ -2691,7 +2705,18 @@ async fn session_turn(
             })
         })
         .flatten();
+    let leg = if mapped_participants {
+        participants::Handle::ASKER.bind(leg)
+    } else {
+        leg
+    };
     let leg = Arc::new(leg);
+    let participant_table = mapped_participants.then(|| {
+        Arc::new(Mutex::new(participants::Table::new(
+            message.subject.clone(),
+            Arc::clone(&leg),
+        )))
+    });
     let participant_worker = participants::Worker::start(
         participant_requests,
         participants::Inputs {
@@ -2701,7 +2726,12 @@ async fn session_turn(
             key: (message.transport.clone(), message.conversation.key()),
             cancellation: cancellation.clone(),
             asker: message.subject.clone(),
-            leg: Arc::clone(&leg),
+            identifiers: identifiers.clone(),
+            table: participant_table.clone(),
+            assets: Arc::clone(&assets),
+            attachments: Arc::clone(&attachments),
+            jobs: Arc::clone(&runner.jobs),
+            shell,
             calls: calls.clone(),
             progress: Arc::clone(&progress_sink),
         },
@@ -2762,10 +2792,13 @@ async fn session_turn(
                 Ok(model) => ChatProviderGovernor::wrap(model, &metering, &agent_id, &model_config),
                 Err(error) => return (Err(error), None, Vec::new()),
             };
-            let runtime = ShellRuntime {
-                invoker,
-                limits: shell,
-                calls,
+            let runtime = participants::Runtime {
+                asker: ShellRuntime {
+                    invoker,
+                    limits: shell,
+                    calls,
+                },
+                table: participant_table,
             };
             let mut history = seeded;
             let mut first_shown = None;
@@ -2782,7 +2815,7 @@ async fn session_turn(
                     },
                     &history,
                     |available, evidence| {
-                        journal::decide(&runtime, &policy.selection, available, evidence)
+                        journal::decide(&runtime.asker, &policy.selection, available, evidence)
                     },
                 ) {
                     Ok(projected) => {
@@ -3190,6 +3223,7 @@ async fn session_turn(
                 claim,
                 steers.user_text(&message.text),
                 DeliveredAnswer::accepted_by_transport(answer),
+                &identifiers,
             )
             .await;
         }
@@ -3483,6 +3517,7 @@ fn chat_claim_for(
         subject,
         route.agent.clone(),
         ChatScopeClaim {
+            participant: None,
             transport,
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
@@ -3505,6 +3540,7 @@ async fn record_delivered_turn(
     claim: Attestation,
     user: String,
     assistant: DeliveredAnswer,
+    identifiers: &IdSequence,
 ) {
     let MessageId::Native(message_id) = &message.message_id else {
         tracing::debug!(
@@ -3523,7 +3559,6 @@ async fn record_delivered_turn(
         return;
     };
     let result: Result<(), MemoryRecordFailure> = async {
-        let identifiers = IdSequence::for_session();
         let client = runner
             .broker
             .leg_client()

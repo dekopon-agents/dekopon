@@ -4583,6 +4583,7 @@ fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
                 thread,
             },
         delivery,
+        participant: _,
         trigger,
     } = scope;
     *kind == ChatTransportKind::Local
@@ -4848,6 +4849,7 @@ fn emit_audit_event(event: &AuditEvent) {
                 conversation.container = authority.chat.as_ref().and_then(|chat| chat.conversation.container.as_deref()),
                 conversation.id = authority.chat.as_ref().map(|chat| chat.conversation.id.as_str()),
                 conversation.thread = authority.chat.as_ref().and_then(|chat| chat.conversation.thread.as_deref()),
+                participant.handle = authority.chat.as_ref().and_then(|chat| chat.participant.as_deref()),
                 delivery.kind = authority.chat.as_ref().and_then(|chat| chat.delivery.as_ref().map(delivery_kind)),
                 delivery.id = authority.chat.as_ref().and_then(|chat| chat.delivery.as_ref().map(delivery_id)),
                 invocation.id = %invocation,

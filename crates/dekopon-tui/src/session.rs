@@ -316,6 +316,7 @@ pub async fn connect(
 #[must_use]
 pub fn smoke_claim() -> ChatScopeClaim {
     ChatScopeClaim {
+        participant: None,
         transport: "console-smoke".parse().unwrap_or_else(|_| unreachable!()),
         kind: ChatTransportKind::Local,
         conversation: Conversation {

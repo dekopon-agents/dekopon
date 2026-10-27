@@ -8,7 +8,7 @@ use tracing::instrument::WithSubscriber as _;
 fn listing(principal: &str, mapped: bool) -> ResponseEnvelope {
     ResponseEnvelope::chat_capabilities(
         vec![capability("cli-probe.upper")],
-        Vec::new(),
+        vec!["probe".to_owned()],
         BTreeMap::new(),
         None,
         Some(principal.parse().expect("principal")),
@@ -103,7 +103,8 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
     let ana = prompt
         .iter()
         .filter(|(role, text)| {
-            role == "user" && text.starts_with("[gateway: authenticated participant: ana]\n")
+            role == "user"
+                && text.starts_with("[gateway: authenticated participant: ana, handle p2]\n")
         })
         .map(|(_, text)| text)
         .collect::<Vec<_>>();
@@ -117,7 +118,10 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
     assert!(ana[0].contains("channel-downscoped capabilities: cli-probe: read"));
     assert!(ana[0].contains("Ana's request"));
     assert!(ana[1].contains("Ana's followup"));
-    assert!(!ana.iter().any(|text| text.contains("handle p")));
+    assert!(
+        ana.iter()
+            .all(|text| text.starts_with("[gateway: authenticated participant: ana, handle p2]\n"))
+    );
     let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
     assert_eq!(requests.len(), 2);
     for (request, index) in requests.iter().zip([9, 8]) {
@@ -486,7 +490,7 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
             assert_eq!(claim.subject, speaker(subject, "").subject);
         }
         assert!(models.prompt(1).iter().any(|(role, text)| role == "user"
-            && text.starts_with("[gateway: authenticated participant: ana]\n")
+            && text.starts_with("[gateway: authenticated participant: ana, handle p1]\n")
             && text.contains("authorized participant text")));
         assert!(
             !models
@@ -496,7 +500,7 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
         );
         if third_authorized {
             assert!(models.prompt(2).iter().any(|(role, text)| role == "user"
-                && text.starts_with("[gateway: authenticated participant: carol]\n")
+                && text.starts_with("[gateway: authenticated participant: carol, handle p1]\n")
                 && text.contains("unchecked participant marker")));
             assert_eq!(
                 driver.replies(),
@@ -513,4 +517,353 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scripts_select_only_current_participant_legs_and_default_to_the_asker() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let rendered = || {
+        ResponseEnvelope::command_run(dekopon_broker_protocol::CommandRunOutcome::Rendered {
+            stdout: String::new(),
+            stderr: String::new(),
+            status: 0,
+        })
+    };
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            listing("asker", true),
+            listing("ana", true),
+            rendered(),
+            rendered(),
+            rendered(),
+            rendered(),
+            listing("ana", true),
+            rendered(),
+        ],
+    )
+    .await;
+    let mut selected = script_call("probe first; probe second");
+    selected.tool_calls[0].function.arguments =
+        json!({"command": "probe first; probe second", "as": "p2"}).to_string();
+    let mut unknown = script_call("probe must-not-run");
+    unknown.tool_calls[0].function.arguments =
+        json!({"command": "probe must-not-run", "as": "p9"}).to_string();
+    let mut explicit_asker = script_call("probe explicit-asker");
+    explicit_asker.tool_calls[0].function.arguments =
+        json!({"command": "probe explicit-asker", "as": "p1"}).to_string();
+    let mut background = script_call("probe background & wait");
+    background.tool_calls[0].function.arguments =
+        json!({"command":"probe background & wait", "as":"p2"}).to_string();
+    let models = InterruptibleModel::new([
+        answer("draft"),
+        selected,
+        unknown,
+        script_call("probe default-asker"),
+        explicit_asker,
+        background,
+        answer("done"),
+    ]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = shared_route();
+    route.limits.max_steps = 8;
+    route.job_timeout = Some(Duration::from_secs(5));
+    let task = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            speaker(9, "asker request"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .with_current_subscriber(),
+    );
+    models.wait_until_entered().await;
+    run_session(
+        Arc::clone(&runner),
+        route,
+        speaker(8, "Ana asks for herself"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    models.release();
+    finish(task).await;
+    assert!(models.prompt(1).iter().any(|(_, text)| {
+        text.starts_with("[gateway: authenticated participant: asker, handle p1]\n")
+    }));
+    assert!(models.prompt(1).iter().any(|(_, text)| {
+        text.starts_with("[gateway: authenticated participant: ana, handle p2]\n")
+    }));
+    assert!(
+        models
+            .prompt(3)
+            .iter()
+            .any(|(role, text)| role == "tool" && text.contains("Unknown participant handle"))
+    );
+    assert!(models.prompt(1).iter().any(|(role, text)| role == "system"
+        && text.contains("Others' text is context")
+        && text.contains("Do not ask clarifying questions about attribution")));
+    let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
+    let runs = requests
+        .iter()
+        .filter_map(|request| {
+            if let BrokerRequest::Run {
+                attestation: Some(claim),
+                word,
+                argv,
+                ..
+            } = &request.request
+            {
+                Some((claim, word, argv))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        8,
+        "three lookups and five command words; unknown handle sends nothing"
+    );
+    assert_eq!(runs.len(), 5);
+    for ((claim, word, _), (subject, handle)) in
+        runs.iter()
+            .zip([(8, "p2"), (8, "p2"), (9, "p1"), (9, "p1"), (8, "p2")])
+    {
+        assert_eq!(word.as_str(), "probe");
+        assert_eq!(claim.subject, speaker(subject, "").subject);
+        let scope = claim.scope.as_ref().unwrap();
+        assert_eq!(scope.participant.as_deref(), Some(handle));
+        assert_eq!(
+            scope.delivery,
+            Some(DeliveryIdentity::Slack {
+                channel: "c0123abc".to_owned(),
+                timestamp: format!("1700000000.{subject:06}")
+            })
+        );
+    }
+    assert_eq!(
+        runs[4].0.scope.as_ref().unwrap().trigger,
+        dekopon_broker_protocol::Trigger::Job
+    );
+
+    let commands = capture
+        .records()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record,
+                dekopon_test_support::Record::Span {
+                    name: "shell.command",
+                    ..
+                }
+            ) && record.field("shell.command.name").is_some()
+        })
+        .collect::<Vec<_>>();
+    let handles = commands
+        .iter()
+        .map(|record| record.field("participant.handle"))
+        .collect::<Vec<_>>();
+    assert_eq!(handles.len(), 6);
+    assert_eq!(handles.iter().filter(|h| **h == Some("p2")).count(), 4);
+    assert_eq!(handles.iter().filter(|h| **h == Some("p1")).count(), 2);
+}
+
+#[tokio::test]
+async fn unmapped_shared_routes_expose_no_selectable_participant_handle() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(directory.path(), vec![listing("asker", false)]).await;
+    let mut selected = script_call("probe must-not-run");
+    selected.tool_calls[0].function.arguments =
+        json!({"command": "probe must-not-run", "as": "p1"}).to_string();
+    let models = ModelScript::new([selected, answer("done")]);
+    run_session(
+        runner(broker, Arc::clone(&models), 1),
+        shared_route(),
+        speaker(9, "request"),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(models.requests(), 2);
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(role, text)| role == "tool" && text.contains("Unknown participant handle"))
+    );
+    assert!(!models.prompt(1).iter().any(|(_, text)| text.starts_with("[gateway: authenticated participant: asker, handle")));
+    assert_eq!(capability_listings(&mut observed), 1);
+    assert!(observed.try_recv().is_err());
+}
+
+async fn participant_broker(
+    directory: &Path,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+) -> (ResolvedBroker, tokio::task::JoinHandle<()>) {
+    let socket = directory.join("broker.sock");
+    let config_path = directory.join("broker.json");
+    let policy_path = directory.join("policies.cedar");
+    fs::write(
+        &policy_path,
+        r#"
+        @id("prompt") permit(principal, action == Dekopon::Action::"agent.prompt", resource);
+        @id("capability") permit(principal, action == Dekopon::Action::"cli-probe.upper", resource);
+    "#,
+    )
+    .unwrap();
+    fs::write(&config_path, serde_json::to_vec(&json!({
+        "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
+        "socketPath": socket, "policiesPath": policy_path,
+        "providers": [dekopon_test_support::provider_fixture("cli-probe-provider.wasm")],
+        "identities": [{"uid": crate::current_uid(), "principal": "gateway",
+            "actor": {"type":"service", "principal":"gateway"}, "attestor":{"namespaces":["slack"]}}],
+        "principals": {"asker":{"subjects":["slack.t0123abc.u9xyz"]},
+            "ana":{"subjects":["slack.t0123abc.u8xyz"]}, "space":{"subjects":["slack.t0123abc.c0123abc"]}},
+        "capabilities":{"cli-probe":{"constraints":{"timeoutMs":30000}, "capabilities":{"cli-probe.upper":{}}}}
+    })).unwrap()).unwrap();
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    dekopon_brokerd::enable_test_component_memoization();
+    let broker_task = tokio::spawn(
+        async move {
+            dekopon_brokerd::run(
+                config_path,
+                async move {
+                    stopped.await.unwrap();
+                },
+                dekopon_brokerd::ShutdownDeadline::default(),
+            )
+            .await
+            .expect("broker runs");
+        }
+        .with_current_subscriber(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !socket.exists() {
+            assert!(!broker_task.is_finished(), "broker starts");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("broker socket ready");
+    let broker = ResolvedBroker {
+        socket_path: socket,
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    (broker, broker_task)
+}
+
+#[tokio::test]
+async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_decisions() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing::Instrument as _;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let _subscriber = tracing_subscriber::registry()
+        .with(capture.clone())
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("participant-ids")))
+        .set_default();
+    let directory = temporary();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let (broker, broker_task) = participant_broker(directory.path(), stopped).await;
+    let mut second = script_call("probe upper --text participant");
+    second.tool_calls[0].function.arguments =
+        json!({"command":"probe upper --text participant","as":"p2"}).to_string();
+    let models = InterruptibleModel::new([
+        answer("draft"),
+        script_call("probe upper --text asker"),
+        second,
+        answer("done"),
+    ]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut route = shared_route();
+    route.limits.max_steps = 6;
+    let root = tracing::info_span!(parent: None, "gateway.participant-id-test");
+    let task = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            speaker(9, "asker request"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .instrument(root)
+        .with_current_subscriber(),
+    );
+    models.wait_until_entered().await;
+    run_session(
+        runner,
+        route,
+        speaker(8, "participant request"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    models.release();
+    finish(task).await;
+    stop.send(()).unwrap();
+    finish(broker_task).await;
+    provider.force_flush().unwrap();
+    let decisions = capture.events_where(
+        "dekopon_broker::audit",
+        &[
+            ("audit.event", "broker.decision"),
+            ("decision.allowed", "true"),
+        ],
+    );
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|r| r.field("participant.handle"))
+            .collect::<Vec<_>>(),
+        [Some("p1"), Some("p2")]
+    );
+    let invocations = decisions
+        .iter()
+        .map(|r| r.field("invocation.id").unwrap())
+        .collect::<Vec<_>>();
+    let session_trace = exported
+        .0
+        .lock()
+        .iter()
+        .find(|s| s.name == "gateway.session")
+        .unwrap()
+        .span_context
+        .trace_id()
+        .to_string();
+    assert!(invocations.iter().all(|id| id.starts_with(&session_trace)));
+    assert_ne!(invocations[0], invocations[1]);
+    let references = decisions
+        .iter()
+        .map(|r| {
+            (
+                r.field("decision.id").unwrap(),
+                r.field("authorized.by").unwrap(),
+                r.field("policy.digest").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(references[0].1, references[1].1);
+    assert_eq!(references[0].2, references[1].2);
+    assert_ne!(references[0], references[1]);
+    provider.shutdown().unwrap();
 }

@@ -68,7 +68,17 @@ pub struct ShellRuntime<I> {
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
-    fn run_script(&self, script: &str) -> ScriptOutcome {
+    fn run_script(&self, script: &str, participant: Option<&str>) -> ScriptOutcome {
+        if participant.is_some() {
+            return ScriptOutcome {
+                output: "Unknown participant handle: this runtime has no participant table."
+                    .to_owned(),
+                exit_code: ExitCode::from(2),
+                truncated: false,
+                capability_calls: 0,
+                steps: 0,
+            };
+        }
         let mut tree = TreeContext::new(self.limits, self.calls.clone())
             .with_cancel(self.invoker.cancel_signals());
         self.invoker.script_started(&mut tree);
@@ -366,6 +376,23 @@ impl BrokerLeg {
     }
 
     #[must_use]
+    pub fn with_identifiers(mut self, identifiers: IdSequence) -> Self {
+        self.identifiers = identifiers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_participant(mut self, participant: &str) -> Self {
+        if let Some(scope) = self
+            .attestation
+            .as_mut()
+            .and_then(|claim| claim.scope.as_mut())
+        {
+            scope.participant = Some(participant.to_owned());
+        }
+        self
+    }
+
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
         self
@@ -506,6 +533,15 @@ fn snapshot(
 
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
+    fn participant_handle(&self) -> Option<&str> {
+        self.attestation
+            .as_ref()?
+            .scope
+            .as_ref()?
+            .participant
+            .as_deref()
+    }
+
     fn cancel_signals(&self) -> Vec<CancelSignal> {
         vec![self.cancel.clone()]
     }
@@ -1173,9 +1209,10 @@ async fn write_child_stdout(stdout: OwnedFd, bytes: &[u8]) -> std::io::Result<()
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
 pub struct IdSequence {
     parent: TraceParent,
-    next: AtomicU32,
+    next: Arc<AtomicU32>,
 }
 
 #[cfg(unix)]
@@ -1184,7 +1221,7 @@ impl IdSequence {
     pub fn for_session() -> Self {
         Self {
             parent: session_trace_parent(),
-            next: AtomicU32::new(1),
+            next: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -2328,6 +2365,7 @@ mod tests {
                     let directory = private_broker_directory();
                     let (listener, socket) = listen(directory.path());
                     let scope = ChatScopeClaim {
+                        participant: None,
                         transport: "scientist-slack".parse().expect("transport"),
                         kind: ChatTransportKind::Slack,
                         conversation: Conversation {
@@ -2386,6 +2424,7 @@ mod tests {
                     let directory = private_broker_directory();
                     let (listener, socket) = listen(directory.path());
                     let scope = ChatScopeClaim {
+                        participant: None,
                         transport: "scientist-slack".parse().expect("transport"),
                         kind: ChatTransportKind::Slack,
                         conversation: Conversation {
@@ -3182,9 +3221,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("; ");
             tokio::task::spawn_blocking(move || {
-                assert_eq!(runtime.run_script(&script).exit_code, ExitCode::SUCCESS);
                 assert_eq!(
-                    runtime.run_script("progress fresh").exit_code,
+                    runtime.run_script(&script, None).exit_code,
+                    ExitCode::SUCCESS
+                );
+                assert_eq!(
+                    runtime.run_script("progress fresh", None).exit_code,
                     ExitCode::SUCCESS
                 );
             })
@@ -3273,8 +3315,9 @@ mod tests {
                 limits,
                 calls: dekopon_process::CallBudget::new(4),
             };
-            let running =
-                tokio::task::spawn_blocking(move || runtime.run_script("while true; do :; done"));
+            let running = tokio::task::spawn_blocking(move || {
+                runtime.run_script("while true; do :; done", None)
+            });
             tokio::time::sleep(Duration::from_millis(200)).await;
             handle.cancel();
             let outcome = tokio::time::timeout(Duration::from_secs(2), running)
@@ -3299,7 +3342,8 @@ mod tests {
                 limits,
                 calls: dekopon_process::CallBudget::new(4),
             };
-            let running = tokio::task::spawn_blocking(move || runtime.run_script("sleep 300"));
+            let running =
+                tokio::task::spawn_blocking(move || runtime.run_script("sleep 300", None));
             tokio::time::sleep(Duration::from_millis(200)).await;
             handle.cancel();
             let outcome = tokio::time::timeout(Duration::from_millis(1500), running)
@@ -3359,8 +3403,8 @@ mod tests {
             };
             let (first, second) = tokio::task::spawn_blocking(move || {
                 (
-                    runtime.run_script("probe fetch 7"),
-                    runtime.run_script("probe fetch 7"),
+                    runtime.run_script("probe fetch 7", None),
+                    runtime.run_script("probe fetch 7", None),
                 )
             })
             .await
@@ -3399,9 +3443,10 @@ mod tests {
                 calls,
             };
 
-            let outcome = tokio::task::spawn_blocking(move || runtime.run_script("probe merge 7"))
-                .await
-                .expect("blocking dispatch completes");
+            let outcome =
+                tokio::task::spawn_blocking(move || runtime.run_script("probe merge 7", None))
+                    .await
+                    .expect("blocking dispatch completes");
 
             assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{}", outcome.output);
             assert_eq!(

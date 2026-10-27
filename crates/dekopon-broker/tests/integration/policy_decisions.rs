@@ -154,6 +154,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         subject(),
         agent("some-agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
             conversation: Conversation {
@@ -280,6 +281,7 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
         subject(),
         agent("some-agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "elote-logs".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Discord,
             conversation: Conversation {
@@ -365,6 +367,7 @@ fn channel_claim(
         subject,
         agent("some-agent"),
         ChatScopeClaim {
+            participant: None,
             transport: "chat".parse().expect("transport"),
             kind,
             conversation: Conversation {

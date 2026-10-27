@@ -311,6 +311,10 @@ impl<I> FollowInvoker<I> {
 }
 
 impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
+    fn participant_handle(&self) -> Option<&str> {
+        self.inner.participant_handle()
+    }
+
     fn cancel_signals(&self) -> Vec<dekopon_process::CancelSignal> {
         self.inner.cancel_signals()
     }

@@ -730,8 +730,8 @@ struct Recording<I> {
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for Recording<I> {
-    fn run_script(&self, script: &str) -> ScriptOutcome {
-        let outcome = self.shell.run_script(script);
+    fn run_script(&self, script: &str, _participant: Option<&str>) -> ScriptOutcome {
+        let outcome = self.shell.run_script(script, _participant);
         self.scripts.lock().push(ScriptRecord {
             script: script.to_owned(),
             exit_code: outcome.exit_code.get(),

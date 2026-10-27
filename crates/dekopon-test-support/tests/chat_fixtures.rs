@@ -35,7 +35,8 @@ fn scripted(body: &str, dialect: dekopon_model::TranscriptDialect) -> Vec<TurnEv
 async fn a_blocked_runtime_parks_inside_run_script_until_it_is_released() {
     let runtime = Arc::new(BlockedRuntime::new("done").offering(&["probe"]));
     let parked = Arc::clone(&runtime);
-    let running = tokio::task::spawn_blocking(move || parked.run_script("probe upper --text hi"));
+    let running =
+        tokio::task::spawn_blocking(move || parked.run_script("probe upper --text hi", None));
 
     tokio::time::timeout(Duration::from_secs(5), runtime.wait_until_parked())
         .await
