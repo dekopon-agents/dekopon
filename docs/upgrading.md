@@ -77,8 +77,9 @@ No configuration migration and no provider WIT or SDK re-pin. Before upgrading:
 ## Console joins the workspace (0.52.0)
 
 `dekopon-console` now ships with core in release archives and both stock and memory-optimized
-Dekopon images. Point the deployment's `console.image` at `ghcr.io/dekopon-agents/dekopon` with
-the matching release tag and selected variant. Chart values and templates are unchanged.
+Dekopon images. The chart default now matches the main Dekopon image, including its selected
+variant or digest pin, when `console.image.tag` and `console.image.digest` are empty. Explicit
+console tags or digests use `console.image.repository`, defaulting to `ghcr.io/dekopon-agents/dekopon`.
 `brew install dekopon-agents/tap/dekopon-console` keeps its existing name; its formula now
 installs the console from the Dekopon release. The `dekopon` formula continues to own only the
 daemon executables. No configuration, CLI flag, environment key or broker frame migration is needed.

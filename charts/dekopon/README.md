@@ -3,6 +3,9 @@
 Chart `0.47.0` targets application `v0.60.0`.
 With empty `image.tag` and `image.digest`, the chart renders
 `ghcr.io/dekopon-agents/dekopon:v0.60.0`; a set `image.digest` wins over the tag.
+With `console.enabled: true` and empty `console.image.tag` and `console.image.digest`,
+the console uses the main image, including its tag, variant, or digest. An explicit console tag
+or digest uses `console.image.repository`, which defaults to `ghcr.io/dekopon-agents/dekopon`.
 With `broker.providerSet.enabled: true`, the chart runs `dekopon-brokerd provider precompile`
 after file preparation and before broker startup, using the broker image, UID, provider-set
 subPath and resource limits. The image must be v0.32.0 or later; earlier images lack the command.
