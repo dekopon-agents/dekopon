@@ -448,9 +448,6 @@ impl TelemetryGuard {
     pub fn shutdown(self) -> Result<(), ShutdownError> {
         let mut failures = Vec::new();
         if let Some(provider) = self.logger_provider {
-            if let Err(error) = provider.force_flush() {
-                failures.push(format!("logs flush: {error}"));
-            }
             let stopped = match self.shutdown_timeout {
                 Some(timeout) => provider.shutdown_with_timeout(timeout),
                 None => provider.shutdown(),
@@ -460,9 +457,6 @@ impl TelemetryGuard {
             }
         }
         if let Some(provider) = self.tracer_provider {
-            if let Err(error) = provider.force_flush() {
-                failures.push(format!("traces flush: {error}"));
-            }
             let stopped = match self.shutdown_timeout {
                 Some(timeout) => provider.shutdown_with_timeout(timeout),
                 None => provider.shutdown(),
@@ -1054,5 +1048,93 @@ mod tests {
             shutdown_timeout: None,
         };
         assert!(guard.shutdown().is_ok());
+    }
+
+    #[test]
+    fn a_stalled_exporter_times_out_at_the_configured_shutdown_timeout() {
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use opentelemetry_sdk::{
+            error::{OTelSdkError, OTelSdkResult},
+            trace::{
+                BatchSpanProcessor, SdkTracerProvider, Span, SpanData, SpanExporter, SpanProcessor,
+            },
+        };
+        use std::{sync::mpsc, time::Duration};
+
+        #[derive(Debug)]
+        struct Stalled(Mutex<mpsc::Receiver<()>>);
+
+        impl SpanExporter for Stalled {
+            async fn export(&self, _: Vec<SpanData>) -> OTelSdkResult {
+                self.0.lock().recv().ok();
+                Ok(())
+            }
+        }
+
+        #[derive(Debug)]
+        struct Observed {
+            batch: BatchSpanProcessor,
+            timed_out: Arc<Mutex<Option<Duration>>>,
+        }
+
+        impl SpanProcessor for Observed {
+            fn on_start(&self, span: &mut Span, context: &opentelemetry::Context) {
+                self.batch.on_start(span, context);
+            }
+            fn on_end(&self, span: SpanData) {
+                self.batch.on_end(span);
+            }
+            fn force_flush(&self) -> OTelSdkResult {
+                self.batch.force_flush()
+            }
+            fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+                let result = self.batch.shutdown_with_timeout(timeout);
+                if let Err(OTelSdkError::Timeout(waited)) = &result {
+                    *self.timed_out.lock() = Some(*waited);
+                }
+                result
+            }
+        }
+
+        let (release, stalled) = mpsc::channel();
+        let release = Arc::new(Mutex::new(Some(release)));
+        let timed_out = Arc::new(Mutex::new(None));
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(Observed {
+                batch: BatchSpanProcessor::builder(Stalled(Mutex::new(stalled))).build(),
+                timed_out: Arc::clone(&timed_out),
+            })
+            .build();
+        provider.tracer("stalled").start("queued");
+
+        let (finished, watching) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn({
+            let release = Arc::clone(&release);
+            move || {
+                if let Err(mpsc::RecvTimeoutError::Timeout) =
+                    watching.recv_timeout(Duration::from_secs(2))
+                    && let Some(release) = release.lock().take()
+                {
+                    release.send(()).ok();
+                }
+            }
+        });
+        let timeout = Duration::from_millis(10);
+        let stopped = TelemetryGuard {
+            console_worker: None,
+            tracer_provider: Some(provider),
+            logger_provider: None,
+            shutdown_timeout: Some(timeout),
+        }
+        .shutdown();
+        let released_after = release.lock().take();
+        finished.send(()).ok();
+        watchdog.join().unwrap();
+
+        let release =
+            released_after.expect("shutdown waited until the watchdog freed the exporter");
+        assert!(stopped.is_err());
+        assert_eq!(*timed_out.lock(), Some(timeout));
+        release.send(()).ok();
     }
 }

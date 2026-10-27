@@ -28,6 +28,8 @@ pub enum TelemetryError {
         "invalid telemetry settings: use a credential-free base endpoint, nonempty serviceName and positive exportTimeoutMs"
     )]
     Settings,
+    #[error("telemetry transport grpc is no longer supported; use http")]
+    GrpcTransport,
     #[error("could not initialize telemetry exporter or subscriber")]
     Install,
     #[error("telemetry flush/shutdown failed")]
@@ -38,15 +40,12 @@ pub enum TelemetryError {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Config {
     endpoint: String,
-    #[serde(default = "transport")]
+    #[serde(default)]
     transport: Transport,
     #[serde(default = "service_name")]
     service_name: String,
     #[serde(default = "timeout_ms")]
     export_timeout_ms: u64,
-}
-const fn transport() -> Transport {
-    Transport::Grpc
 }
 fn service_name() -> String {
     "dekopon-console".into()
@@ -66,7 +65,10 @@ fn settings(text: &str) -> Result<ExporterSettings, TelemetryError> {
         env!("CARGO_PKG_VERSION"),
         Duration::from_millis(config.export_timeout_ms),
     )
-    .map_err(|_sensitive_error| TelemetryError::Settings)
+    .map_err(|error| match error {
+        dekopon_telemetry::TelemetryError::GrpcTransport => TelemetryError::GrpcTransport,
+        _sensitive_error => TelemetryError::Settings,
+    })
 }
 
 pub fn initialize(
@@ -133,14 +135,19 @@ mod tests {
     use super::*;
     #[test]
     fn telemetry_defaults_and_explicit_values_use_shared_validation() {
-        let default = settings("endpoint: http://127.0.0.1:4317").unwrap();
-        assert_eq!(default.transport(), Transport::Grpc);
+        let default = settings("endpoint: http://127.0.0.1:4318").unwrap();
         assert_eq!(default.service_name(), "dekopon-console");
         assert_eq!(default.timeout(), Duration::from_millis(5000));
         let explicit = settings("endpoint: http://127.0.0.1:4318\ntransport: http\nserviceName: fixture\nexportTimeoutMs: 1000").unwrap();
-        assert_eq!(explicit.transport(), Transport::Http);
         assert_eq!(explicit.service_name(), "fixture");
         assert_eq!(explicit.timeout(), Duration::from_millis(1000));
+    }
+    #[test]
+    fn telemetry_refuses_grpc_by_name() {
+        assert!(matches!(
+            settings("endpoint: http://127.0.0.1:4317\ntransport: grpc"),
+            Err(TelemetryError::GrpcTransport)
+        ));
     }
     #[test]
     fn telemetry_refuses_invalid_and_inline_credentials_without_echoing_input() {

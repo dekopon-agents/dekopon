@@ -34,7 +34,7 @@ impl LogExporter for Logs {
 
 #[test]
 fn a_memory_store_after_the_detail_probe_reaches_traces_and_logs() {
-    let filter = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,tonic=off,reqwest=off";
+    let filter = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off";
     let traces = Traces::default();
     let logs = Logs::default();
     let guard = Install::new(Console {

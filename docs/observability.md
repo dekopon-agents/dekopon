@@ -1,7 +1,8 @@
 # Observability
 
-`dekopon-gatewayd` and `dekopon-brokerd` each export their own execution traces over OTLP, using either
-gRPC or HTTP with protobuf payloads. Gateway coverage is a routed chat message, model turns, and
+`dekopon-gatewayd` and `dekopon-brokerd` each export their own execution traces and log records as
+standard OTLP/HTTP (protobuf) to any compliant receiver. Export is direct: no collector sits between
+a daemon and its receiver. Gateway coverage is a routed chat message, model turns, and
 its bounded agent/script session. Broker coverage is component loading and decoded invocations
 from mapped peers. Neither collects telemetry from Kubernetes nodes or other processes.
 
@@ -354,28 +355,35 @@ export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,organ
 dekopon-gatewayd --config gateway.yaml
 ```
 
-Both transports are first-class. `http` treats the endpoint as a generic OTLP/HTTP base and appends
-`/v1/traces` and `/v1/logs`. `grpc` treats it as an authority and takes its method paths from the
-OTLP protobuf service definition — those paths are fixed by the protocol, so a path-routing reverse
-proxy matches `/opentelemetry.proto.collector.*` rather than a path of the operator's choosing.
+`http` is the only transport and the default; `transport: grpc` refuses the configuration at load.
+The endpoint is a generic OTLP/HTTP base, and the exporter appends `/v1/traces` and `/v1/logs`.
+Requests run on the daemon's own async runtime, so export adds no thread beyond the SDK's two batch
+processors.
 
-Both read `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, and
-`OTEL_EXPORTER_OTLP_LOGS_HEADERS` directly through the exporter, in the OpenTelemetry URL-encoded
-form where `%20` is the space in `Basic <token>`. There is no header CLI flag and no header
-configuration field, because credentials must not be exposed in process arguments, retained in a
-parsed CLI value, or written into a configuration file. Endpoint URL userinfo
-(`https://user:password@host`) is rejected for the same reason.
+The exporter reads `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, and
+`OTEL_EXPORTER_OTLP_LOGS_HEADERS` directly, in the OpenTelemetry URL-encoded form where `%20` is the
+space in `Basic <token>`. There is no header CLI flag and no header configuration field, because
+credentials must not be exposed in process arguments, retained in a parsed CLI value, or written
+into a configuration file. Endpoint URL userinfo (`https://user:password@host`) is rejected for the
+same reason.
 
-The example header set works unchanged on both transports. On OpenObserve (observed on v0.92.0)
-`stream-name` selects the stream for traces and logs alike. The organization is the one asymmetry:
-HTTP reads it from the endpoint path (`/api/default`) and ignores the header, while gRPC has no
-path to carry it and requires the `organization` header — without it the receiver rejects every
-export with gRPC status `InvalidArgument`. Keep `organization=<org>` in the header set
-unconditionally; over HTTP it is redundant, never harmful.
+**OpenObserve** (observed on v0.92.0) takes the organization from the endpoint path, so the base is
+`http://<host>:5080/api/<org>`. The `stream-name` header selects the stream for traces and logs
+alike, and `Authorization` carries the ingestion token; the `organization` header in the example
+above is redundant over HTTP, never harmful.
+
+**Quickwit 0.9** serves OTLP/HTTP under `/api/v1/otlp`, so the base is
+`http://<host>:7280/api/v1/otlp`. It writes traces to `otel-traces-v0_9` and logs to
+`otel-logs-v0_9` unless the `qw-otel-traces-index` and `qw-otel-logs-index` headers name other
+indexes; set each in its signal's variable (`OTEL_EXPORTER_OTLP_TRACES_HEADERS` and
+`OTEL_EXPORTER_OTLP_LOGS_HEADERS`). Its log index has no field for a record's OpenTelemetry event
+name, so select log records by their `audit.event` attribute or body instead. Quickwit
+authenticates no ingest request itself: put it behind a reverse proxy that checks the
+`Authorization` header the exporter sends, and point the endpoint at that proxy.
 
 Standard `OTEL_RESOURCE_ATTRIBUTES` values are attached to both signals, alongside a
-`service.version` carrying the exporting executable's own version. HTTPS endpoints use WebPKI roots
-on both transports, plus any PEM roots in the file `OTEL_EXPORTER_OTLP_CERTIFICATE` names (a
+`service.version` carrying the exporting executable's own version. HTTPS endpoints use WebPKI roots,
+plus any PEM roots in the file `OTEL_EXPORTER_OTLP_CERTIFICATE` names (a
 receiver on a private CA; the chart's `otlp.caBundle` sets it), and redirects are disabled so a receiver cannot forward an authorization header
 to another destination. Plain HTTP suits a loopback development receiver or a trusted isolated
 network only, because headers and telemetry are unencrypted.
@@ -388,7 +396,9 @@ disconnected queue, and failed writes are dropped and counted. Before writing th
 line, the writer reports the cumulative loss count since install through the same sink when it
 changes; that notice can itself be dropped under overload without resetting the count. After a
 successful drain, shutdown reports any pending count directly. Shutdown drains the queue within
-the configured timeout (one second by default). A finished writer returns to synchronous logging
+the configured timeout (one second when none is configured). Each OTLP provider's shutdown exports
+its queued records within the same configured timeout, or the SDK's five seconds when none is
+configured; the daemons configure none. A finished writer returns to synchronous logging
 for records after shutdown; an unfinished writer leaves the sink closed and subsequent records
 are dropped and counted.
 Broker `provider` and `check` subcommands keep synchronous stderr logging.
@@ -399,8 +409,8 @@ Broker `provider` and `check` subcommands keep synchronous stderr logging.
 
 The OpenTelemetry SDK has no error handler to install; its `internal-logs` feature is the only
 runtime channel it reports export failures through, and the workspace enables that feature for the
-API, the SDK, and the OTLP exporter. Rejected tokens, a missing `organization` header, and a
-receiver that is down therefore say so, as structured JSON on stdout. `dekopon-telemetry` filters
+API, the SDK, and the OTLP exporter. Rejected tokens, a missing stream header, and a receiver
+that is down therefore say so, as structured JSON on stdout. `dekopon-telemetry` filters
 the `opentelemetry` target off every OTLP layer it installs, whatever crate directive the binary
 supplied, so an export failure can never be re-exported through the exporter that failed.
 
@@ -415,26 +425,25 @@ the time remaining on the broker's shared shutdown deadline and is skipped once 
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
 | `gateway_exit` / `broker_exit` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: the failure and its whole source chain, rendered as one `a: b: c` line |
-| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: every flush and shutdown failure raised while stopping the exporters and console writer, each naming its signal and stage |
+| `gateway_telemetry_shutdown_failed` / `broker_telemetry_shutdown_failed` | error | `dekopon-gatewayd` / `dekopon-brokerd` | `error`: every shutdown failure raised while stopping the exporters and console writer, each naming its signal and stage |
 
 ## Broker export
 
 `dekopon-brokerd` exports through an optional `telemetry` section in its owner-controlled
-configuration. The section is absent by default, and when present every field is required, matching
-every other section in that file:
+configuration. The section is absent by default, and when present every field but `transport` is
+required:
 
 ```yaml
 telemetry:
-  endpoint: http://rpi.localdomain
-  transport: grpc            # grpc | http
+  endpoint: http://openobserve:5080/api/default
+  transport: http            # the default and only value
   serviceName: dekopon-brokerd
   exportTimeoutMs: 5000
 ```
 
 There is no credential field. The broker reads `OTEL_EXPORTER_OTLP_HEADERS` like the gateway does,
 so a token never enters the configuration file the broker parses, its command line, or any span
-attribute. With `transport: grpc` the endpoint names no organization, so the header set must carry
-`organization=<org>`.
+attribute.
 
 Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
 authorization is the service's contract, and a missing exporter must not cost a working authority
