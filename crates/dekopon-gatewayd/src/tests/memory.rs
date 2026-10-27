@@ -1,4 +1,8 @@
 use super::*;
+use crate::memory::{
+    engine::{Counts, SlotTask},
+    record::{Slot, SummaryFailure},
+};
 
 #[tokio::test]
 async fn a_memory_persist_span_reaches_the_installed_trace_pipeline() {
@@ -100,11 +104,6 @@ async fn a_memory_persist_span_reaches_the_installed_trace_pipeline() {
                 && attribute.value.as_str() == "answered")
     );
 }
-
-use crate::memory::{
-    engine::{Counts, SlotTask},
-    record::{Slot, SummaryFailure},
-};
 
 const BIG_OUTPUT: &str = "x=0123456789abcdef; for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do x=$x$x; done; printf %s \"$x\"";
 
@@ -982,38 +981,38 @@ async fn a_mid_file_malformed_line_is_reset_after_delivery() {
     let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let stem = dev_stem();
     let path = journal_path(journal_dir.path(), &stem);
-    {
-        let journal = crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        )
-        .unwrap();
-        append_captured(
-            &journal,
-            &stem,
-            &["cli-probe.upper"],
-            &captured("older-canary", Some("older")),
-        );
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        std::io::Write::write_all(&mut file, b"{broken\n").unwrap();
-        append_captured(
-            &journal,
-            &stem,
-            &["cli-probe.upper"],
-            &captured("newer-canary", Some("newer")),
-        );
-    }
-    let before = fs::read(&path).unwrap();
     let models = ModelScript::new([answer("fresh answer")]);
+    let before = Arc::new(Mutex::new(Vec::new()));
     let unchanged = Arc::new(AtomicBool::new(false));
     let factory = {
-        let (unchanged, path, before) = (Arc::clone(&unchanged), path.clone(), before.clone());
+        let (unchanged, path, before) = (Arc::clone(&unchanged), path.clone(), Arc::clone(&before));
         Hooked::new(&models, move |_| {
-            unchanged.store(fs::read(&path).unwrap() == before, Ordering::SeqCst);
+            unchanged.store(fs::read(&path).unwrap() == *before.lock(), Ordering::SeqCst);
         })
     };
     let runner = journaled_runner(broker, Arc::new(factory), journal_dir.path());
+    let journal = runner.journal.as_ref().unwrap();
+    append_captured(
+        journal,
+        &stem,
+        &["cli-probe.upper"],
+        &captured("older-canary", Some("older")),
+    );
+    append_captured(
+        journal,
+        &stem,
+        &["cli-probe.upper"],
+        &captured("newer-canary", Some("newer")),
+    );
+    let written = fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = written.split_inclusive('\n').collect();
+    assert_eq!(lines.len(), 4);
+    fs::write(
+        &path,
+        [lines[0], lines[1], "{broken\n", lines[2], lines[3]].concat(),
+    )
+    .unwrap();
+    *before.lock() = fs::read(&path).unwrap();
     let driver = Arc::new(RecordingDriver::default());
     run_session(
         runner,
@@ -1031,9 +1030,7 @@ async fn a_mid_file_malformed_line_is_reset_after_delivery() {
         models
             .prompt(0)
             .iter()
-            .all(|(_, text)| !text.contains("older-canary") && !text.contains("newer-canary")),
-        "{:?}",
-        models.prompt(0)
+            .all(|(_, text)| !text.contains("older-canary") && !text.contains("newer-canary"))
     );
     let records = journal_records(&path);
     assert_eq!(records.len(), 1);
@@ -1256,4 +1253,983 @@ async fn admission_remains_held_until_the_record_is_appended() {
         ])
     );
     assert_eq!(journal_records(&path).len(), 2);
+}
+
+struct Vendor {
+    endpoint: String,
+    bodies: Arc<Mutex<Vec<Value>>>,
+    _server: tokio::task::JoinSet<()>,
+}
+
+async fn vendor(responses: Vec<String>) -> Vendor {
+    use tokio::io::AsyncWriteExt as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&bodies);
+    let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let mut server = tokio::task::JoinSet::new();
+    server.spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let Some((_uri, _headers, body)) = read_http_request_parts(&mut stream).await else {
+                continue;
+            };
+            recorded
+                .lock()
+                .push(serde_json::from_str::<Value>(&body).expect("a JSON request body"));
+            let body = responses
+                .lock()
+                .pop_front()
+                .unwrap_or_else(|| router_answer("unscripted"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                continue;
+            }
+        }
+    });
+    Vendor {
+        endpoint,
+        bodies,
+        _server: server,
+    }
+}
+
+fn router_sse(chunk: Value) -> String {
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+fn router_answer(text: &str) -> String {
+    router_sse(
+        json!({"model":"vendor/model","choices":[{"delta":{"content":text},"finish_reason":"stop"}]}),
+    )
+}
+
+fn router_reasoned_call(call: &str, command: &str, sentinel: &str) -> String {
+    router_sse(json!({"model":"vendor/model","choices":[{"delta":{
+        "reasoning_details":[
+            {"index":0,"type":"reasoning.text","id":"r0","text":format!("plain-{sentinel}"),"signature":null},
+            {"index":1,"type":"reasoning.encrypted","id":"r1","format":"opaque","data":format!("cipher-{sentinel}")}
+        ],
+        "tool_calls":[{"index":0,"id":call,"type":"function","function":{"name":"bash","arguments":json!({"command":command}).to_string()}}]
+    },"finish_reason":"tool_calls"}]}))
+}
+
+type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+struct Router {
+    endpoint: String,
+    client: std::sync::OnceLock<Arc<dekopon_model::inference::ModelClient>>,
+    gate: Mutex<Option<Gate>>,
+}
+
+impl Router {
+    fn new(vendor: &Vendor) -> Self {
+        Self {
+            endpoint: vendor.endpoint.clone(),
+            client: std::sync::OnceLock::new(),
+            gate: Mutex::new(None),
+        }
+    }
+}
+
+impl ModelFactory for Router {
+    fn build_bound(
+        &self,
+        _model: &Arc<ModelConfig>,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        let client = self.client.get_or_init(|| {
+            Arc::new(dekopon_model::inference::ModelClient::OpenRouter(
+                dekopon_model::openrouter::OpenRouterClient::new(
+                    "vendor/model",
+                    "router-test-token".to_owned(),
+                    Duration::from_secs(10),
+                    Default::default(),
+                    &[],
+                )
+                .unwrap()
+                .with_loopback_endpoint(&self.endpoint)
+                .unwrap(),
+            ))
+        });
+        Ok(Arc::new(GatedModel {
+            inner: Arc::new(dekopon_model::blocking::BlockingModel::new(
+                Arc::clone(client),
+                runtime,
+                cancel,
+                Duration::from_secs(10),
+            )),
+            gate: Mutex::new(self.gate.lock().take()),
+        }))
+    }
+}
+
+struct GatedModel {
+    inner: SharedModel,
+    gate: Mutex<Option<Gate>>,
+}
+
+impl ChatModel for GatedModel {
+    fn model_key(&self) -> dekopon_model::model::ModelKey {
+        self.inner.model_key()
+    }
+
+    fn complete(
+        &self,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+        on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
+        if let Some((entered, release)) = self.gate.lock().take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+        self.inner.complete(messages, tools, options, on_event)
+    }
+}
+
+fn router_route(window: MemoryWindow) -> crate::routes::BoundRoute {
+    persistent_route(
+        serde_json::from_value(json!({"kind":"openrouter","name":"router","model":"vendor/model","apiKeyEnv":"DEKOPON_ROUTER_TEST_KEY","timeoutMs":10_000}))
+            .unwrap(),
+        window,
+    )
+}
+
+fn reasoning_details(body: &Value) -> Vec<Value> {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message.get("reasoning_details").is_some())
+        .map(|message| message["reasoning_details"].clone())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opaque_replays_as_an_object_and_never_reaches_the_trace() {
+    const SENTINEL: &str = "opaque-sentinel-7f3a";
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let vendor = vendor(vec![
+        router_reasoned_call("call-1", "printf ran", SENTINEL),
+        router_answer("first done"),
+        router_answer("second done"),
+    ])
+    .await;
+    let runner = journaled_runner(broker, Arc::new(Router::new(&vendor)), journal_dir.path());
+    let route = router_route(recall_window(RecallSource::Journal));
+    let driver = Arc::new(RecordingDriver::default());
+    for text in ["first", "second"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    assert_eq!(driver.replies(), ["first done", "second done"]);
+    let bodies = vendor.bodies.lock().clone();
+    assert_eq!(bodies.len(), 3);
+    let expected = json!([
+        {"type":"reasoning.text","id":"r0","text":format!("plain-{SENTINEL}"),"signature":null,"index":0},
+        {"type":"reasoning.encrypted","id":"r1","format":"opaque","data":format!("cipher-{SENTINEL}"),"index":1}
+    ]);
+    for (step, body) in [("in-RAM step 2", &bodies[1]), ("stored record", &bodies[2])] {
+        let details = reasoning_details(body);
+        assert_eq!(details.len(), 1, "{step}: {body}");
+        assert!(details[0].is_array(), "{step}: {}", details[0]);
+        let mut actual = details[0].clone();
+        let mut wanted = expected.clone();
+        for list in [&mut actual, &mut wanted] {
+            for item in list.as_array_mut().unwrap() {
+                item.as_object_mut().unwrap().remove("index");
+            }
+        }
+        assert_eq!(actual, wanted, "{step}");
+    }
+    assert!(
+        fs::read_to_string(journal_path(journal_dir.path(), &dev_stem()))
+            .unwrap()
+            .contains(SENTINEL)
+    );
+    assert!(!capture.text().contains(SENTINEL));
+    assert!(!capture.events_text().contains(SENTINEL));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_gateway_replays_without_a_continuation_mismatch() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let vendor = vendor(vec![
+        router_reasoned_call("call-1", "printf ran", "restart"),
+        router_answer("before restart"),
+        router_answer("after restart"),
+    ])
+    .await;
+    let route = router_route(recall_window(RecallSource::Journal));
+    let driver = Arc::new(RecordingDriver::default());
+    for text in ["first", "second"] {
+        let restarted = journaled_runner(
+            broker.clone(),
+            Arc::new(Router::new(&vendor)),
+            journal_dir.path(),
+        );
+        run_session(
+            restarted,
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    assert_eq!(driver.replies(), ["before restart", "after restart"]);
+    let bodies = vendor.bodies.lock().clone();
+    assert_eq!(bodies.len(), 3);
+    let replayed = bodies[2]["messages"].as_array().unwrap();
+    assert!(
+        replayed
+            .iter()
+            .any(|message| message["role"] == "tool" && message["tool_call_id"] == "call-1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_journal_record_stores_only_exchanges() {
+    for recall in [RecallSource::Platform, RecallSource::None] {
+        let directory = temporary();
+        let journal_dir = temporary();
+        let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+        let vendor = vendor(vec![
+            router_reasoned_call("call-1", "printf exchange-sentinel", "reasoning-sentinel"),
+            router_answer("answer-sentinel"),
+        ])
+        .await;
+        let router = Router::new(&vendor);
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *router.gate.lock() = Some((entered, released));
+        let runner = journaled_runner(broker, Arc::new(router), journal_dir.path());
+        let mut route = router_route(recall_window(recall));
+        route.steering = crate::config::Steering::Boundary;
+        let driver = HistoryDriver::new(Ok(Vec::new()));
+        let held = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message("user-sentinel"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        tokio::task::spawn_blocking(move || entering.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the turn reached its model");
+        run_session(
+            Arc::clone(&runner),
+            route,
+            message("steer-sentinel"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), held)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.inner.replies(), ["answer-sentinel"], "{recall:?}");
+        let bodies = vendor.bodies.lock().clone();
+        assert!(
+            bodies[1].to_string().contains("steer-sentinel"),
+            "{recall:?}"
+        );
+        let path = journal_path(journal_dir.path(), &dev_stem());
+        let bytes = fs::read_to_string(&path).unwrap();
+        assert!(bytes.contains("exchange-sentinel"), "{recall:?}");
+        for sentinel in [
+            "user-sentinel",
+            "steer-sentinel",
+            "answer-sentinel",
+            "plain-reasoning-sentinel",
+            "cipher-reasoning-sentinel",
+        ] {
+            assert!(!bytes.contains(sentinel), "{recall:?}: {sentinel}");
+        }
+        let records = journal_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(body_kinds(&records[0].1), ["exchange"]);
+        assert!(records[0].0["plan"].is_null());
+        assert_eq!(records[0].0["summaries"], json!([]));
+    }
+}
+
+fn follow_capability(action: &str) -> AvailableCapability {
+    serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": format!("dekopon-provider-follow.{action}"),
+            "description": "Follow the conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration")
+}
+
+fn stay_responses() -> Vec<ResponseEnvelope> {
+    vec![
+        ResponseEnvelope::capabilities(
+            vec![follow_capability("stay")],
+            vec!["follow".into()],
+            BTreeMap::new(),
+        ),
+        ResponseEnvelope::command_run(
+            serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "dekopon-provider-follow.stay", "input": {}
+            }))
+            .unwrap(),
+        ),
+        ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+    ]
+}
+
+fn followed(
+    broker: ResolvedBroker,
+    models: Arc<dyn ModelFactory>,
+    journal: &Path,
+) -> (Arc<SessionRunner>, Arc<crate::follow::FollowTable>) {
+    let mut runner = Arc::into_inner(journaled_runner(broker, models, journal)).unwrap();
+    let table = Arc::new(
+        crate::follow::FollowTable::load(Arc::clone(runner.journal.as_ref().unwrap())).unwrap(),
+    );
+    runner.follow = Some(Arc::clone(&table));
+    (Arc::new(runner), table)
+}
+
+fn follow_route() -> crate::routes::BoundRoute {
+    let mut route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    route.follow = true;
+    route
+}
+
+fn dev_follow_key(route: &crate::routes::BoundRoute) -> String {
+    crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &message("").conversation.key(),
+    )
+}
+
+fn marker_path(journal: &Path, key: &str) -> PathBuf {
+    journal.join(format!("{key}.followed"))
+}
+
+struct Held {
+    release: std::sync::mpsc::Sender<()>,
+    holder: std::thread::JoinHandle<()>,
+}
+
+fn hold_journal(journal: &Arc<crate::journal::Journal>) -> Held {
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let journal = Arc::clone(journal);
+    let holder = std::thread::spawn(move || {
+        let _lock = journal.hold_io_for_test();
+        held.send(()).unwrap();
+        let _ = released.recv();
+    });
+    holding.recv().unwrap();
+    Held { release, holder }
+}
+
+impl Held {
+    fn release(self) {
+        self.release.send(()).unwrap();
+        self.holder.join().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_left_mid_turn_is_not_revived() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), stay_responses()).await;
+    let models = ModelScript::new([script_call("follow stay"), answer("staying")]);
+    let route = follow_route();
+    let key = dev_follow_key(&route);
+    let table_slot = Arc::new(std::sync::OnceLock::<Arc<crate::follow::FollowTable>>::new());
+    let invited = Arc::new(AtomicBool::new(false));
+    let factory = {
+        let (table_slot, key, invited) =
+            (Arc::clone(&table_slot), key.clone(), Arc::clone(&invited));
+        Hooked::new(&models, move |request| {
+            if request == 1 {
+                let table = table_slot.get().expect("table installed");
+                invited.store(
+                    matches!(
+                        table.ticket(&key, SystemTime::now()),
+                        crate::follow::FollowTicket::Active { .. }
+                    ),
+                    Ordering::SeqCst,
+                );
+                table.leave(&key).unwrap();
+            }
+        })
+    };
+    let (runner, table) = followed(broker, Arc::new(factory), journal_dir.path());
+    let _ = table_slot.set(Arc::clone(&table));
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route,
+        message("please stay"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["staying"]);
+    assert!(invited.load(Ordering::SeqCst), "the turn invited a follow");
+    assert_eq!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    assert!(!marker_path(journal_dir.path(), &key).exists());
+    let reloaded = crate::follow::FollowTable::load(Arc::new(
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        reloaded.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_journal_write_precedes_delivery() {
+    let route = follow_route();
+    let key = dev_follow_key(&route);
+    let stem = dev_stem();
+
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), stay_responses()).await;
+    let models = ModelScript::new([
+        script_call("follow stay"),
+        tool_call(
+            "pin-call",
+            "set_memory_pin",
+            json!({"recordId": 1, "representationId": "metadata"}),
+        ),
+        answer("invited and pinned"),
+    ]);
+    let (runner, _table) = followed(broker, Arc::new(Arc::clone(&models)), journal_dir.path());
+    let journal = Arc::clone(runner.journal.as_ref().unwrap());
+    append_captured(
+        &journal,
+        &stem,
+        &["dekopon-provider-follow.stay"],
+        &captured("earlier", Some("earlier answer")),
+    );
+    let path = journal_path(journal_dir.path(), &stem);
+    let before = fs::read(&path).unwrap();
+    let held = hold_journal(&journal);
+    let driver = Arc::new(RecordingDriver::default());
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        message("stay and pin"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    until("the invite-and-pin turn delivered", || {
+        driver.replies().len() == 1
+    })
+    .await;
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!marker_path(journal_dir.path(), &key).exists());
+    held.release();
+    session.await.unwrap();
+    assert_eq!(driver.replies(), ["invited and pinned"]);
+    assert_eq!(journal_records(&path).len(), 2);
+    assert!(
+        journal_lines(&path)
+            .iter()
+            .any(|line| line.get("p").is_some())
+    );
+    assert!(marker_path(journal_dir.path(), &key).exists());
+
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = InterruptibleModel::new([]);
+    let runner = journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path());
+    let held = hold_journal(runner.journal.as_ref().unwrap());
+    let mut stopped = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    stopped.max_duration = Some(Duration::from_millis(300));
+    let driver = Arc::new(RecordingDriver::default());
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        stopped,
+        message("take too long"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    until("the wall-clock stop delivered", || {
+        driver.replies().len() == 1
+    })
+    .await;
+    let seals = |dir: &Path| {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sealed")
+            })
+            .count()
+    };
+    assert_eq!(seals(journal_dir.path()), 0);
+    held.release();
+    session.await.unwrap();
+    assert_eq!(model.interrupted.load(Ordering::SeqCst), 1);
+    assert_eq!(seals(journal_dir.path()), 1);
+
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), stay_responses()).await;
+    let models = ModelScript::new([script_call("follow stay"), answer("never")]);
+    let factory = Hooked::new(&models, |request| {
+        assert_ne!(request, 1, "the session task fails after the invite");
+    });
+    let (runner, _table) = followed(broker, Arc::new(factory), journal_dir.path());
+    let held = hold_journal(runner.journal.as_ref().unwrap());
+    let driver = Arc::new(RecordingDriver::default());
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route,
+        message("stay then fail"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    until("the task failure delivered", || driver.replies().len() == 1).await;
+    assert!(!marker_path(journal_dir.path(), &key).exists());
+    held.release();
+    session.await.unwrap();
+    assert!(marker_path(journal_dir.path(), &key).exists());
+    assert!(!journal_path(journal_dir.path(), &stem).exists());
+}
+
+struct ChatFiles;
+
+impl AssetFetcher for ChatFiles {
+    fn fetch(
+        &self,
+        source: &AssetSourceRef,
+        _limit: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        let bytes = match source {
+            AssetSourceRef::Slack { file_id, .. } if file_id == "F-chart.png" => {
+                b"\x89PNG\r\n\x1a\nchart-pixels".to_vec()
+            }
+            AssetSourceRef::Slack { file_id, .. } if file_id == "F-report.pdf" => {
+                b"%PDF-1.4 report-bytes".to_vec()
+            }
+            _ => b"text-asset-content".to_vec(),
+        };
+        Box::pin(async move { Ok(bytes) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_image_fetch_never_promises_a_following_message() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let fetch = |id: u64| {
+        tool_call(
+            &format!("fetch-{id}"),
+            "fetch_chat_asset",
+            json!({"id": id}),
+        )
+    };
+    let models = ModelScript::new([fetch(1), fetch(2), fetch(3), answer("all seen")]);
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let route = persistent_route(model, recall_window(RecallSource::Journal));
+    let driver = Arc::new(RecordingDriver::default());
+    let mut inbound = message("look at these");
+    inbound.assets = vec![
+        pending("chart.png", "image/png", 20),
+        pending("report.pdf", "application/pdf", 21),
+        pending("notes.txt", "text/plain", 18),
+    ];
+    let with_files = |runner: Arc<SessionRunner>| {
+        let mut runner = Arc::into_inner(runner).unwrap();
+        runner.asset_fetchers.insert(
+            "dev".to_owned(),
+            Arc::new(ChatFiles) as Arc<dyn AssetFetcher>,
+        );
+        Arc::new(runner)
+    };
+    run_session(
+        with_files(journaled_runner(
+            broker.clone(),
+            Arc::new(Arc::clone(&models)),
+            journal_dir.path(),
+        )),
+        route.clone(),
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["all seen"]);
+    let live_text_result = tool_message(&models, 3);
+    assert!(live_text_result.contains("text-asset-content"));
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(_, text)| text.contains("follows in the next message")),
+        "the live turn shows the image in a following message"
+    );
+
+    let replay = ModelScript::new([answer("remembered")]);
+    run_session(
+        with_files(journaled_runner(
+            broker,
+            Arc::new(Arc::clone(&replay)),
+            journal_dir.path(),
+        )),
+        route,
+        message("what did you see?"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), ["all seen", "remembered"]);
+    let replayed = replay.prompt(0);
+    let results: Vec<&str> = replayed
+        .iter()
+        .filter(|(role, _)| role == "tool")
+        .map(|(_, text)| text.as_str())
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "chat-asset:1 was shown when it was fetched and is not replayed; call fetch_chat_asset to see it again.",
+            "chat-asset:2 was shown when it was fetched and is not replayed; call fetch_chat_asset to see it again.",
+            live_text_result.as_str(),
+        ]
+    );
+    assert!(
+        replayed
+            .iter()
+            .all(|(_, text)| !text.contains("follows in the next message"))
+    );
+    assert!(
+        replay.prompts.lock()[0]
+            .iter()
+            .all(|message| message.parts().is_none())
+    );
+}
+
+fn exchange(
+    id: &str,
+    tool: dekopon_agent::memory::Tool,
+    arguments: &str,
+    result: &str,
+) -> dekopon_agent::memory::Item {
+    use dekopon_agent::memory::{Call, Exchange, Item, Kept, Outcome, ToolResult};
+    Item::Exchange(Exchange {
+        call: Call {
+            id: id.into(),
+            tool,
+            arguments: Kept::new(arguments, usize::MAX),
+        },
+        result: ToolResult {
+            outcome: Outcome::Exit(0),
+            text: Kept::new(result, usize::MAX),
+        },
+    })
+}
+
+fn call_pairs(body: &Value) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let mut calls = BTreeMap::new();
+    let mut results = BTreeMap::new();
+    for message in body["messages"].as_array().unwrap() {
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            *calls
+                .entry(call["id"].as_str().unwrap().to_owned())
+                .or_insert(0) += 1;
+            assert!(
+                serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .is_ok()
+            );
+        }
+        if message["role"] == "tool" {
+            *results
+                .entry(message["tool_call_id"].as_str().unwrap().to_owned())
+                .or_insert(0) += 1;
+        }
+    }
+    (calls, results)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_degrade_never_orphans_a_call() {
+    use dekopon_agent::memory::{Item, Kept, Tool};
+    let journal_dir = temporary();
+    let journal = crate::journal::Journal::open(
+        journal_dir.path(),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    let stem = dev_stem();
+    let grant = crate::memory::record::GrantDigest::of(&granted(&["cli-probe.upper"]));
+    let key = dekopon_model::model::ModelKey::new(
+        dekopon_model::model::Backend::OpenRouter,
+        "vendor/model",
+    );
+    for turn in 0..4 {
+        let original = vec![
+            Item::User(Kept::new(
+                &format!("question {turn} {}", "q".repeat(300)),
+                usize::MAX,
+            )),
+            exchange(
+                &format!("bash-{turn}"),
+                Tool::Bash,
+                &json!({"command": format!("printf {turn}")}).to_string(),
+                &"r".repeat(600),
+            ),
+            exchange(
+                &format!("wake-{turn}"),
+                Tool::Wake,
+                &json!({"in": "1h"}).to_string(),
+                "scheduled",
+            ),
+            exchange(
+                &format!("rejected-{turn}"),
+                Tool::Rejected(Kept::new("mystery_tool", usize::MAX)),
+                "not an object",
+                "unknown tool",
+            ),
+            Item::Assistant(Kept::new(&format!("answer {turn}"), usize::MAX)),
+        ];
+        journal
+            .append(
+                &stem,
+                &crate::journal::Entry {
+                    at: SystemTime::now(),
+                    grant: &grant,
+                    captured: &dekopon_agent::prompt::CapturedTurn {
+                        original,
+                        model: key.clone(),
+                    },
+                    keep: crate::journal::Keep::Everything,
+                    plan: None,
+                    inventory: &[],
+                    next_asset_id: 1,
+                },
+            )
+            .unwrap()
+            .unwrap();
+    }
+    let vendor = vendor(Vec::new()).await;
+    let client = Arc::new(dekopon_model::inference::ModelClient::OpenRouter(
+        dekopon_model::openrouter::OpenRouterClient::new(
+            "vendor/model",
+            "router-test-token".to_owned(),
+            Duration::from_secs(10),
+            Default::default(),
+            &[],
+        )
+        .unwrap()
+        .with_loopback_endpoint(&vendor.endpoint)
+        .unwrap(),
+    ));
+    let snapshot = journal.record_snapshot(&stem, false).unwrap().unwrap();
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let model = Arc::new(dekopon_model::blocking::BlockingModel::new(
+        Arc::clone(&client),
+        tokio::runtime::Handle::current(),
+        cancelled,
+        Duration::from_secs(10),
+    ));
+    let mut budget = 64 * 1024;
+    let mut sent = 0;
+    loop {
+        let projected = crate::memory::project::project(&crate::memory::project::ProjectionInput {
+            file: &snapshot.file,
+            records: &snapshot.records,
+            prior: &[],
+            hot_turns: 2,
+            max_turns: 12,
+            max_bytes: budget,
+            model: &key,
+        })
+        .unwrap();
+        let mut messages = vec![ModelMessage::system("Answer briefly.")];
+        messages.extend(projected.messages);
+        messages.push(ModelMessage::user("next question"));
+        let model = Arc::clone(&model);
+        tokio::task::spawn_blocking(move || {
+            model.complete(&messages, &[], &CompletionOptions::default(), &mut |_| {
+                ControlFlow::Continue(())
+            })
+        })
+        .await
+        .unwrap()
+        .expect("the vendor accepts the encoded body");
+        sent += 1;
+        let body = vendor.bodies.lock()[sent - 1].clone();
+        let (calls, results) = call_pairs(&body);
+        assert_eq!(calls, results, "budget {budget}: {body}");
+        assert!(calls.values().all(|count| *count == 1), "budget {budget}");
+        if budget == 1 {
+            break;
+        }
+        budget = (budget / 2).max(1);
+    }
+    assert!(sent > 10);
+}
+
+#[test]
+fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
+    use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools as _, Rung};
+    let journal_dir = temporary();
+    let journal = crate::journal::Journal::open(
+        journal_dir.path(),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    let stem = dev_stem();
+    let wide = crate::memory::record::GrantDigest::of(&granted(&["cli-probe.upper", "extra.cap"]));
+    let narrow = crate::memory::record::GrantDigest::of(&granted(&["cli-probe.upper"]));
+    let append = |grant: &crate::memory::record::GrantDigest, text: &str| {
+        journal
+            .append(
+                &stem,
+                &crate::journal::Entry {
+                    at: SystemTime::now(),
+                    grant,
+                    captured: &captured(text, Some("answer")),
+                    keep: crate::journal::Keep::Everything,
+                    plan: None,
+                    inventory: &[],
+                    next_asset_id: 1,
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let side_lines = |record: crate::memory::record::RecordId| {
+        journal
+            .write_pin(
+                &stem,
+                crate::memory::record::PinLine {
+                    at_ms: 1,
+                    record,
+                    pin: Some(Rung::Metadata),
+                    subject: crate::memory::record::Subject::Record,
+                },
+            )
+            .unwrap();
+        journal
+            .write_choice(
+                &stem,
+                crate::memory::record::ChoiceLine {
+                    at_ms: 1,
+                    record,
+                    choice: Rung::Metadata,
+                },
+            )
+            .unwrap();
+    };
+    let recalled = |grant: &crate::memory::record::GrantDigest| {
+        journal
+            .recall(
+                &stem,
+                grant,
+                recall_window(RecallSource::Journal),
+                SystemTime::now(),
+            )
+            .unwrap()
+    };
+    let tools = |grant: &crate::memory::record::GrantDigest, sealed_at_ms: Option<u64>| {
+        crate::memory::journal::JournalMemoryTools::new(
+            &journal,
+            stem.clone(),
+            crate::memory::journal::tools::Admission {
+                grant: grant.clone(),
+                horizon_ms: 0,
+                sealed_at_ms,
+            },
+        )
+    };
+    let wide_record = append(&wide, "wide-canary");
+    side_lines(wide_record);
+    let narrow_record = append(&narrow, "narrow");
+    side_lines(narrow_record);
+    let after_narrowing = recalled(&narrow);
+    let records = &after_narrowing.snapshot.as_ref().unwrap().records;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].header.id, narrow_record);
+    assert_eq!(records[0].header.pin, Some(Rung::Metadata));
+    assert!(after_narrowing.grant_boundary);
+    let narrowed = tools(&narrow, None);
+    assert!(matches!(
+        narrowed.read(wide_record.0.get(), "native", None),
+        Err(MemoryRefusal::RecordIneligible)
+    ));
+    assert!(matches!(
+        narrowed.set_pin(wide_record.0.get(), "metadata"),
+        Err(MemoryRefusal::RecordIneligible)
+    ));
+    assert!(narrowed.read(narrow_record.0.get(), "native", None).is_ok());
+    assert!(narrowed.into_pins().is_empty());
+
+    let sealed_at = SystemTime::now();
+    journal.seal(&stem, sealed_at).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let resumed = append(&narrow, "after the seal");
+    side_lines(resumed);
+    let after_seal = recalled(&narrow);
+    let records = &after_seal.snapshot.as_ref().unwrap().records;
+    assert_eq!(
+        records
+            .iter()
+            .map(|head| head.header.id)
+            .collect::<Vec<_>>(),
+        [resumed]
+    );
+    assert!(!after_seal.grant_boundary);
+    let sealed = tools(&narrow, Some(crate::journal::millis(sealed_at)));
+    assert!(matches!(
+        sealed.read(narrow_record.0.get(), "native", None),
+        Err(MemoryRefusal::RecordIneligible)
+    ));
+    assert!(matches!(
+        sealed.set_pin(narrow_record.0.get(), "native"),
+        Err(MemoryRefusal::RecordIneligible)
+    ));
+    assert!(sealed.read(resumed.0.get(), "native", None).is_ok());
 }

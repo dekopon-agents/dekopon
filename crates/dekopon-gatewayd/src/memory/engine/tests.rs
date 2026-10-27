@@ -1296,3 +1296,120 @@ fn a_record_without_generated_summaries_is_never_asked() {
     let text = projected_text(&projected);
     assert!(text.contains("errored-original") && text.contains("unplanned-original"));
 }
+
+fn window_projection(
+    journal: &Journal,
+    prior: &[super::super::project::Prior],
+    (hot_turns, max_turns, max_bytes): (usize, usize, usize),
+) -> (super::super::project::Projected, Vec<RecordId>) {
+    let mut snapshot = journal.record_snapshot(STEM, false).unwrap().unwrap();
+    let walked = snapshot.records.len().saturating_sub(max_turns * 2);
+    snapshot.records.drain(..walked);
+    let projected = super::super::project::project(&super::super::project::ProjectionInput {
+        file: &snapshot.file,
+        records: &snapshot.records,
+        prior,
+        hot_turns,
+        max_turns,
+        max_bytes,
+        model: &fixture().model,
+    })
+    .unwrap();
+    let ids = snapshot.records.iter().map(|head| head.header.id).collect();
+    (projected, ids)
+}
+
+#[test]
+fn consecutive_turns_differ_at_the_hot_edge_only() {
+    const MAX_TURNS: usize = 4;
+    let (_dir, journal) = journal();
+    let mut previous: Option<super::super::project::Projected> = None;
+    let mut held_below_pin = 0;
+    for turn in 1..=(3 * MAX_TURNS) as u64 {
+        journal
+            .append_record(
+                STEM,
+                &record(turn, &format!("turn {turn} {}", "x".repeat(300)), 0),
+                Vec::new(),
+            )
+            .unwrap();
+        if turn == 4 {
+            journal
+                .write_pin(
+                    STEM,
+                    super::super::record::PinLine {
+                        at_ms: 4,
+                        record: RecordId(1.try_into().unwrap()),
+                        pin: Some(Rung::Native),
+                        subject: Subject::Record,
+                    },
+                )
+                .unwrap();
+        }
+        let prior = previous
+            .as_ref()
+            .map_or(&[][..], |projected| &projected.prior);
+        let (projected, _ids) = window_projection(&journal, prior, (2, MAX_TURNS, 1_500));
+        if let Some(previous) = &previous {
+            assert!(
+                !(previous.repacked && projected.repacked),
+                "turn {turn} repacked right after a repack"
+            );
+            if !projected.repacked {
+                for now in &projected.prior {
+                    if let Some(before) = previous
+                        .prior
+                        .iter()
+                        .find(|before| before.record == now.record)
+                        .filter(|before| before.hot == now.hot && before.pin == now.pin)
+                    {
+                        assert_eq!(before.rung, now.rung, "turn {turn}: {:?}", now.record);
+                    }
+                }
+            }
+        }
+        if let Some(pinned) = projected
+            .prior
+            .iter()
+            .find(|prior| prior.record.0.get() == 1 && prior.pin == Some(Rung::Native))
+            && pinned.rung != Some(Rung::Native)
+        {
+            held_below_pin += 1;
+        }
+        previous = Some(projected);
+    }
+    assert!(
+        held_below_pin >= 2,
+        "the pinned record was held below its pin"
+    );
+}
+
+#[test]
+fn a_turn_never_silently_disappears() {
+    let (_dir, journal) = journal();
+    let mut summarized = record(1, &"summarized ".repeat(80), 1);
+    summarized.summaries = vec![Slot::Generated("a generated summary".to_owned())];
+    journal
+        .append_record(STEM, &summarized, Vec::new())
+        .unwrap();
+    for id in 2..=6 {
+        journal
+            .append_record(STEM, &record(id, &"older ".repeat(120), 0), Vec::new())
+            .unwrap();
+    }
+    let mut budget = 64 * 1024;
+    loop {
+        let (projected, ids) = window_projection(&journal, &[], (2, 12, budget));
+        let shown = projected.rungs.native + projected.rungs.summary + projected.rungs.metadata;
+        assert_eq!(
+            shown as usize + projected.omitted.len(),
+            ids.len(),
+            "budget {budget}"
+        );
+        assert!(projected.omitted.iter().all(|id| ids.contains(id)));
+        if budget == 1 {
+            break;
+        }
+        budget = (budget / 2).max(1);
+    }
+}
