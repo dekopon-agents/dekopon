@@ -466,6 +466,15 @@ fn conversation(
     let part = |value: &str| Some(value.to_owned());
     let team = || part(subject.tenant().unwrap_or("t0"));
     let (container, id, thread) = match (transport, kind) {
+        (
+            ChatTransportKind::Fauxlack,
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage,
+        ) => (subject.tenant().map(str::to_owned), "d0".to_owned(), None),
+        (ChatTransportKind::Fauxlack, ConversationKind::Channel | ConversationKind::Thread) => (
+            subject.tenant().map(str::to_owned),
+            "c0".to_owned(),
+            part("m1"),
+        ),
         (ChatTransportKind::Slack, ConversationKind::DirectMessage) => {
             (team(), "d0".to_owned(), part(SLACK_THREAD))
         }

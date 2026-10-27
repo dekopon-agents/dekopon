@@ -28,6 +28,8 @@ fn only(captured: &CaptureLayer, id: &str) -> Record {
 
 async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let mappings = [
+        ("fauxlack.team.uasker", "asker"),
+        ("fauxlack.team.cchannel", "space"),
         ("slack.team.user", "asker"),
         ("slack.team.channel", "space"),
         ("github.owner.repo", "repo"),
@@ -98,6 +100,23 @@ fn slack_scope() -> ChatScopeClaim {
     }
 }
 
+fn fauxlack_scope() -> ChatScopeClaim {
+    ChatScopeClaim {
+        kind: ChatTransportKind::Fauxlack,
+        conversation: Conversation {
+            kind: ConversationKind::Thread,
+            container: Some("team".into()),
+            id: "cchannel".into(),
+            thread: Some("m1".into()),
+        },
+        delivery: Some(DeliveryIdentity::Fauxlack {
+            channel: "cchannel".into(),
+            message: "m2".into(),
+        }),
+        ..slack_scope()
+    }
+}
+
 async fn assert_refused(
     broker: &Broker<InMemoryAuditLog>,
     audit: &InMemoryAuditLog,
@@ -165,6 +184,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
 
     for (id, form, scope) in [
         ("channel-denial", "slack.team.user", slack_scope()),
+        ("fauxlack-denial", "fauxlack.team.uasker", fauxlack_scope()),
         ("repository-denial", "github.owner.repo", github),
     ] {
         let claim = Attestation::for_chat(
@@ -197,6 +217,26 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     ] {
         assert_eq!(record.field(field), Some(value), "{field}: {record:?}");
     }
+    let record = only(&captured, "fauxlack-denial");
+    for (field, value) in [
+        ("decision.allowed", "false"),
+        ("principal", "asker"),
+        ("principal.kind", "person"),
+        ("space.id", "space"),
+        ("asker.allowed", "true"),
+        ("space.allowed", "false"),
+        ("decision.denied_by", "space"),
+        ("transport.id", "chat"),
+        ("transport.kind", "fauxlack"),
+        ("conversation.kind", "thread"),
+        ("conversation.container", "team"),
+        ("conversation.id", "cchannel"),
+        ("conversation.thread", "m1"),
+        ("delivery.kind", "fauxlack"),
+        ("delivery.id", "m2"),
+    ] {
+        assert_eq!(record.field(field), Some(value), "{field}: {record:?}");
+    }
     let repository = only(&captured, "repository-denial");
     assert_eq!(repository.field("principal.kind"), Some("repository"));
     assert_eq!(repository.field("turn.started_by"), Some("message"));
@@ -214,23 +254,36 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivery_for_another_transport_is_refused() {
     let (broker, audit) = broker_fixture().await;
-    let mut scope = slack_scope();
-    scope.delivery = Some(DeliveryIdentity::Github {
-        delivery: "delivery-1".into(),
-    });
-    let claim = Attestation::for_chat(
-        "slack.team.user".parse().expect("subject"),
-        "test-agent".parse().expect("agent"),
-        scope,
-    );
-    assert_refused(
-        &broker,
-        &audit,
-        "invalid-delivery",
-        claim,
-        "attestation-denied",
-    )
-    .await;
+    for (id, subject, mut scope, delivery) in [
+        (
+            "invalid-delivery",
+            "slack.team.user",
+            slack_scope(),
+            DeliveryIdentity::Github {
+                delivery: "delivery-1".into(),
+            },
+        ),
+        (
+            "fauxlack-wrong-delivery",
+            "fauxlack.team.uasker",
+            fauxlack_scope(),
+            slack_scope().delivery.unwrap(),
+        ),
+        (
+            "slack-fauxlack-delivery",
+            "slack.team.user",
+            slack_scope(),
+            fauxlack_scope().delivery.unwrap(),
+        ),
+    ] {
+        scope.delivery = Some(delivery);
+        let claim = Attestation::for_chat(
+            subject.parse().expect("subject"),
+            "test-agent".parse().expect("agent"),
+            scope,
+        );
+        assert_refused(&broker, &audit, id, claim, "attestation-denied").await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,6 +291,16 @@ async fn a_space_subject_cannot_be_an_attested_sender() {
     let (broker, audit) = broker_fixture().await;
     for (id, form, reason) in [
         ("attested-space", "slack.team.channel", "attestation-denied"),
+        (
+            "fauxlack-attested-space",
+            "fauxlack.team.cchannel",
+            "attestation-denied",
+        ),
+        (
+            "fauxlack-unmapped-space",
+            "fauxlack.team.cother",
+            "unmapped-subject",
+        ),
         ("unmapped-space", "slack.team.cother", "unmapped-subject"),
     ] {
         let claim = Attestation::for_subject(

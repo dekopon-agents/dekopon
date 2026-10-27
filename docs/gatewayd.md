@@ -953,6 +953,12 @@ Unmatched messages are ignored with a debug-level `gateway_message_ignored { rea
 
 Every kind but `directMessage` — a group DM and a thread included — initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match or the bot's managed role in `mention_roles` on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Telegram and Slack Classic retain that rule on every message; an invited Discord channel/thread route with a live follow ticket accepts unmentioned messages after its bounded debounce. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. A continuation starting a new turn is authorized again and may decline to post; a same-sender steer joins the running leg. All non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
 
+The shared subject vocabulary accepts test-only `fauxlack.<tenant>.u<id>` people and
+`fauxlack.<tenant>.c<id>` spaces. The shared chat-scope kind `fauxlack` supports all four
+conversation kinds, with the container equal to the subject tenant. Channel and thread
+scopes require an `m<n>` thread; DM scopes have no thread. The published gateway has no
+fauxlack transport configuration or service. Mappings and broker grants remain required.
+
 ### Being available in a channel is not authority
 
 A route matching every channel widens no authority whatsoever, and an operator reading "available in all channels" must not read it as "available to everyone". Every session opens an attested broker leg naming the sender's canonical subject; the broker maps that subject to a principal, requires policy permitting `agent.prompt` for it, and refuses an unmapped sender before any model call is made. A catch-all route changes *where* the mapped people can reach the bot. It does not change who they are, and somebody the owner never mapped gets the same refusal in a catch-all channel that they would have got in a named one.
@@ -1401,7 +1407,7 @@ HTTP success status before accepting `ok: true`; Slack also validates channel an
 timestamp, Telegram validates message/chat/topic and replies inside the topic, Discord validates
 every split message and treats a later failure as partial, and local acknowledges only after
 `write_all` and `flush`. The hidden request carries a tagged service-specific inbound delivery
-identity, and the broker checks its channel/topic/transport fields against the attested scope before
+identity (including fauxlack channel/message vocabulary for disposable tests), and the broker checks its channel/topic/transport fields against the attested scope before
 namespace creation, preventing cross-transport aliases. Local identities include a 128-bit
 OS-random boot nonce, connection, and sequence, so restarts do not collide.
 
@@ -1632,7 +1638,7 @@ Spans follow [`observability.md`](observability.md):
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
+| `transport.receive` | `transport.kind` (`fauxlack`, `slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 

@@ -2833,6 +2833,7 @@ where
                 return None;
             }
             let service = match scope.kind {
+                ChatTransportKind::Fauxlack => "fauxlack",
                 ChatTransportKind::Slack => "slack",
                 ChatTransportKind::Discord => "discord",
                 ChatTransportKind::Telegram
@@ -4545,7 +4546,8 @@ fn render_chat_slots(
     let scope = scope.ok_or("chat-scope-required")?;
     let api_form = |id: &str| match scope.kind {
         ChatTransportKind::Slack => id.to_ascii_uppercase(),
-        ChatTransportKind::Discord
+        ChatTransportKind::Fauxlack
+        | ChatTransportKind::Discord
         | ChatTransportKind::Telegram
         | ChatTransportKind::Whatsapp
         | ChatTransportKind::Github
@@ -4609,7 +4611,8 @@ fn console_smoke_delivery(
             connection,
             sequence,
         },
-        placeholder @ (DeliveryIdentity::Github { .. }
+        placeholder @ (DeliveryIdentity::Fauxlack { .. }
+        | DeliveryIdentity::Github { .. }
         | DeliveryIdentity::Slack { .. }
         | DeliveryIdentity::Discord { .. }
         | DeliveryIdentity::Telegram { .. }
@@ -4941,6 +4944,7 @@ fn emit_audit_event(event: &AuditEvent) {
 
 fn delivery_kind(delivery: &DeliveryIdentity) -> &'static str {
     match delivery {
+        DeliveryIdentity::Fauxlack { .. } => "fauxlack",
         DeliveryIdentity::Slack { .. } => "slack",
         DeliveryIdentity::Discord { .. } => "discord",
         DeliveryIdentity::Telegram { .. } => "telegram",
@@ -4953,7 +4957,8 @@ fn delivery_kind(delivery: &DeliveryIdentity) -> &'static str {
 fn delivery_id(delivery: &DeliveryIdentity) -> String {
     match delivery {
         DeliveryIdentity::Slack { timestamp, .. } => timestamp.clone(),
-        DeliveryIdentity::Discord { message, .. }
+        DeliveryIdentity::Fauxlack { message, .. }
+        | DeliveryIdentity::Discord { message, .. }
         | DeliveryIdentity::Telegram { message, .. }
         | DeliveryIdentity::Whatsapp { message, .. } => message.clone(),
         DeliveryIdentity::Github { delivery } => delivery.clone(),

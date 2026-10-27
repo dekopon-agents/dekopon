@@ -54,6 +54,12 @@ Attested proposals are the one sanctioned indirection, and they are narrow. A pe
 
 Session-surface refusals disclose the broker's typed `unmapped-subject` or `agent-denied` cause for friendly gateway replies only for subjects permitted by the peer's attestor namespaces, with an omitted `namespaces` list permitting the unmapped cause for every subject; outside them, mapped and unmapped subjects receive the same opaque refusal. The latter includes only the mapped principal ID as display data, never a credential, policy ID or policy evaluation detail. Policy evaluation errors and other authentication failures remain generic. This display distinction grants no authority and changes no authorization decision. Invocation refusals retain their existing opacity.
 
+The published vocabulary also accepts `fauxlack.<tenant>.u<id>` person subjects and
+`fauxlack.<tenant>.c<id>` space subjects for disposable multi-participant tests. A fauxlack
+chat scope binds its container to the sender's tenant. These names grant no authority: owner
+mappings and attestor grants apply unchanged, including to claims from trusted Local clients.
+No deployed transport produces them.
+
 A chat scope also states what started the turn: `trigger` is `message` for a person's message or a verified repository delivery, `wake` for a session a scheduled wake started, `job` for a detached job or its notice turn, and `probe` for a watch's unattended check. Policy sees it as `context.trigger`. A wake reuses the subject and conversation of the authenticated message that scheduled it, so it can never speak as anyone else or anywhere else, and every wake session is authorized afresh. A job under trigger `job` may write only when the broker explicitly authorizes its narrow write capability. A job started by a probe retains trigger `probe`: its leg is refused every capability whose effect is not read-only (`probe-write`) before policy is consulted. A probe's job may look, never act.
 
 ## Current local process boundary
