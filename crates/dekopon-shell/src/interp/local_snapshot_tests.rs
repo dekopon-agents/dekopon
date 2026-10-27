@@ -48,7 +48,8 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
         global_charges: BTreeMap::new(),
         buffer_charges: BTreeMap::new(),
         frames: vec![Frame {
-            locals: BTreeMap::from([("n".into(), Value::from(0))]),
+            kind: super::FrameKind::Function,
+            locals: BTreeMap::from([("n".into(), Some(Value::from(0)))]),
             positional: Vec::new(),
             local_charges: BTreeMap::new(),
             _positional_charges: Vec::new(),
@@ -83,12 +84,12 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
     );
     let mut snapshot = parent.snapshot(writer).expect("snapshot");
     assert!(Arc::ptr_eq(&parent.globals, &snapshot.globals));
-    let saved = snapshot.save_variable("n");
+    let mut saved = None;
     snapshot
-        .assign("n", CommandResult::value(Value::from(1)))
+        .assign_prefix("n", CommandResult::value(Value::from(1)), &mut saved)
         .expect("local assign");
     assert!(Arc::ptr_eq(&parent.globals, &snapshot.globals));
-    snapshot.restore(saved);
+    snapshot.restore_all(saved);
     assert!(Arc::ptr_eq(&parent.globals, &snapshot.globals));
     assert!(snapshot.shared_charges.is_empty());
 }

@@ -73,13 +73,29 @@ Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `
 
 **Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `unset`; the no-op `:`; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
-POSIX IFS word splitting applies to every unquoted string expansion, including parameter expansions
-and command-substitution output. Space, tab and newline runs separate fields; leading and trailing
-whitespace produces no empty fields. Assigning `IFS` does not change these defaults. Quoted
-expansions never field-split; `"$@"` keeps one word per parameter. An unquoted JSON array expansion,
-including `${NAME[@]}`, keeps one word per element without splitting elements further. Assignment
-right-hand sides, `case` subjects and patterns, `[[ ... ]]` operands and here-document bodies do not
-field-split.
+Bash 5.2 IFS field splitting applies to unquoted parameter expansions and command-substitution
+output. Unset `IFS` uses space, tab and newline; empty `IFS` disables splitting. ASCII whitespace
+characters present in `IFS` trim and collapse, while other IFS characters delimit fields,
+retaining leading and adjacent empty fields without adding a field after a trailing delimiter.
+Whitespace adjacent to a nonwhite delimiter belongs to that delimiter. Words containing only literal text and
+explicitly quoted text do not field-split; literal text in an unquoted selected parameter modifier
+does. Field splitting normally uses the IFS value after every expansion in that word has evaluated. For
+example, `unset IFS; v=a,b; f $v${IFS:=,}` passes `a` and `b`; an unquoted literal joined to that
+IFS-changing expansion follows Bash's same final-IFS rules, while quoted text remains protected.
+An unquoted `$*` expanded while IFS is empty uses Bash's space-only splitting
+rule for the complete word; spaces inside the original values remain protected.
+Unquoted positional and JSON array expansions use Bash's element-boundary and IFS joining rules;
+`"$@"` and `"${NAME[@]}"` preserve one word per element, including empty elements. Quoted `$*` and
+`${NAME[*]}` join with the first IFS character (space when unset, no separator when empty).
+Assignment right-hand sides, `case` subjects and patterns, `[[ ... ]]` operands and here-document
+bodies do not field-split. `IFS` follows dynamic function scope, local/unset bindings and
+command-prefix assignments; command substitutions and non-final pipeline stages isolate their
+assignments.
+
+Multibyte IFS follows Bash 5.2, including its extra empty fields after an IFS whitespace delimiter.
+Some Bash quoting and `read` combinations split a UTF-8 character into invalid bytes. Those
+combinations fail explicitly with `IFS: Bash would produce a field that is not valid UTF-8`,
+because shell argument and variable values must remain valid UTF-8.
 
 **Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
@@ -93,19 +109,34 @@ text. Builtins refuse attachment operands with an `asset cat` pipeline suggestio
 
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
+### IFS differential corpus
+
+The fixed-seed corpus in `tests/grammar/ifs.rs` compares argument counts and exact bytes against
+real Bash 5.2 under `C.UTF-8`. Its exclusions are:
+
+- Bare subshells, Bash array literals, here-strings and process substitution: rejected parser syntax; equivalent cases use supported substitutions, JSON arrays and input pipes.
+- ANSI-C quoting, indirect expansion, sparse/associative arrays and unsupported parameter operators: outside the accepted language.
+- `printf -v`, `mapfile`, unsupported `read` flags and unrelated OS commands: absent builtins/options; fixtures use the supported subset.
+- Input NUL and non-UTF-8 bytes: shell values are UTF-8 text; malformed Bash output remains covered by explicit refusal assertions.
+- Locales other than `C.UTF-8`: the oracle fixes this locale to compare UTF-8 delimiter behavior deterministically.
+- Filesystem pathname expansion: this interpreter has no filesystem globbing.
+
 ## `read`
 
-`read [-r] NAME...` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
+`read [-r] [NAME...]` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
 place input is *consumed*. A compound stage owns one input stream: a command that does not read it
 leaves it for the next stdin-reading builtin in that stage. `read` advances the enclosing stream
 and reports failure at end of input,
 which is what ends the loop. End of input is a status and not a diagnostic, because a message there
 would be one per loop, every loop.
 
-Several names split the line on whitespace runs with the remainder in the last, exactly as bash
-does. This input-consumption rule is unchanged by expansion field splitting;
-there is no `IFS` to configure. `-r` is accepted and changes nothing — backslashes are
-never line continuations here — which is said out loud rather than left as a surprise.
+Named reads split the logical line using the current `IFS`. Missing fields bind empty values;
+the last name receives the remaining text with its internal delimiters intact, following Bash's
+trailing-delimiter rules. With no names, `REPLY` receives the unsplit logical line, including edge
+whitespace. Default `read` removes backslash quoting and joins backslash-newline continuations;
+escaped delimiters follow Bash's quoting rules, including the UTF-8 refusal above; `-r` preserves backslashes. A partial line at EOF still
+assigns its values but reports failure. Empty EOF clears the requested names or `REPLY` and fails.
+`IFS= read -r line` preserves input text for one command without changing the enclosing IFS.
 
 There is no `getopts`. Nothing calls a function in this shell with flags: a model writes both the
 caller and the callee, and it writes `f "$x" "$y"`. A flag parser for the one caller that already
@@ -174,7 +205,8 @@ without looking up host files. The cloned input is charged to retained-value bud
 fail when the remaining budget is smaller than the buffer; `cat NAME | cmd` streams instead.
 Expanding buffer bytes into text or passing them to a provider requires valid UTF-8. A command substitution strips trailing LF bytes;
 a whole assignment from JSON object or array text retains its structure, while unquoted text
-substitutions split on default-IFS space, tab and newline runs.
+substitutions split using the current IFS rules above, including first-character joining for
+array and positional expansions. Quoted captures retain internal newlines.
 
 `{ ...; }` is a group, not a subshell, and it is spelled out as such: an empty `{ }` and an
 unterminated `{ echo hi` are parse errors naming themselves rather than quietly running nothing.
@@ -260,7 +292,7 @@ Parsing has a fixed nesting ceiling of 64 levels, applied before any budget exis
 
 Command and `[[ ]]` boolean chains use flat lists, so their length does not consume nesting depth; evaluation iterates with short-circuiting and the existing step budget. Parentheses and negation inside `[[ ]]` still consume parsing depth.
 
-The variable namespace is seeded only from the script's own assignments; the host process environment is never read. `jq --arg NAME VALUE` binds a string (last value wins for repeated names); `--argjson` is unsupported. Jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
+The variable namespace starts with default `IFS` (space, tab and newline), plus `PREV` when supplied by the embedder; the host process environment is never read. `jq --arg NAME VALUE` binds a string (last value wins for repeated names); `--argjson` is unsupported. Jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
 
 Each `jq` stage runs in a worker executable supplied by the embedder. On Linux its address space is limited to its startup size plus 256 MiB; at the deadline or on cancel the worker is killed and waited on. A crashed worker fails the stage, and the script can continue. jaq's value type is a JSON superset, so outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused, and output nesting keeps the JSON parser's 128-container ceiling.
 
