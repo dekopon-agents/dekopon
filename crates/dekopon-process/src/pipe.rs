@@ -214,8 +214,7 @@ impl<C> PipeReader<C> {
         let mut line = ChargedBytes::new();
         loop {
             if let Some(offset) = self.pending.iter().position(|byte| *byte == b'\n') {
-                line.extend(self.pending.drain(..offset), offset, budget)?;
-                self.pending.pop_front();
+                line.extend(self.pending.drain(..=offset), offset + 1, budget)?;
                 return Ok(Some(line));
             }
             let len = self.pending.len();
@@ -267,7 +266,7 @@ mod tests {
                 .read_line(&budget)
                 .expect("reads")
                 .map(|line| line.bytes),
-            Some(b"a".to_vec())
+            Some(b"a\n".to_vec())
         );
         assert_eq!(
             reader.read(&budget).expect("reads"),

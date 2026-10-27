@@ -326,6 +326,8 @@ The feature adds no dependencies and is not enabled for release builds. See the
 
 Use `--locked` for reproducible validation. Start with `git diff --check`. Targeted checks are encouraged during development; run every relevant group before opening a PR.
 
+The shell IFS differential tests require GNU Bash 5.2 on PATH and fail if it is missing or a different major/minor version. CI verifies this prerequisite on both the x86-64 workspace-test runner and the ARM64 component-test runner.
+
 Check target size and free disk space before expensive builds and between validation milestones. After validation, remove inactive build artifacts by default; retain them only for a named near-term check with a cleanup trigger. Before removal, verify the exact path, ownership, ignored/rebuildable contents, and that no concurrent build or running executable uses it. Do not clean another worktree's or a shared active target, or kache's shared store; avoid routine `cargo clean`. Report cleanup, retention, and free space before/after at handoff.
 
 Two permission tests assume a non-root user: `dekopon-brokerd`'s `a_secret_file_that_cannot_be_opened_still_names_its_errno` and `dekopon-model`'s `a_rotated_credential_completes_the_turn_when_the_write_fails`. Under root, their unreadable-file/unwritable-directory setup does not establish the failure condition; report that verification gap rather than treating it as a regression.

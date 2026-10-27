@@ -11,6 +11,9 @@ use dekopon_shell::{
     JobControl, JobRefusal, JobSeed, ScriptOutcome,
 };
 
+#[path = "grammar/ifs.rs"]
+mod ifs;
+
 const PROBE: &str = "probe";
 
 const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
@@ -133,6 +136,12 @@ impl CapabilityInvoker for Fixture {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        if call.word == PROBE && argv.first().is_some_and(|arg| arg == "args") {
+            self.calls
+                .lock()
+                .push(("fixture.argv".to_owned(), json!(&argv[1..])));
+            return dekopon_shell::render_command(streams, "", String::new(), 0);
+        }
         match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
             Some(Ok(proposal)) => {
                 let capability = proposal.capability.clone();
@@ -1149,6 +1158,32 @@ fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
 }
 
 #[test]
+fn substitution_buffer_writes_survive_capture() {
+    assert_eq!(
+        output(
+            "printf before > existing; ignored=$(printf after > existing; printf created > fresh; printf appended >> existing); cat existing; printf ':'; cat fresh"
+        ),
+        "afterappended:created"
+    );
+}
+
+#[test]
+fn substitution_status_is_visible_to_later_argument_expansions() {
+    assert_eq!(output(r#"true; echo "$(false)" "$?""#), " 1");
+    assert_eq!(output(r#"f() { return 3; }; true; echo "$(f)" "$?""#), " 3");
+}
+
+#[test]
+fn substitution_status_is_visible_to_later_conditional_operands() {
+    assert_eq!(
+        output(
+            r#"cmd() { false; }; true; if [[ -n "$(cmd)" || $? -eq 1 ]]; then echo selected; else echo missed; fi"#
+        ),
+        "selected"
+    );
+}
+
+#[test]
 fn a_literal_assignment_preserves_the_last_substitution_status() {
     assert_eq!(output("a=$(false) b=literal; echo $?"), "1");
 }
@@ -1962,7 +1997,6 @@ fn a_piped_read_is_its_own_one_shot_source() {
 #[test]
 fn read_refuses_what_it_does_not_implement() {
     for (script, expected) in [
-        ("echo a | read", "needs at least one variable name"),
         ("echo a | read -d ,", "option \"-d\" is not supported"),
         ("echo a | read 1bad", "is not a valid variable name"),
     ] {
@@ -3959,22 +3993,22 @@ fn unquoted_strings_and_substitutions_split_every_default_ifs_character() {
 }
 
 #[test]
-fn array_elements_keep_whitespace_when_expanded_unquoted() {
+fn unquoted_array_elements_split_using_ifs() {
     for expansion in ["$v", "${v[@]}"] {
         let script = format!(
             r#"v=$(printf '["a b","c d"]' | jq '.'); f() {{ echo $#; for word in "$@"; do echo "<$word>"; done; }}; f {expansion}"#
         );
-        assert_eq!(output(&script), "2\n<a b>\n<c d>", "{expansion}");
+        assert_eq!(output(&script), "4\n<a>\n<b>\n<c>\n<d>", "{expansion}");
     }
 }
 
 #[test]
-fn assigning_ifs_does_not_configure_field_splitting() {
+fn assigning_ifs_configures_field_splitting() {
     assert_eq!(
         output(
             r#"IFS=,; v=' a,b  c '; f() { echo $#; for word in "$@"; do echo "<$word>"; done; }; f $v"#
         ),
-        "2\n<a,b>\n<c>"
+        "2\n< a>\n<b  c >"
     );
 }
 
@@ -4048,10 +4082,10 @@ fn split_fields_are_charged_to_the_value_budget() {
 }
 
 #[test]
-fn quoted_modifier_words_keep_their_existing_substitution_text() {
+fn quoted_modifier_words_preserve_substitution_newlines() {
     assert_eq!(
         output(r#"echo "${x:-pre$(printf 'a\nb')post}""#),
-        "prea bpost"
+        "prea\nbpost"
     );
 }
 

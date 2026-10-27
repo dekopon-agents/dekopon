@@ -8,6 +8,27 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## The bash tool's as is inert on unmapped routes (0.61.1)
+
+No configuration change or provider re-pin is required. In 0.61.0, any `as` value on an unmapped
+route made the bash tool fail with "Unknown participant handle". In 0.61.1, the gateway ignores
+it, runs the script as the asker, and records `tool_call.ignored_arguments = "as"` with
+`reason = "unmapped-route"`. Mapped routes keep their existing participant selection and
+unknown-handle refusal.
+
+Upgrading from 0.61.0 needs only a binary swap. For a downgrade from 0.61.1 to 0.60.0, revert both
+daemons together: the older broker rejects participant-bearing claims. Existing journal text
+remains readable, but stored fauxlack subjects, chat scopes or delivery identities prevent that
+rollback, as described in the 0.61.0 entry below.
+
+## Participant handles, fauxlack vocabulary and the console image default (0.61.0)
+
+No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
+
+- The bash tool's optional `as` argument selects an authenticated participant's turn-local handle in a mapped channel; omitting it uses the asker. Upgrade the broker before the gateway sends the optional `ChatScopeClaim.participant` wire field: 0.60.0 rejects it through `deny_unknown_fields`. The chart runs broker and gateway from one image in one pod, with the broker ready before the gateway starts; the console uses the same image by default. `broker.decision` adds `participant.handle`. Handle attribution changes text in the existing journal records and prompts, not journal or persisted session-state formats, prompt-cache keys or configuration keys. A downgrade to 0.60.0 reads that stored text, but cannot accept participant-bearing claims from a 0.61.0 gateway; revert both daemons together.
+- Fauxlack subjects, chat scopes and delivery identities are new vocabulary that older readers reject. No deployed client sends them. A downgrade cannot read a store holding those values; keep them out of stored data if rollback to 0.60.0 is needed.
+- Chart 0.48.0 defaults the console to the daemon image. Existing explicit console tag or digest overrides still win, using `console.image.repository`, and render the same image reference byte for byte. Operators with that override need do nothing; they may remove it to follow the daemon image. A repository alone does not override the default when both console tag and digest are empty.
+
 ## Participant steering in mapped channels and model extraCABundles (0.60.0)
 
 No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
