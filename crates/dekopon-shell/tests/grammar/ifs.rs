@@ -644,3 +644,46 @@ fn generated_escaped_read_remainders_match_real_bash() {
     assert_eq!(cases, 450);
     eprintln!("Escaped read corpus: {cases} exact Bash agreements");
 }
+
+#[test]
+fn generated_array_defaults_match_real_bash() {
+    let mut cases = 0;
+    for setup in [
+        "",
+        "unset IFS;",
+        "IFS=' \t\n';",
+        "IFS=;",
+        "IFS=,;",
+        "IFS=é;",
+    ] {
+        for elements in [vec![], vec![""], vec!["", ""]] {
+            let actual_setup = format!(
+                "arr=$(printf '%s' {});",
+                quote(&serde_json::to_string(&elements).expect("JSON array"))
+            );
+            let reference_setup = format!(
+                "arr=({});",
+                elements
+                    .iter()
+                    .map(|value| quote(value))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            for expansion in [
+                "${arr[*]:-d e}",
+                "${arr[@]:-d e}",
+                "\"${arr[*]:-d e}\"",
+                "\"${arr[@]:-d e}\"",
+            ] {
+                assert!(!compare_pair(
+                    &format!("{setup}{actual_setup}probe args {expansion}"),
+                    &format!("{setup}{reference_setup}probe args {expansion}"),
+                    &format!("array default case={cases}")
+                ));
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 72);
+    eprintln!("Array default corpus: {cases} exact Bash agreements");
+}

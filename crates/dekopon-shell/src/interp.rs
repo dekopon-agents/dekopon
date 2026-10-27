@@ -4381,24 +4381,32 @@ impl<'a> Evaluator<'a> {
                 "{name}: unbound variable, and `set -u` is on"
             ))));
         }
-        let absent = |colon: bool| {
-            if colon {
-                value.is_null() || display(&value).is_empty()
+        let absent = |this: &mut Self, colon: bool| -> Result<bool, LimitExceeded> {
+            Ok(if colon {
+                match &value {
+                    Value::Null => true,
+                    Value::Array(elements) => {
+                        elements.len() <= 1 && this.ifs_join(elements)?.is_empty()
+                    }
+                    Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+                        display(&value).is_empty()
+                    }
+                }
             } else {
                 !bound
-            }
+            })
         };
         let value = match modifier {
             Modifier::None => value,
             Modifier::Default { colon, word } => {
-                if absent(*colon) {
+                if absent(self, *colon)? {
                     self.expand_selected_word(word, split.take(), output)?
                 } else {
                     value
                 }
             }
             Modifier::Assign { colon, word } => {
-                if !absent(*colon) {
+                if !absent(self, *colon)? {
                     return self.finish_parameter(value, split);
                 }
                 if !indices.is_empty() {
@@ -4411,7 +4419,7 @@ impl<'a> Evaluator<'a> {
                 substitute
             }
             Modifier::Require { colon, word } => {
-                if !absent(*colon) {
+                if !absent(self, *colon)? {
                     return self.finish_parameter(value, split);
                 }
                 let message = match word {
@@ -4423,7 +4431,7 @@ impl<'a> Evaluator<'a> {
                 ))));
             }
             Modifier::Alternate { colon, word } => {
-                if absent(*colon) {
+                if absent(self, *colon)? {
                     Value::Null
                 } else {
                     self.expand_selected_word(word, split.take(), output)?

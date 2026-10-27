@@ -292,7 +292,7 @@ Parsing has a fixed nesting ceiling of 64 levels, applied before any budget exis
 
 Command and `[[ ]]` boolean chains use flat lists, so their length does not consume nesting depth; evaluation iterates with short-circuiting and the existing step budget. Parentheses and negation inside `[[ ]]` still consume parsing depth.
 
-The variable namespace is seeded only from the script's own assignments; the host process environment is never read. `jq --arg NAME VALUE` binds a string (last value wins for repeated names); `--argjson` is unsupported. Jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
+The variable namespace starts with default `IFS` (space, tab and newline), plus `PREV` when supplied by the embedder; the host process environment is never read. `jq --arg NAME VALUE` binds a string (last value wins for repeated names); `--argjson` is unsupported. Jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
 
 Each `jq` stage runs in a worker executable supplied by the embedder. On Linux its address space is limited to its startup size plus 256 MiB; at the deadline or on cancel the worker is killed and waited on. A crashed worker fails the stage, and the script can continue. jaq's value type is a JSON superset, so outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused, and output nesting keeps the JSON parser's 128-container ceiling.
 
