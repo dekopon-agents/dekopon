@@ -124,9 +124,13 @@ fn main() -> Result<(), ExampleError> {
         .map(|address| format!("http://{address}/"));
     let client = match arguments.kind {
         Kind::Codex => {
-            let client =
-                CodexClient::new(&arguments.model, arguments.auth_file.as_deref(), timeout)?
-                    .with_name(&arguments.label);
+            let client = CodexClient::new(
+                &arguments.model,
+                arguments.auth_file.as_deref(),
+                timeout,
+                &[],
+            )?
+            .with_name(&arguments.label);
             ModelClient::Codex(match endpoint.as_deref() {
                 Some(endpoint) => client.with_loopback_endpoint(endpoint)?,
                 None => client,
@@ -139,7 +143,7 @@ fn main() -> Result<(), ExampleError> {
                     .map_err(|_credential_error| ExampleError::Credential)?,
             };
             let client =
-                OpenRouterClient::new(&arguments.model, token, timeout, Settings::default())?
+                OpenRouterClient::new(&arguments.model, token, timeout, Settings::default(), &[])?
                     .with_name(&arguments.label);
             ModelClient::OpenRouter(match endpoint.as_deref() {
                 Some(endpoint) => client.with_loopback_endpoint(endpoint)?,

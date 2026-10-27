@@ -854,7 +854,7 @@ async fn encoding_a_history_image_refills_bytes_or_reports_platform_gone() {
         let response = br#"{"choices":[{"message":{"role":"assistant","content":"seen"},"finish_reason":"stop"}]}"#;
         let response = [format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).into_bytes(), response.to_vec()].concat();
         let peer = dekopon_test_support::LoopbackServer::once(&response);
-        let model = OpenAiClient::new(peer.url(), "fixture", None, Duration::from_secs(5))
+        let model = OpenAiClient::new(peer.url(), "fixture", None, Duration::from_secs(5), &[])
             .unwrap()
             .with_streaming(false);
         let (_, cancel) = tokio::sync::watch::channel(false);

@@ -233,7 +233,7 @@ async fn console_turn_exports_one_causal_trace_through_model_script_broker_and_p
             // The same async opening boundary as dispatch; the leg must be born inside the turn.
             let leg = open_agent(client.clone(), options.subject.clone(), "reviewer".parse().unwrap(), None).await.unwrap();
             let trace = leg.session_trace().to_string();
-            let client = OpenAiClient::new(&collector.endpoint, "synthetic-model", Some("synthetic-model-credential".into()), Duration::from_secs(10)).unwrap().with_streaming(false);
+            let client = OpenAiClient::new(&collector.endpoint, "synthetic-model", Some("synthetic-model-credential".into()), Duration::from_secs(10), &[]).unwrap().with_streaming(false);
             let model = BlockingModel::new(Arc::new(ModelClient::OpenAiCompatible(client)), tokio::runtime::Handle::current(), tokio::sync::watch::channel(false).1, Duration::from_secs(10));
             let agent = serde_json::from_value(json!({"apiVersion":"dekopon.dev/v1alpha1", "kind":"Agent", "metadata":{"name":"reviewer"}, "spec":{"description":"synthetic agent", "enabled":true}})).unwrap();
             let (events, mut receiver) = dekopon_tui::session::session_channel();

@@ -32,6 +32,7 @@ impl PrincipalKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum SubjectService {
+    Fauxlack,
     Slack,
     Discord,
     Telegram,
@@ -44,6 +45,7 @@ impl SubjectService {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Fauxlack => "fauxlack",
             Self::Slack => "slack",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
@@ -55,7 +57,10 @@ impl SubjectService {
 
     #[must_use]
     pub const fn requires_tenant(self) -> bool {
-        matches!(self, Self::Slack | Self::Github)
+        match self {
+            Self::Fauxlack | Self::Slack | Self::Github => true,
+            Self::Discord | Self::Telegram | Self::Whatsapp | Self::Tel => false,
+        }
     }
 
     #[must_use]
@@ -74,7 +79,12 @@ impl SubjectService {
                             || matches!(byte, b'_' | b'-')
                     })
             }
-            Self::Slack | Self::Discord | Self::Telegram | Self::Whatsapp | Self::Tel => {
+            Self::Fauxlack
+            | Self::Slack
+            | Self::Discord
+            | Self::Telegram
+            | Self::Whatsapp
+            | Self::Tel => {
                 !value.is_empty()
                     && value
                         .bytes()
@@ -104,6 +114,7 @@ impl FromStr for SubjectService {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "fauxlack" => Ok(Self::Fauxlack),
             "slack" => Ok(Self::Slack),
             "discord" => Ok(Self::Discord),
             "telegram" => Ok(Self::Telegram),
@@ -187,10 +198,12 @@ impl ExternalSubject {
     #[must_use]
     pub fn kind(&self) -> PrincipalKind {
         match self.service {
+            SubjectService::Fauxlack if self.subject.starts_with('c') => PrincipalKind::Space,
             SubjectService::Slack if self.subject.starts_with(['c', 'g']) => PrincipalKind::Space,
             SubjectService::Discord if self.tenant.is_some() => PrincipalKind::Space,
             SubjectService::Github => PrincipalKind::Repository,
-            SubjectService::Slack
+            SubjectService::Fauxlack
+            | SubjectService::Slack
             | SubjectService::Discord
             | SubjectService::Telegram
             | SubjectService::Whatsapp
@@ -298,7 +311,7 @@ impl FromStr for ExternalSubject {
             SubjectService::Telegram | SubjectService::Tel => {
                 subject.bytes().all(|byte| byte.is_ascii_digit())
             }
-            SubjectService::Slack | SubjectService::Github => true,
+            SubjectService::Fauxlack | SubjectService::Slack | SubjectService::Github => true,
         };
         if !numeric {
             return Err(SubjectError::InvalidSegment {
@@ -446,6 +459,8 @@ mod tests {
         use super::PrincipalKind;
         for (form, kind) in [
             ("slack.team.channel", PrincipalKind::Space),
+            ("fauxlack.acme.cteam", PrincipalKind::Space),
+            ("fauxlack.acme.ualice", PrincipalKind::Person),
             ("slack.team.group", PrincipalKind::Space),
             ("slack.team.user", PrincipalKind::Person),
             ("slack.team.worker", PrincipalKind::Person),
@@ -491,6 +506,8 @@ mod tests {
     fn canonical_forms_round_trip_through_parse_and_serde() {
         for canonical in [
             "slack.t0123abc.u9xyz",
+            "fauxlack.acme.cteam",
+            "fauxlack.acme.ualice",
             "discord.123456789012345678",
             "telegram.5551234",
             "whatsapp.16034700182",
@@ -511,6 +528,8 @@ mod tests {
     fn canonical_subjects_satisfy_the_identifier_grammar() {
         for canonical in [
             "slack.t0123abc.u9xyz",
+            "fauxlack.acme.cteam",
+            "fauxlack.acme.ualice",
             "discord.123456789012345678",
             "telegram.5551234",
             "whatsapp.16034700182",
@@ -526,6 +545,12 @@ mod tests {
     fn malformed_subjects_fail_closed() {
         for invalid in [
             "",
+            "fauxlack",
+            "fauxlack.ualice",
+            "fauxlack..ualice",
+            "fauxlack.acme.ualice.extra",
+            "fauxlack.Acme.ualice",
+            "fauxlack.acme.u-alice",
             "slack",
             "slack.t0123abc",
             "slack.t0123abc.u9xyz.extra",
@@ -574,6 +599,12 @@ mod tests {
         assert!(!subject.in_namespace("slack.t0123abc."));
         assert!(!subject.in_namespace("slack.t0123abc.u9xyz.extra"));
         assert!(!subject.in_namespace(".slack"));
+
+        let fauxlack: ExternalSubject = "fauxlack.acme.ualice".parse().unwrap();
+        assert!(fauxlack.in_namespace("fauxlack.acme"));
+        assert!(!fauxlack.in_namespace("fauxlack.acm"));
+        assert!(!fauxlack.in_namespace("slack.acme"));
+        assert!(!subject.in_namespace("fauxlack"));
 
         let tenantless = "tel.16034700182"
             .parse::<ExternalSubject>()

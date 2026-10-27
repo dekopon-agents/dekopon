@@ -924,12 +924,47 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
 fn one_canonical_conversation_form_decides_every_transport() {
     let sender =
         |value: &str| -> dekopon_core::ExternalSubject { value.parse().expect("subject fixture") };
+    let fauxlack_user = sender("fauxlack.acme.ualice");
     let slack_user = sender("slack.t0123abc.u9xyz");
     let discord_user = sender("discord.578258790881951745");
     let telegram_user = sender("telegram.5551234");
     let whatsapp_user = sender("whatsapp.16034700182");
 
     for (transport, subject, conversation, key) in [
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("acme"),
+                "dalice",
+                None,
+            ),
+            "dalice",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(
+                ConversationKind::GroupDirectMessage,
+                Some("acme"),
+                "gteam",
+                None,
+            ),
+            "gteam",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Channel, Some("acme"), "cteam", Some("m1")),
+            "cteam:m1",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Thread, Some("acme"), "cteam", Some("m2")),
+            "cteam:m2",
+        ),
         (
             ChatTransportKind::Slack,
             &slack_user,
@@ -1070,6 +1105,81 @@ fn one_canonical_conversation_form_decides_every_transport() {
     }
 
     for (transport, subject, conversation, why) in [
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(
+                ConversationKind::Channel,
+                Some("other"),
+                "cteam",
+                Some("m1"),
+            ),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Channel, None, "cteam", Some("m1")),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Channel, Some("acme"), "Cteam", Some("m1")),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Channel, Some("acme"), "cteam", None),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Thread, Some("acme"), "cteam", Some("m01")),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Thread, Some("acme"), "cteam", Some("m0")),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(ConversationKind::Thread, Some("acme"), "cteam", Some("1")),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("acme"),
+                "dalice",
+                Some("m1"),
+            ),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &fauxlack_user,
+            conversation(
+                ConversationKind::GroupDirectMessage,
+                Some("acme"),
+                "gteam",
+                Some("m1"),
+            ),
+            "fauxlack coordinates must be canonical and tenant-bound",
+        ),
+        (
+            ChatTransportKind::Fauxlack,
+            &slack_user,
+            conversation(ConversationKind::Channel, Some("acme"), "cteam", Some("m1")),
+            "service must match",
+        ),
         (
             ChatTransportKind::Slack,
             &slack_user,
@@ -1275,6 +1385,11 @@ fn the_api_channel_is_the_thread_only_where_a_thread_is_a_channel() {
     );
     assert_eq!(slack.api_channel(ChatTransportKind::Slack), "c0123abc");
     assert_eq!(
+        conversation(ConversationKind::Thread, Some("acme"), "cteam", Some("m1"))
+            .api_channel(ChatTransportKind::Fauxlack),
+        "cteam"
+    );
+    assert_eq!(
         conversation(ConversationKind::Channel, Some("999"), "123", None)
             .api_channel(ChatTransportKind::Discord),
         "123"
@@ -1283,6 +1398,34 @@ fn the_api_channel_is_the_thread_only_where_a_thread_is_a_channel() {
 
 #[test]
 fn a_conversation_selector_reports_every_problem_at_once() {
+    let fauxlack = ConversationMatch {
+        kind: ConversationKindMatch::Kinds(vec![
+            ConversationKind::DirectMessage,
+            ConversationKind::GroupDirectMessage,
+            ConversationKind::Channel,
+            ConversationKind::Thread,
+        ]),
+        container: Some("acme".into()),
+        ids: Some(vec!["cteam".into()]),
+    };
+    assert!(fauxlack.validate(ChatTransportKind::Fauxlack).is_empty());
+    assert_eq!(
+        ConversationMatch {
+            container: Some("Acme".into()),
+            ids: Some(vec!["Cteam".into(), "cteam:m1".into()]),
+            ..fauxlack
+        }
+        .validate(ChatTransportKind::Fauxlack),
+        vec![
+            ConversationMatchProblem::NonCanonicalContainer {
+                container: "Acme".into()
+            },
+            ConversationMatchProblem::NonCanonicalId { id: "Cteam".into() },
+            ConversationMatchProblem::ThreadFormId {
+                id: "cteam:m1".into()
+            },
+        ]
+    );
     let bad = ConversationMatch {
         kind: ConversationKindMatch::Kinds(vec![
             ConversationKind::Channel,
@@ -1368,6 +1511,26 @@ fn a_conversation_selector_reports_every_problem_at_once() {
 
 #[test]
 fn a_selector_matches_kind_container_and_id_but_never_a_thread() {
+    let fauxlack = ConversationMatch {
+        kind: ConversationKindMatch::Kinds(vec![
+            ConversationKind::Channel,
+            ConversationKind::Thread,
+        ]),
+        container: Some("acme".into()),
+        ids: Some(vec!["cteam".into()]),
+    };
+    assert!(fauxlack.matches(&conversation(
+        ConversationKind::Thread,
+        Some("acme"),
+        "cteam",
+        Some("m1")
+    )));
+    assert!(!fauxlack.matches(&conversation(
+        ConversationKind::Thread,
+        Some("other"),
+        "cteam",
+        Some("m1")
+    )));
     let selector = ConversationMatch {
         kind: ConversationKindMatch::Kinds(vec![
             ConversationKind::Channel,
@@ -1423,6 +1586,59 @@ fn a_selector_matches_kind_container_and_id_but_never_a_thread() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
+    assert_eq!(ChatTransportKind::Fauxlack.to_string(), "fauxlack");
+    assert_eq!(
+        serde_json::to_value(ChatTransportKind::Fauxlack).unwrap(),
+        json!("fauxlack")
+    );
+    assert_eq!(
+        serde_json::from_value::<ChatTransportKind>(json!("fauxlack")).unwrap(),
+        ChatTransportKind::Fauxlack
+    );
+    let fauxlack = ChatScopeClaim {
+        transport: "chat".parse().unwrap(),
+        kind: ChatTransportKind::Fauxlack,
+        conversation: conversation(ConversationKind::Channel, Some("acme"), "cteam", Some("m1")),
+        delivery: None,
+        trigger: Trigger::Message,
+    };
+    let delivery = DeliveryIdentity::Fauxlack {
+        channel: "cteam".into(),
+        message: "m2".into(),
+    };
+    assert!(delivery.is_canonical_for(&fauxlack));
+    let wire = json!({"kind": "fauxlack", "channel": "cteam", "message": "m2"});
+    assert_eq!(serde_json::to_value(&delivery).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_value::<DeliveryIdentity>(wire).unwrap(),
+        delivery
+    );
+    for (channel, message) in [
+        ("cother", "m2"),
+        ("cteam", "m0"),
+        ("cteam", "m02"),
+        ("cteam", "2"),
+        ("cteam", "m18446744073709551616"),
+    ] {
+        assert!(
+            !DeliveryIdentity::Fauxlack {
+                channel: channel.into(),
+                message: message.into()
+            }
+            .is_canonical_for(&fauxlack)
+        );
+    }
+    assert!(
+        !DeliveryIdentity::Slack {
+            channel: "cteam".into(),
+            timestamp: "1712345678.000100".into()
+        }
+        .is_canonical_for(&fauxlack)
+    );
+    assert!(!delivery.is_canonical_for(&ChatScopeClaim {
+        kind: ChatTransportKind::Slack,
+        ..fauxlack
+    }));
     let slack = ChatScopeClaim {
         participant: None,
         transport: "scientist-slack".parse().expect("transport"),
@@ -1634,24 +1850,27 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
 fn delivered_turn_strings_are_rejected_during_deserialization_at_their_field_bound() {
     let document = serde_json::json!({
         "id": "turn-bound",
-        "trace": "trace-bound",
-        "traceParent": null,
-        "delivery": {
-            "kind": "slack",
-            "channel": "c0123abc",
-            "timestamp": "1712345678.000100"
-        },
-        "user": "x".repeat(64 * 1024 + 1),
-        "assistant": "answer"
+        "traceParent": "00-0000000000000000000000000000f1c7-00000000000000f1-00",
+        "delivery": {"kind": "fauxlack", "channel": "cteam", "message": "m1"},
+        "user": "question", "assistant": "answer"
     });
-    assert!(serde_json::from_value::<DeliveredTurnRequest>(document).is_err());
-
+    assert!(serde_json::from_value::<DeliveredTurnRequest>(document.clone()).is_ok());
+    let mut oversized = document;
+    oversized["user"] = json!("x".repeat(64 * 1024 + 1));
+    assert!(serde_json::from_value::<DeliveredTurnRequest>(oversized).is_err());
     let scope = serde_json::json!({
-        "transport": "scientist-slack",
-        "kind": "slack",
-        "conversation": {"kind": "channel", "id": "x".repeat(257)}
+        "transport": "chat", "kind": "fauxlack", "trigger": "message",
+        "conversation": {"kind": "channel", "container": "acme", "id": "cteam", "thread": "m1"}
     });
-    assert!(serde_json::from_value::<ChatScopeClaim>(scope).is_err());
+    assert!(serde_json::from_value::<ChatScopeClaim>(scope.clone()).is_ok());
+    let mut oversized = scope;
+    oversized["conversation"]["id"] = json!("x".repeat(257));
+    assert!(serde_json::from_value::<ChatScopeClaim>(oversized).is_err());
+    for field in ["channel", "message"] {
+        let mut delivery = json!({"kind": "fauxlack", "channel": "cteam", "message": "m1"});
+        delivery[field] = json!("x".repeat(257));
+        assert!(serde_json::from_value::<DeliveryIdentity>(delivery).is_err());
+    }
 
     let delivery = serde_json::json!({
         "kind": "telegram",

@@ -357,7 +357,8 @@ fn channel_claim(
             (conversation_kind != ConversationKind::DirectMessage).then(|| "999".to_owned()),
             (conversation_kind == ConversationKind::Thread).then(|| "789".to_owned()),
         ),
-        ChatTransportKind::Telegram
+        ChatTransportKind::Fauxlack
+        | ChatTransportKind::Telegram
         | ChatTransportKind::Whatsapp
         | ChatTransportKind::Github
         | ChatTransportKind::Local => panic!("table only covers Slack and Discord"),

@@ -271,6 +271,7 @@ impl ConfiguredModels {
         model: &ModelConfig,
         mut resolve: impl FnMut(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Arc<ModelClient>, SessionError> {
+        let ca_bundles = model.ca_bundles();
         match model {
             ModelConfig::OpenaiCompatible {
                 name,
@@ -291,6 +292,7 @@ impl ConfiguredModels {
                         model,
                         bearer_token,
                         std::time::Duration::from_millis(*timeout_ms),
+                        ca_bundles,
                     )?
                     .with_streaming(*stream)
                     .with_name(name),
@@ -320,6 +322,7 @@ impl ConfiguredModels {
                         token,
                         std::time::Duration::from_millis(*timeout_ms),
                         settings,
+                        ca_bundles,
                     )?
                     .with_name(name),
                 )))
@@ -334,7 +337,8 @@ impl ConfiguredModels {
                 let timeout = std::time::Duration::from_millis(*timeout_ms);
                 let credential = self.chatgpt_credential(auth_file.as_deref(), timeout)?;
                 Ok(Arc::new(ModelClient::Codex(
-                    CodexClient::with_credential(model, credential, timeout)?.with_name(name),
+                    CodexClient::with_credential(model, credential, timeout, ca_bundles)?
+                        .with_name(name),
                 )))
             }
             ModelConfig::Anthropic { name, .. } => Err(SessionError::ProxyOnlyModel {
@@ -3594,6 +3598,10 @@ pub(crate) fn delivery_identity(
     let scope = claim.scope.as_ref()?;
     let conversation = &scope.conversation;
     match message.transport_kind {
+        dekopon_broker_protocol::ChatTransportKind::Fauxlack => Some(DeliveryIdentity::Fauxlack {
+            channel: conversation.id.clone(),
+            message: message_id.to_owned(),
+        }),
         dekopon_broker_protocol::ChatTransportKind::Slack => Some(DeliveryIdentity::Slack {
             channel: conversation.id.clone(),
             timestamp: message_id.to_owned(),

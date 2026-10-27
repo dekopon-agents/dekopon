@@ -44,6 +44,7 @@ impl OpenRouterClient {
         token: String,
         timeout: Duration,
         settings: Settings,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
         let model = model.into();
         if model.trim().is_empty() {
@@ -56,7 +57,7 @@ impl OpenRouterClient {
             return Err(RequestError::OpenRouterSetting(*problem).into());
         }
         Ok(Self {
-            http: InferenceHttp::new(timeout)?,
+            http: InferenceHttp::new(timeout, extra_ca_bundles)?,
             endpoint: ENDPOINT.into(),
             name: model.clone(),
             identity: parking_lot::RwLock::new(ModelKey::new(

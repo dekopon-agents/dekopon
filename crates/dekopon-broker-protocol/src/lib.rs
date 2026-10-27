@@ -266,6 +266,7 @@ pub struct InvocationRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatTransportKind {
+    Fauxlack,
     Slack,
     Discord,
     Telegram,
@@ -277,6 +278,7 @@ pub enum ChatTransportKind {
 impl fmt::Display for ChatTransportKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Fauxlack => "fauxlack",
             Self::Slack => "slack",
             Self::Discord => "discord",
             Self::Telegram => "telegram",
@@ -464,6 +466,12 @@ impl Attestation {
     rename_all_fields = "camelCase"
 )]
 pub enum DeliveryIdentity {
+    Fauxlack {
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        channel: String,
+        #[serde(deserialize_with = "deserialize_scope_part")]
+        message: String,
+    },
     Github {
         #[serde(deserialize_with = "deserialize_scope_part")]
         delivery: String,
@@ -520,26 +528,38 @@ impl DeliveryIdentity {
     #[must_use]
     pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
         let conversation = &scope.conversation;
-        match (self, scope.kind) {
-            (Self::Github { delivery }, ChatTransportKind::Github) => bounded_scope_part(delivery),
-            (Self::Slack { channel, timestamp }, ChatTransportKind::Slack) => {
+        let kind = match self {
+            Self::Fauxlack { .. } => ChatTransportKind::Fauxlack,
+            Self::Slack { .. } => ChatTransportKind::Slack,
+            Self::Discord { .. } => ChatTransportKind::Discord,
+            Self::Telegram { .. } => ChatTransportKind::Telegram,
+            Self::Whatsapp { .. } => ChatTransportKind::Whatsapp,
+            Self::Github { .. } => ChatTransportKind::Github,
+            Self::Local { .. } => ChatTransportKind::Local,
+        };
+        if kind != scope.kind {
+            return false;
+        }
+        match self {
+            Self::Fauxlack { channel, message } => {
+                channel == &conversation.id && conversation::canonical_fauxlack_message(message)
+            }
+            Self::Github { delivery } => bounded_scope_part(delivery),
+            Self::Slack { channel, timestamp } => {
                 channel == &conversation.id && canonical_slack_timestamp(timestamp)
             }
-            (Self::Discord { channel, message }, ChatTransportKind::Discord) => {
+            Self::Discord { channel, message } => {
                 // A Discord thread is itself the channel its messages post in, so delivery names
                 // the thread while the conversation's id names the parent.
                 channel == conversation.api_channel(ChatTransportKind::Discord)
                     && canonical_unsigned_decimal(channel)
                     && canonical_unsigned_decimal(message)
             }
-            (
-                Self::Telegram {
-                    chat,
-                    topic,
-                    message,
-                },
-                ChatTransportKind::Telegram,
-            ) => {
+            Self::Telegram {
+                chat,
+                topic,
+                message,
+            } => {
                 chat == &conversation.id
                     && canonical_signed_decimal(chat)
                     && topic.as_deref() == conversation.thread.as_deref()
@@ -548,29 +568,23 @@ impl DeliveryIdentity {
                         .is_none_or(canonical_positive_service_decimal)
                     && canonical_positive_service_decimal(message)
             }
-            (
-                Self::Whatsapp {
-                    waba,
-                    phone_number,
-                    message,
-                },
-                ChatTransportKind::Whatsapp,
-            ) => {
+            Self::Whatsapp {
+                waba,
+                phone_number,
+                message,
+            } => {
                 conversation.container.as_deref() == Some(&format!("{waba}:{phone_number}"))
                     && canonical_meta_decimal(waba)
                     && canonical_meta_decimal(phone_number)
                     && canonical_whatsapp_message_id(message)
             }
-            (
-                Self::Local {
-                    transport,
-                    conversation: named,
-                    boot_nonce,
-                    connection,
-                    sequence,
-                },
-                ChatTransportKind::Local,
-            ) => {
+            Self::Local {
+                transport,
+                conversation: named,
+                boot_nonce,
+                connection,
+                sequence,
+            } => {
                 transport == &scope.transport
                     && named == &conversation.key()
                     && boot_nonce.len() == 32
@@ -580,7 +594,6 @@ impl DeliveryIdentity {
                     && *connection > 0
                     && *sequence > 0
             }
-            _ => false,
         }
     }
 }

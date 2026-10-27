@@ -138,7 +138,8 @@ impl Mapping {
 fn chat_transport(message: &InboundMessage) -> bool {
     use dekopon_broker_protocol::ChatTransportKind;
     match message.transport_kind {
-        ChatTransportKind::Slack
+        ChatTransportKind::Fauxlack
+        | ChatTransportKind::Slack
         | ChatTransportKind::Discord
         | ChatTransportKind::Telegram
         | ChatTransportKind::Whatsapp
