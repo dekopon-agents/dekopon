@@ -3,58 +3,45 @@ use std::{thread, time::Duration};
 
 use serde_json::Value;
 
-use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
+use super::{BuiltinContext, CommandFailure, CommandResult};
 
-const ECHO_HELP: &str = "-n -e -E";
+pub(super) const ECHO_HELP: &str = "-n -e -E";
 
-pub(crate) struct Echo;
-
-impl Builtin for Echo {
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-
-    fn help(&self) -> &'static str {
-        ECHO_HELP
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let mut suppress_newline = false;
-        let mut escapes = false;
-        let mut words = arguments;
-        // -n, -e, -E and their bundles are consumed as flags, matching busybox echo; leaving -e
-        // unconsumed would print it as data, corrupting the value the script produced.
-        while let Some(first) = words.first() {
-            if !is_echo_flags(first) {
-                break;
-            }
-            for flag in first.chars().skip(1) {
-                match flag {
-                    'n' => suppress_newline = true,
-                    'e' => escapes = true,
-                    _ => escapes = false,
-                }
-            }
-            words = &words[1..];
+pub(crate) fn echo(
+    _context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    let mut suppress_newline = false;
+    let mut escapes = false;
+    let mut words = arguments;
+    // -n, -e, -E and their bundles are consumed as flags, matching busybox echo; leaving -e
+    // unconsumed would print it as data, corrupting the value the script produced.
+    while let Some(first) = words.first() {
+        if !is_echo_flags(first) {
+            break;
         }
-        let joined = words.join(" ");
-        let text = if escapes {
-            interpret_escapes(&joined)
-        } else {
-            joined
-        };
-        let result = CommandResult::value(Value::String(text));
-        Ok(if suppress_newline {
-            result.without_newline()
-        } else {
-            result
-        })
+        for flag in first.chars().skip(1) {
+            match flag {
+                'n' => suppress_newline = true,
+                'e' => escapes = true,
+                _ => escapes = false,
+            }
+        }
+        words = &words[1..];
     }
+    let joined = words.join(" ");
+    let text = if escapes {
+        interpret_escapes(&joined)
+    } else {
+        joined
+    };
+    let result = CommandResult::value(Value::String(text));
+    Ok(if suppress_newline {
+        result.without_newline()
+    } else {
+        result
+    })
 }
 
 fn is_echo_flags(argument: &str) -> bool {
@@ -89,31 +76,18 @@ fn interpret_escapes(text: &str) -> String {
     output
 }
 
-pub(crate) struct Printf;
-
-impl Builtin for Printf {
-    fn name(&self) -> &'static str {
-        "printf"
-    }
-
-    fn help(&self) -> &'static str {
-        ""
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let Some((format, values)) = arguments.split_first() else {
-            return Err(CommandFailure::usage(
-                "printf: a format argument is required",
-            ));
-        };
-        let rendered = format_text(format, values)?;
-        Ok(CommandResult::value(Value::String(rendered)).without_newline())
-    }
+pub(crate) fn printf(
+    _context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    let Some((format, values)) = arguments.split_first() else {
+        return Err(CommandFailure::usage(
+            "printf: a format argument is required",
+        ));
+    };
+    let rendered = format_text(format, values)?;
+    Ok(CommandResult::value(Value::String(rendered)).without_newline())
 }
 
 #[allow(
@@ -170,54 +144,28 @@ fn format_text(format: &str, values: &[String]) -> Result<String, CommandFailure
     Ok(output)
 }
 
-const TEST_HELP: &str = "! -z -n = == != < > -eq -ne -lt -le -gt -ge";
+pub(super) const TEST_HELP: &str = "! -z -n = == != < > -eq -ne -lt -le -gt -ge";
 
-pub(crate) struct Test;
-
-impl Builtin for Test {
-    fn name(&self) -> &'static str {
-        "test"
-    }
-
-    fn help(&self) -> &'static str {
-        TEST_HELP
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        evaluate_test("test", arguments)
-    }
+pub(crate) fn test(
+    _context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    evaluate_test("test", arguments)
 }
 
-pub(crate) struct TestBracket;
-
-impl Builtin for TestBracket {
-    fn name(&self) -> &'static str {
-        "["
+pub(crate) fn test_bracket(
+    _context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    let Some((last, rest)) = arguments.split_last() else {
+        return Err(CommandFailure::usage("[: missing closing `]`"));
+    };
+    if last != "]" {
+        return Err(CommandFailure::usage("[: missing closing `]`"));
     }
-
-    fn help(&self) -> &'static str {
-        TEST_HELP
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let Some((last, rest)) = arguments.split_last() else {
-            return Err(CommandFailure::usage("[: missing closing `]`"));
-        };
-        if last != "]" {
-            return Err(CommandFailure::usage("[: missing closing `]`"));
-        }
-        evaluate_test("[", rest)
-    }
+    evaluate_test("[", rest)
 }
 
 /// Evaluates the curated `test` expression grammar.
@@ -303,187 +251,118 @@ fn parse_number(command: &str, text: &str) -> Result<f64, CommandFailure> {
         .map_err(|_| CommandFailure::usage(format!("{command}: {text:?} is not a number")))
 }
 
-pub(crate) struct True;
-
-impl Builtin for True {
-    fn name(&self) -> &'static str {
-        "true"
-    }
-
-    fn help(&self) -> &'static str {
-        ""
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        _arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        Ok(CommandResult::status(ExitCode::SUCCESS))
-    }
+pub(crate) fn succeed(
+    _context: &mut BuiltinContext<'_>,
+    _arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    Ok(CommandResult::status(ExitCode::SUCCESS))
 }
 
-pub(crate) struct False;
-
-impl Builtin for False {
-    fn name(&self) -> &'static str {
-        "false"
-    }
-
-    fn help(&self) -> &'static str {
-        ""
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        _arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        Ok(CommandResult::status(ExitCode::FAILURE))
-    }
+pub(crate) fn fail(
+    _context: &mut BuiltinContext<'_>,
+    _arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    Ok(CommandResult::status(ExitCode::FAILURE))
 }
 
-pub(crate) struct Progress;
-
-impl Builtin for Progress {
-    fn name(&self) -> &'static str {
-        "progress"
-    }
-
-    fn help(&self) -> &'static str {
-        "--eta"
-    }
-
-    fn run(
-        &self,
-        context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let mut text = None;
-        let mut eta = None;
-        let mut has_eta = false;
-        let mut arguments = arguments.iter();
-        while let Some(argument) = arguments.next() {
-            if argument == "--eta" {
-                if has_eta {
-                    return Err(CommandFailure::usage(
-                        "progress: --eta may appear only once",
-                    ));
-                }
-                has_eta = true;
-                let seconds = arguments
-                    .next()
-                    .ok_or_else(|| CommandFailure::usage("progress: --eta requires seconds"))?;
-                if seconds == "--eta" {
-                    return Err(CommandFailure::usage(
-                        "progress: --eta may appear only once",
-                    ));
-                }
-                eta = seconds
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|seconds| (1..=3600).contains(seconds))
-                    .map(|seconds| Duration::from_secs(u64::from(seconds)));
-            } else if text.replace(argument.as_str()).is_some() {
+pub(crate) fn progress(
+    context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    let mut text = None;
+    let mut eta = None;
+    let mut has_eta = false;
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--eta" {
+            if has_eta {
                 return Err(CommandFailure::usage(
-                    "progress: exactly one text operand is required; quote the text",
+                    "progress: --eta may appear only once",
                 ));
             }
-        }
-        let text = text.ok_or_else(|| {
-            CommandFailure::usage("progress: exactly one text operand is required; quote the text")
-        })?;
-        context.invoker.note(text, eta);
-        Ok(CommandResult::status(ExitCode::SUCCESS))
-    }
-}
-
-pub(crate) struct Sleep;
-
-impl Builtin for Sleep {
-    fn name(&self) -> &'static str {
-        "sleep"
-    }
-
-    fn help(&self) -> &'static str {
-        ""
-    }
-
-    fn run(
-        &self,
-        context: &mut BuiltinContext<'_>,
-        arguments: &[String],
-        _input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        let [seconds] = arguments else {
+            has_eta = true;
+            let seconds = arguments
+                .next()
+                .ok_or_else(|| CommandFailure::usage("progress: --eta requires seconds"))?;
+            if seconds == "--eta" {
+                return Err(CommandFailure::usage(
+                    "progress: --eta may appear only once",
+                ));
+            }
+            eta = seconds
+                .parse::<u32>()
+                .ok()
+                .filter(|seconds| (1..=3600).contains(seconds))
+                .map(|seconds| Duration::from_secs(u64::from(seconds)));
+        } else if text.replace(argument.as_str()).is_some() {
             return Err(CommandFailure::usage(
-                "sleep: exactly one duration in seconds is required",
-            ));
-        };
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "ParseFloatError has one meaning, \"not a float literal\", over an operand \
-                      the message quotes back in full; the range and finiteness checks that \
-                      follow are what carry the interesting rejections"
-        )]
-        let seconds = seconds.trim().parse::<f64>().map_err(|_| {
-            CommandFailure::usage(format!("sleep: {seconds:?} is not a number of seconds"))
-        })?;
-        if !seconds.is_finite() || seconds < 0.0 {
-            return Err(CommandFailure::usage(
-                "sleep: the duration must be a finite, non-negative number of seconds",
+                "progress: exactly one text operand is required; quote the text",
             ));
         }
-
-        // Sleep is capped by the remaining deadline; the fallible duration conversion is deliberate
-        // since it panics above roughly 1.8e19 seconds, and an astronomical sleep must not abort
-        // the process.
-        let requested = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX);
-        let mut left = requested;
-        loop {
-            if context.budget.tree().is_cancelled() {
-                return Err(LimitExceeded::Cancelled.into());
-            }
-            context.budget.check_deadline()?;
-            if left.is_zero() {
-                break;
-            }
-            let slice = left
-                .min(context.budget.remaining())
-                .min(Duration::from_secs(1));
-            thread::sleep(slice);
-            left = left.saturating_sub(slice);
-        }
-        Ok(CommandResult::status(ExitCode::SUCCESS))
     }
+    let text = text.ok_or_else(|| {
+        CommandFailure::usage("progress: exactly one text operand is required; quote the text")
+    })?;
+    context.invoker.note(text, eta);
+    Ok(CommandResult::status(ExitCode::SUCCESS))
 }
 
-pub(crate) struct Cat;
-
-impl Builtin for Cat {
-    fn name(&self) -> &'static str {
-        "cat"
+pub(crate) fn sleep(
+    context: &mut BuiltinContext<'_>,
+    arguments: &[String],
+    _input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    let [seconds] = arguments else {
+        return Err(CommandFailure::usage(
+            "sleep: exactly one duration in seconds is required",
+        ));
+    };
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "ParseFloatError has one meaning, \"not a float literal\", over an operand \
+                  the message quotes back in full; the range and finiteness checks that \
+                  follow are what carry the interesting rejections"
+    )]
+    let seconds = seconds.trim().parse::<f64>().map_err(|_| {
+        CommandFailure::usage(format!("sleep: {seconds:?} is not a number of seconds"))
+    })?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(CommandFailure::usage(
+            "sleep: the duration must be a finite, non-negative number of seconds",
+        ));
     }
 
-    fn help(&self) -> &'static str {
-        ""
+    // Sleep is capped by the remaining deadline; the fallible duration conversion is deliberate
+    // since it panics above roughly 1.8e19 seconds, and an astronomical sleep must not abort
+    // the process.
+    let requested = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX);
+    let mut left = requested;
+    loop {
+        if context.budget.tree().is_cancelled() {
+            return Err(LimitExceeded::Cancelled.into());
+        }
+        context.budget.check_deadline()?;
+        if left.is_zero() {
+            break;
+        }
+        let slice = left
+            .min(context.budget.remaining())
+            .min(Duration::from_secs(1));
+        thread::sleep(slice);
+        left = left.saturating_sub(slice);
     }
+    Ok(CommandResult::status(ExitCode::SUCCESS))
+}
 
-    fn copies_stdin(&self) -> bool {
-        true
-    }
-
-    fn run(
-        &self,
-        _context: &mut BuiltinContext<'_>,
-        _arguments: &[String],
-        input: Option<Value>,
-    ) -> Result<CommandResult, CommandFailure> {
-        Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline())
-    }
+pub(crate) fn cat(
+    _context: &mut BuiltinContext<'_>,
+    _arguments: &[String],
+    input: Option<Value>,
+) -> Result<CommandResult, CommandFailure> {
+    Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline())
 }
 
 #[cfg(test)]
@@ -503,7 +382,10 @@ mod tests {
     };
     use dekopon_process::Limits;
 
-    use super::{Cat, Echo, False, Printf, Progress, Sleep, Test, TestBracket, True};
+    use super::{
+        cat as Cat, echo as Echo, fail as False, printf as Printf, progress as Progress,
+        sleep as Sleep, succeed as True, test as Test, test_bracket as TestBracket,
+    };
 
     #[derive(Default)]
     struct Notes(Mutex<Vec<(String, Option<Duration>)>>);
@@ -534,7 +416,7 @@ mod tests {
             vec![" <@rendering> ", "--eta", "40"],
             vec!["--eta", "40", " <@rendering> "],
         ] {
-            let result = run_builtin_with_invoker(&Progress, &arguments, &notes).unwrap();
+            let result = run_builtin_with_invoker(Progress, &arguments, &notes).unwrap();
             assert_eq!(result.status, ExitCode::SUCCESS);
             assert_eq!(result.value, Value::Null);
         }
@@ -549,7 +431,7 @@ mod tests {
         let notes = Notes::default();
         for seconds in ["0", "3601", "-5", "4.5", "soon"] {
             let result =
-                run_builtin_with_invoker(&Progress, &["x", "--eta", seconds], &notes).unwrap();
+                run_builtin_with_invoker(Progress, &["x", "--eta", seconds], &notes).unwrap();
             assert_eq!(result.status, ExitCode::SUCCESS);
         }
         assert_eq!(*notes.0.lock(), vec![("x".to_owned(), None); 5]);
@@ -566,7 +448,7 @@ mod tests {
             vec!["--eta", "1", "x", "--eta", "2"],
         ] {
             assert!(matches!(
-                run_builtin_with_invoker(&Progress, &arguments, &notes),
+                run_builtin_with_invoker(Progress, &arguments, &notes),
                 Err(CommandFailure::Status {
                     status: ExitCode::SYNTAX,
                     ..
@@ -588,11 +470,11 @@ mod tests {
 
     #[test]
     fn echo_joins_arguments_with_spaces() {
-        let result = run_builtin(&Echo, &["a", "b"], None).expect("echo runs");
+        let result = run_builtin(Echo, &["a", "b"], None).expect("echo runs");
         assert_eq!(result.value, json!("a b"));
         assert!(!result.suppress_newline);
         assert!(
-            run_builtin(&Echo, &["-n", "a"], None)
+            run_builtin(Echo, &["-n", "a"], None)
                 .expect("echo runs")
                 .suppress_newline
         );
@@ -601,22 +483,22 @@ mod tests {
     #[test]
     fn echo_consumes_its_flag_bundles_instead_of_printing_them() {
         assert_eq!(
-            run_builtin(&Echo, &["-e", "a\\nb"], None)
+            run_builtin(Echo, &["-e", "a\\nb"], None)
                 .expect("echo runs")
                 .value,
             json!("a\nb")
         );
         assert_eq!(
-            run_builtin(&Echo, &["-E", "a\\nb"], None)
+            run_builtin(Echo, &["-E", "a\\nb"], None)
                 .expect("echo runs")
                 .value,
             json!("a\\nb")
         );
-        let bundled = run_builtin(&Echo, &["-ne", "a\\tb"], None).expect("echo runs");
+        let bundled = run_builtin(Echo, &["-ne", "a\\tb"], None).expect("echo runs");
         assert_eq!(bundled.value, json!("a\tb"));
         assert!(bundled.suppress_newline);
         assert_eq!(
-            run_builtin(&Echo, &["-x", "a"], None)
+            run_builtin(Echo, &["-x", "a"], None)
                 .expect("echo runs")
                 .value,
             json!("-x a")
@@ -626,30 +508,30 @@ mod tests {
     #[test]
     fn printf_renders_the_curated_conversions() {
         assert_eq!(
-            run_builtin(&Printf, &["%s=%d\\n", "count", "7"], None)
+            run_builtin(Printf, &["%s=%d\\n", "count", "7"], None)
                 .expect("printf runs")
                 .value,
             json!("count=7\n")
         );
         assert_eq!(
-            run_builtin(&Printf, &["%f", "1.5"], None)
+            run_builtin(Printf, &["%f", "1.5"], None)
                 .expect("printf runs")
                 .value,
             json!("1.500000")
         );
         assert_eq!(
-            run_builtin(&Printf, &["100%%"], None)
+            run_builtin(Printf, &["100%%"], None)
                 .expect("printf runs")
                 .value,
             json!("100%")
         );
-        assert!(run_builtin(&Printf, &["%q", "x"], None).is_err());
+        assert!(run_builtin(Printf, &["%q", "x"], None).is_err());
     }
 
     #[test]
     fn test_evaluates_string_and_numeric_comparisons() {
         let status = |arguments: &[&str]| {
-            run_builtin(&Test, arguments, None)
+            run_builtin(Test, arguments, None)
                 .expect("test runs")
                 .status
         };
@@ -665,7 +547,7 @@ mod tests {
     #[test]
     fn stacked_negations_are_counted_not_recursed() {
         let status = |arguments: &[&str]| {
-            run_builtin(&Test, arguments, None)
+            run_builtin(Test, arguments, None)
                 .expect("test runs")
                 .status
         };
@@ -681,17 +563,17 @@ mod tests {
     #[test]
     fn bracket_requires_its_closing_bracket() {
         assert_eq!(
-            run_builtin(&TestBracket, &["a", "=", "a", "]"], None)
+            run_builtin(TestBracket, &["a", "=", "a", "]"], None)
                 .expect("[ runs")
                 .status,
             ExitCode::SUCCESS
         );
-        assert!(run_builtin(&TestBracket, &["a", "=", "a"], None).is_err());
+        assert!(run_builtin(TestBracket, &["a", "=", "a"], None).is_err());
     }
 
     #[test]
     fn file_tests_are_rejected_because_there_is_no_filesystem() {
-        let failure = run_builtin(&Test, &["-f", "/etc/passwd"], None)
+        let failure = run_builtin(Test, &["-f", "/etc/passwd"], None)
             .expect_err("file tests are not supported");
         let CommandFailure::Status { message, .. } = failure else {
             panic!("a file test must stay recoverable");
@@ -702,11 +584,11 @@ mod tests {
     #[test]
     fn true_and_false_carry_their_conventional_statuses() {
         assert_eq!(
-            run_builtin(&True, &[], None).expect("true runs").status,
+            run_builtin(True, &[], None).expect("true runs").status,
             ExitCode::SUCCESS
         );
         assert_eq!(
-            run_builtin(&False, &[], None).expect("false runs").status,
+            run_builtin(False, &[], None).expect("false runs").status,
             ExitCode::FAILURE
         );
     }
@@ -718,7 +600,7 @@ mod tests {
             ..Limits::default()
         };
         let started = std::time::Instant::now();
-        let failure = run_builtin_with(&Sleep, &["30"], None, limits)
+        let failure = run_builtin_with(Sleep, &["30"], None, limits)
             .expect_err("an oversized sleep trips the deadline");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -729,9 +611,9 @@ mod tests {
 
     #[test]
     fn sleep_rejects_malformed_durations() {
-        assert!(run_builtin(&Sleep, &["soon"], None).is_err());
-        assert!(run_builtin(&Sleep, &["-1"], None).is_err());
-        assert!(run_builtin(&Sleep, &[], None).is_err());
+        assert!(run_builtin(Sleep, &["soon"], None).is_err());
+        assert!(run_builtin(Sleep, &["-1"], None).is_err());
+        assert!(run_builtin(Sleep, &[], None).is_err());
     }
 
     #[test]
@@ -742,7 +624,7 @@ mod tests {
         };
         for duration in ["1e30", "99999999999999999999", "1e300"] {
             let started = std::time::Instant::now();
-            let failure = run_builtin_with(&Sleep, &[duration], None, limits)
+            let failure = run_builtin_with(Sleep, &[duration], None, limits)
                 .expect_err("an oversized sleep trips the deadline");
             assert!(matches!(failure, CommandFailure::Fatal(_)), "{duration}");
             assert!(started.elapsed() < Duration::from_secs(5), "{duration}");
@@ -752,7 +634,7 @@ mod tests {
     #[test]
     fn cat_without_arguments_preserves_input() {
         let result =
-            run_builtin_with(&Cat, &[], Some(json!("hi")), Limits::default()).expect("cat runs");
+            run_builtin_with(Cat, &[], Some(json!("hi")), Limits::default()).expect("cat runs");
         assert_eq!(result.value, json!("hi"));
     }
 }

@@ -12,10 +12,14 @@ use crate::{
 use dekopon_process::pipe::{PipeReader, ReadOutcome};
 use dekopon_process::{ExitCode, RetainedBytes};
 
-#[derive(Clone, Copy)]
-pub(crate) enum TextStream {
-    Grep,
-    Sed,
+pub(crate) fn grep(arguments: &[String]) -> Result<(Operation, Option<String>), CommandFailure> {
+    GrepConfig::parse(arguments).map(|(config, input)| (Operation::Grep(config), input))
+}
+pub(crate) fn sed(arguments: &[String]) -> Result<(Operation, Option<String>), CommandFailure> {
+    Ok((
+        Operation::Sed(super::sed::parse_arguments(arguments)?),
+        None,
+    ))
 }
 
 pub(crate) enum Operation {
@@ -32,114 +36,70 @@ struct LineProgress {
     before: std::collections::VecDeque<(usize, Vec<u8>, Vec<RetainedBytes>)>,
 }
 
-impl TextStream {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Grep => "grep",
-            Self::Sed => "sed",
-        }
-    }
+pub(crate) fn run_parsed(
+    operation: Operation,
+    reader: &mut PipeReader<StageObservation>,
+    budget: &mut Budget,
 
-    pub(crate) fn help(self) -> &'static str {
-        match self {
-            Self::Grep => "-v -i -c -n -E -q -A N -B N -C N",
-            Self::Sed => "-e -E",
-        }
-    }
-
-    pub(crate) fn parse(
-        self,
-        arguments: &[String],
-    ) -> Result<(Operation, Option<String>), CommandFailure> {
-        match self {
-            Self::Grep => {
-                GrepConfig::parse(arguments).map(|(config, input)| (Operation::Grep(config), input))
-            }
-            Self::Sed => Ok((
-                Operation::Sed(super::sed::parse_arguments(arguments)?),
-                None,
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn run(
-        self,
-        arguments: &[String],
-        reader: &mut PipeReader<StageObservation>,
-        budget: &mut Budget,
-
-        emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
-    ) -> Result<ExitCode, CommandFailure> {
-        self.run_parsed(self.parse(arguments)?.0, reader, budget, emit)
-    }
-
-    pub(crate) fn run_parsed(
-        self,
-        operation: Operation,
-        reader: &mut PipeReader<StageObservation>,
-        budget: &mut Budget,
-
-        mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
-    ) -> Result<ExitCode, CommandFailure> {
-        let mut pending = Vec::new();
-        let mut charges: Vec<RetainedBytes> = Vec::new();
-        let mut progress = LineProgress::default();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
-            budget.charge_step()?;
-            let mut rest = chunk.as_slice();
-            while !rest.is_empty() {
-                let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
-                let part = &rest[..end.unwrap_or(rest.len())];
-                charges.push(budget.charge_value_bytes(part.len() as u64)?);
-                pending.extend_from_slice(part);
-                rest = &rest[part.len()..];
-                if end.is_some() {
-                    progress.index += 1;
-                    if !process_line(
-                        &operation,
-                        (&pending, &mut charges),
-                        &mut progress,
-                        budget,
-                        &mut emit,
-                    )? {
-                        return Ok(ExitCode::SUCCESS);
-                    }
-                    pending.clear();
-                    charges.clear();
-                }
-            }
-        }
-        if !pending.is_empty() {
-            progress.index += 1;
-            if !process_line(
-                &operation,
-                (&pending, &mut charges),
-                &mut progress,
-                budget,
-                &mut emit,
-            )? {
-                return Ok(ExitCode::SUCCESS);
-            }
-        }
-        if let Operation::Grep(config) = &operation {
-            if let GrepMode::Count = config.mode
-                && !super::sed::emit_chunks(
-                    format!("{}\n", progress.matches).as_bytes(),
+    mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<ExitCode, CommandFailure> {
+    let mut pending = Vec::new();
+    let mut charges: Vec<RetainedBytes> = Vec::new();
+    let mut progress = LineProgress::default();
+    while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
+        budget.charge_step()?;
+        let mut rest = chunk.as_slice();
+        while !rest.is_empty() {
+            let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
+            let part = &rest[..end.unwrap_or(rest.len())];
+            charges.push(budget.charge_value_bytes(part.len() as u64)?);
+            pending.extend_from_slice(part);
+            rest = &rest[part.len()..];
+            if end.is_some() {
+                progress.index += 1;
+                if !process_line(
+                    &operation,
+                    (&pending, &mut charges),
+                    &mut progress,
                     budget,
                     &mut emit,
-                )?
-            {
-                return Ok(ExitCode::SUCCESS);
+                )? {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                pending.clear();
+                charges.clear();
             }
-            return Ok(if progress.matches == 0 {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            });
         }
-        Ok(ExitCode::SUCCESS)
     }
+    if !pending.is_empty() {
+        progress.index += 1;
+        if !process_line(
+            &operation,
+            (&pending, &mut charges),
+            &mut progress,
+            budget,
+            &mut emit,
+        )? {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    if let Operation::Grep(config) = &operation {
+        if let GrepMode::Count = config.mode
+            && !super::sed::emit_chunks(
+                format!("{}\n", progress.matches).as_bytes(),
+                budget,
+                &mut emit,
+            )?
+        {
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Ok(if progress.matches == 0 {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn process_line(
@@ -250,8 +210,11 @@ fn emit_grep(
 }
 
 #[cfg(test)]
+use crate::builtins::Builtin;
+
+#[cfg(test)]
 pub(crate) fn run_test(
-    command: TextStream,
+    command: Builtin,
     arguments: &[&str],
     input: serde_json::Value,
 ) -> Result<crate::builtins::CommandResult, CommandFailure> {
@@ -266,18 +229,18 @@ pub(crate) fn run_test(
     let mut reader = PipeReader::from_bytes(bytes, None, crate::interp::telemetry::stage_read);
     let mut budget = Budget::start(Limits::default());
     let mut output = Vec::new();
-    let operation = command.parse(
+    let operation = command.parse_text(
         &arguments
             .iter()
             .map(|arg| (*arg).to_owned())
             .collect::<Vec<_>>(),
     )?;
-    let status = command.run_parsed(operation.0, &mut reader, &mut budget, |bytes| {
+    let status = run_parsed(operation.0, &mut reader, &mut budget, |bytes| {
         output.extend_from_slice(bytes);
         Ok(true)
     })?;
     let output = String::from_utf8(output).expect("text stream emits UTF-8");
-    let mut result = if matches!(command, TextStream::Grep) && arguments.contains(&"-c") {
+    let mut result = if command == Builtin::Grep && arguments.contains(&"-c") {
         CommandResult::value(serde_json::Value::from(
             output.trim().parse::<usize>().expect("grep count"),
         ))
@@ -305,8 +268,8 @@ mod tests {
             max_value_bytes: 5,
             ..Limits::default()
         });
-        let error = TextStream::Sed
-            .run(&arguments, &mut reader, &mut budget, |_| Ok(true))
+        let error = Builtin::Sed
+            .run_text(&arguments, &mut reader, &mut budget, |_| Ok(true))
             .expect_err("folded scratch exceeds retention after pending input");
         assert!(matches!(
             error,
@@ -321,8 +284,8 @@ mod tests {
             ..Limits::default()
         });
         let mut output = Vec::new();
-        let status = TextStream::Sed
-            .run(&arguments, &mut reader, &mut budget, |chunk| {
+        let status = Builtin::Sed
+            .run_text(&arguments, &mut reader, &mut budget, |chunk| {
                 output.extend_from_slice(chunk);
                 Ok(true)
             })
@@ -333,13 +296,35 @@ mod tests {
 
     #[test]
     fn a_text_builtin_notices_cancellation_between_fixed_input_chunks() {
-        for command in [TextStream::Grep, TextStream::Sed] {
+        for command in [Builtin::Grep, Builtin::Sed] {
             let args = match command {
-                TextStream::Grep => vec!["x".to_owned()],
-                TextStream::Sed => vec!["s/x/y/".to_owned()],
+                Builtin::Grep => vec!["x".to_owned()],
+                Builtin::Sed => vec!["s/x/y/".to_owned()],
+                Builtin::Echo
+                | Builtin::Printf
+                | Builtin::Test
+                | Builtin::TestBracket
+                | Builtin::True
+                | Builtin::False
+                | Builtin::Progress
+                | Builtin::Sleep
+                | Builtin::Cat
+                | Builtin::Jobs
+                | Builtin::Wait
+                | Builtin::Kill
+                | Builtin::Cap
+                | Builtin::Head
+                | Builtin::Tail
+                | Builtin::Cut
+                | Builtin::Uniq
+                | Builtin::Wc
+                | Builtin::Sort
+                | Builtin::Jq
+                | Builtin::Base64
+                | Builtin::Xargs => panic!("not a grep/sed test"),
             };
             let error = crate::builtins::test_support::cancel_after_first_step(|reader, budget| {
-                command.run(&args, reader, budget, |_| Ok(true))
+                command.run_text(&args, reader, budget, |_| Ok(true))
             })
             .expect_err("a later charge notices cancellation");
             assert!(matches!(
@@ -356,8 +341,8 @@ mod tests {
         let mut reader = PipeReader::from_bytes(input, None, crate::interp::telemetry::stage_read);
         let mut budget = Budget::start(Limits::default());
         let mut output = Vec::new();
-        let status = TextStream::Grep
-            .run(
+        let status = Builtin::Grep
+            .run_text(
                 &["-nB1".to_owned(), "-A1".to_owned(), "P".to_owned()],
                 &mut reader,
                 &mut budget,
@@ -393,8 +378,8 @@ mod tests {
             max_value_bytes: 7,
             ..Limits::default()
         });
-        let status = TextStream::Grep
-            .run(
+        let status = Builtin::Grep
+            .run_text(
                 &["-q".to_owned(), "-B2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
@@ -415,8 +400,8 @@ mod tests {
             max_value_bytes: 7,
             ..Limits::default()
         });
-        let failure = TextStream::Grep
-            .run(
+        let failure = Builtin::Grep
+            .run_text(
                 &["-B2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
@@ -441,8 +426,8 @@ mod tests {
             ..Limits::default()
         });
         let mut emitted = Vec::new();
-        let failure = TextStream::Grep
-            .run(
+        let failure = Builtin::Grep
+            .run_text(
                 &["-A2".to_owned(), "match".to_owned()],
                 &mut reader,
                 &mut budget,
@@ -475,8 +460,8 @@ mod tests {
             ..Limits::default()
         });
         let mut total = 0;
-        let status = TextStream::Sed
-            .run(&[script], &mut reader, &mut budget, |bytes| {
+        let status = Builtin::Sed
+            .run_text(&[script], &mut reader, &mut budget, |bytes| {
                 assert!(bytes.len() <= pipe::CHUNK_BYTES);
                 total += bytes.len();
                 Ok(true)
@@ -498,7 +483,7 @@ mod tests {
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 let mut budget = Budget::start(Limits::default());
-                TextStream::Grep.run(&["x".to_owned()], &mut reader, &mut budget, |bytes| {
+                Builtin::Grep.run_text(&["x".to_owned()], &mut reader, &mut budget, |bytes| {
                     sent.send(bytes.to_vec()).expect("the consumer is alive");
                     Ok(true)
                 })
@@ -526,10 +511,32 @@ mod tests {
 
     #[test]
     fn text_builtins_release_completed_lines_before_reading_more() {
-        for command in [TextStream::Grep, TextStream::Sed] {
+        for command in [Builtin::Grep, Builtin::Sed] {
             let args = match command {
-                TextStream::Grep => vec!["x".to_owned()],
-                TextStream::Sed => vec!["s/x/y/".to_owned()],
+                Builtin::Grep => vec!["x".to_owned()],
+                Builtin::Sed => vec!["s/x/y/".to_owned()],
+                Builtin::Echo
+                | Builtin::Printf
+                | Builtin::Test
+                | Builtin::TestBracket
+                | Builtin::True
+                | Builtin::False
+                | Builtin::Progress
+                | Builtin::Sleep
+                | Builtin::Cat
+                | Builtin::Jobs
+                | Builtin::Wait
+                | Builtin::Kill
+                | Builtin::Cap
+                | Builtin::Head
+                | Builtin::Tail
+                | Builtin::Cut
+                | Builtin::Uniq
+                | Builtin::Wc
+                | Builtin::Sort
+                | Builtin::Jq
+                | Builtin::Base64
+                | Builtin::Xargs => panic!("not a grep/sed test"),
             };
             let mut reader = PipeReader::from_bytes(
                 b"x\nx\nx\nx\nx\n".to_vec(),
@@ -542,7 +549,7 @@ mod tests {
             });
             let mut output = Vec::new();
             let status = command
-                .run(&args, &mut reader, &mut budget, |bytes| {
+                .run_text(&args, &mut reader, &mut budget, |bytes| {
                     output.extend_from_slice(bytes);
                     Ok(true)
                 })
@@ -554,10 +561,32 @@ mod tests {
 
     #[test]
     fn text_builtins_charge_each_chunk_and_observe_cancel() {
-        for command in [TextStream::Grep, TextStream::Sed] {
+        for command in [Builtin::Grep, Builtin::Sed] {
             let args = match command {
-                TextStream::Grep => vec!["x".to_owned()],
-                TextStream::Sed => vec!["s/x/y/".to_owned()],
+                Builtin::Grep => vec!["x".to_owned()],
+                Builtin::Sed => vec!["s/x/y/".to_owned()],
+                Builtin::Echo
+                | Builtin::Printf
+                | Builtin::Test
+                | Builtin::TestBracket
+                | Builtin::True
+                | Builtin::False
+                | Builtin::Progress
+                | Builtin::Sleep
+                | Builtin::Cat
+                | Builtin::Jobs
+                | Builtin::Wait
+                | Builtin::Kill
+                | Builtin::Cap
+                | Builtin::Head
+                | Builtin::Tail
+                | Builtin::Cut
+                | Builtin::Uniq
+                | Builtin::Wc
+                | Builtin::Sort
+                | Builtin::Jq
+                | Builtin::Base64
+                | Builtin::Xargs => panic!("not a grep/sed test"),
             };
             let (mut writer, mut reader) = pipe::pipe(
                 None,
@@ -574,7 +603,7 @@ mod tests {
                 ..Limits::default()
             });
             let error = command
-                .run(&args, &mut reader, &mut budget, |_| Ok(true))
+                .run_text(&args, &mut reader, &mut budget, |_| Ok(true))
                 .expect_err("the third chunk exceeds the budget");
             assert!(matches!(
                 error,
@@ -594,7 +623,7 @@ mod tests {
             );
             handle.cancel();
             let error = command
-                .run(&args, &mut reader, &mut budget, |_| Ok(true))
+                .run_text(&args, &mut reader, &mut budget, |_| Ok(true))
                 .expect_err("cancel is checked for each chunk");
             assert!(matches!(
                 error,

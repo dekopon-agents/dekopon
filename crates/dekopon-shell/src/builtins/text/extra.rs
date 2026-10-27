@@ -12,90 +12,53 @@ use crate::{
 
 use super::cut::Selection;
 
-#[derive(Clone, Copy)]
-pub(crate) enum ExtraStream {
-    Cut,
-    Uniq,
-    Wc,
-    Sort,
-}
+pub(crate) fn run_parsed(
+    operation: Operation,
+    reader: &mut PipeReader<StageObservation>,
+    budget: &mut Budget,
 
-impl ExtraStream {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Cut => "cut",
-            Self::Uniq => "uniq",
-            Self::Wc => "wc",
-            Self::Sort => "sort",
+    mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+) -> Result<ExitCode, CommandFailure> {
+    let count_chunks = match &operation {
+        Operation::Wc { .. } => true,
+        Operation::Cut { .. } | Operation::Uniq { .. } | Operation::Sort { .. } => false,
+    };
+    let mut state = State::new(operation);
+    if count_chunks {
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
+            budget.charge_step()?;
+            state.count_chunk(&chunk)?;
         }
-    }
-
-    pub(crate) fn help(self) -> &'static str {
-        match self {
-            Self::Cut => "-d -f -c",
-            Self::Uniq => "-c -d -u",
-            Self::Wc => "-l -w -c",
-            Self::Sort => "-r -n -u",
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn run(
-        self,
-        arguments: &[String],
-        reader: &mut PipeReader<StageObservation>,
-        budget: &mut Budget,
-
-        emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
-    ) -> Result<ExitCode, CommandFailure> {
-        self.run_parsed(Operation::parse(self, arguments)?.0, reader, budget, emit)
-    }
-
-    pub(crate) fn run_parsed(
-        self,
-        operation: Operation,
-        reader: &mut PipeReader<StageObservation>,
-        budget: &mut Budget,
-
-        mut emit: impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
-    ) -> Result<ExitCode, CommandFailure> {
-        let mut state = State::new(operation);
-        if matches!(self, Self::Wc) {
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
-                budget.charge_step()?;
-                state.count_chunk(&chunk)?;
-            }
-        } else {
-            let mut pending = Vec::new();
-            let mut charges = Vec::new();
-            while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
-                budget.charge_step()?;
-                let mut rest = chunk.as_slice();
-                while !rest.is_empty() {
-                    let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
-                    let part = &rest[..end.unwrap_or(rest.len())];
-                    charges.push(budget.charge_value_bytes(part.len() as u64)?);
-                    pending.extend_from_slice(part);
-                    rest = &rest[part.len()..];
-                    if end.is_some()
-                        && !state.line(
-                            std::mem::take(&mut pending),
-                            std::mem::take(&mut charges),
-                            budget,
-                            &mut emit,
-                        )?
-                    {
-                        return Ok(ExitCode::SUCCESS);
-                    }
+    } else {
+        let mut pending = Vec::new();
+        let mut charges = Vec::new();
+        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
+            budget.charge_step()?;
+            let mut rest = chunk.as_slice();
+            while !rest.is_empty() {
+                let end = rest.iter().position(|byte| *byte == b'\n').map(|at| at + 1);
+                let part = &rest[..end.unwrap_or(rest.len())];
+                charges.push(budget.charge_value_bytes(part.len() as u64)?);
+                pending.extend_from_slice(part);
+                rest = &rest[part.len()..];
+                if end.is_some()
+                    && !state.line(
+                        std::mem::take(&mut pending),
+                        std::mem::take(&mut charges),
+                        budget,
+                        &mut emit,
+                    )?
+                {
+                    return Ok(ExitCode::SUCCESS);
                 }
             }
-            if !pending.is_empty() {
-                state.line(pending, charges, budget, &mut emit)?;
-            }
         }
-        state.finish(budget, &mut emit)?;
-        Ok(ExitCode::SUCCESS)
+        if !pending.is_empty() {
+            state.line(pending, charges, budget, &mut emit)?;
+        }
     }
+    state.finish(budget, &mut emit)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 pub(crate) enum Operation {
@@ -125,117 +88,138 @@ pub(crate) enum CutMode {
     Characters(Selection),
 }
 
-impl Operation {
-    pub(crate) fn parse(
-        command: ExtraStream,
-        args: &[String],
-    ) -> Result<(Self, Option<String>), CommandFailure> {
-        let flags: &[(&str, char, &str, bool)] = match command {
-            ExtraStream::Cut => &[
-                ("delimiter", 'd', "delimiter", true),
-                ("fields", 'f', "fields", true),
-                ("characters", 'c', "characters", true),
-            ],
-            ExtraStream::Uniq => &[
-                ("count", 'c', "count", false),
-                ("duplicates", 'd', "repeated", false),
-                ("unique", 'u', "unique", false),
-            ],
-            ExtraStream::Wc => &[
-                ("lines", 'l', "lines", false),
-                ("words", 'w', "words", false),
-                ("bytes", 'c', "bytes", false),
-            ],
-            ExtraStream::Sort => &[
-                ("reverse", 'r', "reverse", false),
-                ("numeric", 'n', "numeric-sort", false),
-                ("unique", 'u', "unique", false),
-            ],
+pub(crate) fn cut(args: &[String]) -> Result<(Operation, Option<String>), CommandFailure> {
+    let matches = flags(
+        crate::builtins::Builtin::Cut,
+        args,
+        &[
+            ("delimiter", 'd', "delimiter", true),
+            ("fields", 'f', "fields", true),
+            ("characters", 'c', "characters", true),
+        ],
+    )?;
+    let value = |id| matches.get_one::<String>(id).map(String::as_str);
+    let operation = {
+        let delimiter = match value("delimiter") {
+            None => '\t',
+            Some(text) => {
+                let mut chars = text.chars();
+                let ch = chars
+                    .next()
+                    .ok_or_else(|| CommandFailure::usage("cut: -d requires a delimiter"))?;
+                if chars.next().is_some() {
+                    return Err(CommandFailure::usage(
+                        "cut: -d accepts exactly one delimiter character",
+                    ));
+                }
+                ch
+            }
         };
-        let mut grammar = Command::new(command.name());
-        for &(id, short, long, value) in flags {
-            let mut arg = Arg::new(id).short(short).long(long);
-            arg = if value {
-                arg.num_args(1).allow_hyphen_values(true)
-            } else {
-                arg.action(ArgAction::SetTrue)
-            };
-            grammar = grammar.arg(arg);
+        let fields = value("fields")
+            .map(|v| Selection::parse("cut", v))
+            .transpose()?;
+        let characters = value("characters")
+            .map(|v| Selection::parse("cut", v))
+            .transpose()?;
+        let mode = match (fields, characters) {
+            (Some(_), Some(_)) => {
+                return Err(CommandFailure::usage(
+                    "cut: -f and -c are mutually exclusive",
+                ));
+            }
+            (Some(fields), None) => CutMode::Fields(fields),
+            (None, Some(characters)) => CutMode::Characters(characters),
+            (None, None) => {
+                return Err(CommandFailure::usage("cut: -f or -c is required"));
+            }
+        };
+        Operation::Cut { delimiter, mode }
+    };
+    Ok((operation, matches.get_one::<String>("input").cloned()))
+}
+pub(crate) fn uniq(args: &[String]) -> Result<(Operation, Option<String>), CommandFailure> {
+    let matches = flags(
+        crate::builtins::Builtin::Uniq,
+        args,
+        &[
+            ("count", 'c', "count", false),
+            ("duplicates", 'd', "repeated", false),
+            ("unique", 'u', "unique", false),
+        ],
+    )?;
+    let flag = |id| matches.get_flag(id);
+    let operation = {
+        let (count, duplicates, unique) = (flag("count"), flag("duplicates"), flag("unique"));
+        if duplicates && unique {
+            return Err(CommandFailure::usage(
+                "uniq: -d and -u are mutually exclusive",
+            ));
         }
-        let matches = parse_flags(
-            grammar.arg(Arg::new("input")),
-            args,
-            command.name(),
-            command.help(),
-        )?;
-        let value = |id| matches.get_one::<String>(id).map(String::as_str);
-        let flag = |id| matches.get_flag(id);
-        Ok((
-            match command {
-                ExtraStream::Cut => {
-                    let delimiter = match value("delimiter") {
-                        None => '\t',
-                        Some(text) => {
-                            let mut chars = text.chars();
-                            let ch = chars.next().ok_or_else(|| {
-                                CommandFailure::usage("cut: -d requires a delimiter")
-                            })?;
-                            if chars.next().is_some() {
-                                return Err(CommandFailure::usage(
-                                    "cut: -d accepts exactly one delimiter character",
-                                ));
-                            }
-                            ch
-                        }
-                    };
-                    let fields = value("fields")
-                        .map(|v| Selection::parse("cut", v))
-                        .transpose()?;
-                    let characters = value("characters")
-                        .map(|v| Selection::parse("cut", v))
-                        .transpose()?;
-                    let mode = match (fields, characters) {
-                        (Some(_), Some(_)) => {
-                            return Err(CommandFailure::usage(
-                                "cut: -f and -c are mutually exclusive",
-                            ));
-                        }
-                        (Some(fields), None) => CutMode::Fields(fields),
-                        (None, Some(characters)) => CutMode::Characters(characters),
-                        (None, None) => {
-                            return Err(CommandFailure::usage("cut: -f or -c is required"));
-                        }
-                    };
-                    Self::Cut { delimiter, mode }
-                }
-                ExtraStream::Uniq => {
-                    let (count, duplicates, unique) =
-                        (flag("count"), flag("duplicates"), flag("unique"));
-                    if duplicates && unique {
-                        return Err(CommandFailure::usage(
-                            "uniq: -d and -u are mutually exclusive",
-                        ));
-                    }
-                    Self::Uniq {
-                        count,
-                        duplicates,
-                        unique,
-                    }
-                }
-                ExtraStream::Wc => Self::Wc {
-                    lines: flag("lines"),
-                    words: flag("words"),
-                    bytes: flag("bytes"),
-                },
-                ExtraStream::Sort => Self::Sort {
-                    reverse: flag("reverse"),
-                    numeric: flag("numeric"),
-                    unique: flag("unique"),
-                },
-            },
-            matches.get_one::<String>("input").cloned(),
-        ))
+        Operation::Uniq {
+            count,
+            duplicates,
+            unique,
+        }
+    };
+    Ok((operation, matches.get_one::<String>("input").cloned()))
+}
+pub(crate) fn wc(args: &[String]) -> Result<(Operation, Option<String>), CommandFailure> {
+    let matches = flags(
+        crate::builtins::Builtin::Wc,
+        args,
+        &[
+            ("lines", 'l', "lines", false),
+            ("words", 'w', "words", false),
+            ("bytes", 'c', "bytes", false),
+        ],
+    )?;
+    let flag = |id| matches.get_flag(id);
+    let operation = Operation::Wc {
+        lines: flag("lines"),
+        words: flag("words"),
+        bytes: flag("bytes"),
+    };
+    Ok((operation, matches.get_one::<String>("input").cloned()))
+}
+pub(crate) fn sort(args: &[String]) -> Result<(Operation, Option<String>), CommandFailure> {
+    let matches = flags(
+        crate::builtins::Builtin::Sort,
+        args,
+        &[
+            ("reverse", 'r', "reverse", false),
+            ("numeric", 'n', "numeric-sort", false),
+            ("unique", 'u', "unique", false),
+        ],
+    )?;
+    let flag = |id| matches.get_flag(id);
+    let operation = Operation::Sort {
+        reverse: flag("reverse"),
+        numeric: flag("numeric"),
+        unique: flag("unique"),
+    };
+    Ok((operation, matches.get_one::<String>("input").cloned()))
+}
+fn flags(
+    command: crate::builtins::Builtin,
+    args: &[String],
+    options: &[(&'static str, char, &'static str, bool)],
+) -> Result<clap::ArgMatches, CommandFailure> {
+    let mut grammar = Command::new(command.name());
+    for &(id, short, long, value) in options {
+        let mut arg = Arg::new(id).short(short).long(long);
+        arg = if value {
+            arg.num_args(1).allow_hyphen_values(true)
+        } else {
+            arg.action(ArgAction::SetTrue)
+        };
+        grammar = grammar.arg(arg);
     }
+    parse_flags(
+        grammar.arg(Arg::new("input")),
+        args,
+        command.name(),
+        command.help(),
+    )
 }
 
 struct State {

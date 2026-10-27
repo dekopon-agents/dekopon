@@ -28,9 +28,9 @@ use crate::{
         SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
     builtins::{
-        self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs,
+        self, Builtin, BuiltinContext, CommandFailure, CommandResult, ControlWord, FatalError,
+        Resolution, xargs,
     },
-    dispatch::{self, Resolution},
     job::ScriptJobs,
     limits::{Budget, OutputBuffer},
     parser::{expanded_pattern, parse, pattern_metacharacter},
@@ -80,56 +80,137 @@ enum StageInput {
     Piped(PipeReader<StageObservation>),
 }
 
-enum SimpleBuiltinMode {
+enum BuiltinMode {
     Help,
     Run { capture_output: bool },
 }
 
-enum StreamCommand {
-    Lines(builtins::text::lines::LineCommand),
-    Text(builtins::text::stream::TextStream),
-    Extra(builtins::text::extra::ExtraStream),
-    Jq,
-}
-
 enum ParsedStream {
-    Lines(
-        builtins::text::lines::LineCommand,
-        builtins::text::lines::Selection,
-    ),
-    Text(
-        builtins::text::stream::TextStream,
-        builtins::text::stream::Operation,
-    ),
-    Extra(
-        builtins::text::extra::ExtraStream,
-        builtins::text::extra::Operation,
-    ),
+    Lines(builtins::text::lines::Selection),
+    Text(builtins::text::stream::Operation),
+    Extra(builtins::text::extra::Operation),
     Jq(builtins::jq::Options),
 }
 
-impl StreamCommand {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Lines(cmd) => cmd.name(),
-            Self::Text(cmd) => cmd.name(),
-            Self::Extra(cmd) => cmd.name(),
-            Self::Jq => "jq",
-        }
-    }
-
-    fn parse(self, arguments: &[String]) -> Result<(ParsedStream, Option<String>), CommandFailure> {
-        match self {
-            Self::Lines(cmd) => cmd
-                .selection(arguments)
-                .map(|(args, input)| (ParsedStream::Lines(cmd, args), input)),
-            Self::Text(cmd) => cmd
-                .parse(arguments)
-                .map(|(args, input)| (ParsedStream::Text(cmd, args), input)),
-            Self::Extra(cmd) => builtins::text::extra::Operation::parse(cmd, arguments)
-                .map(|(args, input)| (ParsedStream::Extra(cmd, args), input)),
-            Self::Jq => builtins::jq::options(arguments).map(|args| (ParsedStream::Jq(args), None)),
-        }
+impl Builtin {
+    fn run(
+        self,
+        evaluator: &mut Evaluator<'_>,
+        arguments: &[String],
+        input: StageInput,
+        mode: BuiltinMode,
+        stdout_sink: &Sink,
+    ) -> Result<Executed, FatalError> {
+        let capture_output = match mode {
+            BuiltinMode::Help => {
+                return Ok(Executed::Result(builtins::help_result(
+                    self.name(),
+                    self.help(),
+                )));
+            }
+            BuiltinMode::Run { capture_output } => capture_output,
+        };
+        let run: builtins::Run = match self {
+            Self::Echo => builtins::misc::echo,
+            Self::Printf => builtins::misc::printf,
+            Self::Test => builtins::misc::test,
+            Self::TestBracket => builtins::misc::test_bracket,
+            Self::True => builtins::misc::succeed,
+            Self::False => builtins::misc::fail,
+            Self::Progress => builtins::misc::progress,
+            Self::Sleep => builtins::misc::sleep,
+            Self::Cat => return evaluator.run_cat(arguments, input, capture_output, stdout_sink),
+            Self::Jobs => builtins::jobs::jobs,
+            Self::Wait => builtins::jobs::wait,
+            Self::Kill => builtins::jobs::kill,
+            Self::Cap => builtins::cap::cap,
+            Self::Head => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::lines::head(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Tail => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::lines::tail(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Grep => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::stream::grep(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Sed => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::stream::sed(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Cut => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::extra::cut(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Uniq => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::extra::uniq(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Wc => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::extra::wc(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Sort => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::text::extra::sort(arguments)
+                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Jq => {
+                return evaluator.run_lines(
+                    self.name(),
+                    builtins::jq::options(arguments)
+                        .map(|options| (ParsedStream::Jq(options), None)),
+                    input,
+                    stdout_sink,
+                );
+            }
+            Self::Base64 => {
+                return evaluator.run_base64(arguments, input, capture_output, stdout_sink, false);
+            }
+            Self::Xargs => return evaluator.run_xargs(arguments, input, stdout_sink),
+        };
+        evaluator.run_simple_builtin(run, arguments, input)
     }
 }
 
@@ -2345,10 +2426,10 @@ impl<'a> Evaluator<'a> {
         let command = argv[0].as_str();
         let arguments = &argv[1..];
 
-        let (kind, resolution) = if telemetry::is_control_word(command) {
+        let (kind, resolution) = if ControlWord::lookup(command).is_some() {
             (CommandKind::Control, None)
         } else {
-            let resolution = dispatch::resolve(command, &self.function_names, self.invoker);
+            let resolution = builtins::resolve(command, &self.function_names, self.invoker);
             (CommandKind::of(&resolution), Some(resolution))
         };
         self.counters.charge(kind);
@@ -2567,17 +2648,12 @@ impl<'a> Evaluator<'a> {
 
     fn run_lines(
         &mut self,
-        command: StreamCommand,
-        arguments: &[String],
+        name: &str,
+        parsed: Result<(ParsedStream, Option<String>), CommandFailure>,
         input: StageInput,
-        literal_help: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        if literal_help {
-            return Ok(Executed::Result(stream_help(command)));
-        }
-        let name = command.name();
-        let (parsed, operand) = match command.parse(arguments) {
+        let (parsed, operand) = match parsed {
             Ok(parsed) => parsed,
             Err(failure) => {
                 return Ok(Executed::Result(CommandResult::status(
@@ -2680,15 +2756,22 @@ impl<'a> Evaluator<'a> {
             Ok(true)
         };
         let outcome = match parsed {
-            ParsedStream::Lines(command, selection) => command
-                .run(selection, &mut reader, &mut self.budget, &mut emit)
-                .map(|()| ExitCode::SUCCESS),
-            ParsedStream::Extra(command, operation) => {
-                command.run_parsed(operation, &mut reader, &mut self.budget, &mut emit)
+            ParsedStream::Lines(selection) => {
+                builtins::text::lines::run(selection, &mut reader, &mut self.budget, &mut emit)
+                    .map(|()| ExitCode::SUCCESS)
             }
-            ParsedStream::Text(command, operation) => {
-                command.run_parsed(operation, &mut reader, &mut self.budget, &mut emit)
-            }
+            ParsedStream::Extra(operation) => builtins::text::extra::run_parsed(
+                operation,
+                &mut reader,
+                &mut self.budget,
+                &mut emit,
+            ),
+            ParsedStream::Text(operation) => builtins::text::stream::run_parsed(
+                operation,
+                &mut reader,
+                &mut self.budget,
+                &mut emit,
+            ),
             ParsedStream::Jq(opts) => {
                 builtins::jq::stream(opts, &mut reader, &mut self.budget, &mut emit)
                     .map(|()| ExitCode::SUCCESS)
@@ -2841,28 +2924,17 @@ impl<'a> Evaluator<'a> {
         Ok(Executed::Result(CommandResult::status(ExitCode::SUCCESS)))
     }
 
-    fn run_simple_builtin(
+    fn run_cat(
         &mut self,
-        builtin: &dyn builtins::Builtin,
         arguments: &[String],
         input: StageInput,
-        mode: SimpleBuiltinMode,
+        capture_output: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let capture_output = match mode {
-            SimpleBuiltinMode::Help => {
-                return Ok(Executed::Result(builtins::help_result(
-                    builtin.name(),
-                    builtin.help(),
-                )));
-            }
-            SimpleBuiltinMode::Run { capture_output } => capture_output,
-        };
-        if builtin.name() == "cat" && !arguments.is_empty() {
+        if !arguments.is_empty() {
             return self.run_named_cat(arguments, stdout_sink);
         }
-        if builtin.copies_stdin()
-            && arguments.is_empty()
+        if arguments.is_empty()
             && (self.stdout.is_some()
                 || capture_output
                 || !self.captures.is_empty()
@@ -2878,6 +2950,15 @@ impl<'a> Evaluator<'a> {
                 }
             };
         }
+        self.run_simple_builtin(builtins::misc::cat, arguments, input)
+    }
+
+    fn run_simple_builtin(
+        &mut self,
+        run: builtins::Run,
+        arguments: &[String],
+        input: StageInput,
+    ) -> Result<Executed, FatalError> {
         drop(input);
         let outcome = {
             let mut context = BuiltinContext {
@@ -2885,7 +2966,7 @@ impl<'a> Evaluator<'a> {
                 budget: &mut self.budget,
                 started_jobs: &self.jobs.started,
             };
-            builtin.run(&mut context, arguments, None)
+            run(&mut context, arguments, None)
         };
         match outcome {
             Ok(result) => Ok(Executed::Result(result)),
@@ -2925,57 +3006,17 @@ impl<'a> Evaluator<'a> {
             Resolution::Function => {
                 self.call_function(command, arguments, input, capture_output, stdout_sink)
             }
-            Resolution::Builtin(BuiltinKind::Simple(builtin)) => self.run_simple_builtin(
-                builtin,
+            Resolution::Builtin(builtin) => builtin.run(
+                self,
                 arguments,
                 input,
                 if literal_help {
-                    SimpleBuiltinMode::Help
+                    BuiltinMode::Help
                 } else {
-                    SimpleBuiltinMode::Run { capture_output }
+                    BuiltinMode::Run { capture_output }
                 },
                 stdout_sink,
             ),
-            Resolution::Builtin(BuiltinKind::Jq) => self.run_lines(
-                StreamCommand::Jq,
-                arguments,
-                input,
-                literal_help,
-                stdout_sink,
-            ),
-            Resolution::Builtin(BuiltinKind::Base64) => {
-                self.run_base64(arguments, input, capture_output, stdout_sink, literal_help)
-            }
-            Resolution::Builtin(BuiltinKind::Lines(command)) => self.run_lines(
-                StreamCommand::Lines(command),
-                arguments,
-                input,
-                literal_help,
-                stdout_sink,
-            ),
-            Resolution::Builtin(BuiltinKind::TextStream(command)) => self.run_lines(
-                StreamCommand::Text(command),
-                arguments,
-                input,
-                literal_help,
-                stdout_sink,
-            ),
-            Resolution::Builtin(BuiltinKind::Extra(command)) => self.run_lines(
-                StreamCommand::Extra(command),
-                arguments,
-                input,
-                literal_help,
-                stdout_sink,
-            ),
-            Resolution::Builtin(BuiltinKind::Xargs) => {
-                if literal_help {
-                    return Ok(Executed::Result(builtins::help_result(
-                        xargs::NAME,
-                        xargs::HELP,
-                    )));
-                }
-                self.run_xargs(arguments, input, stdout_sink)
-            }
             Resolution::ProviderCommand => {
                 if literal_help {
                     if let Some(page) = self.invoker.command_word_help().get(command) {
@@ -3148,8 +3189,12 @@ impl<'a> Evaluator<'a> {
         arguments: &[String],
         input: StageInput,
     ) -> Result<Option<Executed>, FatalError> {
-        let executed = match command {
-            "break" | "continue" => {
+        let Some(control) = ControlWord::lookup(command) else {
+            return Ok(None);
+        };
+        let command = control.name();
+        let executed = match control {
+            ControlWord::Break | ControlWord::Continue => {
                 let level = match parse_level(command, arguments) {
                     Ok(level) => level,
                     Err(failure) => {
@@ -3163,14 +3208,14 @@ impl<'a> Evaluator<'a> {
                     Flow::Continue(level)
                 })
             }
-            "set" => match self.apply_set_options(arguments) {
+            ControlWord::Set => match self.apply_set_options(arguments) {
                 Ok(()) => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
                 Err(failure) => {
                     let status = self.absorb(failure)?;
                     Executed::Result(CommandResult::status(status))
                 }
             },
-            "return" => {
+            ControlWord::Return => {
                 if !self
                     .frames
                     .iter()
@@ -3190,7 +3235,7 @@ impl<'a> Evaluator<'a> {
                 };
                 Executed::Flow(Flow::Return(status))
             }
-            "exit" => {
+            ControlWord::Exit => {
                 let status = match parse_status(command, arguments, self.last_status) {
                     Ok(status) => status,
                     Err(failure) => {
@@ -3200,14 +3245,14 @@ impl<'a> Evaluator<'a> {
                 };
                 Executed::Flow(Flow::Exit(status))
             }
-            "read" => match self.run_read(arguments, input) {
+            ControlWord::Read => match self.run_read(arguments, input) {
                 Ok(result) => Executed::Result(result),
                 Err(failure) => {
                     let status = self.absorb(failure)?;
                     Executed::Result(CommandResult::status(status))
                 }
             },
-            "local" => {
+            ControlWord::Local => {
                 if !self
                     .frames
                     .iter()
@@ -3228,7 +3273,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
             }
-            "shift" => {
+            ControlWord::Shift => {
                 let Some(frame) = self
                     .frames
                     .iter_mut()
@@ -3255,7 +3300,7 @@ impl<'a> Evaluator<'a> {
                     Executed::Result(CommandResult::status(ExitCode::SUCCESS))
                 }
             }
-            "unset" => {
+            ControlWord::Unset => {
                 for name in arguments {
                     if let Some(index) = self
                         .frames
@@ -3281,8 +3326,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
             }
-            ":" => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
-            _ => return Ok(None),
+            ControlWord::Colon => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
         };
         Ok(Some(executed))
     }
@@ -4811,16 +4855,6 @@ fn append_charged_buffer(
         .or_default()
         .extend(charges);
     Ok(())
-}
-
-fn stream_help(command: StreamCommand) -> CommandResult {
-    let (name, help) = match command {
-        StreamCommand::Lines(command) => (command.name(), command.help()),
-        StreamCommand::Text(command) => (command.name(), command.help()),
-        StreamCommand::Extra(command) => (command.name(), command.help()),
-        StreamCommand::Jq => ("jq", builtins::jq::HELP),
-    };
-    builtins::help_result(name, help)
 }
 
 fn retain_value(
