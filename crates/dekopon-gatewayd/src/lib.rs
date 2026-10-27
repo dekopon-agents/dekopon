@@ -227,7 +227,10 @@ where
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
-    let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    let (journal, boot) = match open_journal(config.journal.clone(), &config.memory).await? {
+        Some((journal, boot)) => (Some(journal), Some(boot)),
+        None => (None, None),
+    };
     let journal_dir = config.journal.as_ref().map(|journal| journal.dir.clone());
     let cache_keys = tokio::task::spawn_blocking(move || match journal_dir {
         Some(dir) => cache_key::CacheKeySecret::load_or_create(&dir),
@@ -236,12 +239,8 @@ where
     .await
     .map_err(GatewaydError::TransportTask)??;
     if journal.is_some() {
-        for route in &config.routes {
-            if let (Some(window), Some(policy)) =
-                (route.memory.window(), route.memory_policy.as_ref())
-            {
-                memory::generation::report_policy(policy, window.recall);
-            }
+        for route in generation.load().routes.routes() {
+            memory::generation::report_policy(route);
         }
     }
     let wakes = match config.wakes.clone() {
@@ -286,18 +285,27 @@ where
     })
     .await
     .map_err(GatewaydError::TransportTask)??;
+    let models = Arc::new(ModelCache::new(
+        Arc::clone(&configured) as Arc<dyn session::ModelFactory>
+    ));
+    let engine = journal.as_ref().map(|journal| {
+        memory::engine::channel(
+            Arc::clone(journal),
+            Arc::default(),
+            config.memory.summaries.queue,
+            config.memory.summaries.concurrency,
+        )
+    });
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
         broker: config.broker.clone(),
-        models: Arc::new(ModelCache::new(
-            Arc::clone(&configured) as Arc<dyn session::ModelFactory>
-        )),
+        models: Arc::clone(&models),
+        summaries: engine.as_ref().map(|(sender, _)| sender.clone()),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::with_cache_keys(
             config.sessions.max_conversations,
-            config.memory.arena.max_transient_bytes.get() as usize,
             cache_keys,
         ),
         follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
@@ -310,6 +318,24 @@ where
         metering: Arc::clone(&metering),
     });
     let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
+    if let Some((sender, dispatcher)) = engine {
+        dispatcher.start(generation.clone(), models, &mut owned_tasks);
+        if let Some(boot) = boot {
+            let enqueued = boot.tasks.len();
+            for task in boot.tasks {
+                sender.enqueue(task).await;
+            }
+            tracing::info!(
+                event = "gateway_memory_startup",
+                memory.journals.reset = boot.reset,
+                memory.slots.requeued = boot.requeued,
+                memory.slots.enqueued = enqueued,
+                memory.slots.overflowed = boot.overflowed,
+                memory.boot.crashed_files = boot.crashed_files,
+                "gateway.memory.startup"
+            );
+        }
+    }
 
     tracing::info!(
         event = "gateway_started",
@@ -403,7 +429,7 @@ where
 async fn open_journal(
     config: Option<config::ResolvedJournal>,
     memory: &config::ResolvedSettings,
-) -> Result<Option<Arc<journal::Journal>>, GatewaydError> {
+) -> Result<Option<(Arc<journal::Journal>, memory::journal::records::Boot)>, GatewaydError> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -419,18 +445,21 @@ async fn open_journal(
         .map(|(id, agent)| (id.as_str().to_owned(), agent.max_bytes.get()))
         .collect();
     let max_bytes_per_agent = memory.retention.max_bytes_per_agent.get();
+    let queue = memory.summaries.queue;
     let journal = tokio::task::spawn_blocking(move || {
-        let mut journal = journal::Journal::open_with_age(
+        let (mut journal, boot) = journal::Journal::boot(
             &config.dir,
             max_age,
             config.retention,
             config.seal_retention,
+            queue,
+            std::time::SystemTime::now(),
         )?;
         journal.agent_ages = agent_ages;
         journal.agent_bytes = agent_bytes;
         journal.max_bytes_per_agent = max_bytes_per_agent;
         journal.enforce_caps()?;
-        Ok::<_, journal::JournalError>(journal)
+        Ok::<_, journal::JournalError>((journal, boot))
     })
     .await
     .map_err(GatewaydError::TransportTask)?
@@ -440,7 +469,7 @@ async fn open_journal(
             journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
         },
     })?;
-    Ok(Some(Arc::new(journal)))
+    Ok(Some((Arc::new(journal.0), journal.1)))
 }
 
 async fn load_follow_table(

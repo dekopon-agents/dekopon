@@ -1,4 +1,4 @@
-mod walk;
+pub(crate) mod walk;
 
 use std::{
     fs::{File, OpenOptions},
@@ -218,24 +218,24 @@ fn corrupt(error: serde_json::Error) -> JournalError {
         .map_or(JournalError::Corrupt, |kind| JournalError::Io { kind })
 }
 
-struct BodyWriter<'a> {
-    file: &'a mut File,
+struct BodyWriter<W> {
+    out: W,
     offset: u64,
     spans: Vec<Span>,
 }
 
-impl Write for BodyWriter<'_> {
+impl<W: Write> Write for BodyWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let n = self.file.write(bytes)?;
+        let n = self.out.write(bytes)?;
         self.offset += n as u64;
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.out.flush()
     }
 }
 
-impl BodyWriter<'_> {
+impl<W: Write> BodyWriter<W> {
     fn json(&mut self, value: &(impl Serialize + ?Sized)) -> Result<(), JournalError> {
         serde_json::to_writer(self, value).map_err(|error| {
             error
@@ -379,23 +379,79 @@ impl BodyWriter<'_> {
     }
 }
 
+pub(super) struct Counted(pub u64);
+
+impl Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(super) fn encode_record(
+    out: &mut impl Write,
+    record: &TurnRecord,
+    arrived: Vec<ArrivedAsset>,
+) -> Result<(), JournalError> {
+    let next_record_id = NonZeroU64::new(
+        record
+            .id
+            .0
+            .get()
+            .checked_add(1)
+            .ok_or(JournalError::Corrupt)?,
+    )
+    .ok_or(JournalError::Corrupt)?;
+    u32::try_from(record.original.len()).map_err(|_invalid| JournalError::Corrupt)?;
+    let mut body = BodyWriter {
+        out: &mut *out,
+        offset: 0,
+        spans: Vec::new(),
+    };
+    body.write_all(b"{\"b\":[")?;
+    for (index, item) in record.original.iter().enumerate() {
+        if index > 0 {
+            body.write_all(b",")?;
+        }
+        body.item(
+            u32::try_from(index).map_err(|_invalid| JournalError::Corrupt)?,
+            item,
+        )?;
+    }
+    body.write_all(b"]}\n")?;
+    let header = Header {
+        id: record.id,
+        next_record_id,
+        turn: record.turn,
+        at_ms: record.at_ms,
+        grant: record.grant.clone(),
+        model: record.model.clone(),
+        summaries: record.summaries.clone(),
+        plan: record.plan.clone(),
+        assets: record.assets.clone(),
+        next_asset_id: record.next_asset_id,
+        body_len: body.offset,
+        spans: body.spans,
+        arrived,
+        pin: None,
+        choice: None,
+    };
+    serde_json::to_writer(&mut *out, &HeaderLine { h: header }).map_err(corrupt)?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
 impl Journal {
+    #[cfg(test)]
     pub(crate) fn append_record(
         &self,
         stem: &str,
         record: &TurnRecord,
         arrived: Vec<ArrivedAsset>,
     ) -> Result<(), JournalError> {
-        let next_record_id = NonZeroU64::new(
-            record
-                .id
-                .0
-                .get()
-                .checked_add(1)
-                .ok_or(JournalError::Corrupt)?,
-        )
-        .ok_or(JournalError::Corrupt)?;
-        u32::try_from(record.original.len()).map_err(|_invalid| JournalError::Corrupt)?;
         let _lock = self.lock.lock();
         use std::os::unix::fs::DirBuilderExt as _;
         let path = self.path(stem);
@@ -408,42 +464,7 @@ impl Journal {
             .append(true)
             .mode(0o600)
             .open(self.path(stem))?;
-        let mut body = BodyWriter {
-            file: &mut file,
-            offset: 0,
-            spans: Vec::new(),
-        };
-        body.write_all(b"{\"b\":[")?;
-        for (index, item) in record.original.iter().enumerate() {
-            if index > 0 {
-                body.write_all(b",")?;
-            }
-            body.item(
-                u32::try_from(index).map_err(|_invalid| JournalError::Corrupt)?,
-                item,
-            )?;
-        }
-        body.write_all(b"]}\n")?;
-        let header = Header {
-            id: record.id,
-            next_record_id,
-            turn: record.turn,
-            at_ms: record.at_ms,
-            grant: record.grant.clone(),
-            model: record.model.clone(),
-            summaries: record.summaries.clone(),
-            plan: record.plan.clone(),
-            assets: record.assets.clone(),
-            next_asset_id: record.next_asset_id,
-            body_len: body.offset,
-            spans: body.spans,
-            arrived,
-            pin: None,
-            choice: None,
-        };
-        serde_json::to_writer(&mut file, &HeaderLine { h: header }).map_err(corrupt)?;
-        file.write_all(b"\n")?;
-        Ok(())
+        encode_record(&mut file, record, arrived)
     }
 
     pub(crate) fn record_snapshot(
@@ -553,16 +574,29 @@ impl Journal {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn rewrite_records(
         &self,
         stem: &str,
-        mut keep: impl FnMut(&Header) -> bool,
+        keep: impl FnMut(&Header) -> bool,
     ) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
-        let Some(snapshot) = self.record_snapshot(stem, true)? else {
-            return Ok(());
+        rewrite_path(&self.path(stem), keep)
+    }
+}
+
+pub(super) fn rewrite_path(
+    path: &std::path::Path,
+    mut keep: impl FnMut(&Header) -> bool,
+) -> Result<(), JournalError> {
+    {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         };
-        let path = self.path(stem);
+        let snapshot = scan(file, true, None)?;
+        let path = path.to_path_buf();
         let temporary = path.with_extension("tmp");
         match std::fs::remove_file(&temporary) {
             Ok(()) => {}
@@ -602,6 +636,7 @@ impl Journal {
                     out.write_all(&line)?;
                 }
             }
+            out.sync_all()?;
             std::fs::rename(&temporary, &path)?;
             Ok(())
         })();
@@ -637,6 +672,7 @@ fn validate_header(header: &Header, body_len: u64) -> Result<(), JournalError> {
 }
 
 impl Journal {
+    #[cfg(test)]
     pub(crate) fn record_window(
         &self,
         stem: &str,
@@ -771,6 +807,257 @@ fn scan(file: File, strict: bool, wanted: Option<RecordId>) -> Result<Snapshot, 
     Ok(Snapshot { file, records })
 }
 
+pub(crate) fn scan_path(path: &std::path::Path) -> Result<Snapshot, JournalError> {
+    scan(File::open(path)?, true, None)
+}
+
+pub(crate) fn first_header(path: &std::path::Path) -> Result<Option<Header>, JournalError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut reader = BufReader::with_capacity(BUFFER, file);
+    let mut tag = [0; 5];
+    match reader.read_exact(&mut tag) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    if &tag != b"{\"b\":" {
+        return Err(JournalError::Corrupt);
+    }
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            break;
+        }
+        let len = buffer.len();
+        reader.consume(len);
+    }
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line)?;
+    if line.last() != Some(&b'\n') {
+        return Ok(None);
+    }
+    if !line.starts_with(b"{\"h\":") {
+        return Err(JournalError::Corrupt);
+    }
+    Ok(Some(decode_line::<HeaderLine>(&line)?.h))
+}
+
+pub(crate) fn admits(
+    header: &Header,
+    grant: &GrantDigest,
+    horizon_ms: u64,
+    sealed_at_ms: Option<u64>,
+) -> bool {
+    header.grant == *grant
+        && header.at_ms >= horizon_ms
+        && sealed_at_ms.is_none_or(|seal| header.at_ms > seal)
+}
+
+pub(crate) struct RecordText {
+    pub total: u64,
+    pub selected: Vec<u8>,
+}
+
+struct Window {
+    total: u64,
+    range: Option<(u64, u64)>,
+    selected: Vec<u8>,
+}
+
+impl Window {
+    fn push(&mut self, bytes: &[u8]) {
+        let from = self.total;
+        self.total += bytes.len() as u64;
+        let Some((start, end)) = self.range else {
+            return;
+        };
+        let lo = start.max(from);
+        let hi = end.min(self.total);
+        if lo < hi {
+            let lo = usize::try_from(lo - from).unwrap_or(usize::MAX);
+            let hi = usize::try_from(hi - from).unwrap_or(usize::MAX);
+            self.selected.extend_from_slice(&bytes[lo..hi]);
+        }
+    }
+}
+
+/// The record's original as one text: each text item on its own line, and each exchange as a
+/// tool line followed by its request and result. Opaque reasoning is never read.
+pub(crate) fn record_text(
+    file: &File,
+    head: &Head,
+    range: Option<(u64, u64)>,
+) -> Result<RecordText, JournalError> {
+    let mut window = Window {
+        total: 0,
+        range,
+        selected: Vec::new(),
+    };
+    let mut buffer = vec![0; BUFFER];
+    let mut first = true;
+    let mut tool: Option<String> = None;
+    for span in &head.header.spans {
+        let offset = head
+            .body_at
+            .checked_add(span.rel_offset)
+            .ok_or(JournalError::Corrupt)?;
+        match &span.field {
+            Field::Opaque { .. } | Field::CallId => continue,
+            Field::RejectedTool => {
+                let mut name = Vec::new();
+                decode_escaped(file, offset, span.len, &mut buffer, &mut |bytes| {
+                    name.extend_from_slice(bytes);
+                })?;
+                tool = Some(String::from_utf8_lossy(&name).into_owned());
+                continue;
+            }
+            Field::User { .. } | Field::Steer { .. } | Field::Assistant { .. } | Field::Plain { .. } => {
+                if !first {
+                    window.push(b"\n");
+                }
+            }
+            Field::Arguments { tool: named, .. } => {
+                if !first {
+                    window.push(b"\n");
+                }
+                let name = match named {
+                    NamedTool::Rejected => tool.take().unwrap_or_default(),
+                    named => tool_name(*named).to_owned(),
+                };
+                let outcome = head
+                    .header
+                    .spans
+                    .iter()
+                    .find_map(|other| match other.field {
+                        Field::Result { outcome, .. } if other.item == span.item => Some(outcome),
+                        _ => None,
+                    });
+                let outcome = match outcome {
+                    Some(Outcome::Exit(code)) => format!("exit {code}"),
+                    Some(Outcome::Refused) => "refused".to_owned(),
+                    Some(Outcome::Failed) | None => "failed".to_owned(),
+                };
+                window.push(format!("[tool: {name}, outcome: {outcome}]\n[request] ").as_bytes());
+            }
+            Field::Result { .. } => window.push(b"\n[result] "),
+        }
+        first = false;
+        decode_escaped(file, offset, span.len, &mut buffer, &mut |bytes| window.push(bytes))?;
+    }
+    Ok(RecordText {
+        total: window.total,
+        selected: window.selected,
+    })
+}
+
+const fn tool_name(tool: NamedTool) -> &'static str {
+    match tool {
+        NamedTool::Bash => "bash",
+        NamedTool::ReadSkill => "read_skill",
+        NamedTool::FetchChatAsset => "fetch_chat_asset",
+        NamedTool::ReadMemoryRecord => "read_memory_record",
+        NamedTool::SetMemoryPin => "set_memory_pin",
+        NamedTool::ClearMemoryPin => "clear_memory_pin",
+        NamedTool::InspectAgentConfig => "inspect_agent_config",
+        NamedTool::SuggestImprovement => "suggest_improvement",
+        NamedTool::Wake => "wake",
+        NamedTool::Rejected => "rejected",
+    }
+}
+
+/// Streams a stored JSON string's escaped bytes as their decoded UTF-8, through one buffer.
+pub(crate) fn decode_escaped(
+    file: &File,
+    offset: u64,
+    len: u64,
+    buffer: &mut [u8],
+    sink: &mut dyn FnMut(&[u8]),
+) -> Result<(), JournalError> {
+    let mut at = 0_u64;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut high: Option<u16> = None;
+    while at < len {
+        let count = usize::try_from((len - at).min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let chunk = &mut buffer[..count];
+        file.read_exact_at(chunk, offset + at)?;
+        at += count as u64;
+        let mut run = 0;
+        let mut index = 0;
+        while index < chunk.len() {
+            if pending.is_empty() && chunk[index] != b'\\' {
+                index += 1;
+                continue;
+            }
+            if pending.is_empty() {
+                sink(&chunk[run..index]);
+            }
+            pending.push(chunk[index]);
+            index += 1;
+            run = index;
+            let complete = match pending.get(1) {
+                None => false,
+                Some(b'u') => pending.len() == 6,
+                Some(_) => true,
+            };
+            if !complete {
+                continue;
+            }
+            let decoded: Option<char> = match pending[1] {
+                b'"' => Some('"'),
+                b'\\' => Some('\\'),
+                b'/' => Some('/'),
+                b'b' => Some('\u{8}'),
+                b'f' => Some('\u{c}'),
+                b'n' => Some('\n'),
+                b'r' => Some('\r'),
+                b't' => Some('\t'),
+                b'u' => {
+                    let code = std::str::from_utf8(&pending[2..6])
+                        .ok()
+                        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                        .ok_or(JournalError::Corrupt)?;
+                    match (high.take(), code) {
+                        (None, 0xd800..=0xdbff) => {
+                            high = Some(code);
+                            None
+                        }
+                        (Some(high), 0xdc00..=0xdfff) => char::from_u32(
+                            0x10000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(code) - 0xdc00),
+                        ),
+                        (None, code) => char::from_u32(u32::from(code)),
+                        (Some(_), _) => return Err(JournalError::Corrupt),
+                    }
+                    .map_or_else(
+                        || if high.is_some() { Ok(None) } else { Err(JournalError::Corrupt) },
+                        |character| Ok(Some(character)),
+                    )?
+                }
+                _ => return Err(JournalError::Corrupt),
+            };
+            pending.clear();
+            if let Some(character) = decoded {
+                let mut utf8 = [0; 4];
+                sink(character.encode_utf8(&mut utf8).as_bytes());
+            }
+        }
+        if pending.is_empty() {
+            sink(&chunk[run..]);
+        }
+    }
+    if !pending.is_empty() || high.is_some() {
+        return Err(JournalError::Corrupt);
+    }
+    Ok(())
+}
+
 pub(crate) fn escaped_text(
     file: &File,
     offset: u64,
@@ -888,6 +1175,7 @@ pub(crate) struct Boot {
 }
 
 impl Journal {
+    #[cfg(test)]
     pub(crate) fn open_records(
         dir: &std::path::Path,
         max_age: std::time::Duration,

@@ -29,8 +29,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub(crate) mod memory;
-pub use memory::{MemorySettings, ResolvedPolicy, ResolvedSettings};
-use memory::{PolicyConfig, PolicyProblem, resolve_policy, resolve_settings};
+pub use memory::{MemoryKnobs, MemorySettings, ResolvedSettings};
+use memory::{
+    CaptureConfig, JournalRecall, KnobInputs, KnobOverrides, PolicyProblem, SelectionConfig,
+    SummariesConfig, resolve_knobs, resolve_settings,
+};
 
 use crate::{
     progress::{KeepAlive, ProgressDetail, Templates},
@@ -739,14 +742,20 @@ pub enum MemoryConfig {
         idle_timeout_ms: u64,
         #[serde(default = "default_conversation_max_turns")]
         max_turns: usize,
-        #[serde(default = "default_conversation_max_bytes")]
-        max_bytes: usize,
+        #[serde(default)]
+        max_bytes: Option<usize>,
         #[serde(default)]
         recall: Option<RecallSource>,
         #[serde(default)]
         forget_after_ms: Option<u64>,
         #[serde(default)]
-        policy: Option<Box<PolicyConfig>>,
+        hot_turns: Option<std::num::NonZeroUsize>,
+        #[serde(default)]
+        summaries: Option<SummariesConfig>,
+        #[serde(default)]
+        capture: Option<CaptureConfig>,
+        #[serde(default)]
+        selection: Option<SelectionConfig>,
     },
 }
 
@@ -764,10 +773,13 @@ impl Default for MemoryConfig {
             scope: MemoryScope::default(),
             idle_timeout_ms: default_idle_timeout_ms(),
             max_turns: default_conversation_max_turns(),
-            max_bytes: default_conversation_max_bytes(),
+            max_bytes: None,
             recall: None,
             forget_after_ms: None,
-            policy: None,
+            hot_turns: None,
+            summaries: None,
+            capture: None,
+            selection: None,
         }
     }
 }
@@ -778,10 +790,6 @@ const fn default_idle_timeout_ms() -> u64 {
 
 const fn default_conversation_max_turns() -> usize {
     DEFAULT_CONVERSATION_MAX_TURNS
-}
-
-const fn default_conversation_max_bytes() -> usize {
-    DEFAULT_CONVERSATION_MAX_BYTES
 }
 
 // One week matches how long WhatsApp keeps an inbound media id, so recalled photos stay fetchable.
@@ -892,7 +900,7 @@ pub struct ResolvedRoute {
     pub(crate) steering: Steering,
     pub(crate) progress_notes: bool,
     pub memory: MemoryPolicy,
-    pub memory_policy: Option<ResolvedPolicy>,
+    pub memory_knobs: Option<MemoryKnobs>,
     pub(crate) indicators: BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
@@ -2571,41 +2579,7 @@ fn resolve_with_service(
             });
         }
         let agent_memory = config.sessions.memory.agents.get(&route.agent);
-        let policy_config = match &route.memory {
-            MemoryConfig::Persistent { policy, .. } => policy
-                .as_deref()
-                .or_else(|| agent_memory.and_then(|entry| entry.policy.as_ref())),
-            MemoryConfig::OneShot {} => agent_memory.and_then(|entry| entry.policy.as_ref()),
-        };
-        let memory_policy = match resolve_policy(
-            policy_config,
-            agent_memory.and_then(|entry| entry.routine.as_deref()),
-            &model_names,
-            &proxy_only,
-        ) {
-            Ok(mut policy) => {
-                policy.models = policy
-                    .routines
-                    .iter()
-                    .filter_map(|routine| {
-                        let name = routine.model.as_ref()?;
-                        config
-                            .models
-                            .iter()
-                            .find(|model| model.name() == name)
-                            .map(|model| (name.clone(), model.clone()))
-                    })
-                    .collect();
-                Some(policy)
-            }
-            Err(problem) => {
-                problems.push(ConfigProblem::MemoryPolicy {
-                    route: Some(index),
-                    problem,
-                });
-                None
-            }
-        };
+        let mut memory_knobs = None;
         let memory = match route.memory {
             MemoryConfig::OneShot {} => MemoryPolicy::OneShot,
             MemoryConfig::Persistent {
@@ -2615,8 +2589,45 @@ fn resolve_with_service(
                 max_bytes,
                 recall,
                 forget_after_ms,
-                policy: _,
+                hot_turns,
+                summaries,
+                capture,
+                selection,
             } => {
+                let journaled = config.sessions.journal.is_some();
+                let recall = recall.unwrap_or(if journaled {
+                    RecallSource::Journal
+                } else {
+                    RecallSource::None
+                });
+                let max_bytes = max_bytes.unwrap_or(match recall {
+                    RecallSource::Journal => memory::JOURNAL_RECALL_MAX_BYTES,
+                    RecallSource::None | RecallSource::Platform => DEFAULT_CONVERSATION_MAX_BYTES,
+                });
+                if journaled && max_turns > 0 {
+                    match resolve_knobs(&KnobInputs {
+                        route: &KnobOverrides {
+                            hot_turns,
+                            summaries,
+                            capture,
+                            selection,
+                        },
+                        agent: agent_memory,
+                        max_turns,
+                        journal_recall: match recall {
+                            RecallSource::Journal => JournalRecall::Replays,
+                            RecallSource::None | RecallSource::Platform => JournalRecall::Never,
+                        },
+                        models: &model_names,
+                        proxy_only: &proxy_only,
+                    }) {
+                        Ok(knobs) => memory_knobs = Some(knobs),
+                        Err(problem) => problems.push(ConfigProblem::MemoryPolicy {
+                            route: Some(index),
+                            problem,
+                        }),
+                    }
+                }
                 if idle_timeout_ms == 0
                     || max_turns == 0
                     || max_bytes == 0
@@ -2626,12 +2637,6 @@ fn resolve_with_service(
                         agent: route.agent.to_string(),
                     });
                 }
-                let journaled = config.sessions.journal.is_some();
-                let recall = recall.unwrap_or(if journaled {
-                    RecallSource::Journal
-                } else {
-                    RecallSource::None
-                });
                 match recall {
                     RecallSource::Journal if !journaled => {
                         problems.push(ConfigProblem::JournalRecallWithoutJournal { route: index });
@@ -2699,11 +2704,7 @@ fn resolve_with_service(
             steering: route.steering,
             progress_notes: route.progress_notes,
             memory,
-            memory_policy: if config.sessions.journal.is_some() && memory.window().is_some() {
-                memory_policy
-            } else {
-                None
-            },
+            memory_knobs,
             indicators,
             wakes: route.wakes,
             follow: route.follow,

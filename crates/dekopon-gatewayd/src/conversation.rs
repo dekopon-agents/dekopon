@@ -5,13 +5,11 @@ use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::{
-    ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, History, PackedArena,
-};
+use dekopon_agent::prompt::{ConversationTurn, History};
 use dekopon_core::{AgentId, ExternalSubject};
 use sha2::{Digest, Sha256, digest::Update};
 
@@ -19,6 +17,7 @@ use crate::{
     asset::{AssetAccess, AssetFence},
     cache_key::{self, CacheKeySecret},
     config::MemoryWindow,
+    memory::project::Prior,
     routes::BoundRoute,
 };
 
@@ -138,11 +137,47 @@ impl ConversationKey {
     }
 }
 
+/// What a conversation slot replays: a journal-recall route keeps only the previous turn's
+/// projection report, and every other route keeps its own window of user and answer text.
+#[derive(Clone, Debug)]
+pub(crate) enum Window {
+    Journal { prior: Vec<Prior> },
+    Owned(History),
+}
+
+impl Window {
+    pub(crate) fn turns(&self) -> usize {
+        match self {
+            Self::Journal { prior } => prior.len(),
+            Self::Owned(history) => history.len(),
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Self::Journal { .. } => 0,
+            Self::Owned(history) => history.bytes(),
+        }
+    }
+}
+
+pub(crate) enum Seed {
+    Journal,
+    Owned(Option<History>),
+}
+
+pub(crate) enum Commit {
+    Journal {
+        prior: Vec<Prior>,
+    },
+    Owned {
+        recalled: Option<ConversationTurn>,
+        turn: ConversationTurn,
+    },
+}
+
 struct Conversation {
-    history: History,
-    arena: Arc<PackedArena>,
-    record_ids: Vec<u64>,
-    next_record_id: u64,
+    window: Window,
     cache_key: String,
     touched: Instant,
     watermark: Option<Watermark>,
@@ -158,7 +193,6 @@ pub(crate) struct Watermark {
 pub(crate) struct TakenIn {
     pub newest: Option<String>,
     pub steers: Vec<String>,
-    pub recalled: Option<ConversationTurn>,
 }
 
 impl TakenIn {
@@ -207,14 +241,13 @@ struct Slot {
 struct StoreState {
     next_generation: u64,
     slots: HashMap<ConversationKey, Slot>,
-    capacity_retired: HashMap<ConversationKey, (u64, Vec<String>, Weak<AssetFence>)>,
 }
 
 /// The lease and asset token only bound this generation's history and assets; neither authorizes
 /// running a capability, and both go stale once a fresh grant, idle check, or eviction replaces the
 /// generation.
 pub(crate) struct ConversationSeed<'a> {
-    pub history: History,
+    pub window: Window,
     pub cache_key: String,
     pub assets: AssetAccess,
     pub lease: ConversationLease<'a>,
@@ -234,8 +267,8 @@ impl ConversationLease<'_> {
     pub fn commit(
         mut self,
         window: MemoryWindow,
-        turn: ConversationTurn,
-        mut taken: TakenIn,
+        commit: Commit,
+        taken: TakenIn,
         declared_cache_key: &str,
         now: Instant,
     ) -> bool {
@@ -250,31 +283,37 @@ impl ConversationLease<'_> {
                 .get_mut(&self.key)
                 .expect("the matching conversation slot exists");
             decrement_pending(slot);
-            let recalled = taken.recalled.take();
-            match slot.live.as_mut() {
-                Some(existing) => {
+            let conversation = slot.live.get_or_insert_with(|| Conversation {
+                window: match commit {
+                    Commit::Journal { .. } => Window::Journal { prior: Vec::new() },
+                    Commit::Owned { .. } => Window::Owned(History::new(window.limits)),
+                },
+                cache_key: declared_cache_key.to_owned(),
+                touched: now,
+                watermark: None,
+            });
+            match (commit, &mut conversation.window) {
+                (Commit::Journal { prior }, Window::Journal { prior: kept }) => *kept = prior,
+                (Commit::Owned { recalled, turn }, Window::Owned(history)) => {
                     if let Some(recalled) = recalled {
-                        existing.record(recalled);
+                        history.record(recalled);
                     }
-                    existing.record(turn);
-                    existing.touched = now;
-                    existing.watermark = taken.advance(existing.watermark.take());
+                    history.record(turn);
                 }
-                None => {
-                    let mut conversation = Conversation::new(
-                        History::new(window.limits),
-                        &self.store.headroom,
-                        declared_cache_key.to_owned(),
-                        now,
-                    );
+                (Commit::Journal { prior }, kept @ Window::Owned(_)) => {
+                    *kept = Window::Journal { prior };
+                }
+                (Commit::Owned { recalled, turn }, kept @ Window::Journal { .. }) => {
+                    let mut history = History::new(window.limits);
                     if let Some(recalled) = recalled {
-                        conversation.record(recalled);
+                        history.record(recalled);
                     }
-                    conversation.record(turn);
-                    conversation.watermark = taken.advance(None);
-                    slot.live = Some(conversation);
+                    history.record(turn);
+                    *kept = Window::Owned(history);
                 }
             }
+            conversation.touched = now;
+            conversation.watermark = taken.advance(conversation.watermark.take());
             self.store.enforce_ceiling(&mut state);
         }
         self.active = false;
@@ -339,87 +378,22 @@ pub(crate) struct SealedConversation {
 pub(crate) struct ConversationStore {
     capacity: usize,
     cache_keys: CacheKeySecret,
-    headroom: Arc<ArenaHeadroom>,
     state: Mutex<StoreState>,
-}
-
-impl Conversation {
-    fn new(
-        history: History,
-        headroom: &Arc<ArenaHeadroom>,
-        cache_key: String,
-        now: Instant,
-    ) -> Self {
-        let arena = Arc::new(PackedArena::new(Arc::clone(headroom)));
-        let record_ids = (1..=history.len() as u64).collect();
-        let next_record_id = history.len() as u64 + 1;
-        let conversation = Self {
-            history,
-            arena,
-            record_ids,
-            next_record_id,
-            cache_key,
-            touched: now,
-            watermark: None,
-        };
-        conversation.repack();
-        conversation
-    }
-
-    fn record(&mut self, turn: ConversationTurn) {
-        let prior = self.record_ids.len();
-        self.history.record(turn);
-        self.record_ids.push(self.next_record_id);
-        self.next_record_id += 1;
-        let dropped = prior + 1 - self.history.len();
-        self.record_ids.drain(..dropped);
-        self.repack();
-    }
-
-    fn repack(&self) {
-        let records: Vec<_> = self
-            .record_ids
-            .iter()
-            .zip(self.history.turns())
-            .map(|(id, turn)| (*id, turn))
-            .collect();
-        if let Err(reason) = self.arena.repack(&records) {
-            tracing::warn!(
-                event = "gateway_memory_retention_failed",
-                reason = match reason {
-                    ArenaRefusal::TransientHeadroom => "arena-headroom",
-                    ArenaRefusal::DuplicateRecord => "duplicate-record",
-                },
-                "gateway.memory.retention.failed"
-            );
-        }
-    }
 }
 
 impl ConversationStore {
     #[cfg(test)]
     pub fn new(capacity: usize) -> Self {
-        Self::with_arena_limit(capacity, 128 * 1024 * 1024)
+        Self::with_cache_keys(capacity, CacheKeySecret::from_bytes([7; 32]))
     }
 
-    #[cfg(test)]
-    pub fn with_arena_limit(capacity: usize, arena_limit: usize) -> Self {
-        Self::with_cache_keys(capacity, arena_limit, CacheKeySecret::from_bytes([7; 32]))
-    }
-
-    pub fn with_cache_keys(
-        capacity: usize,
-        arena_limit: usize,
-        cache_keys: CacheKeySecret,
-    ) -> Self {
+    pub fn with_cache_keys(capacity: usize, cache_keys: CacheKeySecret) -> Self {
         Self {
             capacity,
             cache_keys,
-            headroom: ArenaHeadroom::new(arena_limit),
             state: Mutex::new(StoreState {
                 next_generation: 1,
                 slots: HashMap::new(),
-                capacity_retired: HashMap::new(),
             }),
         }
     }
@@ -458,7 +432,7 @@ impl ConversationStore {
         key: &ConversationKey,
         granted: &[String],
         window: MemoryWindow,
-        recalled: Option<History>,
+        seed: Seed,
         now: Instant,
     ) -> ConversationSeed<'_> {
         let mut state = self.state.lock();
@@ -486,79 +460,57 @@ impl ConversationStore {
             }
         }
 
-        let recalled = recalled.filter(|history| !history.is_empty());
-        if !state.slots.contains_key(key) {
-            state.capacity_retired.remove(key);
+        let (recalled, empty) = match seed {
+            Seed::Journal => (None, Window::Journal { prior: Vec::new() }),
+            Seed::Owned(history) => (
+                history.filter(|history| !history.is_empty()),
+                Window::Owned(History::new(window.limits)),
+            ),
+        };
+        let created = !state.slots.contains_key(key);
+        if created {
             let generation = allocate_generation(&mut state);
             let asset_fence = Arc::new(
                 AssetFence::new().with_grant(crate::memory::journal::grant_digest(granted)),
             );
-            let cache_key = self.cache_keys.for_conversation(key);
-            let live = recalled
-                .map(|history| Conversation::new(history, &self.headroom, cache_key.clone(), now));
-            let history = live.as_ref().map_or_else(
-                || History::new(window.limits),
-                |conversation| conversation.history.clone(),
-            );
-            let adopted = live.is_some();
             state.slots.insert(
                 key.clone(),
                 Slot {
                     generation,
-                    asset_fence: Arc::clone(&asset_fence),
+                    asset_fence,
                     granted: granted.to_vec(),
-                    pending: 1,
-                    live,
+                    pending: 0,
+                    live: None,
                 },
             );
-            if adopted {
-                self.enforce_ceiling(&mut state);
-            }
-            return ConversationSeed {
-                created: true,
-                history,
-                cache_key,
-                assets: AssetAccess::persistent(key.clone(), generation, asset_fence),
-                lease: ConversationLease {
-                    store: self,
-                    key: key.clone(),
-                    generation,
-                    granted: granted.to_vec(),
-                    active: true,
-                },
-            };
         }
-
+        let cache_key = self.cache_keys.for_conversation(key);
         let slot = state
             .slots
             .get_mut(key)
-            .expect("the conversation slot was checked above");
+            .expect("the conversation slot was inserted above");
         slot.pending = slot
             .pending
             .checked_add(1)
             .expect("pending conversations are bounded by session admission");
+        let adopted = slot.live.is_none() && recalled.is_some();
         if slot.live.is_none()
             && let Some(history) = recalled
         {
-            slot.live = Some(Conversation::new(
-                history,
-                &self.headroom,
-                self.cache_keys.for_conversation(key),
-                now,
-            ));
+            slot.live = Some(Conversation {
+                window: Window::Owned(history),
+                cache_key: cache_key.clone(),
+                touched: now,
+                watermark: None,
+            });
         }
-        let (history, cache_key) = slot.live.as_ref().map_or_else(
-            || {
-                (
-                    History::new(window.limits),
-                    self.cache_keys.for_conversation(key),
-                )
-            },
-            |conversation| (conversation.history.clone(), conversation.cache_key.clone()),
+        let (window_seed, cache_key) = slot.live.as_ref().map_or_else(
+            || (empty, cache_key.clone()),
+            |conversation| (conversation.window.clone(), conversation.cache_key.clone()),
         );
-        ConversationSeed {
-            created: false,
-            history,
+        let seeded = ConversationSeed {
+            created,
+            window: window_seed,
             cache_key,
             assets: AssetAccess::persistent(
                 key.clone(),
@@ -572,51 +524,16 @@ impl ConversationStore {
                 granted: granted.to_vec(),
                 active: true,
             },
+        };
+        if adopted {
+            self.enforce_ceiling(&mut state);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation_for_test(&self, key: &ConversationKey) -> Option<u64> {
-        self.state.lock().slots.get(key).map(|slot| slot.generation)
-    }
-
-    pub(crate) fn publication_eligible(
-        &self,
-        key: &ConversationKey,
-        granted: &[String],
-        generation: u64,
-    ) -> bool {
-        let state = self.state.lock();
-        if let Some(slot) = state.slots.get(key) {
-            return slot.generation == generation && slot.granted == granted;
-        }
-        state
-            .capacity_retired
-            .get(key)
-            .is_some_and(|(id, expected, fence)| {
-                *id == generation && expected == granted && fence.strong_count() > 0
-            })
-    }
-
-    pub fn snapshot(
-        &self,
-        key: &ConversationKey,
-        granted: &[String],
-    ) -> Option<Arc<ArenaSnapshot>> {
-        let state = self.state.lock();
-        let slot = state.slots.get(key)?;
-        if slot.granted != granted {
-            return None;
-        }
-        slot.live
-            .as_ref()
-            .map(|conversation| conversation.arena.snapshot())
+        seeded
     }
 
     pub fn remove(&self, key: &ConversationKey, reason: EvictionReason) -> bool {
         let mut state = self.state.lock();
         let removed = state.slots.remove(key);
-        state.capacity_retired.remove(key);
         let had_history = removed.as_ref().is_some_and(|slot| slot.live.is_some());
         if let Some(slot) = removed {
             slot.asset_fence.deactivate();
@@ -663,17 +580,6 @@ impl ConversationStore {
             };
             if let Some(slot) = state.slots.remove(&oldest) {
                 slot.asset_fence.deactivate();
-                state
-                    .capacity_retired
-                    .retain(|_, (_, _, fence)| fence.strong_count() > 0);
-                state.capacity_retired.insert(
-                    oldest,
-                    (
-                        slot.generation,
-                        slot.granted,
-                        Arc::downgrade(&slot.asset_fence),
-                    ),
-                );
             }
             evicted(EvictionReason::Capacity);
         }
@@ -701,11 +607,11 @@ impl fmt::Debug for ConversationStore {
             .collect::<Vec<_>>();
         let turns = conversations
             .iter()
-            .map(|conversation| conversation.history.len())
+            .map(|conversation| conversation.window.turns())
             .sum::<usize>();
         let bytes = conversations
             .iter()
-            .map(|conversation| conversation.history.bytes())
+            .map(|conversation| conversation.window.bytes())
             .sum::<usize>();
         formatter
             .debug_struct("ConversationStore")

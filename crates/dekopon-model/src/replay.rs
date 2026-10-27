@@ -42,7 +42,68 @@ impl Serialize for ReplayMessage {
     }
 }
 
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn json_len(value: &(impl Serialize + ?Sized)) -> usize {
+    let mut count = Counted(0);
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_unencodable) => 0,
+    }
+}
+
+fn text_len(text: &Text) -> usize {
+    match text {
+        Text::Owned(text) => json_len(text.as_str()),
+        Text::File { len, .. } => usize::try_from(*len).unwrap_or(usize::MAX).saturating_add(2),
+        Text::Opaque(source) => usize::try_from(source.len()).unwrap_or(usize::MAX),
+    }
+}
+
 impl ReplayMessage {
+    /// The chat-completions encoding's size from slice lengths alone; no slice is read.
+    pub fn encoded_len(&self) -> usize {
+        let skeleton = 32;
+        match self {
+            Self::User(texts) => texts.iter().map(text_len).fold(skeleton, usize::saturating_add),
+            Self::Tool { id, text } => skeleton
+                .saturating_add(json_len(id))
+                .saturating_add(text_len(text)),
+            Self::Assistant {
+                content,
+                calls,
+                reasoning,
+            } => {
+                let calls = calls.iter().fold(0_usize, |total, call| {
+                    total
+                        .saturating_add(64)
+                        .saturating_add(json_len(&call.id))
+                        .saturating_add(json_len(call.name.as_str()))
+                        .saturating_add(text_len(&call.arguments))
+                });
+                let reasoning = reasoning.iter().fold(0_usize, |total, item| {
+                    total
+                        .saturating_add(1)
+                        .saturating_add(usize::try_from(item.value.len()).unwrap_or(usize::MAX))
+                });
+                skeleton
+                    .saturating_add(content.as_ref().map_or(4, text_len))
+                    .saturating_add(calls)
+                    .saturating_add(reasoning)
+            }
+        }
+    }
+
     pub const fn role(&self) -> &'static str {
         match self {
             Self::User(_) => "user",
@@ -79,7 +140,7 @@ impl ReplayMessage {
         }
     }
 
-    pub(crate) fn is_empty_for(&self, model: &ModelKey) -> bool {
+    pub fn is_empty_for(&self, model: &ModelKey) -> bool {
         match self {
             Self::Assistant { content, calls, .. } => {
                 content.is_none() && calls.is_empty() && !self.admits_opaque(model)

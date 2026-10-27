@@ -18,8 +18,8 @@ use dekopon_agent::{
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
-        PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer, SteerSource,
-        run_prompt_session,
+        OmissionReason, PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer,
+        SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -52,11 +52,16 @@ use crate::{
         SeenReaction, Steering,
     },
     conversation::{
-        ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency,
-        SealedConversation, TakenIn, Watermark,
+        Commit, ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency,
+        SealedConversation, Seed, TakenIn, Watermark, Window,
     },
     jobs::JobContext,
     journal::{self, Journal},
+    memory::{
+        generation::{Deferred, PostReply},
+        journal::{CorruptStem, RecallFailure, tools::Admission},
+        record::GrantDigest,
+    },
     metering::ChatProviderGovernor,
     progress::{ProgressInputs, ProgressPolicy, StopCause, Terminal},
     routes::BoundRoute,
@@ -112,27 +117,10 @@ pub(crate) trait ModelFactory: Send + Sync {
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError>;
 
-    fn build_anchored(
-        &self,
-        _anchor: &Arc<ModelConfig>,
-        model: &ModelConfig,
-        runtime: tokio::runtime::Handle,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<SharedModel, SessionError> {
-        self.build_bound(&Arc::new(model.clone()), runtime, cancel)
-    }
-
     fn retire(&self) {}
 }
 
 type BoundClients = HashMap<usize, (std::sync::Weak<ModelConfig>, Arc<ModelClient>)>;
-type AnchoredClients = HashMap<
-    usize,
-    (
-        std::sync::Weak<ModelConfig>,
-        Vec<(ModelConfig, Arc<ModelClient>)>,
-    ),
->;
 
 fn blocking_model(
     model: &ModelConfig,
@@ -156,7 +144,6 @@ fn blocking_model(
 #[derive(Default)]
 pub(crate) struct ConfiguredModels {
     bound_clients: Mutex<BoundClients>,
-    anchored_clients: Mutex<AnchoredClients>,
     active_auth_files: Mutex<BTreeSet<std::path::PathBuf>>,
     /// One credential instance per auth file path, shared across every model naming it, so a second
     /// instance cannot spend a refresh token the first already rotated and retired.
@@ -206,9 +193,6 @@ impl ConfiguredModels {
 
     pub(crate) fn retire(&self) {
         self.bound_clients
-            .lock()
-            .retain(|_, (owner, _)| owner.strong_count() > 0);
-        self.anchored_clients
             .lock()
             .retain(|_, (owner, _)| owner.strong_count() > 0);
         let active = self.active_auth_files.lock();
@@ -389,48 +373,6 @@ impl ModelFactory for ConfiguredModels {
         blocking_model(model, client, runtime, cancel)
     }
 
-    fn build_anchored(
-        &self,
-        anchor: &Arc<ModelConfig>,
-        model: &ModelConfig,
-        runtime: tokio::runtime::Handle,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<SharedModel, SessionError> {
-        let key = Arc::as_ptr(anchor) as usize;
-        let live = |owner: &std::sync::Weak<ModelConfig>| {
-            owner
-                .upgrade()
-                .is_some_and(|owner| Arc::ptr_eq(&owner, anchor))
-        };
-        let cached = self
-            .anchored_clients
-            .lock()
-            .get(&key)
-            .filter(|(owner, _)| live(owner))
-            .and_then(|(_, clients)| clients.iter().find(|(config, _)| config == model))
-            .map(|(_, client)| Arc::clone(client));
-        let client = match cached {
-            Some(client) => client,
-            None => {
-                let built = self.construct(model)?;
-                let mut anchored = self.anchored_clients.lock();
-                anchored.retain(|index, (owner, _)| {
-                    owner.strong_count() > 0 && (*index != key || live(owner))
-                });
-                let (_, clients) = anchored
-                    .entry(key)
-                    .or_insert_with(|| (Arc::downgrade(anchor), Vec::new()));
-                if let Some((_, client)) = clients.iter().find(|(config, _)| config == model) {
-                    Arc::clone(client)
-                } else {
-                    clients.push((model.clone(), Arc::clone(&built)));
-                    built
-                }
-            }
-        };
-        blocking_model(model, client, runtime, cancel)
-    }
-
     fn retire(&self) {
         ConfiguredModels::retire(self);
     }
@@ -450,16 +392,6 @@ impl ModelCache {
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<SharedModel, SessionError> {
         self.factory.build_bound(model, runtime, cancel)
-    }
-
-    pub(crate) fn client_anchored(
-        &self,
-        anchor: &Arc<ModelConfig>,
-        model: &ModelConfig,
-        runtime: tokio::runtime::Handle,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<SharedModel, SessionError> {
-        self.factory.build_anchored(anchor, model, runtime, cancel)
     }
 
     pub(crate) fn retire(&self) {
@@ -1192,6 +1124,7 @@ pub(crate) struct SessionRunner {
     pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
     pub sealed_conversations: Mutex<HashMap<ConversationKey, SealedConversation>>,
     pub journal: Option<Arc<Journal>>,
+    pub summaries: Option<crate::memory::engine::Sender>,
     pub follow: Option<Arc<crate::follow::FollowTable>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
@@ -1201,8 +1134,13 @@ pub(crate) struct SessionRunner {
     pub metering: Arc<dekopon_model_token_governor::Metering>,
 }
 
+enum RecallSeed {
+    Journal(journal::Recalled),
+    Platform(History),
+}
+
 struct RecalledWindow {
-    history: History,
+    seed: RecallSeed,
     assets: Vec<RecalledAsset>,
     next_asset_id: u64,
     newest: Option<String>,
@@ -1249,6 +1187,7 @@ impl Recall<'_> {
         granted: &[String],
         window: MemoryWindow,
         facts: &mut Vec<MemoryFact>,
+        corrupt: &mut Option<CorruptStem>,
     ) -> Option<RecalledWindow> {
         let span = tracing::Span::current();
         match window.recall {
@@ -1256,7 +1195,7 @@ impl Recall<'_> {
             RecallSource::Journal => {
                 let journal = Arc::clone(self.runner.journal.as_ref()?);
                 let stem = key.journal_stem();
-                let grant = journal::grant_digest(granted);
+                let grant = GrantDigest::of(granted);
                 let recalled = tokio::task::spawn_blocking(move || {
                     journal.recall(&stem, &grant, window, SystemTime::now())
                 })
@@ -1267,27 +1206,32 @@ impl Recall<'_> {
                         tracing::info!(
                             event = "gateway_recalled",
                             source = "journal",
-                            messages = recalled.history.len(),
+                            messages = recalled
+                                .snapshot
+                                .as_ref()
+                                .map_or(0, |snapshot| snapshot.records.len()),
                             delta = 0,
                             "gateway.recalled"
                         );
                         Some(RecalledWindow {
-                            history: recalled.history,
-                            assets: recalled.assets,
+                            assets: recalled.assets.clone(),
                             next_asset_id: recalled.next_asset_id,
+                            seed: RecallSeed::Journal(recalled),
                             newest: None,
                         })
                     }
                     Ok(Err(error)) => {
-                        facts.push(MemoryFact::RecallFailed {
-                            reason: error.label(),
-                        });
+                        let reason = error.label();
+                        facts.push(MemoryFact::RecallFailed { reason });
                         tracing::warn!(
                             event = "gateway_recall_failed",
                             source = "journal",
-                            reason = error.label(),
+                            reason,
                             "gateway.recall.failed"
                         );
+                        if let RecallFailure::Corrupt(stem) = error {
+                            *corrupt = Some(stem);
+                        }
                         None
                     }
                     Err(_) => {
@@ -1494,7 +1438,7 @@ fn platform_window(
         turns.push(ConversationTurn::unanswered(pending_user));
     }
     RecalledWindow {
-        history: History::from_turns(window.limits, turns),
+        seed: RecallSeed::Platform(History::from_turns(window.limits, turns)),
         assets,
         next_asset_id,
         newest,
@@ -1888,7 +1832,7 @@ async fn run_admitted(
         record_admission(&message, "started", 0, None);
     }
     let cancellation = admission.cancellation();
-    let Ended { outcome, journal } = session(runner, route, &message, driver, cancellation.clone())
+    let Ended { outcome, deferred } = session(runner, route, &message, driver, cancellation.clone())
         .instrument(tracing::info_span!(
             "gateway.session",
             generation.digest = digest,
@@ -1901,7 +1845,6 @@ async fn run_admitted(
             conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
             conversation.turns = tracing::field::Empty,
             conversation.bytes = tracing::field::Empty,
-            conversation.arena_bytes = tracing::field::Empty,
             conversation.recall_source = tracing::field::Empty,
             conversation.recalled_turns = tracing::field::Empty,
             conversation.carried_assets = tracing::field::Empty,
@@ -1913,22 +1856,42 @@ async fn run_admitted(
         span.record("otel.status_code", "error");
     }
     receipts.finish(outcome);
-    if let Some(journal) = journal {
-        crate::memory::generation::persist(runner, route, &cancellation, journal).await;
-    }
+    crate::memory::generation::drain(runner, deferred).await;
     admission
 }
 
 struct Ended {
     outcome: MessageOutcome,
-    journal: Option<crate::memory::generation::PostReply>,
+    deferred: Deferred,
 }
 
 impl From<MessageOutcome> for Ended {
     fn from(outcome: MessageOutcome) -> Self {
         Self {
             outcome,
-            journal: None,
+            deferred: Deferred::default(),
+        }
+    }
+}
+
+struct Turn {
+    outcome: Result<dekopon_agent::prompt::PromptOutcome, SessionError>,
+    captured: Option<dekopon_agent::prompt::CapturedTurn>,
+    images: Vec<dekopon_agent::attachment::GeneratedImage>,
+    commit: Option<Commit>,
+    pins: Vec<crate::memory::record::PinLine>,
+    choice: Option<crate::memory::record::ChoiceLine>,
+}
+
+impl Turn {
+    fn unstarted(outcome: Result<dekopon_agent::prompt::PromptOutcome, SessionError>) -> Self {
+        Self {
+            outcome,
+            captured: None,
+            images: Vec::new(),
+            commit: None,
+            pins: Vec::new(),
+            choice: None,
         }
     }
 }
@@ -2354,49 +2317,74 @@ async fn session_turn(
         MessageId::Native(id) | MessageId::Follow(id) => Some(id.clone()),
         MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => None,
     };
+    let mut deferred = Deferred::default();
+    let mut recalled_journal = None;
     let (mut seeded, cache_key, conversation_lease, asset_access, delta) = match window {
         Some(window) => {
-            let (recalled, delta) =
-                match runner
-                    .conversations
-                    .resident(&key, &granted, window, Instant::now())
-                {
-                    Residency::Cold => (
-                        recall
-                            .window(&key, &granted, window, &mut memory_facts)
-                            .await,
-                        None,
-                    ),
-                    Residency::Since(watermark) => (None, recall.delta(window, &watermark).await),
-                    Residency::Resident => (None, None),
-                };
-            let (recalled_history, recalled_assets, next_asset_id) = match recalled {
+            let residency = runner
+                .conversations
+                .resident(&key, &granted, window, Instant::now());
+            let journal_recall = window.recall == RecallSource::Journal;
+            let (recalled, delta) = match residency {
+                Residency::Cold => (
+                    recall
+                        .window(
+                            &key,
+                            &granted,
+                            window,
+                            &mut memory_facts,
+                            &mut deferred.corrupt,
+                        )
+                        .await,
+                    None,
+                ),
+                Residency::Since(_) | Residency::Resident if journal_recall => (
+                    recall
+                        .window(
+                            &key,
+                            &granted,
+                            window,
+                            &mut memory_facts,
+                            &mut deferred.corrupt,
+                        )
+                        .await,
+                    None,
+                ),
+                Residency::Since(watermark) => (None, recall.delta(window, &watermark).await),
+                Residency::Resident => (None, None),
+            };
+            let (seed, recalled_assets, next_asset_id) = match recalled {
                 Some(recalled) => {
                     newest_seen = newest_seen.or(recalled.newest);
-                    (
-                        Some(recalled.history),
-                        recalled.assets,
-                        recalled.next_asset_id,
-                    )
+                    let seed = match recalled.seed {
+                        RecallSeed::Journal(journal) => {
+                            recalled_journal = journal.snapshot;
+                            Seed::Journal
+                        }
+                        RecallSeed::Platform(history) => Seed::Owned(Some(history)),
+                    };
+                    (seed, recalled.assets, recalled.next_asset_id)
                 }
-                None => (None, Vec::new(), 1),
+                None if journal_recall => (Seed::Journal, Vec::new(), 1),
+                None => (Seed::Owned(None), Vec::new(), 1),
             };
             let ConversationSeed {
-                history,
+                window: history,
                 cache_key,
                 assets,
                 lease,
                 created,
-            } = runner.conversations.begin(
-                &key,
-                &granted,
-                window,
-                recalled_history,
-                Instant::now(),
-            );
+            } = runner
+                .conversations
+                .begin(&key, &granted, window, seed, Instant::now());
             if created {
                 let span = tracing::Span::current();
-                span.record("conversation.recalled_turns", history.len());
+                span.record(
+                    "conversation.recalled_turns",
+                    recalled_journal
+                        .as_ref()
+                        .map_or(history.turns(), |snapshot| snapshot.records.len()),
+                );
                 span.record("conversation.carried_assets", recalled_assets.len());
                 let store = Arc::clone(&runner.assets);
                 let access = assets.clone();
@@ -2417,7 +2405,7 @@ async fn session_turn(
             (history, cache_key, Some(lease), assets, delta)
         }
         None => (
-            History::default(),
+            Window::Owned(History::default()),
             runner.conversations.route_cache_key(route),
             None,
             AssetAccess::one_shot(key.clone()),
@@ -2425,15 +2413,8 @@ async fn session_turn(
         ),
     };
     let span = tracing::Span::current();
-    span.record("conversation.turns", seeded.len());
+    span.record("conversation.turns", seeded.turns());
     span.record("conversation.bytes", seeded.bytes());
-    span.record(
-        "conversation.arena_bytes",
-        runner
-            .conversations
-            .snapshot(&key, &granted)
-            .map_or(0, |arena| arena.bytes()),
-    );
     tracing::info!(
         target: "dekopon_gatewayd::audit",
         {
@@ -2492,8 +2473,8 @@ async fn session_turn(
             return MessageOutcome::Failed.into();
         }
     };
-    if let Some(delta) = &delta {
-        seeded.record(delta.clone());
+    if let (Some(delta), Window::Owned(history)) = (&delta, &mut seeded) {
+        history.record(delta.clone());
     }
     let text_reader = if leg.is_granted("asset.cat") {
         asset::TextReader::AssetCat
@@ -2748,31 +2729,26 @@ async fn session_turn(
         },
     );
     let leave_request = invoker.leave_request();
-    let capture_limits = route.memory_policy.as_ref().and_then(|policy| {
-        (runner.journal.is_some() && matches!(route.memory, MemoryPolicy::Persistent(_))).then(
-            || {
-                let bound = |limit| match limit {
-                    crate::config::memory::CaptureBound::Bytes(bytes) => Some(bytes.get() as usize),
-                    crate::config::memory::CaptureBound::Word(_) => None,
-                };
-                (
-                    bound(policy.capture.tool_request),
-                    bound(policy.capture.tool_result),
-                )
-            },
-        )
-    });
+    let pending_follows = invoker.pending_follows();
+    let knobs = route.memory_knobs.clone();
+    let capture_cap = knobs
+        .as_ref()
+        .filter(|_| runner.journal.is_some())
+        .map(|knobs| knobs.capture_max_item_bytes.get() as usize);
     let memory_journal = runner
         .journal
         .as_ref()
         .filter(|_| matches!(route.memory, MemoryPolicy::Persistent(_)))
         .cloned();
     let memory_stem = key.journal_stem();
-    let memory_grant = journal::grant_digest(&granted);
-    let selection_policy = route.memory_policy.clone().unwrap_or_default();
-    let selection_seal = sealed.map(|seal| seal.at);
-    let selection_window = window.filter(|window| window.recall == RecallSource::Journal);
-    let recalled_empty = seeded.is_empty();
+    let memory_grant = GrantDigest::of(&granted);
+    let memory_window = window;
+    let memory_seal = sealed.map(|seal| seal.at);
+    let journal_age = runner
+        .journal
+        .as_ref()
+        .map(|journal| journal.age_horizon_ms(&memory_stem, SystemTime::now()));
+    let recalled_empty = seeded.turns() == 0 && recalled_journal.is_none();
     let thread_reply =
         message
             .conversation
@@ -2790,8 +2766,9 @@ async fn session_turn(
             let _entered = blocking_span.enter();
             let model = match models.client_bound(&model_config, model_runtime, model_cancel) {
                 Ok(model) => ChatProviderGovernor::wrap(model, &metering, &agent_id, &model_config),
-                Err(error) => return (Err(error), None, Vec::new()),
+                Err(error) => return Turn::unstarted(Err(error)),
             };
+            let model_key = model.model_key();
             let runtime = participants::Runtime {
                 asker: ShellRuntime {
                     invoker,
@@ -2800,54 +2777,105 @@ async fn session_turn(
                 },
                 table: participant_table,
             };
-            let mut history = seeded;
-            let mut first_shown = None;
-            let mut replay_source = ReplaySource::Conversation;
-            if let (Some(journal), Some(window)) = (memory_journal.as_ref(), selection_window) {
-                let policy = &selection_policy;
-                match journal.project(
-                    journal::Projection {
-                        stem: &memory_stem,
-                        grant: &memory_grant,
-                        window,
-                        sealed_at: selection_seal,
-                        policy,
-                    },
-                    &history,
-                    |available, evidence| {
-                        journal::decide(&runtime.asker, &policy.selection, available, evidence)
-                    },
-                ) {
-                    Ok(projected) => {
-                        history = projected.history;
-                        first_shown = projected.first_shown;
-                        replay_source = projected.source;
-                        memory_facts.extend(projected.facts);
+            let mut choice = None;
+            let (prior, commit, replay_source) = match (&seeded, &recalled_journal) {
+                (Window::Journal { prior }, Some(snapshot))
+                    if let (Some(knobs), Some(window)) = (knobs.as_ref(), memory_window) =>
+                {
+                    if let crate::config::memory::Selection::Decider(decider) = &knobs.selection
+                        && let Some(record) = crate::memory::project::decider_candidate(
+                            &snapshot.records,
+                            knobs.hot_turns.get(),
+                        )
+                    {
+                        let now_ms = journal::millis(SystemTime::now());
+                        choice = crate::memory::decider::choose(
+                            &runtime.asker,
+                            decider,
+                            record,
+                            &crate::memory::project::decider_labels(record),
+                            &crate::memory::decider::evidence(&snapshot.records, now_ms),
+                            now_ms,
+                        );
                     }
-                    Err(error) => {
-                        if !memory_facts.iter().any(|fact| match fact {
-                            MemoryFact::RecallFailed { .. } => true,
-                            MemoryFact::WindowOmission { .. }
-                            | MemoryFact::Omitted { .. }
-                            | MemoryFact::Replaced { .. }
-                            | MemoryFact::GrantBoundary
-                            | MemoryFact::ThreadWithoutMemory
-                            | MemoryFact::Fidelity { .. } => false,
-                        }) {
+                    match crate::memory::project::project(
+                        &crate::memory::project::ProjectionInput {
+                            file: &snapshot.file,
+                            records: &snapshot.records,
+                            prior,
+                            hot_turns: knobs.hot_turns.get(),
+                            max_turns: window.limits.max_turns,
+                            max_bytes: window.limits.max_bytes,
+                            model: &model_key,
+                        },
+                    ) {
+                        Ok(projected) => {
+                            let ids: Vec<String> = projected
+                                .prior
+                                .iter()
+                                .filter(|prior| prior.rung.is_some())
+                                .map(|prior| prior.record.0.to_string())
+                                .collect();
+                            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                            dekopon_telemetry::with_event_string_array(
+                                "memory.record.ids",
+                                &ids,
+                                || {
+                                    tracing::info!(
+                                        event = "gateway_memory_projection",
+                                        memory.rung.native = projected.rungs.native,
+                                        memory.rung.summary = projected.rungs.summary,
+                                        memory.rung.metadata = projected.rungs.metadata,
+                                        memory.omitted = projected.omitted.len() as u64,
+                                        memory.opaque.dropped = projected.opaque_dropped,
+                                        memory.repacked = projected.repacked,
+                                        memory.bytes = projected.bytes,
+                                        "gateway.memory.projection"
+                                    );
+                                },
+                            );
+                            for record in &projected.omitted {
+                                memory_facts.push(MemoryFact::Omitted {
+                                    record: record.0.get(),
+                                    reason: OmissionReason::WindowFit,
+                                });
+                            }
+                            if snapshot.records.len() >= window.limits.max_turns.saturating_mul(2)
+                                && let Some(first) = snapshot.records.first()
+                            {
+                                memory_facts.push(MemoryFact::WindowOmission {
+                                    first_shown: first.header.id.0.get(),
+                                    limits: window.limits,
+                                });
+                            }
+                            (
+                                projected.messages,
+                                Some(Commit::Journal {
+                                    prior: projected.prior,
+                                }),
+                                ReplaySource::Journal,
+                            )
+                        }
+                        Err(error) => {
                             memory_facts.push(MemoryFact::RecallFailed {
                                 reason: error.label(),
                             });
+                            tracing::warn!(
+                                event = "gateway_recall_failed",
+                                source = "journal",
+                                reason = error.label(),
+                                "gateway.recall.failed"
+                            );
+                            (Vec::new(), None, ReplaySource::Journal)
                         }
-                        tracing::warn!(
-                            event = "gateway_recall_failed",
-                            source = "journal",
-                            reason = error.label(),
-                            "gateway.recall.failed"
-                        );
                     }
                 }
-            }
-            if history.is_empty() {
+                (Window::Journal { .. }, _) => (Vec::new(), None, ReplaySource::Journal),
+                (Window::Owned(history), _) => {
+                    (history.replay(), None, ReplaySource::Conversation)
+                }
+            };
+            if prior.is_empty() {
                 if thread_reply && recalled_empty {
                     memory_facts.push(MemoryFact::ThreadWithoutMemory);
                 }
@@ -2856,7 +2884,7 @@ async fn session_turn(
                     source: replay_source,
                 });
             }
-            let memory_notice = MemoryNotice::new(&memory_facts, first_shown);
+            let memory_notice = MemoryNotice::new(&memory_facts, None);
             if let Some(notice) = memory_notice.as_ref() {
                 dekopon_telemetry::with_event_string_array(
                     "memory.notice.kinds",
@@ -2892,18 +2920,28 @@ async fn session_turn(
             // instructions, which are still the system prompt, so this is not secrecy from a determined
             // user.
             let memory_tools = memory_journal.as_ref().map(|journal| {
-                journal::JournalMemoryTools::new(
+                crate::memory::journal::JournalMemoryTools::new(
                     journal,
                     memory_stem,
-                    memory_grant,
-                    &selection_policy,
+                    Admission {
+                        grant: memory_grant,
+                        horizon_ms: journal_age.unwrap_or(0).max(
+                            memory_window.map_or(0, |window| {
+                                journal::millis(SystemTime::now()).saturating_sub(
+                                    u64::try_from(window.forget_after.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                )
+                            }),
+                        ),
+                        sealed_at_ms: memory_seal.map(journal::millis),
+                    },
                 )
             });
             if let Some(tools) = memory_tools.as_ref() {
                 inputs = inputs.with_memory_tools(tools);
             }
-            if let Some((request, result)) = capture_limits {
-                inputs = inputs.with_exchange_capture(request, result);
+            if let Some(cap) = capture_cap {
+                inputs = inputs.with_capture_cap(cap);
             }
             if inspect_agent_config {
                 inputs = inputs.with_agent_config(&agent_config);
@@ -2917,35 +2955,54 @@ async fn session_turn(
             if let Some(wakes) = wakes.as_ref() {
                 inputs = inputs.with_wakes(wakes);
             }
-            let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
-                .map_err(SessionError::from);
-            let turn = match &outcome {
-                Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
-                _ => history
-                    .turns()
-                    .last()
-                    .cloned()
-                    .map(|turn| turn.with_memory_id(journal::mint_turn_id())),
+            let (outcome, captured) = run_prompt_session(model.as_ref(), &runtime, inputs, &prior);
+            let outcome = outcome.map_err(SessionError::from);
+            let captured = match &outcome {
+                Err(SessionError::Prompt(PromptError::Cancelled)) => None,
+                Ok(_) | Err(_) => captured,
             };
             let images = if outcome.is_ok() {
                 session_attachments.take()
             } else {
                 Vec::new()
             };
-            (outcome, turn, images)
+            Turn {
+                outcome,
+                captured,
+                images,
+                commit,
+                pins: memory_tools.map_or_else(Vec::new, |tools| tools.into_pins()),
+                choice,
+            }
         })
     })
     .await;
 
     participant_worker.finish().await;
-    let (outcome, turn, images) = match result.map_err(TaskFailure::from) {
-        Ok(session) => session,
+    deferred.follows = std::mem::take(&mut *pending_follows.lock());
+    let Turn {
+        outcome,
+        captured,
+        images,
+        commit,
+        pins,
+        choice,
+    } = match result.map_err(TaskFailure::from) {
+        Ok(turn) => turn,
         Err(failure) => {
             match steers.seal() {
                 Seal::Stopped => {
-                    return stopped(runner, route, &key, message, &mut progress, &cancellation)
-                        .await
-                        .into();
+                    return stopped(
+                        runner,
+                        route,
+                        &key,
+                        message,
+                        &mut progress,
+                        &cancellation,
+                        deferred,
+                    )
+                    .await
+                    .into();
                 }
                 Seal::Sealed { .. } => {}
             }
@@ -2965,11 +3022,19 @@ async fn session_turn(
             let replied = progress.terminal(terminal).await;
             if replied {
                 reply_delivered(MessageOutcome::Failed);
-                return MessageOutcome::Failed.into();
             }
-            return MessageOutcome::ReplyFailed.into();
+            return Ended {
+                outcome: if replied {
+                    MessageOutcome::Failed
+                } else {
+                    MessageOutcome::ReplyFailed
+                },
+                deferred,
+            };
         }
     };
+    deferred.pins = pins;
+    deferred.choice = choice;
 
     if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
         || match steers.seal() {
@@ -2977,38 +3042,54 @@ async fn session_turn(
             Seal::Sealed { .. } => false,
         }
     {
-        return stopped(runner, route, &key, message, &mut progress, &cancellation)
-            .await
-            .into();
+        return stopped(
+            runner,
+            route,
+            &key,
+            message,
+            &mut progress,
+            &cancellation,
+            deferred,
+        )
+        .await
+        .into();
     }
 
     progress.seal();
-    let mut pending_journal = None;
 
     if let Some(window) = window
-        && let Some(turn) = turn
+        && let Some(captured) = captured
         && let Some(lease) = conversation_lease
     {
         let taken = TakenIn {
             newest: newest_seen,
             steers: std::mem::take(&mut *steers.taken.lock()),
-            recalled: delta,
         };
-        if lease.commit(
-            window,
-            turn.without_exchanges(),
-            taken,
-            &cache_key,
-            Instant::now(),
-        ) && runner.journal.is_some()
+        let commit = commit.unwrap_or_else(|| match window.recall {
+            RecallSource::Journal => Commit::Journal { prior: Vec::new() },
+            RecallSource::None | RecallSource::Platform => Commit::Owned {
+                recalled: delta,
+                turn: ConversationTurn::from_captured(
+                    &captured,
+                    match &outcome {
+                        Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
+                            Some(outcome.answer.as_str())
+                        }
+                        Ok(_) | Err(_) => None,
+                    },
+                ),
+            },
+        });
+        if lease.commit(window, commit, taken, &cache_key, Instant::now()) && runner.journal.is_some()
         {
-            pending_journal = Some(crate::memory::generation::PostReply {
+            deferred.record = Some(PostReply {
                 key: key.clone(),
                 granted,
                 access: journal_access,
                 publication: publication.take().map(asset::Publication::seal),
-                window,
-                turn,
+                captured,
+                keep: crate::memory::generation::keep(window.recall),
+                plan: crate::memory::generation::plan(route),
             });
         }
     }
@@ -3020,7 +3101,7 @@ async fn session_turn(
         progress.terminal(Terminal::Silent).await;
         return Ended {
             outcome: MessageOutcome::Declined,
-            journal: pending_journal,
+            deferred,
         };
     }
 
@@ -3229,12 +3310,12 @@ async fn session_turn(
         }
         Ended {
             outcome: completed_outcome,
-            journal: pending_journal,
+            deferred,
         }
     } else {
         Ended {
             outcome: MessageOutcome::ReplyFailed,
-            journal: pending_journal,
+            deferred,
         }
     }
 }
@@ -3375,23 +3456,20 @@ async fn stopped(
     message: &InboundMessage,
     progress: &mut ProgressPolicy,
     cancellation: &SessionCancellation,
+    deferred: Deferred,
 ) -> MessageOutcome {
     tracing::info!(
         event = "gateway_session_cancelled",
         "gateway.session.cancelled"
     );
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
-    let sealed = match by {
+    let seals = match by {
         CancelSource::Budget {
             limit: BudgetLimit::WallClock,
-        } => {
-            let sealed = seal_conversation(runner, route, message, key).await;
-            runner.conversations.remove(key, EvictionReason::Sealed);
-            sealed
-        }
+        } => true,
         CancelSource::User { .. } | CancelSource::Operator => false,
     };
-    let terminal = if sealed && message.conversation.kind == ConversationKind::Thread {
+    let terminal = if seals && message.conversation.kind == ConversationKind::Thread {
         revoke_thread_ownership(runner, message);
         Terminal::Stopped(StopCause::Cancelled(by))
     } else {
@@ -3399,6 +3477,13 @@ async fn stopped(
     };
     if progress.terminal(terminal).await {
         reply_delivered(MessageOutcome::Cancelled);
+    }
+    crate::memory::generation::drain(runner, deferred).await;
+    if seals {
+        if !seal_conversation(runner, route, message, key).await {
+            remember_stop(runner, key, StopCause::Cancelled(by));
+        }
+        runner.conversations.remove(key, EvictionReason::Sealed);
     }
     MessageOutcome::Cancelled
 }
@@ -3931,12 +4016,11 @@ mod model_factory_tests {
     }
 
     #[test]
-    fn retired_generations_release_route_and_memory_clients_after_old_work_finishes() {
+    fn retired_generations_release_route_clients_after_old_work_finishes() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let factory = ConfiguredModels::default();
         let config = |name: &str| Arc::new(compatible(name));
         let first = config("first");
-        let memory = compatible("memory");
         let old = Arc::downgrade(&first);
         let bind = |anchor: &Arc<ModelConfig>| {
             factory
@@ -3946,34 +4030,20 @@ mod model_factory_tests {
                     tokio::sync::watch::channel(false).1,
                 )
                 .unwrap();
-            factory
-                .build_anchored(
-                    anchor,
-                    &memory,
-                    runtime.handle().clone(),
-                    tokio::sync::watch::channel(false).1,
-                )
-                .unwrap();
         };
         bind(&first);
         let route_client = Arc::downgrade(&factory.bound_client_for_test(&first).unwrap());
-        let memory_client = Arc::downgrade(
-            &factory.anchored_clients.lock()[&(Arc::as_ptr(&first) as usize)].1[0].1,
-        );
         for name in ["second", "third"] {
             let next = config(name);
             bind(&next);
             factory.retire();
             assert!(route_client.upgrade().is_some());
-            assert!(memory_client.upgrade().is_some());
         }
         drop(first);
         factory.retire();
         assert!(old.upgrade().is_none());
         assert!(route_client.upgrade().is_none());
-        assert!(memory_client.upgrade().is_none());
         assert!(factory.bound_clients.lock().is_empty());
-        assert!(factory.anchored_clients.lock().is_empty());
     }
 
     #[test]

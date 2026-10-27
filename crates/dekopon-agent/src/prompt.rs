@@ -39,10 +39,9 @@ pub use notice::{MemoryFact, MemoryNotice, OmissionReason, ReplaySource};
 pub use crate::{
     improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME, wake::WAKE_TOOL_NAME,
 };
+pub use crate::memory::{CapturedTurn, Item};
 pub use history::{
-    ArenaHeadroom, ArenaRefusal, ArenaSnapshot, ConversationTurn, DEFAULT_MAX_BYTES,
-    DEFAULT_MAX_TURNS, Exchange, History, HistoryLimits, PackedArena, Pin, RawAnswer, ReadRef,
-    Representation, Selection,
+    ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits, RawAnswer,
 };
 
 pub const SCRIPT_TOOL_NAME: &str = "bash";
@@ -312,8 +311,7 @@ where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
-    let mut history = History::default();
-    run_prompt_with_history(model, runtime, prompt, system, limits, &mut history)
+    run_prompt_with_history(model, runtime, prompt, system, limits, &[]).0
 }
 
 pub fn run_prompt_with_history<M, R>(
@@ -322,8 +320,8 @@ pub fn run_prompt_with_history<M, R>(
     prompt: &str,
     system: Option<&str>,
     limits: PromptLimits,
-    history: &mut History,
-) -> Result<PromptOutcome, PromptError>
+    prior: &[ModelMessage],
+) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>)
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
@@ -334,7 +332,7 @@ where
         prompt,
         system,
         limits,
-        history,
+        prior,
         &CompletionOptions::default(),
     )
 }
@@ -349,9 +347,9 @@ pub fn run_prompt_with_history_and_options<M, R>(
     prompt: &str,
     system: Option<&str>,
     limits: PromptLimits,
-    history: &mut History,
+    prior: &[ModelMessage],
     options: &CompletionOptions,
-) -> Result<PromptOutcome, PromptError>
+) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>)
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
@@ -362,7 +360,7 @@ where
         SessionInputs::new(prompt, limits)
             .with_system(system)
             .with_options(options),
-        history,
+        prior,
     )
 }
 
@@ -384,7 +382,7 @@ pub struct SessionInputs<'a> {
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
-    capture_exchanges: Option<(Option<usize>, Option<usize>)>,
+    capture_cap: usize,
     memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
     memory_notice: Option<&'a MemoryNotice>,
 }
@@ -410,7 +408,7 @@ impl<'a> SessionInputs<'a> {
             skills: &[],
             progress_notes: false,
             wakes: None,
-            capture_exchanges: None,
+            capture_cap: dekopon_process::DEFAULT_MAX_OUTPUT_BYTES,
             memory_tools: None,
             memory_notice: None,
         }
@@ -432,12 +430,8 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
-    pub const fn with_exchange_capture(
-        mut self,
-        request_max_bytes: Option<usize>,
-        result_max_bytes: Option<usize>,
-    ) -> Self {
-        self.capture_exchanges = Some((request_max_bytes, result_max_bytes));
+    pub const fn with_capture_cap(mut self, max_item_bytes: usize) -> Self {
+        self.capture_cap = max_item_bytes;
         self
     }
 
@@ -536,7 +530,6 @@ impl<'a> SessionInputs<'a> {
 }
 
 struct SessionExtensions<'a> {
-    exchanges: &'a mut Vec<Exchange>,
     record: &'a mut RecordBuilder,
     options: &'a CompletionOptions,
     assets: Option<&'a dyn AssetSource>,
@@ -551,7 +544,6 @@ struct SessionExtensions<'a> {
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
-    capture_exchanges: Option<(Option<usize>, Option<usize>)>,
     memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
 }
 
@@ -559,8 +551,8 @@ pub fn run_prompt_session<M, R>(
     model: &M,
     runtime: &R,
     inputs: SessionInputs<'_>,
-    history: &mut History,
-) -> Result<PromptOutcome, PromptError>
+    prior: &[ModelMessage],
+) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>)
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
@@ -583,7 +575,7 @@ where
         skills,
         progress_notes,
         wakes,
-        capture_exchanges,
+        capture_cap,
         memory_tools,
         memory_notice,
     } = inputs;
@@ -593,7 +585,7 @@ where
     if limits.max_steps == 0 {
         let error = PromptError::ZeroSteps;
         report_end(progress, cancellation, &error);
-        return Err(error);
+        return (Err(error), None);
     }
 
     let mut messages = Vec::new();
@@ -609,25 +601,18 @@ where
     if let Some(notice) = memory_notice {
         messages.push(ModelMessage::system(notice.text()));
     }
-    history.replay_into(&mut messages);
+    messages.extend_from_slice(prior);
     let options = options.clone().with_stable_prefix(messages.len());
     messages.push(ModelMessage::user(prompt));
 
-    let mut exchanges = Vec::new();
-    let mut record = RecordBuilder::new(
-        recorded.unwrap_or(prompt),
-        model.model_key(),
-        dekopon_process::DEFAULT_MAX_OUTPUT_BYTES,
-    );
-    let (result, steers) = run_session(
+    let mut record = RecordBuilder::new(recorded.unwrap_or(prompt), model.model_key(), capture_cap);
+    let result = run_session(
         model,
         runtime,
         messages,
         limits,
         SessionExtensions {
-            exchanges: &mut exchanges,
             record: &mut record,
-            capture_exchanges,
             memory_tools,
             options: &options,
             assets,
@@ -644,22 +629,7 @@ where
             wakes,
         },
     );
-    let mut user = recorded.unwrap_or(prompt).to_owned();
-    for steer in steers {
-        user.push_str("\n\n");
-        user.push_str(&steer);
-    }
-    history.record(
-        match &result {
-            Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
-                ConversationTurn::completed(user, outcome.answer.as_str())
-            }
-            Ok(_) | Err(_) => ConversationTurn::unanswered(user),
-        }
-        .with_exchanges(exchanges)
-        .with_capture(record.finish()),
-    );
-    result
+    (result, Some(record.finish()))
 }
 
 fn run_session<M, R>(
@@ -668,7 +638,7 @@ fn run_session<M, R>(
     messages: Vec<ModelMessage>,
     limits: PromptLimits,
     extensions: SessionExtensions<'_>,
-) -> (Result<PromptOutcome, PromptError>, Vec<String>)
+) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
@@ -676,11 +646,11 @@ where
     let progress = extensions.progress;
     let cancellation = extensions.cancellation;
     let lease = MailboxLease::new(extensions.steering);
-    let (result, steers) = run_turns(model, runtime, messages, limits, extensions, lease);
+    let result = run_turns(model, runtime, messages, limits, extensions, lease);
     if let Err(error) = &result {
         report_end(progress, cancellation, error);
     }
-    (result, steers)
+    result
 }
 
 fn report_end(
@@ -717,17 +687,16 @@ fn run_turns<M, R>(
     limits: PromptLimits,
     extensions: SessionExtensions<'_>,
     mut lease: MailboxLease<'_>,
-) -> (Result<PromptOutcome, PromptError>, Vec<String>)
+) -> Result<PromptOutcome, PromptError>
 where
     M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     let result = turns(model, runtime, messages, limits, extensions, &mut lease);
-    let result = match lease.seal() {
+    match lease.seal() {
         Seal::Stopped => Err(PromptError::Cancelled),
         Seal::Sealed { .. } => result,
-    };
-    (result, std::mem::take(&mut lease.staged))
+    }
 }
 
 #[expect(
@@ -747,7 +716,6 @@ where
     R: ScriptRuntime + ?Sized,
 {
     let SessionExtensions {
-        exchanges,
         record,
         options,
         assets,
@@ -762,7 +730,6 @@ where
         skills,
         progress_notes,
         wakes,
-        capture_exchanges,
         memory_tools,
     } = extensions;
     let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
@@ -1187,11 +1154,16 @@ where
                 record.result(&call, &messages, outcome);
                 continue;
             }
-            if let Some(memory) = memory_tools
-                && crate::memory_tools::dispatch(&mut messages, memory, &call)?
-            {
-                record.result(&call, &messages, RecordedOutcome::Exit(0));
-                continue;
+            if let Some(memory) = memory_tools {
+                let outcome = match crate::memory_tools::dispatch(&mut messages, memory, &call)? {
+                    crate::memory_tools::Dispatched::NotMemory => None,
+                    crate::memory_tools::Dispatched::Served => Some(RecordedOutcome::Exit(0)),
+                    crate::memory_tools::Dispatched::Refused => Some(RecordedOutcome::Refused),
+                };
+                if let Some(outcome) = outcome {
+                    record.result(&call, &messages, outcome);
+                    continue;
+                }
             }
             if call.function.name == WAKE_TOOL_NAME
                 && let Some(registrar) = wakes
@@ -1295,30 +1267,6 @@ where
                 );
                 outcome
             };
-            if let Some((request_max_bytes, result_max_bytes)) = capture_exchanges {
-                let request_cut = script.floor_char_boundary(
-                    request_max_bytes.unwrap_or(script.len()).min(script.len()),
-                );
-                let output = &outcome.output;
-                let cut = output.floor_char_boundary(
-                    result_max_bytes
-                        .unwrap_or(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES)
-                        .min(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES)
-                        .min(output.len()),
-                );
-                exchanges.push(Exchange {
-                    tool: SCRIPT_TOOL_NAME.into(),
-                    request: vec![Representation::original(&script[..request_cut], "")],
-                    result: vec![Representation::original(&output[..cut], "")],
-                    outcome: if outcome.exit_code == dekopon_process::ExitCode::SUCCESS {
-                        "success"
-                    } else {
-                        "failure"
-                    }
-                    .into(),
-                    exit_status: Some(i32::from(outcome.exit_code.get())),
-                });
-            }
             check_cancelled(cancellation)?;
             script_calls = script_calls.saturating_add(1);
             capability_invocations = runtime.capability_calls_used();
