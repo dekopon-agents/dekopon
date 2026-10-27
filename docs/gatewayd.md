@@ -663,9 +663,9 @@ effects already accepted cannot be rolled back. The broker leg drives a provider
 flight, after which the script reads `session-cancelled`. Unknown,
 duplicate, and other-user Stop events are ignored.
 
-The Agent manifest also subscribes to `message.channels` and `message.groups`, requiring
+Both manifests subscribe to `message.channels` and `message.groups`, requiring
 `channels:history` and `groups:history`, so the transport can hear follow-ups that contain no new
-mention. This is **owned-thread continuation**, not ambient activation:
+mention. Without route follow, the Agent experience uses **owned-thread continuation**:
 
 - an explicitly addressed channel message proposes an exact authenticated
   `(workspace, channel, root thread, sender)` claim;
@@ -677,7 +677,7 @@ mention. This is **owned-thread continuation**, not ambient activation:
 - all unmatched channel-history events are discarded inside the Slack transport before routing,
   authorization, payload telemetry, or model spend.
 
-An inherited Slack Agent continuation or an authorized Discord follow turn may decline its reply. The prompt says the message
+An inherited Slack Agent continuation or an authorized Slack/Discord follow turn may decline its reply. The prompt says the message
 was not addressed to the agent and offers `decline_chat_reply`; selecting it before any
 capability work posts nothing, produces no transport receipt or durable recording, and remembers
 the user's message as a user-only in-process turn. A decline selected in the same turn as work runs
@@ -700,9 +700,33 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 - A channel answer joins the thread it was asked in, starting one on the inbound message when there is none. A classic direct message has no thread to join; an Agent direct message is intentionally rooted at `thread_ts = event.thread_ts || event.ts`, and that root also scopes admission, history, status, Stop, and owned continuation.
 - An answer is posted in a Block Kit [`markdown` block](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/), which carries the model's CommonMark unchanged and lets Slack render it. The `text` field is mrkdwn — a proprietary syntax where bold is `*one asterisk*` and a link is `<url|label>` — so an answer posted through it alone arrives with `**bold**` as four literal asterisks, and tables and task lists cannot be expressed in it at all. Translating in this process would be a second translation of what Slack is about to translate, so the gateway does none: the block gets the answer verbatim. `text` carries the notification fallback, the one place blocks do not render. The block caps a payload at 12,000 characters, which the 8 KiB outbound bound already sits under.
 
+### Slack thread follow
+
+On a `follow: true` channel/thread route, a successful broker-authorized no-argument
+`dekopon-provider-follow.stay` opens one ticket shared by every speaker in the exact thread.
+Slack must deliver `message.channels`/`message.groups` events with `channels:history`/`groups:history`;
+configuration cannot verify installed app scopes. Both example manifests subscribe to these events.
+Unmentioned replies enter the same bounded follow batches described below, ahead of Agent
+owned-thread continuation or participant steering. Other threads and untagged top-level messages
+remain inactive. The turn uses the newest speaker's fresh broker leg, downscoped by the channel
+space when mapped. Speaker labels in a batch describe context and grant no executable handles.
+Declining is the default; only a useful contribution warrants a reply, and only a delivered reply
+refreshes the 24-hour ticket.
+
+`follow leave` takes effect after its visible report. `mute`, configured stop words, a human
+`-1`/`thumbsdown` reaction on any message this bot posted in the thread, or lapse closes following.
+These signals remove pending follow work; session cancellation still belongs only to its asker.
+An @mention is admitted again and an authorized `follow stay` restores the ticket. Follow-enabled
+routes do not fall back to owned-thread continuation after leaving.
+
+The reaction handler requires `reaction_added` and `reactions:read`, plus `users:read` to distinguish
+bot reactors. It resolves the referenced message's root with `reactions.get`, verifies the bot
+as author, and ignores bot reactors, non-agent messages and unresolved lookups. Install or reinstall
+the app with these scopes before using reaction-based leave. No ticket marker format changes.
+
 ### Discord Gateway
 
-A route may declare `follow: true` only for Discord channel/thread kinds when its transport sets `messageContent: true` and `sessions.journal` is configured. Absent, `null`, and `false` leave it disabled; other route kinds and transports refuse at configuration load. The gateway loads a bounded resident ticket table from private `.followed` journal-root markers at boot; marker expiry uses the stored `untilMs`, not file mtime. A successful authorized no-argument `dekopon-provider-follow.stay` invocation on its speaker's leg records an invitation. Unmentioned messages with a valid ticket coalesce for 30 seconds of quiet or at most two minutes from the first message, then queue a fresh turn as the newest speaker, without steering a running turn. An addressed message from that speaker cancels the pending batch. Each turn opens a fresh broker leg as the newest authenticated speaker: the broker maps that subject, checks `agent.prompt` and returns only that speaker's currently named capabilities. Unmapped, forbidden, empty-grant and subsequently revoked speakers receive no model call, capability call or reply; the inviter's grants are never reused. A memory-forbidden speaker cannot use a memory capability, and a new provider capability is unavailable until explicitly listed and granted by the broker. Follow turns show no streaming or progress before completion: a successful final reply is posted once, while seal, refusal, failure, cancellation or pre-work quiet decline posts nothing, except that a worked turn declining on its final step posts the fixed unreported-work warning without leaving or refreshing the ticket. Only a delivered reply refreshes the 24-hour ticket. A successful no-argument `dekopon-provider-follow.leave` requests self-leave, applied only after the turn delivers its visible report; a seal or any participant's configured stop word ends follow; stop words still cancel running work only for their own sender. The out-of-tree provider and reviewed grants must ship before route opt-in.
+A route may declare `follow: true` for Slack socket-mode channel/thread kinds, or Discord channel/thread kinds when its transport sets `messageContent: true`, with `sessions.journal` configured in either case. Absent, `null`, and `false` leave it disabled; other route kinds and transports refuse at configuration load. The gateway loads a bounded resident ticket table from private `.followed` journal-root markers at boot; marker expiry uses the stored `untilMs`, not file mtime. A successful authorized no-argument `dekopon-provider-follow.stay` invocation on its speaker's leg records an invitation. Batches retain each speaker's text with batch-local speaker labels, under the existing text bound. Unmentioned messages with a valid ticket coalesce for 30 seconds of quiet or at most two minutes from the first message, then queue a fresh turn as the newest speaker, without steering a running turn. An addressed message from that speaker cancels the pending batch. Each turn opens a fresh broker leg as the newest authenticated speaker: the broker maps that subject, checks `agent.prompt` and returns only that speaker's currently named capabilities. Unmapped, forbidden, empty-grant and subsequently revoked speakers receive no model call, capability call or reply; the inviter's grants are never reused. A memory-forbidden speaker cannot use a memory capability, and a new provider capability is unavailable until explicitly listed and granted by the broker. Follow turns show no streaming or progress before completion: a successful final reply is posted once, while seal, refusal, failure, cancellation or pre-work quiet decline posts nothing, except that a worked turn declining on its final step posts the fixed unreported-work warning without leaving or refreshing the ticket. Only a delivered reply refreshes the 24-hour ticket. A successful no-argument `dekopon-provider-follow.leave` requests self-leave, applied only after the turn delivers its visible report; a seal or any participant's configured stop word ends follow; stop words still cancel running work only for their own sender. The out-of-tree provider and reviewed grants must ship before route opt-in.
 
 Discord Gateway v10 is another outbound WebSocket transport. The daemon discovers the service URL through authenticated `GET /api/v10/gateway/bot`, requests the non-privileged `GUILD_MESSAGES` and `DIRECT_MESSAGES` intents, adds the privileged `MESSAGE_CONTENT` intent when the transport sets `messageContent: true`, and identifies after Hello. It jitters the first heartbeat, requires each heartbeat ACK, tracks dispatch sequence, resumes a live session after reconnect, honors Invalid Session and identify/session-start limits, and treats Discord's fatal close codes as terminal transport failures; close 4014 (disallowed intents) stops the transport with an error naming the Developer Portal toggle. No public endpoint is required. Without `messageContent`, Discord exposes content and attachments only in DMs and in guild messages whose structured `mentions` array names the bot; with it, every message the bot can see arrives with its text, and addressing still decides which ones wake a session.
 

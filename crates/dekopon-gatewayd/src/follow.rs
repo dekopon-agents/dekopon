@@ -29,6 +29,8 @@ const MAX_WAIT: Duration = Duration::from_secs(120);
 
 struct Pending {
     message: InboundMessage,
+    speakers: Vec<dekopon_core::ExternalSubject>,
+    text: String,
     first: tokio::time::Instant,
     latest: tokio::time::Instant,
 }
@@ -46,23 +48,25 @@ impl Debounce {
         now: tokio::time::Instant,
     ) -> bool {
         if let Some(pending) = self.pending.get_mut(&key) {
-            if pending.message.subject == message.subject {
-                let combined = format!("{}\n\n{}", pending.message.text, message.text);
-                pending.message = message;
-                let end = combined
-                    .char_indices()
-                    .map(|(index, _)| index)
-                    .take_while(|index| *index <= MAX_INBOUND_TEXT_BYTES)
-                    .last()
-                    .unwrap_or(0);
-                pending.message.text = if combined.len() <= MAX_INBOUND_TEXT_BYTES {
-                    combined
-                } else {
-                    combined[..end].to_owned()
-                };
-            } else {
-                pending.message = message;
+            let speaker = pending
+                .speakers
+                .iter()
+                .position(|subject| subject == &message.subject);
+            let label = speaker.unwrap_or(pending.speakers.len()) + 1;
+            if pending.text.len() < MAX_INBOUND_TEXT_BYTES {
+                if speaker.is_none() {
+                    pending.speakers.push(message.subject.clone());
+                }
+                pending
+                    .text
+                    .push_str(&format!("\n\n[follow speaker {label}]\n{}", message.text));
+                let end = crate::transport::floor_boundary(
+                    &pending.text,
+                    MAX_INBOUND_TEXT_BYTES.min(pending.text.len()),
+                );
+                pending.text.truncate(end);
             }
+            pending.message = message;
             pending.latest = now;
             return true;
         }
@@ -72,6 +76,11 @@ impl Debounce {
         self.pending.insert(
             key,
             Pending {
+                speakers: vec![message.subject.clone()],
+                text: crate::transport::bound_inbound(&format!(
+                    "[follow speaker 1]\n{}",
+                    message.text
+                )),
                 message,
                 first: now,
                 latest: now,
@@ -111,6 +120,7 @@ impl Debounce {
         keys.into_iter()
             .filter_map(|key| self.pending.remove(&key))
             .map(|mut pending| {
+                pending.message.text = pending.text;
                 if let MessageId::Native(id) = pending.message.message_id {
                     pending.message.message_id = MessageId::Follow(id);
                 }
@@ -125,6 +135,25 @@ pub(crate) enum FollowTicket {
     Active { until_ms: u64 },
     Lapsed,
     Absent,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LeaveCause {
+    Reaction,
+    Mute,
+    StopWord,
+    Lapse,
+}
+
+impl LeaveCause {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Reaction => "reaction",
+            Self::Mute => "mute",
+            Self::StopWord => "stop-word",
+            Self::Lapse => "lapse",
+        }
+    }
 }
 
 pub(crate) struct FollowTable {
@@ -181,6 +210,12 @@ impl FollowTable {
         for old in lapsed {
             self.journal.remove_follow(&old)?;
             self.resident.lock().remove(&old);
+            tracing::info!(
+                audit.event = "gateway.follow",
+                operation = "banished",
+                cause = "lapse",
+                "gateway.follow"
+            );
         }
         {
             let writer = self.writer.lock();
@@ -228,11 +263,13 @@ impl FollowTable {
         Ok(())
     }
 
-    pub(crate) fn suspend(&self, key: &str) {
+    pub(crate) fn suspend(&self, key: &str) -> bool {
         let mut writer = self.writer.lock();
-        if self.resident.lock().remove(key).is_some() {
+        let removed = self.resident.lock().remove(key).is_some();
+        if removed {
             writer.insert(key.to_owned());
         }
+        removed
     }
 }
 

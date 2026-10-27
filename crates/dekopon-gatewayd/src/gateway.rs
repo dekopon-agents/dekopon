@@ -48,21 +48,35 @@ pub(crate) struct ServingGeneration {
 }
 
 #[derive(Clone)]
-pub(crate) struct CurrentGeneration(Arc<ArcSwap<ServingGeneration>>);
+pub(crate) struct CurrentGeneration(
+    Arc<ArcSwap<ServingGeneration>>,
+    Arc<std::sync::OnceLock<Option<Arc<follow::FollowTable>>>>,
+);
 
 impl CurrentGeneration {
     pub(crate) fn load(&self) -> Arc<ServingGeneration> {
         self.0.load_full()
     }
     pub(crate) fn boot(routes: Arc<RoutingTable>, stop_words: Arc<Vec<String>>) -> Self {
-        Self(Arc::new(ArcSwap::from_pointee(ServingGeneration {
-            routes,
-            stop_words,
-            proxy: None,
-            _sources: None,
-            _digest: String::new(),
-            _broker_digest: String::new(),
-        })))
+        Self(
+            Arc::new(ArcSwap::from_pointee(ServingGeneration {
+                routes,
+                stop_words,
+                proxy: None,
+                _sources: None,
+                _digest: String::new(),
+                _broker_digest: String::new(),
+            })),
+            Arc::default(),
+        )
+    }
+
+    pub(crate) fn set_follow(&self, table: Option<Arc<follow::FollowTable>>) {
+        self.1.get_or_init(|| table);
+    }
+
+    pub(crate) fn follow_table(&self) -> Option<&Arc<follow::FollowTable>> {
+        self.1.get().and_then(Option::as_ref)
     }
 
     pub(crate) fn admits_github(
@@ -283,7 +297,7 @@ impl Gateway {
     }
 
     pub(crate) fn proxy_router(&self) -> axum::Router {
-        ModelProxy::router_current(CurrentGeneration(Arc::clone(&self.active)))
+        ModelProxy::router_current(CurrentGeneration(Arc::clone(&self.active), Arc::default()))
     }
 
     #[cfg(test)]
@@ -433,11 +447,14 @@ impl Gateway {
                     for message in follow_pending.due(tokio::time::Instant::now()) {
                         let generation = self.active.load();
                         if let Some(route) = generation.routes.route(&message)
+                            && route.follow
                             && let Some(table) = self.runner.follow.as_ref()
                         {
                             let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &message.conversation.key());
-                            if matches!(table.ticket(&key, SystemTime::now()), follow::FollowTicket::Active { .. }) {
-                                self.start_session(&mut sessions, &generation, message);
+                            match table.ticket(&key, SystemTime::now()) {
+                                follow::FollowTicket::Active { .. } => self.start_session(&mut sessions, &generation, message),
+                                follow::FollowTicket::Lapsed => self.leave_follow(&mut sessions, &mut follow_pending, key, route.route_index, follow::LeaveCause::Lapse),
+                                follow::FollowTicket::Absent => {},
                             }
                         }
                     }
@@ -501,6 +518,13 @@ impl Gateway {
                                 self.dispatch_delivery(&mut sessions, *message, ticket);
                             });
                         }
+                        TransportEvent::FollowLeave { transport, conversation, received } => {
+                            let generation = self.active.load();
+                            for route in generation.routes.follow_routes(&transport, &conversation) {
+                                let key = follow::follow_key(&route.transport, route.agent.as_str(), &route.conversation, &conversation.key());
+                                received.in_scope(|| self.leave_follow(&mut sessions, &mut follow_pending, key, route.route_index, follow::LeaveCause::Reaction));
+                            }
+                        }
                         TransportEvent::CancelRequested(request) => {
                             if collector.cancel(&request) {
                                 tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via), "gateway.input.stop.requested");
@@ -559,11 +583,24 @@ impl Gateway {
         // whose person still owns jobs, and a channel stop word like the bot mention plus stop would
         // otherwise be dropped as unaddressed; only this sender's running or pending work may be stopped.
         let generation = self.active.load();
-        if transport::is_stop_word(
-            self.identities.get(&message.transport),
-            &message.text,
-            &generation.stop_words,
-        ) {
+        let follow_mute = message.transport_kind
+            == dekopon_broker_protocol::ChatTransportKind::Slack
+            && generation
+                .routes
+                .route(&message)
+                .is_some_and(|route| route.follow)
+            && transport::is_stop_word(
+                self.identities.get(&message.transport),
+                &message.text,
+                &["mute".to_owned()],
+            );
+        if follow_mute
+            || transport::is_stop_word(
+                self.identities.get(&message.transport),
+                &message.text,
+                &generation.stop_words,
+            )
+        {
             let mut banished = false;
             if let Some(route) = generation.routes.route(&message)
                 && route.follow
@@ -575,33 +612,18 @@ impl Gateway {
                     &route.conversation,
                     &message.conversation.key(),
                 );
-                follow_pending.remove(&key);
-                if matches!(
-                    table.ticket(&key, SystemTime::now()),
-                    follow::FollowTicket::Active { .. }
-                ) {
-                    table.suspend(&key);
-                    banished = true;
-                    let table = Arc::clone(table);
-                    let index = route.route_index;
-                    sessions.spawn(async move {
-                        match tokio::task::spawn_blocking(move || table.leave(&key)).await {
-                            Ok(Ok(())) => tracing::info!(
-                                audit.event = "gateway.follow",
-                                operation = "banished",
-                                route = index,
-                                "gateway.follow"
-                            ),
-                            _ => tracing::warn!(
-                                audit.event = "gateway.follow",
-                                operation = "refused",
-                                route = index,
-                                reason = "persistence",
-                                "gateway.follow"
-                            ),
-                        }
-                    });
-                }
+                banished = table.ticket(&key, SystemTime::now()) != follow::FollowTicket::Absent;
+                self.leave_follow(
+                    sessions,
+                    follow_pending,
+                    key,
+                    route.route_index,
+                    if follow_mute {
+                        follow::LeaveCause::Mute
+                    } else {
+                        follow::LeaveCause::StopWord
+                    },
+                );
             }
             let request = CancelRequest {
                 transport: message.transport.clone(),
@@ -707,8 +729,11 @@ impl Gateway {
         }
         if message.conversation.kind != ConversationKind::DirectMessage
             && !addressed
-            && !inherited_thread
-            && !collector.is_native_continuation(&RouteIdentity::of(route, &message), &message)
+            && ((route.follow
+                && message.transport_kind == dekopon_broker_protocol::ChatTransportKind::Slack)
+                || (!inherited_thread
+                    && !collector
+                        .is_native_continuation(&RouteIdentity::of(route, &message), &message)))
         {
             if let Some(route) = generation.routes.route(&message)
                 && route.follow
@@ -720,20 +745,30 @@ impl Gateway {
                     &route.conversation,
                     &message.conversation.key(),
                 );
-                if matches!(
-                    table.ticket(&key, SystemTime::now()),
-                    follow::FollowTicket::Active { .. }
-                ) {
-                    if !follow_pending.offer(key, message, tokio::time::Instant::now()) {
-                        tracing::info!(
-                            audit.event = "gateway.follow",
-                            operation = "refused",
-                            route = route_id,
-                            reason = "capacity",
-                            "gateway.follow"
-                        );
+                match table.ticket(&key, SystemTime::now()) {
+                    follow::FollowTicket::Active { .. } => {
+                        if !follow_pending.offer(key, message, tokio::time::Instant::now()) {
+                            tracing::info!(
+                                audit.event = "gateway.follow",
+                                operation = "refused",
+                                route = route_id,
+                                reason = "capacity",
+                                "gateway.follow"
+                            );
+                        }
+                        return;
                     }
-                    return;
+                    follow::FollowTicket::Lapsed => {
+                        self.leave_follow(
+                            sessions,
+                            follow_pending,
+                            key,
+                            route_id,
+                            follow::LeaveCause::Lapse,
+                        );
+                        return;
+                    }
+                    follow::FollowTicket::Absent => {}
                 }
             }
             tracing::debug!(
@@ -768,6 +803,43 @@ impl Gateway {
                 }
             }
         }
+    }
+
+    fn leave_follow(
+        &self,
+        sessions: &mut JoinSet<()>,
+        pending: &mut follow::Debounce,
+        key: String,
+        route: usize,
+        cause: follow::LeaveCause,
+    ) {
+        pending.remove(&key);
+        let Some(table) = self.runner.follow.as_ref() else {
+            return;
+        };
+        if !table.suspend(&key) {
+            return;
+        }
+        tracing::info!(
+            audit.event = "gateway.follow",
+            operation = "banished",
+            cause = cause.label(),
+            route,
+            "gateway.follow"
+        );
+        let table = Arc::clone(table);
+        sessions.spawn(async move {
+            match tokio::task::spawn_blocking(move || table.leave(&key)).await {
+                Ok(Ok(())) => {}
+                _ => tracing::warn!(
+                    audit.event = "gateway.follow",
+                    operation = "refused",
+                    route,
+                    reason = "persistence",
+                    "gateway.follow"
+                ),
+            }
+        });
     }
 
     pub(crate) fn dispatch_delivery(
@@ -1340,7 +1412,7 @@ mod snapshot_tests {
         let serving = tokio::spawn(async move {
             axum::serve(
                 listener,
-                ModelProxy::router_current(CurrentGeneration(routed)),
+                ModelProxy::router_current(CurrentGeneration(routed, Arc::default())),
             )
             .await
             .unwrap()

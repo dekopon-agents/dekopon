@@ -3,9 +3,10 @@
 This directory contains the Slack app profiles used by the
 [conditional writer](../conditional-write/README.md). Both receive direct messages and
 explicit channel mentions over Socket Mode, open supported attachments on demand, and publish
-best-effort in-flight liveness. The Agent profile additionally receives channel history so one
-freshly authorized sender can continue in that exact owned thread without repeating the mention;
-all other ambient messages are dropped before routing. No public endpoint is needed.
+best-effort in-flight liveness. Both profiles receive channel history for opted-in `follow: true`
+routes. The Agent profile also lets a freshly authorized sender continue in an exact owned thread
+without repeating the mention on routes without follow. Other ambient messages are dropped before
+routing. No public endpoint is needed.
 
 Choose the profile before creating the app:
 
@@ -46,8 +47,8 @@ bounded provider-attachment replies; remove it only when no route grants asset.s
 `reactions:write` for the explicitly configured fallback; remove that scope and leave liveness off
 if the classic deployment wants final replies only. The Agent profile additionally adds
 `agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
-requires for Agent View. It also adds `channels:history`/`message.channels` and
-`groups:history`/`message.groups` for exact owned-thread continuation. Opening App Home is not
+requires for Agent View. Both profiles include `channels:history`/`message.channels` and
+`groups:history`/`message.groups` for thread follow; Agent also uses them for owned-thread continuation. Opening App Home is not
 itself routed as a prompt, and ambient channel-history events are discarded inside the transport.
 
 ### Generate the app-level token (`xapp-…`)
@@ -197,3 +198,22 @@ attestor:
 An unmapped sender is refused before any model call. In channels, a new conversation responds only
 when mentioned. An Agent channel thread then accepts unmentioned follow-ups only from each exact
 sender it already freshly authorized there; direct messages route normally.
+
+## Follow a thread
+
+With `sessions.journal` configured, a Slack route selecting `[channel, thread]` may set
+`follow: true`. An authorized `follow stay` opens one thread ticket for all speakers.
+Unmentioned replies batch for 30 seconds of quiet or two minutes maximum, retaining labelled
+text from every speaker within the text bound. Each batch runs as its newest authenticated
+speaker under fresh broker authorization, including the mapped channel space's restrictions.
+The reply is optional: silence is the default, and follow messages never steer running work.
+Only a delivered reply renews the 24-hour ticket.
+
+Both manifests include the history scopes and channel-message events required to hear replies,
+plus `reactions:read`, `reaction_added`, and `users:read` for human thumbs-down handling.
+Reinstall the app after changing scopes. `mute`, configured stop words, an authorized `follow leave`,
+a human thumbs-down on an agent message in the thread, or expiry ends following. Bot reactions
+and reactions on other messages are ignored. A mention starts an addressed turn again; its
+authorized `follow stay` restores following. Leaving does not let another person cancel the
+asker's running session. The [gateway contract](../../docs/gatewayd.md#slack-thread-follow)
+describes the admission and installation requirements.
