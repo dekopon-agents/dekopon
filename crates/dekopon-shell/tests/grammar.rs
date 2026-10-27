@@ -1158,6 +1158,32 @@ fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
 }
 
 #[test]
+fn substitution_buffer_writes_survive_capture() {
+    assert_eq!(
+        output(
+            "printf before > existing; ignored=$(printf after > existing; printf created > fresh; printf appended >> existing); cat existing; printf ':'; cat fresh"
+        ),
+        "afterappended:created"
+    );
+}
+
+#[test]
+fn substitution_status_is_visible_to_later_argument_expansions() {
+    assert_eq!(output(r#"true; echo "$(false)" "$?""#), " 1");
+    assert_eq!(output(r#"f() { return 3; }; true; echo "$(f)" "$?""#), " 3");
+}
+
+#[test]
+fn substitution_status_is_visible_to_later_conditional_operands() {
+    assert_eq!(
+        output(
+            r#"cmd() { false; }; true; if [[ -n "$(cmd)" || $? -eq 1 ]]; then echo selected; else echo missed; fi"#
+        ),
+        "selected"
+    );
+}
+
+#[test]
 fn a_literal_assignment_preserves_the_last_substitution_status() {
     assert_eq!(output("a=$(false) b=literal; echo $?"), "1");
 }
