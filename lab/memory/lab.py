@@ -128,18 +128,11 @@ class Lab:
         model = lambda name, model_id, classes, timeout: {  # noqa: E731
             "name": name, "kind": "openaiCompatible", "model": model_id, "endpoint": endpoint,
             "apiKeyEnv": "LAB_MODEL_KEY", "timeoutMs": timeout, "classes": classes, "stream": False}
-        uncapped = {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped",
-                    "toolResult": "uncapped"}
-        summary_memory = {"mode": "persistent", "recall": "journal"}
-        if self.summaries_on:
-            summary_memory["policy"] = {
-                "capture": uncapped,
-                "routines": [{"id": "original", "kind": "original"},
-                             {"id": "summary", "kind": "progressiveOneShot", "model": "summarizer",
-                              "parts": [{"id": "core", "maxBytes": 256},
-                                        {"id": "detail", "maxBytes": 1024}]}],
-                "retain": ["original", "summary"],
-                "selection": {"mode": "fixed", "routine": "summary"}}
+        capture = {"maxItemBytes": 4 * 1024 * 1024}
+        summary_memory = {"mode": "persistent", "recall": "journal", "capture": capture,
+                          "selection": "ladder",
+                          "summaries": {"model": "summarizer", "parts": [256, 1024]}
+                          if self.summaries_on else "off"}
         route = lambda conversation, memory: {  # noqa: E731
             "transport": "dev", "conversation": {"kind": ["directMessage"], "ids": [conversation]},
             "agent": AGENT, "memory": memory, "limits": {"maxSteps": 4, "maxCapabilityCalls": 4}}
@@ -153,7 +146,8 @@ class Lab:
             "models": [self.chat_model(model),
                        self.summarizer_model(model)],
             "routes": [route("summary", summary_memory),
-                       route("plain", {"mode": "persistent", "recall": "journal"}),
+                       route("plain", {"mode": "persistent", "recall": "journal", "capture": capture,
+                                       "summaries": "off"}),
                        route("none", {"mode": "persistent", "recall": "none"})],
             "sessions": {"journal": {"path": str(self.journal)},
                          "assets": {"path": str(self.dirs["gateway"] / "assets")}},

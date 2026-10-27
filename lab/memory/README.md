@@ -37,8 +37,8 @@ routine, 20 s timeout) and journal memory on, with three routes selected by conv
 
 | Conversation | Memory |
 |---|---|
-| `summary` | `recall: journal`, policy retaining `original` and a `progressiveOneShot` summary (`core` 256 B, `detail` 1 KiB), fixed selection of the summary |
-| `plain` | `recall: journal`, default policy (original only, no model call) |
+| `summary` | `recall: journal`, `summaries` on the `summarizer` model with parts of 256 B and 1 KiB, ladder selection |
+| `plain` | `recall: journal`, `summaries: off` (original only, no model call) |
 | `none` | `recall: none` |
 
 ## Scenarios
