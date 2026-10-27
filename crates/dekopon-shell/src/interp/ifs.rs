@@ -13,6 +13,7 @@ pub(super) struct Ifs {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Kind {
     Text,
+    LeadingByte,
     Whitespace,
     Delimiter,
 }
@@ -36,7 +37,7 @@ pub(super) enum Action {
 impl Boundary {
     pub(super) fn accept(&mut self, kind: Kind) -> Action {
         match kind {
-            Kind::Text => {
+            Kind::Text | Kind::LeadingByte => {
                 let action = match self {
                     Self::Text => Action::Append,
                     Self::Start | Self::ArrayStart | Self::Whitespace | Self::Delimiter => {
@@ -96,11 +97,30 @@ impl Ifs {
 
     fn kind(&self, character: char) -> Kind {
         if !self.delimiters.contains(&character) {
-            Kind::Text
+            let mut encoded = [0; 4];
+            if !character.is_ascii()
+                && self.bytes[usize::from(character.encode_utf8(&mut encoded).as_bytes()[0])]
+            {
+                Kind::LeadingByte
+            } else {
+                Kind::Text
+            }
         } else if matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}') {
             Kind::Whitespace
         } else {
             Kind::Delimiter
+        }
+    }
+
+    pub(super) fn contains(&self, character: char) -> bool {
+        self.delimiters.contains(&character)
+    }
+
+    pub(super) fn byte_kind(&self, byte: u8) -> Kind {
+        if self.bytes[usize::from(byte)] {
+            Kind::Delimiter
+        } else {
+            Kind::Text
         }
     }
 
@@ -147,7 +167,7 @@ impl Ifs {
             .peekable();
         std::iter::from_fn(move || {
             let (kind, mut range) = characters.next()?;
-            if kind != Kind::Delimiter {
+            if matches!(kind, Kind::Text | Kind::Whitespace) {
                 while characters.peek().is_some_and(|(next, _)| *next == kind) {
                     if let Some((_, next)) = characters.next() {
                         range.end = next.end;
@@ -182,6 +202,8 @@ impl Ifs {
             })
         });
         let mut cursor = ReadCursor {
+            ifs: self,
+            text,
             spans: spans.peekable(),
             continuation: None,
         };
@@ -225,16 +247,23 @@ enum Whitespace {
     SpaceTabNewline,
 }
 
-struct ReadCursor<I: Iterator<Item = (Kind, Range<usize>)>> {
+struct ReadCursor<'a, I: Iterator<Item = (Kind, Range<usize>)>> {
+    ifs: &'a Ifs,
+    text: &'a str,
     spans: std::iter::Peekable<I>,
     continuation: Option<Range<usize>>,
 }
 
-impl<I: Iterator<Item = (Kind, Range<usize>)>> ReadCursor<I> {
+impl<I: Iterator<Item = (Kind, Range<usize>)>> ReadCursor<'_, I> {
     fn peek(&mut self) -> Option<(Kind, Range<usize>)> {
         self.continuation.as_ref().map_or_else(
             || self.spans.peek().cloned(),
-            |range| Some((Kind::Delimiter, range.start..range.start + 1)),
+            |range| {
+                Some((
+                    self.ifs.byte_kind(self.text.as_bytes()[range.start]),
+                    range.start..range.start + 1,
+                ))
+            },
         )
     }
 
@@ -281,7 +310,7 @@ impl<I: Iterator<Item = (Kind, Range<usize>)>> ReadCursor<I> {
         self.skip_whitespace(text, Whitespace::All);
         let start = self.offset(text.len());
         let mut end = start;
-        while let Some((Kind::Text, range)) = self.peek() {
+        while let Some((Kind::Text | Kind::LeadingByte, range)) = self.peek() {
             end = range.end;
             self.consume();
         }
@@ -290,7 +319,11 @@ impl<I: Iterator<Item = (Kind, Range<usize>)>> ReadCursor<I> {
             .is_some_and(|(kind, _)| kind == Kind::Whitespace);
         self.consume();
         self.skip_whitespace(text, Whitespace::SpaceTabNewline);
-        if whitespace && self.peek().is_some_and(|(kind, _)| kind == Kind::Delimiter) {
+        if whitespace
+            && self
+                .peek()
+                .is_some_and(|(kind, _)| matches!(kind, Kind::Delimiter | Kind::LeadingByte))
+        {
             // Bash consumes one byte here, even for a multibyte IFS character.
             self.consume_byte();
             self.skip_whitespace(text, Whitespace::All);

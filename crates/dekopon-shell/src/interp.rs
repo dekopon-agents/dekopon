@@ -339,19 +339,20 @@ impl StderrCapture {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FrameKind {
+    #[default]
+    Function,
+    Prefix,
+}
+
 #[derive(Debug, Default)]
 struct Frame {
+    kind: FrameKind,
     locals: BTreeMap<String, Option<Value>>,
     positional: Vec<Value>,
     local_charges: BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
     _positional_charges: Vec<dekopon_process::RetainedBytes>,
-}
-
-struct SavedVariable {
-    name: String,
-    value: Option<Value>,
-    charge: Option<Vec<dekopon_process::RetainedBytes>>,
-    local: Option<usize>,
 }
 
 pub(crate) fn run(
@@ -530,8 +531,25 @@ enum ExpansionOutput {
 }
 
 struct FieldExpansion<'a> {
-    fields: &'a mut Vec<String>,
-    separated: &'a mut Boundary,
+    spans: &'a mut Vec<ExpansionSpan>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Protection {
+    Unquoted,
+    Quoted,
+    Checked,
+}
+
+enum SpanContent {
+    Text(String, Protection),
+    Elements(Vec<Value>, String),
+    Boundary,
+}
+
+struct ExpansionSpan {
+    content: SpanContent,
+    _charge: dekopon_process::RetainedBytes,
 }
 
 struct Evaluator<'a> {
@@ -568,6 +586,7 @@ struct Evaluator<'a> {
 }
 
 struct ScopedFrame {
+    kind: FrameKind,
     locals: BTreeMap<String, Option<Value>>,
     positional: Vec<Value>,
 }
@@ -799,56 +818,35 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn save_variable(&mut self, name: &str) -> SavedVariable {
-        let value = self.lookup(name).cloned();
-        let local = self
-            .frames
-            .iter()
-            .rposition(|frame| frame.locals.contains_key(name));
-        let charge = match local {
-            Some(index) => self.frames[index].local_charges.remove(name),
-            None => self.global_charges.remove(name),
-        };
-        SavedVariable {
-            name: name.to_owned(),
-            value,
-            charge,
-            local,
+    fn assign_prefix(
+        &mut self,
+        name: &str,
+        result: CommandResult,
+        scope: &mut Option<usize>,
+    ) -> Result<(), LimitExceeded> {
+        if scope.is_none() {
+            *scope = Some(self.frames.len());
+            self.frames.push(Frame {
+                kind: FrameKind::Prefix,
+                ..Frame::default()
+            });
         }
-    }
-
-    fn restore(&mut self, saved: SavedVariable) {
-        let SavedVariable {
-            name,
-            value,
-            charge,
-            local,
-        } = saved;
-        if let Some(index) = local {
-            if let Some(frame) = self.frames.get_mut(index) {
-                frame.locals.insert(name.clone(), value);
-                frame.local_charges.remove(&name);
-                if let Some(charge) = charge {
-                    frame.local_charges.insert(name, charge);
-                }
-            }
-        } else {
-            if self.globals.get(&name) != value.as_ref() {
-                let globals = Arc::make_mut(&mut self.globals);
-                globals.remove(&name);
-                if let Some(value) = value {
-                    globals.insert(name.clone(), value);
-                }
-            }
-            self.global_charges.remove(&name);
-            if let Some(charge) = charge {
-                self.global_charges.insert(name, charge);
-            }
+        if let Some(frame) = self.frames.last_mut() {
+            frame.locals.insert(name.to_owned(), None);
         }
+        self.assign(name, result)
     }
 
     fn declare_local(&mut self, name: &str, value: Option<Value>) -> Result<(), LimitExceeded> {
-        if let Some(frame) = self.frames.last_mut() {
+        if let Some(frame) = self
+            .frames
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.kind == FrameKind::Function)
+        {
+            if value.is_none() && frame.locals.contains_key(name) {
+                return Ok(());
+            }
             frame.locals.remove(name);
             frame.local_charges.remove(name);
             let charge = self
@@ -862,7 +860,9 @@ impl<'a> Evaluator<'a> {
 
     fn positional(&self) -> &[Value] {
         self.frames
-            .last()
+            .iter()
+            .rev()
+            .find(|frame| frame.kind == FrameKind::Function)
             .map_or(&[][..], |frame| frame.positional.as_slice())
     }
 
@@ -1572,6 +1572,7 @@ impl<'a> Evaluator<'a> {
                 .map(|value| self.budget.charge_value_bytes(value_bytes(value)))
                 .collect::<Result<Vec<_>, _>>()?;
             frames.push(Frame {
+                kind: frame.kind,
                 locals: frame.locals.clone(),
                 positional: frame.positional.clone(),
                 local_charges,
@@ -1629,7 +1630,12 @@ impl<'a> Evaluator<'a> {
             let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
             self.buffer_charges.insert(name.clone(), vec![charge]);
         }
-        for ScopedFrame { locals, positional } in frames {
+        for ScopedFrame {
+            kind,
+            locals,
+            positional,
+        } in frames
+        {
             let mut local_charges = BTreeMap::new();
             for (name, value) in &locals {
                 local_charges.insert(
@@ -1645,6 +1651,7 @@ impl<'a> Evaluator<'a> {
                 .map(|value| self.budget.charge_value_bytes(value_bytes(value)))
                 .collect::<Result<Vec<_>, _>>()?;
             self.frames.push(Frame {
+                kind,
                 locals,
                 positional,
                 local_charges,
@@ -1664,6 +1671,7 @@ impl<'a> Evaluator<'a> {
                 .frames
                 .iter()
                 .map(|frame| ScopedFrame {
+                    kind: frame.kind,
                     locals: frame.locals.clone(),
                     positional: frame.positional.clone(),
                 })
@@ -2032,7 +2040,7 @@ impl<'a> Evaluator<'a> {
             );
 
         let transient = !argv.is_empty();
-        let mut restore = Vec::new();
+        let mut restore = None;
         let mut assignment_status = ExitCode::SUCCESS;
         self.last_substitution_status = ExitCode::SUCCESS;
         for assignment in &command.assignments {
@@ -2045,10 +2053,12 @@ impl<'a> Evaluator<'a> {
                 }
             };
             assignment_status = self.last_substitution_status;
-            if transient {
-                restore.push(self.save_variable(&assignment.name));
-            }
-            if let Err(limit) = self.assign(&assignment.name, value) {
+            let assigned = if transient {
+                self.assign_prefix(&assignment.name, value, &mut restore)
+            } else {
+                self.assign(&assignment.name, value)
+            };
+            if let Err(limit) = assigned {
                 self.restore_all(restore);
                 return Err(limit.into());
             }
@@ -2250,9 +2260,9 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn restore_all(&mut self, restore: Vec<SavedVariable>) {
-        for saved in restore.into_iter().rev() {
-            self.restore(saved);
+    fn restore_all(&mut self, restore: Option<usize>) {
+        if let Some(depth) = restore {
+            self.frames.truncate(depth);
         }
     }
 
@@ -3170,7 +3180,11 @@ impl<'a> Evaluator<'a> {
                 }
             },
             "local" => {
-                if self.frames.is_empty() {
+                if !self
+                    .frames
+                    .iter()
+                    .any(|frame| frame.kind == FrameKind::Function)
+                {
                     self.write_line("dekopon-shell: local: only valid inside a function");
                     return Ok(Some(Executed::Result(CommandResult::status(
                         ExitCode::SYNTAX,
@@ -3187,7 +3201,12 @@ impl<'a> Evaluator<'a> {
                 Executed::Result(CommandResult::status(ExitCode::SUCCESS))
             }
             "shift" => {
-                let Some(frame) = self.frames.last_mut() else {
+                let Some(frame) = self
+                    .frames
+                    .iter_mut()
+                    .rev()
+                    .find(|frame| frame.kind == FrameKind::Function)
+                else {
                     self.write_line("dekopon-shell: shift: only valid inside a function");
                     return Ok(Some(Executed::Result(CommandResult::status(
                         ExitCode::SYNTAX,
@@ -3210,13 +3229,21 @@ impl<'a> Evaluator<'a> {
             }
             "unset" => {
                 for name in arguments {
-                    if let Some(frame) = self
+                    if let Some(index) = self
                         .frames
-                        .iter_mut()
-                        .rev()
-                        .find(|frame| frame.locals.contains_key(name))
+                        .iter()
+                        .rposition(|frame| frame.locals.contains_key(name))
                     {
-                        frame.locals.insert(name.clone(), None);
+                        let current = self.frames[index].kind == FrameKind::Function
+                            && !self.frames[index + 1..]
+                                .iter()
+                                .any(|frame| frame.kind == FrameKind::Function);
+                        let frame = &mut self.frames[index];
+                        if current {
+                            frame.locals.insert(name.clone(), None);
+                        } else {
+                            frame.locals.remove(name);
+                        }
                         frame.local_charges.remove(name);
                     } else {
                         self.unshare_globals()?;
@@ -3257,6 +3284,7 @@ impl<'a> Evaluator<'a> {
                 .map(|argument| this.budget.charge_value_bytes(value_bytes(argument)))
                 .collect::<Result<Vec<_>, _>>()?;
             this.frames.push(Frame {
+                kind: FrameKind::Function,
                 locals: BTreeMap::new(),
                 positional,
                 local_charges: BTreeMap::new(),
@@ -3464,99 +3492,255 @@ impl<'a> Evaluator<'a> {
         word: &Word,
         output: ExpansionOutput,
     ) -> Result<Vec<String>, CommandFailure> {
-        let mut fields = Vec::new();
-        let mut separated = Boundary::Start;
-        for part in &word.parts {
-            self.expand_unquoted_part(part, &mut fields, &mut separated, output)?;
+        match output {
+            ExpansionOutput::Fields | ExpansionOutput::Value => {
+                let mut spans = Vec::new();
+                for part in &word.parts {
+                    self.collect_field_part(part, &mut spans, output)?;
+                }
+                self.split_spans(spans)
+            }
+            ExpansionOutput::Legacy | ExpansionOutput::Unsplit => {
+                self.expand_preserved_fields(&word.parts, output)
+            }
         }
-        Ok(fields)
     }
 
-    fn expand_unquoted_part(
+    fn record_text(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        text: &str,
+        protection: Protection,
+    ) -> Result<(), CommandFailure> {
+        self.budget.charge_step()?;
+        let charge = self
+            .budget
+            .charge_value_bytes((text.len() + size_of::<ExpansionSpan>()) as u64)?;
+        spans.push(ExpansionSpan {
+            content: SpanContent::Text(text.to_owned(), protection),
+            _charge: charge,
+        });
+        Ok(())
+    }
+
+    fn record_value(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        value: &Value,
+    ) -> Result<(), CommandFailure> {
+        match value {
+            Value::Array(items) => {
+                let mut separator = self.ifs_separator();
+                if separator.is_empty() {
+                    separator.push(' ');
+                }
+                let charge = self.budget.charge_value_bytes(
+                    value_bytes(value) + (size_of::<ExpansionSpan>() + separator.len()) as u64,
+                )?;
+                spans.push(ExpansionSpan {
+                    content: SpanContent::Elements(items.clone(), separator),
+                    _charge: charge,
+                });
+            }
+            Value::Null => {}
+            Value::String(text) => self.record_text(spans, text, Protection::Unquoted)?,
+            Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
+                self.record_text(spans, &display(value), Protection::Unquoted)?
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_literal(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        text: &str,
+    ) -> Result<(), CommandFailure> {
+        let ifs = self.ifs()?;
+        let mut start = 0;
+        let mut protection = None;
+        for (offset, character) in text.char_indices() {
+            let next = if ifs.contains(character) {
+                Protection::Quoted
+            } else {
+                Protection::Unquoted
+            };
+            if let Some(previous) = protection
+                && previous != next
+            {
+                self.record_text(spans, &text[start..offset], previous)?;
+                start = offset;
+            }
+            protection = Some(next);
+        }
+        if let Some(protection) = protection {
+            self.record_text(spans, &text[start..], protection)?;
+        }
+        Ok(())
+    }
+
+    fn collect_field_part(
         &mut self,
         part: &WordPart,
-        fields: &mut Vec<String>,
-        separated: &mut Boundary,
+        spans: &mut Vec<ExpansionSpan>,
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
-        Ok(match part {
+        match part {
+            WordPart::Literal(text) => {
+                self.collect_literal(spans, text)?;
+                self.expansion_text(text, output)
+            }
+            WordPart::SingleQuoted(text) => {
+                self.record_text(spans, text, Protection::Quoted)?;
+                self.expansion_text(text, output)
+            }
             WordPart::Asset(number) => {
                 let text = number.to_string();
-                append_field(fields, separated, &text);
-                self.expansion_text(&text, output)?
-            }
-            WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
-                append_field(fields, separated, text);
-                self.expansion_text(text, output)?
-            }
-            WordPart::DoubleQuoted(parts) => {
-                let expanded = self.expand_quoted_fields(parts)?;
-                let value = match output {
-                    ExpansionOutput::Legacy
-                    | ExpansionOutput::Unsplit
-                    | ExpansionOutput::Fields => Value::Null,
-                    ExpansionOutput::Value => {
-                        let bytes = expanded.iter().map(String::len).sum::<usize>()
-                            + expanded.len().saturating_sub(1);
-                        self.expansion_charges
-                            .push(self.budget.charge_value_bytes(bytes as u64)?);
-                        Value::String(expanded.join(" "))
-                    }
-                };
-                let mut expanded = expanded.into_iter();
-                if let Some(first) = expanded.next() {
-                    append_field(fields, separated, &first);
-                }
-                fields.extend(expanded);
-                value
+                self.record_text(spans, &text, Protection::Quoted)?;
+                self.expansion_text(&text, output)
             }
             WordPart::Arithmetic(expression) => {
                 let text = render_number(self.evaluate_arithmetic(expression)?);
-                append_field(fields, separated, &text);
-                Value::String(text)
+                self.record_text(spans, &text, Protection::Quoted)?;
+                Ok(Value::String(text))
             }
-            WordPart::Parameter(parameter) => match output {
-                ExpansionOutput::Legacy | ExpansionOutput::Unsplit => {
-                    let value = self.parameter_value_with(parameter, output)?;
-                    append_unsplit_value(fields, separated, &value);
-                    value
-                }
-                ExpansionOutput::Fields | ExpansionOutput::Value => {
-                    self.expand_parameter_fields(parameter, fields, separated)?
-                }
-            },
-            WordPart::CommandSubstitution(program) => {
-                let result = self.run_substitution(program)?;
+            WordPart::DoubleQuoted(parts) => {
+                let start = spans.len();
+                self.collect_quoted_parts(parts, spans)?;
                 match output {
-                    ExpansionOutput::Legacy => match &result.value {
-                        Value::String(text) => {
-                            if !text.is_empty() {
-                                let mut lines = text.split('\n');
-                                if let Some(first) = lines.next() {
-                                    append_field(fields, separated, first);
-                                }
-                                fields.extend(lines.map(str::to_owned));
+                    ExpansionOutput::Value => {
+                        let mut text = String::new();
+                        for span in &spans[start..] {
+                            match &span.content {
+                                SpanContent::Text(part, _) => text.push_str(part),
+                                SpanContent::Boundary => text.push(' '),
+                                SpanContent::Elements(_, _) => {}
                             }
                         }
-                        Value::Null
-                        | Value::Bool(_)
-                        | Value::Number(_)
-                        | Value::Array(_)
-                        | Value::Object(_) => {
-                            append_unsplit_value(fields, separated, &result.value);
-                        }
-                    },
-                    ExpansionOutput::Unsplit => {
-                        append_unsplit_value(fields, separated, &result.value);
+                        self.expansion_text(&text, output)
                     }
-                    ExpansionOutput::Fields | ExpansionOutput::Value => {
-                        self.split_expansion(fields, separated, &result.value)?;
+                    ExpansionOutput::Fields
+                    | ExpansionOutput::Legacy
+                    | ExpansionOutput::Unsplit => Ok(Value::Null),
+                }
+            }
+            WordPart::Parameter(parameter) => self.expand_parameter_fields(parameter, spans),
+            WordPart::CommandSubstitution(program) => {
+                let result = self.run_substitution(program)?;
+                self.record_value(spans, &result.value)?;
+                self.expansion_charges.extend(result.retained);
+                Ok(result.value)
+            }
+        }
+    }
+
+    fn collect_quoted_parts(
+        &mut self,
+        parts: &[WordPart],
+        spans: &mut Vec<ExpansionSpan>,
+    ) -> Result<(), CommandFailure> {
+        if parts.is_empty() {
+            self.record_text(spans, "", Protection::Quoted)?;
+        }
+        for part in parts {
+            match part {
+                WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
+                    self.record_text(spans, text, Protection::Quoted)?
+                }
+                WordPart::Asset(number) => {
+                    self.record_text(spans, &number.to_string(), Protection::Quoted)?
+                }
+                WordPart::DoubleQuoted(inner) => self.collect_quoted_parts(inner, spans)?,
+                WordPart::Arithmetic(expression) => {
+                    let text = render_number(self.evaluate_arithmetic(expression)?);
+                    self.record_text(spans, &text, Protection::Quoted)?;
+                }
+                WordPart::Parameter(parameter) => {
+                    let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
+                    if splits_inside_quotes(parameter) {
+                        let elements = match value {
+                            Value::Array(items) => items,
+                            Value::Null => Vec::new(),
+                            scalar => vec![scalar],
+                        };
+                        let protection = match parameter {
+                            Parameter::Named { .. } => Protection::Checked,
+                            _ => Protection::Quoted,
+                        };
+                        for (index, element) in elements.iter().enumerate() {
+                            if index > 0 {
+                                let charge = self
+                                    .budget
+                                    .charge_value_bytes(size_of::<ExpansionSpan>() as u64)?;
+                                spans.push(ExpansionSpan {
+                                    content: SpanContent::Boundary,
+                                    _charge: charge,
+                                });
+                            }
+                            self.record_text(spans, &display(element), protection)?;
+                        }
+                    } else {
+                        self.record_text(spans, &quoted_text(&value), Protection::Quoted)?;
                     }
                 }
-                self.expansion_charges.extend(result.retained);
-                result.value
+                WordPart::CommandSubstitution(program) => {
+                    let result = self.run_substitution(program)?;
+                    self.record_text(spans, &quoted_text(&result.value), Protection::Quoted)?;
+                    self.expansion_charges.extend(result.retained);
+                }
             }
-        })
+        }
+        Ok(())
+    }
+
+    fn split_spans(&mut self, spans: Vec<ExpansionSpan>) -> Result<Vec<String>, CommandFailure> {
+        let ifs = self.ifs()?;
+        let split_elements = !self.ifs_separator().is_empty();
+        let mut fields = Vec::new();
+        let mut separated = Boundary::Start;
+        for span in spans {
+            match span.content {
+                SpanContent::Text(text, Protection::Unquoted) => {
+                    self.split_text_with(&mut fields, &mut separated, &text, &ifs)?
+                }
+                SpanContent::Text(
+                    text,
+                    protection @ (Protection::Quoted | Protection::Checked),
+                ) => {
+                    match protection {
+                        Protection::Checked => ifs.check_quoted(&text)?,
+                        Protection::Quoted | Protection::Unquoted => {}
+                    }
+                    self.expansion_charges.push(
+                        self.budget
+                            .charge_value_bytes((text.len() + size_of::<String>()) as u64)?,
+                    );
+                    append_field(&mut fields, &mut separated, &text);
+                }
+                SpanContent::Boundary => separated = Boundary::Start,
+                SpanContent::Elements(values, separator) => {
+                    if separated == Boundary::Start {
+                        separated = Boundary::ArrayStart;
+                    }
+                    for (index, value) in values.iter().enumerate() {
+                        if index > 0 {
+                            if split_elements {
+                                self.split_text_with(
+                                    &mut fields,
+                                    &mut separated,
+                                    &separator,
+                                    &ifs,
+                                )?;
+                            } else {
+                                separated = Boundary::Start;
+                            }
+                        }
+                        self.split_text_with(&mut fields, &mut separated, &display(value), &ifs)?;
+                    }
+                }
+            }
+        }
+        Ok(fields)
     }
 
     fn expansion_text(
@@ -3579,8 +3763,7 @@ impl<'a> Evaluator<'a> {
     fn expand_parameter_fields(
         &mut self,
         parameter: &Parameter,
-        fields: &mut Vec<String>,
-        separated: &mut Boundary,
+        spans: &mut Vec<ExpansionSpan>,
     ) -> Result<Value, CommandFailure> {
         match parameter {
             Parameter::Named {
@@ -3593,13 +3776,13 @@ impl<'a> Evaluator<'a> {
                     name,
                     indices,
                     modifier,
-                    Some(FieldExpansion { fields, separated }),
+                    Some(FieldExpansion { spans }),
                     ExpansionOutput::Unsplit,
                 )
             }),
             Parameter::AllPositional | Parameter::AllPositionalJoined => {
                 let values = self.positional().to_vec();
-                self.split_elements(fields, separated, &values)?;
+                self.record_value(spans, &Value::Array(values.clone()))?;
                 Ok(Value::Array(values))
             }
             Parameter::Named { length: true, .. }
@@ -3608,7 +3791,7 @@ impl<'a> Evaluator<'a> {
             | Parameter::LastStatus
             | Parameter::LastJob => {
                 let value = self.parameter_value(parameter)?;
-                self.split_expansion(fields, separated, &value)?;
+                self.record_value(spans, &value)?;
                 Ok(value)
             }
         }
@@ -3621,7 +3804,7 @@ impl<'a> Evaluator<'a> {
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         match split {
-            Some(split) => self.expand_replacement(word, split.fields, split.separated),
+            Some(split) => self.expand_replacement(word, split.spans),
             None => self.expansion_value(word, output),
         }
     }
@@ -3632,7 +3815,7 @@ impl<'a> Evaluator<'a> {
         split: Option<FieldExpansion<'_>>,
     ) -> Result<Value, CommandFailure> {
         if let Some(split) = split {
-            self.split_expansion(split.fields, split.separated, &value)?;
+            self.record_value(split.spans, &value)?;
         }
         Ok(value)
     }
@@ -3640,20 +3823,20 @@ impl<'a> Evaluator<'a> {
     fn expand_replacement(
         &mut self,
         word: &Word,
-        fields: &mut Vec<String>,
-        separated: &mut Boundary,
+        spans: &mut Vec<ExpansionSpan>,
     ) -> Result<Value, CommandFailure> {
         if let [WordPart::CommandSubstitution(_)] = word.parts.as_slice() {
             let result = self.assignment_value(word)?;
-            self.split_expansion(fields, separated, &result.value)?;
+            self.record_value(spans, &result.value)?;
             self.expansion_charges.extend(result.retained);
             return Ok(result.value);
         }
         let mut text = String::new();
         for part in &word.parts {
+            let start = spans.len();
             let value = match part {
                 WordPart::Literal(literal) => {
-                    self.split_text(fields, separated, literal)?;
+                    self.record_text(spans, literal, Protection::Unquoted)?;
                     self.expansion_text(literal, ExpansionOutput::Value)?
                 }
                 WordPart::Asset(_)
@@ -3662,11 +3845,15 @@ impl<'a> Evaluator<'a> {
                 | WordPart::Parameter(_)
                 | WordPart::CommandSubstitution(_)
                 | WordPart::Arithmetic(_) => {
-                    self.expand_unquoted_part(part, fields, separated, ExpansionOutput::Value)?
+                    self.collect_field_part(part, spans, ExpansionOutput::Value)?
                 }
             };
             if matches!(part, WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_)) {
-                self.ifs()?.check_quoted(&display(&value))?;
+                for span in &mut spans[start..] {
+                    if let SpanContent::Text(_, protection) = &mut span.content {
+                        *protection = Protection::Checked;
+                    }
+                }
             }
             if word.parts.len() == 1 {
                 return Ok(value);
@@ -3716,30 +3903,6 @@ impl<'a> Evaluator<'a> {
         )
     }
 
-    fn split_elements(
-        &mut self,
-        fields: &mut Vec<String>,
-        separated: &mut Boundary,
-        values: &[Value],
-    ) -> Result<(), CommandFailure> {
-        let separator = self.ifs_separator();
-        let ifs = self.ifs()?;
-        if *separated == Boundary::Start {
-            *separated = Boundary::ArrayStart;
-        }
-        for (index, value) in values.iter().enumerate() {
-            if index > 0 {
-                if separator.is_empty() {
-                    *separated = Boundary::Start;
-                } else {
-                    self.split_text_with(fields, separated, &separator, &ifs)?;
-                }
-            }
-            self.split_text_with(fields, separated, &display(value), &ifs)?;
-        }
-        Ok(())
-    }
-
     fn ifs_join(&mut self, values: &[Value]) -> Result<String, LimitExceeded> {
         let separator = self.ifs_separator();
         let bytes = values
@@ -3759,33 +3922,6 @@ impl<'a> Evaluator<'a> {
         Ok(text)
     }
 
-    fn split_expansion(
-        &mut self,
-        fields: &mut Vec<String>,
-        separated: &mut Boundary,
-        value: &Value,
-    ) -> Result<(), CommandFailure> {
-        match value {
-            Value::String(text) => self.split_text(fields, separated, text)?,
-            Value::Array(items) => self.split_elements(fields, separated, items)?,
-            Value::Null => {}
-            Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
-                self.split_text(fields, separated, &display(value))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn split_text(
-        &mut self,
-        fields: &mut Vec<String>,
-        separated: &mut Boundary,
-        text: &str,
-    ) -> Result<(), CommandFailure> {
-        let ifs = self.ifs()?;
-        self.split_text_with(fields, separated, text, &ifs)
-    }
-
     fn split_text_with(
         &mut self,
         fields: &mut Vec<String>,
@@ -3795,8 +3931,25 @@ impl<'a> Evaluator<'a> {
     ) -> Result<(), CommandFailure> {
         self.budget.charge_step()?;
         for (kind, range) in ifs.scan(text, &[]) {
-            let partial_delimiter = kind == Kind::Delimiter && *separated == Boundary::Whitespace;
-            let delimiter_bytes = range.len();
+            if matches!(kind, Kind::Delimiter | Kind::LeadingByte)
+                && *separated == Boundary::Whitespace
+            {
+                separated.accept(Kind::Delimiter);
+                for byte in &text.as_bytes()[range.start + 1..range.end] {
+                    match ifs.byte_kind(*byte) {
+                        Kind::Delimiter => {
+                            self.budget.charge_step()?;
+                            self.expansion_charges
+                                .push(self.budget.charge_value_bytes(size_of::<String>() as u64)?);
+                            fields.push(String::new());
+                        }
+                        Kind::Text | Kind::LeadingByte | Kind::Whitespace => {
+                            return Err(invalid_ifs_utf8());
+                        }
+                    }
+                }
+                continue;
+            }
             match separated.accept(kind) {
                 action @ (Action::Append | Action::Start | Action::Empty) => {
                     self.budget.charge_step()?;
@@ -3816,15 +3969,6 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 Action::Separate => {}
-            }
-            // Bash 5.2 consumes one byte of a nonwhite delimiter following IFS whitespace.
-            if partial_delimiter {
-                for _ in 1..delimiter_bytes {
-                    self.budget.charge_step()?;
-                    self.expansion_charges
-                        .push(self.budget.charge_value_bytes(size_of::<String>() as u64)?);
-                    fields.push(String::new());
-                }
             }
         }
         Ok(())
@@ -3869,12 +4013,6 @@ impl<'a> Evaluator<'a> {
                         Value::Null => Vec::new(),
                         scalar => vec![scalar],
                     };
-                    if let Parameter::Named { .. } = parameter {
-                        let ifs = self.ifs()?;
-                        for element in &elements {
-                            ifs.check_quoted(&display(element))?;
-                        }
-                    }
                     let mut elements = elements.iter().map(display);
                     let Some(first) = elements.next() else {
                         if parts.len() == 1 {
@@ -4644,26 +4782,6 @@ fn append(fields: &mut Vec<String>, text: &str) {
         last.push_str(text);
     } else {
         fields.push(text.to_owned());
-    }
-}
-
-fn append_unsplit_value(fields: &mut Vec<String>, separated: &mut Boundary, value: &Value) {
-    match value {
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    *separated = Boundary::Start;
-                }
-                append_field(fields, separated, &display(item));
-            }
-        }
-        Value::Null => {}
-        Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
-            let text = display(value);
-            if !text.is_empty() {
-                append_field(fields, separated, &text);
-            }
-        }
     }
 }
 

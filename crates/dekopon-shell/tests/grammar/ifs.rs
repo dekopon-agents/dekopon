@@ -1,3 +1,11 @@
+// Corpus exclusions:
+// - Bare subshells, Bash array literals, here-strings and process substitution: rejected parser syntax; use supported substitutions, JSON arrays and input pipes.
+// - ANSI-C quoting, indirect expansion, sparse/associative arrays and unsupported parameter operators: outside the accepted language.
+// - printf -v, mapfile, unsupported read flags and unrelated OS commands: absent builtins/options; fixtures use the supported subset.
+// - Input NUL and non-UTF-8 bytes: shell values are UTF-8 text; malformed Bash output remains covered by explicit refusal assertions.
+// - Locales other than C.UTF-8: the oracle fixes this locale to compare UTF-8 delimiter behavior deterministically.
+// - Filesystem pathname expansion: this interpreter has no filesystem globbing.
+
 use super::*;
 use std::{
     io::Read,
@@ -365,5 +373,61 @@ fn continued_reads_obey_the_shared_value_budget() {
         } else {
             assert_eq!(outcome.output, "12345678".repeat(lines));
         }
+    }
+}
+
+#[test]
+fn review_post_whitespace_leading_byte_collision_refuses_expansion() {
+    assert!(compare_pair(
+        "IFS=' é'; v='a à'; probe args $v",
+        "IFS=' é'; v='a à'; probe args $v",
+        "shared UTF-8 leading byte in expansion"
+    ));
+}
+
+#[test]
+fn review_post_whitespace_leading_byte_collision_refuses_read() {
+    let script = "IFS=' é'; printf '%s' 'a à' | { read a b; probe args \"$a\" \"$b\"; }";
+    assert!(compare_pair(
+        script,
+        script,
+        "shared UTF-8 leading byte in read"
+    ));
+}
+
+#[test]
+fn review_word_splits_after_later_ifs_assignment() {
+    for script in [
+        "unset IFS; v=a,b; probe args $v${IFS:=,}",
+        "unset IFS; v=a,b; probe args ${v}${IFS:=,}",
+        "unset IFS; v=a,b; probe args ${missing:-$v}${IFS:=,}",
+        "unset IFS; v=a,b; probe args $(printf '%s' \"$v\")${IFS:=,}",
+        "unset IFS; v=a,b; probe args \"$v\"${IFS:=,}",
+        "unset IFS; probe args a,b${IFS:=,}",
+        "unset IFS; probe args ${missing:-\"a,b\"}${IFS:=,}",
+        "unset IFS; v=a,b; probe args $v$(IFS=:; printf ':')${IFS:=,}; probe args \"$IFS\"",
+    ] {
+        compare(script);
+    }
+}
+
+#[test]
+fn review_descendant_unset_removes_the_outer_local_binding() {
+    compare("IFS=,; g() { unset IFS; IFS=';'; }; f() { local IFS=:; g; }; f; probe args \"$IFS\"");
+}
+
+#[test]
+fn review_repeated_bare_local_preserves_the_existing_value() {
+    compare("IFS=,; f() { local IFS=:; local IFS; probe args \"$IFS\"; }; f; probe args \"$IFS\"");
+}
+
+#[test]
+fn review_unset_function_prefix_reveals_the_enclosing_binding() {
+    for script in [
+        "IFS=,; f() { unset IFS; probe args \"${IFS-unset}\"; }; IFS=: f; probe args \"$IFS\"",
+        "IFS=,; f() { unset IFS; IFS=';'; }; IFS=: f; probe args \"$IFS\"",
+        "IFS=,; g() { unset IFS; probe args \"${IFS-unset}\"; }; f() { local IFS=';'; IFS=: g; probe args \"$IFS\"; }; f; probe args \"$IFS\"",
+    ] {
+        compare(script);
     }
 }

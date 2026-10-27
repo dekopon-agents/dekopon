@@ -104,6 +104,18 @@ text. Builtins refuse attachment operands with an `asset cat` pipeline suggestio
 
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
+### IFS differential corpus
+
+The fixed-seed corpus in `tests/grammar/ifs.rs` compares argument counts and exact bytes against
+real Bash 5.2 under `C.UTF-8`. Its exclusions are:
+
+- Bare subshells, Bash array literals, here-strings and process substitution: rejected parser syntax; equivalent cases use supported substitutions, JSON arrays and input pipes.
+- ANSI-C quoting, indirect expansion, sparse/associative arrays and unsupported parameter operators: outside the accepted language.
+- `printf -v`, `mapfile`, unsupported `read` flags and unrelated OS commands: absent builtins/options; fixtures use the supported subset.
+- Input NUL and non-UTF-8 bytes: shell values are UTF-8 text; malformed Bash output remains covered by explicit refusal assertions.
+- Locales other than `C.UTF-8`: the oracle fixes this locale to compare UTF-8 delimiter behavior deterministically.
+- Filesystem pathname expansion: this interpreter has no filesystem globbing.
+
 ## `read`
 
 `read [-r] [NAME...]` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
