@@ -12,7 +12,7 @@ Without features the crate is only the [trace context](#trace-context) surface, 
 `opentelemetry`, `tracing-opentelemetry` and `tracing`. The `exporter` feature adds everything that
 installs or exports telemetry — `ExporterSettings`, `Transport`, `Install` and its console types,
 `TelemetryError` — together with the OTLP exporter, the OpenTelemetry SDK, the log bridge and the
-blocking reqwest client they need. Only the processes that export enable it (`dekopon-gatewayd` and
+async reqwest client they need. Only the processes that export enable it (`dekopon-gatewayd` and
 `dekopon-brokerd`), so `dekopon-http-host`, `dekopon-broker-host` and every provider test build that
 links them read the active trace without linking an exporter.
 
@@ -21,24 +21,27 @@ links them read the active trace without linking an exporter.
 `Install` builds one process's whole subscriber: a `Console` layer — JSON or text, on stdout or
 stderr, filtered by `RUST_LOG` or by a fixed directive — then any process-specific layer, then the
 OTLP span layer, then the OTLP log bridge, in that order so an entered span has already activated
-a context the log SDK can correlate against. It returns a `TelemetryGuard` whose `shutdown` flushes
-and stops both providers and drains the bounded stdout writer within the shutdown timeout (one
-second by default), reporting every failure rather than the first. What a caller does with
+a context the log SDK can correlate against. It returns a `TelemetryGuard` whose `shutdown` stops both
+providers, which exports their queues, within the shutdown timeout (the SDK's five seconds by
+default), then drains the bounded stdout writer within the same timeout (one second by default),
+reporting every failure rather than the first. Call it off the runtime's worker threads while the
+runtime is still alive: the exports it waits for run on that runtime. What a caller does with
 that failure stays the caller's policy: the daemons log and carry on.
 
-## Transports
+## Transport
 
-`Transport::Grpc` and `Transport::Http` are both first-class. gRPC method paths are fixed by the
-OTLP protobuf service definition, which suits a receiver reached through a path-routing reverse
-proxy; HTTP appends `/v1/traces` and `/v1/logs` to the configured base endpoint. Both reach an
-`https://` endpoint using WebPKI roots. The HTTP client is the workspace's own reqwest build with
-redirects disabled, so an authorization header cannot be forwarded to a receiver-selected
-destination, and with ambient proxies disabled, so an exported `HTTPS_PROXY` cannot put the
-`OTEL_EXPORTER_OTLP_HEADERS` ingest credential — or a span — on a host nobody named to Dekopon.
-`OTEL_EXPORTER_OTLP_CERTIFICATE`, when set, names a PEM file whose roots are trusted beside WebPKI
-on both transports, for a receiver on a private CA; a file that cannot be read or holds no
-certificate refuses startup. A collector reachable only through a proxy must be addressed directly;
-one client serves both signals rather than one per signal.
+Export is OTLP/HTTP with protobuf payloads: the exporter appends `/v1/traces` and `/v1/logs` to the
+configured base endpoint. `Transport::Grpc` exists only so a configuration naming it is refused with
+`TelemetryError::GrpcTransport`. The HTTP client is the workspace's own async reqwest build, created
+inside the caller's tokio runtime (outside one, `TelemetryError::NoRuntime`); the SDK's two batch
+threads hand each request to that runtime and wait for it. Redirects are disabled, so an
+authorization header cannot be forwarded to a receiver-selected destination, and ambient proxies
+are disabled, so an exported `HTTPS_PROXY` cannot put the `OTEL_EXPORTER_OTLP_HEADERS` ingest
+credential — or a span — on a host nobody named to Dekopon. `https://` endpoints use WebPKI roots,
+and `OTEL_EXPORTER_OTLP_CERTIFICATE`, when set, names a PEM file whose roots are trusted beside them,
+for a receiver on a private CA; a file that cannot be read or holds no certificate refuses startup.
+A receiver reachable only through a proxy must be addressed directly; one client serves both
+signals rather than one per signal.
 
 ## Export failures
 

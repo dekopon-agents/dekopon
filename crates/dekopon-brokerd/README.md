@@ -685,8 +685,8 @@ An optional `telemetry` section enables OTLP export of broker spans and log reco
 
 ```yaml
 telemetry:
-  endpoint: http://rpi.localdomain
-  transport: grpc            # grpc | http
+  endpoint: http://openobserve:5080/api/default
+  transport: http            # the default and only value
   serviceName: dekopon-brokerd
   exportTimeoutMs: 5000
 ```
@@ -699,9 +699,9 @@ with [`propagateTrace`](#trace-propagation-to-first-party-destinations).
 
 The section has no credential field. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
-this configuration file, the process command line, or a span attribute. Receiver routing travels the
-same way: over gRPC OpenObserve reads the organization from an `organization` header and rejects
-exports without it, so include `organization=<org>` alongside the token and `stream-name`. Export
+this configuration file, the process command line, or a span attribute. Export goes over OTLP/HTTP
+(protobuf) to the endpoint's `/v1/traces` and `/v1/logs`; OpenObserve takes the organization from
+the endpoint path and the stream from a `stream-name` header ([receivers](../../docs/observability.md#enable-otlp-export)). Export
 failures disable telemetry and log the reason rather than preventing startup. Broker logs are
 structured JSON on stdout, filtered by `RUST_LOG`.
 
