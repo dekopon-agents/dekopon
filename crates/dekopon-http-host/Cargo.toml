@@ -13,7 +13,12 @@ keywords = ["agents", "http", "security", "sandbox", "wasm"]
 categories = ["web-programming::http-client"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
+[features]
+native-test = ["dep:http", "dep:parking_lot"]
+
 [dependencies]
+http = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 aho-corasick.workspace = true
 base64.workspace = true
 dekopon-capability.workspace = true

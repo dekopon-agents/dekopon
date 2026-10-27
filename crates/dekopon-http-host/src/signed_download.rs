@@ -112,6 +112,7 @@ impl Destination {
         grant: HttpConstraints,
         ceilings: super::HttpHostCeilings,
         deadline: tokio::time::Instant,
+        #[cfg(feature = "native-test")] transport: Option<crate::test_transport::Transport>,
     ) -> Result<Self, DownloadError> {
         let budget = deadline
             .checked_duration_since(tokio::time::Instant::now())
@@ -119,6 +120,10 @@ impl Destination {
         let mut validator = BufferedHttpClient::authorized(grant.clone(), ceilings, budget)
             .map_err(|_cause| DownloadError::Internal)?;
         validator.deadline = deadline;
+        #[cfg(feature = "native-test")]
+        {
+            validator.test_transport = transport;
+        }
         let prepared = validator
             .prepare(
                 Request {
@@ -155,13 +160,17 @@ impl Destination {
                 | ErrorCode::ResponseTooLarge
                 | ErrorCode::Internal => DownloadError::from(error),
             })?;
-        let client = validator
-            .pinned_client(
-                &prepared.host,
-                &prepared.addresses,
-                validator.remaining().map_err(DownloadError::from)?,
-            )
-            .map_err(DownloadError::from)?;
+        let client = if prepared.addresses.is_empty() {
+            reqwest::Client::new()
+        } else {
+            validator
+                .pinned_client(
+                    &prepared.host,
+                    &prepared.addresses,
+                    validator.remaining().map_err(DownloadError::from)?,
+                )
+                .map_err(DownloadError::from)?
+        };
         Ok(Self {
             uri: dekopon_core::Redacted::new(prepared.url),
             client,
@@ -398,7 +407,15 @@ impl BufferedHttpClient {
             }
             return Ok(destination);
         }
-        Destination::new(uri, grant, ceilings, self.deadline).await
+        Destination::new(
+            uri,
+            grant,
+            ceilings,
+            self.deadline,
+            #[cfg(feature = "native-test")]
+            self.test_transport.clone(),
+        )
+        .await
     }
 
     async fn fetch_storage(
@@ -527,18 +544,47 @@ impl BufferedHttpClient {
                 upstream_request_id: None,
                 credential_injected: false,
             });
-            let response = timeout_at(
-                self.deadline,
-                destination
-                    .client
-                    .request(Method::GET, destination.uri.expose().clone())
-                    .headers(destination.headers.clone())
-                    .header("range", range)
-                    .send(),
-            )
-            .await
-            .map_err(|_cause| DownloadError::Timeout)?
-            .map_err(|_cause| DownloadError::Storage)?;
+            #[cfg(feature = "native-test")]
+            let scripted = self.test_transport.as_ref().map(|transport| {
+                let mut headers = destination.headers.clone();
+                headers.insert(
+                    "range",
+                    reqwest::header::HeaderValue::from_str(&range)
+                        .map_err(|_error| DownloadError::Internal)?,
+                );
+                transport.guest(Request {
+                    method: "GET".to_owned(),
+                    uri: destination.uri.expose().as_str().to_owned(),
+                    headers: headers
+                        .iter()
+                        .map(|(name, value)| Header {
+                            name: name.to_string(),
+                            value: value.as_bytes().to_vec(),
+                        })
+                        .collect(),
+                    body: vec![],
+                });
+                transport
+                    .response(&Method::GET, destination.uri.expose(), &headers, &[])
+                    .map_err(DownloadError::from)
+            });
+            #[cfg(not(feature = "native-test"))]
+            let scripted: Option<Result<reqwest::Response, DownloadError>> = None;
+            let response = match scripted {
+                Some(response) => response?,
+                None => timeout_at(
+                    self.deadline,
+                    destination
+                        .client
+                        .request(Method::GET, destination.uri.expose().clone())
+                        .headers(destination.headers.clone())
+                        .header("range", range)
+                        .send(),
+                )
+                .await
+                .map_err(|_cause| DownloadError::Timeout)?
+                .map_err(|_cause| DownloadError::Storage)?,
+            };
             let status = response.status().as_u16();
             tracing::Span::current().record("http.response.status_code", status);
             if let Some(evidence) = self.evidence.last_mut() {
@@ -1021,6 +1067,8 @@ mod tests {
             grant(server.authority()),
             HttpHostCeilings::default(),
             parent.deadline,
+            #[cfg(feature = "native-test")]
+            None,
         )
         .await
         .unwrap()

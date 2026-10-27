@@ -61,6 +61,7 @@ Without either asset builder method, asset storage remains absent; without
 `.assets(...)`, attachment, removal and send grants remain absent. Storage alone
 (`AssetConstraints::default()`) does not allow attachment, removal or sending.
 The HTTPS script still grants only its exact origin, method and one request.
+`Run::signed_download(api, storage, max_requests)` and `Native::signed_download` script one Actions log redirect, probe and bounded window through an in-process HTTPS fake.
 
 Seed input bytes with `Run::asset(id, content_type, bytes)` and reference them in
 invocation JSON as `chat-asset:<id>`:

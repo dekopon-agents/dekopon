@@ -21,6 +21,16 @@ pub trait Port {
         &mut self,
         request: crate::http::StreamedRequest<'_>,
     ) -> Result<crate::http::StreamedResponse, crate::http::HttpError>;
+    /// Downloads through the installed test port; other native ports retain denial.
+    #[cfg(feature = "native-test")]
+    fn signed_download(
+        &mut self,
+        _request: &crate::signed_download::Request,
+    ) -> Result<crate::signed_download::Response, crate::signed_download::DownloadError> {
+        Err(crate::signed_download::DownloadError {
+            code: crate::signed_download::ErrorCode::Denied,
+        })
+    }
     /// Runs a child script; a port that scripts no child refuses the call by panicking.
     fn spawn(&mut self, script: &str, stdin: NativeChildStdin) -> NativeChild {
         drop(stdin);
@@ -199,4 +209,16 @@ mod tests {
         });
         assert!(std::panic::catch_unwind(now_unix_millis).is_err());
     }
+}
+
+#[cfg(feature = "native-test")]
+pub(crate) fn signed_download(
+    request: &crate::signed_download::Request,
+) -> Result<crate::signed_download::Response, crate::signed_download::DownloadError> {
+    CURRENT.with(|current| match current.borrow_mut().as_mut() {
+        Some(port) => port.signed_download(request),
+        None => Err(crate::signed_download::DownloadError {
+            code: crate::signed_download::ErrorCode::Denied,
+        }),
+    })
 }

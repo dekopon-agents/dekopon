@@ -130,6 +130,7 @@ enum ProbeError {
     InvalidRequest(HttpBuildError),
     HttpFailed(HttpError),
     StreamHttp(HttpError),
+    Signed(dekopon_provider_sdk::signed_download::DownloadError),
     Asset(dekopon_provider_sdk::asset::AssetError),
     PreconditionFailed { expected: String, observed: String },
     AssetTestFailure,
@@ -144,6 +145,7 @@ impl std::fmt::Display for ProbeError {
             Self::HttpFailed(error) => write!(f, "{error}"),
             Self::StreamHttp(error) => f.write_str(&error.message),
             Self::Asset(error) => f.write_str(&error.message),
+            Self::Signed(error) => write!(f, "signed download failed: {:?}", error.code),
             Self::PreconditionFailed { expected, observed } => {
                 write!(
                     f,
@@ -163,6 +165,7 @@ impl Failure for ProbeError {
             Self::HttpFailed(_) => "http-failed",
             Self::StreamHttp(error) => error.code.as_str(),
             Self::Asset(error) => error.code.as_str(),
+            Self::Signed(_) => "signed-download-failed",
             Self::PreconditionFailed { .. } => "precondition-failed",
             Self::AssetTestFailure => "asset-test-failure",
             Self::Output => "output-error",
@@ -271,6 +274,23 @@ impl Capability for Fetch {
         out: &mut Stdout,
     ) -> Result<(), ProbeError> {
         let value = (|| -> Result<Value, ProbeError> {
+            if input.asset_mode.as_deref() == Some("signed-download") {
+                use dekopon_provider_sdk::signed_download as signed;
+                let response = signed::download(&signed::Request {
+                    api_uri: input.uri.ok_or(ProbeError::UriRequired)?,
+                    window: signed::Window::Tail(
+                        u32::try_from(input.bytes.unwrap_or(3))
+                            .map_err(|_| ProbeError::UnknownAssetMode)?,
+                    ),
+                })
+                .map_err(ProbeError::Signed)?;
+                return match response {
+                    signed::Response::Storage { status, body, .. } => Ok(
+                        json!({"status": status, "bytes": body.map(|body| body.read_all()).transpose().map_err(ProbeError::Asset)?}),
+                    ),
+                    signed::Response::Api(response) => Ok(json!({"status": response.status})),
+                };
+            }
             if let Some(mode) = input.asset_mode.as_deref() {
                 return asset_probe(mode, &input, &http, &assets);
             }

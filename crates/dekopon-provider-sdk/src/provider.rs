@@ -14,6 +14,8 @@ pub use bounded::{Bounded, TooLong, Truncated};
 pub use handles::{
     Assets, Clock, DurableFiles, Http, Jsonl, Monotonic, Random, Settings, Spawn, Storage,
 };
+#[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
+pub(crate) use port::signed_download as native_signed_download;
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{NativeChild, NativeChildStdin, Port, with_port};
 #[cfg(not(target_arch = "wasm32"))]

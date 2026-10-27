@@ -176,6 +176,10 @@ impl Default for BrokerHostLimits {
 
 #[derive(Clone, Debug, Default)]
 pub struct TestImports {
+    #[cfg(feature = "native-test")]
+    pub http_transport: Option<dekopon_http_host::test_transport::Transport>,
+    #[cfg(feature = "native-test")]
+    pub credential: Option<BoundCredential>,
     pub assets: Option<dekopon_http_host::asset::AssetDirectory>,
     pub clock: Option<std::time::SystemTime>,
     pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
@@ -1182,6 +1186,13 @@ impl BrokerWasmProvider {
             Ok(http) => http,
             Err(source) => return Err(BrokerHostError::HttpConfiguration { source }.into()),
         };
+        #[cfg(feature = "native-test")]
+        let http = match test_imports.and_then(|imports| imports.http_transport.clone()) {
+            Some(transport) => HttpState {
+                client: http.client.with_test_transport(transport),
+            },
+            None => http,
+        };
         let storage_state = storage_transaction.map_or_else(
             storage::StorageState::disabled,
             storage::StorageState::active,
@@ -1819,8 +1830,20 @@ impl BrokerProviderRegistry {
         assets: asset::AssetInputs,
         test_imports: Option<&TestImports>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
-        self.invoke_authorized(authorized, None, None, slots, None, assets, test_imports)
-            .await
+        #[cfg(feature = "native-test")]
+        let credential = test_imports.and_then(|imports| imports.credential.clone());
+        #[cfg(not(feature = "native-test"))]
+        let credential = None;
+        self.invoke_authorized(
+            authorized,
+            credential,
+            None,
+            slots,
+            None,
+            assets,
+            test_imports,
+        )
+        .await
     }
 
     #[expect(
