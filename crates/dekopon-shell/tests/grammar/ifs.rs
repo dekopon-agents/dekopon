@@ -425,9 +425,124 @@ fn review_repeated_bare_local_preserves_the_existing_value() {
 fn review_unset_function_prefix_reveals_the_enclosing_binding() {
     for script in [
         "IFS=,; f() { unset IFS; probe args \"${IFS-unset}\"; }; IFS=: f; probe args \"$IFS\"",
+        "IFS=,; f() { local IFS; probe args \"${IFS-unset}\"; }; IFS=: f; probe args \"$IFS\"",
+        "IFS=,; f() { IFS=: local IFS; probe args \"${IFS-unset}\"; }; f; probe args \"$IFS\"",
+        "IFS=,; f() { local IFS=:; IFS=';' unset IFS; probe args \"${IFS-unset}\"; }; f; probe args \"$IFS\"",
         "IFS=,; f() { unset IFS; IFS=';'; }; IFS=: f; probe args \"$IFS\"",
         "IFS=,; g() { unset IFS; probe args \"${IFS-unset}\"; }; f() { local IFS=';'; IFS=: g; probe args \"$IFS\"; }; f; probe args \"$IFS\"",
     ] {
         compare(script);
     }
+}
+
+#[test]
+fn deferred_word_fragments_are_charged_before_splitting() {
+    for (count, expected) in [(3, ExitCode::SUCCESS), (128, ExitCode::SYNTAX)] {
+        let script = format!(
+            "unset IFS; v='{}'; : {}${{IFS:= }}",
+            " ".repeat(64),
+            "${v}".repeat(count)
+        );
+        let outcome = run_with(
+            &script,
+            Limits {
+                max_value_bytes: 2048,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(outcome.exit_code, expected, "{outcome:?}");
+        if expected == ExitCode::SYNTAX {
+            assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+        }
+    }
+}
+
+#[test]
+fn generated_ifs_review_edges_match_real_bash() {
+    let mut cases = 0;
+    let mut refused = 0;
+    for ifs in [" é", " éĠ", " 💠", " é💠"] {
+        for value in ["a à", "a é", "a 💡", "a 💠", " a à b "] {
+            for names in 0..=4 {
+                let prefix = format!("IFS={};v={};", quote(ifs), quote(value));
+                let body = if names == 0 {
+                    "probe args $v".to_owned()
+                } else {
+                    let names = ["a", "b", "c", "d"][..names].join(" ");
+                    let args = names
+                        .split(' ')
+                        .map(|name| format!("\"${name}\""))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("printf '%s' \"$v\" | {{ read {names}; probe args {args}; }}")
+                };
+                let script = format!("{prefix}{body}");
+                refused += usize::from(compare_pair(
+                    &script,
+                    &script,
+                    &format!("UTF-8 review case={cases}"),
+                ));
+                cases += 1;
+            }
+        }
+    }
+    for initial in [None, Some(""), Some(",")] {
+        for final_ifs in [",", ":", "é", " "] {
+            for form in 0..14 {
+                let setup = initial.map_or_else(
+                    || "unset IFS;".to_owned(),
+                    |ifs| format!("IFS={};", quote(ifs)),
+                );
+                let change = format!("${{IFS:={}}}", quote(final_ifs));
+                let prefix = format!("{setup}v='a,b:é c';");
+                let body = match form {
+                    0 => format!("probe args $v{change}"),
+                    1 => format!("probe args a,b:é{change}"),
+                    2 => format!("probe args \"$v\"{change}"),
+                    3 => format!("probe args ${{missing:-$v}}{change}"),
+                    4 => format!("probe args ${{missing:-\"a,b:é\"}}{change}"),
+                    5 => format!("probe args $(printf '%s' \"$v\"){change}"),
+                    6 => format!("probe args $v$(IFS=:; printf ':'){change}; probe args \"$IFS\""),
+                    7..=9 => {
+                        let expansion = ["$@", "$*", "\"$@\""][form - 7];
+                        format!("f() {{ probe args {expansion}{change}; }}; f \"$v\" '' tail")
+                    }
+                    10..=13 => {
+                        let expansion =
+                            ["${arr[@]}", "${arr[*]}", "\"${arr[@]}\"", "\"${arr[*]}\""][form - 10];
+                        format!("probe args {expansion}{change}")
+                    }
+                    _ => unreachable!(),
+                };
+                let (actual_setup, bash_setup) = if form >= 10 {
+                    (
+                        "arr=$(printf '%s' '[\"a,b:é c\",\"\",\"tail\"]');",
+                        "arr=('a,b:é c' '' tail);",
+                    )
+                } else {
+                    ("", "")
+                };
+                refused += usize::from(compare_pair(
+                    &format!("{prefix}{actual_setup}{body}"),
+                    &format!("{prefix}{bash_setup}{body}"),
+                    &format!("final-IFS review case={cases}"),
+                ));
+                cases += 1;
+            }
+        }
+    }
+    eprintln!(
+        "IFS review matrix: {cases} scenarios; {} exact Bash agreements; {refused} explicit UTF-8 refusals",
+        cases - refused
+    );
+    assert_eq!(cases, 268);
+}
+
+#[test]
+fn quoted_array_assignments_do_not_resplit_multibyte_characters() {
+    compare_pair(
+        "IFS=é; arr=$(printf '%s' '[\"é\",\"tail\"]'); value=\"${arr[@]}\"; probe args \"$value\"",
+        "IFS=é; arr=(é tail); value=\"${arr[@]}\"; probe args \"$value\"",
+        "quoted array assignment",
+    );
 }

@@ -77,8 +77,13 @@ Bash 5.2 IFS field splitting applies to unquoted parameter expansions and comman
 output. Unset `IFS` uses space, tab and newline; empty `IFS` disables splitting. ASCII whitespace
 characters present in `IFS` trim and collapse, while other IFS characters delimit fields,
 retaining leading and adjacent empty fields without adding a field after a trailing delimiter.
-Whitespace adjacent to a nonwhite delimiter belongs to that delimiter. Command literals and
-quoted text do not field-split; literal text in an unquoted selected parameter modifier does.
+Whitespace adjacent to a nonwhite delimiter belongs to that delimiter. Words containing only literal text and
+explicitly quoted text do not field-split; literal text in an unquoted selected parameter modifier
+does. Field splitting normally uses the IFS value after every expansion in that word has evaluated. For
+example, `unset IFS; v=a,b; f $v${IFS:=,}` passes `a` and `b`; an unquoted literal joined to that
+IFS-changing expansion follows Bash's same final-IFS rules, while quoted text remains protected.
+An unquoted `$*` expanded while IFS is empty uses Bash's space-only splitting
+rule for the complete word; spaces inside the original values remain protected.
 Unquoted positional and JSON array expansions use Bash's element-boundary and IFS joining rules;
 `"$@"` and `"${NAME[@]}"` preserve one word per element, including empty elements. Quoted `$*` and
 `${NAME[*]}` join with the first IFS character (space when unset, no separator when empty).

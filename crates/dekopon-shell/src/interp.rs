@@ -530,6 +530,12 @@ enum ExpansionOutput {
     Value,
 }
 
+#[derive(Clone, Copy)]
+enum PreservedExpansion {
+    Legacy,
+    Unsplit,
+}
+
 struct FieldExpansion<'a> {
     spans: &'a mut Vec<ExpansionSpan>,
 }
@@ -537,6 +543,7 @@ struct FieldExpansion<'a> {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Protection {
     Unquoted,
+    EmptyIfs,
     Quoted,
     Checked,
 }
@@ -544,12 +551,14 @@ enum Protection {
 enum SpanContent {
     Text(String, Protection),
     Elements(Vec<Value>, String),
-    Boundary,
+    Boundary(String),
+    SplitSpace,
 }
 
 struct ExpansionSpan {
     content: SpanContent,
-    _charge: dekopon_process::RetainedBytes,
+    charge: dekopon_process::RetainedBytes,
+    retained: Vec<dekopon_process::RetainedBytes>,
 }
 
 struct Evaluator<'a> {
@@ -838,23 +847,33 @@ impl<'a> Evaluator<'a> {
     }
 
     fn declare_local(&mut self, name: &str, value: Option<Value>) -> Result<(), LimitExceeded> {
-        if let Some(frame) = self
+        let Some(index) = self
             .frames
-            .iter_mut()
+            .iter()
+            .rposition(|frame| frame.kind == FrameKind::Function)
+        else {
+            return Ok(());
+        };
+        let prefix = self
+            .frames
+            .iter()
             .rev()
-            .find(|frame| frame.kind == FrameKind::Function)
-        {
-            if value.is_none() && frame.locals.contains_key(name) {
-                return Ok(());
-            }
-            frame.locals.remove(name);
-            frame.local_charges.remove(name);
-            let charge = self
-                .budget
-                .charge_value_bytes(value.as_ref().map_or(0, value_bytes))?;
-            frame.locals.insert(name.to_owned(), value);
-            frame.local_charges.insert(name.to_owned(), vec![charge]);
+            .find(|frame| frame.locals.contains_key(name))
+            .filter(|frame| frame.kind == FrameKind::Prefix);
+        if value.is_none() && prefix.is_none() && self.frames[index].locals.contains_key(name) {
+            return Ok(());
         }
+        let borrowed = value
+            .as_ref()
+            .or_else(|| prefix.and_then(|frame| frame.locals.get(name).and_then(Option::as_ref)));
+        let charge = self
+            .budget
+            .charge_value_bytes(borrowed.map_or(0, value_bytes))?;
+        let value =
+            value.or_else(|| prefix.and_then(|frame| frame.locals.get(name).cloned().flatten()));
+        let frame = &mut self.frames[index];
+        frame.locals.insert(name.to_owned(), value);
+        frame.local_charges.insert(name.to_owned(), vec![charge]);
         Ok(())
     }
 
@@ -3492,18 +3511,111 @@ impl<'a> Evaluator<'a> {
         word: &Word,
         output: ExpansionOutput,
     ) -> Result<Vec<String>, CommandFailure> {
+        if let [WordPart::Literal(text) | WordPart::SingleQuoted(text)] = word.parts.as_slice() {
+            return Ok(vec![text.clone()]);
+        }
         match output {
             ExpansionOutput::Fields | ExpansionOutput::Value => {
                 let mut spans = Vec::new();
                 for part in &word.parts {
                     self.collect_field_part(part, &mut spans, output)?;
                 }
+                let resplit = word.parts.iter().any(|part| match part {
+                    WordPart::Parameter(_)
+                    | WordPart::CommandSubstitution(_)
+                    | WordPart::Arithmetic(_) => true,
+                    WordPart::Asset(_)
+                    | WordPart::Literal(_)
+                    | WordPart::SingleQuoted(_)
+                    | WordPart::DoubleQuoted(_) => false,
+                });
+                if resplit {
+                    for span in &mut spans {
+                        if let SpanContent::Text(_, protection @ Protection::Quoted) =
+                            &mut span.content
+                        {
+                            *protection = Protection::Checked;
+                        }
+                    }
+                }
                 self.split_spans(spans)
             }
-            ExpansionOutput::Legacy | ExpansionOutput::Unsplit => {
-                self.expand_preserved_fields(&word.parts, output)
+            ExpansionOutput::Legacy => self.expand_preserved_word(word, PreservedExpansion::Legacy),
+            ExpansionOutput::Unsplit => {
+                self.expand_preserved_word(word, PreservedExpansion::Unsplit)
             }
         }
+    }
+
+    fn expand_preserved_word(
+        &mut self,
+        word: &Word,
+        output: PreservedExpansion,
+    ) -> Result<Vec<String>, CommandFailure> {
+        let mut fields = Vec::new();
+        let mut separated = Boundary::Start;
+        for part in &word.parts {
+            match part {
+                WordPart::Literal(text) | WordPart::SingleQuoted(text) => {
+                    append_field(&mut fields, &mut separated, text)
+                }
+                WordPart::Asset(number) => {
+                    append_field(&mut fields, &mut separated, &number.to_string())
+                }
+                WordPart::Arithmetic(expression) => {
+                    let text = render_number(self.evaluate_arithmetic(expression)?);
+                    append_field(&mut fields, &mut separated, &text);
+                }
+                WordPart::DoubleQuoted(parts) => {
+                    let mut expanded = self.expand_quoted_fields(parts)?.into_iter();
+                    if let Some(first) = expanded.next() {
+                        append_field(&mut fields, &mut separated, &first);
+                    }
+                    fields.extend(expanded);
+                }
+                WordPart::Parameter(parameter) => {
+                    let output = match output {
+                        PreservedExpansion::Legacy => ExpansionOutput::Legacy,
+                        PreservedExpansion::Unsplit => ExpansionOutput::Unsplit,
+                    };
+                    let value = self.parameter_value_with(parameter, output)?;
+                    append_unsplit_value(&mut fields, &mut separated, &value);
+                }
+                WordPart::CommandSubstitution(program) => {
+                    let result = self.run_substitution(program)?;
+                    match (&result.value, output) {
+                        (Value::String(text), PreservedExpansion::Legacy) => {
+                            if !text.is_empty() {
+                                let mut lines = text.split('\n');
+                                if let Some(first) = lines.next() {
+                                    append_field(&mut fields, &mut separated, first);
+                                }
+                                fields.extend(lines.map(str::to_owned));
+                            }
+                        }
+                        (
+                            Value::Null
+                            | Value::Bool(_)
+                            | Value::Number(_)
+                            | Value::Array(_)
+                            | Value::Object(_),
+                            PreservedExpansion::Legacy,
+                        )
+                        | (
+                            Value::Null
+                            | Value::Bool(_)
+                            | Value::Number(_)
+                            | Value::String(_)
+                            | Value::Array(_)
+                            | Value::Object(_),
+                            PreservedExpansion::Unsplit,
+                        ) => append_unsplit_value(&mut fields, &mut separated, &result.value),
+                    }
+                    self.expansion_charges.extend(result.retained);
+                }
+            }
+        }
+        Ok(fields)
     }
 
     fn record_text(
@@ -3518,9 +3630,53 @@ impl<'a> Evaluator<'a> {
             .charge_value_bytes((text.len() + size_of::<ExpansionSpan>()) as u64)?;
         spans.push(ExpansionSpan {
             content: SpanContent::Text(text.to_owned(), protection),
-            _charge: charge,
+            charge,
+            retained: Vec::new(),
         });
         Ok(())
+    }
+
+    fn record_capture(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        result: CommandResult,
+        protection: Protection,
+    ) -> Result<(), CommandFailure> {
+        let text = match result.value {
+            Value::String(text) => text,
+            value @ (Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::Array(_)
+            | Value::Object(_)) => quoted_text(&value),
+        };
+        let held = result
+            .retained
+            .iter()
+            .map(dekopon_process::RetainedBytes::bytes)
+            .sum::<u64>();
+        let charge = self.budget.charge_value_bytes(
+            size_of::<ExpansionSpan>() as u64 + (text.len() as u64).saturating_sub(held),
+        )?;
+        spans.push(ExpansionSpan {
+            content: SpanContent::Text(text, protection),
+            charge,
+            retained: result.retained,
+        });
+        Ok(())
+    }
+
+    fn record_split_text(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        text: &str,
+    ) -> Result<(), CommandFailure> {
+        let protection = if self.ifs_separator().is_empty() {
+            Protection::EmptyIfs
+        } else {
+            Protection::Unquoted
+        };
+        self.record_text(spans, text, protection)
     }
 
     fn record_value(
@@ -3530,22 +3686,20 @@ impl<'a> Evaluator<'a> {
     ) -> Result<(), CommandFailure> {
         match value {
             Value::Array(items) => {
-                let mut separator = self.ifs_separator();
-                if separator.is_empty() {
-                    separator.push(' ');
-                }
+                let separator = self.ifs_separator();
                 let charge = self.budget.charge_value_bytes(
                     value_bytes(value) + (size_of::<ExpansionSpan>() + separator.len()) as u64,
                 )?;
                 spans.push(ExpansionSpan {
                     content: SpanContent::Elements(items.clone(), separator),
-                    _charge: charge,
+                    charge,
+                    retained: Vec::new(),
                 });
             }
             Value::Null => {}
-            Value::String(text) => self.record_text(spans, text, Protection::Unquoted)?,
+            Value::String(text) => self.record_split_text(spans, text)?,
             Value::Bool(_) | Value::Number(_) | Value::Object(_) => {
-                self.record_text(spans, &display(value), Protection::Unquoted)?
+                self.record_split_text(spans, &display(value))?
             }
         }
         Ok(())
@@ -3601,7 +3755,7 @@ impl<'a> Evaluator<'a> {
             }
             WordPart::Arithmetic(expression) => {
                 let text = render_number(self.evaluate_arithmetic(expression)?);
-                self.record_text(spans, &text, Protection::Quoted)?;
+                self.record_text(spans, &text, Protection::Unquoted)?;
                 Ok(Value::String(text))
             }
             WordPart::DoubleQuoted(parts) => {
@@ -3609,22 +3763,53 @@ impl<'a> Evaluator<'a> {
                 self.collect_quoted_parts(parts, spans)?;
                 match output {
                     ExpansionOutput::Value => {
-                        let mut text = String::new();
+                        let bytes = spans[start..]
+                            .iter()
+                            .map(|span| match &span.content {
+                                SpanContent::Text(part, _) => part.len(),
+                                SpanContent::Boundary(_) => 1,
+                                SpanContent::Elements(_, _) | SpanContent::SplitSpace => 0,
+                            })
+                            .sum::<usize>();
+                        let charge = self.budget.charge_value_bytes(bytes as u64)?;
+                        let mut text = String::with_capacity(bytes);
                         for span in &spans[start..] {
                             match &span.content {
                                 SpanContent::Text(part, _) => text.push_str(part),
-                                SpanContent::Boundary => text.push(' '),
-                                SpanContent::Elements(_, _) => {}
+                                SpanContent::Boundary(_) => text.push(' '),
+                                SpanContent::Elements(_, _) | SpanContent::SplitSpace => {}
                             }
                         }
-                        self.expansion_text(&text, output)
+                        self.expansion_charges.push(charge);
+                        Ok(Value::String(text))
                     }
                     ExpansionOutput::Fields
                     | ExpansionOutput::Legacy
                     | ExpansionOutput::Unsplit => Ok(Value::Null),
                 }
             }
-            WordPart::Parameter(parameter) => self.expand_parameter_fields(parameter, spans),
+            WordPart::Parameter(parameter) => {
+                let joined = match parameter {
+                    Parameter::AllPositionalJoined => true,
+                    Parameter::Named { .. }
+                    | Parameter::Positional(_)
+                    | Parameter::AllPositional
+                    | Parameter::PositionalCount
+                    | Parameter::LastStatus
+                    | Parameter::LastJob => false,
+                };
+                if joined && self.ifs_separator().is_empty() {
+                    let charge = self
+                        .budget
+                        .charge_value_bytes(size_of::<ExpansionSpan>() as u64)?;
+                    spans.push(ExpansionSpan {
+                        content: SpanContent::SplitSpace,
+                        charge,
+                        retained: Vec::new(),
+                    });
+                }
+                self.expand_parameter_fields(parameter, spans)
+            }
             WordPart::CommandSubstitution(program) => {
                 let result = self.run_substitution(program)?;
                 self.record_value(spans, &result.value)?;
@@ -3661,20 +3846,33 @@ impl<'a> Evaluator<'a> {
                         let elements = match value {
                             Value::Array(items) => items,
                             Value::Null => Vec::new(),
-                            scalar => vec![scalar],
+                            scalar @ (Value::Bool(_)
+                            | Value::Number(_)
+                            | Value::String(_)
+                            | Value::Object(_)) => vec![scalar],
                         };
                         let protection = match parameter {
                             Parameter::Named { .. } => Protection::Checked,
-                            _ => Protection::Quoted,
+                            Parameter::Positional(_)
+                            | Parameter::AllPositional
+                            | Parameter::AllPositionalJoined
+                            | Parameter::PositionalCount
+                            | Parameter::LastStatus
+                            | Parameter::LastJob => Protection::Quoted,
                         };
                         for (index, element) in elements.iter().enumerate() {
                             if index > 0 {
-                                let charge = self
-                                    .budget
-                                    .charge_value_bytes(size_of::<ExpansionSpan>() as u64)?;
+                                let mut separator = self.ifs_separator();
+                                if separator.is_empty() {
+                                    separator.push(' ');
+                                }
+                                let charge = self.budget.charge_value_bytes(
+                                    (size_of::<ExpansionSpan>() + separator.len()) as u64,
+                                )?;
                                 spans.push(ExpansionSpan {
-                                    content: SpanContent::Boundary,
-                                    _charge: charge,
+                                    content: SpanContent::Boundary(separator),
+                                    charge,
+                                    retained: Vec::new(),
                                 });
                             }
                             self.record_text(spans, &display(element), protection)?;
@@ -3685,8 +3883,7 @@ impl<'a> Evaluator<'a> {
                 }
                 WordPart::CommandSubstitution(program) => {
                     let result = self.run_substitution(program)?;
-                    self.record_text(spans, &quoted_text(&result.value), Protection::Quoted)?;
-                    self.expansion_charges.extend(result.retained);
+                    self.record_capture(spans, result, Protection::Quoted)?;
                 }
             }
         }
@@ -3694,30 +3891,47 @@ impl<'a> Evaluator<'a> {
     }
 
     fn split_spans(&mut self, spans: Vec<ExpansionSpan>) -> Result<Vec<String>, CommandFailure> {
-        let ifs = self.ifs()?;
-        let split_elements = !self.ifs_separator().is_empty();
+        let force_space = spans
+            .iter()
+            .any(|span| matches!(span.content, SpanContent::SplitSpace));
+        let ifs = if force_space {
+            Ifs::new(" ", &self.budget)?
+        } else {
+            self.ifs()?
+        };
+        let split_elements = force_space || !self.ifs_separator().is_empty();
         let mut fields = Vec::new();
         let mut separated = Boundary::Start;
-        for span in spans {
+        for mut span in spans {
             match span.content {
                 SpanContent::Text(text, Protection::Unquoted) => {
                     self.split_text_with(&mut fields, &mut separated, &text, &ifs)?
                 }
-                SpanContent::Text(
-                    text,
-                    protection @ (Protection::Quoted | Protection::Checked),
-                ) => {
+                SpanContent::Text(text, Protection::EmptyIfs) => {
+                    self.split_protected_spaces(&mut fields, &mut separated, &text, &ifs)?;
+                }
+                SpanContent::Text(text, protection) => {
                     match protection {
                         Protection::Checked => ifs.check_quoted(&text)?,
-                        Protection::Quoted | Protection::Unquoted => {}
+                        Protection::Quoted | Protection::Unquoted | Protection::EmptyIfs => {}
                     }
-                    self.expansion_charges.push(
-                        self.budget
-                            .charge_value_bytes((text.len() + size_of::<String>()) as u64)?,
-                    );
-                    append_field(&mut fields, &mut separated, &text);
+                    match separated.accept(Kind::Text) {
+                        Action::Append => append(&mut fields, &text),
+                        Action::Start => fields.push(text),
+                        Action::Empty | Action::Separate => {}
+                    }
+                    span.charge.shrink(size_of::<ExpansionSpan>() as u64);
+                    self.expansion_charges.push(span.charge);
+                    self.expansion_charges.extend(span.retained);
                 }
-                SpanContent::Boundary => separated = Boundary::Start,
+                SpanContent::Boundary(separator) => {
+                    if split_elements {
+                        self.split_text_with(&mut fields, &mut separated, &separator, &ifs)?;
+                    } else {
+                        separated = Boundary::Start;
+                    }
+                }
+                SpanContent::SplitSpace => {}
                 SpanContent::Elements(values, separator) => {
                     if separated == Boundary::Start {
                         separated = Boundary::ArrayStart;
@@ -3728,19 +3942,67 @@ impl<'a> Evaluator<'a> {
                                 self.split_text_with(
                                     &mut fields,
                                     &mut separated,
-                                    &separator,
+                                    if separator.is_empty() {
+                                        " "
+                                    } else {
+                                        &separator
+                                    },
                                     &ifs,
                                 )?;
                             } else {
                                 separated = Boundary::Start;
                             }
                         }
-                        self.split_text_with(&mut fields, &mut separated, &display(value), &ifs)?;
+                        if separator.is_empty() {
+                            self.split_protected_spaces(
+                                &mut fields,
+                                &mut separated,
+                                &display(value),
+                                &ifs,
+                            )?;
+                        } else {
+                            self.split_text_with(
+                                &mut fields,
+                                &mut separated,
+                                &display(value),
+                                &ifs,
+                            )?;
+                        }
                     }
                 }
             }
         }
         Ok(fields)
+    }
+
+    fn split_protected_spaces(
+        &mut self,
+        fields: &mut Vec<String>,
+        separated: &mut Boundary,
+        text: &str,
+        ifs: &Ifs,
+    ) -> Result<(), CommandFailure> {
+        let mut start = 0;
+        while start < text.len() {
+            let space = text.as_bytes()[start] == b' ';
+            let end = text.as_bytes()[start..]
+                .iter()
+                .position(|byte| (*byte == b' ') != space)
+                .map_or(text.len(), |offset| start + offset);
+            let part = &text[start..end];
+            if space {
+                self.budget.charge_step()?;
+                self.expansion_charges.push(
+                    self.budget
+                        .charge_value_bytes((part.len() + size_of::<String>()) as u64)?,
+                );
+                append_field(fields, separated, part);
+            } else {
+                self.split_text_with(fields, separated, part, ifs)?;
+            }
+            start = end;
+        }
+        Ok(())
     }
 
     fn expansion_text(
@@ -3836,7 +4098,7 @@ impl<'a> Evaluator<'a> {
             let start = spans.len();
             let value = match part {
                 WordPart::Literal(literal) => {
-                    self.record_text(spans, literal, Protection::Unquoted)?;
+                    self.record_split_text(spans, literal)?;
                     self.expansion_text(literal, ExpansionOutput::Value)?
                 }
                 WordPart::Asset(_)
@@ -4782,6 +5044,26 @@ fn append(fields: &mut Vec<String>, text: &str) {
         last.push_str(text);
     } else {
         fields.push(text.to_owned());
+    }
+}
+
+fn append_unsplit_value(fields: &mut Vec<String>, separated: &mut Boundary, value: &Value) {
+    match value {
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    *separated = Boundary::Start;
+                }
+                append_field(fields, separated, &display(item));
+            }
+        }
+        Value::Null => {}
+        Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+            let text = display(value);
+            if !text.is_empty() {
+                append_field(fields, separated, &text);
+            }
+        }
     }
 }
 
