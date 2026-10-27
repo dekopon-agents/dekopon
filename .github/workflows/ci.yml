@@ -186,6 +186,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify Bash 5.2 reference interpreter
+        shell: bash
+        run: |
+          bash --version
+          bash -c '[[ ${BASH_VERSINFO[0]} == 5 && ${BASH_VERSINFO[1]} == 2 ]]'
       - name: Install Rust
         run: rustup toolchain install
       - name: Configure compiler cache
@@ -227,6 +232,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify Bash 5.2 reference interpreter
+        shell: bash
+        run: |
+          bash --version
+          bash -c '[[ ${BASH_VERSINFO[0]} == 5 && ${BASH_VERSINFO[1]} == 2 ]]'
       - name: Install Rust
         run: rustup toolchain install
       - name: Fetch exact JSONPlaceholder, memory-chat, and gh test fixtures

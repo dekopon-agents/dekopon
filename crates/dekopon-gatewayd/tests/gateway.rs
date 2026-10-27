@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -209,22 +209,66 @@ fn final_answer(text: &str) -> Value {
     })
 }
 
+struct SpawnedModel {
+    endpoint: String,
+    requests: Arc<AtomicUsize>,
+    prompts: Arc<Mutex<Vec<Value>>>,
+    worker: ModelWorker,
+}
+
+struct ModelWorker {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    holds: Vec<ModelHold>,
+}
+
+impl Drop for ModelWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for hold in &self.holds {
+            hold.release();
+        }
+        if let Some(worker) = self.thread.take() {
+            worker.join().expect("model worker joins");
+        }
+    }
+}
+
 fn spawn_model(
     responses: Vec<Value>,
     first_answer_delay: Duration,
     first_answer_hold: Option<ModelHold>,
     first_delta_hold: Option<ModelHold>,
-) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+) -> SpawnedModel {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock model binds");
     let address = listener.local_addr().expect("mock model address");
+    listener
+        .set_nonblocking(true)
+        .expect("model listener is cancellable");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let holds = first_answer_hold
+        .iter()
+        .chain(first_delta_hold.iter())
+        .cloned()
+        .collect();
     let requests = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&requests);
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&bodies);
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         for (index, response) in responses.into_iter().enumerate() {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
+            let mut stream = loop {
+                if stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("model accept: {error}"),
+                }
             };
             counted.fetch_add(1, Ordering::SeqCst);
             let Some(request) = read_request(&mut stream) else {
@@ -252,7 +296,16 @@ fn spawn_model(
             }
         }
     });
-    (format!("http://{address}/v1"), requests, bodies)
+    SpawnedModel {
+        endpoint: format!("http://{address}/v1"),
+        requests,
+        prompts: bodies,
+        worker: ModelWorker {
+            stop,
+            thread: Some(worker),
+            holds,
+        },
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Value> {
@@ -535,6 +588,7 @@ fn scripted_deltas(responses: &[Value]) -> usize {
 }
 
 struct Fixture {
+    model: ModelWorker,
     directory: tempfile::TempDir,
     broker: tokio::task::JoinHandle<Result<(), dekopon_brokerd::BrokerdError>>,
     stop_broker: oneshot::Sender<()>,
@@ -565,6 +619,28 @@ impl Fixture {
                 )
             })
             .collect()
+    }
+
+    #[cfg(feature = "fauxlack")]
+    fn tool_result(&self, call_id: &str) -> String {
+        let prompts = self.model_prompts.lock();
+        let results = prompts
+            .iter()
+            .flat_map(|request| request["messages"].as_array().expect("messages"))
+            .filter(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+            .map(|message| {
+                message["content"]
+                    .as_str()
+                    .expect("tool content")
+                    .to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            results.len(),
+            1,
+            "one distinct tool result for {call_id}: {results:?}"
+        );
+        results.into_iter().next().expect("one result")
     }
 
     #[allow(
@@ -695,6 +771,10 @@ impl ModelHold {
 
 #[derive(Default)]
 struct Timing {
+    #[cfg(feature = "fauxlack")]
+    fauxlack: Option<dekopon_gatewayd::fauxlack::Fauxlack>,
+    #[cfg(feature = "fauxlack")]
+    fauxlack_servers: Vec<String>,
     jobs: bool,
     route_seen_only: bool,
     keep_alive: Option<Value>,
@@ -734,14 +814,23 @@ async fn boot_with(
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
+    let mut policies = broker_policies();
+    let mut broker_document = broker_config(directory.path(), uid);
+    #[cfg(feature = "fauxlack")]
+    if timing.fauxlack.is_some() {
+        fauxlack::configure_broker(
+            &mut broker_document,
+            &mut policies,
+            &timing.fauxlack_servers,
+        );
+    }
     write_owner_only(
         &directory.path().join("policies.cedar"),
-        broker_policies().as_bytes(),
+        policies.as_bytes(),
     );
     write_owner_only(
         &broker_path,
-        &serde_json::to_vec(&broker_config(directory.path(), uid))
-            .expect("broker config serializes"),
+        &serde_json::to_vec(&broker_document).expect("broker config serializes"),
     );
     let (stop_broker, broker_stopped) = oneshot::channel::<()>();
     let mut broker = tokio::spawn(dekopon_brokerd::run(
@@ -762,7 +851,12 @@ async fn boot_with(
         &directory.path().join("dekopon.yaml"),
         catalog_text().as_bytes(),
     );
-    let (endpoint, model_requests, model_prompts) = spawn_model(
+    let SpawnedModel {
+        endpoint,
+        requests: model_requests,
+        prompts: model_prompts,
+        worker: model,
+    } = spawn_model(
         responses,
         timing.model_delay,
         timing.model_hold.clone(),
@@ -777,6 +871,10 @@ async fn boot_with(
         progress_detail,
         stream,
     );
+    #[cfg(feature = "fauxlack")]
+    if timing.fauxlack.is_some() {
+        fauxlack::configure_gateway(&mut config, &timing.fauxlack_servers);
+    }
     if let Some(keep_alive) = &timing.keep_alive {
         config["transports"][0]["indicators"]["keepAlive"] = keep_alive.clone();
     }
@@ -795,17 +893,38 @@ async fn boot_with(
         &serde_json::to_vec(&config).expect("gateway config serializes"),
     );
     let (stop_gateway, gateway_stopped) = oneshot::channel::<()>();
-    let mut gateway = tokio::spawn(dekopon_gatewayd::run(gateway_path, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "a dropped sender means the fixture went away, which is the same instruction \
-                      to shut down as a delivered one"
-        )]
-        let _ = gateway_stopped.await;
-    }));
-    wait_for_socket(&directory.path().join("dev.sock"), &mut gateway).await;
+    #[cfg(feature = "fauxlack")]
+    let service = timing.fauxlack.clone();
+    let mut gateway = tokio::spawn(async move {
+        let shutdown = async move {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "dropping the fixture also requests shutdown"
+            )]
+            let _ = gateway_stopped.await;
+        };
+        #[cfg(feature = "fauxlack")]
+        if let Some(service) = service {
+            return dekopon_gatewayd::run_fauxlack(gateway_path, shutdown, service).await;
+        }
+        dekopon_gatewayd::run(gateway_path, shutdown).await
+    });
+    #[cfg(feature = "fauxlack")]
+    let in_process = timing.fauxlack.is_some();
+    #[cfg(not(feature = "fauxlack"))]
+    let in_process = false;
+    if !in_process {
+        wait_for_socket(&directory.path().join("dev.sock"), &mut gateway).await;
+    }
+    #[cfg(feature = "fauxlack")]
+    if let Some(chat) = &timing.fauxlack {
+        for server in &timing.fauxlack_servers {
+            chat.server(server).attached("udekopon").await;
+        }
+    }
 
     Fixture {
+        model,
         directory,
         broker,
         stop_broker,
@@ -867,6 +986,7 @@ async fn an_unsent_gateway_job_leg_survives_a_broker_restart_and_a_fresh_connect
     )
     .await;
     let Fixture {
+        model,
         directory,
         broker,
         stop_broker,
@@ -945,6 +1065,7 @@ async fn an_unsent_gateway_job_leg_survives_a_broker_restart_and_a_fresh_connect
         .await
         .expect("replacement joins")
         .expect("replacement drains");
+    drop(model);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1930,3 +2051,7 @@ async fn a_healthy_chat_serves_during_peer_recovery_then_fatal_failure_exits_non
     );
     fixture.shutdown().await;
 }
+
+#[cfg(feature = "fauxlack")]
+#[path = "gateway/fauxlack.rs"]
+mod fauxlack;

@@ -26,6 +26,8 @@ use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 pub(crate) mod discord;
+#[cfg(feature = "fauxlack")]
+pub(crate) mod fauxlack;
 pub(crate) mod github;
 mod hydration;
 pub(crate) mod local;
@@ -176,6 +178,11 @@ pub(crate) struct ThreadContinuation {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum LivenessTarget {
+    Fauxlack {
+        server: String,
+        container: String,
+        thread: Option<String>,
+    },
     Slack {
         channel_id: String,
         thread_ts: String,
@@ -263,6 +270,11 @@ pub(crate) struct CancelPress {
     rename_all_fields = "camelCase"
 )]
 pub(crate) enum ReplyTarget {
+    Fauxlack {
+        server: String,
+        container: String,
+        thread: Option<String>,
+    },
     Slack {
         channel: String,
         thread_ts: Option<String>,

@@ -73,6 +73,10 @@ impl fmt::Debug for AssetRef {
     rename_all_fields = "camelCase"
 )]
 pub(crate) enum AssetSourceRef {
+    Fauxlack {
+        server: String,
+        file: String,
+    },
     Generated {
         capability: String,
         invocation: String,
@@ -105,6 +109,11 @@ impl AssetSourceRef {
 impl fmt::Debug for AssetSourceRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Fauxlack { server, file } => formatter
+                .debug_struct("Fauxlack")
+                .field("server", server)
+                .field("file", file)
+                .finish(),
             Self::Generated { .. } => formatter.write_str("Generated"),
             Self::Slack { file_id, .. } => formatter
                 .debug_struct("Slack")
@@ -896,7 +905,8 @@ impl AssetRef {
                     format!("provider:{capability}")
                 }
                 Some(
-                    AssetSourceRef::Slack { .. }
+                    AssetSourceRef::Fauxlack { .. }
+                    | AssetSourceRef::Slack { .. }
                     | AssetSourceRef::Discord { .. }
                     | AssetSourceRef::WhatsApp { .. }
                     | AssetSourceRef::Telegram { .. },
