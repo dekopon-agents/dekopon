@@ -546,6 +546,7 @@ pub fn build_model(
                 &options.model,
                 Some(&path),
                 options.model_timeout,
+                &[],
             )?)
         }
         ModelChoice::OpenAiCompatible {
@@ -566,6 +567,7 @@ pub fn build_model(
                 &options.model,
                 bearer,
                 options.model_timeout,
+                &[],
             )?)
         }
     };

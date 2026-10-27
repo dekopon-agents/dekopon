@@ -91,6 +91,8 @@ impl InferenceError {
 
 #[derive(Debug, Error)]
 pub enum RequestError {
+    #[error("invalid model CA bundle")]
+    InvalidCaBundle,
     #[error("generation override requires http://127.0.0.1 or http://[::1]")]
     InvalidLoopbackEndpoint,
     #[error("OpenRouter credential must not be blank")]

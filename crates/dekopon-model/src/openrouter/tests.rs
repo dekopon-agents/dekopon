@@ -18,6 +18,7 @@ fn client(server: &MockServer, settings: Settings) -> OpenRouterClient {
         "synthetic-key".into(),
         Duration::from_secs(3),
         settings,
+        &[],
     )
     .unwrap()
     .with_endpoint(server.base_url())
@@ -850,7 +851,7 @@ fn routing_cache_and_sampling_problems_are_collected_without_clamping() {
     };
     assert_eq!(empty.problems(), vec![settings::SettingsProblem::EmptyOnly]);
     assert!(matches!(
-        OpenRouterClient::new("model", "key".into(), Duration::from_secs(1), settings),
+        OpenRouterClient::new("model", "key".into(), Duration::from_secs(1), settings, &[]),
         Err(InferenceError::InvalidRequest(
             RequestError::OpenRouterSetting(_)
         ))
@@ -883,7 +884,8 @@ fn constructor_refusals_are_local_typed_request_errors() {
             " ",
             "key".into(),
             Duration::from_secs(1),
-            Settings::default()
+            Settings::default(),
+            &[]
         ),
         Err(InferenceError::InvalidRequest(RequestError::EmptyModel))
     ));
@@ -892,14 +894,21 @@ fn constructor_refusals_are_local_typed_request_errors() {
             "model",
             " ".into(),
             Duration::from_secs(1),
-            Settings::default()
+            Settings::default(),
+            &[]
         ),
         Err(InferenceError::InvalidRequest(
             RequestError::EmptyCredential
         ))
     ));
     assert!(matches!(
-        OpenRouterClient::new("model", "key".into(), Duration::ZERO, Settings::default()),
+        OpenRouterClient::new(
+            "model",
+            "key".into(),
+            Duration::ZERO,
+            Settings::default(),
+            &[]
+        ),
         Err(InferenceError::InvalidRequest(RequestError::ZeroTimeout))
     ));
     let client = OpenRouterClient::new(
@@ -907,6 +916,7 @@ fn constructor_refusals_are_local_typed_request_errors() {
         "key".into(),
         Duration::from_nanos(1),
         Settings::default(),
+        &[],
     )
     .unwrap();
     assert_eq!(
