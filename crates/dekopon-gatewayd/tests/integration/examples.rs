@@ -96,7 +96,7 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
 }
 
 #[test]
-fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
+fn both_slack_manifests_receive_follow_events_while_only_agent_enables_agent_ui() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let load = |name: &str| {
         let path = root.join("examples/slack").join(name);
@@ -140,13 +140,29 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
             .iter()
             .any(|scope| matches!(scope.as_str(), "channels:history" | "groups:history"))
     );
-    assert!(
-        !classic["settings"]["event_subscriptions"]["bot_events"]
+    for manifest in [&classic, &agent] {
+        let scopes = scopes(manifest);
+        for required in [
+            "channels:history",
+            "groups:history",
+            "reactions:read",
+            "users:read",
+        ] {
+            assert!(
+                scopes.iter().any(|scope| scope == required),
+                "follow requires {required}"
+            );
+        }
+        let events = manifest["settings"]["event_subscriptions"]["bot_events"]
             .as_sequence()
-            .expect("classic events are a sequence")
-            .iter()
-            .any(|event| matches!(event.as_str(), Some("message.channels" | "message.groups")))
-    );
+            .expect("bot events are a sequence");
+        for required in ["message.channels", "message.groups", "reaction_added"] {
+            assert!(
+                events.iter().any(|event| event.as_str() == Some(required)),
+                "follow requires {required}"
+            );
+        }
+    }
     let agent_events = agent["settings"]["event_subscriptions"]["bot_events"]
         .as_sequence()
         .expect("Agent events are a sequence");
@@ -160,14 +176,6 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
             .iter()
             .any(|event| event.as_str() == Some("app_home_opened"))
     );
-    for continuation_event in ["message.channels", "message.groups"] {
-        assert!(
-            agent_events
-                .iter()
-                .any(|event| event.as_str() == Some(continuation_event)),
-            "Agent manifest must receive {continuation_event} for owned-thread continuation"
-        );
-    }
     assert_eq!(
         classic["display_information"]["background_color"],
         "#ff6a3d"
