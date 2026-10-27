@@ -932,7 +932,7 @@ mod openrouter_startup_tests {
     #[test]
     fn missing_and_blank_openrouter_credentials_are_startup_problems_not_config_problems() {
         let model = config::ModelConfig::Openrouter {
-            ca_bundles: Vec::new(),
+            ca_bundles: Default::default(),
             name: "router".into(),
             model: "vendor/model".into(),
             api_key_env: "OPENROUTER_API_KEY".into(),

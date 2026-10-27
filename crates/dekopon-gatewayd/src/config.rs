@@ -507,7 +507,7 @@ impl TransportConfig {
 pub enum ModelConfig {
     OpenaiCompatible {
         #[serde(skip)]
-        ca_bundles: Vec<dekopon_core::Redacted<String>>,
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         endpoint: String,
         model: String,
@@ -523,7 +523,7 @@ pub enum ModelConfig {
     },
     Openrouter {
         #[serde(skip)]
-        ca_bundles: Vec<dekopon_core::Redacted<String>>,
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         model: String,
         api_key_env: String,
@@ -539,7 +539,7 @@ pub enum ModelConfig {
     },
     ChatgptSubscription {
         #[serde(skip)]
-        ca_bundles: Vec<dekopon_core::Redacted<String>>,
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         model: String,
         #[serde(default)]
@@ -552,7 +552,7 @@ pub enum ModelConfig {
     },
     Anthropic {
         #[serde(skip)]
-        ca_bundles: Vec<dekopon_core::Redacted<String>>,
+        ca_bundles: Arc<[dekopon_core::Redacted<String>]>,
         name: String,
         model: String,
         api_key_env: String,
@@ -579,12 +579,12 @@ impl ModelConfig {
         }
     }
 
-    fn set_ca_bundles(&mut self, bundles: &[dekopon_core::Redacted<String>]) {
+    fn set_ca_bundles(&mut self, bundles: &Arc<[dekopon_core::Redacted<String>]>) {
         match self {
             Self::OpenaiCompatible { ca_bundles, .. }
             | Self::Openrouter { ca_bundles, .. }
             | Self::ChatgptSubscription { ca_bundles, .. }
-            | Self::Anthropic { ca_bundles, .. } => *ca_bundles = bundles.to_vec(),
+            | Self::Anthropic { ca_bundles, .. } => *ca_bundles = Arc::clone(bundles),
         }
     }
 
@@ -1901,12 +1901,12 @@ fn model_ca_bundles(
     mode: LoadMode,
     problems: &mut Vec<ConfigProblem>,
 ) -> (
-    Vec<dekopon_core::Redacted<String>>,
+    Arc<[dekopon_core::Redacted<String>]>,
     BTreeMap<PathBuf, RawCandidate>,
 ) {
     if paths.len() > 8 {
         problems.push(ConfigProblem::ModelCaBundleCount);
-        return (Vec::new(), BTreeMap::new());
+        return (Arc::default(), BTreeMap::new());
     }
     let mut bundles = Vec::new();
     let mut sources = BTreeMap::new();
@@ -1961,7 +1961,7 @@ fn model_ca_bundles(
             Err(_) => problems.push(ConfigProblem::ModelCaBundlePem),
         }
     }
-    (bundles, sources)
+    (bundles.into(), sources)
 }
 
 #[expect(

@@ -1205,7 +1205,7 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
 fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
     let variable = "DEKOPON_GATEWAYD_TEST_MODEL_KEY_4F1A62";
     let model = |api_key_env: Option<&str>| ModelConfig::OpenaiCompatible {
-        ca_bundles: Vec::new(),
+        ca_bundles: Default::default(),
         name: "fast".to_owned(),
         endpoint: "http://127.0.0.1:8080/v1/chat/completions".to_owned(),
         model: "qwen3".to_owned(),
@@ -4440,7 +4440,7 @@ fn shared_window() -> MemoryWindow {
 
 fn model_config() -> ModelConfig {
     ModelConfig::OpenaiCompatible {
-        ca_bundles: Vec::new(),
+        ca_bundles: Default::default(),
         name: "local-qwen".to_owned(),
         endpoint: "http://127.0.0.1:1/v1".to_owned(),
         model: "qwen3".to_owned(),
