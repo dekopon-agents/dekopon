@@ -231,12 +231,19 @@ fn a_truncated_descriptor_receive_is_refused_and_leaves_none_open() {
         .build()
         .expect("runtime")
         .block_on(async {
+            use std::{collections::BTreeSet, os::unix::fs::MetadataExt as _};
+
             let (writer, reader) = UnixStream::pair().expect("socket pair");
             let mut reader = DescriptorStream::new(reader);
             reader.receive_capacity = 2;
-            let count = || std::fs::read_dir("/dev/fd").expect("fd directory").count();
-            let before = count();
-            let files = files(MAX_DESCRIPTORS_PER_FRAME);
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let files: Vec<_> = (0..MAX_DESCRIPTORS_PER_FRAME)
+                .map(|index| {
+                    std::fs::File::create(directory.path().join(index.to_string()))
+                        .expect("distinct fixture")
+                })
+                .collect();
+            let sent: Vec<_> = files.iter().map(inode).collect();
             raw_frame(&writer, &[0, 0, 0, 2, b'{', b'}'], &files).await;
             drop(files);
             assert!(matches!(
@@ -245,7 +252,20 @@ fn a_truncated_descriptor_receive_is_refused_and_leaves_none_open() {
                     .await,
                 Err(ProtocolError::DescriptorsTruncated)
             ));
-            assert_eq!(count(), before);
+            let open: BTreeSet<_> = std::fs::read_dir("/dev/fd")
+                .expect("fd directory")
+                .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+                .map(|metadata| metadata.ino())
+                .filter(|inode| sent.contains(inode))
+                .collect();
+            let undelivered: BTreeSet<_> =
+                sent[sent.len() - open.len()..].iter().copied().collect();
+            assert!(
+                !open.contains(&sent[0]) && open == undelivered,
+                "delivered descriptors left open: sent {sent:?}, open {open:?}"
+            );
+            #[cfg(target_os = "linux")]
+            assert!(open.is_empty());
         });
 }
 
