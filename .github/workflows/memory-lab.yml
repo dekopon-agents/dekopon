@@ -37,7 +37,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LAB_HARNESS_SHA: 63eee72f78797a2ea637a4cfdb69202487e13099
+  LAB_HARNESS_SHA: 0a2f9e7ac5a3a46d14327409de0f73a0e1097f71
   CARGO_INCREMENTAL: '0'
   CARGO_TERM_COLOR: always
 

@@ -769,10 +769,7 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     assert_eq!(
         window(2),
         turns(&[
-            (
-                "user",
-                "[gateway: unmapped participant]\nperson said this"
-            ),
+            ("user", "[gateway: unmapped participant]\nperson said this"),
             ("assistant", "draft"),
             ("assistant", "finished"),
             ("user", "[gateway: unmapped participant]\nwhat did I say?"),
@@ -781,16 +778,10 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
     assert_eq!(
         window(3),
         turns(&[
-            (
-                "user",
-                "[gateway: unmapped participant]\nperson said this"
-            ),
+            ("user", "[gateway: unmapped participant]\nperson said this"),
             ("assistant", "draft"),
             ("assistant", "finished"),
-            (
-                "user",
-                "[gateway: unmapped participant]\nwhat did I say?"
-            ),
+            ("user", "[gateway: unmapped participant]\nwhat did I say?"),
             ("assistant", "remembered"),
             ("user", "[gateway: unmapped participant]\nand before that?"),
         ])

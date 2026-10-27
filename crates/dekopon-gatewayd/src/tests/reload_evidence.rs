@@ -357,8 +357,7 @@ async fn rejected_budget_and_summary_model_values_stay_out_of_reload_and_boot_di
     }});
     config["metering"]["budgets"][KEY] = meter;
     config["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
-    config["routes"][0]["memory"] =
-        json!({"mode": "persistent", "summaries": {"model": ROUTINE}});
+    config["routes"][0]["memory"] = json!({"mode": "persistent", "summaries": {"model": ROUTINE}});
     write_config(root.path(), &config);
     let report = crate::check(&path, None, None).await;
     assert!(report.problems.iter().any(|problem| matches!(

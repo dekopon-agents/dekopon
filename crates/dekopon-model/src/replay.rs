@@ -496,7 +496,8 @@ mod tests {
         let raw = br#"{"type":"reasoning.encrypted","data":"opaque"}"#;
         let mut reasoning = tempfile::tempfile().unwrap();
         reasoning.write_all(raw).unwrap();
-        let mut files = vec![Arc::new(reasoning)];
+        let reasoning = Arc::new(reasoning);
+        let mut files = vec![Arc::clone(&reasoning)];
         let sliced = shapes(
             |source| {
                 let text = slice(source);
@@ -506,7 +507,7 @@ mod tests {
                 text
             },
             OpaqueSource::File {
-                file: Arc::clone(&files[0]),
+                file: reasoning,
                 offset: 0,
                 len: raw.len() as u64,
             },

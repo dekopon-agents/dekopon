@@ -1225,8 +1225,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn elapsed_resident_tickets_release_capacity_for_a_new_invitation() {
+    fn follow_table() -> (tempfile::TempDir, Arc<Journal>, Arc<FollowTable>) {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1237,36 +1236,172 @@ mod tests {
             .unwrap(),
         );
         let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
+        (dir, journal, table)
+    }
+
+    fn lapse(table: &FollowTable, dir: &std::path::Path, key: &str, now: SystemTime) {
+        let marker = FollowMarker {
+            at_ms: millis(now) - 2,
+            until_ms: millis(now) - 1,
+        };
+        std::fs::write(
+            dir.join(format!("{key}.followed")),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let seq = MarkerSeq(table.next_seq.fetch_add(1, Ordering::Relaxed));
+        table
+            .resident
+            .lock()
+            .insert(key.to_owned(), Marked { marker, seq });
+        table.written.lock().insert(key.to_owned(), seq);
+    }
+
+    fn reloaded(journal: &Arc<Journal>, key: &str, now: SystemTime) -> FollowTicket {
+        FollowTable::load(Arc::clone(journal))
+            .unwrap()
+            .ticket(key, now)
+    }
+
+    #[test]
+    fn lapsed_tickets_never_block_a_new_invite() {
+        let (dir, journal, table) = follow_table();
         let now = SystemTime::now();
-        for index in 0..MAX_TICKETS {
-            table.resident.lock().insert(
-                format!("{index:064x}"),
-                Marked {
-                    marker: FollowMarker {
-                        at_ms: millis(now) - 2,
-                        until_ms: millis(now) - 1,
-                    },
-                    seq: MarkerSeq(u64::MAX - index as u64),
-                },
-            );
+        let lapsed: Vec<String> = (0..MAX_TICKETS)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        for key in &lapsed {
+            lapse(&table, dir.path(), key, now);
         }
-        let first = format!("{:064x}", 0);
-        journal
-            .write_follow(
-                &first,
-                FollowMarker {
-                    at_ms: millis(now) - 2,
-                    until_ms: millis(now) - 1,
-                },
-            )
-            .unwrap();
         let fresh = "f".repeat(64);
-        table.stay_and_write(&fresh, now).unwrap();
+        let pending = table.stay(&fresh, now, 0).unwrap();
         assert!(matches!(
             table.ticket(&fresh, now),
             FollowTicket::Active { .. }
         ));
-        assert!(!dir.path().join(format!("{first}.followed")).exists());
+        assert!(dir.path().join(format!("{}.followed", lapsed[0])).exists());
+        assert!(!dir.path().join(format!("{fresh}.followed")).exists());
+        pending.write();
+        for key in &lapsed {
+            assert!(!dir.path().join(format!("{key}.followed")).exists());
+        }
+        assert!(matches!(
+            reloaded(&journal, &fresh, now),
+            FollowTicket::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn a_lapsed_unlink_never_drops_a_rewritten_marker() {
+        let (dir, journal, table) = follow_table();
+        let now = SystemTime::now();
+        let key = "a".repeat(64);
+        lapse(&table, dir.path(), &key, now);
+        let first = table.stay(&"b".repeat(64), now, 0).unwrap();
+        let second = table.stay(&key, now, 1).unwrap();
+        second.write();
+        first.write();
+        assert!(matches!(
+            reloaded(&journal, &key, now),
+            FollowTicket::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_refresh_never_drops_a_new_invite() {
+        for held in [true, false] {
+            let (dir, journal, table) = follow_table();
+            let now = SystemTime::now();
+            let key = "c".repeat(64);
+            table.stay_and_write(&key, now).unwrap();
+            let marker = dir.path().join(format!("{key}.followed"));
+            std::fs::remove_file(&marker).unwrap();
+            std::fs::create_dir(&marker).unwrap();
+            let pending = if held {
+                std::thread::scope(|scope| {
+                    let (locked, ready) = std::sync::mpsc::sync_channel(1);
+                    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+                    let held = &journal;
+                    let holder = scope.spawn(move || {
+                        let _lock = held.hold_io_for_test();
+                        locked.send(()).unwrap();
+                        unblock.recv_timeout(Duration::from_secs(8)).unwrap();
+                    });
+                    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let refresh = scope.spawn(|| table.refresh(&key, now));
+                    while !table.writing_for_test() {
+                        std::thread::yield_now();
+                    }
+                    let pending = table.stay(&key, now, 1).unwrap();
+                    release.send(()).unwrap();
+                    holder.join().unwrap();
+                    assert!(matches!(
+                        refresh.join().unwrap(),
+                        Err(JournalError::Io { .. })
+                    ));
+                    pending
+                })
+            } else {
+                let pending = table.stay(&key, now, 1).unwrap();
+                assert!(matches!(
+                    table.refresh(&key, now),
+                    Err(JournalError::Io { .. })
+                ));
+                pending
+            };
+            assert!(matches!(
+                table.ticket(&key, now),
+                FollowTicket::Active { .. }
+            ));
+            std::fs::remove_dir(&marker).unwrap();
+            pending.write();
+            assert!(matches!(
+                reloaded(&journal, &key, now),
+                FollowTicket::Active { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn stay_never_waits_on_disk() {
+        let (dir, journal, table) = follow_table();
+        let now = SystemTime::now();
+        let other = "d".repeat(64);
+        let key = "e".repeat(64);
+        table.stay_and_write(&other, now).unwrap();
+        let pending = std::thread::scope(|scope| {
+            let (locked, ready) = std::sync::mpsc::sync_channel(1);
+            let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+            let held = &journal;
+            let holder = scope.spawn(move || {
+                let _lock = held.hold_io_for_test();
+                locked.send(()).unwrap();
+                unblock.recv_timeout(Duration::from_secs(8)).unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let refresh = scope.spawn(|| table.refresh(&other, now));
+            while !table.writing_for_test() {
+                std::thread::yield_now();
+            }
+            let (sent, stayed) = std::sync::mpsc::sync_channel(1);
+            let (staying, staying_key) = (&table, &key);
+            let staying =
+                scope.spawn(move || sent.send(staying.stay(staying_key, now, 0)).unwrap());
+            let pending = stayed.recv_timeout(Duration::from_secs(2));
+            assert!(table.writing_for_test());
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            staying.join().unwrap();
+            refresh.join().unwrap().unwrap();
+            pending.expect("stay never waits on disk").unwrap()
+        });
+        assert!(!dir.path().join(format!("{key}.followed")).exists());
+        pending.write();
+        assert!(dir.path().join(format!("{key}.followed")).exists());
+        assert!(matches!(
+            reloaded(&journal, &key, now),
+            FollowTicket::Active { .. }
+        ));
     }
 
     #[test]

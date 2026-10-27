@@ -152,7 +152,7 @@ struct RawHeaderLine {
 }
 
 #[cfg(test)]
-thread_local! { static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! { pub(super) static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, JournalError> {
     #[cfg(test)]
