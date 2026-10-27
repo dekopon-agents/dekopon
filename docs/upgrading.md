@@ -8,6 +8,19 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## The bash tool's as is inert on unmapped routes (0.61.1)
+
+No configuration change or provider re-pin is required. In 0.61.0, any `as` value on an unmapped
+route made the bash tool fail with "Unknown participant handle". In 0.61.1, the gateway ignores
+it, runs the script as the asker, and records `tool_call.ignored_arguments = "as"` with
+`reason = "unmapped-route"`. Mapped routes keep their existing participant selection and
+unknown-handle refusal.
+
+Upgrading from 0.61.0 needs only a binary swap. For a downgrade from 0.61.1 to 0.60.0, revert both
+daemons together: the older broker rejects participant-bearing claims. Existing journal text
+remains readable, but stored fauxlack subjects, chat scopes or delivery identities prevent that
+rollback, as described in the 0.61.0 entry below.
+
 ## Participant handles, fauxlack vocabulary and the console image default (0.61.0)
 
 No configuration change is required, and existing providers need no WIT or SDK re-pin. Before upgrading:
