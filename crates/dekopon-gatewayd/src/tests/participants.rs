@@ -539,6 +539,8 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
             rendered(),
             rendered(),
             rendered(),
+            listing("ana", true),
+            rendered(),
         ],
     )
     .await;
@@ -551,18 +553,23 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
     let mut explicit_asker = script_call("probe explicit-asker");
     explicit_asker.tool_calls[0].function.arguments =
         json!({"command": "probe explicit-asker", "as": "p1"}).to_string();
+    let mut background = script_call("probe background & wait");
+    background.tool_calls[0].function.arguments =
+        json!({"command":"probe background & wait", "as":"p2"}).to_string();
     let models = InterruptibleModel::new([
         answer("draft"),
         selected,
         unknown,
         script_call("probe default-asker"),
         explicit_asker,
+        background,
         answer("done"),
     ]);
     let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
     let driver = Arc::new(RecordingDriver::default());
     let mut route = shared_route();
     route.limits.max_steps = 8;
+    route.job_timeout = Some(Duration::from_secs(5));
     let task = tokio::spawn(
         run_session(
             Arc::clone(&runner),
@@ -600,37 +607,45 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
     let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
     let runs = requests
         .iter()
-        .filter_map(|request| match &request.request {
-            BrokerRequest::Run {
+        .filter_map(|request| {
+            if let BrokerRequest::Run {
                 attestation: Some(claim),
                 word,
                 argv,
                 ..
-            } => Some((claim, word, argv)),
-            _ => None,
+            } = &request.request
+            {
+                Some((claim, word, argv))
+            } else {
+                None
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(
         requests.len(),
-        6,
-        "two lookups and four command words; unknown handle sends nothing"
+        8,
+        "three lookups and five command words; unknown handle sends nothing"
     );
-    assert_eq!(runs.len(), 4);
+    assert_eq!(runs.len(), 5);
     for ((claim, word, _), (subject, handle)) in
         runs.iter()
-            .zip([(8, "p2"), (8, "p2"), (9, "p1"), (9, "p1")])
+            .zip([(8, "p2"), (8, "p2"), (9, "p1"), (9, "p1"), (8, "p2")])
     {
         assert_eq!(word.as_str(), "probe");
         assert_eq!(claim.subject, speaker(subject, "").subject);
         let scope = claim.scope.as_ref().unwrap();
         assert_eq!(scope.participant.as_deref(), Some(handle));
-        assert_eq!(
-            scope.delivery,
-            Some(DeliveryIdentity::Slack {
-                channel: "c0123abc".to_owned(),
-                timestamp: format!("1700000000.{subject:06}")
-            })
-        );
+        if scope.trigger == dekopon_broker_protocol::Trigger::Job {
+            assert_eq!(scope.delivery, None);
+        } else {
+            assert_eq!(
+                scope.delivery,
+                Some(DeliveryIdentity::Slack {
+                    channel: "c0123abc".to_owned(),
+                    timestamp: format!("1700000000.{subject:06}")
+                })
+            );
+        }
     }
     let commands = capture
         .records()
@@ -645,13 +660,13 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
             ) && record.field("shell.command.name").is_some()
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        commands
-            .iter()
-            .map(|record| record.field("participant.handle"))
-            .collect::<Vec<_>>(),
-        [Some("p2"), Some("p2"), Some("p1"), Some("p1")]
-    );
+    let handles = commands
+        .iter()
+        .map(|record| record.field("participant.handle"))
+        .collect::<Vec<_>>();
+    assert_eq!(handles.len(), 6);
+    assert_eq!(handles.iter().filter(|h| **h == Some("p2")).count(), 4);
+    assert_eq!(handles.iter().filter(|h| **h == Some("p1")).count(), 2);
 }
 
 #[tokio::test]

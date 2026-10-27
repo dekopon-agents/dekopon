@@ -11,6 +11,10 @@ pub(super) struct Handle(&'static str);
 impl Handle {
     pub(super) const ASKER: Self = Self("p1");
 
+    pub(super) fn as_str(self) -> &'static str {
+        self.0
+    }
+
     pub(super) fn bind(self, leg: BrokerLeg) -> BrokerLeg {
         leg.with_participant(self.0)
     }
@@ -444,7 +448,7 @@ async fn authorize(
                 let mut table = table.lock();
                 match Handle::ALL.get(table.entries.len()).copied() {
                     Some(handle) => {
-                        let leg = Arc::new(handle.bind(leg));
+                        let leg = Arc::new(with_jobs(inputs, &message, handle.bind(leg), handle));
                         table.entries.push(Entry {
                             subject: message.subject.clone(),
                             handle,
@@ -512,24 +516,37 @@ async fn open(inputs: &Inputs, message: &InboundMessage) -> Result<BrokerLeg, Se
     if inputs.route.progress_notes {
         leg = leg.with_progress_notes();
     }
+
+    Ok(leg)
+}
+
+fn with_jobs(
+    inputs: &Inputs,
+    message: &InboundMessage,
+    mut leg: BrokerLeg,
+    handle: Handle,
+) -> BrokerLeg {
     if let Some((timeout, anchor)) = inputs
         .route
         .job_timeout
         .zip(Anchor::for_job(message, &inputs.route.agent))
     {
-        leg = leg.with_job_control(Arc::new(JobContext::for_turn(
-            Arc::clone(&inputs.jobs),
-            message,
-            anchor,
-            inputs.broker.clone(),
-            ShellLimits {
-                max_capability_calls: inputs.shell.max_capability_calls,
-                timeout,
-                ..ShellLimits::default()
-            },
-        )));
+        leg = leg.with_job_control(Arc::new(
+            JobContext::for_turn(
+                Arc::clone(&inputs.jobs),
+                message,
+                anchor,
+                inputs.broker.clone(),
+                ShellLimits {
+                    max_capability_calls: inputs.shell.max_capability_calls,
+                    timeout,
+                    ..ShellLimits::default()
+                },
+            )
+            .with_participant(Some(handle.0)),
+        ));
     }
-    Ok(leg)
+    leg
 }
 
 fn refusal_reason(error: &SessionError) -> &'static str {

@@ -532,6 +532,7 @@ pub(crate) struct JobContext {
     runtime: tokio::runtime::Handle,
     limits: ShellLimits,
     origin: Origin,
+    participant: Option<String>,
 }
 
 impl JobContext {
@@ -550,7 +551,13 @@ impl JobContext {
             runtime: tokio::runtime::Handle::current(),
             limits,
             origin: Origin::Turn,
+            participant: None,
         }
+    }
+
+    pub(crate) fn with_participant(mut self, handle: Option<&str>) -> Self {
+        self.participant = handle.map(str::to_owned);
+        self
     }
 
     #[cfg(test)]
@@ -581,6 +588,7 @@ impl JobContext {
             runtime,
             limits,
             origin: Origin::Tree(Trigger::Probe),
+            participant: None,
         }
     }
 
@@ -603,12 +611,13 @@ impl JobContext {
                 );
             })
             .ok()?;
+        let mut claim = self.anchor.claim(self.trigger());
+        if let Some(scope) = &mut claim.scope {
+            scope.participant = self.participant.clone();
+        }
         let leg = self
             .runtime
-            .block_on(BrokerLeg::connect(
-                client,
-                Some(self.anchor.claim(self.trigger())),
-            ))
+            .block_on(BrokerLeg::connect(client, Some(claim)))
             .inspect_err(|error| {
                 tracing::warn!(
                     event = "gateway_job_leg_unavailable",
