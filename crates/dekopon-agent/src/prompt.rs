@@ -1903,7 +1903,7 @@ fn script_argument(tool: &str, arguments: &str) -> Result<BashArguments, PromptE
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. Call this tool with JSON arguments, for example \
 `{\"command\":\"cap --list\"}`; provider command words are not separate model \
-tools. Optional `as` selects one current participant handle for the whole script in mapped channels; ignored on unmapped routes; default: asker. Returns the script's combined output followed by an \
+tools. Optional `as`: current participant handle in mapped channels; ignored on unmapped routes; default: asker. Returns the script's combined output followed by an \
 `[exit code: N]` trailer.
 
 - Capabilities are reached only through this tool. Do the whole job in one script; send another \
