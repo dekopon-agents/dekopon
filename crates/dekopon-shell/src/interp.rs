@@ -3166,7 +3166,11 @@ impl<'a> Evaluator<'a> {
                 }
             },
             "return" => {
-                if self.frames.is_empty() {
+                if !self
+                    .frames
+                    .iter()
+                    .any(|frame| frame.kind == FrameKind::Function)
+                {
                     self.write_line("dekopon-shell: return: only valid inside a function");
                     return Ok(Some(Executed::Result(CommandResult::status(
                         ExitCode::SYNTAX,
@@ -3524,10 +3528,19 @@ impl<'a> Evaluator<'a> {
                     WordPart::Parameter(_)
                     | WordPart::CommandSubstitution(_)
                     | WordPart::Arithmetic(_) => true,
-                    WordPart::Asset(_)
-                    | WordPart::Literal(_)
-                    | WordPart::SingleQuoted(_)
-                    | WordPart::DoubleQuoted(_) => false,
+                    WordPart::DoubleQuoted(parts) => {
+                        (word.parts.len() > 1 || parts.len() > 1)
+                            && parts.iter().any(|part| match part {
+                                WordPart::Parameter(parameter) => splits_inside_quotes(parameter),
+                                WordPart::Asset(_)
+                                | WordPart::Literal(_)
+                                | WordPart::SingleQuoted(_)
+                                | WordPart::DoubleQuoted(_)
+                                | WordPart::CommandSubstitution(_)
+                                | WordPart::Arithmetic(_) => false,
+                            })
+                    }
+                    WordPart::Asset(_) | WordPart::Literal(_) | WordPart::SingleQuoted(_) => false,
                 });
                 if resplit {
                     for span in &mut spans {
@@ -3891,9 +3904,12 @@ impl<'a> Evaluator<'a> {
     }
 
     fn split_spans(&mut self, spans: Vec<ExpansionSpan>) -> Result<Vec<String>, CommandFailure> {
-        let force_space = spans
-            .iter()
-            .any(|span| matches!(span.content, SpanContent::SplitSpace));
+        let force_space = spans.iter().any(|span| match span.content {
+            SpanContent::SplitSpace => true,
+            SpanContent::Text(_, _) | SpanContent::Elements(_, _) | SpanContent::Boundary(_) => {
+                false
+            }
+        });
         let ifs = if force_space {
             Ifs::new(" ", &self.budget)?
         } else {

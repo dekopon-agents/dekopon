@@ -546,3 +546,28 @@ fn quoted_array_assignments_do_not_resplit_multibyte_characters() {
         "quoted array assignment",
     );
 }
+
+#[test]
+fn compound_quoted_positionals_refuse_malformed_bash_fields() {
+    for form in [r#""x$@""#, r#""$@x""#, r#"x"$@""#, r#""$@"x"#, r#""$@$@""#] {
+        let script = format!("IFS=é; f() {{ probe args {form}; }}; f é");
+        assert!(compare_pair(
+            &script,
+            &script,
+            "compound quoted positional expansion"
+        ));
+    }
+    compare("IFS=é; f() { probe args \"$@\"; }; f é '' tail");
+    compare("IFS=,; f() { probe args \"x$@\"; }; f a,b '' tail");
+}
+
+#[test]
+fn prefix_bindings_do_not_authorize_top_level_return() {
+    let result = run("IFS=: return 7; echo reached:$?");
+    assert_eq!(result.exit_code, ExitCode::SUCCESS);
+    assert_eq!(
+        result.output,
+        "dekopon-shell: return: only valid inside a function\nreached:2"
+    );
+    compare("f() { IFS=: return 7; probe args unreachable; }; f; probe args \"$?\"");
+}
