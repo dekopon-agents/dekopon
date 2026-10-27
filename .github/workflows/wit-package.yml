@@ -152,7 +152,8 @@ jobs:
             case "$provider" in
               clock-probe) expected+=$'\ndekopon:clock/wall@1.1.0\ndekopon:clock/monotonic@1.1.0\ndekopon:random/source@0.1.0' ;;
               clock-raw-probe) expected+=$'\ndekopon:clock/wall@1.1.0' ;;
-              http-probe|http-raw-probe) expected+=$'\ndekopon:asset/asset@0.1.0\ndekopon:http/client@1.1.0' ;;
+              http-probe) expected+=$'\ndekopon:asset/asset@0.1.0\ndekopon:http/client@1.1.0\ndekopon:http/signed-download@0.1.0' ;;
+              http-raw-probe) expected+=$'\ndekopon:asset/asset@0.1.0\ndekopon:http/client@1.1.0' ;;
               storage-probe) expected+=$'\ndekopon:storage/durable-files@0.1.1' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
@@ -655,11 +656,14 @@ jobs:
             exports='["describe", "invoke", "run-command"]'
             if [ "$name" != jsonplaceholder ]; then
               jq --exit-status --argjson exports "$exports" --arg name "$name" '
-                ((.packages | map(.name) | sort) == ["dekopon:asset@0.1.0", "dekopon:http@1.1.0", "dekopon:stdio@0.1.0", "root:component"]) and
+                ((.packages | map(.name) | sort) == (if $name == "http-probe" then
+                  ["dekopon:asset@0.1.0", "dekopon:http@0.1.0", "dekopon:http@1.1.0", "dekopon:stdio@0.1.0", "root:component"]
+                  else ["dekopon:asset@0.1.0", "dekopon:http@1.1.0", "dekopon:stdio@0.1.0", "root:component"] end)) and
                 (.worlds | length == 1) and
-                ((.worlds[0].imports | keys) == ["interface-0", "interface-1", "interface-2"]) and
+                ((.worlds[0].imports | keys) == (if $name == "http-probe" then ["interface-0", "interface-1", "interface-2", "interface-3"] else ["interface-0", "interface-1", "interface-2"] end)) and
                 ((.worlds[0].exports | keys) == $exports) and
-                (([.interfaces[] | select(.name == "client") | .functions | keys] | .[0]) == (if $name == "http-probe" then ["send", "stream"] else ["send"] end))
+                (([.interfaces[] | select(.name == "client") | .functions | keys] | .[0]) == (if $name == "http-probe" then ["send", "stream"] else ["send"] end)) and
+                ([.interfaces[] | select(.name == "signed-download") | .functions | keys] == (if $name == "http-probe" then [["download"]] else [] end))
               ' "$description"
             else
               # The unchanged standalone JSONPlaceholder release remains HTTP@1.0.0 coverage.
