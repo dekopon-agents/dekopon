@@ -577,6 +577,7 @@ fn generated_initial_ifs_round_trips_match_real_bash() {
     let mut cases = 0;
     for setup in [
         "IFS=$IFS;",
+        "IFS=$IFS,;",
         "saved=$IFS; IFS=,; IFS=$saved;",
         "saved=$IFS; unset IFS; IFS=$saved;",
         "saved=\"$IFS\"; IFS=é; IFS=\"$saved\";",
@@ -598,7 +599,7 @@ fn generated_initial_ifs_round_trips_match_real_bash() {
             }
         }
     }
-    assert_eq!(cases, 128);
+    assert_eq!(cases, 160);
     eprintln!("Initial IFS corpus: {cases} exact Bash agreements");
 }
 
