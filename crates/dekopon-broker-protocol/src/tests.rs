@@ -1596,6 +1596,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         ChatTransportKind::Fauxlack
     );
     let fauxlack = ChatScopeClaim {
+        participant: None,
         transport: "chat".parse().unwrap(),
         kind: ChatTransportKind::Fauxlack,
         conversation: conversation(ConversationKind::Channel, Some("acme"), "cteam", Some("m1")),
