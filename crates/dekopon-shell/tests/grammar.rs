@@ -64,7 +64,6 @@ impl Fixture {
                 stderr: String::new(),
                 status: 0,
             }),
-            ["args", args @ ..] => proposal("fixture.argv", json!(args)),
             ["list"] => proposal("fixture.list", json!({})),
             ["null"] => proposal("fixture.null", json!({})),
             ["fetch"] => proposal("http-probe.fetch", json!({})),
@@ -99,7 +98,6 @@ impl CapabilityInvoker for Fixture {
             "cli-probe.upper".to_owned(),
             "fixture.object".to_owned(),
             "fixture.list".to_owned(),
-            "fixture.argv".to_owned(),
             "fixture.null".to_owned(),
             "http-probe.fetch".to_owned(),
             "policy.denied".to_owned(),
@@ -138,6 +136,12 @@ impl CapabilityInvoker for Fixture {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        if call.word == PROBE && argv.first().is_some_and(|arg| arg == "args") {
+            self.calls
+                .lock()
+                .push(("fixture.argv".to_owned(), json!(&argv[1..])));
+            return dekopon_shell::render_command(streams, "", String::new(), 0);
+        }
         match self.parse_command(&call.word, &argv, streams.stdin.is_some()) {
             Some(Ok(proposal)) => {
                 let capability = proposal.capability.clone();
@@ -215,7 +219,6 @@ impl CapabilityInvoker for Fixture {
                 },
             },
             "fixture.object" => streams.reply(&input),
-            "fixture.argv" => streams.reply(&Value::Null),
             "fixture.list" => streams.reply(&json!(["a", "b"])),
             "fixture.null" => streams.reply(&Value::Null),
             "policy.denied" => CapabilityCallResult::Denied {

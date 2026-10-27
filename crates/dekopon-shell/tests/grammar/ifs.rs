@@ -75,15 +75,11 @@ fn compare(script: &str) {
     compare_pair(script, script, "named regression");
 }
 
-fn capture(script: &str, context: &str) -> Vec<Vec<Vec<u8>>> {
+fn compare_pair(script: &str, reference: &str, context: &str) -> bool {
+    let expected = bash(reference);
     let fixture = Fixture::default();
     let result = Interpreter::new(Limits::default()).run(script, &fixture);
-    assert_eq!(
-        result.exit_code,
-        ExitCode::SUCCESS,
-        "{context}: {script}: {result:?}"
-    );
-    fixture
+    let actual: Vec<Vec<Vec<u8>>> = fixture
         .calls
         .lock()
         .iter()
@@ -95,15 +91,39 @@ fn capture(script: &str, context: &str) -> Vec<Vec<Vec<u8>>> {
                 .map(|arg| arg.as_str().expect("text").as_bytes().to_vec())
                 .collect()
         })
-        .collect()
-}
-
-fn compare_pair(script: &str, reference: &str, context: &str) {
-    assert_eq!(
-        capture(script, context),
-        bash(reference),
-        "{context}: exact argument counts and UTF-8 bytes: {script}"
-    );
+        .collect();
+    if let Some(first_invalid) = expected
+        .iter()
+        .position(|call| call.iter().any(|bytes| std::str::from_utf8(bytes).is_err()))
+    {
+        assert_eq!(
+            actual,
+            expected[..first_invalid],
+            "{context}: refuse before invoking malformed argv"
+        );
+        assert_eq!(
+            result.exit_code,
+            ExitCode::SYNTAX,
+            "{context}: {script}: {result:?}"
+        );
+        assert_eq!(
+            result.output, "dekopon-shell: IFS: Bash would produce a field that is not valid UTF-8",
+            "{context}: {script}"
+        );
+        eprintln!("{context}: explicit UTF-8 refusal; raw Bash={expected:?}");
+        true
+    } else {
+        assert_eq!(
+            result.exit_code,
+            ExitCode::SUCCESS,
+            "{context}: {script}: {result:?}"
+        );
+        assert_eq!(
+            actual, expected,
+            "{context}: exact argument counts and bytes: {script}"
+        );
+        false
+    }
 }
 
 #[test]
@@ -170,7 +190,7 @@ fn generated_ifs_expansions_reads_and_scopes_match_real_bash() {
         "a", "b", " ", "\t", "\n", ",", ":", ";", "é", "💠", "\\", "'", "\r", "\u{b}",
     ];
     let mut cases = 0;
-    let mut preserved_quoted_text = 0;
+    let mut utf8_refusals = 0;
     eprintln!("IFS corpus seed={SEED:#x}; generated scenarios=4096");
     for (policy, ifs) in policies.iter().enumerate() {
         for form in 0..32 {
@@ -260,73 +280,79 @@ fn generated_ifs_expansions_reads_and_scopes_match_real_bash() {
                 };
                 let context =
                     format!("seed={SEED:#x} case={cases} policy={policy} form={form} edge={edge}");
-                let script = format!("{actual_prefix}{body}");
-                let reference = format!("{bash_prefix}{body}");
-                let actual = capture(&script, &context);
-                let expected = bash(&reference);
-                if actual != expected
-                    && (form == 17 || form == 31)
-                    && separator.chars().next().is_some_and(|c| c.len_utf8() > 1)
-                {
-                    // Bash 5.2.37 splits UTF-8 continuation bytes in protected text with multibyte IFS.
-                    let intact = if form == 17 {
-                        vec![vec![
-                            value.as_bytes().to_vec(),
-                            Vec::new(),
-                            b"tail ,\xc3\xa9".to_vec(),
-                        ]]
-                    } else {
-                        let mut words = bash(&format!("{setup}probe args ${{missing:-a,b:é}}"));
-                        words[0].extend(["a,b:é".as_bytes().to_vec(), "a,b:é".as_bytes().to_vec()]);
-                        words
-                    };
-                    assert_eq!(actual, intact, "{context}: {script}");
-                    eprintln!(
-                        "{context}: deliberate quoted UTF-8 preservation; Bash={expected:?}; shell={actual:?}"
-                    );
-                    preserved_quoted_text += 1;
-                } else {
-                    assert_eq!(
-                        actual, expected,
-                        "{context}: exact argument counts and bytes: {script}"
-                    );
+                if compare_pair(
+                    &format!("{actual_prefix}{body}"),
+                    &format!("{bash_prefix}{body}"),
+                    &context,
+                ) {
+                    utf8_refusals += 1;
                 }
                 cases += 1;
             }
         }
     }
     eprintln!(
-        "IFS corpus: {cases} scenarios; {} exact Bash agreements; {preserved_quoted_text} deliberate quoted UTF-8 preservations",
-        cases - preserved_quoted_text
+        "IFS corpus: {cases} scenarios; {} exact Bash agreements; {utf8_refusals} explicit UTF-8 refusals",
+        cases - utf8_refusals
     );
-    assert!(cases - preserved_quoted_text >= 2000);
+    assert!(cases - utf8_refusals >= 2000);
     assert_eq!(cases, 4096, "fixed generated corpus size; seed={SEED:#x}");
 }
 
 #[test]
-fn quoted_arrays_preserve_utf8_despite_the_bash_5_2_37_multibyte_ifs_defect() {
-    let expected = vec![vec![Vec::new(), Vec::new(), b"tail ,\xc3\xa9".to_vec()]];
-    let observed = bash("IFS='é'; arr=('' '' 'tail ,é'); probe args \"${arr[@]}\"");
-    let corrupted = vec![vec![Vec::new(), Vec::new(), b"tail ,\xc3".to_vec()]];
-    assert!(
-        observed == expected || observed == corrupted,
-        "unrecognized Bash result: {observed:?}"
-    );
-    eprintln!("Bash quoted array bytes: {observed:?}; preserved UTF-8: {expected:?}");
+fn quoted_arrays_refuse_when_bash_would_emit_invalid_utf8() {
     let script = r#"IFS='é'; arr=$(printf '%s' '["","","tail ,é"]'); probe args "${arr[@]}""#;
-    assert_eq!(capture(script, "quoted UTF-8 array"), expected);
+    let reference = "IFS='é'; arr=('' '' 'tail ,é'); probe args \"${arr[@]}\"";
+    assert!(compare_pair(
+        script,
+        reference,
+        "Bash 5.2 multibyte quoted array"
+    ));
 }
 
 #[test]
-fn protected_default_words_preserve_utf8_despite_the_bash_5_2_37_multibyte_ifs_defect() {
+fn protected_defaults_refuse_when_bash_would_emit_invalid_utf8() {
     let script = r#"IFS='é'; probe args ${missing:-"a,b:é"}"#;
-    let observed = bash(script);
-    let expected = vec![vec![b"a,b:\xc3\xa9".to_vec()]];
-    let corrupted = vec![vec![b"a,b:\xc3".to_vec()]];
-    assert!(
-        observed == expected || observed == corrupted,
-        "unrecognized Bash result: {observed:?}"
+    assert!(compare_pair(
+        script,
+        script,
+        "Bash 5.2 multibyte protected default"
+    ));
+}
+
+#[test]
+fn adjacent_empty_ifs_fields_spend_the_step_budget() {
+    let script = format!("IFS=,; v='{}'; probe args $v", ",".repeat(100));
+    let outcome = run_with(
+        &script,
+        Limits {
+            max_steps: 20,
+            ..Limits::default()
+        },
     );
-    eprintln!("Bash protected default bytes: {observed:?}; preserved UTF-8: {expected:?}");
-    assert_eq!(capture(script, "protected UTF-8 default"), expected);
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert!(
+        outcome.output.contains("step budget exhausted"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn continued_reads_obey_the_shared_value_budget() {
+    for (lines, expected) in [(3, ExitCode::SUCCESS), (1000, ExitCode::SYNTAX)] {
+        let script = format!(
+            r"i=0; while [[ $i -lt {lines} ]]; do printf '12345678\\\n'; i=$((i+1)); done | {{ read x; :; }}"
+        );
+        let outcome = run_with(
+            &script,
+            Limits {
+                max_value_bytes: 1024,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(outcome.exit_code, expected, "{outcome:?}");
+        if expected == ExitCode::SYNTAX {
+            assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
+        }
+    }
 }

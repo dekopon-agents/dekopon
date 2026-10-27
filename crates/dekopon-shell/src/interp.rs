@@ -1160,14 +1160,15 @@ impl<'a> Evaluator<'a> {
             let line = std::str::from_utf8(&bytes).map_err(|_not_utf8| {
                 CommandFailure::failed("read: input is not valid UTF-8 text")
             })?;
-            retained.grow(line.len() as u64)?;
             for character in line.chars() {
                 if escaped {
                     escaped = false;
                     if character == '\n' {
                         continue;
                     }
-                    retained.grow(size_of::<std::ops::Range<usize>>() as u64)?;
+                    retained.grow(
+                        (size_of::<std::ops::Range<usize>>() + character.len_utf8()) as u64,
+                    )?;
                     protected.push(text.len()..text.len() + character.len_utf8());
                     text.push(character);
                 } else if !raw && character == '\\' {
@@ -1175,6 +1176,7 @@ impl<'a> Evaluator<'a> {
                 } else if character == '\n' {
                     terminated = true;
                 } else {
+                    retained.grow(character.len_utf8() as u64)?;
                     text.push(character);
                 }
             }
@@ -1189,7 +1191,10 @@ impl<'a> Evaluator<'a> {
             let fields = ifs.read_fields(&text, &protected, names.len(), &mut self.budget)?;
             for (index, name) in names.iter().enumerate() {
                 let field = fields.get(&text, index)?;
-                self.assign(name, CommandResult::value(Value::String(field.to_owned())))?;
+                let charge = self.budget.charge_value_bytes(field.len() as u64)?;
+                let mut result = CommandResult::value(Value::String(field.to_owned()));
+                result.retained.push(charge);
+                self.assign(name, result)?;
             }
         }
         Ok(CommandResult::status(if terminated {
