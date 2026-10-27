@@ -14,7 +14,7 @@ use crate::{
     asset::{AssetSourceRef, PendingAsset},
     fauxlack::{
         File, Message, Server,
-        world::{Progress, Publication},
+        world::{Draft, Progress, Publication},
     },
     progress::ProgressText,
 };
@@ -214,14 +214,14 @@ impl ChatDriver for Driver {
         }
         let (text, files) = self.images(reply).await?;
         self.server
-            .publish(
-                &self.bot,
+            .publish(Draft {
+                author: &self.bot,
                 container,
-                thread.as_deref(),
-                &text,
+                thread: thread.as_deref(),
+                text: &text,
                 files,
-                Publication::Final,
-            )
+                publication: Publication::Final,
+            })
             .await
             .map_err(|error| TransportError::Request(Box::new(error)))?;
         Ok(())
@@ -247,14 +247,14 @@ impl ProgressMessage for Driver {
         let (container, thread) = self.target(target)?;
         let posted = self
             .server
-            .publish(
-                &self.bot,
+            .publish(Draft {
+                author: &self.bot,
                 container,
                 thread,
-                text.as_str(),
-                Vec::new(),
-                Publication::Progress,
-            )
+                text: text.as_str(),
+                files: Vec::new(),
+                publication: Publication::Progress,
+            })
             .await
             .map_err(|error| TransportError::Request(Box::new(error)))?;
         Ok(MessageRef {
@@ -317,7 +317,12 @@ impl AssetFetcher for Driver {
             AssetSourceRef::Fauxlack { server, file } if server == self.server.id() => {
                 self.server.read_file(file)
             }
-            _ => None,
+            AssetSourceRef::Fauxlack { .. }
+            | AssetSourceRef::Generated { .. }
+            | AssetSourceRef::Slack { .. }
+            | AssetSourceRef::Discord { .. }
+            | AssetSourceRef::WhatsApp { .. }
+            | AssetSourceRef::Telegram { .. } => None,
         };
         Box::pin(async move {
             let file = file.ok_or(TransportError::Response)?;

@@ -265,15 +265,15 @@ impl Server {
                 .collect(),
         }
     }
-    pub(crate) async fn publish(
-        &self,
-        author: &str,
-        container: &str,
-        thread: Option<&str>,
-        text: &str,
-        files: Vec<File>,
-        publication: Publication,
-    ) -> Result<Posted, PostError> {
+    pub(crate) async fn publish(&self, draft: Draft<'_>) -> Result<Posted, PostError> {
+        let Draft {
+            author,
+            container,
+            thread,
+            text,
+            files,
+            publication,
+        } = draft;
         let facts = self
             .container(container)
             .ok_or(PostError::UnknownContainer)?;
@@ -285,7 +285,7 @@ impl Server {
             .posting
             .acquire()
             .await
-            .map_err(|_| PostError::UnknownContainer)?;
+            .expect("the private posting semaphore is never closed");
         let (posted, deliveries) = {
             let mut state = self.0.state.lock();
             state.next_message += 1;
@@ -432,6 +432,14 @@ impl Server {
         true
     }
 }
+pub(crate) struct Draft<'a> {
+    pub author: &'a str,
+    pub container: &'a str,
+    pub thread: Option<&'a str>,
+    pub text: &'a str,
+    pub files: Vec<File>,
+    pub publication: Publication,
+}
 pub(crate) enum Publication {
     Posted,
     Progress,
@@ -453,14 +461,14 @@ impl User {
         files: &[&str],
     ) -> Result<Posted, PostError> {
         self.server
-            .publish(
-                &self.id,
+            .publish(Draft {
+                author: &self.id,
                 container,
-                None,
+                thread: None,
                 text,
-                self.server.files(files)?,
-                Publication::Posted,
-            )
+                files: self.server.files(files)?,
+                publication: Publication::Posted,
+            })
             .await
     }
     pub async fn reply(&self, posted: &Posted, text: &str) -> Result<Posted, PostError> {
@@ -468,14 +476,14 @@ impl User {
             return Err(PostError::UnknownContainer);
         }
         self.server
-            .publish(
-                &self.id,
-                &posted.message.container,
-                posted.message.thread.as_deref(),
+            .publish(Draft {
+                author: &self.id,
+                container: &posted.message.container,
+                thread: posted.message.thread.as_deref(),
                 text,
-                Vec::new(),
-                Publication::Posted,
-            )
+                files: Vec::new(),
+                publication: Publication::Posted,
+            })
             .await
     }
 }

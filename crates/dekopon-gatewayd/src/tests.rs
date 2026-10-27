@@ -3894,6 +3894,11 @@ fn inspect_agent_config() -> AssistantTurn {
 
 fn rendered_target(target: &LivenessTarget) -> String {
     match target {
+        LivenessTarget::Fauxlack {
+            server,
+            container,
+            thread,
+        } => format!("fauxlack:{server}:{container}:{thread:?}"),
         LivenessTarget::Slack {
             channel_id,
             thread_ts,
@@ -22929,4 +22934,46 @@ async fn binding_keeps_unused_models_and_reuses_the_route_model_arc() {
         .unwrap();
     assert!(Arc::ptr_eq(&table.models[route.model.name()], &route.model));
     assert_ne!(route.model.name(), "summary-only");
+}
+
+#[tokio::test]
+async fn fauxlack_config_parses_but_check_refuses_it_without_a_service_in_every_build() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["transports"] = json!([
+        {"name": "chat", "kind": "fauxlack", "server": "acme", "bot": "udekopon"},
+        {"name": "chat", "kind": "fauxlack", "server": "acme", "bot": "udekopon"}
+    ]);
+    let path = write_config(directory.path(), &config);
+    let report = crate::check(&path, None, None).await;
+    let problems = report
+        .problems
+        .iter()
+        .find_map(|error| {
+            if let crate::GatewaydError::Config(ConfigError::Invalid { problems, .. }) = error {
+                Some(problems)
+            } else {
+                None
+            }
+        })
+        .expect("aggregate config refusal");
+    assert!(
+        problems
+            .iter()
+            .any(|p| matches!(p, ConfigProblem::FauxlackService { .. }))
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| matches!(p, ConfigProblem::DuplicateTransport { .. }))
+    );
+    let reply: ReplyTarget = serde_json::from_value(
+        json!({"kind": "fauxlack", "server": "acme", "container": "cteam", "thread": "m1"}),
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_value(reply).unwrap()["kind"], "fauxlack");
+    let asset: crate::asset::AssetSourceRef =
+        serde_json::from_value(json!({"kind": "fauxlack", "server": "acme", "file": "f1"}))
+            .unwrap();
+    assert_eq!(serde_json::to_value(asset).unwrap()["kind"], "fauxlack");
 }

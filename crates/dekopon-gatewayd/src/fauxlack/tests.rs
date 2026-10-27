@@ -1,4 +1,4 @@
-use super::world::{Progress, Publication};
+use super::world::{Draft, Progress, Publication};
 use super::*;
 use crate::{
     progress::ProgressText,
@@ -38,24 +38,38 @@ servers:
         panic!("semantic problems");
     };
     assert!(problems.iter().any(|p| matches!(p, ManifestProblem::Subject { source, .. } if source == &dekopon_core::ExternalSubject::fauxlack("acme", "UPPER").unwrap_err())));
-    for category in 0..10 {
-        assert!(
-            problems.iter().any(|problem| match (category, problem) {
-                (0, ManifestProblem::DuplicateServer { .. })
-                | (1, ManifestProblem::DuplicateId { .. })
-                | (2, ManifestProblem::DuplicateFile { .. })
-                | (3, ManifestProblem::Kind { .. })
-                | (4, ManifestProblem::Conversation { .. })
-                | (5, ManifestProblem::UnknownMember { .. })
-                | (6, ManifestProblem::RepeatedMember { .. })
-                | (7, ManifestProblem::DirectMessageSize { .. })
-                | (8, ManifestProblem::FileContent { .. })
-                | (9, ManifestProblem::Base64 { .. }) => true,
-                _ => false,
-            }),
-            "missing category {category}: {problems:?}"
-        );
-    }
+    let categories = problems
+        .iter()
+        .map(|problem| match problem {
+            ManifestProblem::Subject { .. } => "subject",
+            ManifestProblem::Kind { .. } => "kind",
+            ManifestProblem::Conversation { .. } => "conversation",
+            ManifestProblem::DuplicateServer { .. } => "server",
+            ManifestProblem::DuplicateId { .. } => "id",
+            ManifestProblem::DuplicateFile { .. } => "file",
+            ManifestProblem::UnknownMember { .. } => "unknown-member",
+            ManifestProblem::RepeatedMember { .. } => "repeated-member",
+            ManifestProblem::DirectMessageSize { .. } => "dm-size",
+            ManifestProblem::FileContent { .. } => "file-content",
+            ManifestProblem::Base64 { .. } => "base64",
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        categories,
+        std::collections::BTreeSet::from([
+            "subject",
+            "kind",
+            "conversation",
+            "server",
+            "id",
+            "file",
+            "unknown-member",
+            "repeated-member",
+            "dm-size",
+            "file-content",
+            "base64"
+        ])
+    );
 }
 
 #[test]
@@ -88,27 +102,27 @@ async fn completed_answers_follow_completion_order_and_progress_is_not_a_transcr
     let root = server.user("ualice").post("cteam", "start").await.unwrap();
     let thread = root.thread();
     let progress = server
-        .publish(
-            "udekopon",
-            "cteam",
-            Some(root.id()),
-            "working",
-            Vec::new(),
-            Publication::Progress,
-        )
+        .publish(Draft {
+            author: "udekopon",
+            container: "cteam",
+            thread: Some(root.id()),
+            text: "working",
+            files: Vec::new(),
+            publication: Publication::Progress,
+        })
         .await
         .unwrap();
     assert_eq!(thread.transcript().authors(), ["ualice"]);
     assert!(server.progress(progress.id(), "edited", Progress::Edit));
     let second = server
-        .publish(
-            "udekopon",
-            "cteam",
-            Some(root.id()),
-            "first completed",
-            Vec::new(),
-            Publication::Final,
-        )
+        .publish(Draft {
+            author: "udekopon",
+            container: "cteam",
+            thread: Some(root.id()),
+            text: "first completed",
+            files: Vec::new(),
+            publication: Publication::Final,
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -132,14 +146,14 @@ async fn completed_answers_follow_completion_order_and_progress_is_not_a_transcr
     );
     assert!(!server.progress(progress.id(), "duplicate", Progress::Finalize(Vec::new())));
     let deleted = server
-        .publish(
-            "udekopon",
-            "cteam",
-            Some(root.id()),
-            "never completed",
-            Vec::new(),
-            Publication::Progress,
-        )
+        .publish(Draft {
+            author: "udekopon",
+            container: "cteam",
+            thread: Some(root.id()),
+            text: "never completed",
+            files: Vec::new(),
+            publication: Publication::Progress,
+        })
         .await
         .unwrap();
     assert!(server.progress(deleted.id(), "", Progress::Delete));

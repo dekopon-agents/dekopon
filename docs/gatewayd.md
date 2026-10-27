@@ -230,7 +230,7 @@ telemetry:                                    # optional, identical in shape to 
   exportTimeoutMs: 10000
 ```
 
-The route's `conversation:` block is the **match**: `kind` is the word `any` or a list of `directMessage`, `groupDirectMessage`, `channel`, and `thread`, with an optional `container` (Slack team, Discord guild, WhatsApp `waba:phoneNumberId`) and an optional `ids` list. A bare `kind: channel` is a decode failure naming the list form, because it reads as though it claimed the threads under the channel too. `subjects:` restricts a route to named canonical subjects and is accepted only beside `kind: [directMessage]`; it is routing, never authority, and a per-person channel route would read as an access-control list and be trusted as one.
+The route's `conversation:` block is the **match**: `kind` is the word `any` or a list of `directMessage`, `groupDirectMessage`, `channel`, and `thread`, with an optional `container` (Slack team, Discord guild, WhatsApp `waba:phoneNumberId`, or a test-only fauxlack server) and an optional `ids` list. A bare `kind: channel` is a decode failure naming the list form, because it reads as though it claimed the threads under the channel too. `subjects:` restricts a route to named canonical subjects and is accepted only beside `kind: [directMessage]`; it is routing, never authority, and a per-person channel route would read as an access-control list and be trusted as one.
 
 `inspectAgentConfig: true` offers the `inspect_agent_config` tool on that route's sessions; without it the tool is not offered. Leaving it off removes the structured dump — the description, model class, limits, and the agent's `instructions` verbatim — and nothing else: the instructions are still the system prompt, so this is not secrecy from a determined user, only the removal of a one-call transcript of them.
 
@@ -538,7 +538,7 @@ their last descriptor. Both modes share `sessions.assetRetentionBytes`, defaulti
 All descriptor reads are positional. A trap, denial or timeout admits no asset effects.
 
 Outbound `video/mp4` files are named `asset-N.mp4`, and their bytes bypass the model: an MP4
-is not a model-readable image. Slack, Discord and the local transport deliver the named file;
+is not a model-readable image. Slack, Discord, the local transport and feature-only fauxlack deliver the named file;
 WhatsApp refuses it before upload. Telegram currently tries `sendPhoto` and Telegram's API
 rejects it after upload, rather than Dekopon refusing before upload.
 
@@ -583,6 +583,43 @@ need **Attach Files** in addition to View/Send/Read History/Send in Threads. Tel
 additional bot permission.
 
 ## Transports
+
+### fauxlack (tests only)
+
+The `fauxlack` Cargo feature enables an in-process chat service for Rust gateway tests. It has
+no credentials, socket or listener. Build a `dekopon_gatewayd::fauxlack::Fauxlack` from one YAML
+manifest, then pass it to `run_fauxlack(config_path, shutdown, service)`. Ordinary `run`, `check`
+and the executable have no service and refuse every fauxlack transport, even in a feature build.
+
+```yaml
+transports:
+  - name: chat
+    kind: fauxlack
+    server: acme
+    bot: udekopon
+    indicators: {mode: native, progress: message}
+```
+
+The manifest's `servers` list declares each server's `id`, `users` (`id`, `name`, optional `bot`),
+`channels` (`id`, `name`, `members`), `directMessages` (`id`, `members`) and `files`. File entries
+have a `name` and exactly one of `canvas` (immutable Markdown), `snippet` (plain text), or
+`image: {mime, base64}`. All authored levels reject unknown fields. IDs use the shared subject
+and conversation validators; semantic conflicts are reported together. Authority belongs to
+broker mappings and grants, not the manifest.
+
+Member bots receive posts in order over bounded queues; posting waits for room. The adapter drops
+bot-authored posts. Channel roots and replies share one thread; DMs have no thread. Channel posts
+must explicitly mention the bot with `<@userId>`. The driver offers replies and message progress;
+other optional surfaces are absent. Manifest files are fetched from memory and authorized outbound
+attachments appear as files on the bot's answer. Waiting handles observe completed answers only,
+including progress finalized in place; unfinished or deleted progress is absent from transcripts.
+Each posted handle captures its thread observer before delivery, so an immediate answer remains
+observable. Clones share that observer's cursor.
+
+Without the feature neither the world nor adapter compiles. The config and private target/source
+vocabulary still decode in every build; existing wake and journal persistence rules apply. Tests
+use disposable stores. This service tests gateway processing after its own projection; real chat
+platform projection remains covered by those adapters' tests.
 
 ### Slack Socket Mode
 
@@ -988,7 +1025,8 @@ The shared subject vocabulary accepts test-only `fauxlack.<tenant>.u<id>` people
 `fauxlack.<tenant>.c<id>` spaces. The shared chat-scope kind `fauxlack` supports all four
 conversation kinds, with the container equal to the subject tenant. Channel and thread
 scopes require an `m<n>` thread; DM scopes have no thread. The published gateway has no
-fauxlack transport configuration or service. Mappings and broker grants remain required.
+in-process fauxlack service. Its test-only transport configuration parses in every build but
+refuses boot without that service. Mappings and broker grants remain required.
 
 ### Being available in a channel is not authority
 
@@ -1716,7 +1754,7 @@ Spans follow [`observability.md`](observability.md):
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`fauxlack`, `slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
+| `transport.receive` | `transport.kind` (`fauxlack` in feature tests, `slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `refused`, `unauthorized`, `steered`, `queued`, `busy`, `failed`, `cancelled`, `sealed`, `reply-failed`), `busy.cause` (`same-conversation` or `saturated`, on `busy` only) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 

@@ -193,6 +193,7 @@ impl Fauxlack {
         let mut problems = Vec::new();
         let mut servers = BTreeMap::new();
         for server in manifest.servers {
+            subject(&server.id, "u0", PrincipalKind::Person, &mut problems);
             if servers.contains_key(&server.id) {
                 problems.push(ManifestProblem::DuplicateServer {
                     id: server.id.clone(),
@@ -279,51 +280,7 @@ impl Fauxlack {
                     },
                 );
             }
-            let mut files = BTreeMap::new();
-            for attachment in server.files {
-                let id = format!("f{}", files.len() + 1);
-                if files.contains_key(&attachment.name) {
-                    problems.push(ManifestProblem::DuplicateFile {
-                        server: server.id.clone(),
-                        name: attachment.name.clone(),
-                    });
-                }
-                let count = usize::from(attachment.canvas.is_some())
-                    + usize::from(attachment.snippet.is_some())
-                    + usize::from(attachment.image.is_some());
-                if count != 1 {
-                    problems.push(ManifestProblem::FileContent {
-                        server: server.id.clone(),
-                        name: attachment.name.clone(),
-                    });
-                }
-                let (mime, bytes) = match (attachment.canvas, attachment.snippet, attachment.image)
-                {
-                    (Some(text), None, None) => ("text/markdown".into(), text.into_bytes()),
-                    (None, Some(text), None) => ("text/plain".into(), text.into_bytes()),
-                    (_, _, Some(image)) => match STANDARD.decode(image.base64) {
-                        Ok(bytes) => (image.mime, bytes),
-                        Err(source) => {
-                            problems.push(ManifestProblem::Base64 {
-                                server: server.id.clone(),
-                                name: attachment.name.clone(),
-                                source,
-                            });
-                            continue;
-                        }
-                    },
-                    _ => continue,
-                };
-                files.insert(
-                    attachment.name.clone(),
-                    File {
-                        id,
-                        name: attachment.name,
-                        mime,
-                        bytes,
-                    },
-                );
-            }
+            let files = files(&server.id, server.files, &mut problems);
             servers.insert(
                 server.id,
                 Facts {
@@ -339,4 +296,58 @@ impl Fauxlack {
             Err(ManifestError::Invalid { problems })
         }
     }
+}
+
+fn files(
+    server: &str,
+    attachments: Vec<Attachment>,
+    problems: &mut Vec<ManifestProblem>,
+) -> BTreeMap<String, File> {
+    let mut files = BTreeMap::new();
+    let mut file_names = BTreeSet::new();
+    for attachment in attachments {
+        let id = format!("f{}", files.len() + 1);
+        if !file_names.insert(attachment.name.clone()) {
+            problems.push(ManifestProblem::DuplicateFile {
+                server: server.into(),
+                name: attachment.name.clone(),
+            });
+        }
+        let count = usize::from(attachment.canvas.is_some())
+            + usize::from(attachment.snippet.is_some())
+            + usize::from(attachment.image.is_some());
+        if count != 1 {
+            problems.push(ManifestProblem::FileContent {
+                server: server.into(),
+                name: attachment.name.clone(),
+            });
+        }
+        let (mime, bytes) = match (attachment.canvas, attachment.snippet, attachment.image) {
+            (Some(text), None, None) => ("text/markdown".into(), text.into_bytes()),
+            (None, Some(text), None) => ("text/plain".into(), text.into_bytes()),
+            (_, _, Some(image)) => match STANDARD.decode(image.base64) {
+                Ok(bytes) => (image.mime, bytes),
+                Err(source) => {
+                    problems.push(ManifestProblem::Base64 {
+                        server: server.into(),
+                        name: attachment.name.clone(),
+                        source,
+                    });
+                    continue;
+                }
+            },
+            _ => continue,
+        };
+        files.insert(
+            attachment.name.clone(),
+            File {
+                id,
+                name: attachment.name,
+                mime,
+                bytes,
+            },
+        );
+    }
+
+    files
 }
