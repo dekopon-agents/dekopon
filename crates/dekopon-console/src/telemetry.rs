@@ -67,7 +67,11 @@ fn settings(text: &str) -> Result<ExporterSettings, TelemetryError> {
     )
     .map_err(|error| match error {
         dekopon_telemetry::TelemetryError::GrpcTransport => TelemetryError::GrpcTransport,
-        _sensitive_error => TelemetryError::Settings,
+        dekopon_telemetry::TelemetryError::Configuration(_)
+        | dekopon_telemetry::TelemetryError::NoRuntime
+        | dekopon_telemetry::TelemetryError::HttpClient(_)
+        | dekopon_telemetry::TelemetryError::CaCertificate { .. }
+        | dekopon_telemetry::TelemetryError::Exporter { .. } => TelemetryError::Settings,
     })
 }
 
