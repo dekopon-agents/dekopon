@@ -160,3 +160,12 @@ fn stage_call_and_feeder_threads_carry_their_full_names() {
         assert!(names.iter().any(|seen| seen == name), "{name} in {names:?}");
     }
 }
+
+#[test]
+fn a_feeder_that_never_started_fails_the_command() {
+    let unstarted = super::Fed::Unstarted(std::io::Error::other("no thread"));
+    assert!(matches!(
+        unstarted.settle("probe"),
+        Err(crate::builtins::CommandFailure::Status { status, .. }) if status != dekopon_process::ExitCode::SUCCESS
+    ));
+}

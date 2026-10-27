@@ -231,6 +231,29 @@ struct StagePosition {
     index: usize,
 }
 
+enum Fed {
+    Unpiped,
+    Joined(Option<PipeReader<StageObservation>>),
+    Unstarted(std::io::Error),
+}
+
+impl Fed {
+    /// A feeder that never started dropped the provider's stdin, so the provider read EOF instead
+    /// of the script's input; whatever it reported cannot stand as success.
+    fn settle(
+        self,
+        capability: &str,
+    ) -> Result<Option<PipeReader<StageObservation>>, CommandFailure> {
+        match self {
+            Self::Unpiped => Ok(None),
+            Self::Joined(unread) => Ok(unread),
+            Self::Unstarted(error) => Err(CommandFailure::failed(format!(
+                "{capability}: failed: its stdin feeder could not start: {error}"
+            ))),
+        }
+    }
+}
+
 struct StageSetup {
     position: StagePosition,
     meter: Arc<telemetry::StageMeter>,
@@ -3142,35 +3165,27 @@ impl<'a> Evaluator<'a> {
                     span.in_scope(|| invoker.run(call, streams, &tree))
                 })
             })?;
-            let feeder = feed.and_then(|((mut reader, socket, inherited), permit)| {
+            let feeder = feed.map(|((mut reader, socket, inherited), permit)| {
                 let (feeder_budget, finished) = (&feeder_budget, &finished);
-                permit
-                    .spawn(scope, FEED_THREAD, move || {
-                        pump_stdin(&mut reader, socket, feeder_budget, finished);
-                        inherited.then_some(reader)
-                    })
-                    .inspect_err(|error| {
-                        tracing::warn!(
-                            event = "shell_feeder_unstarted",
-                            error = %error,
-                            "shell.feeder.unstarted"
-                        );
-                    })
-                    .ok()
+                permit.spawn(scope, FEED_THREAD, move || {
+                    pump_stdin(&mut reader, socket, feeder_budget, finished);
+                    inherited.then_some(reader)
+                })
             });
             let copied = self.copy_stdin(StageInput::Piped(output), capture_output, sink);
             let result = call.join();
             finished.store(true, atomic::Ordering::Relaxed);
-            let fed = feeder.map(ScopedJoinHandle::join);
+            let fed = feeder.map(|spawned| spawned.map(ScopedJoinHandle::join));
             let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            let unread = match fed {
-                Some(Err(panic)) => std::panic::resume_unwind(panic),
-                Some(Ok(unread)) => unread,
-                None => None,
+            let fed = match fed {
+                None => Fed::Unpiped,
+                Some(Err(error)) => Fed::Unstarted(error),
+                Some(Ok(Err(panic))) => std::panic::resume_unwind(panic),
+                Some(Ok(Ok(unread))) => Fed::Joined(unread),
             };
-            Ok::<_, std::io::Error>((result, copied, unread))
+            Ok::<_, std::io::Error>((result, copied, fed))
         });
-        let (result, copied, unread) = match joined {
+        let (result, copied, fed) = match joined {
             Ok(joined) => joined,
             Err(error) => {
                 self.budget.refund_capability_call();
@@ -3179,9 +3194,6 @@ impl<'a> Evaluator<'a> {
                 )));
             }
         };
-        if let (Some(slot), Some(reader)) = (self.stdin.last_mut(), unread) {
-            *slot = reader;
-        }
         let result = match result {
             crate::RunResult::Invoked {
                 capability: reported,
@@ -3197,6 +3209,9 @@ impl<'a> Evaluator<'a> {
                 result
             }
         };
+        if let (Some(slot), Some(reader)) = (self.stdin.last_mut(), fed.settle(&capability)?) {
+            *slot = reader;
+        }
         self.budget.check_deadline()?;
         let mut copied = copied?;
         let status = ExitCode::from(&result);
