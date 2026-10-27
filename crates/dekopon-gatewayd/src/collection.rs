@@ -540,6 +540,7 @@ pub(crate) mod tests {
             let result = collector.offer(route("a"), message(1, ""));
             assert_eq!(matches!(result, Offered::Immediate(_)), millis == 0);
             for kind in [
+                ChatTransportKind::Fauxlack,
                 ChatTransportKind::Slack,
                 ChatTransportKind::Discord,
                 ChatTransportKind::Local,
@@ -594,6 +595,7 @@ pub(crate) mod tests {
         for millis in [0, 3000] {
             for kind in [
                 ChatTransportKind::Local,
+                ChatTransportKind::Fauxlack,
                 ChatTransportKind::Slack,
                 ChatTransportKind::Discord,
                 ChatTransportKind::Telegram,
