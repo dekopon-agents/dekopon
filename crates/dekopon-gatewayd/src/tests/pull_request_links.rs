@@ -45,6 +45,16 @@ fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data(
     }
 }
 
+#[test]
+fn a_truncated_pr_link_is_never_reinterpreted_as_a_shorter_number() {
+    let url = "https://github.com/acme/widget/pull/123";
+    let text = format!(
+        "{}{url}",
+        " ".repeat(MAX_INBOUND_TEXT_BYTES - url.len() + 1)
+    );
+    assert!(PullRequestLinkContext::parse(&text).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn only_a_keyed_unaddressed_human_channel_pr_link_is_admitted() {
     for keyed in [false, true] {

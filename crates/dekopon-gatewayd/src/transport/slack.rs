@@ -517,7 +517,7 @@ impl SlackTransport {
                     .routes
                     .find(&self.name, &follow_conversation, &subject)
                     .filter(|(_, route)| route.ambient.pull_request_links)?;
-                crate::pull_request_links::PullRequestLinkContext::parse(&bound_inbound(top_text))
+                crate::pull_request_links::PullRequestLinkContext::parse(top_text)
             })
             .flatten();
         let ambient = pull_request_links.is_some();

@@ -16,9 +16,19 @@ pub(crate) struct PullRequestLinkContext {
 
 impl PullRequestLinkContext {
     pub(crate) fn parse(text: &str) -> Option<Self> {
+        let delimiter = |c: char| c.is_whitespace() || "<>|\"[]()`".contains(c);
+        let text = if text.len() > crate::transport::MAX_INBOUND_TEXT_BYTES {
+            let prefix = &text[..crate::transport::floor_boundary(
+                text,
+                crate::transport::MAX_INBOUND_TEXT_BYTES,
+            )];
+            &prefix[..prefix.rfind(delimiter).unwrap_or(0)]
+        } else {
+            text
+        };
         let mut seen = HashSet::new();
         let targets: Vec<_> = text
-            .split(|c: char| c.is_whitespace() || "<>|\"[]()`".contains(c))
+            .split(delimiter)
             .filter_map(PullRequestLinkTarget::parse)
             .filter(|target| {
                 seen.insert((
