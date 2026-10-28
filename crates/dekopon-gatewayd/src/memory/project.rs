@@ -429,7 +429,7 @@ pub(crate) fn project(input: &ProjectionInput<'_>) -> Result<Projected, JournalE
     let mut repacked = false;
     if total(&rungs) > budget
         || shown > input.max_turns.saturating_mul(2)
-        || records.len() >= input.max_turns.saturating_mul(2)
+        || (input.prior.is_empty() && records.len() >= input.max_turns.saturating_mul(2))
     {
         repacked = true;
         rungs = records

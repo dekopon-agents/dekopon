@@ -44,8 +44,10 @@ pub(crate) fn window(file: File, limit: NonZeroUsize) -> Result<Snapshot, Journa
             let _torn = lines.previous()?;
         }
     }
+    let mut extent = lines.end;
     let mut records = Vec::new();
-    let mut sides = Vec::new();
+    let mut header_ends = Vec::new();
+    let mut above = false;
     while records.len() < limit.get() {
         let Some((at, len)) = lines.previous()? else {
             break;
@@ -55,55 +57,79 @@ pub(crate) fn window(file: File, limit: NonZeroUsize) -> Result<Snapshot, Journa
             return Err(JournalError::Corrupt);
         }
         file.read_exact_at(&mut tag, at)?;
-        if &tag == b"{\"b\":" {
-            continue;
+        match &tag {
+            b"{\"b\":" if !above => {
+                extent = at;
+                continue;
+            }
+            b"{\"s\":" | b"{\"p\":" | b"{\"c\":" => {
+                above = true;
+                continue;
+            }
+            b"{\"h\":" => {}
+            _ => return Err(JournalError::Corrupt),
         }
-        if !matches!(&tag, b"{\"h\":" | b"{\"s\":" | b"{\"p\":" | b"{\"c\":") {
-            return Err(JournalError::Corrupt);
-        }
+        above = true;
         let mut raw = vec![0; usize::try_from(len).map_err(|_invalid| JournalError::Corrupt)?];
         file.read_exact_at(&mut raw, at)?;
-        if &tag == b"{\"h\":" {
-            let header = decode_line::<HeaderLine>(&raw)?.h;
-            validate_header(&header, header.body_len)?;
-            if records
-                .last()
-                .is_some_and(|newer: &Head| header.next_record_id != newer.header.id.0)
+        let header = decode_line::<HeaderLine>(&raw)?.h;
+        validate_header(&header, header.body_len)?;
+        if records
+            .last()
+            .is_some_and(|newer: &Head| header.next_record_id != newer.header.id.0)
+        {
+            return Err(JournalError::Corrupt);
+        }
+        let body_at = at
+            .checked_sub(header.body_len)
+            .ok_or(JournalError::Corrupt)?;
+        file.read_exact_at(&mut tag, body_at)?;
+        if &tag != b"{\"b\":" {
+            return Err(JournalError::Corrupt);
+        }
+        let arrived_raw = decode_line::<RawHeaderLine>(&raw)?.h.arrived;
+        lines.end = body_at;
+        header_ends.push(at + len);
+        records.push(Head {
+            header,
+            body_at,
+            asset_lines: Vec::new(),
+            raw_asset_lines: Vec::new(),
+            arrived_raw,
+        });
+    }
+    records.reverse();
+    header_ends.reverse();
+    let mut cursor = lines.end;
+    let mut line = Vec::new();
+    for index in 0..=records.len() {
+        let until = records.get(index).map_or(extent, |head| head.body_at);
+        let mut region = io::BufReader::new(SliceReader {
+            file: &file,
+            offset: cursor,
+            left: until.saturating_sub(cursor),
+        });
+        loop {
+            line.clear();
+            if region.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let side = Side::decode(&line)?;
+            if let Some(head) = records
+                .binary_search_by_key(&side.record(), |head| head.header.id)
+                .ok()
+                .and_then(|found| records.get_mut(found))
+            {
+                side.apply(head, &line)?;
+            } else if records
+                .first()
+                .is_none_or(|head| side.record() >= head.header.id)
             {
                 return Err(JournalError::Corrupt);
             }
-            let body_at = at
-                .checked_sub(header.body_len)
-                .ok_or(JournalError::Corrupt)?;
-            file.read_exact_at(&mut tag, body_at)?;
-            if &tag != b"{\"b\":" {
-                return Err(JournalError::Corrupt);
-            }
-            let arrived_raw = decode_line::<RawHeaderLine>(&raw)?.h.arrived;
-            lines.end = body_at;
-            records.push(Head {
-                header,
-                body_at,
-                asset_lines: Vec::new(),
-                raw_asset_lines: Vec::new(),
-                arrived_raw,
-            });
-        } else {
-            sides.push((Side::decode(&raw)?, raw));
         }
-    }
-    records.reverse();
-    for (side, raw) in sides.into_iter().rev() {
-        if let Some(head) = records
-            .iter_mut()
-            .find(|head| head.header.id == side.record())
-        {
-            side.apply(head, &raw)?;
-        } else if records
-            .first()
-            .is_none_or(|head| side.record() >= head.header.id)
-        {
-            return Err(JournalError::Corrupt);
+        if let Some(end) = header_ends.get(index) {
+            cursor = *end;
         }
     }
     Ok(Snapshot { file, records })

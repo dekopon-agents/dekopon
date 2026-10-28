@@ -321,19 +321,7 @@ where
     if let Some((sender, dispatcher)) = engine {
         dispatcher.start(generation.clone(), models, &mut owned_tasks);
         if let Some(boot) = boot {
-            let enqueued = boot.tasks.len();
-            for task in boot.tasks {
-                sender.enqueue(task).await;
-            }
-            tracing::info!(
-                event = "gateway_memory_startup",
-                memory.journals.reset = boot.reset,
-                memory.slots.requeued = boot.requeued,
-                memory.slots.enqueued = enqueued,
-                memory.slots.overflowed = boot.overflowed,
-                memory.boot.crashed_files = boot.crashed_files,
-                "gateway.memory.startup"
-            );
+            enqueue_boot(&sender, boot).await;
         }
     }
 
@@ -424,6 +412,22 @@ where
             Err(GatewaydError::TransportsLost)
         }
     }
+}
+
+async fn enqueue_boot(sender: &memory::engine::Sender, boot: memory::journal::records::Boot) {
+    let enqueued = boot.tasks.len();
+    for task in boot.tasks {
+        sender.enqueue(task).await;
+    }
+    tracing::info!(
+        event = "gateway_memory_startup",
+        memory.journals.reset = boot.reset,
+        memory.slots.requeued = boot.requeued,
+        memory.slots.enqueued = enqueued,
+        memory.slots.overflowed = boot.overflowed,
+        memory.boot.crashed_files = boot.crashed_files,
+        "gateway.memory.startup"
+    );
 }
 
 async fn open_journal(
