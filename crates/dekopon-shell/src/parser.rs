@@ -1849,3 +1849,7 @@ mod tests {
 #[cfg(test)]
 #[path = "nesting_tests.rs"]
 mod nesting_tests;
+
+#[cfg(test)]
+#[path = "parser/line_tests.rs"]
+mod line_tests;
