@@ -1042,3 +1042,51 @@ fn asset_markers_replay_as_nothing_beside_native_user_and_steer_text() {
         assert!(!encoded.contains("asset"), "{encoded}");
     }
 }
+
+#[test]
+fn a_lone_surrogate_argument_replays_as_a_cut_after_reopen() {
+    use dekopon_agent::memory::{Call, Exchange, Outcome, Tool, ToolResult};
+    use dekopon_model::replay::ReplayMessage;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = open(dir.path());
+    let mut turn = captured("question", Some("answer"));
+    for (index, arguments) in [r#"{"\ud800":0}"#, r#"{"😀":0}"#].into_iter().enumerate() {
+        turn.original.insert(
+            1 + index,
+            Item::Exchange(Exchange {
+                call: Call {
+                    id: format!("call-{index}").as_str().into(),
+                    tool: Tool::Bash,
+                    arguments: Kept::new(arguments, usize::MAX),
+                },
+                result: ToolResult {
+                    outcome: Outcome::Exit(0),
+                    text: Kept::new("done", usize::MAX),
+                },
+            }),
+        );
+    }
+    append_turn(&journal, STEM, SystemTime::now(), &turn, None);
+    drop(journal);
+    let journal = open(dir.path());
+    let arguments: Vec<_> = project_native(&journal)
+        .into_iter()
+        .filter_map(|message| match message {
+            ModelMessage::Journal {
+                message: ReplayMessage::Assistant { calls, .. },
+            } => Some(calls),
+            ModelMessage::Journal {
+                message: ReplayMessage::User(_) | ReplayMessage::Tool { .. },
+            }
+            | ModelMessage::System { .. }
+            | ModelMessage::User { .. }
+            | ModelMessage::Assistant { .. }
+            | ModelMessage::ToolResults { .. } => None,
+        })
+        .flatten()
+        .map(|call| call.arguments)
+        .collect();
+    assert_eq!(arguments.len(), 2);
+    assert!(matches!(&arguments[0], Text::Owned(cut) if cut == r#"{"cut":12}"#));
+    assert!(matches!(&arguments[1], Text::File { .. }));
+}
