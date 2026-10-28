@@ -314,7 +314,7 @@ thousand.
 Instrumentation lives at the single seam every command word passes through, so a builtin added
 later is traced without another edit. The closed `Builtin` enum owns names, help and execution
 dispatch; `ControlWord` and `RejectedCommand` own control and refusal vocabulary. Builtin
-implementations carry no telemetry code.
+implementations carry no telemetry code. Output routing lives in `interp::StageOut`, whose closed destination enum selects discard, diagnostics, named buffers, pipes, captures or the terminal. Cat and base64 use the same stream dispatcher as the text builtins.
 
 `tracing` is this crate's only dependency for that. There is no exporter here, no collector, and no
 telemetry protocol — the embedding binary's subscriber decides where spans go. Spans must therefore

@@ -88,7 +88,7 @@ enum StageInput {
 
 enum BuiltinMode {
     Help,
-    Run { capture_output: bool },
+    Run,
 }
 
 enum ParsedStream<'a> {
@@ -110,14 +110,14 @@ impl Builtin {
         mode: BuiltinMode,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let capture_output = match mode {
+        match mode {
             BuiltinMode::Help => {
                 return Ok(Executed::Result(builtins::help_result(
                     self.name(),
                     self.help(),
                 )));
             }
-            BuiltinMode::Run { capture_output } => capture_output,
+            BuiltinMode::Run => {}
         };
         let parsed = match self {
             Self::Echo => Ok((ParsedStream::Value(builtins::misc::echo, arguments), None)),
@@ -164,7 +164,7 @@ impl Builtin {
             }
             Self::Xargs => return evaluator.run_xargs(arguments, input, stdout_sink),
         };
-        evaluator.run_lines(self.name(), parsed, input, capture_output, stdout_sink)
+        evaluator.run_lines(self.name(), parsed, input, stdout_sink)
     }
 }
 
@@ -758,7 +758,7 @@ impl<'a> Evaluator<'a> {
 
     fn emit(&mut self, result: CommandResult) -> Result<(), LimitExceeded> {
         if !result.value.is_null() {
-            StageOut::new(self, &Sink::Value, OutputMode::Value, false).value(self, result)?;
+            StageOut::new(self, &Sink::Value, OutputMode::Value).value(self, result)?;
         }
         Ok(())
     }
@@ -773,7 +773,7 @@ impl<'a> Evaluator<'a> {
             Sink::Diagnostics | Sink::Discard | Sink::Buffer { .. } => {
                 let status = result.status;
                 if !result.value.is_null() {
-                    StageOut::new(self, sink, OutputMode::Value, false).value(self, result)?;
+                    StageOut::new(self, sink, OutputMode::Value).value(self, result)?;
                 }
                 Ok(Executed::Result(CommandResult::status(status)))
             }
@@ -813,19 +813,16 @@ impl<'a> Evaluator<'a> {
         if stdout.is_empty() {
             return Ok(Executed::Result(CommandResult::status(status)));
         }
-        let result = match stdout.strip_suffix('\n') {
-            Some(terminated) => CommandResult {
-                value: Value::String(terminated.to_owned()),
-                status,
-                suppress_newline: false,
-                retained: vec![retained],
-            },
-            None => CommandResult {
-                value: Value::String(stdout),
-                status,
-                suppress_newline: true,
-                retained: vec![retained],
-            },
+        let suppress_newline = !stdout.ends_with('\n');
+        let result = CommandResult {
+            value: Value::String(if suppress_newline {
+                stdout
+            } else {
+                stdout[..stdout.len() - 1].to_owned()
+            }),
+            status,
+            suppress_newline,
+            retained: vec![retained],
         };
         Ok(Executed::Result(result))
     }
@@ -1457,7 +1454,7 @@ impl<'a> Evaluator<'a> {
             }
             let _entered_compound = compound_span.as_ref().map(tracing::Span::enter);
             let executed = self.tested(pipeline.negated, |evaluator| {
-                evaluator.execute_command(last, input, false)
+                evaluator.execute_command(last, input)
             });
             record_compound_outcome(compound_span.as_ref(), &executed);
             drop(_entered_compound);
@@ -1509,14 +1506,10 @@ impl<'a> Evaluator<'a> {
         if let Some(error) = fatal {
             return Err(error);
         }
-        let last = match executed {
+        let (last, deferred) = match executed {
             Executed::Flow(flow) => return Ok((self.last_status, Some(flow))),
-            Executed::Result(result) => result,
-            Executed::Deferred(result, mut out) => {
-                let status = result.status;
-                out.value(self, result)?;
-                CommandResult::status(status)
-            }
+            Executed::Result(result) => (result, None),
+            Executed::Deferred(result, out) => (result, Some(out)),
         };
         stages.push(last.status);
 
@@ -1534,7 +1527,11 @@ impl<'a> Evaluator<'a> {
             status = invert(status);
         }
         last_trace.resume();
-        self.emit(last)?;
+        if let Some(mut out) = deferred {
+            out.value(self, last)?;
+        } else {
+            self.emit(last)?;
+        }
         drop(last_trace);
         Ok((status, None))
     }
@@ -1597,7 +1594,7 @@ impl<'a> Evaluator<'a> {
                 }
                 let status = (|| {
                     let executed =
-                        stage.tested(true, |stage| stage.execute_command(command, input, false));
+                        stage.tested(true, |stage| stage.execute_command(command, input));
                     record_compound_outcome(compound_span.as_ref(), &executed);
                     let executed = executed?;
                     match executed {
@@ -1800,10 +1797,9 @@ impl<'a> Evaluator<'a> {
     fn copy_output(
         &mut self,
         input: StageInput,
-        capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
-        let mut out = StageOut::new(self, sink, OutputMode::Copy, capture_output);
+        let mut out = StageOut::new(self, sink, OutputMode::Copy);
         let mut piped = match input {
             StageInput::Piped(reader) => Some(reader),
             StageInput::Inherited => None,
@@ -1824,17 +1820,14 @@ impl<'a> Evaluator<'a> {
         &mut self,
         command: &Command,
         input: StageInput,
-        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let parent = std::mem::take(&mut self.expansion_charges);
         let result = match command {
-            Command::Simple(command) => self.execute_simple_command(command, input, capture_output),
+            Command::Simple(command) => self.execute_simple_command(command, input),
             Command::Compound {
                 statement,
                 redirects,
-            } => self.nested(|this| {
-                this.execute_compound_command(statement, redirects, input, capture_output)
-            }),
+            } => self.nested(|this| this.execute_compound_command(statement, redirects, input)),
         };
         self.expansion_charges = parent;
         result
@@ -1849,15 +1842,11 @@ impl<'a> Evaluator<'a> {
         statement: &Statement,
         redirects: &[Redirect],
         input: StageInput,
-        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let (stdout, stderr) = match self.resolve_redirects(redirects) {
             Ok(sinks) => sinks,
-            Err(failure) => {
-                return self.failed(failure);
-            }
+            Err(failure) => return self.failed(failure),
         };
-        let collect = stdout == Sink::Value && capture_output;
         self.open_buffers(&[&stdout, &stderr])?;
         let previous_buffer = match &stdout {
             Sink::Buffer { name, .. } => self
@@ -1878,9 +1867,6 @@ impl<'a> Evaluator<'a> {
             }
             StageInput::Inherited => false,
         };
-        if collect {
-            self.captures.push(Vec::new());
-        }
         let previous_discard = self.discard_capture_depth;
         match stdout {
             Sink::Discard => self.discard_capture_depth = Some(self.captures.len()),
@@ -1904,11 +1890,6 @@ impl<'a> Evaluator<'a> {
             self.active_buffer = previous_buffer;
         }
 
-        let mut captured = if collect {
-            self.captures.pop().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         if piped {
             self.stdin.pop();
         }
@@ -1919,12 +1900,6 @@ impl<'a> Evaluator<'a> {
             .unwrap_or_default();
 
         let flow = flow?;
-        let mut retained = capture_charges(&mut captured);
-        let value = if collect {
-            reduce_charged(&self.budget, captured, &mut retained)?
-        } else {
-            Value::Null
-        };
         let status = match flow {
             Flow::Normal => self.last_status,
             _ => {
@@ -1933,12 +1908,7 @@ impl<'a> Evaluator<'a> {
             }
         };
 
-        let mut result = CommandResult {
-            value,
-            status,
-            suppress_newline: false,
-            retained,
-        };
+        let mut result = CommandResult::status(status);
         if stderr == Sink::Value {
             if let Sink::Buffer { name, .. } = &stdout {
                 for line in diagnostics.drain(..) {
@@ -1986,15 +1956,12 @@ impl<'a> Evaluator<'a> {
         &mut self,
         command: &SimpleCommand,
         input: StageInput,
-        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
 
         let argv = match self.expand_command_argv(&command.words) {
             Ok(argv) => argv,
-            Err(failure) => {
-                return self.failed(failure);
-            }
+            Err(failure) => return self.failed(failure),
         };
 
         // `--help` wins only when the script wrote it as the command's one bare, unquoted word.
@@ -2091,7 +2058,7 @@ impl<'a> Evaluator<'a> {
         if let Sink::Buffer { name, .. } = &stdout {
             self.active_buffer = Some((name.clone(), self.captures.len()));
         }
-        let executed = self.run_argv(&argv, input, capture_output, literal_help, &stdout);
+        let executed = self.run_argv(&argv, input, literal_help, &stdout);
         if stdout != Sink::Value {
             self.active_buffer = active_buffer;
         }
@@ -2130,6 +2097,9 @@ impl<'a> Evaluator<'a> {
         self.route_diagnostics(diagnostics, &stderr)?;
 
         if let Some(mut out) = deferred {
+            if stdout == Sink::Value {
+                return Ok(Executed::Deferred(result, out));
+            }
             let status = result.status;
             out.value(self, result)?;
             Ok(Executed::Result(CommandResult::status(status)))
@@ -2277,7 +2247,6 @@ impl<'a> Evaluator<'a> {
         &mut self,
         argv: &[crate::Arg],
         input: StageInput,
-        capture_output: bool,
         literal_help: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
@@ -2311,7 +2280,6 @@ impl<'a> Evaluator<'a> {
             resolution,
             typed_arguments,
             input,
-            capture_output,
             literal_help,
             stdout_sink,
         );
@@ -2389,7 +2357,6 @@ impl<'a> Evaluator<'a> {
         name: &str,
         parsed: Result<(ParsedStream<'_>, Option<String>), CommandFailure>,
         input: StageInput,
-        capture_output: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
         let (parsed, operand) = match parsed {
@@ -2400,15 +2367,14 @@ impl<'a> Evaluator<'a> {
             ParsedStream::Value(run, arguments) => {
                 return self.run_simple_builtin(*run, arguments, input);
             }
-            ParsedStream::Cat(arguments) if arguments.is_empty() => {
+            ParsedStream::Cat([]) => {
                 let consume = self.stdout.is_some()
-                    || capture_output
                     || !self.captures.is_empty()
                     || !self.stdout_redirected
                     || self.active_buffer_name().is_some()
                     || *stdout_sink == Sink::Diagnostics;
                 return if consume {
-                    match self.copy_output(input, capture_output, stdout_sink) {
+                    match self.copy_output(input, stdout_sink) {
                         Ok(result) => Ok(Executed::Result(result)),
                         Err(failure) => self.failed(failure),
                     }
@@ -2435,7 +2401,7 @@ impl<'a> Evaluator<'a> {
                 Err(failure) => return self.failed(failure),
             },
         };
-        let mut out = StageOut::new(self, stdout_sink, mode, capture_output);
+        let mut out = StageOut::new(self, stdout_sink, mode);
         let mut budget = self.budget.fork();
         let mut emit = |bytes: &[u8]| out.write(self, bytes);
         let outcome = match parsed {
@@ -2469,9 +2435,7 @@ impl<'a> Evaluator<'a> {
             Err(failure) => self.absorb(failure)?,
         };
         match out.finish(self, status) {
-            Ok(result) if out.deferred() && !result.value.is_null() => {
-                Ok(Executed::Deferred(result, out))
-            }
+            Ok(result) if !result.value.is_null() => Ok(Executed::Deferred(result, out)),
             Ok(result) => Ok(Executed::Result(result)),
             Err(failure) => self.failed(failure),
         }
@@ -2537,7 +2501,6 @@ impl<'a> Evaluator<'a> {
         resolution: Option<Resolution>,
         typed_arguments: &[crate::Arg],
         input: StageInput,
-        capture_output: bool,
         literal_help: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
@@ -2551,9 +2514,7 @@ impl<'a> Evaluator<'a> {
 
         match resolution {
             Resolution::Rejected(reason) => Err(FatalError::Unsupported(reason.to_owned())),
-            Resolution::Function => {
-                self.call_function(command, arguments, input, capture_output, stdout_sink)
-            }
+            Resolution::Function => self.call_function(command, arguments, input, stdout_sink),
             Resolution::Builtin(builtin) => builtin.run(
                 self,
                 arguments,
@@ -2561,7 +2522,7 @@ impl<'a> Evaluator<'a> {
                 if literal_help {
                     BuiltinMode::Help
                 } else {
-                    BuiltinMode::Run { capture_output }
+                    BuiltinMode::Run
                 },
                 stdout_sink,
             ),
@@ -2580,7 +2541,7 @@ impl<'a> Evaluator<'a> {
                     word: command.to_owned(),
                     argv: typed_arguments.to_vec(),
                 };
-                match self.run_provider(call, input, capture_output, stdout_sink) {
+                match self.run_provider(call, input, stdout_sink) {
                     Ok(result) => Ok(Executed::Result(result)),
                     Err(failure) => self.failed(failure),
                 }
@@ -2601,7 +2562,6 @@ impl<'a> Evaluator<'a> {
         &mut self,
         call: crate::RunCall,
         input: StageInput,
-        capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.check_deadline()?;
@@ -2668,7 +2628,7 @@ impl<'a> Evaluator<'a> {
                     inherited.then_some(reader)
                 })
             });
-            let copied = self.copy_output(StageInput::Piped(output), capture_output, sink);
+            let copied = self.copy_output(StageInput::Piped(output), sink);
             let result = call.join();
             finished.store(true, atomic::Ordering::Relaxed);
             let fed = feeder.map(|spawned| spawned.map(ScopedJoinHandle::join));
@@ -2774,10 +2734,7 @@ impl<'a> Evaluator<'a> {
             ControlWord::Break | ControlWord::Continue => {
                 let level = match parse_level(command, arguments) {
                     Ok(level) => level,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 Executed::Flow(if command == "break" {
                     Flow::Break(level)
@@ -2787,10 +2744,7 @@ impl<'a> Evaluator<'a> {
             }
             ControlWord::Set => match self.apply_set_options(arguments) {
                 Ok(()) => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Executed::Result(CommandResult::status(status))
-                }
+                Err(failure) => self.failed(failure)?,
             },
             ControlWord::Return => {
                 if !self
@@ -2805,29 +2759,20 @@ impl<'a> Evaluator<'a> {
                 }
                 let status = match parse_status(command, arguments, self.last_status) {
                     Ok(status) => status,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 Executed::Flow(Flow::Return(status))
             }
             ControlWord::Exit => {
                 let status = match parse_status(command, arguments, self.last_status) {
                     Ok(status) => status,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 Executed::Flow(Flow::Exit(status))
             }
             ControlWord::Read => match self.run_read(arguments, input) {
                 Ok(result) => Executed::Result(result),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Executed::Result(CommandResult::status(status))
-                }
+                Err(failure) => self.failed(failure)?,
             },
             ControlWord::Local => {
                 if !self
@@ -2864,10 +2809,7 @@ impl<'a> Evaluator<'a> {
                 };
                 let count = match parse_shift_count(arguments) {
                     Ok(count) => count,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 if count > frame.positional.len() {
                     Executed::Result(CommandResult::status(ExitCode::FAILURE))
@@ -2913,17 +2855,15 @@ impl<'a> Evaluator<'a> {
         name: &str,
         arguments: &[String],
         input: StageInput,
-        capture_output: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let capture_output = *stdout_sink == Sink::Value && capture_output;
         let Some(body) = self.functions.get(name).cloned() else {
             self.write_line(&format!("dekopon-shell: {name}: command not found"));
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
         };
 
         self.budget.charge_step()?;
-        let (flow, mut captured) = self.nested(|this| {
+        let flow = self.nested(|this| {
             let positional = arguments
                 .iter()
                 .map(|argument| Value::String(argument.clone()))
@@ -2946,9 +2886,6 @@ impl<'a> Evaluator<'a> {
                 }
                 StageInput::Inherited => false,
             };
-            if capture_output {
-                this.captures.push(Vec::new());
-            }
             let saved_stdout = (*stdout_sink != Sink::Value)
                 .then(|| this.stdout.take())
                 .flatten();
@@ -2968,39 +2905,19 @@ impl<'a> Evaluator<'a> {
             }
             this.discard_capture_depth = previous_discard;
             this.diagnostics_depth = previous_diagnostics;
-            let captured = if capture_output {
-                this.captures.pop().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
             if piped {
                 this.stdin.pop();
             }
             this.frames.pop();
-            Ok::<_, FatalError>((flow, captured))
+            Ok::<_, FatalError>(flow)
         })?;
 
-        let mut retained = capture_charges(&mut captured);
-        let value = if capture_output {
-            reduce_charged(&self.budget, captured, &mut retained)?
-        } else {
-            Value::Null
-        };
-        retain_value(&self.budget, &value, &mut retained)?;
         Ok(match flow? {
-            Flow::Return(status) => Executed::Result(CommandResult {
-                value,
-                status,
-                suppress_newline: false,
-                retained,
-            }),
+            Flow::Return(status) => Executed::Result(CommandResult::status(status)),
             Flow::Exit(status) => Executed::Flow(Flow::Exit(status)),
-            Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(CommandResult {
-                value,
-                status: self.last_status,
-                suppress_newline: false,
-                retained,
-            }),
+            Flow::Normal | Flow::Break(_) | Flow::Continue(_) => {
+                Executed::Result(CommandResult::status(self.last_status))
+            }
         })
     }
 
@@ -3012,9 +2929,7 @@ impl<'a> Evaluator<'a> {
     ) -> Result<Executed, FatalError> {
         let template = match xargs::parse(arguments) {
             Ok(template) => template,
-            Err(failure) => {
-                return self.failed(failure);
-            }
+            Err(failure) => return self.failed(failure),
         };
         let mut piped = match input {
             StageInput::Piped(reader) => Some(reader),
@@ -3057,7 +2972,6 @@ impl<'a> Evaluator<'a> {
                         .collect::<Vec<_>>(),
                     StageInput::Piped(PipeReader::default()),
                     false,
-                    false,
                     stdout_sink,
                 )? {
                     Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
@@ -3071,8 +2985,7 @@ impl<'a> Evaluator<'a> {
                         if result.status != ExitCode::SUCCESS {
                             status = result.status;
                         }
-                        StageOut::new(self, stdout_sink, OutputMode::Value, false)
-                            .value(self, result)?;
+                        StageOut::new(self, stdout_sink, OutputMode::Value).value(self, result)?;
                         if self.reader_gone {
                             return Ok(Executed::Result(CommandResult::status(status)));
                         }

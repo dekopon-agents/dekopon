@@ -9,12 +9,27 @@ pub(super) enum OutputMode {
     Bytes,
 }
 
+enum Diagnostics {
+    Chunks,
+    Excerpt,
+    Deferred,
+}
+enum Buffering {
+    Immediate,
+    Deferred,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Capture {
+    Chunks,
+    Bytes,
+}
+
 enum Destination {
     Discard,
-    Diagnostics { deferred: bool, excerpt: bool },
-    Buffer { name: String, deferred: bool },
+    Diagnostics(Diagnostics),
+    Buffer(String, Buffering),
     Pipe,
-    Capture { returned: bool, whole: bool },
+    Capture(Capture),
     Terminal,
 }
 
@@ -23,17 +38,11 @@ pub(super) struct StageOut {
     mode: OutputMode,
     pending: Vec<u8>,
     charges: Vec<dekopon_process::RetainedBytes>,
-    collected: Vec<CommandResult>,
     truncated: bool,
 }
 
 impl StageOut {
-    pub(super) fn new(
-        evaluator: &Evaluator<'_>,
-        sink: &Sink,
-        mode: OutputMode,
-        capture_output: bool,
-    ) -> Self {
+    pub(super) fn new(evaluator: &Evaluator<'_>, sink: &Sink, mode: OutputMode) -> Self {
         let (whole, excerpt, named, value) = match mode {
             OutputMode::Value => (false, false, false, true),
             OutputMode::Copy => (false, true, false, false),
@@ -41,12 +50,32 @@ impl StageOut {
             OutputMode::Lines => (false, false, false, false),
             OutputMode::Bytes => (true, false, false, false),
         };
-        let diagnostics = |deferred| Destination::Diagnostics { deferred, excerpt };
-        let buffer = |name: &str, deferred| Destination::Buffer {
-            name: name.to_owned(),
-            deferred,
+        let diagnostics = |deferred| {
+            Destination::Diagnostics(if deferred {
+                Diagnostics::Deferred
+            } else if excerpt {
+                Diagnostics::Excerpt
+            } else {
+                Diagnostics::Chunks
+            })
         };
-        let capture = |returned| Destination::Capture { returned, whole };
+        let buffer = |name: &str, deferred| {
+            Destination::Buffer(
+                name.to_owned(),
+                if deferred {
+                    Buffering::Deferred
+                } else {
+                    Buffering::Immediate
+                },
+            )
+        };
+        let capture = || {
+            Destination::Capture(if whole {
+                Capture::Bytes
+            } else {
+                Capture::Chunks
+            })
+        };
         let destination = match sink {
             Sink::Discard => Destination::Discard,
             Sink::Diagnostics => diagnostics(!value && !named && !excerpt),
@@ -63,11 +92,9 @@ impl StageOut {
                 } else if named && evaluator.stdout.is_some() {
                     Destination::Pipe
                 } else if !evaluator.captures.is_empty() {
-                    capture(whole)
+                    capture()
                 } else if evaluator.stdout.is_some() {
                     Destination::Pipe
-                } else if (whole || excerpt) && capture_output {
-                    capture(true)
                 } else {
                     Destination::Terminal
                 }
@@ -78,19 +105,7 @@ impl StageOut {
             mode,
             pending: Vec::new(),
             charges: Vec::new(),
-            collected: Vec::new(),
             truncated: false,
-        }
-    }
-
-    pub(super) fn deferred(&self) -> bool {
-        match self.destination {
-            Destination::Diagnostics { deferred, .. } => deferred,
-            Destination::Discard
-            | Destination::Buffer { .. }
-            | Destination::Pipe
-            | Destination::Capture { .. }
-            | Destination::Terminal => false,
         }
     }
 
@@ -108,13 +123,10 @@ impl StageOut {
     ) -> Result<bool, CommandFailure> {
         match &self.destination {
             Destination::Discard => {}
-            Destination::Diagnostics { deferred: true, .. }
-            | Destination::Buffer { deferred: true, .. }
-            | Destination::Capture { whole: true, .. } => self.collect(evaluator, bytes)?,
-            Destination::Diagnostics {
-                deferred: false,
-                excerpt: true,
-            } => {
+            Destination::Diagnostics(Diagnostics::Deferred)
+            | Destination::Buffer(_, Buffering::Deferred)
+            | Destination::Capture(Capture::Bytes) => self.collect(evaluator, bytes)?,
+            Destination::Diagnostics(Diagnostics::Excerpt) => {
                 let room = evaluator
                     .limits
                     .max_output_bytes
@@ -123,16 +135,12 @@ impl StageOut {
                 self.pending
                     .extend_from_slice(&bytes[..bytes.len().min(room)]);
             }
-            Destination::Diagnostics {
-                deferred: false,
-                excerpt: false,
-            } => {
+            Destination::Diagnostics(Diagnostics::Chunks) => {
                 push_diagnostic_bytes(bytes, &mut evaluator.stderr_capture, &mut evaluator.output);
             }
-            Destination::Buffer {
-                name,
-                deferred: false,
-            } => evaluator.append_buffer_bytes(name, bytes)?,
+            Destination::Buffer(name, Buffering::Immediate) => {
+                evaluator.append_buffer_bytes(name, bytes)?
+            }
             Destination::Pipe => {
                 if let Some(writer) = evaluator.stdout.as_mut()
                     && writer.write(bytes) == WriteOutcome::ReaderGone
@@ -141,10 +149,7 @@ impl StageOut {
                     return Ok(false);
                 }
             }
-            Destination::Capture {
-                returned,
-                whole: false,
-            } => {
+            Destination::Capture(Capture::Chunks) => {
                 match self.mode {
                     OutputMode::Copy => telemetry::stage_write(bytes.len(), true, &None),
                     OutputMode::Lines => telemetry::stage_terminal_write(bytes.len(), false),
@@ -153,23 +158,26 @@ impl StageOut {
                 self.pending.extend_from_slice(bytes);
                 let complete = match std::str::from_utf8(&self.pending) {
                     Ok(text) => text.len(),
-                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                    Err(error) if error.error_len().is_none() && self.mode != OutputMode::Named => {
+                        error.valid_up_to()
+                    }
                     Err(_invalid_utf8) => return Err(invalid_text()),
                 };
-                if complete > 0 {
+                if complete > 0 || self.mode == OutputMode::Named {
                     let charge = evaluator.budget.charge_value_bytes(complete as u64)?;
                     let mut result = CommandResult::value(Value::String(
                         String::from_utf8_lossy(&self.pending[..complete]).into_owned(),
                     ))
                     .without_newline();
                     result.retained.push(charge);
-                    if *returned {
-                        self.collected.push(result);
-                    } else if let Some(capture) = evaluator.captures.last_mut() {
+                    if let Some(capture) = evaluator.captures.last_mut() {
                         capture.push(result);
                     }
                     self.pending.drain(..complete);
                 }
+            }
+            Destination::Terminal if self.mode == OutputMode::Named => {
+                push_lossy_bytes(&mut evaluator.output, bytes)
             }
             Destination::Terminal => {
                 telemetry::stage_write(bytes.len(), true, &None);
@@ -199,34 +207,17 @@ impl StageOut {
             )));
         }
         match &self.destination {
-            Destination::Buffer {
-                name: destination, ..
-            } => evaluator.append_named_buffer(name, destination)?,
+            Destination::Buffer(destination, _) => {
+                evaluator.append_named_buffer(name, destination)?
+            }
             Destination::Discard => {}
-            Destination::Diagnostics { .. }
+            Destination::Diagnostics(_)
             | Destination::Pipe
-            | Destination::Capture { .. }
+            | Destination::Capture(_)
             | Destination::Terminal => {
                 let buffers = Arc::clone(&evaluator.buffers);
                 if let Some(bytes) = buffers.get(name) {
-                    match self.destination {
-                        Destination::Terminal => push_lossy_bytes(&mut evaluator.output, bytes),
-                        Destination::Capture { .. } => {
-                            let text = std::str::from_utf8(bytes)
-                                .map_err(|_invalid_utf8| invalid_text())?;
-                            let charge = evaluator.budget.charge_value_bytes(bytes.len() as u64)?;
-                            let mut result = CommandResult::value(Value::String(text.to_owned()))
-                                .without_newline();
-                            result.retained.push(charge);
-                            if let Some(capture) = evaluator.captures.last_mut() {
-                                capture.push(result);
-                            }
-                        }
-                        Destination::Discard
-                        | Destination::Diagnostics { .. }
-                        | Destination::Buffer { .. }
-                        | Destination::Pipe => return self.write(evaluator, bytes),
-                    }
+                    return self.write(evaluator, bytes);
                 }
             }
         }
@@ -247,10 +238,7 @@ impl StageOut {
                         .push_fragment(&String::from_utf8_lossy(&self.pending));
                 }
             }
-            Destination::Diagnostics {
-                excerpt: true,
-                deferred: false,
-            } => {
+            Destination::Diagnostics(Diagnostics::Excerpt) => {
                 push_diagnostic_bytes(
                     &self.pending,
                     &mut evaluator.stderr_capture,
@@ -266,10 +254,7 @@ impl StageOut {
                     }
                 }
             }
-            Destination::Buffer {
-                name,
-                deferred: true,
-            } => {
+            Destination::Buffer(name, Buffering::Deferred) => {
                 if !self.pending.is_empty() && (self.mode != OutputMode::Bytes || successful) {
                     evaluator.append_charged_buffer_bytes(
                         name,
@@ -278,8 +263,8 @@ impl StageOut {
                     )?;
                 }
             }
-            Destination::Diagnostics { deferred: true, .. }
-            | Destination::Capture { whole: true, .. } => {
+            Destination::Diagnostics(Diagnostics::Deferred)
+            | Destination::Capture(Capture::Bytes) => {
                 if !self.pending.is_empty() && (self.mode != OutputMode::Bytes || successful) {
                     let bytes = std::mem::take(&mut self.pending);
                     let text = String::from_utf8(bytes).map_err(|_invalid_utf8| {
@@ -299,41 +284,14 @@ impl StageOut {
                     });
                 }
             }
-            Destination::Capture {
-                returned,
-                whole: false,
-            } => {
-                if !self.pending.is_empty() && (self.mode != OutputMode::Lines || successful) {
+            Destination::Capture(Capture::Chunks) => {
+                if !self.pending.is_empty() && (self.mode == OutputMode::Copy || successful) {
                     return Err(invalid_text());
-                }
-                if *returned {
-                    let mut retained = capture_charges(&mut self.collected);
-                    let value = if self.collected.is_empty() {
-                        Value::Null
-                    } else {
-                        reduce_charged(
-                            &evaluator.budget,
-                            std::mem::take(&mut self.collected),
-                            &mut retained,
-                        )?
-                    };
-                    retain_value(&evaluator.budget, &value, &mut retained)?;
-                    return Ok(CommandResult {
-                        value,
-                        status,
-                        suppress_newline: true,
-                        retained,
-                    });
                 }
             }
             Destination::Discard
-            | Destination::Diagnostics {
-                deferred: false,
-                excerpt: false,
-            }
-            | Destination::Buffer {
-                deferred: false, ..
-            }
+            | Destination::Diagnostics(Diagnostics::Chunks)
+            | Destination::Buffer(_, Buffering::Immediate)
             | Destination::Pipe => {}
         }
         Ok(CommandResult::status(status))
@@ -349,9 +307,9 @@ impl StageOut {
         }
         match &self.destination {
             Destination::Discard => {}
-            Destination::Diagnostics { .. } => evaluator.write_redirected_diagnostics(&result),
-            Destination::Buffer { name, .. } => evaluator.append_buffer(name, result)?,
-            Destination::Capture { .. } => {
+            Destination::Diagnostics(_) => evaluator.write_redirected_diagnostics(&result),
+            Destination::Buffer(name, _) => evaluator.append_buffer(name, result)?,
+            Destination::Capture(_) => {
                 retain_value(&evaluator.budget, &result.value, &mut result.retained)?;
                 if let Some(capture) = evaluator.captures.last_mut() {
                     capture.push(result);
