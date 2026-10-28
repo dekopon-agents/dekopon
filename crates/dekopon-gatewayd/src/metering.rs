@@ -545,21 +545,13 @@ impl std::io::Write for ByteCount {
     }
 }
 
-struct MeteredMessages<'a>(&'a [ModelMessage]);
-
-impl serde::Serialize for MeteredMessages<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq as _;
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for message in self.0 {
-            sequence.serialize_element(&message.for_metering())?;
-        }
-        sequence.end()
-    }
-}
-
 fn json_bytes(messages: &[ModelMessage]) -> usize {
-    serialized_bytes(&MeteredMessages(messages))
+    messages
+        .iter()
+        .map(ModelMessage::encoded_len)
+        .fold(1, |total, bytes| {
+            total.saturating_add(bytes).saturating_add(1)
+        })
 }
 
 fn serialized_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
@@ -764,7 +756,14 @@ mod tests {
             count: ByteCount(0),
             initialize: Some((resume, completed)),
         };
-        serde_json::to_writer(&mut writer, &MeteredMessages(&messages)).unwrap();
+        serde_json::to_writer(
+            &mut writer,
+            &messages
+                .iter()
+                .map(ModelMessage::for_metering)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         assert!(writer.initialize.is_none());
         assert_eq!(writer.count.0, whole_before);
         assert_eq!(json_bytes(&messages), whole_before);

@@ -11,8 +11,10 @@ use std::{
 
 use dekopon_core::AgentId;
 use dekopon_model::{
-    error::InferenceError,
+    error::{InferenceError, TransportFailure},
     model::{ChatModel, CompletionOptions, ModelMessage},
+    replay::ReplayMessage,
+    text::Text,
 };
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 use tokio::{
@@ -24,7 +26,7 @@ use tracing::Instrument as _;
 use super::{
     journal::{
         Journal, JournalError,
-        records::{Field, Head, Snapshot, escaped_text},
+        records::{Field, Head, Snapshot},
     },
     record::{RecordId, Slot, SlotLine, Subject, SummaryError, SummaryFailure, TurnId},
 };
@@ -82,24 +84,68 @@ impl Drop for CancelOnDrop {
     }
 }
 
+pub(crate) struct Dispatcher {
+    receiver: mpsc::Receiver<Queued>,
+    sender: Sender,
+    concurrency: NonZeroUsize,
+}
+
+pub(crate) fn channel(
+    journal: Arc<Journal>,
+    counts: Arc<Counts>,
+    queue: NonZeroUsize,
+    concurrency: NonZeroUsize,
+) -> (Sender, Dispatcher) {
+    let (tx, receiver) = mpsc::channel(queue.get());
+    let sender = Sender {
+        queue: tx,
+        journal,
+        counts,
+    };
+    let dispatcher = Dispatcher {
+        receiver,
+        sender: sender.clone(),
+        concurrency,
+    };
+    (sender, dispatcher)
+}
+
+impl Dispatcher {
+    pub(crate) fn start(
+        self,
+        current: CurrentGeneration,
+        models: Arc<ModelCache>,
+        owned_tasks: &mut JoinSet<()>,
+    ) {
+        let resources = Resources {
+            journal: Arc::clone(&self.sender.journal),
+            current,
+            models,
+            counts: Arc::clone(&self.sender.counts),
+        };
+        owned_tasks.spawn(dispatch(
+            Arc::new(resources),
+            self.receiver,
+            self.sender,
+            self.concurrency,
+        ));
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn spawn(
     resources: Resources,
     queue: NonZeroUsize,
     concurrency: NonZeroUsize,
     owned_tasks: &mut JoinSet<()>,
 ) -> Sender {
-    let (tx, rx) = mpsc::channel(queue.get());
-    let sender = Sender {
-        queue: tx,
-        journal: Arc::clone(&resources.journal),
-        counts: Arc::clone(&resources.counts),
-    };
-    owned_tasks.spawn(dispatch(
-        Arc::new(resources),
-        rx,
-        sender.clone(),
+    let (sender, dispatcher) = channel(
+        Arc::clone(&resources.journal),
+        Arc::clone(&resources.counts),
+        queue,
         concurrency,
-    ));
+    );
+    dispatcher.start(resources.current, resources.models, owned_tasks);
     sender
 }
 
@@ -387,7 +433,7 @@ enum Completed {
 fn complete_summary(
     client: &dyn ChatModel,
     call: Call,
-    input: String,
+    mut input: Vec<Text>,
     previous: String,
     part: NonZeroU8,
     limit: NonZeroU32,
@@ -396,17 +442,18 @@ fn complete_summary(
         "Write only new additive summary information for part {}. Do not repeat earlier parts.",
         part
     );
+    input.insert(0, Text::Owned("Source:\n".to_owned()));
+    input.push(Text::Owned(format!("\nEarlier parts:\n{previous}")));
+    let input_bytes = input.iter().map(text_bytes).sum::<usize>();
     let messages = [
         ModelMessage::system(instructions),
-        ModelMessage::user(format!("Source:\n{input}\nEarlier parts:\n{previous}")),
+        ModelMessage::Journal {
+            message: ReplayMessage::User(input),
+        },
     ];
     let estimate = Estimate::from_sizes(
         Sizes {
-            bytes: messages
-                .iter()
-                .filter_map(ModelMessage::content)
-                .map(str::len)
-                .sum(),
+            bytes: input_bytes + messages[0].content().map_or(0, str::len),
             images: 0,
         },
         None,
@@ -458,6 +505,10 @@ fn complete_summary(
             }
             None => error_slot(SummaryFailure::Empty, "summary returned no text"),
         },
+        Err(InferenceError::Transport(TransportFailure::Body(error))) => error_slot(
+            SummaryFailure::Io { kind: error.kind() },
+            "could not read summary input",
+        ),
         Err(InferenceError::Cancelled) => return Completed::Cancelled,
         Err(InferenceError::DeadlineExceeded) => {
             error_slot(SummaryFailure::Timeout, "summary model deadline exceeded")
@@ -480,10 +531,20 @@ fn evicted(resources: &Resources) -> Next {
     Next::Stop
 }
 
-fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<String, JournalError> {
-    let mut input = String::new();
+fn text_bytes(text: &Text) -> usize {
+    match text {
+        Text::Owned(text) => text.len(),
+        Text::File { len, .. } => usize::try_from(*len).unwrap_or(usize::MAX),
+        Text::Opaque(_) => 0,
+    }
+}
+
+fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<Vec<Text>, JournalError> {
+    let file_len = snapshot.file.metadata()?.len();
+    let mut chosen = Vec::new();
+    let mut left = cap;
     for text_first in [true, false] {
-        for span in &head.header.spans {
+        for (index, span) in head.header.spans.iter().enumerate() {
             let selected = match span.field {
                 Field::User { .. }
                 | Field::Steer { .. }
@@ -492,18 +553,45 @@ fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<String, Journal
                 Field::Arguments { .. } | Field::Result { .. } => !text_first,
                 Field::Opaque { .. } | Field::CallId | Field::RejectedTool => false,
             };
-            if selected && input.len() < cap {
-                let text = escaped_text(
-                    &snapshot.file,
-                    head.body_at + span.rel_offset,
-                    span.len,
-                    cap - input.len(),
-                )?;
-                input.push_str(&text);
+            if !selected || left == 0 {
+                continue;
+            }
+            let offset = head
+                .body_at
+                .checked_add(span.rel_offset)
+                .ok_or(JournalError::Corrupt)?;
+            if offset
+                .checked_add(span.len)
+                .is_none_or(|end| end > file_len)
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let text = match span.field {
+                Field::Arguments { original_bytes, .. } if span.len > left as u64 => {
+                    Text::Owned(serde_json::json!({"cut": original_bytes}).to_string())
+                }
+                Field::Arguments { .. }
+                | Field::User { .. }
+                | Field::Steer { .. }
+                | Field::Assistant { .. }
+                | Field::Plain { .. }
+                | Field::Result { .. } => Text::File {
+                    file: Arc::clone(&snapshot.file),
+                    offset,
+                    len: span.len,
+                }
+                .prefix(left as u64)?,
+                Field::Opaque { .. } | Field::CallId | Field::RejectedTool => continue,
+            };
+            let bytes = text_bytes(&text);
+            if bytes <= left {
+                left -= bytes;
+                chosen.push((index, text));
             }
         }
     }
-    Ok(input)
+    chosen.sort_by_key(|(index, _text)| *index);
+    Ok(chosen.into_iter().map(|(_index, text)| text).collect())
 }
 
 fn slot_line(task: &SlotTask, slot: Slot) -> SlotLine {
