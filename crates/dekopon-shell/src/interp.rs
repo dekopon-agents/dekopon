@@ -10,7 +10,7 @@ use case_pattern::PatternChar;
 mod nesting;
 pub(crate) mod stage_out;
 use ifs::{Action, Boundary, Ifs, Kind};
-use stage_out::{OutputMode, StageOut};
+use stage_out::{OutputMode, StageOut, WriteTarget};
 
 use std::{
     cmp::Ordering,
@@ -99,6 +99,75 @@ enum ParsedStream<'a> {
     Text(builtins::text::stream::Operation),
     Extra(builtins::text::extra::Operation),
     Jq(builtins::jq::Options),
+    Awk(builtins::awk::Options),
+}
+
+impl ParsedStream<'_> {
+    fn run(
+        self,
+        input: builtins::awk::StageReader<'_>,
+        budget: &mut Budget,
+        emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<ExitCode, CommandFailure> {
+        match self {
+            Self::Awk(options) => {
+                return builtins::awk::run_stream(options, input, budget, emit)
+                    .map_err(CommandFailure::from);
+            }
+            Self::Cat(_) => unreachable!("named cat streams resolve each buffer separately"),
+            Self::Base64(_) | Self::Lines(_) | Self::Text(_) | Self::Extra(_) | Self::Jq(_) => {}
+        }
+        let (mut reader, _charge) = input.open();
+        match self {
+            Self::Lines(selection) => {
+                builtins::text::lines::run(selection, &mut reader, budget, emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            Self::Text(operation) => {
+                builtins::text::stream::run_parsed(operation, &mut reader, budget, emit)
+            }
+            Self::Extra(operation) => {
+                builtins::text::extra::run_parsed(operation, &mut reader, budget, emit)
+            }
+            Self::Jq(options) => {
+                builtins::jq::stream(options, &mut reader, budget, emit).map(|()| ExitCode::SUCCESS)
+            }
+            Self::Base64(arguments) => {
+                builtins::encode::stream(arguments, &mut reader, budget, emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            Self::Cat(_) | Self::Awk(_) => unreachable!("handled before opening inherited input"),
+        }
+    }
+}
+
+fn stage_input<'a>(
+    stdin: &'a mut [PipeReader<StageObservation>],
+    buffers: &BTreeMap<String, Vec<u8>>,
+    budget: &Budget,
+    command: &str,
+    operand: Option<&str>,
+    input: StageInput,
+) -> Result<builtins::awk::StageReader<'a>, CommandFailure> {
+    use builtins::awk::StageReader;
+    if let Some(name) = operand.filter(|name| *name != "-") {
+        check_buffer_operand(command, name)?;
+        if name == DEV_NULL {
+            return Ok(StageReader::Ready(PipeReader::default(), None));
+        }
+        let bytes = buffers.get(name).ok_or_else(|| CommandFailure::failed(format!(
+            "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
+        )))?;
+        let charge = budget.charge_value_bytes(bytes.len() as u64)?;
+        return Ok(StageReader::Ready(
+            PipeReader::from_bytes(bytes.clone(), None, telemetry::stage_read),
+            Some(charge),
+        ));
+    }
+    Ok(match input {
+        StageInput::Piped(reader) => StageReader::Ready(reader, None),
+        StageInput::Inherited => StageReader::Inherited(stdin.last_mut()),
+    })
 }
 
 impl Builtin {
@@ -177,6 +246,9 @@ impl Builtin {
             Self::Jq => {
                 builtins::jq::options(arguments).map(|options| (ParsedStream::Jq(options), None))
             }
+            Self::Awk => builtins::awk::parse(arguments, &evaluator.budget)
+                .map(|(options, operand)| (ParsedStream::Awk(options), operand))
+                .map_err(CommandFailure::from),
             Self::Cat => Ok((ParsedStream::Cat(arguments), None)),
             Self::Base64 => Ok((ParsedStream::Base64(arguments), None)),
             Self::Xargs => return evaluator.run_xargs(arguments, input, stdout_sink),
@@ -329,7 +401,7 @@ fn record_compound_outcome(span: Option<&tracing::Span>, executed: &Result<Execu
 
 struct StageOutcome {
     status: Result<ExitCode, FatalError>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
     enclosing: Option<PipeReader<StageObservation>>,
 }
 
@@ -359,11 +431,59 @@ impl Stage<'_> {
     }
 }
 
+#[derive(Debug)]
+enum Diagnostic {
+    Line(String),
+    Fragment(String),
+}
+
+impl Diagnostic {
+    fn from_result(result: &CommandResult) -> Option<Self> {
+        if result.value.is_null() {
+            return None;
+        }
+        let text = display(&result.value);
+        Some(if result.suppress_newline {
+            Self::Fragment(text)
+        } else {
+            Self::Line(text)
+        })
+    }
+
+    fn followed_by(self, next: Self) -> Self {
+        let mut text = match self {
+            Self::Line(mut text) => {
+                text.push('\n');
+                text
+            }
+            Self::Fragment(text) => text,
+        };
+        match next {
+            Self::Line(next) => {
+                text.push_str(&next);
+                Self::Line(text)
+            }
+            Self::Fragment(next) => {
+                text.push_str(&next);
+                Self::Fragment(text)
+            }
+        }
+    }
+
+    fn into_result(self) -> CommandResult {
+        match self {
+            Self::Line(text) => CommandResult::value(Value::String(text)),
+            Self::Fragment(text) => CommandResult::value(Value::String(text)).without_newline(),
+        }
+    }
+}
+
 /// A redirected stderr capture must stay bounded by the same output ceilings, since a function can
 /// run thousands of commands into it.
 #[derive(Debug)]
 struct StderrCapture {
-    lines: Vec<String>,
+    lines: Vec<Diagnostic>,
+    pending: String,
     bytes: usize,
     max_lines: usize,
     max_bytes: usize,
@@ -374,6 +494,7 @@ impl StderrCapture {
     fn new(limits: &Limits) -> Self {
         Self {
             lines: Vec::new(),
+            pending: String::new(),
             bytes: 0,
             max_lines: limits.max_output_lines,
             max_bytes: limits.max_output_bytes,
@@ -382,12 +503,37 @@ impl StderrCapture {
     }
 
     fn push(&mut self, line: &str) {
-        if self.lines.len() >= self.max_lines || self.bytes + line.len() > self.max_bytes {
-            self.truncated = true;
-            return;
+        self.push_fragment(line);
+        self.push_fragment("\n");
+    }
+
+    fn push_fragment(&mut self, text: &str) {
+        for part in text.split_inclusive('\n') {
+            if self.lines.len() >= self.max_lines {
+                self.truncated = true;
+                return;
+            }
+            let line = part.strip_suffix('\n').unwrap_or(part);
+            let room = self.max_bytes.saturating_sub(self.bytes);
+            let mut end = line.len().min(room);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.pending.push_str(&line[..end]);
+            self.bytes += end;
+            self.truncated |= end < line.len();
+            if part.ends_with('\n') {
+                self.lines
+                    .push(Diagnostic::Line(std::mem::take(&mut self.pending)));
+            }
         }
-        self.bytes += line.len();
-        self.lines.push(line.to_owned());
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.lines
+                .push(Diagnostic::Line(std::mem::take(&mut self.pending)));
+        }
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) {
@@ -404,17 +550,20 @@ impl StderrCapture {
         while !prefix.is_char_boundary(end) {
             end -= 1;
         }
-        let text = prefix[..end].strip_suffix('\n').unwrap_or(&prefix[..end]);
-        self.push(text);
+        self.push_fragment(&prefix[..end]);
         if bytes.len() > room || end < prefix.len() {
             self.truncated = true;
         }
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> Vec<Diagnostic> {
         if self.truncated {
-            self.lines
-                .push("... redirected diagnostics truncated ...".to_owned());
+            self.flush_pending();
+            self.lines.push(Diagnostic::Line(
+                "... redirected diagnostics truncated ...".to_owned(),
+            ));
+        } else if !self.pending.is_empty() {
+            self.lines.push(Diagnostic::Fragment(self.pending));
         }
         self.lines
     }
@@ -740,18 +889,8 @@ impl<'a> Evaluator<'a> {
     }
 
     fn write_redirected_diagnostics(&mut self, result: &CommandResult) {
-        if result.value.is_null() {
-            return;
-        }
-        let text = display(&result.value);
-        if result.suppress_newline {
-            if let Some(capture) = self.stderr_capture.last_mut() {
-                capture.push(text.strip_suffix('\n').unwrap_or(&text));
-            } else {
-                self.output.push_fragment(&text);
-            }
-        } else {
-            self.write_line(&text);
+        if let Some(diagnostic) = Diagnostic::from_result(result) {
+            self.write_diagnostic(diagnostic);
         }
     }
 
@@ -761,6 +900,15 @@ impl<'a> Evaluator<'a> {
             return;
         }
         self.output.push_block(line);
+    }
+
+    fn write_diagnostic(&mut self, diagnostic: Diagnostic) {
+        match diagnostic {
+            Diagnostic::Line(text) => self.write_line(&text),
+            Diagnostic::Fragment(text) => {
+                push_diagnostic_fragment(&text, &mut self.stderr_capture, &mut self.output)
+            }
+        }
     }
 
     fn active_buffer_name(&self) -> Option<&str> {
@@ -1455,8 +1603,8 @@ impl<'a> Evaluator<'a> {
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
                 Ok(outcome) => {
-                    for line in outcome.diagnostics {
-                        self.write_line(&line);
+                    for diagnostic in outcome.diagnostics {
+                        self.write_diagnostic(diagnostic);
                     }
                     match outcome.status {
                         Ok(status) => {
@@ -1480,8 +1628,8 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        for line in diagnostics {
-            self.write_line(&line);
+        for diagnostic in diagnostics {
+            self.write_diagnostic(diagnostic);
         }
         let executed = executed.map_err(|error| fatal.take().unwrap_or(error))?;
         if let Some(error) = fatal {
@@ -1783,7 +1931,7 @@ impl<'a> Evaluator<'a> {
                 break;
             };
             self.budget.charge_step()?;
-            if !output.write(self, &chunk)? {
+            if !output.write(&mut WriteTarget::split(self).1, &chunk)? {
                 break;
             }
         }
@@ -1883,11 +2031,11 @@ impl<'a> Evaluator<'a> {
         let mut result = CommandResult::status(status);
         if stderr == Sink::Value {
             if let Sink::Buffer { name, .. } = &stdout {
-                for line in diagnostics.drain(..) {
-                    self.append_buffer_bytes(name, format!("{line}\n").as_bytes())?;
+                for diagnostic in diagnostics.drain(..) {
+                    self.append_buffer(name, diagnostic.into_result())?;
                 }
             } else {
-                result.value = merge_diagnostics(result.value, diagnostics);
+                merge_diagnostics(&mut result, diagnostics);
                 diagnostics = Vec::new();
             }
         }
@@ -2063,7 +2211,7 @@ impl<'a> Evaluator<'a> {
         };
 
         if stderr == Sink::Value {
-            result.value = merge_diagnostics(result.value, diagnostics);
+            merge_diagnostics(&mut result, diagnostics);
             diagnostics = Vec::new();
         }
 
@@ -2149,7 +2297,7 @@ impl<'a> Evaluator<'a> {
 
     fn route_diagnostics(
         &mut self,
-        diagnostics: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
         sink: &Sink,
     ) -> Result<(), FatalError> {
         if diagnostics.is_empty() {
@@ -2158,14 +2306,14 @@ impl<'a> Evaluator<'a> {
         match sink {
             Sink::Discard => {}
             Sink::Diagnostics | Sink::Value => {
-                for line in diagnostics {
-                    self.write_line(&line);
+                for diagnostic in diagnostics {
+                    self.write_diagnostic(diagnostic);
                 }
             }
             Sink::Buffer { name, .. } => {
                 let name = name.clone();
-                for line in diagnostics {
-                    self.append_buffer_bytes(&name, format!("{line}\n").as_bytes())?;
+                for diagnostic in diagnostics {
+                    self.append_buffer(&name, diagnostic.into_result())?;
                 }
             }
         }
@@ -2199,11 +2347,16 @@ impl<'a> Evaluator<'a> {
     }
 
     fn append_buffer_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<(), LimitExceeded> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-        self.append_charged_buffer_bytes(name, bytes, vec![charge])
+        append_buffer_bytes(
+            &self.budget,
+            BufferStorage {
+                buffers: &mut self.buffers,
+                charges: &mut self.buffer_charges,
+                shared_charges: &mut self.shared_charges,
+            },
+            name,
+            bytes,
+        )
     }
 
     fn append_charged_buffer_bytes(
@@ -2293,47 +2446,6 @@ impl<'a> Evaluator<'a> {
         executed
     }
 
-    fn stream_input(
-        &mut self,
-        command: &str,
-        operand: Option<&str>,
-        input: StageInput,
-    ) -> Result<
-        (
-            PipeReader<StageObservation>,
-            Option<dekopon_process::RetainedBytes>,
-        ),
-        CommandFailure,
-    > {
-        if let Some(name) = operand.filter(|name| *name != "-") {
-            check_buffer_operand(command, name)?;
-            if name == DEV_NULL {
-                return Ok((PipeReader::default(), None));
-            }
-            let bytes = self.buffers.get(name).ok_or_else(|| {
-                CommandFailure::failed(format!(
-                    "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
-                ))
-            })?;
-            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-            return Ok((
-                PipeReader::from_bytes(bytes.clone(), None, crate::interp::telemetry::stage_read),
-                Some(charge),
-            ));
-        }
-        Ok((
-            match input {
-                StageInput::Piped(reader) => reader,
-                StageInput::Inherited => self
-                    .stdin
-                    .last_mut()
-                    .map(std::mem::take)
-                    .unwrap_or_default(),
-            },
-            None,
-        ))
-    }
-
     fn run_stream(
         &mut self,
         name: &str,
@@ -2362,6 +2474,7 @@ impl<'a> Evaluator<'a> {
             }
             ParsedStream::Cat(_) => OutputMode::Named,
             ParsedStream::Base64(_) => OutputMode::Base64,
+            ParsedStream::Awk(_) => OutputMode::Awk,
             ParsedStream::Lines(_)
             | ParsedStream::Text(_)
             | ParsedStream::Extra(_)
@@ -2369,42 +2482,27 @@ impl<'a> Evaluator<'a> {
         };
         let mut output = StageOut::new(self, stdout_sink, mode);
         let mut budget = self.budget.fork();
-        let (mut reader, _input_charge) = match &parsed {
-            ParsedStream::Cat(_) => (PipeReader::default(), None),
-            ParsedStream::Base64(_)
-            | ParsedStream::Lines(_)
-            | ParsedStream::Text(_)
-            | ParsedStream::Extra(_)
-            | ParsedStream::Jq(_) => match self.stream_input(name, operand.as_deref(), input) {
-                Ok(selected) => selected,
-                Err(failure) => return self.failed(failure),
-            },
-        };
-        let mut emit = |bytes: &[u8]| output.write(self, bytes);
         let outcome = match parsed {
-            ParsedStream::Lines(selection) => {
-                builtins::text::lines::run(selection, &mut reader, &mut budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
-            }
-            ParsedStream::Text(operation) => {
-                builtins::text::stream::run_parsed(operation, &mut reader, &mut budget, &mut emit)
-            }
-            ParsedStream::Extra(operation) => {
-                builtins::text::extra::run_parsed(operation, &mut reader, &mut budget, &mut emit)
-            }
-            ParsedStream::Jq(options) => {
-                builtins::jq::stream(options, &mut reader, &mut budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
-            }
-            ParsedStream::Base64(arguments) => {
-                builtins::encode::stream(arguments, &mut reader, &mut budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
-            }
             ParsedStream::Cat(arguments) => {
                 builtins::misc::cat_stream(arguments, |name| output.named(self, name))
                     .map(|()| ExitCode::SUCCESS)
             }
+            parsed @ (ParsedStream::Base64(_)
+            | ParsedStream::Lines(_)
+            | ParsedStream::Text(_)
+            | ParsedStream::Extra(_)
+            | ParsedStream::Jq(_)
+            | ParsedStream::Awk(_)) => {
+                let (stdin, mut target) = WriteTarget::split(self);
+                match target.input(stdin, name, operand.as_deref(), input) {
+                    Ok(input) => parsed.run(input, &mut budget, &mut |bytes| {
+                        output.write(&mut target, bytes)
+                    }),
+                    Err(failure) => Err(failure),
+                }
+            }
         };
+        output.flush_diagnostics(self);
         let status = outcome.or_else(|failure| self.absorb(failure))?;
         let outcome = output.finish(self, status);
         self.completed(outcome)
@@ -4382,13 +4480,20 @@ fn parameter_length(value: &Value) -> Value {
     }
 }
 
-fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
-    if diagnostics.is_empty() {
-        return value;
-    }
-    let mut lines = value::to_lines(&value);
-    lines.extend(diagnostics);
-    value::from_lines(lines)
+fn merge_diagnostics(result: &mut CommandResult, diagnostics: Vec<Diagnostic>) {
+    let mut diagnostics = diagnostics.into_iter();
+    let Some(first) = diagnostics.next() else {
+        return;
+    };
+    let first = match Diagnostic::from_result(result) {
+        Some(output) => output.followed_by(first),
+        None => first,
+    };
+    let merged = diagnostics
+        .fold(first, Diagnostic::followed_by)
+        .into_result();
+    result.value = merged.value;
+    result.suppress_newline = merged.suppress_newline;
 }
 
 fn write_display(stdout: &mut PipeWriter<StageObservation>, value: &Value) -> WriteOutcome {
@@ -4412,6 +4517,19 @@ struct BufferStorage<'a> {
     buffers: &'a mut Arc<BTreeMap<String, Vec<u8>>>,
     charges: &'a mut BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
     shared_charges: &'a mut Vec<dekopon_process::RetainedBytes>,
+}
+
+fn append_buffer_bytes(
+    budget: &Budget,
+    storage: BufferStorage<'_>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), LimitExceeded> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let charge = budget.charge_value_bytes(bytes.len() as u64)?;
+    append_charged_buffer(budget, storage, name, bytes, vec![charge])
 }
 
 fn append_charged_buffer(
@@ -4479,6 +4597,14 @@ fn push_diagnostic_bytes(bytes: &[u8], captures: &mut [StderrCapture], output: &
         capture.push_bytes(bytes);
     } else {
         push_lossy_bytes(output, bytes);
+    }
+}
+
+fn push_diagnostic_fragment(text: &str, captures: &mut [StderrCapture], output: &mut OutputBuffer) {
+    if let Some(capture) = captures.last_mut() {
+        capture.push_fragment(text);
+    } else {
+        output.push_fragment(text);
     }
 }
 

@@ -6,7 +6,7 @@ use crate::builtins::{CommandFailure, unsupported_flag};
 use std::collections::BTreeMap;
 
 #[derive(Debug, PartialEq)]
-pub(super) enum GawkVariable {
+pub(crate) enum GawkVariable {
     IgnoreCase,
     Fpat,
     FieldWidths,
@@ -19,7 +19,7 @@ pub(super) enum GawkVariable {
 }
 
 impl GawkVariable {
-    fn name(&self) -> &str {
+    pub(super) fn name(&self) -> &str {
         match self {
             Self::IgnoreCase => "IGNORECASE",
             Self::Fpat => "FPAT",
@@ -48,7 +48,7 @@ impl GawkVariable {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) enum GawkSyntax {
+pub(crate) enum GawkSyntax {
     BeginFile,
     EndFile,
     Include,
@@ -57,7 +57,7 @@ pub(super) enum GawkSyntax {
 }
 
 impl GawkSyntax {
-    fn name(&self) -> &str {
+    pub(super) fn name(&self) -> &str {
         match self {
             Self::BeginFile => "BEGINFILE",
             Self::EndFile => "ENDFILE",
@@ -75,7 +75,7 @@ impl GawkSyntax {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) enum Refusal {
+pub(crate) enum Refusal {
     Getline,
     Process,
     Redirection,
