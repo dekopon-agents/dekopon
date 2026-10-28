@@ -244,6 +244,12 @@ Publishing a release additionally runs `.github/workflows/homebrew-tap.yml`, whi
 
 Neither that workflow nor `.github/workflows/container-image.yml` triggers on `release: published`. `release.yml` publishes with `GITHUB_TOKEN`, and GitHub does not create workflow runs from events raised by that token, so the event is dispatched to nothing: neither workflow produces a run at all, rather than a failed or skipped one. Both are `workflow_call` reusable workflows that `release.yml` invokes as jobs with `needs: github-release`, which is what guarantees they see a release with its assets attached; both keep a `workflow_dispatch` with a `tag` input as the manual recovery path. A reusable workflow reads `github.event_name` and `github.ref` from its caller, so neither may branch on its own event name; each branches on whether its `tag` input is set.
 
+On tag pushes, the container workflow returns its registry-verified `digest`. The release run's
+`release-digests` job exposes `digest` (stock) and `optimized-digest` (Wasmtime optimization)
+outputs and lists both in its summary. After both image publications succeed, it appends their
+full image tags and `sha256:…` digests to the generated GitHub release notes under **Container
+images**, preserving the existing notes. Manual recovery does not append release notes.
+
 ### Memory-optimized Wasmtime
 
 Normal Cargo commands, `--all-features`, packages, and stock release images keep crates.io
