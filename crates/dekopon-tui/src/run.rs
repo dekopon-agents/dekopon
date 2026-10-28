@@ -789,6 +789,7 @@ async fn dispatch_in_context(
             };
             app.broker_trace = Some(leg.session_trace().to_string());
             let limits = options.shell_limits;
+            let threads = options.shell_threads.clone();
             let (sender, receiver) = session_channel();
             stop.reset();
             let (handle_cancel, signal) = CancelSignal::pair();
@@ -806,6 +807,7 @@ async fn dispatch_in_context(
                         invoker: LegHandle(Arc::new(leg.with_cancel_signal(signal))),
                         limits,
                         calls: CallBudget::new(limits.max_capability_calls),
+                        threads,
                     }.run_script(&line, None);
                     tracing::info!(target: "dekopon_tui::audit", output = outcome.output.as_str(), exit_code = outcome.exit_code.get(), "console manual output");
                     if sender

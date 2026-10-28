@@ -589,6 +589,7 @@ async fn producer_events(
             let tree = dekopon_process::TreeContext::new(
                 dekopon_process::Limits::default(),
                 dekopon_process::CallBudget::new(1),
+                dekopon_test_support::shell_threads(),
             );
             let _result = leg.run(
                 dekopon_shell::RunCall { word, argv: vec![] },

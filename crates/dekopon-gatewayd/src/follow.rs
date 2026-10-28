@@ -666,6 +666,7 @@ mod tests {
             &TreeContext::new(
                 dekopon_process::Limits::default(),
                 dekopon_process::CallBudget::new(1),
+                dekopon_test_support::shell_threads(),
             ),
         )
     }
@@ -780,6 +781,7 @@ mod tests {
         let tree = TreeContext::new(
             dekopon_process::Limits::default(),
             dekopon_process::CallBudget::new(2),
+            dekopon_test_support::shell_threads(),
         );
         invoker.invoke(
             CommandProposal {

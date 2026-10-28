@@ -199,9 +199,9 @@ impl Probe {
     pub(crate) fn baseline(
         script: String,
         leg: &dyn CapabilityInvoker,
-        limits: ShellLimits,
+        shell: &Interpreter,
     ) -> Result<Self, WakeRefusal> {
-        match Verdict::from(Interpreter::new(limits).run(&script, leg)) {
+        match Verdict::from(shell.run(&script, leg)) {
             Verdict::Fire { output } | Verdict::Wait { output } => Ok(Self {
                 script,
                 prev: output,
@@ -213,8 +213,8 @@ impl Probe {
         }
     }
 
-    pub(crate) fn tick(&self, leg: &dyn CapabilityInvoker, limits: ShellLimits) -> Verdict {
-        Verdict::from(Interpreter::new(limits).run_with_prev(&self.script, &self.prev, leg))
+    pub(crate) fn tick(&self, leg: &dyn CapabilityInvoker, shell: &Interpreter) -> Verdict {
+        Verdict::from(shell.run_with_prev(&self.script, &self.prev, leg))
     }
 }
 
@@ -256,7 +256,7 @@ pub(crate) struct SessionWakes {
     bounds: WakeBounds,
     broker: ResolvedBroker,
     runtime: tokio::runtime::Handle,
-    limits: ShellLimits,
+    shell: Interpreter,
     started: SystemTime,
     job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
 }
@@ -267,7 +267,7 @@ impl SessionWakes {
         store: Arc<WakeStore>,
         broker: ResolvedBroker,
         runtime: tokio::runtime::Handle,
-        limits: ShellLimits,
+        shell: Interpreter,
         job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
     ) -> Self {
         Self {
@@ -277,7 +277,7 @@ impl SessionWakes {
             store,
             broker,
             runtime,
-            limits,
+            shell,
             started: SystemTime::now(),
         }
     }
@@ -344,7 +344,7 @@ impl WakeRegistrar for SessionWakes {
                         *limits,
                     )));
                 }
-                let probe = Probe::baseline(script, &leg, self.limits)?;
+                let probe = Probe::baseline(script, &leg, &self.shell)?;
                 self.store.register(
                     self.anchor.clone(),
                     note,
@@ -387,15 +387,15 @@ pub(crate) fn run_tick(
     store: &WakeStore,
     broker: &ResolvedBroker,
     runtime: &tokio::runtime::Handle,
-    limits: Option<ShellLimits>,
+    shell: Option<Interpreter>,
     job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
 ) -> Option<Fired> {
-    let verdict = match limits {
+    let verdict = match shell {
         None => Verdict::Failed {
             exit: ExitCode::DENIED,
             output: "[gateway: no route answers this chat as this agent with wakes on]".to_owned(),
         },
-        Some(limits) => match tick.anchor().probe_leg(broker, runtime) {
+        Some(shell) => match tick.anchor().probe_leg(broker, runtime) {
             Some(mut leg) => {
                 if let Some((jobs, job_limits)) = job_control {
                     leg = leg.with_job_control(Arc::new(crate::jobs::JobContext::from_probe(
@@ -406,7 +406,7 @@ pub(crate) fn run_tick(
                         job_limits,
                     )));
                 }
-                tick.run(&leg, limits)
+                tick.run(&leg, &shell)
             }
             None => Verdict::Failed {
                 exit: ExitCode::DENIED,

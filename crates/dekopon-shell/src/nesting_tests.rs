@@ -196,10 +196,14 @@ fn each_production_preserves_its_measured_ceiling_and_refusal() {
 }
 
 fn two_mib<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    let [permit] = crate::test_threads().reserve().unwrap();
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn_scoped(scope, f)
+        permit
+            .spawn(
+                scope,
+                dekopon_process::ThreadName::new("sh-nesting-test"),
+                f,
+            )
             .expect("spawn parser thread")
             .join()
             .expect("join parser thread")

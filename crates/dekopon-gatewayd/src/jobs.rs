@@ -12,7 +12,7 @@ use dekopon_process::{
     Limits as ShellLimits, TreeContext,
 };
 use dekopon_shell::{Interpreter, JobControl, JobRefusal, JobSeed};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 
 use crate::{
@@ -133,9 +133,13 @@ impl Table {
     }
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "owner: Jobs; bound: every wait is wait_for a WAIT_SLICE, re-checking cancellation and the deadline"
+)]
 pub(crate) struct Jobs {
     table: Mutex<Table>,
-    ended: Condvar,
+    ended: parking_lot::Condvar,
     permits: Arc<Semaphore>,
     maximum: usize,
     notices: mpsc::Sender<InboundMessage>,
@@ -143,6 +147,10 @@ pub(crate) struct Jobs {
 }
 
 impl Jobs {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "owner: Jobs; bound: every wait is wait_for a WAIT_SLICE, re-checking cancellation and the deadline"
+    )]
     pub(crate) fn new(maximum: usize) -> Self {
         let (notices, receiver) = mpsc::channel(maximum);
         Self {
@@ -151,7 +159,7 @@ impl Jobs {
                 next: 1,
                 sealed: false,
             }),
-            ended: Condvar::new(),
+            ended: parking_lot::Condvar::new(),
             permits: Arc::new(Semaphore::new(maximum)),
             maximum,
             notices,
@@ -650,7 +658,11 @@ impl JobContext {
 
     fn tree(&self, seed: &JobSeed) -> TreeContext {
         match self.origin {
-            Origin::Turn => TreeContext::new(self.limits, seed.tree().calls().clone()),
+            Origin::Turn => TreeContext::new(
+                self.limits,
+                seed.tree().calls().clone(),
+                seed.tree().shell_threads().clone(),
+            ),
             Origin::Tree(_) => seed.tree().clone(),
         }
     }
@@ -667,7 +679,8 @@ impl JobContext {
                 ending: Ending::Ran { expired: false },
             };
         };
-        let outcome = Interpreter::new(self.limits).run_seed(seed, &leg, &tree);
+        let outcome =
+            Interpreter::new(self.limits, tree.shell_threads().clone()).run_seed(seed, &leg, &tree);
         Ended {
             exit: outcome.exit_code,
             output: outcome.output,

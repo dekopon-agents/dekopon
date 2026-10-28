@@ -144,6 +144,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
             &dekopon_process::TreeContext::new(
                 dekopon_process::Limits::default(),
                 dekopon_process::CallBudget::new(4),
+                dekopon_test_support::shell_threads(),
             ),
         )
     };
@@ -178,6 +179,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
             &dekopon_process::TreeContext::new(
                 dekopon_process::Limits::default(),
                 dekopon_process::CallBudget::new(4),
+                dekopon_test_support::shell_threads(),
             ),
         );
         match outcome {
@@ -312,7 +314,7 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
         writer.write_all(b"hello from stdin\n").unwrap();
         drop(writer);
         let (stdout, mut reader) = UnixStream::pair().unwrap();
-        let result = invoker.run(dekopon_shell::RunCall { word: "probe".into(), argv: vec![dekopon_shell::Arg::Text("upper".into())] }, Streams { stdin: Some(stdin.into()), stdout: stdout.into() }, &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), dekopon_process::CallBudget::new(4)));
+        let result = invoker.run(dekopon_shell::RunCall { word: "probe".into(), argv: vec![dekopon_shell::Arg::Text("upper".into())] }, Streams { stdin: Some(stdin.into()), stdout: stdout.into() }, &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), dekopon_process::CallBudget::new(4), dekopon_test_support::shell_threads()));
         assert!(matches!(result, dekopon_shell::RunResult::Invoked { secret_use: Some(ref received), result: CapabilityCallResult::Exited { status, ref stderr }, .. } if *received == secret && status.get() == 141 && stderr.is_empty()));
         let mut output = String::new();
         reader.read_to_string(&mut output).unwrap();

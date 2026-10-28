@@ -47,6 +47,7 @@ use std::{
 
 use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
+use dekopon_process::ShellThreads;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet};
 
@@ -89,6 +90,8 @@ pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,
 
 const INBOUND_BUFFER: usize = 64;
 const ONE_SHOT_ASSET_IDLE: Duration = Duration::from_secs(60 * 60);
+
+const SHELL_THREADS: u32 = 32;
 
 #[must_use]
 pub fn current_uid() -> u32 {
@@ -311,6 +314,7 @@ where
         wakes,
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
+        shell_threads: ShellThreads::new(SHELL_THREADS, tokio::runtime::Handle::current()),
     });
     let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
 
@@ -854,13 +858,16 @@ fn spawn_tick(
         );
         return;
     };
-    let limits = routes
-        .route_for_anchor(tick.anchor())
-        .map(|route| dekopon_process::Limits {
-            max_capability_calls: route.limits.max_capability_calls,
-            timeout: route.script_timeout,
-            ..dekopon_process::Limits::default()
-        });
+    let shell = routes.route_for_anchor(tick.anchor()).map(|route| {
+        dekopon_shell::Interpreter::new(
+            dekopon_process::Limits {
+                max_capability_calls: route.limits.max_capability_calls,
+                timeout: route.script_timeout,
+                ..dekopon_process::Limits::default()
+            },
+            runner.shell_threads.clone(),
+        )
+    });
     let job_limits = routes.route_for_anchor(tick.anchor()).and_then(|route| {
         route.job_timeout.map(|timeout| dekopon_process::Limits {
             max_capability_calls: route.limits.max_capability_calls,
@@ -878,7 +885,7 @@ fn spawn_tick(
             &store,
             &broker,
             &runtime,
-            limits,
+            shell,
             job_limits.map(|limits| (jobs, limits)),
         )
     });

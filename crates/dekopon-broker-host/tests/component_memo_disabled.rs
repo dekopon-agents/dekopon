@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use dekopon_broker_host::{
     BrokerHostLimits, BrokerProviderRegistry, enable_test_component_memoization,
 };

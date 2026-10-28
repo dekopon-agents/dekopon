@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    reason = "tests spawn, join and build runtimes freely; production sites carry their own expectation"
+)]
 use parking_lot::Mutex;
 
 use dekopon_process::Limits;
@@ -5,6 +10,17 @@ use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter,
 };
 use serde_json::{Value, json};
+
+fn shell_threads() -> dekopon_process::ShellThreads {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    dekopon_process::ShellThreads::new(16, RUNTIME.handle().clone())
+}
 
 struct Replay {
     calls: Mutex<Vec<Value>>,
@@ -363,7 +379,7 @@ fn deployed_recipes_run_offline_with_exact_arguments_stdin_and_order() {
         let replay = Replay {
             calls: Mutex::default(),
         };
-        let result = Interpreter::new(Limits::default()).run(case.script, &replay);
+        let result = Interpreter::new(Limits::default(), shell_threads()).run(case.script, &replay);
         assert_eq!(result.exit_code.get(), 0, "{}: {result:?}", case.name);
         assert_eq!(result.output, case.output, "{}", case.name);
         assert_eq!(*replay.calls.lock(), case.calls, "{}", case.name);
