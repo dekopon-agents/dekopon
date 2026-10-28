@@ -891,8 +891,19 @@ impl Journal {
                 }
                 _ => false,
             };
-            if stale {
-                remove(&path);
+            if stale && remove(&path) {
+                if records
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == FOLLOW_EXTENSION)
+                {
+                    tracing::info!(
+                        audit.event = "gateway.follow",
+                        operation = "banished",
+                        cause = "lapse",
+                        "gateway.follow"
+                    );
+                }
                 tracing::info!(event = "gateway_journal_expired", "gateway.journal.expired");
             }
         }
@@ -956,15 +967,14 @@ fn parse_seal(file: File) -> Result<SealedConversation, JournalError> {
         .ok_or(JournalError::Corrupt)
 }
 
-fn remove(path: &Path) {
-    if let Err(error) = fs::remove_file(path)
-        && error.kind() != io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            event = "gateway_journal_remove_failed",
-            kind = %error.kind(),
-            "gateway.journal.remove.failed"
-        );
+fn remove(path: &Path) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(event = "gateway_journal_remove_failed", kind = %error.kind(), "gateway.journal.remove.failed");
+            false
+        }
     }
 }
 

@@ -165,6 +165,7 @@ fn recording_preserves_descriptor_pipeline_reports_lifecycle_and_shared_budget()
             ),
             limits: Limits::default(),
             calls: calls.clone(),
+            threads: dekopon_test_support::shell_threads(),
         },
         events,
         sequence,
@@ -225,6 +226,7 @@ fn recording_forwards_cancellation_before_a_provider_effect() {
         invoker,
         limits: Limits::default(),
         calls: CallBudget::new(2),
+        threads: dekopon_test_support::shell_threads(),
     }
     .run_script("probe produce", None);
     assert_eq!(outcome.exit_code.get(), 130);

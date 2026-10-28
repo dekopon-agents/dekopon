@@ -79,6 +79,7 @@ pub(crate) struct SlackTransport {
     experience: SlackExperience,
     deadline: Duration,
     thread_ownership: Arc<SlackThreadOwnership>,
+    generation: Option<crate::gateway::CurrentGeneration>,
 }
 
 impl SlackTransport {
@@ -120,7 +121,13 @@ impl SlackTransport {
             experience,
             deadline: LIVENESS_DEADLINE,
             thread_ownership,
+            generation: None,
         })
+    }
+
+    pub(crate) fn with_generation(mut self, generation: crate::gateway::CurrentGeneration) -> Self {
+        self.generation = Some(generation);
+        self
     }
 
     #[cfg(test)]
@@ -315,7 +322,9 @@ impl SlackTransport {
             .ok_or(TransportError::Response)?
             .to_owned();
         let event = &payload["event"];
-        if self.experience == SlackExperience::Agent
+        if event["type"].as_str() == Some("reaction_added") {
+            self.reaction_added(&team, event, received).await?;
+        } else if self.experience == SlackExperience::Agent
             && event["type"].as_str() == Some("agent_session_stopped")
         {
             if let Some(stopped) = self.session_stopped(&team, event)? {
@@ -327,6 +336,117 @@ impl SlackTransport {
             self.pending
                 .push_back(TransportEvent::Message(Box::new(message)));
         }
+        Ok(())
+    }
+
+    async fn reaction_added(
+        &mut self,
+        team: &str,
+        event: &Value,
+        received: &Span,
+    ) -> Result<(), TransportError> {
+        if !matches!(event["reaction"].as_str(), Some("-1" | "thumbsdown"))
+            || event["item"]["type"].as_str() != Some("message")
+            || event["item_user"].as_str() != self.identity.user_id.as_deref()
+        {
+            return Ok(());
+        }
+        let (Some(channel), Some(ts), Some(user)) = (
+            event["item"]["channel"].as_str(),
+            event["item"]["ts"].as_str(),
+            event["user"].as_str(),
+        ) else {
+            return Ok(());
+        };
+        if self.identity.user_id.as_deref() == Some(user)
+            || !canonical_timestamp(ts)
+            || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Ok(());
+        }
+        let Some(generation) = &self.generation else {
+            return Ok(());
+        };
+        if generation.follow_table().is_none() {
+            return Ok(());
+        }
+        let message = match self
+            .replier
+            .liveness_call(
+                "reactions.get",
+                &json!({"channel": channel, "timestamp": ts}),
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(event = "gateway_follow_reaction_ignored", cause = "message-unresolved", error = %error, "gateway.follow.reaction.ignored");
+                return Ok(());
+            }
+        };
+        let target = &message["message"];
+        if message["type"].as_str() != Some("message")
+            || message["channel"].as_str() != Some(channel)
+            || target["ts"].as_str() != Some(ts)
+            || target["user"].as_str() != self.identity.user_id.as_deref()
+        {
+            return Ok(());
+        }
+        let Some(root) = target["thread_ts"]
+            .as_str()
+            .filter(|root| canonical_timestamp(root))
+        else {
+            return Ok(());
+        };
+        let conversation = Conversation {
+            kind: ConversationKind::Thread,
+            container: Some(team.to_ascii_lowercase()),
+            id: channel.to_ascii_lowercase(),
+            thread: Some(root.to_owned()),
+        };
+        let active = generation.load();
+        if !active
+            .routes
+            .follow_routes(&self.name, &conversation)
+            .any(|route| {
+                let key = crate::follow::follow_key(
+                    &route.transport,
+                    route.agent.as_str(),
+                    &route.conversation,
+                    &conversation.key(),
+                );
+                generation.follow_table().is_some_and(|table| {
+                    matches!(
+                        table.ticket(&key, SystemTime::now()),
+                        crate::follow::FollowTicket::Active { .. }
+                    )
+                })
+            })
+        {
+            return Ok(());
+        }
+        let reactor = match self
+            .replier
+            .liveness_call("users.info", &json!({"user": user}))
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(event = "gateway_follow_reaction_ignored", cause = "user-unresolved", error = %error, "gateway.follow.reaction.ignored");
+                return Ok(());
+            }
+        };
+        if reactor["user"]["id"].as_str() != Some(user)
+            || reactor["user"]["is_bot"].as_bool() != Some(false)
+            || reactor["user"]["is_app_user"].as_bool() == Some(true)
+        {
+            return Ok(());
+        }
+        self.pending.push_back(TransportEvent::FollowLeave {
+            transport: self.name.clone(),
+            conversation,
+            received: received.clone(),
+        });
         Ok(())
     }
 
@@ -379,6 +499,39 @@ impl SlackTransport {
         };
         let kind = posted_in.conversation_kind(thread_ts.is_some());
         let is_shared = kind != ConversationKind::DirectMessage;
+        let follow_conversation = Conversation {
+            kind,
+            container: Some(team.to_ascii_lowercase()),
+            id: channel.to_ascii_lowercase(),
+            thread: Some(root_ts.clone()),
+        };
+        let generation = self
+            .generation
+            .as_ref()
+            .map(crate::gateway::CurrentGeneration::load);
+        let follow_route = generation.as_ref().and_then(|active| {
+            active
+                .routes
+                .follow_routes(&self.name, &follow_conversation)
+                .next()
+        });
+        let followed = follow_route.is_some_and(|route| {
+            let key = crate::follow::follow_key(
+                &route.transport,
+                route.agent.as_str(),
+                &route.conversation,
+                &follow_conversation.key(),
+            );
+            self.generation
+                .as_ref()
+                .and_then(crate::gateway::CurrentGeneration::follow_table)
+                .is_some_and(|table| {
+                    table.ticket(&key, SystemTime::now()) != crate::follow::FollowTicket::Absent
+                })
+        });
+        if follow_route.is_some() && !explicitly_addressed && !followed {
+            return Ok(None);
+        }
         let thread_continuation = match (is_shared, self.experience) {
             (true, SlackExperience::Agent) => {
                 let claim = ThreadClaim::Slack {
@@ -388,12 +541,12 @@ impl SlackTransport {
                     user_id: user.to_owned(),
                 };
                 let inherited = !explicitly_addressed && self.thread_ownership.owns(&claim);
-                if !explicitly_addressed && !inherited {
+                if !explicitly_addressed && !inherited && !followed {
                     return Ok(None);
                 }
                 Some(ThreadContinuation { claim, inherited })
             }
-            (true, SlackExperience::Classic) if !explicitly_addressed => {
+            (true, SlackExperience::Classic) if !explicitly_addressed && !followed => {
                 return Ok(None);
             }
             _ => None,

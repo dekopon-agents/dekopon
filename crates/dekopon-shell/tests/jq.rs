@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    reason = "tests spawn, join and build runtimes freely; production sites carry their own expectation"
+)]
 use parking_lot::Mutex;
 use std::{
     io::{BufRead as _, Write as _},
@@ -9,6 +14,19 @@ use std::{
 use dekopon_process::Limits;
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter};
 use serde_json::{Value, json};
+
+const JQ_TEST: dekopon_process::ThreadName = dekopon_process::ThreadName::new("jq-test");
+
+fn shell_threads() -> dekopon_process::ShellThreads {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    dekopon_process::ShellThreads::new(16, RUNTIME.handle().clone())
+}
 
 struct Invoker;
 impl CapabilityInvoker for Invoker {
@@ -33,7 +51,7 @@ fn worker() {
 
 fn filter(source: &str, input: Value) -> dekopon_shell::ScriptOutcome {
     worker();
-    Interpreter::new(Limits::default())
+    Interpreter::new(Limits::default(), shell_threads())
         .run(&format!("echo '{}' | jq '{}'", input, source), &Invoker)
 }
 
@@ -71,7 +89,8 @@ fn an_empty_filter_result_does_not_supply_a_null_document() {
     let outcome = filter("empty", json!(1));
     assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
     assert_eq!(outcome.output, "");
-    let piped = Interpreter::new(Limits::default()).run("echo 1 | jq empty | jq type", &Invoker);
+    let piped = Interpreter::new(Limits::default(), shell_threads())
+        .run("echo 1 | jq empty | jq type", &Invoker);
     assert_eq!(piped.output, "", "{piped:?}");
 }
 
@@ -85,8 +104,8 @@ fn one_document_producing_several_results_emits_separate_lines() {
 #[test]
 fn several_input_documents_produce_separate_output_lines() {
     worker();
-    let outcome =
-        Interpreter::new(Limits::default()).run("printf '1\\n2\\n' | jq '. + 1'", &Invoker);
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
+        .run("printf '1\\n2\\n' | jq '. + 1'", &Invoker);
     assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
     assert_eq!(outcome.output, "2\n3");
 }
@@ -94,9 +113,11 @@ fn several_input_documents_produce_separate_output_lines() {
 #[test]
 fn string_results_are_quoted_unless_raw_output_is_requested() {
     worker();
-    let strings = Interpreter::new(Limits::default()).run("printf '\"a\"\\n' | jq .", &Invoker);
+    let strings = Interpreter::new(Limits::default(), shell_threads())
+        .run("printf '\"a\"\\n' | jq .", &Invoker);
     assert_eq!(strings.output, "\"a\"");
-    let raw = Interpreter::new(Limits::default()).run("printf '\"a\"\\n' | jq -r .", &Invoker);
+    let raw = Interpreter::new(Limits::default(), shell_threads())
+        .run("printf '\"a\"\\n' | jq -r .", &Invoker);
     assert_eq!(raw.output, "a");
 }
 
@@ -104,7 +125,7 @@ fn string_results_are_quoted_unless_raw_output_is_requested() {
 fn invalid_json_input_has_status_two_even_after_a_valid_result() {
     worker();
     for flag in ["", "-s "] {
-        let invalid = Interpreter::new(Limits::default())
+        let invalid = Interpreter::new(Limits::default(), shell_threads())
             .run(&format!("printf '1\\nnot json' | jq {flag}."), &Invoker);
         assert_eq!(invalid.exit_code.get(), 2, "{flag}: {invalid:?}");
         if flag.is_empty() {
@@ -116,10 +137,13 @@ fn invalid_json_input_has_status_two_even_after_a_valid_result() {
 #[test]
 fn a_downstream_early_close_kills_a_busy_jq_worker_and_joins_its_stage() {
     worker();
-    let outcome = Interpreter::new(Limits {
-        timeout: Duration::from_secs(3),
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            timeout: Duration::from_secs(3),
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run(
         "set -o pipefail; jq -n 'range(1000000000)' | head -1",
         &Invoker,
@@ -132,7 +156,7 @@ fn a_downstream_early_close_kills_a_busy_jq_worker_and_joins_its_stage() {
 #[test]
 fn slurp_of_empty_input_emits_an_empty_array() {
     worker();
-    let slurp = Interpreter::new(Limits::default()).run("jq -s .", &Invoker);
+    let slurp = Interpreter::new(Limits::default(), shell_threads()).run("jq -s .", &Invoker);
     assert_eq!(slurp.exit_code.get(), 0, "{slurp:?}");
     assert_eq!(slurp.output, "[]");
 }
@@ -140,7 +164,8 @@ fn slurp_of_empty_input_emits_an_empty_array() {
 #[test]
 fn null_input_ignores_stdin() {
     worker();
-    let null = Interpreter::new(Limits::default()).run("printf 'not json' | jq -n '1'", &Invoker);
+    let null = Interpreter::new(Limits::default(), shell_threads())
+        .run("printf 'not json' | jq -n '1'", &Invoker);
     assert_eq!(null.exit_code.get(), 0, "{null:?}");
     assert_eq!(null.output, "1");
 }
@@ -148,7 +173,8 @@ fn null_input_ignores_stdin() {
 #[test]
 fn slurp_collects_multiple_documents() {
     worker();
-    let grouped = Interpreter::new(Limits::default()).run("printf '1\\n2\\n' | jq -s .", &Invoker);
+    let grouped = Interpreter::new(Limits::default(), shell_threads())
+        .run("printf '1\\n2\\n' | jq -s .", &Invoker);
     assert_eq!(grouped.exit_code.get(), 0, "{grouped:?}");
     assert_eq!(grouped.output, "[1,2]");
 }
@@ -156,10 +182,13 @@ fn slurp_collects_multiple_documents() {
 #[test]
 fn slurp_refuses_documents_past_the_retained_budget() {
     worker();
-    let refused = Interpreter::new(Limits {
-        max_value_bytes: 1024,
-        ..Limits::default()
-    })
+    let refused = Interpreter::new(
+        Limits {
+            max_value_bytes: 1024,
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run(
         &format!("jq -s . <<EOF\n{}\nEOF", "1\n".repeat(1100)),
         &Invoker,
@@ -267,11 +296,12 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
         release: Mutex::new(released),
         observed,
     };
+    let [permit] = shell_threads().reserve().unwrap();
     std::thread::scope(|scope| {
-        let run = scope.spawn(|| Interpreter::new(Limits::default()).run(
+        let run = permit.spawn(scope, JQ_TEST, || Interpreter::new(Limits::default(), shell_threads()).run(
             "{ printf '1\\n'; hold; printf '2\\n'; } | jq . | { read first; progress \"$first\"; cat; }",
             &invoker,
-        ));
+        )).unwrap();
         let arrived = first.recv_timeout(Duration::from_secs(3));
         release.send(()).expect("release producer");
         let outcome = run.join().expect("join interpreter");
@@ -331,20 +361,20 @@ fn worker_emits_the_first_document_before_stdin_ends() {
 fn arg_bindings_are_exact_strings_with_last_wins_order() {
     worker();
     for (value, expected) in [("''", "\"\""), ("'a b'", "\"a b\""), ("'-x'", "\"-x\"")] {
-        let outcome = Interpreter::new(Limits::default())
+        let outcome = Interpreter::new(Limits::default(), shell_threads())
             .run(&format!("jq -n --arg s {value} '$s'"), &Invoker);
         assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
         assert_eq!(outcome.output, expected);
     }
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "jq -n --arg s first --arg t two --arg s last '[$t,$s]'",
         &Invoker,
     );
     assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
     assert_eq!(outcome.output, "[\"two\",\"last\"]");
     for args in ["--arg 1bad x", "--arg '' x", "--arg s", "--argjson s 1"] {
-        let outcome =
-            Interpreter::new(Limits::default()).run(&format!("jq -n {args} '$s'"), &Invoker);
+        let outcome = Interpreter::new(Limits::default(), shell_threads())
+            .run(&format!("jq -n {args} '$s'"), &Invoker);
         assert_eq!(outcome.exit_code.get(), 2, "{args}: {outcome:?}");
     }
 }
@@ -374,10 +404,13 @@ fn old_and_malformed_worker_headers_are_refused() {
 #[test]
 fn binding_header_is_charged_before_worker_input() {
     worker();
-    let outcome = Interpreter::new(Limits {
-        max_value_bytes: 117,
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            max_value_bytes: 117,
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run(
         &format!("jq -n --arg s '{}' '1'", "\u{1}".repeat(16)),
         &Invoker,
@@ -415,19 +448,25 @@ fn host_filters_and_halt_do_not_escape_the_worker() {
 #[test]
 fn output_steps_and_bytes_are_charged() {
     worker();
-    let outcome = Interpreter::new(Limits {
-        max_steps: 16,
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            max_steps: 16,
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run("jq -n 'range(1000000)'", &Invoker);
     assert!(
         outcome.output.contains("step budget exhausted"),
         "{outcome:?}"
     );
-    let outcome = Interpreter::new(Limits {
-        max_value_bytes: 1024,
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            max_value_bytes: 1024,
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run("jq -n '[range(5000)]'", &Invoker);
     assert!(
         outcome.output.contains("more than 1024 bytes"),
@@ -438,10 +477,13 @@ fn output_steps_and_bytes_are_charged() {
 #[test]
 fn a_custom_value_byte_ceiling_refuses_a_single_jq_output_at_its_configured_maximum() {
     worker();
-    let outcome = Interpreter::new(Limits {
-        max_value_bytes: 1024,
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            max_value_bytes: 1024,
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run("jq -n '[range(5000)]'", &Invoker);
     assert!(
         outcome.output.contains("more than 1024 bytes"),
@@ -456,18 +498,18 @@ fn worker_framing_does_not_count_against_the_emitted_result_ceiling() {
         max_value_bytes: 128,
         ..Limits::default()
     };
-    let number = Interpreter::new(limits).run("jq -n 1234", &Invoker);
+    let number = Interpreter::new(limits, shell_threads()).run("jq -n 1234", &Invoker);
     assert_eq!(number.exit_code.get(), 0, "{number:?}");
     assert_eq!(number.output, "1234");
-    let raw = Interpreter::new(limits).run("jq -n -r '\"abcd\"'", &Invoker);
+    let raw = Interpreter::new(limits, shell_threads()).run("jq -n -r '\"abcd\"'", &Invoker);
     assert_eq!(raw.exit_code.get(), 0, "{raw:?}");
     assert_eq!(raw.output, "abcd");
-    let escaped =
-        Interpreter::new(limits).run("jq -n -r '\"\\u0001\\u0002\\u0003\\u0004\"'", &Invoker);
+    let escaped = Interpreter::new(limits, shell_threads())
+        .run("jq -n -r '\"\\u0001\\u0002\\u0003\\u0004\"'", &Invoker);
     assert_eq!(escaped.exit_code.get(), 0, "{escaped:?}");
     assert_eq!(escaped.output, "\u{1}\u{2}\u{3}\u{4}");
-    let too_large =
-        Interpreter::new(limits).run(&format!("jq -n -r '\"{}\"'", "x".repeat(129)), &Invoker);
+    let too_large = Interpreter::new(limits, shell_threads())
+        .run(&format!("jq -n -r '\"{}\"'", "x".repeat(129)), &Invoker);
     assert!(
         too_large.output.contains("more than 128 bytes"),
         "{too_large:?}"
@@ -477,7 +519,7 @@ fn worker_framing_does_not_count_against_the_emitted_result_ceiling() {
 #[test]
 fn raw_compact_flags_and_piped_json_text_keep_working() {
     for flag in ["-r", "-c", "--raw-output", "--compact-output"] {
-        let outcome = Interpreter::new(Limits::default())
+        let outcome = Interpreter::new(Limits::default(), shell_threads())
             .run(&format!("echo '{{\"a\":\"x\"}}' | jq {flag} .a"), &Invoker);
         assert_eq!(
             outcome.output,
@@ -486,7 +528,7 @@ fn raw_compact_flags_and_piped_json_text_keep_working() {
         );
     }
     assert_eq!(
-        Interpreter::new(Limits::default())
+        Interpreter::new(Limits::default(), shell_threads())
             .run("echo '\"abc\"' | jq -r 'ltrimstr(\"a\")'", &Invoker)
             .output,
         "bc"
@@ -497,10 +539,13 @@ fn raw_compact_flags_and_piped_json_text_keep_working() {
 fn a_filter_that_never_yields_is_killed_at_the_deadline() {
     worker();
     let started = Instant::now();
-    let outcome = Interpreter::new(Limits {
-        timeout: Duration::from_millis(250),
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            timeout: Duration::from_millis(250),
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run("jq -n 'def f: f; f'", &Invoker);
     assert_eq!(outcome.exit_code.get(), 124, "{outcome:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -530,12 +575,16 @@ fn a_cancelled_turn_kills_its_jq_stage() {
     worker();
     let start = Instant::now();
     let (handle, signal) = dekopon_process::CancelSignal::pair();
+    let [permit] = shell_threads().reserve().unwrap();
     let outcome = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            handle.cancel();
-        });
-        Interpreter::new(Limits::default()).run("jq -n 'def f: f; f'", &Cancelled(signal))
+        permit
+            .spawn(scope, JQ_TEST, move || {
+                std::thread::sleep(Duration::from_millis(200));
+                handle.cancel();
+            })
+            .unwrap();
+        Interpreter::new(Limits::default(), shell_threads())
+            .run("jq -n 'def f: f; f'", &Cancelled(signal))
     });
     assert_eq!(outcome.exit_code.get(), 130, "{outcome:?}");
     assert!(start.elapsed() < Duration::from_secs(2));
@@ -554,7 +603,7 @@ fn an_unbounded_allocation_fails_the_stage_and_the_process_lives() {
 fn a_max_value_bytes_sized_input_passes() {
     worker();
     let input = vec!["x".repeat(1024); 30_000];
-    let outcome = Interpreter::new(Limits::default())
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
         .run(&format!("echo '{}' | jq length", json!(input)), &Invoker);
     assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
     assert_eq!(outcome.output, "30000");

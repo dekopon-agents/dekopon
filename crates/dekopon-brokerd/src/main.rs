@@ -139,11 +139,11 @@ enum ProviderCommand {
     Verify,
 }
 
-/// Transport crates are silenced explicitly: an HTTP or gRPC stack logs every connection. The
+/// Transport crates are silenced explicitly: an HTTP stack logs every connection. The
 /// OTLP exporter's own diagnostics are silenced by `dekopon_telemetry`, which appends that
 /// directive to every OTLP layer it installs; category targets run at the standard level.
 #[cfg(unix)]
-const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,tonic=off,reqwest=off";
+const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off";
 
 /// Log records ride the same crate set as spans, because the broker's audit record is one of them.
 ///
@@ -153,6 +153,10 @@ const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,deko
 const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: main, which drops it after the broker returns; bound: the daemon's one runtime, one worker per core"
+)]
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

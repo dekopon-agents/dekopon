@@ -10,7 +10,9 @@
 )]
 use std::time::Duration;
 use tokio::sync::watch;
+mod threads;
 mod tree;
+pub use threads::{ShellThreads, ThreadName, ThreadPermit};
 pub use tree::{CallBudget, RetainedBytes, TreeContext};
 
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
@@ -55,6 +57,7 @@ pub enum LimitExceeded {
     Deadline { timeout_ms: u128 },
     CapabilityCalls { maximum: u32 },
     ValueBytes { maximum: u64 },
+    ShellThreads { maximum: u32 },
     Cancelled,
 }
 

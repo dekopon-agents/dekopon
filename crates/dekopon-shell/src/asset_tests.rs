@@ -27,7 +27,7 @@ impl CapabilityInvoker for Commands {
 #[test]
 fn ifs_never_splits_a_reference() {
     let commands = Commands::default();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), crate::test_threads()).run(
         "IFS='chat-asset:3'; asset chat-asset:3 'chat-asset:3' --image=chat-asset:3",
         &commands,
     );
@@ -45,7 +45,7 @@ fn ifs_never_splits_a_reference() {
 #[test]
 fn a_reference_outside_argv_expands_to_its_text() {
     let commands = Commands::default();
-    let outcome = Interpreter::new(Limits::default()).run("x=chat-asset:3; echo $x; for y in chat-asset:3; do echo $y; done; case chat-asset:3 in chat-asset:3) echo yes;; esac; printf '%s' chat-asset:3", &commands);
+    let outcome = Interpreter::new(Limits::default(), crate::test_threads()).run("x=chat-asset:3; echo $x; for y in chat-asset:3; do echo $y; done; case chat-asset:3 in chat-asset:3) echo yes;; esac; printf '%s' chat-asset:3", &commands);
     assert_eq!(outcome.exit_code.get(), 0);
     assert_eq!(
         outcome.output,
@@ -57,7 +57,7 @@ fn a_reference_outside_argv_expands_to_its_text() {
 #[test]
 fn a_builtin_names_asset_cat_for_a_reference_operand() {
     for command in ["head", "cat"] {
-        let outcome = Interpreter::new(Limits::default()).run(
+        let outcome = Interpreter::new(Limits::default(), crate::test_threads()).run(
             &format!("echo buffered > chat-asset:3; {command} chat-asset:3"),
             &Commands::default(),
         );
@@ -73,10 +73,13 @@ fn a_builtin_names_asset_cat_for_a_reference_operand() {
 #[test]
 fn a_literal_help_sends_no_frame() {
     let commands = Commands::default();
-    let outcome = Interpreter::new(Limits {
-        max_capability_calls: 0,
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            max_capability_calls: 0,
+            ..Limits::default()
+        },
+        crate::test_threads(),
+    )
     .run("asset --help", &commands);
     assert_eq!(outcome.exit_code.get(), 0);
     assert_eq!(outcome.output, "cached help");
@@ -87,8 +90,8 @@ fn a_literal_help_sends_no_frame() {
 fn a_usage_error_refunds_its_call() {
     let commands = Commands::default();
     let calls = CallBudget::new(1);
-    let tree = TreeContext::new(Limits::default(), calls.clone());
-    let outcome = Interpreter::new(Limits::default()).run_with_tree(
+    let tree = TreeContext::new(Limits::default(), calls.clone(), crate::test_threads());
+    let outcome = Interpreter::new(Limits::default(), crate::test_threads()).run_with_tree(
         "asset invalid; asset invalid",
         &commands,
         &tree,
@@ -116,7 +119,7 @@ fn concurrent_stages_cannot_overrun_the_call_budget() {
             };
             let tree = seed.tree().clone();
             *self.job.lock() = Some(std::thread::spawn(move || {
-                Interpreter::new(Limits::default())
+                Interpreter::new(Limits::default(), crate::test_threads())
                     .run_seed(seed, &probe, &tree)
                     .exit_code
             }));
@@ -168,8 +171,12 @@ fn concurrent_stages_cannot_overrun_the_call_budget() {
     }
     let probe = Probe::default();
     let calls = CallBudget::new(1);
-    let tree = TreeContext::new(Limits::default(), calls.clone());
-    Interpreter::new(Limits::default()).run_with_tree("probe & probe; wait", &probe, &tree);
+    let tree = TreeContext::new(Limits::default(), calls.clone(), crate::test_threads());
+    Interpreter::new(Limits::default(), crate::test_threads()).run_with_tree(
+        "probe & probe; wait",
+        &probe,
+        &tree,
+    );
     let unfinished = probe.job.lock().take();
     if let Some(job) = unfinished {
         job.join().unwrap();

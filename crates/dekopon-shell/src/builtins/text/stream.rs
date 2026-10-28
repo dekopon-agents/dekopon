@@ -480,14 +480,26 @@ mod tests {
             crate::interp::telemetry::stage_write,
         );
         let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let mut budget = Budget::start(Limits::default());
+        let [permit] = budget.tree().shell_threads().reserve().unwrap();
         std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                let mut budget = Budget::start(Limits::default());
-                Builtin::Grep.run_text(&["x".to_owned()], &mut reader, &mut budget, |bytes| {
-                    sent.send(bytes.to_vec()).expect("the consumer is alive");
-                    Ok(true)
-                })
-            });
+            let worker = permit
+                .spawn(
+                    scope,
+                    dekopon_process::ThreadName::new("sh-stream-test"),
+                    || {
+                        Builtin::Grep.run_text(
+                            &["x".to_owned()],
+                            &mut reader,
+                            &mut budget,
+                            |bytes| {
+                                sent.send(bytes.to_vec()).expect("the consumer is alive");
+                                Ok(true)
+                            },
+                        )
+                    },
+                )
+                .unwrap();
             assert_eq!(writer.write(b"x\n"), pipe::WriteOutcome::Accepted);
             assert_eq!(
                 received
@@ -618,8 +630,12 @@ mod tests {
             let limits = Limits::default();
             let mut budget = Budget::start_tree(
                 limits,
-                dekopon_process::TreeContext::new(limits, dekopon_process::CallBudget::new(32))
-                    .with_cancel(vec![signal]),
+                dekopon_process::TreeContext::new(
+                    limits,
+                    dekopon_process::CallBudget::new(32),
+                    crate::test_threads(),
+                )
+                .with_cancel(vec![signal]),
             );
             handle.cancel();
             let error = command

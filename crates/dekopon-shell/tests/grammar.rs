@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    reason = "tests spawn, join and build runtimes freely; production sites carry their own expectation"
+)]
 use dekopon_process::{
     CallBudget, ExitCode, JOBS_OFF, JobId, JobSummary, JobWait, Limits, TreeContext,
 };
@@ -10,6 +15,20 @@ use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, Interpreter,
     JobControl, JobRefusal, JobSeed, ScriptOutcome,
 };
+
+const GRAMMAR_TEST: dekopon_process::ThreadName =
+    dekopon_process::ThreadName::new("sh-grammar-test");
+
+fn shell_threads() -> dekopon_process::ShellThreads {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    dekopon_process::ShellThreads::new(16, RUNTIME.handle().clone())
+}
 
 #[path = "grammar/ifs.rs"]
 mod ifs;
@@ -274,11 +293,11 @@ fn worker() {
 }
 
 fn run(script: &str) -> ScriptOutcome {
-    Interpreter::new(Limits::default()).run(script, &Fixture::default())
+    Interpreter::new(Limits::default(), shell_threads()).run(script, &Fixture::default())
 }
 
 fn run_with(script: &str, limits: Limits) -> ScriptOutcome {
-    Interpreter::new(limits).run(script, &Fixture::default())
+    Interpreter::new(limits, shell_threads()).run(script, &Fixture::default())
 }
 
 fn output(script: &str) -> String {
@@ -402,7 +421,7 @@ fn last_status_is_observable() {
 #[test]
 fn a_previous_output_is_visible_as_prev_and_absent_otherwise() {
     let script = r#"if [ -z "$PREV" ]; then echo none; exit 1; fi; [ "$PREV" != "green" ]"#;
-    let interpreter = Interpreter::new(Limits::default());
+    let interpreter = Interpreter::new(Limits::default(), shell_threads());
     let fixture = Fixture::default();
 
     let baseline = interpreter.run(script, &fixture);
@@ -1571,7 +1590,7 @@ fn xargs_never_invokes_its_command_for_empty_input() {
         "printf '1\\n' | jq empty | xargs probe upper --text",
     ] {
         let fixture = Fixture::default();
-        let outcome = Interpreter::new(Limits::default()).run(script, &fixture);
+        let outcome = Interpreter::new(Limits::default(), shell_threads()).run(script, &fixture);
         assert_eq!(
             outcome.exit_code,
             ExitCode::SUCCESS,
@@ -1585,7 +1604,7 @@ fn xargs_never_invokes_its_command_for_empty_input() {
 #[test]
 fn xargs_maps_a_command_over_a_list() {
     let fixture = Fixture::default();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         r#"probe object --a a --b b | jq -r '.a + "\n" + .b' | xargs probe upper --text"#,
         &fixture,
     );
@@ -1635,7 +1654,7 @@ fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
     // capability-identifier-shaped word is not itself callable, even for a capability this session
     // holds.
     let fixture = Fixture::default();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "wikipedia_page --title x; echo $?\ncli-probe.upper --text hi; echo $?",
         &fixture,
     );
@@ -1653,7 +1672,8 @@ fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
 
 #[test]
 fn a_typed_provider_failure_renders_its_code_and_message_after_the_classification() {
-    let outcome = Interpreter::new(Limits::default()).run("probe refused", &Fixture::default());
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
+        .run("probe refused", &Fixture::default());
 
     assert_eq!(
         outcome.output,
@@ -1665,7 +1685,8 @@ fn a_typed_provider_failure_renders_its_code_and_message_after_the_classificatio
 
 #[test]
 fn a_failure_without_a_provider_detail_renders_the_classification_alone() {
-    let outcome = Interpreter::new(Limits::default()).run("probe broken", &Fixture::default());
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
+        .run("probe broken", &Fixture::default());
 
     assert_eq!(outcome.output, "provider.broken: failed: provider trapped");
     assert_eq!(outcome.exit_code, ExitCode::FAILURE);
@@ -2566,10 +2587,10 @@ fn recursion_through_substitutions_and_blocks_is_refused_before_it_overflows_a_2
         ),
         "f() {\nxargs f <<EOF\na\nEOF\n}\nf".to_owned(),
     ] {
+        let [permit] = shell_threads().reserve().unwrap();
         let outcome = std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(2 * 1024 * 1024)
-                .spawn_scoped(scope, || run(&script))
+            permit
+                .spawn(scope, GRAMMAR_TEST, || run(&script))
                 .expect("a 2 MiB thread")
                 .join()
                 .expect("the script returns an outcome")
@@ -2604,10 +2625,10 @@ fn the_capability_call_cap_is_independent_of_the_step_budget() {
 }
 
 fn on_a_two_mib_stack(script: &str) -> ScriptOutcome {
+    let [permit] = shell_threads().reserve().unwrap();
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn_scoped(scope, || run(script))
+        permit
+            .spawn(scope, GRAMMAR_TEST, || run(script))
             .expect("spawn the interpreter thread")
             .join()
             .expect("join the interpreter thread")
@@ -2843,10 +2864,13 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
     }
 
     let script = "slow call\n".repeat(32);
-    let outcome = Interpreter::new(Limits {
-        timeout: Duration::from_millis(60),
-        ..Limits::default()
-    })
+    let outcome = Interpreter::new(
+        Limits {
+            timeout: Duration::from_millis(60),
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
     .run(&script, &Slow);
     assert_eq!(outcome.exit_code, ExitCode::TIMEOUT, "{}", outcome.output);
     assert!(
@@ -2907,7 +2931,8 @@ fn a_single_oversized_line_cannot_bypass_the_byte_ceiling() {
 #[test]
 fn a_provider_command_help_page_is_stdout_exit_0_and_capturable() {
     let fixture = Fixture::default();
-    let outcome = Interpreter::new(Limits::default()).run("probe --help", &fixture);
+    let outcome =
+        Interpreter::new(Limits::default(), shell_threads()).run("probe --help", &fixture);
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
     assert_eq!(
         outcome.output,
@@ -2941,7 +2966,7 @@ fn a_provider_command_usage_error_is_a_diagnostic_with_exit_2() {
 #[test]
 fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
     let fixture = Fixture::default();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "echo hello | probe upper -\nprobe object --a 1 | probe upper -\nprobe upper --text flag",
         &fixture,
     );
@@ -2965,7 +2990,8 @@ fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
 #[test]
 fn a_provider_command_proposal_still_needs_the_grant() {
     let fixture = Fixture::default();
-    let outcome = Interpreter::new(Limits::default()).run("probe ungranted", &fixture);
+    let outcome =
+        Interpreter::new(Limits::default(), shell_threads()).run("probe ungranted", &fixture);
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
     assert_eq!(
         outcome.output,
@@ -3108,7 +3134,7 @@ fn a_syntax_error_reports_exit_code_two_without_running_anything() {
 fn echo_writes_its_newline_into_the_pipe() {
     assert_eq!(output("echo hi | wc -c"), "3");
     let fixture = Fixture::default();
-    Interpreter::new(Limits::default()).run("echo hi | probe upper -", &fixture);
+    Interpreter::new(Limits::default(), shell_threads()).run("echo hi | probe upper -", &fixture);
     assert_eq!(
         *fixture.calls.lock(),
         vec![("cli-probe.upper".to_owned(), json!({"text": "hi\n"}))]
@@ -3295,7 +3321,8 @@ fn a_stage_truncating_a_buffer_is_charged_for_its_copy_of_the_buffers() {
 #[test]
 fn a_provider_list_crosses_the_pipe_as_one_json_document() {
     let fixture = Fixture::default();
-    Interpreter::new(Limits::default()).run("probe list | probe upper -", &fixture);
+    Interpreter::new(Limits::default(), shell_threads())
+        .run("probe list | probe upper -", &fixture);
     assert_eq!(
         fixture.calls.lock().last(),
         Some(&(
@@ -3486,7 +3513,7 @@ fn ordered_fixture() -> OrderedFixture {
 #[test]
 fn a_compound_emits_its_first_line_before_its_second_statement() {
     let fixture = ordered_fixture();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "{ echo first; probe upper --text held; } | { read first; probe upper --text release; cat; }",
         &fixture,
     );
@@ -3500,7 +3527,7 @@ fn a_compound_emits_its_first_line_before_its_second_statement() {
 #[test]
 fn xargs_emits_one_item_before_requesting_the_next() {
     let fixture = ordered_fixture();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "{ echo first; probe line second; } | xargs probe upper --text | { read first; probe upper --text release; cat; }",
         &fixture,
     );
@@ -3633,7 +3660,7 @@ fn a_compound_read_does_not_pass_its_stream_to_a_provider() {
         fixture: Fixture::default(),
         received: Mutex::default(),
     };
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "printf 'a\\nb\\n' | while read n; do probe object --a 1; done",
         &fixture,
     );
@@ -3706,10 +3733,10 @@ impl JobControl for StubJobs {
         seeds.push(seed.text().to_string());
         let id = JobId::new(seeds.len() as u64);
         drop(seeds);
-        let outcome = Interpreter::new(Limits::default()).run_seed(
+        let outcome = Interpreter::new(Limits::default(), shell_threads()).run_seed(
             seed,
             &Fixture::default(),
-            &TreeContext::new(Limits::default(), CallBudget::new(4)),
+            &TreeContext::new(Limits::default(), CallBudget::new(4), shell_threads()),
         );
         self.outputs.lock().push(outcome.output);
         Ok(id)
@@ -3797,13 +3824,14 @@ fn an_ampersand_without_job_control_fails_that_statement_and_the_script_continue
 #[test]
 fn a_started_job_reports_its_id_on_stderr_and_in_last_job() {
     let invoker = WithJobs::default();
-    let outcome = Interpreter::new(Limits::default()).run("echo a & echo $!", &invoker);
+    let outcome =
+        Interpreter::new(Limits::default(), shell_threads()).run("echo a & echo $!", &invoker);
     assert_eq!(outcome.output, "[1]\n1");
     assert_eq!(*invoker.jobs.seeds.lock(), ["echo a"]);
     assert_eq!(*invoker.jobs.outputs.lock(), ["a"]);
 
     let invoker = WithJobs::default();
-    let outcome = Interpreter::new(Limits::default())
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
         .run("echo \"[$!]\"; x=$(true &); echo \"x=$x\"", &invoker);
     assert_eq!(outcome.output, "[]\n[1]\nx=");
 }
@@ -3811,8 +3839,8 @@ fn a_started_job_reports_its_id_on_stderr_and_in_last_job() {
 #[test]
 fn a_pipeline_snapshot_waits_for_the_job_started_before_it() {
     let invoker = WithJobs::default();
-    let outcome =
-        Interpreter::new(Limits::default()).run("sleep 1 & { wait; echo $?; } | cat", &invoker);
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
+        .run("sleep 1 & { wait; echo $?; } | cat", &invoker);
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
     assert_eq!(*invoker.jobs.waited.lock(), [JobId::new(1)]);
 }
@@ -3829,7 +3857,7 @@ fn job_builtins_refuse_a_route_without_job_control() {
 #[test]
 fn jobs_rejects_operands_and_accepts_listing_options() {
     let invoker = WithJobs::default();
-    let interpreter = Interpreter::new(Limits::default());
+    let interpreter = Interpreter::new(Limits::default(), shell_threads());
     assert_eq!(
         interpreter.run("jobs 1", &invoker).exit_code,
         ExitCode::SYNTAX
@@ -3855,7 +3883,8 @@ fn jobs_rejects_operands_and_accepts_listing_options() {
 #[test]
 fn a_job_seed_carries_the_functions_and_globals_set_before_it() {
     let invoker = WithJobs::default();
-    let outcome = Interpreter::new(Limits::default()).run("g=1; f() { echo $g; }; f &", &invoker);
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
+        .run("g=1; f() { echo $g; }; f &", &invoker);
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
     assert_eq!(*invoker.jobs.seeds.lock(), ["f"]);
     assert_eq!(*invoker.jobs.outputs.lock(), ["1"]);
@@ -3870,10 +3899,10 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
                 max_value_bytes: 1024,
                 ..Limits::default()
             };
-            let outcome = Interpreter::new(limits).run_seed(
+            let outcome = Interpreter::new(limits, shell_threads()).run_seed(
                 seed,
                 &self.0,
-                &TreeContext::new(limits, CallBudget::new(1)),
+                &TreeContext::new(limits, CallBudget::new(1), shell_threads()),
             );
             assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
             assert!(outcome.output.contains("1024 bytes"), "{outcome:?}");
@@ -3906,7 +3935,7 @@ fn a_job_seed_that_does_not_fit_its_tree_fails_before_running() {
             CapabilityCallResult::NotFound
         }
     }
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         &format!("big={}; echo never &", "x".repeat(2048)),
         &Invoker(Tight(Fixture::default())),
     );
@@ -4140,10 +4169,10 @@ fn separator_only_expansions_do_not_spend_steps_per_byte() {
 
 #[test]
 fn conditional_chains_build_evaluate_and_drop_on_a_two_mib_stack() {
+    let [permit] = shell_threads().reserve().unwrap();
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn_scoped(scope, || {
+        permit
+            .spawn(scope, GRAMMAR_TEST, || {
                 for (terms, separator, expected) in [
                     (vec!["-n a"; 10_000], " && ", 0),
                     (vec!["-z a"; 10_000], " || ", 1),
