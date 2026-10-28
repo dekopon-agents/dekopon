@@ -340,6 +340,79 @@ fn awk_diagnostics_preserve_utf8_across_emitter_chunks() {
 }
 
 #[test]
+fn awk_diagnostics_split_only_at_actual_newlines() {
+    for sink in [" | cat", ""] {
+        let outcome = run(
+            &format!(
+                "{{ awk 'BEGIN{{printf \"a\";printf \"\\n\\nb\";printf \"c\"}}' >&2; awk 'BEGIN{{printf \"d\"}}' >&2; }}{sink}"
+            ),
+            Limits::default(),
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+        assert_eq!(outcome.output, "a\n\nbcd", "{sink}");
+    }
+}
+
+#[test]
+fn awk_diagnostics_keep_partial_lines_when_execution_fails() {
+    let failure =
+        crate::builtins::CommandFailure::from(super::AwkError::Runtime(super::RuntimeError {
+            kind: super::RuntimeKind::DivisionByZero,
+            record: 0.0,
+        }));
+    let crate::builtins::CommandFailure::Status { message, status } = failure else {
+        panic!("usage error")
+    };
+    for sink in [" | cat", ""] {
+        let outcome = run(
+            &format!("set -o pipefail; awk 'BEGIN{{printf \"[%03d]\",1;print 1/0}}' >&2{sink}"),
+            Limits::default(),
+        );
+        assert_eq!(outcome.exit_code, status);
+        assert_eq!(outcome.output, format!("[001]{message}"), "{sink}");
+    }
+    let outcome = run(
+        "awk 'BEGIN{printf \"[%03d]\",1;while(1);}' >&2 | cat",
+        Limits {
+            max_steps: 100,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert_eq!(
+        outcome.output,
+        format!(
+            "[001]\n{}",
+            crate::interp::fatal_message(&crate::builtins::FatalError::Limit(
+                dekopon_process::LimitExceeded::Steps { maximum: 100 }
+            ))
+        )
+    );
+}
+
+#[test]
+fn awk_diagnostic_fragments_spend_the_existing_byte_and_line_limits() {
+    let outcome = run(
+        "{ awk 'BEGIN{s=\"é\";for(i=0;i<16;i++)s=s s;printf \"%s\",s}' >&2; } 2>diag; awk '{print length($0)}' diag",
+        Limits {
+            max_output_bytes: 65,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+    assert_eq!(outcome.output, "32\n40");
+    let outcome = run(
+        "{ awk 'BEGIN{for(i=0;i<5;i++)printf \"%02d\\n\",i}' >&2; } 2>diag; awk 'END{print NR,$0}' diag",
+        Limits {
+            max_output_lines: 2,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(outcome.output, "3 ... redirected diagnostics truncated ...");
+}
+
+#[test]
 fn printf_and_sprintf_keep_flags_precision_and_character_widths() {
     for (program, expected) in [
         (
