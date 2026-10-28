@@ -204,6 +204,7 @@ impl InferenceHttp {
                     InferenceError::Authentication(AuthError::Credential(_))
                     | InferenceError::Transport(
                         TransportFailure::Blocking(_)
+                        | TransportFailure::Body(_)
                         | TransportFailure::Encoding(_)
                         | TransportFailure::Credential(_),
                     )
@@ -226,6 +227,7 @@ impl InferenceHttp {
                         | InferenceError::Transport(
                             TransportFailure::Encoding(_)
                                 | TransportFailure::Blocking(_)
+                                | TransportFailure::Body(_)
                                 | TransportFailure::Credential(_)
                         )
                 ) {
@@ -436,6 +438,20 @@ pub(crate) fn http_failure(
     status: Option<u16>,
     source: reqwest::Error,
 ) -> InferenceError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&source);
+    while let Some(error) = cause {
+        if let Some(error) = error.downcast_ref::<crate::body::ReadFailure>() {
+            return TransportFailure::Body(std::io::Error::from(error.kind)).into();
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>()
+            && let Some(marker) = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<crate::body::ReadFailure>())
+        {
+            return TransportFailure::Body(std::io::Error::from(marker.kind)).into();
+        }
+        cause = error.source();
+    }
     let source = source.without_url();
     let mut context =
         ProviderFailure::new(status.unwrap_or(0), &dekopon_core::error_chain(&source));

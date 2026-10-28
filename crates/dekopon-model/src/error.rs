@@ -101,8 +101,6 @@ pub enum RequestError {
     CacheAnchor,
     #[error("invalid OpenRouter setting: {0}")]
     OpenRouterSetting(crate::openrouter::settings::SettingsProblem),
-    #[error("model request body cannot be replayed")]
-    NonReplayableBody,
     #[error("model deadline exceeds the clock range")]
     DeadlineOutOfRange,
     #[error("model timeout must be greater than zero")]
@@ -165,6 +163,8 @@ impl ProviderFailure {
 
 #[derive(Debug, Error)]
 pub enum TransportFailure {
+    #[error("could not read request body: {0}")]
+    Body(#[source] std::io::Error),
     #[error("{context}")]
     Http {
         context: ProviderFailure,
