@@ -9,17 +9,18 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   improvement-suggestion tools. Every call to a tool that was not offered, or `bash` call
   without a string `command`, in the first turn with such a rejection is answered with the
   tool shape as a tool result; one in a later turn ends the session.
-- `prompt::run_prompt_with_history` — the same loop run as the continuation of a
-  `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
-  there is no tokenizer here and token counts only arrive after a call has been billed.
-  Only the prompt and the final answer of each exchange are remembered; the assistant
-  turns carrying `tool_calls` and the `tool` results answering them are dropped together,
-  which is both the cost control and what makes trimming safe. A `ConversationTurn` holds
-  text rather than messages, so it cannot remember a system prompt, cannot hold half a
-  tool call, and cannot carry provider replay state out of the session that produced it —
-  which is also what lets one conversation replay identically on either model backend
-  rather than losing encrypted reasoning silently on the way across. The session's own
-  exchange is recorded even when the session fails, so a failed turn is not silently lost. A chat
+- `prompt::run_prompt_with_history` — the same loop run as the continuation of prior
+  messages the embedder supplies (`prior: &[ModelMessage]`), returning the result beside an
+  `Option<CapturedTurn>`. The captured turn holds the turn's original items in order: the
+  recorded user text, each consumed person steer (never a gateway notice), assistant text,
+  reasoning, and every tool call with the result the model received, cut to the capture cap
+  (`SessionInputs::with_capture_cap`); opaque provider reasoning carries its model identity so an
+  embedder can replay it only to that model. It is returned even when the session fails, so a
+  failed turn is not silently lost, and is `None` only when no step could run.
+  `prompt::History` and `ConversationTurn` are a text-only window of earlier exchanges bounded by
+  turn count and bytes for embedders that keep no journal: `History::replay` gives the prior
+  messages, and `ConversationTurn::from_captured` records a turn's user and steer text with its
+  answer. A chat
   embedder may mark one request's reply optional; the loop then prompts and offers
   `decline_chat_reply`, returning a typed suppressed disposition and remembering the user-only turn.
   The tool is absent from ordinary prompts, capability work makes a visible reply mandatory, and

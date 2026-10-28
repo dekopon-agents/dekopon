@@ -11,8 +11,10 @@ use std::{
 
 use dekopon_core::AgentId;
 use dekopon_model::{
-    error::InferenceError,
-    model::{ChatModel, CompletionOptions, ModelMessage},
+    error::{InferenceError, TransportFailure},
+    model::{AssistantTurn, ChatModel, CompletionOptions, ModelKey, ModelMessage},
+    replay::ReplayMessage,
+    text::Text,
 };
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 use tokio::{
@@ -24,7 +26,7 @@ use tracing::Instrument as _;
 use super::{
     journal::{
         Journal, JournalError,
-        records::{Field, Head, Snapshot, escaped_text},
+        records::{Field, Head, Snapshot},
     },
     record::{RecordId, Slot, SlotLine, Subject, SummaryError, SummaryFailure, TurnId},
 };
@@ -73,6 +75,7 @@ type Binding = Arc<parking_lot::Mutex<Option<TurnId>>>;
 struct RunningTask {
     task: SlotTask,
     binding: Binding,
+    span: tracing::Span,
 }
 
 struct CancelOnDrop(watch::Sender<bool>);
@@ -82,24 +85,68 @@ impl Drop for CancelOnDrop {
     }
 }
 
+pub(crate) struct Dispatcher {
+    receiver: mpsc::Receiver<Queued>,
+    sender: Sender,
+    concurrency: NonZeroUsize,
+}
+
+pub(crate) fn channel(
+    journal: Arc<Journal>,
+    counts: Arc<Counts>,
+    queue: NonZeroUsize,
+    concurrency: NonZeroUsize,
+) -> (Sender, Dispatcher) {
+    let (tx, receiver) = mpsc::channel(queue.get());
+    let sender = Sender {
+        queue: tx,
+        journal,
+        counts,
+    };
+    let dispatcher = Dispatcher {
+        receiver,
+        sender: sender.clone(),
+        concurrency,
+    };
+    (sender, dispatcher)
+}
+
+impl Dispatcher {
+    pub(crate) fn start(
+        self,
+        current: CurrentGeneration,
+        models: Arc<ModelCache>,
+        owned_tasks: &mut JoinSet<()>,
+    ) {
+        let resources = Resources {
+            journal: Arc::clone(&self.sender.journal),
+            current,
+            models,
+            counts: Arc::clone(&self.sender.counts),
+        };
+        owned_tasks.spawn(dispatch(
+            Arc::new(resources),
+            self.receiver,
+            self.sender,
+            self.concurrency,
+        ));
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn spawn(
     resources: Resources,
     queue: NonZeroUsize,
     concurrency: NonZeroUsize,
     owned_tasks: &mut JoinSet<()>,
 ) -> Sender {
-    let (tx, rx) = mpsc::channel(queue.get());
-    let sender = Sender {
-        queue: tx,
-        journal: Arc::clone(&resources.journal),
-        counts: Arc::clone(&resources.counts),
-    };
-    owned_tasks.spawn(dispatch(
-        Arc::new(resources),
-        rx,
-        sender.clone(),
+    let (sender, dispatcher) = channel(
+        Arc::clone(&resources.journal),
+        Arc::clone(&resources.counts),
+        queue,
         concurrency,
-    ));
+    );
+    dispatcher.start(resources.current, resources.models, owned_tasks);
     sender
 }
 
@@ -115,16 +162,21 @@ impl Sender {
             Err(mpsc::error::TrySendError::Full(queued)) => {
                 let journal = Arc::clone(&self.journal);
                 let counts = Arc::clone(&self.counts);
+                let span = summarize_span(&queued.task, &queued.since);
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let result = tokio::task::spawn_blocking(move || {
-                    let count = mark_later(
-                        &journal,
-                        &queued.task,
-                        None,
-                        SummaryFailure::Overflow,
-                        "summary queue is full",
-                    )?;
-                    counts.overflowed.fetch_add(count, Ordering::Relaxed);
-                    Ok::<_, JournalError>(())
+                    let _subscriber = tracing::dispatcher::set_default(&subscriber);
+                    span.in_scope(|| {
+                        let count = mark_later(
+                            &journal,
+                            &queued.task,
+                            None,
+                            SummaryFailure::Overflow,
+                            "summary queue is full",
+                        )?;
+                        counts.overflowed.fetch_add(count, Ordering::Relaxed);
+                        Ok::<_, JournalError>(())
+                    })
                 })
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
@@ -165,7 +217,13 @@ async fn dispatch(
                         if let Some(running) = tasks.remove(&error.id()).filter(|_| error.is_panic()) {
                             let journal = Arc::clone(&resources.journal);
                             let turn = *running.binding.lock();
-                            let _written = tokio::task::spawn_blocking(move || mark_later(&journal, &running.task, turn, SummaryFailure::Panicked, "summary task panicked")).await;
+                            let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                            let _written = tokio::task::spawn_blocking(move || {
+                                let _subscriber = tracing::dispatcher::set_default(&subscriber);
+                                running.span.in_scope(|| {
+                                    mark_later(&journal, &running.task, turn, SummaryFailure::Panicked, "summary task panicked")
+                                })
+                            }).await;
                         }
                     }
                     None => {}
@@ -175,11 +233,23 @@ async fn dispatch(
                 let Some(queued) = queued else { break; };
                 let task = queued.task.clone();
                 let binding: Binding = Arc::default();
-                let handle = running.spawn(run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding)));
-                tasks.insert(handle.id(), RunningTask { task, binding });
+                let span = summarize_span(&task, &queued.since);
+                let handle = running.spawn(run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding), span.clone()));
+                tasks.insert(handle.id(), RunningTask { task, binding, span });
             }
         }
     }
+}
+
+fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
+    tracing::info_span!(
+        "memory.summarize",
+        memory.record.id = task.record.0.get(),
+        memory.summary.part = task.part.get(),
+        memory.summary.queue_wait_ms = since.elapsed().as_millis() as u64,
+        gen_ai.request.model = tracing::field::Empty,
+        gen_ai.response.model = tracing::field::Empty,
+    )
 }
 
 async fn run(
@@ -187,18 +257,16 @@ async fn run(
     queued: Queued,
     cancel: watch::Receiver<bool>,
     binding: Binding,
+    span: tracing::Span,
 ) -> Next {
-    let span = tracing::info_span!(
-        "memory.summarize",
-        memory.record.id = queued.task.record.0.get(),
-        memory.summary.part = queued.task.part.get(),
-        memory.summary.queue_wait_ms = queued.since.elapsed().as_millis() as u64
-    );
     let runtime = tokio::runtime::Handle::current();
     let task = queued.task;
     let blocking_span = span.clone();
+    let subscriber = tracing::dispatcher::get_default(Clone::clone);
     match tokio::task::spawn_blocking(move || {
-        blocking_span.in_scope(|| summarize(&resources, &task, runtime, cancel, &binding))
+        tracing::dispatcher::with_default(&subscriber, || {
+            blocking_span.in_scope(|| summarize(&resources, &task, runtime, cancel, &binding))
+        })
     })
     .instrument(span)
     .await
@@ -225,16 +293,16 @@ fn summarize(
             .position(|head| head.header.id == task.record)
         {
             Some(position) => (snapshot, position),
-            None => return evicted(resources),
+            None => return evicted(resources, task),
         },
-        Ok(None) => return evicted(resources),
+        Ok(None) => return evicted(resources, task),
         Err(error) => {
             return fail(
                 resources,
                 task,
                 None,
-                io_failure(error),
-                "could not read summary input",
+                &Slot::Queued,
+                error_slot(io_failure(error), "could not read summary input"),
                 task.part
                     .get()
                     .checked_add(1)
@@ -257,20 +325,21 @@ fn summarize(
             return next_pending(&head.header.summaries, part + 1);
         }
     }
+    tracing::Span::current().record("gen_ai.request.model", plan.model.as_str());
     let Some(limit) = plan.parts.get(part) else {
         return Next::Stop;
     };
     let next = next_pending(&head.header.summaries, part + 1);
-    match write_slot(journal, task, Slot::Running, expected) {
+    match write_slot(journal, task, &Slot::Queued, Slot::Running, expected) {
         Ok(true) => {}
-        Ok(false) => return evicted(resources),
+        Ok(false) => return evicted(resources, task),
         Err(error) => {
             return fail(
                 resources,
                 task,
                 expected,
-                io_failure(error),
-                "could not persist summary start",
+                &Slot::Queued,
+                error_slot(io_failure(error), "could not persist summary start"),
                 next,
             );
         }
@@ -293,8 +362,8 @@ fn summarize(
                 resources,
                 task,
                 expected,
-                SummaryFailure::ModelFailed,
-                &error.to_string(),
+                &Slot::Running,
+                error_slot(SummaryFailure::ModelFailed, &error.to_string()),
                 next,
             );
         }
@@ -306,8 +375,8 @@ fn summarize(
                 resources,
                 task,
                 expected,
-                io_failure(error),
-                "could not read summary input",
+                &Slot::Running,
+                error_slot(io_failure(error), "could not read summary input"),
                 next,
             );
         }
@@ -348,15 +417,15 @@ fn summarize(
             return Next::Stop;
         }
     };
-    match write_slot(journal, task, slot, expected) {
+    match write_slot(journal, task, &Slot::Running, slot, expected) {
         Ok(true) => next,
-        Ok(false) => evicted(resources),
+        Ok(false) => evicted(resources, task),
         Err(error) => fail(
             resources,
             task,
             expected,
-            io_failure(error),
-            "could not persist summary result",
+            &Slot::Running,
+            error_slot(io_failure(error), "could not persist summary result"),
             next,
         ),
     }
@@ -387,7 +456,7 @@ enum Completed {
 fn complete_summary(
     client: &dyn ChatModel,
     call: Call,
-    input: String,
+    mut input: Vec<Text>,
     previous: String,
     part: NonZeroU8,
     limit: NonZeroU32,
@@ -396,17 +465,18 @@ fn complete_summary(
         "Write only new additive summary information for part {}. Do not repeat earlier parts.",
         part
     );
+    input.insert(0, Text::Owned("Source:\n".to_owned()));
+    input.push(Text::Owned(format!("\nEarlier parts:\n{previous}")));
+    let input_bytes = input.iter().map(text_bytes).sum::<usize>();
     let messages = [
         ModelMessage::system(instructions),
-        ModelMessage::user(format!("Source:\n{input}\nEarlier parts:\n{previous}")),
+        ModelMessage::Journal {
+            message: ReplayMessage::User(input),
+        },
     ];
     let estimate = Estimate::from_sizes(
         Sizes {
-            bytes: messages
-                .iter()
-                .filter_map(ModelMessage::content)
-                .map(str::len)
-                .sum(),
+            bytes: input_bytes + messages[0].content().map_or(0, str::len),
             images: 0,
         },
         None,
@@ -443,6 +513,14 @@ fn complete_summary(
         ),
     };
     meter.finish(usage, bytes, outcome, kind);
+    if let Some(reported) = result
+        .as_ref()
+        .ok()
+        .and_then(AssistantTurn::model_key)
+        .and_then(ModelKey::reported)
+    {
+        tracing::Span::current().record("gen_ai.response.model", reported);
+    }
     let slot = match result {
         Ok(turn) => match turn
             .content
@@ -458,6 +536,10 @@ fn complete_summary(
             }
             None => error_slot(SummaryFailure::Empty, "summary returned no text"),
         },
+        Err(InferenceError::Transport(TransportFailure::Body(error))) => error_slot(
+            SummaryFailure::Io { kind: error.kind() },
+            "could not read summary input",
+        ),
         Err(InferenceError::Cancelled) => return Completed::Cancelled,
         Err(InferenceError::DeadlineExceeded) => {
             error_slot(SummaryFailure::Timeout, "summary model deadline exceeded")
@@ -475,15 +557,83 @@ fn complete_summary(
     Completed::Slot(slot)
 }
 
-fn evicted(resources: &Resources) -> Next {
+fn evicted(resources: &Resources, task: &SlotTask) -> Next {
     resources.counts.evicted.fetch_add(1, Ordering::Relaxed);
+    dropped(task, Dropped::Evicted);
     Next::Stop
 }
 
-fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<String, JournalError> {
-    let mut input = String::new();
+#[derive(Clone, Copy)]
+enum Dropped {
+    Overflow,
+    Evicted,
+}
+
+fn dropped(task: &SlotTask, reason: Dropped) {
+    tracing::info!(
+        event = "gateway_memory_summary_dropped",
+        memory.record.id = task.record.0.get(),
+        memory.summary.part = task.part.get(),
+        memory.summary.failure = match reason {
+            Dropped::Overflow => "overflow",
+            Dropped::Evicted => "evicted",
+        },
+        "gateway.memory.summary.dropped"
+    );
+}
+
+const TRANSITION_TEXT_BYTES: usize = 4096;
+
+fn transition(task: &SlotTask, from: &Slot, to: &Slot) {
+    let (failure, io_kind) = match to {
+        Slot::Error(error) => (
+            Some(error.kind.label()),
+            match error.kind {
+                SummaryFailure::Io { kind } => Some(kind),
+                SummaryFailure::Timeout
+                | SummaryFailure::Refused
+                | SummaryFailure::ModelFailed
+                | SummaryFailure::Empty
+                | SummaryFailure::Overflow
+                | SummaryFailure::Panicked
+                | SummaryFailure::Unconfigured => None,
+            },
+        ),
+        Slot::Queued | Slot::Running | Slot::Generated(_) => (None, None),
+    };
+    let text = match to {
+        Slot::Generated(text) => Some(text.as_str()),
+        Slot::Queued | Slot::Running | Slot::Error(_) => None,
+    };
+    tracing::info!(
+        event = "gateway_memory_summary_transition",
+        memory.record.id = task.record.0.get(),
+        memory.summary.part = task.part.get(),
+        memory.summary.from = from.label(),
+        memory.summary.to = to.label(),
+        memory.summary.failure = failure,
+        io.kind = io_kind.map(tracing::field::display),
+        memory.summary.bytes = text.map(str::len),
+        memory.summary.text =
+            text.map(|text| &text[..text.floor_char_boundary(TRANSITION_TEXT_BYTES)]),
+        "gateway.memory.summary.transition"
+    );
+}
+
+fn text_bytes(text: &Text) -> usize {
+    match text {
+        Text::Owned(text) => text.len(),
+        Text::File { len, .. } => usize::try_from(*len).unwrap_or(usize::MAX),
+        Text::Opaque(_) => 0,
+    }
+}
+
+fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<Vec<Text>, JournalError> {
+    let file_len = snapshot.file.metadata()?.len();
+    let mut chosen = Vec::new();
+    let mut left = cap;
     for text_first in [true, false] {
-        for span in &head.header.spans {
+        for (index, span) in head.header.spans.iter().enumerate() {
             let selected = match span.field {
                 Field::User { .. }
                 | Field::Steer { .. }
@@ -492,18 +642,45 @@ fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<String, Journal
                 Field::Arguments { .. } | Field::Result { .. } => !text_first,
                 Field::Opaque { .. } | Field::CallId | Field::RejectedTool => false,
             };
-            if selected && input.len() < cap {
-                let text = escaped_text(
-                    &snapshot.file,
-                    head.body_at + span.rel_offset,
-                    span.len,
-                    cap - input.len(),
-                )?;
-                input.push_str(&text);
+            if !selected || left == 0 {
+                continue;
+            }
+            let offset = head
+                .body_at
+                .checked_add(span.rel_offset)
+                .ok_or(JournalError::Corrupt)?;
+            if offset
+                .checked_add(span.len)
+                .is_none_or(|end| end > file_len)
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            let text = match span.field {
+                Field::Arguments { original_bytes, .. } if span.len > left as u64 => {
+                    Text::Owned(serde_json::json!({"cut": original_bytes}).to_string())
+                }
+                Field::Arguments { .. }
+                | Field::User { .. }
+                | Field::Steer { .. }
+                | Field::Assistant { .. }
+                | Field::Plain { .. }
+                | Field::Result { .. } => Text::File {
+                    file: Arc::clone(&snapshot.file),
+                    offset,
+                    len: span.len,
+                }
+                .prefix(left as u64)?,
+                Field::Opaque { .. } | Field::CallId | Field::RejectedTool => continue,
+            };
+            let bytes = text_bytes(&text);
+            if bytes <= left {
+                left -= bytes;
+                chosen.push((index, text));
             }
         }
     }
-    Ok(input)
+    chosen.sort_by_key(|(index, _text)| *index);
+    Ok(chosen.into_iter().map(|(_index, text)| text).collect())
 }
 
 fn slot_line(task: &SlotTask, slot: Slot) -> SlotLine {
@@ -526,26 +703,32 @@ fn error_slot(kind: SummaryFailure, detail: &str) -> Slot {
 fn write_slot(
     journal: &Journal,
     task: &SlotTask,
+    from: &Slot,
     slot: Slot,
     turn: Option<TurnId>,
 ) -> Result<bool, JournalError> {
+    let to = slot.clone();
     let line = slot_line(task, slot);
-    match turn {
+    let written = match turn {
         Some(turn) => journal.write_slot_for(&task.stem, line, turn),
         None => journal.write_slot(&task.stem, line),
+    }?;
+    if written {
+        transition(task, from, &to);
     }
+    Ok(written)
 }
 
 fn fail(
     resources: &Resources,
     task: &SlotTask,
     turn: Option<TurnId>,
-    kind: SummaryFailure,
-    detail: &str,
+    from: &Slot,
+    failed: Slot,
     next: Next,
 ) -> Next {
-    match write_slot(&resources.journal, task, error_slot(kind, detail), turn) {
-        Ok(false) => evicted(resources),
+    match write_slot(&resources.journal, task, from, failed, turn) {
+        Ok(false) => evicted(resources, task),
         Ok(true) => next,
         Err(_error) => {
             tracing::warn!(
@@ -595,11 +778,27 @@ fn mark_later(
             part,
             ..task.clone()
         };
+        let to = error_slot(kind, detail);
         if journal.write_pending_slot_for(
             &task.stem,
-            slot_line(&later, error_slot(kind, detail)),
+            slot_line(&later, to.clone()),
             head.header.turn,
         )? {
+            transition(
+                &later,
+                &head.header.summaries[usize::from(part.get() - 1)],
+                &to,
+            );
+            match kind {
+                SummaryFailure::Overflow => dropped(&later, Dropped::Overflow),
+                SummaryFailure::Timeout
+                | SummaryFailure::Refused
+                | SummaryFailure::ModelFailed
+                | SummaryFailure::Empty
+                | SummaryFailure::Panicked
+                | SummaryFailure::Io { .. }
+                | SummaryFailure::Unconfigured => {}
+            }
             count += 1;
         }
     }

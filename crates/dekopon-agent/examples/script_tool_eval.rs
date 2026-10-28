@@ -7,10 +7,7 @@ mod score;
 
 use dekopon_agent::{
     ShellRuntime,
-    prompt::{
-        ConversationTurn, History, HistoryLimits, PromptLimits, ScriptRuntime, SessionInputs,
-        run_prompt_session,
-    },
+    prompt::{PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session},
 };
 use dekopon_model::{
     TurnEvent,
@@ -19,7 +16,9 @@ use dekopon_model::{
     codex::CodexClient,
     error::{AuthError, InferenceError},
     inference::ModelClient,
-    model::{AssistantTurn, ChatModel, CompletionOptions, ModelMessage, ModelTool},
+    model::{
+        AssistantTurn, ChatModel, CompletionOptions, ModelMessage, ModelTool, assistant_message,
+    },
     openrouter::{
         OpenRouterClient,
         settings::{Routing, Settings},
@@ -358,22 +357,27 @@ struct HistoryLine {
     answer: Option<String>,
 }
 
-fn parse_history(text: &str) -> Result<Vec<ConversationTurn>, EvalError> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            let line_record =
-                serde_json::from_str::<HistoryLine>(line).map_err(|source| EvalError::History {
-                    line: index + 1,
-                    source,
-                })?;
-            Ok(match line_record.answer {
-                Some(answer) => ConversationTurn::completed(line_record.user, answer),
-                None => ConversationTurn::unanswered(line_record.user),
-            })
-        })
-        .collect()
+fn parse_history(text: &str) -> Result<Vec<ModelMessage>, EvalError> {
+    let mut messages = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line_record =
+            serde_json::from_str::<HistoryLine>(line).map_err(|source| EvalError::History {
+                line: index + 1,
+                source,
+            })?;
+        messages.push(ModelMessage::user(line_record.user));
+        if let Some(answer) = line_record.answer {
+            messages.push(assistant_message(&AssistantTurn::new(
+                Some(answer),
+                Vec::new(),
+                None,
+            )));
+        }
+    }
+    Ok(messages)
 }
 
 fn offered_sha256(tools: &[ModelTool], system: &str, task: &Task) -> String {
@@ -783,7 +787,7 @@ struct Trial<'a> {
     task: &'a Task,
     index: u32,
     system: &'a Arc<str>,
-    history: &'a Arc<[ConversationTurn]>,
+    history: &'a Arc<[ModelMessage]>,
     label: &'a str,
     model: &'a str,
     client: ClientKind,
@@ -819,8 +823,7 @@ fn session<I: CapabilityInvoker + Send + 'static>(
     let history = Arc::clone(trial.history);
     let (result, model, shell) = runtime.block_on(runtime.spawn_blocking(move || {
         let inputs = SessionInputs::new(&instruction, limits).with_system(Some(&system));
-        let mut history = History::from_turns(HistoryLimits::default(), history.iter().cloned());
-        let result = run_prompt_session(&model, &shell, inputs, &mut history);
+        let (result, _captured) = run_prompt_session(&model, &shell, inputs, &history);
         (result, model, shell)
     }))?;
     Ok(Session {
@@ -989,7 +992,7 @@ fn run() -> Result<u32, EvalError> {
     let system = load_system(arguments.system.as_deref(), arguments.rename.as_deref())?;
     let basic_system: Arc<str> = system.as_str().into();
     let orchard_system: Arc<str> = format!("{system}\n\n{}", orchard::GATEWAY_ASSETS_NOTE).into();
-    let history: Arc<[ConversationTurn]> = match &arguments.history {
+    let history: Arc<[ModelMessage]> = match &arguments.history {
         Some(path) => {
             parse_history(&std::fs::read_to_string(path).map_err(EvalError::HistoryFile)?)?
         }
@@ -1422,8 +1425,7 @@ mod tests {
         ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let task = task("pr-view", r#"{"all_of": ["412"]}"#);
-        let (system, history): (Arc<str>, Arc<[ConversationTurn]>) =
-            (SYSTEM.into(), Vec::new().into());
+        let (system, history): (Arc<str>, Arc<[ModelMessage]>) = (SYSTEM.into(), Vec::new().into());
         let row = run_trial(
             &runtime,
             &client,
@@ -1495,8 +1497,7 @@ mod tests {
         ));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let task = task("echo", r#"{"all_of": ["hello"]}"#);
-        let (system, history): (Arc<str>, Arc<[ConversationTurn]>) =
-            (SYSTEM.into(), Vec::new().into());
+        let (system, history): (Arc<str>, Arc<[ModelMessage]>) = (SYSTEM.into(), Vec::new().into());
         let row = run_trial(
             &runtime,
             &client,
