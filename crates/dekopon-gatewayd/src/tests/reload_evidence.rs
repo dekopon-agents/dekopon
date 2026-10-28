@@ -755,7 +755,7 @@ async fn boot_never_echoes_auth_file_content() {
         let (capture, guard) = capture_spans();
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            crate::run(&path, std::future::pending()),
+            crate::run(&path, std::future::pending(), 32),
         )
         .await
         .expect("boot is bounded")

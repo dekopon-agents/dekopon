@@ -16,12 +16,14 @@ FLAGS = {
 def render(*args):
     rendered = subprocess.run(
         ["helm", "template", "dekopon", str(CHART), "-f", str(DIRECTORY), *args],
-        text=True, capture_output=True, check=True,
+        text=True, capture_output=True, check=False,
     )
+    assert rendered.returncode == 0, rendered.stderr
     parsed = subprocess.run(
         ["yq", "-o=json", "-I=0", "."], input=rendered.stdout,
-        text=True, capture_output=True, check=True,
+        text=True, capture_output=True, check=False,
     )
+    assert parsed.returncode == 0, parsed.stderr
     return [json.loads(line) for line in parsed.stdout.splitlines() if line.strip()]
 
 
@@ -50,9 +52,8 @@ def test_each_optional_value_and_unset_defaults():
         fields = FLAGS | {extra + "Threads": (extra + "-threads", "3")}
         for key, (flag, value) in fields.items():
             setting = f"{daemon}.runtime.{key}"
-            for absent in ("null",):
-                unchanged = containers(render("--set", f"{setting}={absent}"))
-                assert unchanged[daemon]["args"] == base[daemon]["args"]
+            unchanged = containers(render("--set", f"{setting}=null"))
+            assert unchanged[daemon]["args"] == base[daemon]["args"]
             changed = containers(render("--set", f"{setting}={value}"))
             assert changed[daemon]["args"] == base[daemon]["args"] + [f"--{flag}={value}"]
             other = "broker" if daemon == "gateway" else "gateway"
@@ -61,6 +62,7 @@ def test_each_optional_value_and_unset_defaults():
 
 def test_runtime_values_reach_every_daemon_invocation():
     settings = [
+        "--set", "state.existingClaim=dekopon-state",
         "--set", "broker.providerSet.enabled=true",
         "--set", "broker.providerSync.enabled=true",
         "--set", "broker.providerSync.configMap=providers",

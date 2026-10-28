@@ -333,7 +333,6 @@ fn main() -> std::process::ExitCode {
 #[cfg(all(test, unix))]
 mod runtime_sizing_tests {
     use super::*;
-    use clap::Parser as _;
     use std::{collections::BTreeSet, process::Command, time::Duration};
 
     #[test]
