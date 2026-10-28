@@ -197,7 +197,8 @@ def build(run):
     kinds = collections.Counter(t["kind"] for t in turns)
     slot_events = {name: count for name, count in events.items() if SLOT.search(name)}
     dropped = {name: count for name, count in events.items() if DROPPED.search(name)}
-    resets = events.get("gateway_journal_reset", 0)
+    resets = sum(int((row.get("fields", row)).get("memory.journals.reset", 0)) for row in gateway
+                 if event_name(row) == "gateway_memory_startup")
     restarts = sum(1 for e in lab_events if e.get("event") == "daemon-ready" and e.get("daemon") == "gatewayd") - 1
     out += ["## Counts", "",
             f"- turns sent: {len(turns)}; replies: {len(replies)}; other outcomes: "
@@ -206,7 +207,7 @@ def build(run):
                                               else f"0 (no slot events at {ref8})"),
             "- dropped jobs: " + (f"{sum(dropped.values())} {dropped}" if dropped
                                   else f"0 (no drop events at {ref8})"),
-            f"- journal resets (`gateway_journal_reset`): {resets}",
+            f"- journal resets at startup (`gateway_memory_startup` `memory.journals.reset`): {resets}",
             f"- gatewayd restarts: {max(restarts, 0)}",
             f"- model calls: {len(chats)} chat, {len(summaries)} summarizer "
             f"{dict(collections.Counter(c.get('status') for c in summaries))}",

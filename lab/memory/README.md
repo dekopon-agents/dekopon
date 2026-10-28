@@ -49,7 +49,7 @@ routine, 20 s timeout) and journal memory on, with three routes selected by conv
 | `flood` | 20 turns on `summary`, each a bash tool call printing 1,800 lines, about 290 KB (the shell keeps at most 256 KiB and 2,000 lines, and clamps any one line to half that) |
 | `summarizer-hang`, `summarizer-fail`, `summarizer-refuse` | 10 turns on `summary` whose summaries hang until the client gives up, return 503, or refuse; each followed by a `none` turn |
 | `restart-mid-summary` | 3 turns, a fourth whose summary hangs, `kill -9` of the gateway while it runs (journal copied to `journal-at-kill/`), restart, 3 more turns; reports whether the killed turn's summary was retried |
-| `unloadable-journal` | 4 turns on `summary` and `plain`, stop, overwrite the smallest journal file with garbage (copy in `journal-before-corrupt/`), boot, 3 more turns each; expects one `gateway_journal_reset` and replies |
+| `unloadable-journal` | 4 turns on `summary` and `plain`, stop, overwrite the smallest journal file with garbage (copy in `journal-before-corrupt/`), boot, 3 more turns each; expects `memory.journals.reset` totalling 1 across `gateway_memory_startup` records, and replies |
 | `summaries-off-vs-on` | 20 turns on `summary` with the summary routine removed, then the gateway restarted with it on, a fresh journal and the same 20 turns |
 | `config-check` | writes the configs and runs `dekopon-gatewayd check` on them; starts no daemon |
 
