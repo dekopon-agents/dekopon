@@ -1,5 +1,7 @@
 use std::{fs::File, num::NonZeroU8, sync::Arc};
 
+mod object;
+
 use dekopon_agent::memory_tools::Rung;
 use dekopon_model::{
     body::OpaqueSource,
@@ -196,39 +198,13 @@ fn slice(file: &Arc<File>, head: &Head, rel_offset: u64, len: u64) -> Result<Tex
 }
 
 fn is_object(file: &File, offset: u64, len: u64) -> Result<bool, JournalError> {
-    struct Object;
-    impl<'de> serde::Deserialize<'de> for Object {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct Entries;
-            impl<'de> serde::de::Visitor<'de> for Entries {
-                type Value = Object;
-                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    formatter.write_str("a JSON object")
-                }
-                fn visit_map<A: serde::de::MapAccess<'de>>(
-                    self,
-                    mut map: A,
-                ) -> Result<Object, A::Error> {
-                    while map
-                        .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                        .is_some()
-                    {}
-                    Ok(Object)
-                }
-            }
-            deserializer.deserialize_map(Entries)
+    object::is_json_object(Unescaped::new(file, offset, len, 16 * 1024)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            JournalError::Corrupt
+        } else {
+            JournalError::Io { kind: error.kind() }
         }
-    }
-    let mut decoded =
-        serde_json::Deserializer::from_reader(Unescaped::new(file, offset, len, 16 * 1024));
-    match serde::Deserialize::deserialize(&mut decoded).and_then(|Object| decoded.end()) {
-        Ok(()) => Ok(true),
-        Err(error) => match error.io_error_kind() {
-            Some(std::io::ErrorKind::InvalidData) => Err(JournalError::Corrupt),
-            Some(kind) => Err(JournalError::Io { kind }),
-            None => Ok(false),
-        },
-    }
+    })
 }
 
 /// Verbatim steps within the record's share: text items first, then exchanges, cutting only
