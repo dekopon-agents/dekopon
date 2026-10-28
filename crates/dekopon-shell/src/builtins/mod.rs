@@ -669,7 +669,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum RejectedCommand {
     Eval,
     Exec,
