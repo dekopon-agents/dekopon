@@ -645,6 +645,9 @@ fixed chat warning directs the sender to audit before retrying.
 Each steered, queued or busy admission attempt emits `gateway.admission` on `dekopon_gatewayd::audit`, with `outcome`
 (`steered`, `queued`, or `busy`), `transport`, `conversation.id`, and `queue.depth`: queued steers
 plus follow-ups after the push, or at refusal. A saturated new conversation has depth zero.
+PR-link admission records also cover `started` and carry `admission.trigger = "pull-request-link"`,
+with native string arrays `github.repository.owners` and `github.repository.names` in matching
+target order. They use the existing `gateway.admission` event and message trace.
 GitHub admission records also cover `started` and `ignored`; every GitHub record carries
 `github.deliveries`, a native string array in arrival order. On a queued append it lists the whole
 tail batch so far; the last queued record names exactly that batch's deliveries. A busy record

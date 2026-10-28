@@ -133,6 +133,7 @@ impl Anchor {
             );
         }
         InboundMessage {
+            pull_request_links: None,
             transport: self.transport.to_string(),
             transport_kind: self.kind,
             subject: self.subject.clone(),

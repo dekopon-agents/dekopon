@@ -223,13 +223,13 @@ impl LocalTransport {
                 sequence += 1;
                 let message_id = format!("{boot_nonce}-{connection}-{sequence}");
                 received.record("message.id", message_id.as_str());
-                let conversation = request.conversation;
-                record_conversation(&received, &conversation);
+                record_conversation(&received, &request.conversation);
                 let message = InboundMessage {
+                    pull_request_links: None,
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
                     subject: request.subject,
-                    conversation,
+                    conversation: request.conversation,
                     message_id: MessageId::Native(message_id),
                     text: bound_inbound(&text),
                     assets: Vec::new(),
