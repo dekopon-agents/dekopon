@@ -23,10 +23,13 @@ re-pin and no broker wire change. Before upgrading:
 - Summaries are on by default on journal-recall routes and use the route's own model after each
   reply. Their calls are metered with `via = "summary"` but never refused by a budget. Set
   `summaries: off` to opt out.
-- The journal moves to a new record format. At startup every journal file in an earlier format
-  resets (counted in `gateway_memory_startup`'s `memory.journals.reset`), including files left
-  under the pre-0.58.0 conversation stems, so conversation memory starts empty once and memory
-  `session_id`s change once. Follow markers, seals and the prompt-cache secret are kept.
+- The journal moves to a new record format. At startup earlier-format journals in per-agent
+  directories reset (counted in `gateway_memory_startup`'s `memory.journals.reset`). Files under
+  pre-0.58.0 conversation stems without matching follow markers are removed separately and emit
+  `gateway_journal_reset` with reason `legacy`; files paired with follow markers remain but are
+  not replayed. Conversation memory starts empty once. Follow markers, seals and the prompt-cache
+  secret are kept; the journal reset does not change the prompt-cache `session_id` for unchanged
+  conversation coordinates.
 - Journal-recall routes default `maxBytes` to 524288 instead of 65536.
 - `agent.model.prompt` is split into records of at most 16 KiB carrying `transcript.segment` and
   `transcript.segments`; a query that read one prompt per model turn concatenates the segments of
