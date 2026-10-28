@@ -252,7 +252,14 @@ fn all_forbidden_names_and_spellings_are_recognized() {
     }
     assert_eq!(refused("func f(){}"), Refusal::UserFunction);
     assert_eq!(refused("END{if(1) next}"), Refusal::NextOutsideRule);
-    for source in ["{print a >> b}", "{printf a | b}", "{printf a > b}"] {
+    for source in [
+        "{print > b}",
+        "{print >> b}",
+        "{print | b}",
+        "{print a >> b}",
+        "{printf a | b}",
+        "{printf a > b}",
+    ] {
         assert_eq!(refused(source), Refusal::OutputRedirection);
     }
     for op in ["<", "<=", "==", "!=", ">="] {
@@ -434,6 +441,11 @@ fn parse_bounds_cover_source_depth_height_and_flat_chains() {
             }
         );
     }
+    parsed(&format!("{}x{}", "length(".repeat(31), ")".repeat(31)));
+    assert_eq!(
+        refused(&format!("{}x+1{}", "length(".repeat(31), ")".repeat(31))),
+        Refusal::ParseDepth
+    );
     let chain = std::iter::repeat_n("1", 500).collect::<Vec<_>>().join("+");
     let p = parsed(&chain);
     match &p.program.rules[0].pattern {

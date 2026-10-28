@@ -869,7 +869,15 @@ impl Parser<'_> {
             self.expression(0, depth, ExprContext::Normal).map(Some)
         }
     }
+    fn print_redirection(&self) -> bool {
+        [Punct::Gt, Punct::Append, Punct::Pipe]
+            .into_iter()
+            .any(|punct| self.at(punct))
+    }
     fn print_list(&mut self, kind: PrintKind, depth: u8) -> Result<Vec<Expr>, AwkError> {
+        if self.print_redirection() {
+            return Err(Refusal::OutputRedirection.into());
+        }
         let mut list = Vec::new();
         if !self.terminated() {
             if self.eat(Punct::LParen)? {
@@ -894,7 +902,7 @@ impl Parser<'_> {
                 list.push(self.expression(0, depth, ExprContext::Print)?);
             }
         }
-        if self.at(Punct::Gt) || self.at(Punct::Append) || self.at(Punct::Pipe) {
+        if self.print_redirection() {
             return Err(Refusal::OutputRedirection.into());
         }
         if kind == PrintKind::Printf {
