@@ -26,10 +26,22 @@ impl CapabilityInvoker for NoCalls {
 }
 
 fn evaluator(invoker: &dyn CapabilityInvoker, limits: Limits) -> Evaluator<'_> {
+    evaluator_in(
+        invoker,
+        limits,
+        TreeContext::new(limits, CallBudget::new(1), crate::test_threads()),
+    )
+}
+
+pub(super) fn evaluator_in(
+    invoker: &dyn CapabilityInvoker,
+    limits: Limits,
+    tree: TreeContext,
+) -> Evaluator<'_> {
     Evaluator {
         nesting: super::nesting::Nesting::root(),
         invoker,
-        budget: Budget::start_tree(limits, TreeContext::new(limits, CallBudget::new(1))),
+        budget: Budget::start_tree(limits, tree),
         limits,
         output: OutputBuffer::new(&limits),
         globals: Arc::new(BTreeMap::new()),
@@ -114,15 +126,19 @@ fn runtime_paths_refuse_two_thousand_levels_on_a_two_mib_stack() {
     for (open, close) in [("", ""), ("echo $(", ")"), ("{ ", "; }")] {
         let program =
             crate::parser::parse(&chain(2_000, open, close)).expect("flat definitions parse");
+        let [permit] = crate::test_threads().reserve().unwrap();
         std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(2 * 1024 * 1024)
-                .spawn_scoped(scope, || {
-                    let error = evaluator(&NoCalls, Limits::default())
-                        .execute_program(&program)
-                        .expect_err("deep execution refused");
-                    assert_recursion_refusal(error);
-                })
+            permit
+                .spawn(
+                    scope,
+                    dekopon_process::ThreadName::new("sh-nesting-test"),
+                    || {
+                        let error = evaluator(&NoCalls, Limits::default())
+                            .execute_program(&program)
+                            .expect_err("deep execution refused");
+                        assert_recursion_refusal(error);
+                    },
+                )
                 .expect("spawn evaluator thread")
                 .join()
                 .expect("join evaluator thread");

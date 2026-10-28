@@ -1883,7 +1883,8 @@ impl JobControl for ProbeJobs {
             .and_then(std::sync::Weak::upgrade)
             .expect("probe job uses the same live broker leg");
         let tree = seed.tree().clone();
-        let outcome = Interpreter::new(Limits::default()).run_seed(seed, leg.as_ref(), &tree);
+        let outcome = Interpreter::new(Limits::default(), dekopon_test_support::shell_threads())
+            .run_seed(seed, leg.as_ref(), &tree);
         *self.exit.lock() = Some(outcome.exit_code);
         Ok(JobId::new(1))
     }
@@ -1954,7 +1955,11 @@ async fn real_broker_probe_child_and_probe_started_job_refuse_write_on_same_leg(
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             tokio::task::spawn_blocking(move || {
-                let tree = TreeContext::new(Limits::default(), CallBudget::new(64));
+                let tree = TreeContext::new(
+                    Limits::default(),
+                    CallBudget::new(64),
+                    dekopon_test_support::shell_threads(),
+                );
                 leg.invoke(
                     CommandProposal::new("cli-probe.upper", json!({}), None),
                     Streams {
@@ -2696,16 +2701,18 @@ async fn a_memory_word_refused_by_a_gate_is_not_found_and_refunded() {
             .unwrap(),
     );
     let calls = CallBudget::new(1);
-    let tree = TreeContext::new(Limits::default(), calls.clone());
-    let outcome = tokio::task::spawn_blocking(move || {
-        Interpreter::new(Limits::default()).run_with_tree(
-            "probe --not-valid-in-the-guest",
-            &invoker,
-            &tree,
-        )
-    })
-    .await
-    .unwrap();
+    let tree = TreeContext::new(
+        Limits::default(),
+        calls.clone(),
+        dekopon_test_support::shell_threads(),
+    );
+    let outcome =
+        tokio::task::spawn_blocking(move || {
+            Interpreter::new(Limits::default(), dekopon_test_support::shell_threads())
+                .run_with_tree("probe --not-valid-in-the-guest", &invoker, &tree)
+        })
+        .await
+        .unwrap();
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
     assert_eq!(outcome.output, "dekopon-shell: probe: command not found");
     assert_eq!(calls.used(), 0);

@@ -1230,6 +1230,7 @@ fn decided(journal: &Journal, answer: &'static str) -> Option<super::super::reco
         invoker: Chooses(answer),
         limits: dekopon_process::Limits::default(),
         calls: dekopon_process::CallBudget::new(4),
+        threads: dekopon_test_support::shell_threads(),
     };
     super::super::decider::choose(
         &runtime,

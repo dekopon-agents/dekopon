@@ -157,7 +157,10 @@ fn only_exit_zero_fires_only_exit_one_waits_and_oversized_output_is_a_failure() 
 
 #[test]
 fn a_baseline_never_fires_and_a_broken_probe_is_never_stored() {
-    let limits = dekopon_process::Limits::default();
+    let limits = &dekopon_shell::Interpreter::new(
+        dekopon_process::Limits::default(),
+        dekopon_test_support::shell_threads(),
+    );
     assert!(
         Probe::baseline("echo green; exit 0".to_owned(), &NoProviders, limits).is_ok(),
         "an already-true condition is stored, not fired"
@@ -253,7 +256,10 @@ impl dekopon_shell::CapabilityInvoker for ChecksStatus {
 #[test]
 fn checks_recipe_waits_on_pending_fires_with_one_word_and_stops_on_errors() {
     let script = "gh pr checks -R owner/repo 42 > /dev/null; s=$?; case $s in 0) echo pass; exit 0;; 1) echo fail; exit 0;; 8) exit 1;; *) exit $s;; esac";
-    let limits = dekopon_process::Limits::default();
+    let limits = &dekopon_shell::Interpreter::new(
+        dekopon_process::Limits::default(),
+        dekopon_test_support::shell_threads(),
+    );
     for (status, word) in [(0, "pass"), (1, "fail")] {
         let probe = Probe::baseline(script.to_owned(), &ChecksStatus(8), limits).expect("wait");
         assert_eq!(
@@ -325,7 +331,10 @@ async fn a_watch_interval_longer_than_its_run_is_refused_before_any_probe() {
             frame: FrameLimits::default(),
         },
         tokio::runtime::Handle::current(),
-        dekopon_process::Limits::default(),
+        dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        ),
         None,
     );
     let refused = tokio::task::spawn_blocking(move || {
@@ -349,7 +358,10 @@ fn a_due_watch_is_leased_once_and_a_cancel_mid_tick_never_fires() {
     let probe = Probe::baseline(
         "echo waiting; exit 1".to_owned(),
         &NoProviders,
-        dekopon_process::Limits::default(),
+        &dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        ),
     )
     .expect("baseline");
     let id = store
@@ -480,7 +492,10 @@ fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
                     probe: Probe::baseline(
                         "echo pass; exit 0".to_owned(),
                         &NoProviders,
-                        dekopon_process::Limits::default(),
+                        &dekopon_shell::Interpreter::new(
+                            dekopon_process::Limits::default(),
+                            dekopon_test_support::shell_threads(),
+                        ),
                     )
                     .expect("baseline"),
                     every: Duration::from_secs(60),
@@ -497,7 +512,13 @@ fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
         .ticks
         .pop()
         .expect("restored watch");
-    let verdict = tick.run(&NoProviders, dekopon_process::Limits::default());
+    let verdict = tick.run(
+        &NoProviders,
+        &dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        ),
+    );
     assert_eq!(
         verdict,
         Verdict::Fire {
@@ -578,7 +599,10 @@ echo "after $PREV""#;
                     &store,
                     &broker,
                     &runtime,
-                    Some(dekopon_process::Limits::default()),
+                    Some(dekopon_shell::Interpreter::new(
+                        dekopon_process::Limits::default(),
+                        dekopon_test_support::shell_threads(),
+                    )),
                     None,
                 )
             })

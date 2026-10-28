@@ -149,6 +149,10 @@ fn main() -> Result<(), ExampleError> {
             })
         }
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: this comparison run, which drops it on return; bound: the example's one runtime"
+    )]
     let runtime = tokio::runtime::Runtime::new()?;
     let (_cancel, receiver) = tokio::sync::watch::channel(false);
     let model = BlockingModel::new(

@@ -85,7 +85,7 @@ validated by published `dekopon_telemetry::ExporterSettings` (that type is not d
 
 ```yaml
 endpoint: https://telemetry.example.invalid/otlp
-transport: http                 # grpc (default) or http
+transport: http                 # default and only value; grpc is refused
 serviceName: dekopon-console     # default
 exportTimeoutMs: 5000            # default, positive; export and shutdown deadline
 ```

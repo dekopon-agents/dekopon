@@ -26,8 +26,8 @@
 #   a channel and matches no `directMessage` or `groupDirectMessage` route. The answer is
 #   remembered per conversation, so it costs one call per conversation the bot is addressed in.
 # - `message.channels`/`channels:history` and `message.groups`/`groups:history`: receive channel
-#   traffic so the transport can admit only exact freshly authorized sender/thread continuations.
-#   All other ambient messages are dropped before routing, authorization, telemetry, or inference.
+#   traffic for exact freshly authorized sender/thread continuations and opted-in thread follow.
+#   Other ambient messages are dropped before routing, authorization, telemetry, or inference.
 # - `files:read`: lazy access to attachments the sender included.
 # - `files:write`: shares the one bounded PNG an explicitly image-enabled route generated.
 #
@@ -68,6 +68,9 @@ oauth_config:
       - im:history
       - im:read
       - mpim:read
+      # Follow leaves on human thumbs-down; user lookup distinguishes bot reactors.
+      - reactions:read
+      - users:read
       - reactions:write
 settings:
   event_subscriptions:
@@ -78,6 +81,7 @@ settings:
       - message.channels
       - message.groups
       - message.im
+      - reaction_added
   interactivity:
     is_enabled: false
   org_deploy_enabled: false
