@@ -317,6 +317,7 @@ where
                         opentelemetry::Value::I64(value) => serde_json::json!(value),
                         opentelemetry::Value::Bool(value) => serde_json::json!(value),
                         opentelemetry::Value::F64(value) => serde_json::json!(value),
+                        opentelemetry::Value::Array(value) => serde_json::json!(value.to_string()),
                         value => serde_json::json!(value.to_string()),
                     })
                     .collect::<Vec<_>>(),
@@ -871,7 +872,9 @@ mod tests {
         tracing::subscriber::with_default(registry().with(console), || {
             crate::with_event_string_array("github.deliveries", &["first", "second"], || {
                 crate::with_event_string_array("github.repository.names", &["one", "two"], || {
-                    tracing::info!(outcome = "queued", "admission");
+                    crate::with_event_string_array("github.actor.id", &[&1_i64, &2_i64], || {
+                        tracing::info!(outcome = "queued", "admission")
+                    });
                 });
             });
             tracing::info!(outcome = "ignored", "next");
@@ -885,6 +888,8 @@ mod tests {
             lines[0]["github.repository.names"],
             serde_json::json!(["one", "two"])
         );
+        assert_eq!(lines[0]["github.actor.id"], serde_json::json!([1, 2]));
+        assert!(lines[1].get("github.actor.id").is_none());
         assert!(lines[1].get("github.repository.names").is_none());
         assert!(lines[1].get("github.deliveries").is_none());
     }

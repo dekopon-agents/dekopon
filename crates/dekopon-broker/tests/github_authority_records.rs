@@ -5,16 +5,15 @@
 )]
 #[path = "common/github.rs"]
 mod github;
-use dekopon_broker::{AttestorGrant, InvocationRequest};
+use dekopon_broker::AttestorGrant;
+#[path = "common/broker.rs"]
+mod broker_support;
 use dekopon_test_support::CaptureLayer;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+type NativeRecord = std::collections::BTreeMap<&'static str, Vec<opentelemetry::Value>>;
 #[derive(Clone, Default)]
-struct NativeArrays(
-    std::sync::Arc<
-        std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, Vec<opentelemetry::Value>>>>,
-    >,
-);
+struct NativeArrays(std::sync::Arc<std::sync::Mutex<Vec<NativeRecord>>>);
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NativeArrays {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if event.metadata().target() != "dekopon_broker::audit" {
@@ -40,20 +39,12 @@ async fn broker_decision_names_the_waking_events() {
         .with(arrays.clone())
         .with(captured.clone())
         .init();
-    let (broker,_)=github::broker(r#"@id("allow") permit(principal,action,resource) when { context has github && context.github.event == "issue_comment" };"#).await;
+    let (broker,_)=github::broker(r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource) when { context has github && context.github.event == "issue_comment" };"#).await;
     let claim = github::claim(vec![
         github::event("issue_comment", "delivery-1"),
         github::event("pull_request", "delivery-2"),
     ]);
-    let request = InvocationRequest {
-        id: "github-denial".parse().unwrap(),
-        capability: "cli-probe.reverse".parse().unwrap(),
-        trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
-            .parse()
-            .unwrap(),
-        input: serde_json::json!({}),
-        secret_use: None,
-    };
+    let request = broker_support::request(97, "cli-probe.reverse");
     broker
         .invoke(
             &github::gateway(),
@@ -68,7 +59,7 @@ async fn broker_decision_names_the_waking_events() {
         "dekopon_broker::audit",
         &[
             ("audit.event", "broker.decision"),
-            ("invocation.id", "github-denial"),
+            ("invocation.id", "invoke-table-97"),
         ],
     );
     assert_eq!(records.len(), 1);

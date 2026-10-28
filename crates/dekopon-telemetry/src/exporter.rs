@@ -688,6 +688,9 @@ impl logs::LogProcessor for EventArrayProcessor {
                             opentelemetry::Value::F64(value) => {
                                 opentelemetry::logs::AnyValue::from(value)
                             }
+                            opentelemetry::Value::Array(value) => {
+                                opentelemetry::logs::AnyValue::from(value.to_string())
+                            }
                             value => opentelemetry::logs::AnyValue::from(value.to_string()),
                         })
                         .collect(),

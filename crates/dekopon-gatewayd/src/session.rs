@@ -3682,11 +3682,17 @@ fn chat_claim_for(
                         delivery: batch.lead().delivery.to_string(),
                     })
                 }
-                _ => None,
+                MessageId::Native(_)
+                | MessageId::Follow(_)
+                | MessageId::Wake { .. }
+                | MessageId::Job { .. } => None,
             },
             github: match &message.message_id {
                 MessageId::Github(batch) => Some((**batch).clone()),
-                _ => None,
+                MessageId::Native(_)
+                | MessageId::Follow(_)
+                | MessageId::Wake { .. }
+                | MessageId::Job { .. } => None,
             },
             trigger: message.message_id.trigger(),
         },

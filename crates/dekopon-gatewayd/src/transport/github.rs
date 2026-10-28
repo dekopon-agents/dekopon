@@ -931,8 +931,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn missing_run_identity_is_malformed_even_for_an_ignored_action() {
         let (state, mut receiver) = state();
-        let mut body = json!({"repository":{"id":10,"owner":{"login":"Owner"},"name":"Repo"},"sender":{"id":1},
-            "action":"requested"});
+        let mut body = sample("workflow_run");
+        body["action"] = json!("requested");
+        let mut run = body["workflow_run"].clone();
+        run["conclusion"] = Value::Null;
+        body.as_object_mut().unwrap().remove("workflow_run");
         let missing = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
             process(
@@ -944,7 +947,8 @@ pub(crate) mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
-        body["workflow_run"] = json!({"head_sha":"a".repeat(40), "conclusion":null});
+        body["workflow_run"] = run.clone();
+        body["workflow_run"].as_object_mut().unwrap().remove("id");
         let missing_id = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
             process(
@@ -956,7 +960,11 @@ pub(crate) mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
-        body["workflow_run"] = json!({"id":5, "conclusion":null});
+        body["workflow_run"] = run.clone();
+        body["workflow_run"]
+            .as_object_mut()
+            .unwrap()
+            .remove("head_sha");
         let missing_sha = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
             process(
@@ -968,7 +976,7 @@ pub(crate) mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
-        body["workflow_run"]["head_sha"] = json!("a".repeat(40));
+        body["workflow_run"] = run;
         let pending = serde_json::to_vec(&body).expect("signed JSON");
         assert_eq!(
             process(
@@ -1288,6 +1296,61 @@ mod typed_fact_tests {
         }
     }
 
+    #[test]
+    fn foreign_issue_and_pull_request_numbers_never_become_facts_or_threads() {
+        for (name, action, repo, issue) in [
+            (
+                "sub_issues",
+                "parent_issue_added",
+                "parent_issue_repo",
+                "parent_issue",
+            ),
+            (
+                "issue_dependencies",
+                "blocking_added",
+                "blocked_issue_repo",
+                "blocked_issue",
+            ),
+        ] {
+            let mut body = super::tests::sample(name);
+            body["action"] = json!(action);
+            body[repo]["id"] = json!(20);
+            body[issue]["number"] = json!(987);
+            let event = parse(
+                &body,
+                serde_json::from_value(json!(name)).unwrap(),
+                "foreign",
+            )
+            .unwrap();
+            assert_eq!(event.thread().to_string(), "repository");
+            let value = serde_json::to_value(event).unwrap();
+            assert!(value.get("number").is_none());
+            assert!(value.get("issue").is_none());
+        }
+        for (name, key) in [
+            ("workflow_run", "workflow_run"),
+            ("check_run", "check_run"),
+            ("check_suite", "check_suite"),
+        ] {
+            let mut body = super::tests::sample(name);
+            body[key]["pull_requests"] = json!([{"number":987,"base":{"repo":{"id":20}}},{"number":7,"base":{"repo":{"id":10}}}]);
+            let event = parse(
+                &body,
+                serde_json::from_value(json!(name)).unwrap(),
+                "foreign",
+            )
+            .unwrap();
+            assert_eq!(event.thread().to_string(), "7");
+            let value = serde_json::to_value(event).unwrap();
+            let target = if name == "workflow_run" {
+                "run"
+            } else {
+                "check"
+            };
+            assert_eq!(value[target]["pullRequests"], json!([7]));
+        }
+    }
+
     #[tokio::test]
     async fn the_redelivery_bodies_parse_to_their_facts() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1315,9 +1378,10 @@ mod typed_fact_tests {
                 delivery,
                 fixture["event"].as_str().unwrap(),
             );
-            let verified = webhook::verified_body(request, b"test-secret")
-                .await
-                .expect("test-secret signature");
+            let verified = match webhook::verified_body(request, b"test-secret").await {
+                Ok(bytes) => bytes,
+                Err(_) => panic!("test-secret signature must verify"),
+            };
             assert_eq!(serde_json::from_slice::<Value>(&verified).unwrap(), *body);
             let event = parse(body, family, delivery).expect("real delivery parses");
             let thread = event.thread().to_string();

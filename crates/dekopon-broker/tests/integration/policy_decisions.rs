@@ -3,21 +3,16 @@
 use std::sync::Arc;
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
-    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld,
+    Attestation, AttestorGrant, AuthenticatedContext, Broker, ChatScopeClaim, ChatTransportKind,
+    Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
 };
-use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
-use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, TransportId,
-};
-use dekopon_test_support::provider_fixture;
+use dekopon_capability::InvocationOutcome;
+use dekopon_core::{Actor, AgentId, ExternalSubject, TransportId};
 use serde_json::json;
 
-const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
+#[path = "../common/broker.rs"]
+mod broker_support;
+use broker_support::{capability, configured_broker, principal, provider, request};
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
@@ -36,39 +31,12 @@ permit(principal == Dekopon::Principal::"cpetersen",
 when { context.via == "gateway" };
 "#;
 
-fn principal(name: &str) -> PrincipalId {
-    name.parse().expect("valid principal fixture")
-}
-
 fn agent(name: &str) -> AgentId {
     name.parse().expect("valid agent fixture")
 }
 
-fn capability(name: &str) -> CapabilityId {
-    name.parse().expect("valid capability fixture")
-}
-
-fn provider() -> ProviderId {
-    "cli-probe".parse().expect("valid provider fixture")
-}
-
 fn subject() -> ExternalSubject {
     SLACK_SUBJECT.parse().expect("canonical subject fixture")
-}
-
-fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
-    (
-        capability(capability_id),
-        ConstraintSet {
-            default_secret_use: None,
-            route: CapabilityRoute::Generic,
-            provider: provider(),
-            effect: EffectKind::ReadOnly,
-            risk: RiskLevel::Low,
-            credential: None,
-            constraints: ExecutionConstraints::default(),
-        },
-    )
 }
 
 fn policy_engine() -> PolicyEngine {
@@ -87,43 +55,6 @@ async fn broker() -> Broker<InMemoryAuditLog> {
         Arc::new(InMemoryAuditLog::new(8).expect("audit")),
     )
     .await
-}
-
-async fn configured_broker(
-    policy: PolicyEngine,
-    identities: IdentityDirectory,
-    audit: Arc<InMemoryAuditLog>,
-) -> Broker<InMemoryAuditLog> {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("cli-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("cli-probe provider fixture loads");
-    Broker::new(
-        registry,
-        principal("broker-test"),
-        policy,
-        ConstraintCatalog::new([constraint_set("cli-probe.reverse")])
-            .expect("one capability builds a catalog"),
-        CredentialStore::empty(),
-        identities,
-        audit,
-        BrokerLimits::default(),
-    )
-    .expect("the broker starts")
-}
-
-fn request(index: usize, capability_id: &str) -> InvocationRequest {
-    InvocationRequest {
-        id: format!("invoke-table-{index}")
-            .parse::<InvocationId>()
-            .expect("valid invocation fixture"),
-        capability: capability(capability_id),
-        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-        input: json!({"text": "decision table"}),
-        secret_use: None,
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -619,19 +550,19 @@ mod github;
 async fn a_permit_on_an_author_set_fact_never_allows() {
     for (policies, expected) in [
         (
-            r#"@id("allow") permit(principal,action,resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
+            r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
             false,
         ),
         (
-            r#"@id("allow") permit(principal,action,resource); @id("deny") forbid(principal,action,resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
+            r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource); @id("deny") forbid(principal,action == Dekopon::Action::"cli-probe.reverse",resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
             false,
         ),
         (
-            r#"@id("allow") permit(principal,action,resource); @id("deny") forbid(principal,action,resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "other" };"#,
+            r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource); @id("deny") forbid(principal,action == Dekopon::Action::"cli-probe.reverse",resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "other" };"#,
             true,
         ),
         (
-            r#"@id("allow") permit(principal,action,resource); @id("deny") forbid(principal,action,resource) unless { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
+            r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource); @id("deny") forbid(principal,action == Dekopon::Action::"cli-probe.reverse",resource) unless { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
             false,
         ),
     ] {
@@ -653,7 +584,7 @@ async fn a_permit_on_an_author_set_fact_never_allows() {
 
 #[tokio::test]
 async fn a_coalesced_turn_is_allowed_only_if_every_event_is() {
-    let (broker,_) = github::broker(r#"@id("allow") permit(principal,action,resource) when { context has github && context.github.event == "issue_comment" };"#).await;
+    let (broker,_) = github::broker(r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource) when { context has github && context.github.event == "issue_comment" };"#).await;
     for (second, expected) in [("pull_request", false), ("issue_comment", true)] {
         let (context, refusal) = broker.resolve_context(
             &github::gateway(),
@@ -675,7 +606,7 @@ async fn a_coalesced_turn_is_allowed_only_if_every_event_is() {
 
 #[tokio::test]
 async fn github_facts_must_match_the_attested_scope() {
-    let (broker, _) = github::broker(r#"@id("allow") permit(principal,action,resource);"#).await;
+    let (broker, _) = github::broker(r#"@id("allow") permit(principal,action == Dekopon::Action::"cli-probe.reverse",resource);"#).await;
     let good = github::claim(vec![github::event("issue_comment", "delivery-1")]);
     let mut foreign = github::event("issue_comment", "delivery-1");
     foreign["repository"]["fullName"] = json!("owner/foreign");

@@ -1592,6 +1592,10 @@ fn identity_digest_binds_each_group_to_its_principal() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one family table exercises all action contexts and both author-set passes"
+)]
 fn every_family_sample_validates_strictly_against_the_schema() {
     use dekopon_core::github::GithubEvent;
     let common = json!({"delivery":"delivery-1","event":"repository","repository":{"id":10,"fullName":"owner/repo"},"actor":{"id":1,"kind":"user"},"authorSet":{"actorLogin":"owner"},"kind":"none"});
@@ -1752,6 +1756,13 @@ fn every_family_sample_validates_strictly_against_the_schema() {
             .as_object_mut()
             .unwrap()
             .extend(shape.as_object().unwrap().clone());
+        let fact = shape.as_object().unwrap().iter().find(|(key,_)|key.as_str()!="kind" && key.as_str()!="number").and_then(|(key,value)| {
+            if let Some(record)=value.as_object(){record.iter().next().map(|(field,value)|format!("context.github has {key} && context.github.{key} has {field} && context.github.{key}.{field} == {value}"))}
+            else{Some(format!("context.github has {key} && context.github.{key} == {value}"))}
+        }).unwrap_or_else(||"context.github.repository.id == 10".to_owned());
+        value["action"] = json!("deploy:migrations");
+        value["at"] = json!(1790000000);
+        value["authorSet"] = json!({"actorLogin":"owner","headRef":"feature","headSha":"a".repeat(40),"headRepository":"owner/fork","draft":false,"state":"open","reviewState":"approved","reviewCommit":"a".repeat(40),"commentCommit":"a".repeat(40),"runStatus":"completed","conclusion":"success","runPath":".github/workflows/test.yml","alertRef":"main","forkRepository":"owner/fork","category":"q-a","answered":true,"environment":"staging","alertState":"open","deploymentRef":"main","deploymentSha":"a".repeat(40),"deploymentState":"success","task":"deploy:migrations"});
         let typed: GithubEvent = serde_json::from_value(value).expect("typed family sample");
         let full = serde_json::to_value(typed).unwrap();
         for stripped in [false, true] {
@@ -1762,7 +1773,7 @@ fn every_family_sample_validates_strictly_against_the_schema() {
             let mut context = session();
             context.github = Some(github);
             let policy = format!(
-                r#"@id("family") permit(principal, action, resource) when {{ context has github && context.github.event == "{event}" }};"#
+                r#"@id("family") permit(principal, action, resource) when {{ context has github && context.github.event == "{event}" && {fact} }};"#
             );
             let engine = PolicyEngine::new(&policy, &world).expect("strict policy");
             for request in [
@@ -1779,8 +1790,23 @@ fn every_family_sample_validates_strictly_against_the_schema() {
                     "{event}, stripped={stripped}"
                 );
                 let decision =
-                    engine.authorize_http(request, facts(Some(br#"{"text":"preserved"}"#)));
+                    engine.authorize_http(request.clone(), facts(Some(br#"{"text":"preserved"}"#)));
                 assert!(decision.allowed, "{event}, HTTP stripped={stripped}");
+                let (built, _) = engine
+                    .build_request(request, Some(facts(Some(br#"{"text":"preserved"}"#))))
+                    .unwrap();
+                let Some(cedar_policy::EvalResult::Record(http)) =
+                    built.context().unwrap().get("request")
+                else {
+                    panic!("HTTP context record")
+                };
+                let Some(cedar_policy::EvalResult::Record(body)) = http.get("body") else {
+                    panic!("HTTP body record")
+                };
+                assert_eq!(
+                    body.get("text"),
+                    Some(&cedar_policy::EvalResult::String("preserved".to_owned()))
+                );
             }
         }
     }

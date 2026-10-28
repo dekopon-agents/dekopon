@@ -143,6 +143,10 @@ fn run_author(root: &Value, a: &mut AuthorSetFacts) -> Option<()> {
     Some(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive match owns the frozen family-to-facts table"
+)]
 pub(super) fn parse(root: &Value, event: E, delivery: &str) -> Option<github::GithubEvent> {
     let subject = ExternalSubject::github(
         root.pointer("/repository/owner/login")?.as_str()?,

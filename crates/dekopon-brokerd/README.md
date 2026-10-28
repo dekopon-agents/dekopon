@@ -813,8 +813,7 @@ that can never match.
 
 The context each action carries is `dekopon-policy`'s
 [context](../dekopon-policy/README.md#context). Every value is derived by the broker from
-authenticated transport state or this configuration — never from a request payload, and never from
-message content or provider input.
+authenticated transport state or this configuration. GitHub facts come from gateway-verified deliveries bound to the attested scope; author-set facts can only deny. Model text and arbitrary invocation input grant no authority.
 
 An `@id("…")` annotation is required on every policy. That name is what audit records carry in
 `policy.ids`; without one Cedar would name policies positionally (`policy0`, `policy1`, …) and

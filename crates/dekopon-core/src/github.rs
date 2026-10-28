@@ -79,9 +79,6 @@ impl GithubNumber {
             .map(Self)
             .ok_or(GithubNumberError)
     }
-    pub fn get(self) -> i64 {
-        self.0.get() as i64
-    }
 }
 impl TryFrom<u64> for GithubNumber {
     type Error = GithubNumberError;
@@ -187,7 +184,7 @@ macro_rules! string_fact {
         }
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(f)
+                f.write_str(self.as_str())
             }
         }
         impl<'de> Deserialize<'de> for $name {
@@ -295,7 +292,9 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for BoundedVec<T
 pub struct UnixSeconds(i64);
 impl UnixSeconds {
     pub fn new(value: i128) -> Result<Self, GithubFactError> {
-        i64::try_from(value).map(Self).map_err(|_| GithubFactError)
+        i64::try_from(value)
+            .map(Self)
+            .map_err(|_out_of_range| GithubFactError)
     }
 }
 

@@ -1,8 +1,5 @@
 use dekopon_broker::*;
-use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{EffectKind, ExecutionConstraints};
-use dekopon_core::{Actor, PrincipalId, RiskLevel};
-use dekopon_test_support::provider_fixture;
+use dekopon_core::{Actor, PrincipalId};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -21,36 +18,17 @@ pub async fn broker(policies: &str) -> (Broker<InMemoryAuditLog>, Arc<InMemoryAu
     )
     .unwrap()
     .with_subjects(mappings.clone());
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("cli-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .unwrap();
+    let policies = format!(
+        r#"@id("fixture-prompt") permit(principal,action == Dekopon::Action::"agent.prompt",resource);
+{policies}"#
+    );
     let audit = Arc::new(InMemoryAuditLog::new(32).unwrap());
-    let broker = Broker::new(
-        registry,
-        principal("broker-test"),
-        PolicyEngine::new(policies, &world).unwrap(),
-        ConstraintCatalog::new([(
-            "cli-probe.reverse".parse().unwrap(),
-            ConstraintSet {
-                default_secret_use: None,
-                route: CapabilityRoute::Generic,
-                provider: "cli-probe".parse().unwrap(),
-                effect: EffectKind::ReadOnly,
-                risk: RiskLevel::Low,
-                credential: None,
-                constraints: ExecutionConstraints::default(),
-            },
-        )])
-        .unwrap(),
-        CredentialStore::empty(),
+    let broker = super::broker_support::configured_broker(
+        PolicyEngine::new(&policies, &world).unwrap(),
         IdentityDirectory::new(mappings).unwrap(),
         Arc::clone(&audit),
-        BrokerLimits::default(),
     )
-    .unwrap();
+    .await;
     (broker, audit)
 }
 

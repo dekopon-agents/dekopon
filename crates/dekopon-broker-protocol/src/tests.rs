@@ -3054,7 +3054,8 @@ fn a_frame_with_an_unknown_key_is_refused() {
             );
         }
     }
-    let original = serde_json::to_vec(&scope()).unwrap();
+    let original=br#"{"transport":"scientist-slack","kind":"slack","conversation":{"kind":"channel","container":"t0123abc","id":"c0123abc","thread":"1712345678.000100"},"trigger":"message"}"#.to_vec();
+    assert_eq!(serde_json::to_vec(&scope()).unwrap(), original);
     let absent: ChatScopeClaim = serde_json::from_slice(&original).unwrap();
     assert!(absent.github.is_none());
     assert_eq!(serde_json::to_vec(&absent).unwrap(), original);
