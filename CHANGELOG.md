@@ -7,6 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.65.0] - 2026-10-28
+
+### Added
+
+- Memory trace records `gateway_memory_summary_transition`, `gateway_memory_summary_dropped` and `gateway_memory_published`, and expiry reasons and record ids on `gateway_journal_expired`.
+- `sessions.memory.summaries` (`concurrency`, `queue`) and per-agent or per-route `hotTurns`, `summaries`, `capture` and `selection` memory keys.
+
+### Changed
+
+- `agent.model.prompt` is split into records of at most 16 KiB with `transcript.segment` and `transcript.segments`, replays journal turns in full and shows opaque reasoning only as `[opaque N B]`.
+- Conversation journals use the v3 record format only; older journals are reset at startup.
+- Journal-recall routes replay earlier turns as originals, summaries or envelopes within the hot window and `maxBytes`, and summaries are generated after the reply is delivered.
+- Memory tools name representations `native`, `summary-<n>` and `metadata`, and refusals list the eligible IDs.
+- Model clients stream replayable request bodies.
+- Conversation seals are replaced atomically for concurrent readers.
+
+### Removed
+
+- The memory `policy` key with its `routines`, `retain` and routine selection, and the in-memory replay arena.
+
+## [dekopon-chart-0.52.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.52.0 targets core v0.65.0 and renders the `v0.65.0` image tag.
+
 ## [0.64.0] - 2026-10-28
 
 ### Added
