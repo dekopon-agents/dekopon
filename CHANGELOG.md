@@ -7,6 +7,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-10-28
+
+### Added
+
+- an awk builtin with a POSIX subset; everything outside it is refused before input is read
+- case patterns match bash globs (*, ?, bracket expressions)
+
+## [dekopon-chart-0.57.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.57.0 targets core v0.70.0 and renders the `v0.70.0` image tag.
+
 ## [0.69.0] - 2026-10-28
 
 ### Changed
