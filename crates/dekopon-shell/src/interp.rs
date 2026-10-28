@@ -3457,7 +3457,7 @@ impl<'a> Evaluator<'a> {
                             | Parameter::LastStatus
                             | Parameter::LastJob => Protection::Quoted,
                         };
-                        self.record_quoted_elements(spans, &value, protection)?;
+                        self.record_quoted_elements(spans, &value, protection, context)?;
                     } else {
                         self.record_text(spans, &quoted_text(&value), Protection::Quoted)?;
                     }
@@ -3476,6 +3476,7 @@ impl<'a> Evaluator<'a> {
         spans: &mut Vec<ExpansionSpan>,
         value: &Value,
         protection: Protection,
+        context: FieldContext,
     ) -> Result<(), CommandFailure> {
         let elements = match value {
             Value::Array(items) => items.as_slice(),
@@ -3487,6 +3488,8 @@ impl<'a> Evaluator<'a> {
         for (index, element) in elements.iter().enumerate() {
             if index > 0 {
                 let mut separator = self.ifs_separator();
+                let literal_separator =
+                    context == FieldContext::QuotedCasePattern && separator.is_empty();
                 if separator.is_empty() {
                     separator.push(' ');
                 }
@@ -3494,7 +3497,11 @@ impl<'a> Evaluator<'a> {
                     .budget
                     .charge_value_bytes((size_of::<ExpansionSpan>() + separator.len()) as u64)?;
                 spans.push(ExpansionSpan {
-                    content: SpanContent::Boundary(separator),
+                    content: if literal_separator {
+                        SpanContent::Text(separator, protection)
+                    } else {
+                        SpanContent::Boundary(separator)
+                    },
                     charge,
                     retained: Vec::new(),
                 });
@@ -3670,7 +3677,7 @@ impl<'a> Evaluator<'a> {
                     let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
                     if context == FieldContext::QuotedCasePattern && splits_inside_quotes(parameter)
                     {
-                        self.record_quoted_elements(spans, &value, Protection::Quoted)?;
+                        self.record_quoted_elements(spans, &value, Protection::Quoted, context)?;
                     } else {
                         self.record_expanded_value(spans, &value, context)?;
                     }
@@ -3711,7 +3718,12 @@ impl<'a> Evaluator<'a> {
     ) -> Result<Value, CommandFailure> {
         if let Some(split) = split {
             if split.quoted_elements {
-                self.record_quoted_elements(split.spans, &value, Protection::Quoted)?;
+                self.record_quoted_elements(
+                    split.spans,
+                    &value,
+                    Protection::Quoted,
+                    split.context,
+                )?;
             } else {
                 self.record_expanded_value(split.spans, &value, split.context)?;
             }

@@ -2111,6 +2111,17 @@ fn case_quoted_positionals_select_the_first_expanded_field() {
 }
 
 #[test]
+fn case_quoted_positionals_join_with_spaces_when_ifs_is_empty() {
+    let scripts = [
+        r#"f() { IFS=''; case 'a b' in "$@") echo yes ;; *) echo no ;; esac; }; f a b"#,
+        r#"f() { IFS=''; case 'xa by' in x"$@"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+        r#"f() { IFS=''; case 'xa by' in x${p:-"$@"}y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+        r#"f() { IFS=''; case 'xa by' in x"${p:-$@}"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+    ];
+    assert_eq!(scripts.map(output), ["yes"; 4]);
+}
+
+#[test]
 fn case_charges_the_step_budget_like_every_other_construct() {
     let outcome = run_with(
         "while true; do case x in a) : ;; b) : ;; *) : ;; esac; done",
