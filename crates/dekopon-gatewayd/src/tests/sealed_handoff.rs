@@ -8,8 +8,8 @@ use crate::{
     },
 };
 use dekopon_agent::prompt::{
-    CancellationProbe, Handoff, History, PromptError, PromptLimits, ScriptRuntime, Seal,
-    SessionInputs, Steer, SteerSource, run_prompt_session,
+    CancellationProbe, Handoff, PromptError, PromptLimits, ScriptRuntime, Seal, SessionInputs,
+    Steer, SteerSource, run_prompt_session,
 };
 use std::sync::Barrier;
 
@@ -128,8 +128,9 @@ fn a_steer_during_the_capped_last_steps_tools_runs_next_before_newer_input() {
             },
         )
         .with_steering(&mailbox),
-        &mut History::default(),
+        &[],
     )
+    .0
     .expect_err("the capped step ends without an answer");
     assert!(matches!(error, PromptError::MaxSteps { maximum: 1 }));
     assert_eq!(

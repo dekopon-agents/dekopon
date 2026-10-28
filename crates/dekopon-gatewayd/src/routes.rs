@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     config::{
-        GithubEvent, MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness, ResolvedPolicy,
+        GithubEvent, MemoryKnobs, MemoryPolicy, ModelConfig, ResolvedConfig, ResolvedLiveness,
         Steering, render_problems,
     },
     progress::ProgressDetail,
@@ -46,7 +46,7 @@ pub(crate) struct BoundRoute {
     pub steering: Steering,
     pub progress_notes: bool,
     pub memory: MemoryPolicy,
-    pub memory_policy: Option<ResolvedPolicy>,
+    pub memory_knobs: Option<MemoryKnobs>,
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
@@ -59,6 +59,10 @@ pub(crate) struct RoutingTable {
 }
 
 impl RoutingTable {
+    pub(crate) fn routes(&self) -> &[BoundRoute] {
+        &self.routes
+    }
+
     pub(crate) fn follow_routes<'a>(
         &'a self,
         transport: &'a str,
@@ -153,7 +157,7 @@ impl RoutingTable {
                 steering: route.steering,
                 progress_notes: route.progress_notes,
                 memory: route.memory,
-                memory_policy: route.memory_policy.clone(),
+                memory_knobs: route.memory_knobs.clone(),
                 indicators: route.indicators.clone(),
                 wakes: route.wakes,
                 follow: route.follow,

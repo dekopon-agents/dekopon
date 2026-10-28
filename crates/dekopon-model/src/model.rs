@@ -231,6 +231,18 @@ impl ModelMessage {
         }
     }
 
+    /// Request-size estimate in bytes; journal slices count by their lengths and are never read.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Self::Journal { message } => message.encoded_len(),
+            Self::System { .. }
+            | Self::User { .. }
+            | Self::Assistant { .. }
+            | Self::ToolResults { .. } => crate::replay::json_len(self.for_metering().as_ref()),
+        }
+    }
+
     #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
         Self::System {
