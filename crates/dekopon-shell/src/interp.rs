@@ -140,7 +140,7 @@ impl ParsedStream<'_> {
 }
 
 fn stage_input<'a>(
-    stdin: &'a mut Vec<PipeReader<StageObservation>>,
+    stdin: &'a mut [PipeReader<StageObservation>],
     buffers: &BTreeMap<String, Vec<u8>>,
     budget: &Budget,
     command: &str,

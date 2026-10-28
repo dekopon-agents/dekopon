@@ -967,7 +967,15 @@ impl Engine<'_> {
     fn format_error(&self, error: AwkError) -> AwkError {
         match error {
             AwkError::Refused(refusal) => self.error(RuntimeKind::Refused(refusal)),
-            AwkError::Syntax { expected, .. } => self.error(RuntimeKind::FormatSyntax(expected)),
+            AwkError::Syntax {
+                line,
+                column,
+                expected,
+            } => self.error(RuntimeKind::FormatSyntax {
+                line,
+                column,
+                expected,
+            }),
             other @ (AwkError::Runtime(_) | AwkError::Limit(_)) => other,
         }
     }

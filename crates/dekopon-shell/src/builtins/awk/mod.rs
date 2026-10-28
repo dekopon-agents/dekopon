@@ -2,6 +2,8 @@ mod eval;
 #[cfg(test)]
 mod eval_tests;
 mod format;
+#[cfg(test)]
+mod interpreter_tests;
 mod lex;
 mod parse;
 #[cfg(test)]
@@ -44,7 +46,11 @@ enum RuntimeKind {
     Utf8,
     EmptySeparator,
     Refused(Refusal),
-    FormatSyntax(String),
+    FormatSyntax {
+        line: usize,
+        column: usize,
+        expected: String,
+    },
 }
 
 impl RuntimeKind {
@@ -56,9 +62,17 @@ impl RuntimeKind {
             Self::Utf8 => "awk: record is not valid UTF-8".into(),
             Self::EmptySeparator => "awk: an empty field separator is not supported".into(),
             Self::Refused(refusal) => refusal.message(),
-            Self::FormatSyntax(expected) => format!("awk: invalid format: {expected}"),
+            Self::FormatSyntax {
+                line,
+                column,
+                expected,
+            } => syntax_message(*line, *column, expected),
         }
     }
+}
+
+fn syntax_message(line: usize, column: usize, expected: &str) -> String {
+    format!("awk: syntax error at line {line}, column {column}: {expected}")
 }
 
 impl From<Refusal> for AwkError {
@@ -79,9 +93,7 @@ impl From<AwkError> for CommandFailure {
                 line,
                 column,
                 expected,
-            } => Self::usage(format!(
-                "awk: syntax error at line {line}, column {column}: {expected}"
-            )),
+            } => Self::usage(syntax_message(line, column, &expected)),
             AwkError::Runtime(RuntimeError { kind, record }) => {
                 Self::usage(format!("{} (record {record})", kind.message()))
             }

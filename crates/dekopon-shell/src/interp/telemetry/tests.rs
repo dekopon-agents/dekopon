@@ -452,6 +452,19 @@ fn early_consumer_close_records_reader_gone_on_the_producer() {
 }
 
 #[test]
+fn awk_records_builtin_resolution_and_stops_when_its_reader_closes() {
+    let telemetry = capture("awk 'BEGIN{while(1)print \"y\"}' | head -1");
+    assert_eq!(telemetry.outcome.output, "y");
+    let spans = telemetry.command_spans("awk");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].field("shell.command.close_reason"),
+        Some("reader_gone")
+    );
+    assert_eq!(spans[0].field("shell.command.kind"), Some("builtin"));
+}
+
+#[test]
 fn every_command_produces_exactly_one_span() {
     let telemetry =
         capture("greet() { echo hi; }\ngreet\ntrue\nprobe upper --text two\nnosuchcommand\n:");

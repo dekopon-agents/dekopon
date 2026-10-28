@@ -182,9 +182,72 @@ fn boundary_refusals() -> Vec<(Refusal, &'static str)> {
     ]
 }
 
+fn refusal_arguments(refusal: &Refusal) -> Vec<String> {
+    let program = match refusal {
+        Refusal::Getline => "{getline}".into(),
+        Refusal::Process => "{system(\"x\")}".into(),
+        Refusal::Redirection => "{print > \"buf\"}".into(),
+        Refusal::StreamFunction(name)
+        | Refusal::Randomness(name)
+        | Refusal::UnknownFunction(name) => format!("{{{name}()}}"),
+        Refusal::UserFunction => "function f(){}".into(),
+        Refusal::RecordSeparator => "{RS}".into(),
+        Refusal::NumberFormat(name) | Refusal::Environment(name) => format!("{{{name}}}"),
+        Refusal::GawkVariable(variable) => format!("{{{}}}", variable.name()),
+        Refusal::MultiSubscript => "{a[1,2]}".into(),
+        Refusal::PowerSpelling => "{2**3}".into(),
+        Refusal::Nextfile => "{nextfile}".into(),
+        Refusal::GawkSyntax(syntax) => syntax.name().into(),
+        Refusal::PrintComparison(operator) => format!("{{print a {operator} b}}"),
+        Refusal::NextOutsideRule => "BEGIN{next}".into(),
+        Refusal::ScalarArray(name) => format!("{{{name}=1;{name}[0]}}"),
+        Refusal::Option(option) => return vec![option.clone()],
+        Refusal::OperandAssignment(value) => return vec!["{}".into(), value.clone()],
+        Refusal::SecondInput => return vec!["{}".into(), "a".into(), "b".into()],
+        Refusal::NoProgram => return vec![],
+        Refusal::BadVariable(value) => return vec!["-v".into(), value.clone(), "{}".into()],
+        Refusal::BadFieldRegex(_) => return vec!["-F".into(), "x".repeat(1025), "{}".into()],
+        Refusal::EmptySeparator => return vec!["-F".into(), "".into(), "{}".into()],
+        Refusal::FormatStar => "BEGIN{printf \"%*s\",2,\"x\"}".into(),
+        Refusal::FormatConversion(conversion) => format!("BEGIN{{printf \"%{conversion}\"}}"),
+        Refusal::FormatBound {
+            function,
+            dimension,
+            value,
+        } => {
+            let dot = if dimension == "precision" { "." } else { "" };
+            if function == "sprintf" {
+                format!("BEGIN{{sprintf(\"%{dot}{value}s\",\"x\")}}")
+            } else {
+                format!("BEGIN{{printf \"%{dot}{value}s\",\"x\"}}")
+            }
+        }
+        Refusal::ProgramBytes(bytes) => " ".repeat(*bytes),
+        Refusal::ParseDepth => format!("{}0{}", "(".repeat(100), ")".repeat(100)),
+        Refusal::AstHeight => format!("{}0{}", "(".repeat(32), ")".repeat(32)),
+        Refusal::RegexExtension => "/(?i)x/".into(),
+        Refusal::Regex(_) => format!("/{}/", "x".repeat(1025)),
+        Refusal::ParserStart(_) | Refusal::ParserPanic(_) | Refusal::InternalRegex => {
+            unreachable!("internal failures have no user trigger")
+        }
+    };
+    vec![program]
+}
+
 #[test]
 fn every_refusal_class_has_its_exact_message() {
     for (refusal, expected) in language_refusals().into_iter().chain(boundary_refusals()) {
+        let argv = refusal_arguments(&refusal)
+            .iter()
+            .map(|s| format!("'{}'", s.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let outcome = crate::Interpreter::new(Limits::default(), crate::test_threads()).run(
+            &format!("printf 'hi\\n' | {{ awk {argv} 2>error; status=$?; cat; cat error; exit $status; }}"),
+            &crate::builtins::test_support::NoCapabilities,
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{argv}");
+        assert_eq!(outcome.output, format!("hi\n{expected}"), "{argv}");
         assert_eq!(
             CommandFailure::from(AwkError::Refused(refusal)),
             CommandFailure::Status {
@@ -199,6 +262,15 @@ fn every_refusal_class_has_its_exact_message() {
     assert_eq!(CommandFailure::from(AwkError::Runtime(RuntimeError { kind: RuntimeKind::Refused(dynamic), record: 7.0 })), CommandFailure::Status {
         message: "awk: `sprintf` precision 4097 is more than 4096; use a precision of at most 4096 (record 7)".into(), status: ExitCode::SYNTAX,
     });
+    let outcome = crate::Interpreter::new(Limits::default(), crate::test_threads()).run(
+        "printf 'x\\nx\\nx\\nx\\nx\\nx\\nx\\n' | awk -v fmt=%.4097f 'NR==7{print 1;print sprintf(fmt,2)}'",
+        &crate::builtins::test_support::NoCapabilities,
+    );
+    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
+    assert_eq!(
+        outcome.output,
+        "1\nawk: `sprintf` precision 4097 is more than 4096; use a precision of at most 4096 (record 7)"
+    );
 }
 
 #[test]

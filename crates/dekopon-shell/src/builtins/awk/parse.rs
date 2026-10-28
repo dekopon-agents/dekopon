@@ -19,7 +19,7 @@ pub(crate) enum GawkVariable {
 }
 
 impl GawkVariable {
-    fn name(&self) -> &str {
+    pub(super) fn name(&self) -> &str {
         match self {
             Self::IgnoreCase => "IGNORECASE",
             Self::Fpat => "FPAT",
@@ -57,7 +57,7 @@ pub(crate) enum GawkSyntax {
 }
 
 impl GawkSyntax {
-    fn name(&self) -> &str {
+    pub(super) fn name(&self) -> &str {
         match self {
             Self::BeginFile => "BEGINFILE",
             Self::EndFile => "ENDFILE",

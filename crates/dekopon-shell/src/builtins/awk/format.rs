@@ -10,10 +10,31 @@ use crate::limits::Budget;
 #[derive(Clone, Copy, Default)]
 struct Flags {
     left: bool,
-    plus: bool,
-    space: bool,
+    sign: Sign,
     alternate: bool,
     zero: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Sign {
+    #[default]
+    Negative,
+    Plus,
+    Space,
+}
+
+impl Flags {
+    fn sign(self, negative: bool) -> &'static str {
+        if negative {
+            "-"
+        } else {
+            match self.sign {
+                Sign::Negative => "",
+                Sign::Plus => "+",
+                Sign::Space => " ",
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -99,8 +120,12 @@ impl<'a> Format<'a> {
         while let Some(c) = self.source.as_bytes().get(self.at) {
             match c {
                 b'-' => flags.left = true,
-                b'+' => flags.plus = true,
-                b' ' => flags.space = true,
+                b'+' => flags.sign = Sign::Plus,
+                b' ' => {
+                    if flags.sign != Sign::Plus {
+                        flags.sign = Sign::Space;
+                    }
+                }
                 b'#' => flags.alternate = true,
                 b'0' => flags.zero = true,
                 _ => break,
@@ -164,7 +189,7 @@ impl Number {
         }
     }
     fn text(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..self.len]).expect("numeric ASCII")
+        std::str::from_utf8(&self.bytes[..self.len]).expect("formatted UTF-8")
     }
     fn trim_fraction(&mut self) {
         if self.bytes[..self.len].contains(&b'.') {
@@ -256,13 +281,8 @@ pub(super) fn number(number: f64, budget: &Budget) -> Result<Text, AwkError> {
 }
 
 fn floating(out: &mut Number, number: f64, conversion: Conversion, precision: usize, flags: Flags) {
-    if number.is_sign_negative() {
-        out.write_str("-").expect("sign");
-    } else if flags.plus {
-        out.write_str("+").expect("sign");
-    } else if flags.space {
-        out.write_str(" ").expect("sign");
-    }
+    out.write_str(flags.sign(number.is_sign_negative()))
+        .expect("sign");
     let upper = match conversion {
         Conversion::Scientific(upper) | Conversion::Fixed(upper) | Conversion::General(upper) => {
             upper
@@ -315,13 +335,11 @@ fn integer(out: &mut Number, number: f64, spec: &Spec) -> usize {
     };
     match spec.conversion {
         Conversion::Signed => {
-            if number.is_sign_negative() && number.trunc() != 0.0 {
-                out.write_str("-").expect("sign");
-            } else if spec.flags.plus {
-                out.write_str("+").expect("sign");
-            } else if spec.flags.space {
-                out.write_str(" ").expect("sign");
-            }
+            out.write_str(
+                spec.flags
+                    .sign(number.is_sign_negative() && number.trunc() != 0.0),
+            )
+            .expect("sign");
             write!(digits, "{:.0}", number.trunc().abs()).expect("bounded decimal integer");
         }
         Conversion::Unsigned => write!(digits, "{unsigned}").expect("u64"),
@@ -434,7 +452,7 @@ fn conversion<E: From<AwkError>>(
             let n = value.number();
             floating(&mut out, n, kind, spec.precision.unwrap_or(6), spec.flags);
             (
-                usize::from(n.is_sign_negative() || spec.flags.plus || spec.flags.space),
+                spec.flags.sign(n.is_sign_negative()).len(),
                 spec.flags.zero && n.is_finite(),
             )
         }

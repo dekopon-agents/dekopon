@@ -66,7 +66,7 @@ impl<'a> WriteTarget<'a> {
     }
     pub(super) fn input<'b>(
         &self,
-        stdin: &'b mut Vec<PipeReader<StageObservation>>,
+        stdin: &'b mut [PipeReader<StageObservation>],
         command: &str,
         operand: Option<&str>,
         input: StageInput,
@@ -216,11 +216,7 @@ impl StageOut {
                     self.pending
                         .extend_from_slice(&bytes[..bytes.len().min(room)]);
                 } else {
-                    push_diagnostic_bytes(
-                        bytes,
-                        &mut evaluator.stderr_capture,
-                        &mut evaluator.output,
-                    );
+                    push_diagnostic_bytes(bytes, evaluator.stderr_capture, evaluator.output);
                 }
                 return Ok(true);
             }
