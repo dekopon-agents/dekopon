@@ -8,6 +8,21 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Slack routes can review pull-request links (0.67.0)
+
+No configuration change or provider re-pin is required for existing deployments.
+Slack channel/thread routes can opt in with `ambient: {pullRequestLinks: true}` alongside
+`follow: true` and `sessions.journal`; the boolean defaults to false. Install the follow provider
+and reviewed broker grants before enabling it. An unaddressed human top-level post containing a
+GitHub pull-request link starts one review turn threaded under that post. Bot posts, edits and
+thread replies do not trigger it. Only the posting user's broker authority can authorize the
+review, downscoped by the channel when mapped; other speakers' grants cannot join that turn.
+
+Run gatewayd 0.67.0 before adding `ambient.pullRequestLinks` to a route. Version 0.66.0 rejects
+the new `ambient` route field, even when `pullRequestLinks` is false. No broker wire, provider WIT
+or journal format changes accompany this opt-in. Reverting to 0.66.0 is revert-safe for these
+changes only if no route sets it: remove the `ambient` field before downgrading.
+
 ## Conversation memory records, summaries and removed memory keys (0.65.0)
 
 One configuration change on gateways that set the removed memory keys; no provider WIT or SDK
