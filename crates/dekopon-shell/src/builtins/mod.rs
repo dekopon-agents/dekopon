@@ -4,6 +4,9 @@ use std::collections::BTreeSet;
 
 use crate::{CapabilityInvoker, limits::Budget};
 
+#[cfg(test)]
+mod awk;
+
 pub(crate) mod cap;
 pub(crate) mod encode;
 pub(crate) mod jobs;
@@ -18,6 +21,7 @@ pub(crate) struct CommandResult {
     pub status: ExitCode,
     pub suppress_newline: bool,
     pub retained: Vec<dekopon_process::RetainedBytes>,
+    pub output: Option<crate::interp::stage_out::StageOut>,
 }
 
 impl CommandResult {
@@ -27,6 +31,7 @@ impl CommandResult {
             status: ExitCode::SUCCESS,
             suppress_newline: false,
             retained: Vec::new(),
+            output: None,
         }
     }
 
@@ -36,6 +41,7 @@ impl CommandResult {
             status,
             suppress_newline: false,
             retained: Vec::new(),
+            output: None,
         }
     }
 
@@ -460,6 +466,31 @@ pub(crate) mod test_support {
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
+    }
+
+    pub(crate) fn cat(
+        context: &mut BuiltinContext<'_>,
+        arguments: &[String],
+        input: Option<Value>,
+    ) -> Result<CommandResult, CommandFailure> {
+        assert!(arguments.is_empty());
+        let input = crate::value::display(&input.unwrap_or(Value::Null));
+        let reader = dekopon_process::pipe::PipeReader::from_bytes(
+            input.into_bytes(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
+        let outcome = crate::interp::run_with_tree(
+            "cat",
+            None,
+            Some(reader),
+            context.invoker,
+            *context.budget.tree().limits(),
+            context.budget.tree(),
+        );
+        let mut result = CommandResult::value(Value::String(outcome.output)).without_newline();
+        result.status = outcome.exit_code;
+        Ok(result)
     }
 
     pub(crate) fn run_builtin(
