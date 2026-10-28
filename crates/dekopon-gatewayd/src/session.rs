@@ -417,7 +417,24 @@ enum Holder {
     Session(Box<Running>),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TurnParticipation {
+    Ordinary,
+    PosterOnly,
+}
+
+impl TurnParticipation {
+    fn of(message: &InboundMessage) -> Self {
+        if message.pull_request_links.is_some() {
+            Self::PosterOnly
+        } else {
+            Self::Ordinary
+        }
+    }
+}
+
 struct Running {
+    participation: TurnParticipation,
     subject: dekopon_core::ExternalSubject,
     cancellation: SessionCancellation,
     steering: Steering,
@@ -438,6 +455,7 @@ impl Running {
             aborts: 0,
             received_at: message.received_at,
             mapping: participants::Mapping::for_turn(route, message),
+            participation: TurnParticipation::of(message),
             authorizing: 0,
             steers: VecDeque::new(),
             follow_ups: VecDeque::new(),
@@ -551,7 +569,8 @@ pub(crate) fn record_admission(
             target: "dekopon_gatewayd::audit",
             { audit.event = "gateway.admission", outcome, busy.cause = cause,
               transport = %message.transport, conversation.id = %message.conversation.key(),
-              queue.depth = depth },
+              queue.depth = depth,
+              admission.trigger = message.pull_request_links.as_ref().map(|_| "pull-request-link") },
             "gateway.admission"
         )
     };
@@ -559,7 +578,10 @@ pub(crate) fn record_admission(
         Some(deliveries) => {
             dekopon_telemetry::with_event_string_array("github.deliveries", &deliveries, emit)
         }
-        None => emit(),
+        None => match &message.pull_request_links {
+            Some(links) => links.record(emit),
+            None => emit(),
+        },
     }
 }
 
@@ -620,7 +642,8 @@ impl SessionGate {
                 );
                 return Admit::Full(message, receipts);
             }
-            let participant = message.subject != running.subject
+            let participant = running.participation == TurnParticipation::Ordinary
+                && message.subject != running.subject
                 && participants::native_chat(&message)
                 && match running.mapping {
                     participants::Mapping::Mapped => true,
@@ -654,7 +677,8 @@ impl SessionGate {
                 }
                 return Admit::Steered(receipts);
             }
-            let kind = if running.mapping == participants::Mapping::Pending
+            let kind = if running.participation == TurnParticipation::Ordinary
+                && running.mapping == participants::Mapping::Pending
                 && participants::native_chat(&message)
                 && message.subject != running.subject
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
@@ -914,6 +938,7 @@ impl SessionAdmission {
                 running.steering = next.route.steering;
                 running.aborts = 0;
                 running.mapping = participants::Mapping::for_turn(&next.route, &next.message);
+                running.participation = TurnParticipation::of(&next.message);
                 running.authorizing = 0;
                 running.received_at = next.message.received_at;
                 self.cancellation = running.cancellation.clone();
@@ -1835,6 +1860,8 @@ async fn run_admitted(
 ) -> SessionAdmission {
     if let MessageId::Github(batch) = &message.message_id {
         message.text = batch.note(&message.subject);
+    }
+    if matches!(message.message_id, MessageId::Github(_)) || message.pull_request_links.is_some() {
         record_admission(&message, "started", 0, None);
     }
     let cancellation = admission.cancellation();
@@ -2453,7 +2480,13 @@ async fn session_turn(
             .as_ref()
             .map(|memory| memory.prompt_note.as_str()),
         assets_note,
-        mapped_participants.then_some(participants::FRAME),
+        (mapped_participants && message.pull_request_links.is_none())
+            .then_some(participants::FRAME),
+        message
+            .pull_request_links
+            .as_ref()
+            .map(|links| links.prompt())
+            .as_deref(),
         Some(limits_line(limits, route.max_duration).as_str()),
     ]
     .into_iter()
@@ -2525,8 +2558,10 @@ async fn session_turn(
     );
     let text = participants::with_handle(text, asker_handle);
     let text = participants::with_join(text, asker_join.as_deref());
-    let (participant_drain, participant_requests) =
-        participants::channel(mapped_participants, &cancellation);
+    let (participant_drain, participant_requests) = participants::channel(
+        mapped_participants && message.pull_request_links.is_none(),
+        &cancellation,
+    );
     let frame = |text: String| {
         let text = match &delivery_notice {
             Some(note) => bound_inbound(&format!("{note}\n{text}")),

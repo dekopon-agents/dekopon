@@ -2,9 +2,11 @@ use std::ops::{Deref, DerefMut};
 
 use super::*;
 
-#[derive(Clone, Copy)]
-pub(super) enum Construct {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Construct {
     If,
+    Elif,
+    Arithmetic,
     While,
     Until,
     For,
@@ -21,6 +23,8 @@ impl Construct {
         match self {
             Self::Group => 2,
             Self::If
+            | Self::Elif
+            | Self::Arithmetic
             | Self::While
             | Self::Until
             | Self::For
@@ -32,8 +36,10 @@ impl Construct {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
+            Self::Elif => "an `elif` branch",
+            Self::Arithmetic => "an arithmetic expansion",
             Self::If => "an `if` statement",
             Self::While => "a `while` loop",
             Self::Until => "an `until` loop",
@@ -56,7 +62,7 @@ pub(super) struct Nested<'p, 'a> {
 impl<'a> Parser<'a> {
     pub(super) fn nest(&mut self, construct: Construct) -> Result<Nested<'_, 'a>, ParseError> {
         let saved = self.depth;
-        self.depth = saved.nest(construct.units(), self.line(), construct.name())?;
+        self.depth = saved.nest(construct.units(), self.line(), construct)?;
         Ok(Nested {
             parser: self,
             saved,
@@ -85,11 +91,11 @@ impl Drop for Nested<'_, '_> {
 
 impl Nested<'_, '_> {
     pub(super) fn parse_if(&mut self) -> Result<IfStatement, ParseError> {
-        self.expect_reserved("if", "an `if` statement")?;
+        self.expect_reserved("if", Construct::If)?;
         let mut branches = Vec::new();
         let condition = self.parse_and_or_list()?;
         self.skip_separators();
-        self.expect_reserved("then", "an `if` statement")?;
+        self.expect_reserved("then", Construct::If)?;
         let body = self.parse_program(&["elif", "else", "fi"])?;
         branches.push((condition, body));
 
@@ -100,7 +106,7 @@ impl Nested<'_, '_> {
                     self.position += 1;
                     let condition = self.parse_and_or_list()?;
                     self.skip_separators();
-                    self.expect_reserved("then", "an `elif` branch")?;
+                    self.expect_reserved("then", Construct::Elif)?;
                     let body = self.parse_program(&["elif", "else", "fi"])?;
                     branches.push((condition, body));
                 }
@@ -112,7 +118,7 @@ impl Nested<'_, '_> {
                 _ => break,
             }
         }
-        self.expect_reserved("fi", "an `if` statement")?;
+        self.expect_reserved("fi", Construct::If)?;
         Ok(IfStatement {
             branches,
             otherwise,
@@ -121,9 +127,9 @@ impl Nested<'_, '_> {
 
     pub(super) fn parse_while(&mut self, until: bool) -> Result<WhileLoop, ParseError> {
         let (keyword, context) = if until {
-            ("until", "an `until` loop")
+            ("until", Construct::Until)
         } else {
-            ("while", "a `while` loop")
+            ("while", Construct::While)
         };
         self.expect_reserved(keyword, context)?;
         let condition = self.parse_and_or_list()?;
@@ -143,17 +149,11 @@ impl Nested<'_, '_> {
         self.position += 1;
         let body = self.parse_program(&["}"])?;
         if !matches!(self.peek_kind(), Some(TokenKind::RightBrace)) {
-            return Err(ParseError::syntax(
-                line,
-                "expected `}` to close a `{ ...; }` group",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedGroupClose));
         }
         self.position += 1;
         if body.statements.is_empty() {
-            return Err(ParseError::syntax(
-                line,
-                "an empty `{ }` group runs nothing; remove it or put a command in it",
-            ));
+            return Err(ParseError::refused(line, Refusal::EmptyGroup));
         }
         Ok(body)
     }
@@ -163,12 +163,12 @@ impl Nested<'_, '_> {
         self.position += 1;
         let expression = self.parse_conditional_or()?;
         if !self.peek_literal_word("]]") {
-            let found = self
-                .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
+            let found = self.peek_kind().cloned();
+            return Err(ParseError::refused(
                 line,
-                format!("expected `]]` to close a `[[ ... ]]` conditional, found {found}"),
+                Refusal::ExpectedConditionalClose {
+                    found: Found(found),
+                },
             ));
         }
         self.position += 1;
@@ -184,10 +184,7 @@ impl Nested<'_, '_> {
             self.position += 1;
         } else if self.peek_reserved() != Some("esac") {
             let line = self.line();
-            return Err(ParseError::syntax(
-                line,
-                "expected `;;` to end a `case` clause",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedCaseClauseEnd));
         }
         Ok(CaseClause { patterns, body })
     }
@@ -202,7 +199,7 @@ impl Nested<'_, '_> {
         words: Vec<Word>,
     ) -> Result<ForLoop, ParseError> {
         let body = self.parse_program(&["done"])?;
-        self.expect_reserved("done", "a `for` loop")?;
+        self.expect_reserved("done", Construct::For)?;
         Ok(ForLoop {
             variable,
             words,
@@ -221,10 +218,7 @@ impl Nested<'_, '_> {
         self.position += 1;
         let inner = self.parse_conditional_or()?;
         if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
-            return Err(ParseError::syntax(
-                line,
-                "expected `)` to close a group inside `[[ ... ]]`",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedTestGroupClose));
         }
         self.position += 1;
         Ok(inner)
