@@ -4357,17 +4357,20 @@ fn merge_diagnostics(result: &mut CommandResult, diagnostics: Vec<Diagnostic>) {
     if diagnostics.is_empty() {
         return;
     }
+    let trailing_fragment = match diagnostics.last() {
+        Some(Diagnostic::Fragment(_)) => true,
+        Some(Diagnostic::Line(_)) | None => false,
+    };
     let mut lines = value::to_lines(&result.value);
-    for diagnostic in diagnostics {
-        match diagnostic {
-            Diagnostic::Line(text) => lines.push(text),
-            Diagnostic::Fragment(text) => {
-                lines.push(text);
-                result.suppress_newline = true;
-            }
-        }
+    lines.extend(diagnostics.into_iter().map(|diagnostic| match diagnostic {
+        Diagnostic::Line(text) | Diagnostic::Fragment(text) => text,
+    }));
+    if trailing_fragment {
+        result.value = Value::String(lines.join("\n"));
+        result.suppress_newline = true;
+    } else {
+        result.value = value::from_lines(lines);
     }
-    result.value = value::from_lines(lines);
 }
 
 fn write_display(stdout: &mut PipeWriter<StageObservation>, value: &Value) -> WriteOutcome {

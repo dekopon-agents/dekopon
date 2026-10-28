@@ -322,6 +322,10 @@ fn awk_diagnostics_capture_completion_preserves_the_buffer_byte_count() {
     ] {
         stdout(script, "5\n");
     }
+    stdout(
+        "{ awk 'BEGIN{printf \"a\\n[%03d]\",1}' >&2; } 2>&1 | wc -c",
+        "7\n",
+    );
 }
 
 #[test]
