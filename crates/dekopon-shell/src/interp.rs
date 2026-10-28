@@ -434,6 +434,7 @@ impl Stage<'_> {
 #[derive(Debug)]
 struct StderrCapture {
     lines: Vec<String>,
+    pending: String,
     bytes: usize,
     max_lines: usize,
     max_bytes: usize,
@@ -444,6 +445,7 @@ impl StderrCapture {
     fn new(limits: &Limits) -> Self {
         Self {
             lines: Vec::new(),
+            pending: String::new(),
             bytes: 0,
             max_lines: limits.max_output_lines,
             max_bytes: limits.max_output_bytes,
@@ -452,12 +454,44 @@ impl StderrCapture {
     }
 
     fn push(&mut self, line: &str) {
+        if !self.pending.is_empty() {
+            self.push_fragment(line);
+            self.flush_pending();
+            return;
+        }
         if self.lines.len() >= self.max_lines || self.bytes + line.len() > self.max_bytes {
             self.truncated = true;
             return;
         }
         self.bytes += line.len();
         self.lines.push(line.to_owned());
+    }
+
+    fn push_fragment(&mut self, text: &str) {
+        for part in text.split_inclusive('\n') {
+            if self.lines.len() >= self.max_lines {
+                self.truncated = true;
+                return;
+            }
+            let line = part.strip_suffix('\n').unwrap_or(part);
+            let room = self.max_bytes.saturating_sub(self.bytes);
+            let mut end = line.len().min(room);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.pending.push_str(&line[..end]);
+            self.bytes += end;
+            self.truncated |= end < line.len();
+            if part.ends_with('\n') {
+                self.lines.push(std::mem::take(&mut self.pending));
+            }
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.lines.push(std::mem::take(&mut self.pending));
+        }
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) {
@@ -482,6 +516,7 @@ impl StderrCapture {
     }
 
     fn finish(mut self) -> Vec<String> {
+        self.flush_pending();
         if self.truncated {
             self.lines
                 .push("... redirected diagnostics truncated ...".to_owned());
@@ -2439,6 +2474,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
         };
+        output.flush_diagnostics(self);
         let status = outcome.or_else(|failure| self.absorb(failure))?;
         let outcome = output.finish(self, status);
         self.completed(outcome)
@@ -4398,6 +4434,14 @@ fn push_diagnostic_bytes(bytes: &[u8], captures: &mut [StderrCapture], output: &
         capture.push_bytes(bytes);
     } else {
         push_lossy_bytes(output, bytes);
+    }
+}
+
+fn push_diagnostic_fragment(text: &str, captures: &mut [StderrCapture], output: &mut OutputBuffer) {
+    if let Some(capture) = captures.last_mut() {
+        capture.push_fragment(text);
+    } else {
+        output.push_fragment(text);
     }
 }
 

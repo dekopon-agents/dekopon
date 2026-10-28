@@ -312,6 +312,34 @@ fn the_twenty_nine_frozen_programs_run_through_interpreter() {
 }
 
 #[test]
+fn awk_diagnostics_preserve_formatted_fragments() {
+    for sink in [" | cat", ""] {
+        let outcome = run(
+            &format!("awk 'BEGIN{{printf \"[%03d]\",1}}' >&2{sink}"),
+            Limits::default(),
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+        assert_eq!(outcome.output, "[001]", "{sink}");
+    }
+}
+
+#[test]
+fn awk_diagnostics_preserve_utf8_across_emitter_chunks() {
+    let text = format!("{}é", "a".repeat(4095));
+    for sink in [" | cat", ""] {
+        let outcome = run(
+            &format!(
+                "awk -v text={} 'BEGIN{{printf \"%s\",text}}' >&2{sink}",
+                quote(&text)
+            ),
+            Limits::default(),
+        );
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+        assert_eq!(outcome.output, text, "{sink}");
+    }
+}
+
+#[test]
 fn printf_and_sprintf_keep_flags_precision_and_character_widths() {
     for (program, expected) in [
         (

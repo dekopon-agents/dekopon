@@ -191,6 +191,19 @@ impl StageOut {
         evaluator: &mut WriteTarget<'_>,
         bytes: &[u8],
     ) -> Result<bool, CommandFailure> {
+        if self.mode == OutputMode::Awk
+            && let Destination::Diagnostics = self.destination
+        {
+            self.pending.extend_from_slice(bytes);
+            let complete = lossy_complete_prefix(&self.pending);
+            push_diagnostic_fragment(
+                &String::from_utf8_lossy(&self.pending[..complete]),
+                evaluator.stderr_capture,
+                evaluator.output,
+            );
+            self.pending.drain(..complete);
+            return Ok(true);
+        }
         match &self.destination {
             Destination::Discard => return Ok(true),
             Destination::Buffer(name) if !self.deferred => {
@@ -284,6 +297,19 @@ impl StageOut {
         }
         self.pending.drain(..complete);
         Ok(true)
+    }
+
+    pub(super) fn flush_diagnostics(&mut self, evaluator: &mut Evaluator<'_>) {
+        if self.mode == OutputMode::Awk
+            && let Destination::Diagnostics = self.destination
+        {
+            push_diagnostic_fragment(
+                &String::from_utf8_lossy(&self.pending),
+                &mut evaluator.stderr_capture,
+                &mut evaluator.output,
+            );
+            self.pending.clear();
+        }
     }
 
     pub(super) fn named(
