@@ -50,6 +50,7 @@ pub(crate) struct BoundRoute {
     pub indicators: std::collections::BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
+    pub ambient: crate::config::AmbientConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -161,6 +162,7 @@ impl RoutingTable {
                 indicators: route.indicators.clone(),
                 wakes: route.wakes,
                 follow: route.follow,
+                ambient: route.ambient,
             });
         }
         if problems.is_empty() {
@@ -246,7 +248,7 @@ impl RoutingTable {
         .filter(|route| route.wakes && &route.agent == anchor.agent())
     }
 
-    fn find(
+    pub(crate) fn find(
         &self,
         transport: &str,
         conversation: &Conversation,

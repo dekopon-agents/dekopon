@@ -285,8 +285,8 @@ where
         let native = opentelemetry::Context::current();
         let span = native.span();
         let ids = span.span_context();
-        let array = native.get::<crate::EventStringArray>();
-        if !ids.is_valid() && array.is_none() {
+        let arrays = native.get::<crate::EventStringArrays>();
+        if !ids.is_valid() && arrays.is_none() {
             return self.0.format_event(context, writer, event);
         }
         let mut json = String::new();
@@ -302,7 +302,7 @@ where
                 ids.span_id()
             )?;
         }
-        if let Some(array) = array {
+        for array in arrays.into_iter().flat_map(|arrays| &arrays.0) {
             let name =
                 serde_json::to_string(array.name).map_err(|_invalid_json| std::fmt::Error)?;
             let values =
@@ -845,7 +845,9 @@ mod tests {
             .with_writer(move || writer.clone());
         tracing::subscriber::with_default(registry().with(console), || {
             crate::with_event_string_array("github.deliveries", &["first", "second"], || {
-                tracing::info!(outcome = "queued", "admission")
+                crate::with_event_string_array("github.repository.names", &["one", "two"], || {
+                    tracing::info!(outcome = "queued", "admission");
+                });
             });
             tracing::info!(outcome = "ignored", "next");
         });
@@ -854,6 +856,11 @@ mod tests {
             lines[0]["github.deliveries"],
             serde_json::json!(["first", "second"])
         );
+        assert_eq!(
+            lines[0]["github.repository.names"],
+            serde_json::json!(["one", "two"])
+        );
+        assert!(lines[1].get("github.repository.names").is_none());
         assert!(lines[1].get("github.deliveries").is_none());
     }
 

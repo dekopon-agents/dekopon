@@ -59,6 +59,7 @@ pub(crate) struct InboundMessage {
     /// Reference lines naming attachments are appended by the session, not the transport, because
     /// AssetStore assigns the numbers and a transport minting its own would collide.
     pub text: String,
+    pub pull_request_links: Option<crate::pull_request_links::PullRequestLinkContext>,
     pub assets: Vec<PendingAsset>,
     pub asset_overflow: bool,
     /// Discord sets addressed to Some(false) deliberately from its authenticated mentions array so
