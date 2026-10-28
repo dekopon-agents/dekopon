@@ -1842,214 +1842,240 @@ fn a_case_pattern_assembled_at_run_time_matches_as_a_glob() {
     );
 }
 
+const CASE_GLOB_ROWS: &[(&str, &str)] = &[
+    (
+        "case 'report.json' in *.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "case 'report.txt' in *.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    ("case 'abc' in a?c) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'ac' in a?c) echo yes ;; *) echo no ;; esac", "no"),
+    ("case 'b' in [ab]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'c' in [ab]) echo yes ;; *) echo no ;; esac", "no"),
+    ("case 'bee' in [!a]*) echo yes ;; *) echo no ;; esac", "yes"),
+    (
+        "case 'apple' in [!a]*) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    ("case 'bee' in [^a]*) echo yes ;; *) echo no ;; esac", "yes"),
+    (
+        "case 'apple' in [^a]*) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    ("case 'bx' in [a-c]x) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'dx' in [a-c]x) echo yes ;; *) echo no ;; esac", "no"),
+    (
+        "case 'report.json' in '*'.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "case '*.json' in '*'.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "case '*file.json' in '*'*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "case 'file.json' in '*'*.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    ("case '*' in \\*) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'abc' in \\*) echo yes ;; *) echo no ;; esac", "no"),
+    ("case 'a/b' in *) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '.hidden' in *) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '' in *) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '[' in [) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '[abc' in [a*) echo yes ;; *) echo no ;; esac", "yes"),
+    (
+        "case 'bx' in *.json|[a-c]x) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "case 'dx' in *.json|[a-c]x) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    ("case ']' in []a]) echo yes ;; *) echo no ;; esac", "yes"),
+    (
+        "case ']' in [a\"]\"]) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    ("case 'b' in [a'-'c]) echo yes ;; *) echo no ;; esac", "no"),
+    ("case '-' in [a'-'c]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '[a]' in '['a]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '^' in ['^'a]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'é' in ?) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'a\nb' in a?b) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '[' in [[]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'q' in [z-aq]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'z' in [z-a]) echo yes ;; *) echo no ;; esac", "no"),
+    ("case 'q' in [!z-a]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case '-' in [a-b-c]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case 'c' in [a-b-c]) echo yes ;; *) echo no ;; esac", "yes"),
+    (
+        "case '[[:alpha:]]' in '[[:alpha:]]') echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "case 'a' in '[[:alpha:]]') echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "p='*.json'; case 'report.json' in $p) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='*.json'; case 'report.json' in \"$p\") echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "p='*.json'; case '*.json' in \"$p\") echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\\*'; case '*' in $p) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\\'; case '\\' in $p) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "case 'report.json' in $(printf '*.json')) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:-'*.json'}) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:-*.json}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:='*.json'}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:=*.json}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:-''}*.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:=''}*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'report.json' in *.json${p:-''}) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p; case 'report.json' in ${p:-\"\"}*.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p; case 'report.json' in \"${p:-}\"*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'report.json' in \"${p:-\"\"}\"*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p=x; case 'report.json' in ${p:+'*.json'}) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "p=x; case 'report.json' in ${p:+''}*.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "case 'report.json' in ''*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '' in ${p:-''}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p=x; case '' in ${p:+''}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case 'xreport.json' in ${p:-''x}*.json) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p q; case '' in ${p:-''}${q:-''}) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p q; case '\u{7f}\u{7f}' in ${p:-''}${q:-''}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '\u{7f}report.json' in ${p:-''}*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '' in ''${p:-''}) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\u{7f}'; case '\u{7f}' in $p) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '\u{7f}\u{7f}report.json' in ${p:-''''}*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '\u{7f}\u{7f}report.json' in ${p:-''\"\"}*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p q; case '\u{7f}report.json' in ${p:-${q:-''}}*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p q; case 'report.json' in ${p:-${q:=''}}*.json) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\\'; case '\\abc' in $p'*') echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\\'; case '*' in $p'*') echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "p='\\'; case '\\a' in $p'?') echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\\'; case '\\a' in $p'a') echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p='\\'; case '\\' in $p'\\') echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "p='\\'; case '\\\\' in $p'\\') echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+];
+
 #[test]
 fn case_patterns_match_bash_globs_with_quote_structure() {
-    for (script, expected) in [
-        (
-            "case 'report.json' in *.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "case 'report.txt' in *.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        ("case 'abc' in a?c) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'ac' in a?c) echo yes ;; *) echo no ;; esac", "no"),
-        ("case 'b' in [ab]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'c' in [ab]) echo yes ;; *) echo no ;; esac", "no"),
-        ("case 'bee' in [!a]*) echo yes ;; *) echo no ;; esac", "yes"),
-        (
-            "case 'apple' in [!a]*) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        ("case 'bee' in [^a]*) echo yes ;; *) echo no ;; esac", "yes"),
-        (
-            "case 'apple' in [^a]*) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        ("case 'bx' in [a-c]x) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'dx' in [a-c]x) echo yes ;; *) echo no ;; esac", "no"),
-        (
-            "case 'report.json' in '*'.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "case '*.json' in '*'.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "case '*file.json' in '*'*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "case 'file.json' in '*'*.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        ("case '*' in \\*) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'abc' in \\*) echo yes ;; *) echo no ;; esac", "no"),
-        ("case 'a/b' in *) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '.hidden' in *) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '' in *) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '[' in [) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '[abc' in [a*) echo yes ;; *) echo no ;; esac", "yes"),
-        (
-            "case 'bx' in *.json|[a-c]x) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "case 'dx' in *.json|[a-c]x) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        ("case ']' in []a]) echo yes ;; *) echo no ;; esac", "yes"),
-        (
-            "case ']' in [a\"]\"]) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        ("case 'b' in [a'-'c]) echo yes ;; *) echo no ;; esac", "no"),
-        ("case '-' in [a'-'c]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '[a]' in '['a]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '^' in ['^'a]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'é' in ?) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'a\nb' in a?b) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '[' in [[]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'q' in [z-aq]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'z' in [z-a]) echo yes ;; *) echo no ;; esac", "no"),
-        ("case 'q' in [!z-a]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case '-' in [a-b-c]) echo yes ;; *) echo no ;; esac", "yes"),
-        ("case 'c' in [a-b-c]) echo yes ;; *) echo no ;; esac", "yes"),
-        (
-            "case '[[:alpha:]]' in '[[:alpha:]]') echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "case 'a' in '[[:alpha:]]') echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "p='*.json'; case 'report.json' in $p) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "p='*.json'; case 'report.json' in \"$p\") echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "p='*.json'; case '*.json' in \"$p\") echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "p='\\*'; case '*' in $p) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "p='\\'; case '\\' in $p) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "case 'report.json' in $(printf '*.json')) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:-'*.json'}) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:-*.json}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:='*.json'}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:=*.json}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:-''}*.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:=''}*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'report.json' in *.json${p:-''}) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "unset p; case 'report.json' in ${p:-\"\"}*.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "unset p; case 'report.json' in \"${p:-}\"*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'report.json' in \"${p:-\"\"}\"*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "p=x; case 'report.json' in ${p:+'*.json'}) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "p=x; case 'report.json' in ${p:+''}*.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "case 'report.json' in ''*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case '' in ${p:-''}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "p=x; case '' in ${p:+''}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case 'xreport.json' in ${p:-''x}*.json) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "unset p q; case '' in ${p:-''}${q:-''}) echo yes ;; *) echo no ;; esac",
-            "no",
-        ),
-        (
-            "unset p q; case '\u{7f}\u{7f}' in ${p:-''}${q:-''}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case '\u{7f}report.json' in ${p:-''}*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case '' in ''${p:-''}) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "p='\u{7f}'; case '\u{7f}' in $p) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case '\u{7f}\u{7f}report.json' in ${p:-''''}*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p; case '\u{7f}\u{7f}report.json' in ${p:-''\"\"}*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p q; case '\u{7f}report.json' in ${p:-${q:-''}}*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-        (
-            "unset p q; case 'report.json' in ${p:-${q:=''}}*.json) echo yes ;; *) echo no ;; esac",
-            "yes",
-        ),
-    ] {
+    for &(script, expected) in CASE_GLOB_ROWS {
         assert_eq!(output(script), expected, "{script}");
     }
 }

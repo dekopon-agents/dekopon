@@ -123,18 +123,40 @@ impl CaseExpansion {
             self.fragments.clear();
             return;
         }
-        let mut read = 0;
+        let mut escaped = false;
         let mut write = 0;
-        while read < self.fragments.len() {
-            self.fragments[write] = match self.fragments[read] {
-                PatternFragment::Unquoted('\\') if read + 1 < self.fragments.len() => {
-                    read += 1;
-                    PatternFragment::Literal(self.fragments[read].character())
-                }
-                PatternFragment::QuotedNull => PatternFragment::Literal('\u{7f}'),
-                fragment @ (PatternFragment::Literal(_) | PatternFragment::Unquoted(_)) => fragment,
+        for read in 0..self.fragments.len() {
+            let fragment = self.fragments[read];
+            let character = fragment.character();
+            let quoted = match fragment {
+                PatternFragment::Literal('\u{1}' | '\u{7f}')
+                | PatternFragment::Unquoted(_)
+                | PatternFragment::QuotedNull => false,
+                PatternFragment::Literal(_) => true,
             };
-            read += 1;
+            if quoted {
+                if !escaped {
+                    self.fragments[write] = PatternFragment::Literal(character);
+                    write += 1;
+                    continue;
+                }
+                self.fragments[write] = PatternFragment::Literal('\\');
+                write += 1;
+                escaped = false;
+            }
+            if escaped {
+                self.fragments[write] = PatternFragment::Literal(character);
+                write += 1;
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else {
+                self.fragments[write] = PatternFragment::Unquoted(character);
+                write += 1;
+            }
+        }
+        if escaped {
+            self.fragments[write] = PatternFragment::Literal('\\');
             write += 1;
         }
         self.fragments.truncate(write);
