@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Conversation memory records, summaries and removed memory keys (0.63.0)
+## Conversation memory records, summaries and removed memory keys (0.65.0)
 
 One configuration change on gateways that set the removed memory keys; no provider WIT or SDK
 re-pin and no broker wire change. Before upgrading:
@@ -16,7 +16,7 @@ re-pin and no broker wire change. Before upgrading:
 - `sessions.memory.arena`, `sessions.memory.agents.<id>.routine` and `.policy`, and
   `routes[].memory.policy` are removed, and unknown names refuse at load. Delete them and, where
   a route used a decider, set `selection: {decider: {capability, backend, model,
-  requireProbabilities}}` on the route or agent instead. A 0.62.0 gateway refuses the new
+  requireProbabilities}}` on the route or agent instead. A 0.64.0 gateway refuses the new
   `hotTurns`, `summaries`, `capture`, `selection` and `sessions.memory.summaries` keys, so the
   configuration change and the image roll out, and revert, together; expect the gateway to refuse
   its configuration between the two.
@@ -32,8 +32,36 @@ re-pin and no broker wire change. Before upgrading:
   `transcript.segments`; a query that read one prompt per model turn concatenates the segments of
   a turn in order. `gateway_memory_selection` and `gateway_memory_deviation` are gone; the
   [memory records](observability.md) replace them.
-- Reverting to 0.62.0 needs the configuration reverted too, and resets the new-format journals
+- Reverting to 0.64.0 needs the configuration reverted too, and resets the new-format journals
   the same way. The drop is not revert-safe.
+
+## Slack routes can follow threads (0.64.0)
+
+No configuration change or provider re-pin is required for existing deployments.
+`follow: true` is a new opt-in on Slack channel and thread routes; omitted, `null`
+and `false` leave it disabled. It requires `sessions.journal` and the out-of-tree
+`dekopon-provider-follow` provider with reviewed grants. An authorized `follow stay`
+opens a shared ticket for the exact thread: unmentioned replies are batched, retaining
+each speaker's text, and each turn uses the newest speaker's fresh broker authorization.
+Other threads and unmentioned top-level messages remain inactive.
+
+Upgrade gatewayd to 0.64.0 before enabling Slack follow. Version 0.63.0 refuses
+`follow: true` on Slack routes at configuration validation; its existing Discord
+follow support is unchanged. Slack must deliver `message.channels`/`message.groups`
+with `channels:history`/`groups:history`; install or reinstall the app with the
+example manifest's scopes and events before opting in. Reaction-based leave also
+needs `reaction_added`, `reactions:read` and `users:read`.
+
+Shell threads now have short names visible in `ps`. A script needing more threads
+than the process allows is refused with a limit error before those threads start.
+The SDK lets providers declare up to 64 capabilities instead of 32; this is an SDK-only
+change and adds no wire, WIT or configuration change. Existing provider components
+continue to work without rebuilding.
+
+Reverting 0.64.0 to 0.63.0 is revert-safe for these changes only if no Slack route
+sets `follow: true`: disable or remove that opt-in before downgrading. Existing
+Discord follow routes may retain it. These changes do not change the follow ticket
+marker format or the provider wire and WIT contracts.
 
 ## OTLP export is HTTP only (0.63.0)
 
