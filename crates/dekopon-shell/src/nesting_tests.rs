@@ -1,3 +1,6 @@
+use super::errors::DepthConstruct::{
+    ArithmeticGroup, ArithmeticOperators, Block, Parameter, Substitution,
+};
 use super::{ParseError, errors::DepthConstruct, nested::Construct, parse};
 
 struct Case {
@@ -39,85 +42,61 @@ fn cases() -> Vec<Case> {
             "if ",
             "; then :; fi",
             63,
-            DepthConstruct::Block(Construct::If),
+            Block(Construct::If),
         ),
-        (
-            "if body",
-            "if :; then ",
-            "; fi",
-            63,
-            DepthConstruct::Block(Construct::If),
-        ),
+        ("if body", "if :; then ", "; fi", 63, Block(Construct::If)),
         (
             "elif condition",
             "if :; then :; elif ",
             "; then :; fi",
             63,
-            DepthConstruct::Block(Construct::If),
+            Block(Construct::If),
         ),
         (
             "while condition",
             "while ",
             "; do :; done",
             63,
-            DepthConstruct::Block(Construct::While),
+            Block(Construct::While),
         ),
         (
             "while body",
             "while :; do ",
             "; done",
             63,
-            DepthConstruct::Block(Construct::While),
+            Block(Construct::While),
         ),
         (
             "until condition",
             "until ",
             "; do :; done",
             63,
-            DepthConstruct::Block(Construct::Until),
+            Block(Construct::Until),
         ),
         (
             "until body",
             "until :; do ",
             "; done",
             63,
-            DepthConstruct::Block(Construct::Until),
+            Block(Construct::Until),
         ),
         (
             "for",
             "for x in a; do ",
             "; done",
             63,
-            DepthConstruct::Block(Construct::For),
+            Block(Construct::For),
         ),
         (
             "case",
             "case x in x) ",
             ";; esac",
             63,
-            DepthConstruct::Block(Construct::Case),
+            Block(Construct::Case),
         ),
-        (
-            "group",
-            "{ ",
-            "; }",
-            31,
-            DepthConstruct::Block(Construct::Group),
-        ),
-        (
-            "function",
-            "f() { ",
-            "; }",
-            63,
-            DepthConstruct::Block(Construct::Function),
-        ),
-        (
-            "substitution",
-            "echo $(",
-            ")",
-            31,
-            DepthConstruct::Substitution,
-        ),
+        ("group", "{ ", "; }", 31, Block(Construct::Group)),
+        ("function", "f() { ", "; }", 63, Block(Construct::Function)),
+        ("substitution", "echo $(", ")", 31, Substitution),
     ] {
         cases.push(Case {
             name,
@@ -138,7 +117,7 @@ fn cases() -> Vec<Case> {
         close: "}",
         suffix: "",
         ceiling: 31,
-        refusal: DepthConstruct::Parameter,
+        refusal: Parameter,
     });
     for (name, prefix, open, close, suffix, ceiling, refusal) in [
         (
@@ -148,7 +127,7 @@ fn cases() -> Vec<Case> {
             "",
             " ]]",
             62,
-            DepthConstruct::Block(Construct::TestNot),
+            Block(Construct::TestNot),
         ),
         (
             "conditional group",
@@ -157,7 +136,7 @@ fn cases() -> Vec<Case> {
             " )",
             " ]]",
             62,
-            DepthConstruct::Block(Construct::TestGroup),
+            Block(Construct::TestGroup),
         ),
         (
             "arithmetic group",
@@ -166,7 +145,7 @@ fn cases() -> Vec<Case> {
             " )",
             " ))",
             63,
-            DepthConstruct::ArithmeticGroup,
+            ArithmeticGroup,
         ),
         (
             "arithmetic unary",
@@ -175,7 +154,7 @@ fn cases() -> Vec<Case> {
             "",
             " ))",
             64,
-            DepthConstruct::ArithmeticOperators,
+            ArithmeticOperators,
         ),
         (
             "arithmetic binary",
@@ -184,7 +163,7 @@ fn cases() -> Vec<Case> {
             "",
             " ))",
             64,
-            DepthConstruct::ArithmeticOperators,
+            ArithmeticOperators,
         ),
     ] {
         cases.push(Case {
