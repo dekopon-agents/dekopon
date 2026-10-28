@@ -56,6 +56,7 @@ mod telemetry;
 )]
 struct Cli {
     /// Tokio worker threads; otherwise TOKIO_WORKER_THREADS or the available CPU count.
+    /// Idle mode has no workers unless this option or DEKOPON_WORKER_THREADS is supplied.
     #[arg(long, env = "DEKOPON_WORKER_THREADS", value_name = "COUNT")]
     worker_threads: Option<std::num::NonZeroUsize>,
     /// Maximum additional Tokio blocking threads (default: 512).
@@ -726,13 +727,19 @@ mod runtime_sizing_tests {
     }
     #[test]
     fn idle_keeps_the_current_thread_scheduler_until_workers_are_selected() {
-        for (arguments, workers) in [
-            (vec!["console", "--idle"], 0),
-            (vec!["console", "--idle", "--worker-threads=1"], 1),
+        for (arguments, flavor) in [
+            (
+                vec!["console", "--idle"],
+                tokio::runtime::RuntimeFlavor::CurrentThread,
+            ),
+            (
+                vec!["console", "--idle", "--worker-threads=1"],
+                tokio::runtime::RuntimeFlavor::MultiThread,
+            ),
         ] {
             let cli = Cli::parse_from(arguments);
             let runtime = runtime_builder(&cli).build().unwrap();
-            assert_eq!(runtime.metrics().num_workers(), workers);
+            assert_eq!(runtime.handle().runtime_flavor(), flavor);
         }
     }
 }

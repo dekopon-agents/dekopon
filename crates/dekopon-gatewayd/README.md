@@ -4,6 +4,10 @@ The unprivileged Dekopon chat gateway and agent daemon. It connects to chat serv
 wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model
 session with the sandboxed shell plus safe on-demand meta tools, and replies with the answer.
 
+Runtime sizing uses `--worker-threads`, `--blocking-threads`, `--blocking-keep-alive` and
+`--shell-threads`, with `DEKOPON_*` environment fallbacks; see
+[runtime threads](../../docs/gatewayd.md#runtime-threads) for defaults and thread ceilings.
+
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
   polling, a raw-body-HMAC-authenticated text/image WhatsApp Cloud API webhook with pinned Graph
   replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;

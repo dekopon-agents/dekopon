@@ -607,7 +607,7 @@ additional bot permission.
 
 The `fauxlack` Cargo feature enables an in-process chat service for Rust gateway tests. It has
 no credentials, socket or listener. Build a `dekopon_gatewayd::fauxlack::Fauxlack` from one YAML
-manifest, then pass it to `run_fauxlack(config_path, shutdown, service)`. Ordinary `run`, `check`
+manifest, then pass it to `run_fauxlack(config_path, shutdown, service, shell_threads)`. Ordinary `run`, `check`
 and the executable have no service and refuse every fauxlack transport, even in a feature build.
 
 ```yaml
