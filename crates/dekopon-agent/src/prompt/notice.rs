@@ -105,6 +105,9 @@ impl MemoryNotice {
                 }.into(),
             };
             notice.text.push_str(&line);
+            if let MemoryFact::Fidelity { .. } = fact {
+                notice.text.push_str("A tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n");
+            }
         }
         notice.omitted = omitted.len() as u64;
         for reason in [

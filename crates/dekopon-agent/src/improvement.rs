@@ -11,9 +11,7 @@ use crate::prompt::{PromptError, reject_tool_call};
 
 pub const IMPROVEMENT_TOOL_NAME: &str = "suggest_improvement";
 
-/// Three is enough to name the wrong instruction, the missing capability, and the limit that bit;
-/// more would be a model narrating, not reporting.
-pub const MAX_SUGGESTIONS_PER_SESSION: usize = 3;
+const MAX_SUGGESTIONS_PER_EXECUTION: usize = 10;
 pub const MAX_SUGGESTION_TARGET_BYTES: usize = 128;
 pub const MAX_SUGGESTION_SUMMARY_BYTES: usize = 512;
 pub const MAX_SUGGESTION_DETAIL_BYTES: usize = 2048;
@@ -103,12 +101,13 @@ struct RawSuggestion {
 pub(crate) fn improvement_tool() -> ModelTool {
     ModelTool {
         name: IMPROVEMENT_TOOL_NAME.to_owned(),
-        description: format!(
-            "After you have answered, you may send the operator a note \
-             ({MAX_SUGGESTIONS_PER_SESSION} per session) on what would make this agent work \
-             better: an instruction that was wrong or missing, a capability or skill you needed, a \
-             limit you hit. Quote what you saw in this session. The person never sees it."
-        ),
+        description: "Send the operator a note when it would change how this agent is run: \
+             an instruction that was wrong or missing, a capability or skill you needed, or a \
+             limit you hit. Quote what you saw. Don't spam; three per message you answer is a \
+             good ceiling. A note exists only when this tool returns a receipt; saying you will \
+             send one records nothing. When a person asks you to record a suggestion, call this \
+             tool or tell them it was not recorded. The person never sees the note."
+            .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -160,14 +159,11 @@ pub(crate) fn suggest_improvement_into(
             return Err(error);
         }
     };
-    if suggestions.len() >= MAX_SUGGESTIONS_PER_SESSION {
+    if suggestions.len() >= MAX_SUGGESTIONS_PER_EXECUTION {
         refuse(model_turn, call.id.as_str(), "session-limit");
         messages.push(ModelMessage::tool(
             call.id.clone(),
-            format!(
-                "This session has already recorded its {MAX_SUGGESTIONS_PER_SESSION} suggestions; \
-                 this one was not recorded. Continue with the task."
-            ),
+            "No more notes this message; this one was not recorded. Continue with the task.",
         ));
         return Ok(crate::memory::Outcome::Refused);
     }
@@ -202,10 +198,7 @@ pub(crate) fn suggest_improvement_into(
     suggestions.push(suggestion);
     messages.push(ModelMessage::tool(
         call.id.clone(),
-        format!(
-            "Recorded suggestion {index} of {MAX_SUGGESTIONS_PER_SESSION} for the operator. \
-             Continue with the task, or finish."
-        ),
+        "Recorded suggestion for the operator. Continue with the task, or finish.",
     ));
     Ok(crate::memory::Outcome::Exit(0))
 }

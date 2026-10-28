@@ -7,6 +7,53 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-10-28
+
+### Added
+
+- an awk builtin with a POSIX subset; everything outside it is refused before input is read
+- case patterns match bash globs (*, ?, bracket expressions)
+
+## [dekopon-chart-0.57.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.57.0 targets core v0.70.0 and renders the `v0.70.0` image tag.
+
+## [0.69.0] - 2026-10-28
+
+### Changed
+
+- an ambient PR link from an unmapped or denied poster is ignored without a thread reply
+- suggest_improvement has no three-per-session cap; its receipt is unnumbered and its description guides how many notes to send
+
+### Fixed
+
+- the memory notice tells the model that a tool call missing from replayed history is not evidence it did not run
+
+## [dekopon-chart-0.56.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.56.0 targets core v0.69.0 and renders the `v0.69.0` image tag.
+
+## [0.68.0] - 2026-10-28
+
+### Added
+
+- release notes list the published container image digests
+- --worker-threads, --blocking-threads, --blocking-keep-alive, --cpu-threads and --shell-threads, with chart values
+
+## [dekopon-chart-0.55.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.55.0 targets core v0.68.0 and renders the `v0.68.0` image tag.
+
+### Added
+
+- Optional `gateway.runtime` and `broker.runtime` values size worker threads, blocking threads and blocking keep-alive, plus gateway shell threads and broker CPU threads; unset or null values render no daemon flags.
+
 ## [0.67.0] - 2026-10-28
 
 ### Added

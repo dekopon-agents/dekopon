@@ -10,7 +10,8 @@ fn arguments(command: Builtin) -> Vec<String> {
     match command {
         Builtin::Cut => vec!["-c".into(), "1".into()],
         Builtin::Uniq | Builtin::Wc | Builtin::Sort => Vec::new(),
-        Builtin::Echo
+        Builtin::Awk
+        | Builtin::Echo
         | Builtin::Printf
         | Builtin::Test
         | Builtin::TestBracket

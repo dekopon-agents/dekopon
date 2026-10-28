@@ -63,12 +63,12 @@ pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 /// Must mirror dekopon-shell's own builtin and reserved-word tables exactly; a bidirectional test
 /// fails the build if the two disagree.
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
-    ".", ":", "[", "[[", "]]", "base64", "bg", "break", "cap", "case", "cat", "continue", "cut",
-    "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit", "export",
-    "false", "fg", "fi", "for", "function", "grep", "head", "if", "in", "jobs", "jq", "kill",
-    "local", "printf", "progress", "read", "return", "sed", "select", "set", "shift", "sleep",
-    "sort", "source", "tail", "test", "then", "trap", "true", "uniq", "unset", "until", "wait",
-    "wc", "while", "xargs",
+    ".", ":", "[", "[[", "]]", "awk", "base64", "bg", "break", "cap", "case", "cat", "continue",
+    "cut", "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit",
+    "export", "false", "fg", "fi", "for", "function", "grep", "head", "if", "in", "jobs", "jq",
+    "kill", "local", "printf", "progress", "read", "return", "sed", "select", "set", "shift",
+    "sleep", "sort", "source", "tail", "test", "then", "trap", "true", "uniq", "unset", "until",
+    "wait", "wc", "while", "xargs",
 ];
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

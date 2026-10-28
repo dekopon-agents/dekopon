@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::Range,
-    rc::Rc,
+    sync::Arc,
 };
 
 use super::parse::{Binary, Expr, ExprKind, Function, Phase, Stmt, StmtKind, Unary};
@@ -10,7 +10,7 @@ use crate::{builtins::CommandFailure, limits::Budget};
 use dekopon_process::{LimitExceeded, RetainedBytes};
 
 #[derive(Clone, Debug)]
-pub(super) struct Text(Rc<StoredText>);
+pub(super) struct Text(Arc<StoredText>);
 
 #[derive(Debug)]
 struct StoredText {
@@ -35,7 +35,7 @@ impl Text {
         Ok(Self::owned(text, charge))
     }
     pub fn owned(text: String, charge: RetainedBytes) -> Self {
-        Self(Rc::new(StoredText {
+        Self(Arc::new(StoredText {
             text,
             _charge: charge,
         }))
@@ -156,7 +156,7 @@ impl Value {
             Self::Str(text)
         }
     }
-    fn number(&self) -> f64 {
+    pub(super) fn number(&self) -> f64 {
         match self {
             Self::Num(number) | Self::StrNum(_, number) => *number,
             Self::Str(text) => number_prefix(text.as_str()).0,
@@ -174,7 +174,7 @@ impl Value {
         match self {
             Self::Str(text) | Self::StrNum(text, _) => Ok(text.clone()),
             Self::Uninit => Text::new("", budget),
-            Self::Num(number) => Text::build(512, budget, || format!("{number}")),
+            Self::Num(number) => super::format::number(*number, budget),
         }
     }
     fn compare(
@@ -818,7 +818,7 @@ impl Engine<'_> {
                 self.expression(expr)?;
             }
             StmtKind::Print(args) => return self.print(args, emit),
-            StmtKind::Printf(_) => return Err(self.error(RuntimeKind::FormatterPending).into()),
+            StmtKind::Printf(args) => return self.printf(args, emit),
             StmtKind::If { condition, yes, no } => {
                 if self.expression(condition)?.truth() {
                     return self.statement(yes, emit);
@@ -964,6 +964,73 @@ impl Engine<'_> {
         self.reader_gone |= !accepted;
         Ok(accepted)
     }
+    fn format_error(&self, error: AwkError) -> AwkError {
+        match error {
+            AwkError::Refused(refusal) => self.error(RuntimeKind::Refused(refusal)),
+            AwkError::Syntax {
+                line,
+                column,
+                expected,
+            } => self.error(RuntimeKind::FormatSyntax {
+                line,
+                column,
+                expected,
+            }),
+            other @ (AwkError::Runtime(_) | AwkError::Limit(_)) => other,
+        }
+    }
+    fn printf(
+        &mut self,
+        args: &[Expr],
+        emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<Flow, RunError> {
+        self.budget.check_deadline()?;
+        let _charge = self.budget.charge_value_bytes(args.len() as u64 * 32)?;
+        let values = args
+            .iter()
+            .map(|arg| self.expression(arg))
+            .collect::<Result<Vec<_>, _>>()?;
+        let format = values[0].text(self.budget)?;
+        let accepted = super::format::write(
+            "printf",
+            format.as_str(),
+            &values[1..],
+            self.budget,
+            |text, budget| {
+                crate::builtins::text::sed::emit_chunks(text.as_bytes(), budget, emit)
+                    .map_err(RunError::from)
+            },
+        )
+        .map_err(|error| match error {
+            RunError::Awk(error) => RunError::Awk(self.format_error(error)),
+            other @ RunError::Output(_) => other,
+        })?;
+        self.reader_gone |= !accepted;
+        Ok(if accepted {
+            Flow::Normal
+        } else {
+            Flow::Exit(self.status)
+        })
+    }
+    fn sprintf(&mut self, args: &[Expr]) -> Result<Value, AwkError> {
+        self.budget.check_deadline()?;
+        let _charge = self.budget.charge_value_bytes(args.len() as u64 * 32)?;
+        let values = args
+            .iter()
+            .map(|arg| self.expression(arg))
+            .collect::<Result<Vec<_>, _>>()?;
+        let format = values[0].text(self.budget)?;
+        let mut output = Builder::new(self.budget)?;
+        super::format::write(
+            "sprintf",
+            format.as_str(),
+            &values[1..],
+            self.budget,
+            |text, budget| output.append(text, budget).map(|()| true),
+        )
+        .map_err(|error| self.format_error(error))?;
+        Ok(Value::Str(output.finish()))
+    }
     fn call(&mut self, function: Function, args: &[Expr]) -> Result<Value, AwkError> {
         self.budget.check_deadline()?;
         match function {
@@ -1032,7 +1099,7 @@ impl Engine<'_> {
                     Text::build(size, self.budget, || text.to_uppercase())?
                 }))
             }
-            Function::Sprintf => Err(self.error(RuntimeKind::FormatterPending)),
+            Function::Sprintf => self.sprintf(args),
             Function::Int
             | Function::Sqrt
             | Function::Exp

@@ -3,6 +3,130 @@ use crate::{collection::Dispositions, pull_request_links::PullRequestLinkContext
 
 const PR: &str = "https://github.com/acme/widget/pull/17";
 
+#[tokio::test(start_paused = true)]
+async fn an_unmapped_posters_ambient_pr_link_is_traced_silently_and_leaves_the_mention_reply_slot()
+{
+    refused_ambient_link_then_mention(
+        dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+        "unmapped-subject",
+        crate::session::UNMAPPED_REPLY,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agent_denied_posters_ambient_pr_link_is_traced_silently_but_its_mention_is_answered() {
+    refused_ambient_link_then_mention(
+        dekopon_broker_protocol::SessionRefusal::AgentDenied {
+            principal: "simon".parse().unwrap(),
+        },
+        "agent-denied",
+        "Sorry simon, you don't have permission for this agent.",
+    )
+    .await;
+}
+
+async fn refused_ambient_link_then_mention(
+    refusal: dekopon_broker_protocol::SessionRefusal,
+    reason: &str,
+    reply: &str,
+) {
+    for experience in [SlackExperience::Classic, SlackExperience::Agent] {
+        let (capture, _guard) = capture_spans();
+        let fixture = SlackFollowFixture::with_pull_request_links(true).await;
+        let socket = spawn_socket_mock(vec![
+            events_envelope(
+                "ambient",
+                channel_message("u9xyz", "1700000000.000001", None, PR),
+            ),
+            events_envelope(
+                "mention",
+                channel_message(
+                    "u9xyz",
+                    "1700000000.000002",
+                    None,
+                    &format!("<@{BOT_USER}> {PR}"),
+                ),
+            ),
+        ]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut transport = slack_with(&http.base, experience, LivenessConfig::default())
+            .with_generation(fixture.generation.clone());
+        transport.connect().await.unwrap();
+        let ambient = next_message(&mut transport).await;
+        let mentioned = next_message(&mut transport).await;
+        assert!(ambient.pull_request_links.is_some());
+        assert!(mentioned.pull_request_links.is_none());
+        assert_eq!(ambient.subject, mentioned.subject);
+        let (broker, mut observed) = stub_broker(
+            fixture.directory.path(),
+            vec![
+                ResponseEnvelope::session_refused(&refusal),
+                ResponseEnvelope::session_refused(&refusal),
+            ],
+        )
+        .await;
+        let models = ModelScript::forbidden();
+        let running = runner(broker, Arc::clone(&models), 4);
+        let driver = transport.driver();
+        let before = http.calls();
+        let turn_started = tokio::time::Instant::now();
+        run_session(
+            Arc::clone(&running),
+            fixture.routes.route(&ambient).unwrap().clone(),
+            ambient,
+            Arc::clone(&driver),
+        )
+        .await;
+        assert_eq!(http.calls(), before);
+        let rejections =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections[0].field("message"),
+            Some("gateway.session.rejected")
+        );
+        assert_eq!(rejections[0].field("reason"), Some(reason));
+        assert_eq!(
+            rejections[0].field("admission.trigger"),
+            Some("pull-request-link")
+        );
+        assert_eq!(
+            rejections[0].field("audit.event"),
+            (reason == "unmapped-subject").then_some("gateway.session.rejected")
+        );
+        run_session(
+            running,
+            fixture.routes.route(&mentioned).unwrap().clone(),
+            mentioned,
+            driver,
+        )
+        .await;
+        assert_eq!(tokio::time::Instant::now(), turn_started);
+        let posts: Vec<Value> = http
+            .calls()
+            .iter()
+            .filter(|(path, _)| path == "/api/chat.postMessage")
+            .map(|(_, body)| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["thread_ts"], "1700000000.000002");
+        assert_eq!(posts[0]["text"], reply);
+        let rejections =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_session_rejected")]);
+        assert_eq!(rejections.len(), 2);
+        assert_eq!(rejections[1].field("admission.trigger"), None);
+        assert_eq!(models.requests(), 0);
+        for _ in 0..2 {
+            assert!(matches!(
+                observed.try_recv().unwrap().request,
+                BrokerRequest::Capabilities { .. }
+            ));
+        }
+        assert!(observed.try_recv().is_err());
+    }
+}
+
 #[test]
 fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data() {
     let links = PullRequestLinkContext::parse(&format!(

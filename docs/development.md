@@ -188,6 +188,8 @@ Never edit `.wasm` files directly. Each in-tree source directory is a separate C
 
 ### Dependencies, crates, CI, or releases
 
+The dispatch-only `.github/workflows/burn-in.yml` appends a dated note to `docs/burn-in/TURNS.md` and pushes only `burn-in/webhook-turn` as the release App to trigger the standing draft PR’s webhook turn, recording the pushed commit SHA in its job summary.
+
 The root workspace temporarily patches `tracing-core` to commit
 `2b696a18454a04df9c9a60569b6fb73a22415296` from the
 [`dekopon-agents/tracing` fork](https://github.com/dekopon-agents/tracing), the source
@@ -243,6 +245,12 @@ The tag-triggered release performs only the release-specific tag/version, change
 Publishing a release additionally runs `.github/workflows/homebrew-tap.yml`, which renders `dekopon-agents/homebrew-tap`'s formula with `.github/scripts/render-homebrew-formula.py`. That script reads the release's asset list and its published `.sha256` sidecars, so the formula's platform blocks follow whatever a release shipped and never a list held in the workflow; a target it cannot map to a Homebrew `on_macos`/`on_linux` block fails the job rather than disappearing from the formula. Its hand-maintained lists are `EXECUTABLES`, the binaries every archive carries, and `RETIRED`, naming targets a past release shipped that the tap must stop offering, so an immutable older release cannot reintroduce a platform the project has dropped. Pushing to another repository needs a credential `GITHUB_TOKEN` cannot provide: the job mints a short-lived installation token from a GitHub App via the `TAP_APP_ID` and `TAP_APP_PRIVATE_KEY` repository secrets, and skips with a warning when either is absent or when the App is not installed on the tap, since both are the same unfinished operator setup. The one-time App setup is in the root [`README.md`](../README.md#homebrew-tap-automation).
 
 Neither that workflow nor `.github/workflows/container-image.yml` triggers on `release: published`. `release.yml` publishes with `GITHUB_TOKEN`, and GitHub does not create workflow runs from events raised by that token, so the event is dispatched to nothing: neither workflow produces a run at all, rather than a failed or skipped one. Both are `workflow_call` reusable workflows that `release.yml` invokes as jobs with `needs: github-release`, which is what guarantees they see a release with its assets attached; both keep a `workflow_dispatch` with a `tag` input as the manual recovery path. A reusable workflow reads `github.event_name` and `github.ref` from its caller, so neither may branch on its own event name; each branches on whether its `tag` input is set.
+
+On tag pushes, the container workflow returns its registry-verified `digest`. The release run's
+`release-digests` job exposes `digest` (stock) and `optimized-digest` (Wasmtime optimization)
+outputs and lists both in its summary. After both image publications succeed, it appends their
+full image tags and `sha256:…` digests to the generated GitHub release notes under **Container
+images**, preserving the existing notes. Manual recovery does not append release notes.
 
 ### Memory-optimized Wasmtime
 

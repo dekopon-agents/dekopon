@@ -8,6 +8,74 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## awk is a builtin and case patterns match globs (0.70.0)
+
+No configuration change is required.
+
+`awk` joins the reserved command words. A provider that declares an `awk` command word
+is now refused at load by `dekopon_core::command_word_conflicts`; if you run such a
+provider, rename its command word before upgrading.
+
+Scripts gain an `awk` builtin with a POSIX subset. Unsupported program constructs are
+refused at exit 2 before input is read; formats and field separators built at run time
+are checked when used. Unquoted `case` patterns now match globs (`*`, `?` and bracket
+expressions); quoted or escaped characters remain literal. The model-facing shell tool
+description advertises unquoted case globs.
+
+Downgrading to 0.69.0 is revert-safe: these changes migrate no state and require no
+configuration rollback. Scripts using `awk` or the newly supported `case` globs fail
+again on 0.69.0.
+
+## Ambient pull-request links and improvement notes (0.69.0)
+
+No configuration change or provider re-pin is required.
+
+With `ambient.pullRequestLinks` enabled on a Slack route, a link from an unmapped or
+agent-denied poster gets no thread reply or reaction. The rejection is still recorded as
+`gateway_session_rejected` with message `gateway.session.rejected`, reason `unmapped-subject`
+or `agent-denied`, and `admission.trigger = "pull-request-link"`; the unmapped case retains
+its `audit.event = "gateway.session.rejected"` owner-notice selector. With no route enabling
+`ambient.pullRequestLinks`, this change is inert.
+
+`suggest_improvement` has no per-session cap and returns an unnumbered receipt. A private
+runaway stop still limits accepted notes to ten per message execution, and the existing
+text-field bounds remain. No persisted or per-conversation counter is introduced.
+
+Downgrading to 0.68.0 is revert-safe: these changes migrate no state and require no
+configuration rollback. The earlier ambient refusal replies and three-per-session
+suggestion cap return.
+
+## Daemon thread pools can be sized (0.68.0)
+
+No configuration change or provider re-pin is required. Every new flag and chart value is
+optional; existing defaults are unchanged when no sizing option is supplied.
+
+Brokerd, gatewayd and console accept `--worker-threads` (`DEKOPON_WORKER_THREADS`),
+`--blocking-threads` (`DEKOPON_BLOCKING_THREADS`) and `--blocking-keep-alive`
+(`DEKOPON_BLOCKING_KEEP_ALIVE`). Brokerd also accepts `--cpu-threads` (`DEKOPON_CPU_THREADS`);
+gatewayd and console accept `--shell-threads` (`DEKOPON_SHELL_THREADS`). Explicit flags override
+the corresponding environment variables. Without a worker setting, `TOKIO_WORKER_THREADS`
+then the available CPU count selects workers; console idle mode keeps no workers unless
+`--worker-threads` or `DEKOPON_WORKER_THREADS` is supplied. Without a CPU setting, brokerd uses
+`RAYON_NUM_THREADS` then the available CPU count. Blocking threads default to 512 and their
+keep-alive to 10s; shell threads default to 32 for gatewayd and 16 for console.
+
+Chart values `gateway.runtime.workerThreads`, `gateway.runtime.blockingThreads`,
+`gateway.runtime.blockingKeepAlive` and `gateway.runtime.shellThreads` render the corresponding
+gateway flags. Values `broker.runtime.workerThreads`, `broker.runtime.blockingThreads`,
+`broker.runtime.blockingKeepAlive` and `broker.runtime.cpuThreads` render the broker flags,
+including for precompile, provider sync, configuration checks and probes. Unset or null values
+render no flags; console can use the environment variables through its existing environment
+settings. Counts must be positive, with worker, blocking and broker CPU counts capped at 4096;
+keep-alive accepts humantime durations such as `10s`.
+
+Run chart 0.55.0 only with a v0.68.0 image: 0.67.0 binaries refuse the new flags. These changes
+are revert-safe while no sizing value is set; remove new flags and environment settings and
+unset chart runtime values before downgrading core and chart together. No broker wire, provider
+WIT or daemon configuration key changes accompany these options.
+
+When pinning a container image, use the published image digests now listed in the release notes.
+
 ## Slack routes can review pull-request links (0.67.0)
 
 No configuration change or provider re-pin is required for existing deployments.
