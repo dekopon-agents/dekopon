@@ -137,17 +137,8 @@ pub struct CaseStatement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseClause {
-    pub patterns: Vec<CasePattern>,
+    pub patterns: Vec<Word>,
     pub body: Program,
-}
-
-/// Unlike bash's filename-style globs, this matches literal text, since a partial wildcard would
-/// otherwise mismatch silently; a bare * is kept only as the default branch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CasePattern {
-    Any,
-    Literal(Word),
-    Expanded(Word),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,7 +178,6 @@ impl Word {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WordPart {
     Asset(dekopon_core::AssetNumber),
-    /// Unquoted literal text. `*`, `?`, `[`, `{`, and `~` are ordinary characters here.
     Literal(String),
     SingleQuoted(String),
     DoubleQuoted(Vec<WordPart>),

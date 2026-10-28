@@ -1835,26 +1835,290 @@ fn case_composes_with_the_control_flow_around_it() {
 }
 
 #[test]
-fn a_case_pattern_assembled_at_run_time_is_still_checked() {
-    let outcome = run("p='*.json'\ncase report.json in $p) echo matched ;; esac");
-    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(
-        outcome.output.contains("expanded to text"),
-        "{}",
-        outcome.output
+fn a_case_pattern_assembled_at_run_time_matches_a_glob() {
+    assert_eq!(
+        output("p='*.json'\ncase report.json in $p) echo matched ;; esac"),
+        "matched"
     );
-    // An error here must not suggest quoting: quoting only exempts a metacharacter while the parser
-    // can still see it, and an expanded pattern has already lost its quotes.
-    assert!(
-        !outcome.output.contains("quote it as"),
-        "{}",
-        outcome.output
-    );
-
     assert_eq!(
         output("p=ready\ncase ready in $p) echo matched ;; esac"),
         "matched"
     );
+}
+
+#[test]
+fn case_patterns_match_bash_globs_and_preserve_quotes() {
+    for (script, expected) in [
+        (
+            "case report.json in *.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        ("case abc in a?c) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case abbc in a?c) echo yes ;; *) echo no ;; esac", "no"),
+        ("case b in [ab]) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case bcd in [!a]*) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case abc in [!a]*) echo yes ;; *) echo no ;; esac", "no"),
+        ("case bcd in [^a]*) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case bx in [a-c]x) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case dx in [a-c]x) echo yes ;; *) echo no ;; esac", "no"),
+        (
+            "case '*.json' in '*'.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "case report.json in '*'.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r#"p='*.json'; case '*.json' in "$p"|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "yes",
+        ),
+        (
+            r#"p='*.json'; case report.json in "$p"|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            "p='*.json'; case report.json in $p) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (r"case '*' in \*|?) echo yes ;; *) echo no ;; esac", "yes"),
+        (r"case hello in \*|?) echo yes ;; *) echo no ;; esac", "no"),
+        ("case a/b in *|?) echo yes ;; esac", "yes"),
+        ("case .hidden in *|?) echo yes ;; esac", "yes"),
+        ("case '[' in [) echo yes ;; *) echo no ;; esac", "yes"),
+        (
+            "case report.json in *.txt|*.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        ("case '' in *|?) echo yes ;; esac", "yes"),
+        ("case '' in ?) echo yes ;; *) echo no ;; esac", "no"),
+        ("case 'a\nc' in a?c) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case é in ?) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case ']' in []a]) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case b in [a'-'c]) echo yes ;; *) echo no ;; esac", "no"),
+        (
+            "unset p; case '*.json' in ${p:-'*'}.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "unset p; case report.json in ${p:-'*'}.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            "p=set; case report.json in ${p:+'*'}.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            "unset p; case report.json in ${p:='*'}.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "unset p; case report.json in ${p='*'}.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r#"unset p; case report.json in "${p:='*'}".json|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            r#"unset p; case report.json in "${p='*'}".json|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            "case report.json in $(printf '*.json')) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r#"case report.json in "$(printf '*.json')"|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            r"p='\*'; case '*' in $p) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\*'; case other in $p) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r"case '\abc' in \\*|?) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "case A in a?) echo yes ;; [a]) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
+
+#[test]
+fn a_case_pattern_with_many_stars_finishes_with_the_expected_non_match() {
+    let pattern = format!("{}b", "*a".repeat(64));
+    let script = format!(
+        "case '{}' in {pattern}) echo yes ;; *) echo no ;; esac",
+        "a".repeat(8192)
+    );
+    assert_eq!(output(&script), "no");
+}
+
+#[test]
+fn case_posix_bracket_constructs_are_refused_by_name() {
+    for (pattern, diagnostic) in [
+        (
+            "[[:alpha:]]",
+            "`case` POSIX bracket classes are not supported",
+        ),
+        (
+            "[[.a.]]",
+            "`case` POSIX collating symbols are not supported",
+        ),
+        ("[[.a]", "`case` POSIX collating symbols are not supported"),
+        (
+            "[[=a=]]",
+            "`case` POSIX equivalence classes are not supported",
+        ),
+        (
+            "[[=a]",
+            "`case` POSIX equivalence classes are not supported",
+        ),
+    ] {
+        for script in [
+            format!("case a in {pattern}) echo yes ;; esac"),
+            format!("p='{pattern}'; case a in $p) echo yes ;; esac"),
+        ] {
+            let outcome = run(&script);
+            assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+            assert_eq!(outcome.output, diagnostic, "{script}");
+        }
+    }
+}
+
+#[test]
+fn case_backslashes_preserve_mixed_quote_boundaries() {
+    for (script, expected) in [
+        (
+            r"p='\'; case '\a' in $p'a') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case a in $p'a') echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r"p='\'; case '\abc' in $p'*') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case abc in $p'*') echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r"p='\'; case '\?' in $p'?') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case '\[' in $p'[') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case '\\' in $p'\') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
+
+#[test]
+fn case_matching_checks_the_deadline_inside_stars_and_brackets() {
+    for (subject, pattern) in [
+        ("a".repeat(8192), format!("{}b", "*a".repeat(4096))),
+        ("b".repeat(8192), format!("*[{}]", "a".repeat(65536))),
+    ] {
+        let script = format!("case '{subject}' in {pattern}) : ;; esac");
+        let outcome = run_with(
+            &script,
+            Limits {
+                timeout: Duration::from_millis(100),
+                max_value_bytes: 64 * 1024 * 1024,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(outcome.exit_code, ExitCode::TIMEOUT);
+    }
+}
+
+#[test]
+fn case_incomplete_posix_classes_are_refused_directly_and_after_expansion() {
+    for script in [
+        "case '[' in [a[:b]) echo yes ;; *) echo no ;; esac",
+        "p='[a[:b]'; case '[' in $p) echo yes ;; *) echo no ;; esac",
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert_eq!(
+            outcome.output, "`case` POSIX bracket classes are not supported",
+            "{script}"
+        );
+    }
+}
+
+#[test]
+fn case_quoted_positionals_select_the_first_expanded_field() {
+    for (script, expected) in [
+        (
+            r#"f() { IFS=:; case 'a b' in "$@") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "no",
+        ),
+        (
+            r#"f() { IFS=:; case a in "$@") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case xa in x"$@"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case 'xa by' in x"$@"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "no",
+        ),
+        (
+            r#"f() { IFS=:; case a in ${p:-"$@"}) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case a in "${p:-$@}") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case 'a b' in $@) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case a:b in "$*") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { case a in "$@"${p:=x}) echo "$p" ;; esac; }; f a b"#,
+            "x",
+        ),
+        (r#"f() { case '' in "$@") echo yes ;; esac; }; f"#, "yes"),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
+
+#[test]
+fn case_quoted_positionals_join_with_spaces_when_ifs_is_empty() {
+    let scripts = [
+        r#"f() { IFS=''; case 'a b' in "$@") echo yes ;; *) echo no ;; esac; }; f a b"#,
+        r#"f() { IFS=''; case 'xa by' in x"$@"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+        r#"f() { IFS=''; case 'xa by' in x${p:-"$@"}y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+        r#"f() { IFS=''; case 'xa by' in x"${p:-$@}"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+    ];
+    assert_eq!(scripts.map(output), ["yes"; 4]);
 }
 
 #[test]
