@@ -170,7 +170,9 @@ file is `0600` on Unix. Refresh rotates the token, so its directory must be writ
 secret-store export is a seed for one deployment, not a backup. Opaque encrypted reasoning
 items are stored only in `0600` journal files, replayed only to a model with an equal identity
 (backend, upstream model and reported model), and never sent to telemetry, a summarizer, a
-decider or another model.
+decider or another model. Replayed journal text reaches a model only as slices of those files, which the Codex,
+OpenRouter and OpenAI-compatible encoders stream into the request body through the gateway's
+own read-only descriptors; no descriptor crosses to the broker.
 
 Provider schemas are model-facing metadata, not general host input validation; each provider
 must validate capability-specific input. The shared agent loop accepts only typed tool
