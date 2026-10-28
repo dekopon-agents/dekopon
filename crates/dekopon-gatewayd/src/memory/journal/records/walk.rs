@@ -60,6 +60,7 @@ pub(crate) fn window(file: File, limit: NonZeroUsize) -> Result<Snapshot, Journa
         match &tag {
             b"{\"b\":" if !above => {
                 extent = at;
+                above = true;
                 continue;
             }
             b"{\"s\":" | b"{\"p\":" | b"{\"c\":" => {

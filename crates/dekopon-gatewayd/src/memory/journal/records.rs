@@ -152,11 +152,17 @@ struct RawHeaderLine {
 }
 
 #[cfg(test)]
-thread_local! { pub(super) static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    pub(super) static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DECODED_HEADERS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, JournalError> {
     #[cfg(test)]
-    DECODED_BYTES.with(|bytes| bytes.set(bytes.get() + line.len()));
+    {
+        DECODED_BYTES.with(|bytes| bytes.set(bytes.get() + line.len()));
+        DECODED_HEADERS.with_borrow_mut(|kinds| kinds.push(line.starts_with(b"{\"h\":")));
+    }
     serde_json::from_slice(line).map_err(corrupt)
 }
 
