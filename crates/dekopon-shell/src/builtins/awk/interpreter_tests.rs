@@ -312,6 +312,63 @@ fn the_twenty_nine_frozen_programs_run_through_interpreter() {
 }
 
 #[test]
+fn awk_diagnostics_reredirection_preserves_unterminated_text() {
+    stdout(
+        "{ { awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>&1; } >&2 | cat; printf END",
+        "[001]END",
+    );
+}
+
+#[test]
+fn awk_diagnostics_merged_terminated_lines_remain_text() {
+    stdout(
+        "{ awk 'BEGIN{printf \"a\\nb\\n\"}' >&2; } 2>&1 | wc -c",
+        "4\n",
+    );
+}
+
+#[test]
+fn awk_diagnostics_reredirection_keeps_actual_line_terminators() {
+    for (program, expected) in [
+        (r#"BEGIN{printf "a\n\nb\n"}"#, "a\n\nb\nEND"),
+        (r#"BEGIN{printf "a\n\nb"}"#, "a\n\nbEND"),
+        (r#"BEGIN{printf "\n\n"}"#, "\n\nEND"),
+    ] {
+        stdout(
+            &format!(
+                "{{ {{ awk {} >&2; }} 2>&1; }} >&2 | cat; printf END",
+                quote(program)
+            ),
+            expected,
+        );
+    }
+    stdout(
+        "{ awk 'BEGIN{printf \"p\"}' >&2; { awk 'BEGIN{printf \"a\\n\\n\"}' >&2; } 2>&1; } >&2 | cat; printf END",
+        "pa\n\nEND",
+    );
+}
+
+#[test]
+fn awk_diagnostics_reredirection_preserves_captured_buffer_bytes() {
+    stdout(
+        "{ { { awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>&1; } >&2; } 2>diag; wc -c diag",
+        "5\n",
+    );
+    stdout(
+        "{ { awk 'BEGIN{printf \"a\\nb\\n\"}' >&2; } 2>&1; } >diag; cat diag; printf END",
+        "a\nb\nEND",
+    );
+    stdout(
+        "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>diag; cat diag >&2 | cat; printf END",
+        "[001]END",
+    );
+    stdout(
+        "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>diag; { cat diag | cat >&2; } | cat; printf END",
+        "[001]END",
+    );
+}
+
+#[test]
 fn awk_diagnostics_capture_completion_preserves_the_buffer_byte_count() {
     for script in [
         "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>diag; wc -c diag",

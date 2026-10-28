@@ -436,6 +436,38 @@ enum Diagnostic {
 }
 
 impl Diagnostic {
+    fn from_result(result: &CommandResult) -> Option<Self> {
+        if result.value.is_null() {
+            return None;
+        }
+        let text = display(&result.value);
+        Some(if result.suppress_newline {
+            Self::Fragment(text)
+        } else {
+            Self::Line(text)
+        })
+    }
+
+    fn followed_by(self, next: Self) -> Self {
+        let mut text = match self {
+            Self::Line(mut text) => {
+                text.push('\n');
+                text
+            }
+            Self::Fragment(text) => text,
+        };
+        match next {
+            Self::Line(next) => {
+                text.push_str(&next);
+                Self::Line(text)
+            }
+            Self::Fragment(next) => {
+                text.push_str(&next);
+                Self::Fragment(text)
+            }
+        }
+    }
+
     fn into_result(self) -> CommandResult {
         match self {
             Self::Line(text) => CommandResult::value(Value::String(text)),
@@ -469,17 +501,8 @@ impl StderrCapture {
     }
 
     fn push(&mut self, line: &str) {
-        if !self.pending.is_empty() {
-            self.push_fragment(line);
-            self.flush_pending();
-            return;
-        }
-        if self.lines.len() >= self.max_lines || self.bytes + line.len() > self.max_bytes {
-            self.truncated = true;
-            return;
-        }
-        self.bytes += line.len();
-        self.lines.push(Diagnostic::Line(line.to_owned()));
+        self.push_fragment(line);
+        self.push_fragment("\n");
     }
 
     fn push_fragment(&mut self, text: &str) {
@@ -525,8 +548,7 @@ impl StderrCapture {
         while !prefix.is_char_boundary(end) {
             end -= 1;
         }
-        let text = prefix[..end].strip_suffix('\n').unwrap_or(&prefix[..end]);
-        self.push(text);
+        self.push_fragment(&prefix[..end]);
         if bytes.len() > room || end < prefix.len() {
             self.truncated = true;
         }
@@ -856,18 +878,8 @@ impl<'a> Evaluator<'a> {
     }
 
     fn write_redirected_diagnostics(&mut self, result: &CommandResult) {
-        if result.value.is_null() {
-            return;
-        }
-        let text = display(&result.value);
-        if result.suppress_newline {
-            if let Some(capture) = self.stderr_capture.last_mut() {
-                capture.push(text.strip_suffix('\n').unwrap_or(&text));
-            } else {
-                self.output.push_fragment(&text);
-            }
-        } else {
-            self.write_line(&text);
+        if let Some(diagnostic) = Diagnostic::from_result(result) {
+            self.write_diagnostic(diagnostic);
         }
     }
 
@@ -4354,23 +4366,19 @@ fn parameter_length(value: &Value) -> Value {
 }
 
 fn merge_diagnostics(result: &mut CommandResult, diagnostics: Vec<Diagnostic>) {
-    if diagnostics.is_empty() {
+    let mut diagnostics = diagnostics.into_iter();
+    let Some(first) = diagnostics.next() else {
         return;
-    }
-    let trailing_fragment = match diagnostics.last() {
-        Some(Diagnostic::Fragment(_)) => true,
-        Some(Diagnostic::Line(_)) | None => false,
     };
-    let mut lines = value::to_lines(&result.value);
-    lines.extend(diagnostics.into_iter().map(|diagnostic| match diagnostic {
-        Diagnostic::Line(text) | Diagnostic::Fragment(text) => text,
-    }));
-    if trailing_fragment {
-        result.value = Value::String(lines.join("\n"));
-        result.suppress_newline = true;
-    } else {
-        result.value = value::from_lines(lines);
-    }
+    let first = match Diagnostic::from_result(result) {
+        Some(output) => output.followed_by(first),
+        None => first,
+    };
+    let merged = diagnostics
+        .fold(first, Diagnostic::followed_by)
+        .into_result();
+    result.value = merged.value;
+    result.suppress_newline = merged.suppress_newline;
 }
 
 fn write_display(stdout: &mut PipeWriter<StageObservation>, value: &Value) -> WriteOutcome {
