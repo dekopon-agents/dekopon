@@ -11,7 +11,8 @@ use parking_lot::Mutex;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
 async fn run(resources: Arc<Resources>, queued: Queued, cancel: watch::Receiver<bool>) -> Next {
-    super::run(resources, queued, cancel, Arc::default()).await
+    let span = summarize_span(&queued.task, &queued.since);
+    super::run(resources, queued, cancel, Arc::default(), span).await
 }
 
 const STEM: &str = "reviewer/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -300,6 +301,7 @@ async fn a_refused_part_does_not_reopen_its_later_slots() {
 
 #[tokio::test]
 async fn a_panicked_summary_marks_its_later_parts() {
+    let (capture, _guard) = crate::tests::capture_spans();
     let (_dir, journal) = journal();
     let mut first = fixture();
     first.summaries = vec![Slot::Queued; 2];
@@ -348,6 +350,26 @@ async fn a_panicked_summary_marks_its_later_parts() {
     .unwrap();
     assert_eq!(script.calls.load(Ordering::Relaxed), 2);
     owned.shutdown().await;
+    let panicked: Vec<_> = capture
+        .records()
+        .into_iter()
+        .filter(|record| {
+            record.field("event") == Some("gateway_memory_summary_transition")
+                && record.field("memory.summary.failure") == Some("panicked")
+        })
+        .collect();
+    assert_eq!(
+        panicked
+            .iter()
+            .map(|record| record.field("memory.summary.part").unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "2"]
+    );
+    assert!(
+        panicked
+            .iter()
+            .all(|record| record.parent() == Some("memory.summarize"))
+    );
 }
 
 #[tokio::test]
@@ -1412,5 +1434,83 @@ fn a_turn_never_silently_disappears() {
             break;
         }
         budget = (budget / 2).max(1);
+    }
+}
+
+#[tokio::test]
+async fn each_slot_change_is_one_transition_event_inside_its_span() {
+    let (capture, _guard) = crate::tests::capture_spans();
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (resources, _script) = resources(Arc::clone(&journal), [Action::Text("summary")], true);
+    run(
+        Arc::new(resources),
+        Queued {
+            task: task(),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .await;
+    let transitions: Vec<_> = capture
+        .records()
+        .into_iter()
+        .filter(|record| record.field("event") == Some("gateway_memory_summary_transition"))
+        .collect();
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|record| (
+                record.field("memory.summary.from").unwrap(),
+                record.field("memory.summary.to").unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [("queued", "running"), ("running", "generated")]
+    );
+    assert!(
+        transitions
+            .iter()
+            .all(|record| record.parent() == Some("memory.summarize"))
+    );
+    assert_eq!(transitions[1].field("memory.summary.bytes"), Some("7"));
+    assert_eq!(transitions[1].field("memory.summary.text"), Some("summary"));
+}
+
+#[tokio::test]
+async fn an_overflowed_part_logs_one_drop_per_later_part() {
+    let (capture, _guard) = crate::tests::capture_spans();
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (tx, _rx) = mpsc::channel(1);
+    let sender = Sender {
+        queue: tx,
+        journal: Arc::clone(&journal),
+        counts: Arc::default(),
+    };
+    sender.enqueue(task()).await;
+    sender.enqueue(task()).await;
+    let records = capture.records();
+    for (event, field, value) in [
+        (
+            "gateway_memory_summary_dropped",
+            "memory.summary.failure",
+            "overflow",
+        ),
+        (
+            "gateway_memory_summary_transition",
+            "memory.summary.to",
+            "error",
+        ),
+    ] {
+        let parts: Vec<_> = records
+            .iter()
+            .filter(|record| record.field("event") == Some(event))
+            .map(|record| {
+                assert_eq!(record.field(field), Some(value));
+                assert_eq!(record.parent(), Some("memory.summarize"));
+                record.field("memory.summary.part").unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(parts, ["1", "2", "3"], "{event}");
     }
 }

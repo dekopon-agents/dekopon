@@ -638,6 +638,15 @@ impl Journal {
             File::open(parent)?.sync_all()?;
         }
         File::open(&self.dir)?.sync_all()?;
+        tracing::info!(
+            event = "gateway_memory_published",
+            memory.record.id = record.id.0.get(),
+            memory.generation = record.turn.0,
+            memory.record.bytes = size.0,
+            memory.record.items = record.original.len(),
+            memory.slots.queued = record.summaries.len(),
+            "gateway.memory.published"
+        );
         Ok(Some(record.id))
     }
 
@@ -652,7 +661,7 @@ impl Journal {
             let path = self.path(stem);
             let horizon = millis(now).saturating_sub(duration_millis(self.age_for(stem)));
             match sweep_file(&path, horizon) {
-                Ok(_) => {}
+                Ok(evicted) => expired(&evicted, Expiry::RecordAge),
                 Err(JournalError::Corrupt) => {
                     remove(&path);
                     tracing::warn!(
@@ -737,7 +746,15 @@ impl Journal {
         }
         for (index, last_cut) in cut {
             let path = &files[index].0;
-            records::rewrite_path(path, |header| header.id > last_cut)?;
+            let mut evicted = Vec::new();
+            records::rewrite_path(path, |header| {
+                let kept = header.id > last_cut;
+                if !kept {
+                    evicted.push(header.id);
+                }
+                kept
+            })?;
+            expired(&evicted, Expiry::AgentCap);
             if fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0) {
                 remove(path);
             }
@@ -806,11 +823,14 @@ impl Journal {
                             .and_then(|m| m.modified())
                             .is_ok_and(|modified| modified < limit)
                     }) {
-                        remove(&file_path);
-                        tracing::info!(
-                            event = "gateway_journal_expired",
-                            "gateway.journal.expired"
-                        );
+                        let evicted: Vec<RecordId> = records::scan_path(&file_path)
+                            .map(|snapshot| {
+                                snapshot.records.iter().map(|head| head.header.id).collect()
+                            })
+                            .unwrap_or_default();
+                        if remove(&file_path) {
+                            expired(&evicted, Expiry::FileAge);
+                        }
                     } else if records {
                         let age = self.age_for(&format!(
                             "{}/{}",
@@ -819,10 +839,7 @@ impl Journal {
                         ));
                         let horizon = millis(now).saturating_sub(duration_millis(age));
                         match sweep_file(&file_path, horizon) {
-                            Ok(true) => tracing::info!(
-                                event = "gateway_journal_expired",
-                                "gateway.journal.expired"
-                            ),
+                            Ok(evicted) => expired(&evicted, Expiry::RecordAge),
                             Err(JournalError::Corrupt) => {
                                 remove(&file_path);
                                 tracing::warn!(
@@ -832,7 +849,6 @@ impl Journal {
                                 );
                             }
                             Err(error) => return Err(error),
-                            Ok(false) => {}
                         }
                     }
                 }
@@ -842,7 +858,7 @@ impl Journal {
                 Some(extension) if extension == SEAL_EXTENSION => {
                     let modified = entry.metadata()?.modified()?;
                     if seal_cutoff.is_some_and(|limit| modified < limit) {
-                        true
+                        Some(Expiry::Seal)
                     } else {
                         match File::open(&path)
                             .map_err(JournalError::from)
@@ -855,27 +871,29 @@ impl Journal {
                                     reason = "corrupt",
                                     "gateway.journal.reset"
                                 );
-                                false
+                                None
                             }
                             Err(JournalError::Io {
                                 kind: io::ErrorKind::NotFound,
-                            }) => false,
+                            }) => None,
                             Err(error) => return Err(error),
-                            Ok(_) => false,
+                            Ok(_) => None,
                         }
                     }
                 }
-                Some(extension) if extension == FOLLOW_EXTENSION => {
-                    read_follow_marker(&path)?.is_some_and(|marker| marker.until_ms <= millis(now))
-                }
-                _ => false,
+                Some(extension) if extension == FOLLOW_EXTENSION => read_follow_marker(&path)?
+                    .is_some_and(|marker| marker.until_ms <= millis(now))
+                    .then_some(Expiry::Follow),
+                _ => None,
             };
-            if stale && remove(&path) {
-                if records
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == FOLLOW_EXTENSION)
-                {
+            if let Some(reason) = stale
+                && remove(&path)
+            {
+                let follow = match reason {
+                    Expiry::Follow => true,
+                    Expiry::FileAge | Expiry::RecordAge | Expiry::AgentCap | Expiry::Seal => false,
+                };
+                if records && follow {
                     tracing::info!(
                         audit.event = "gateway.follow",
                         operation = "banished",
@@ -883,7 +901,7 @@ impl Journal {
                         "gateway.follow"
                     );
                 }
-                tracing::info!(event = "gateway_journal_expired", "gateway.journal.expired");
+                expired(&[], reason);
             }
         }
         Ok(())
@@ -1012,15 +1030,57 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn sweep_file(path: &Path, horizon: u64) -> Result<bool, JournalError> {
+fn sweep_file(path: &Path, horizon: u64) -> Result<Vec<RecordId>, JournalError> {
+    let mut evicted = Vec::new();
     if records::first_header(path)?.is_none_or(|header| header.at_ms >= horizon) {
-        return Ok(false);
+        return Ok(evicted);
     }
-    records::rewrite_path(path, |header| header.at_ms >= horizon)?;
+    records::rewrite_path(path, |header| {
+        let kept = header.at_ms >= horizon;
+        if !kept {
+            evicted.push(header.id);
+        }
+        kept
+    })?;
     if fs::metadata(path)?.len() == 0 {
         remove(path);
     }
-    Ok(true)
+    Ok(evicted)
+}
+
+#[derive(Clone, Copy)]
+enum Expiry {
+    FileAge,
+    RecordAge,
+    AgentCap,
+    Seal,
+    Follow,
+}
+
+fn expired(evicted: &[RecordId], reason: Expiry) {
+    let whole_file = match reason {
+        Expiry::FileAge | Expiry::Seal | Expiry::Follow => true,
+        Expiry::RecordAge | Expiry::AgentCap => false,
+    };
+    if evicted.is_empty() && !whole_file {
+        return;
+    }
+    let ids: Vec<String> = evicted.iter().map(|id| id.0.to_string()).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    dekopon_telemetry::with_event_string_array("memory.record.ids", &ids, || {
+        tracing::info!(
+            event = "gateway_journal_expired",
+            memory.records.evicted = evicted.len(),
+            memory.expiry.reason = match reason {
+                Expiry::FileAge => "file-age",
+                Expiry::RecordAge => "record-age",
+                Expiry::AgentCap => "agent-cap",
+                Expiry::Seal => "seal",
+                Expiry::Follow => "follow",
+            },
+            "gateway.journal.expired"
+        );
+    });
 }
 
 #[cfg(test)]

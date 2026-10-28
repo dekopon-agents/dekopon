@@ -799,13 +799,37 @@ fn a_turn_larger_than_the_agent_cap_is_refused_without_evicting_older_turns() {
 
 #[test]
 fn a_file_untouched_past_the_retention_is_deleted() {
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone, Default)]
+    struct RecordIds(Arc<parking_lot::Mutex<Vec<Vec<String>>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordIds {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(array) = opentelemetry::Context::current()
+                .get::<dekopon_telemetry::EventStringArray>()
+                .filter(|array| array.name == "memory.record.ids")
+            {
+                self.0.lock().push(array.values.clone());
+            }
+        }
+    }
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let ids = RecordIds::default();
+    let _guard = tracing_subscriber::registry()
+        .with(capture.clone())
+        .with(ids.clone())
+        .set_default();
     let dir = tempfile::tempdir().unwrap();
     let journal = open(dir.path());
     let now = SystemTime::now();
     let agent = "reviewer".parse().unwrap();
     let [stale, fresh] = ["stale", "fresh"]
         .map(|conversation| ConversationKey::shared(&agent, "slack", conversation).journal_stem());
-    append_user(&journal, &stale, now, "stale");
+    let first = append_user(&journal, &stale, now, "stale");
+    let second = append_user(&journal, &stale, now, "stale again");
     append_user(&journal, &fresh, now, "fresh");
     File::options()
         .write(true)
@@ -816,6 +840,19 @@ fn a_file_untouched_past_the_retention_is_deleted() {
     journal.maintain(&fresh, now, 1);
     assert!(!journal.path(&stale).exists());
     assert_eq!(users(&journal.path(&fresh)), ["fresh"]);
+    let expired = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_journal_expired"),
+            ("memory.expiry.reason", "file-age"),
+        ],
+    );
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].field("memory.records.evicted"), Some("2"));
+    assert_eq!(
+        *ids.0.lock(),
+        [vec![first.0.to_string(), second.0.to_string()]]
+    );
 }
 
 #[test]
@@ -897,6 +934,59 @@ fn the_directory_and_its_files_are_private_to_the_daemon() {
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&dir.join("reviewer")), 0o700);
     assert_eq!(mode(&journal.path(STEM)), 0o600);
+}
+
+#[test]
+fn published_and_expired_records_name_their_ids_and_reason() {
+    let (capture, _guard) = crate::tests::capture_spans();
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(dir.path());
+    let now = SystemTime::now();
+    let swept = append_turn(
+        &journal,
+        STEM,
+        now - 2 * RETENTION,
+        &captured("swept", Some("answer")),
+        Some(plan(2)),
+    );
+    let capped = append_user(&journal, STEM, now - Duration::from_secs(1), "capped");
+    let kept = append_user(&journal, STEM, now, "kept");
+    journal.maintain(STEM, now, 1);
+    let len = fs::metadata(journal.path(STEM)).unwrap().len();
+    journal.agent_bytes.insert("reviewer".to_owned(), len - 1);
+    journal.maintain(STEM, now, 1);
+    assert_eq!(header_ids(&journal.path(STEM)), [kept.0.get()]);
+
+    let records = capture.records();
+    let published: Vec<_> = records
+        .iter()
+        .filter(|record| record.field("event") == Some("gateway_memory_published"))
+        .collect();
+    assert_eq!(published.len(), 3);
+    assert_eq!(
+        published[0].field("memory.record.id"),
+        Some(swept.0.to_string().as_str())
+    );
+    assert_eq!(published[0].field("memory.record.items"), Some("2"));
+    assert_eq!(published[0].field("memory.slots.queued"), Some("2"));
+    let expired: Vec<_> = records
+        .iter()
+        .filter(|record| record.field("event") == Some("gateway_journal_expired"))
+        .map(|record| {
+            (
+                record.field("memory.expiry.reason").unwrap().to_owned(),
+                record.field("memory.records.evicted").unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        expired,
+        [
+            ("record-age".to_owned(), "1".to_owned()),
+            ("agent-cap".to_owned(), "1".to_owned())
+        ]
+    );
+    let _ = capped;
 }
 
 #[test]

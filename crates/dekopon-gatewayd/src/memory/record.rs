@@ -82,6 +82,15 @@ pub(crate) enum Slot {
 }
 
 impl Slot {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Generated(_) => "generated",
+            Self::Error(_) => "error",
+        }
+    }
+
     pub(crate) const fn is_pending(&self) -> bool {
         match self {
             Self::Queued | Self::Running => true,
@@ -111,6 +120,21 @@ pub(crate) enum SummaryFailure {
         kind: io::ErrorKind,
     },
     Unconfigured,
+}
+
+impl SummaryFailure {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Refused => "refused",
+            Self::ModelFailed => "model-failed",
+            Self::Empty => "empty",
+            Self::Overflow => "overflow",
+            Self::Panicked => "panicked",
+            Self::Io { .. } => "io",
+            Self::Unconfigured => "unconfigured",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
