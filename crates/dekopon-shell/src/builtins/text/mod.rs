@@ -83,12 +83,26 @@ pub(crate) fn extended_pattern(
     pattern: &str,
     ignore_case: bool,
 ) -> Result<Regex, CommandFailure> {
+    check_extended_length(command, pattern)?;
+    build_extended(command, pattern, pattern, ignore_case)
+}
+
+pub(crate) fn check_extended_length(command: &str, pattern: &str) -> Result<(), CommandFailure> {
     if pattern.len() > EXTENDED_PATTERN_MAX_BYTES {
         return Err(CommandFailure::usage(format!(
             "{command}: -E pattern is {} bytes; the limit is {EXTENDED_PATTERN_MAX_BYTES}",
             pattern.len()
         )));
     }
+    Ok(())
+}
+
+pub(crate) fn build_extended(
+    command: &str,
+    original: &str,
+    pattern: &str,
+    ignore_case: bool,
+) -> Result<Regex, CommandFailure> {
     RegexBuilder::new(pattern)
         .case_insensitive(ignore_case)
         .size_limit(EXTENDED_PATTERN_SIZE_LIMIT)
@@ -96,7 +110,7 @@ pub(crate) fn extended_pattern(
         .build()
         .map_err(|error| {
             CommandFailure::usage(format!(
-                "{command}: -E pattern {pattern:?} did not compile: {error}"
+                "{command}: -E pattern {original:?} did not compile: {error}"
             ))
         })
 }
