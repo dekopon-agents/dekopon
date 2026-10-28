@@ -1,6 +1,5 @@
 use super::*;
 use crate::{collection::Dispositions, pull_request_links::PullRequestLinkContext, session::Admit};
-use tracing::instrument::WithSubscriber as _;
 
 const PR: &str = "https://github.com/acme/widget/pull/17";
 
@@ -90,6 +89,13 @@ async fn only_a_keyed_unaddressed_human_channel_pr_link_is_admitted() {
             let mut transport = slack_with(&http.base, experience, LivenessConfig::default())
                 .with_generation(fixture.generation.clone());
             transport.connect().await.unwrap();
+            let direct = next_message(&mut transport).await;
+            assert_eq!(
+                direct.message_id,
+                MessageId::Native("1700000000.000006".into())
+            );
+            assert_eq!(direct.conversation.kind, ConversationKind::DirectMessage);
+            assert!(direct.pull_request_links.is_none());
             let mentioned = next_message(&mut transport).await;
             assert_eq!(
                 mentioned.message_id,
@@ -101,7 +107,7 @@ async fn only_a_keyed_unaddressed_human_channel_pr_link_is_admitted() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_follow_ticket() {
     for mapped in [false, true] {
         for experience in [SlackExperience::Classic, SlackExperience::Agent] {
@@ -193,15 +199,16 @@ async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_foll
                 fixture.table.ticket(&fixture.key, SystemTime::now()),
                 crate::follow::FollowTicket::Active { .. }
             ));
-            let calls = http.calls.lock();
-            let posts: Vec<Value> = calls
-                .iter()
-                .filter(|(path, _)| path == "/api/chat.postMessage")
-                .map(|(_, body)| serde_json::from_str(body).unwrap())
-                .collect();
+            let posts: Vec<Value> = {
+                let calls = http.calls.lock();
+                calls
+                    .iter()
+                    .filter(|(path, _)| path == "/api/chat.postMessage")
+                    .map(|(_, body)| serde_json::from_str(body).unwrap())
+                    .collect()
+            };
             assert_eq!(posts.len(), 1);
             assert_eq!(posts[0]["thread_ts"], "1700000000.000001");
-            drop(calls);
             assert_eq!(
                 capture
                     .events_where(

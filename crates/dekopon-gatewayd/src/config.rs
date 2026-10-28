@@ -4169,11 +4169,14 @@ routes:
                 .pull_request_links
         );
         assert!(matches!(
-            resolved(&format!(
-                "{journal}{slack}{}",
-                route.replace("pullRequestLinks: true", "pullRequestLinks: yes")
-            )),
-            Err(ConfigError::Parse { .. })
+            super::decode(
+                format!(
+                    "{PREAMBLE}{journal}{slack}{}",
+                    route.replace("pullRequestLinks: true", "pullRequestLinks: yes")
+                )
+                .as_bytes()
+            ),
+            Err(ConfigError::Decode { .. })
         ));
     }
 

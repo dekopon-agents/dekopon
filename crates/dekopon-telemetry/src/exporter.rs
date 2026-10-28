@@ -720,9 +720,11 @@ mod event_array_tests {
             .build();
         let logger = provider.logger("array-test");
         crate::with_event_string_array("github.deliveries", &["first", "second"], || {
-            let mut record = logger.create_log_record();
-            record.add_attribute("outcome", "queued");
-            logger.emit(record);
+            crate::with_event_string_array("github.repository.names", &["one", "two"], || {
+                let mut record = logger.create_log_record();
+                record.add_attribute("outcome", "queued");
+                logger.emit(record);
+            });
         });
         logger.emit(logger.create_log_record());
         let records = capture.0.lock();
@@ -737,10 +739,19 @@ mod event_array_tests {
                 AnyValue::from("second")
             ]))
         );
+        let (_, names) = records[0]
+            .attributes_iter()
+            .find(|(key, _)| key.as_str() == "github.repository.names")
+            .unwrap();
+        assert_eq!(
+            names,
+            &AnyValue::ListAny(Box::new(vec![AnyValue::from("one"), AnyValue::from("two")]))
+        );
         assert!(
             !records[1]
                 .attributes_iter()
-                .any(|(key, _)| key.as_str() == "github.deliveries")
+                .any(|(key, _)| key.as_str() == "github.deliveries"
+                    || key.as_str() == "github.repository.names")
         );
     }
 }
