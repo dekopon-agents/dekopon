@@ -22,22 +22,40 @@ impl PullRequestLinkContext {
                 text,
                 crate::transport::MAX_INBOUND_TEXT_BYTES,
             )];
-            &prefix[..prefix.rfind(delimiter).unwrap_or(0)]
+            let end = prefix
+                .char_indices()
+                .rev()
+                .find(|(_, c)| delimiter(*c))
+                .map_or(0, |(index, c)| index + c.len_utf8());
+            &prefix[..end]
         } else {
             text
         };
+        let mut remaining = text;
+        let mut targets = Vec::new();
+        loop {
+            let (bare, slack) = remaining.split_once('<').unwrap_or((remaining, ""));
+            targets.extend(
+                bare.split(delimiter)
+                    .filter_map(PullRequestLinkTarget::parse),
+            );
+            let Some((link, tail)) = slack.split_once('>') else {
+                break;
+            };
+            let url = link.split_once('|').map_or(link, |(url, _)| url);
+            if let Some(target) = PullRequestLinkTarget::parse(url) {
+                targets.push(target);
+            }
+            remaining = tail;
+        }
         let mut seen = HashSet::new();
-        let targets: Vec<_> = text
-            .split(delimiter)
-            .filter_map(PullRequestLinkTarget::parse)
-            .filter(|target| {
-                seen.insert((
-                    target.owner.clone(),
-                    target.repo.clone(),
-                    target.number.to_string(),
-                ))
-            })
-            .collect();
+        targets.retain(|target| {
+            seen.insert((
+                target.owner.clone(),
+                target.repo.clone(),
+                target.number.to_string(),
+            ))
+        });
         (!targets.is_empty()).then_some(Self { targets })
     }
 

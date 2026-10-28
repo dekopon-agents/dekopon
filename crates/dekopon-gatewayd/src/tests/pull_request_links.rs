@@ -46,6 +46,38 @@ fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data(
 }
 
 #[test]
+fn a_non_pr_slack_hyperlink_does_not_start_a_review_from_its_display_label() {
+    assert!(
+        PullRequestLinkContext::parse(
+            "<https://github.com/acme/widget/issues/17|https://github.com/other/repo/pull/18>"
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn a_pr_slack_hyperlink_reviews_only_its_url_and_bare_links_outside_it() {
+    let links = PullRequestLinkContext::parse(&format!(
+        "{PR} <{PR}|https://github.com/other/repo/pull/18> \
+         https://github.com/third/project/pull/19"
+    ))
+    .unwrap();
+    assert_eq!(links.targets.len(), 2);
+    assert_eq!(links.targets[0].owner, "acme");
+    assert_eq!(links.targets[0].repo, "widget");
+    assert_eq!(
+        links.targets[0].number,
+        dekopon_core::github::GithubNumber::new(17).unwrap()
+    );
+    assert_eq!(links.targets[1].owner, "third");
+    assert_eq!(links.targets[1].repo, "project");
+    assert_eq!(
+        links.targets[1].number,
+        dekopon_core::github::GithubNumber::new(19).unwrap()
+    );
+}
+
+#[test]
 fn a_truncated_pr_link_is_never_reinterpreted_as_a_shorter_number() {
     let url = "https://github.com/acme/widget/pull/123";
     let text = format!(
@@ -53,6 +85,22 @@ fn a_truncated_pr_link_is_never_reinterpreted_as_a_shorter_number() {
         " ".repeat(MAX_INBOUND_TEXT_BYTES - url.len() + 1)
     );
     assert!(PullRequestLinkContext::parse(&text).is_none());
+}
+
+#[test]
+fn truncation_keeps_complete_slack_hyperlinks_and_drops_incomplete_ones() {
+    let complete = format!("<{PR}|review>{}", "x".repeat(MAX_INBOUND_TEXT_BYTES));
+    let links = PullRequestLinkContext::parse(&complete).unwrap();
+    assert_eq!(links.targets.len(), 1);
+    assert_eq!(
+        links.targets[0].number,
+        dekopon_core::github::GithubNumber::new(17).unwrap()
+    );
+    let incomplete = format!(
+        "<https://github.com/acme/widget/issues/17|{PR} {}>",
+        "x".repeat(MAX_INBOUND_TEXT_BYTES)
+    );
+    assert!(PullRequestLinkContext::parse(&incomplete).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -76,6 +124,12 @@ async fn only_a_keyed_unaddressed_human_channel_pr_link_is_admitted() {
                     "1700000000.000005",
                     None,
                     "https://github.com/acme/widget/issues/17",
+                ),
+                channel_message(
+                    "u9xyz",
+                    "1700000000.000009",
+                    None,
+                    "<https://github.com/acme/widget/issues/17|https://github.com/other/repo/pull/18>",
                 ),
                 dm,
             ];
@@ -127,7 +181,7 @@ async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_foll
                 "u9xyz",
                 "1700000000.000001",
                 Some("1700000000.000001"),
-                &format!("<{PR}|review> {PR}"),
+                &format!("<{PR}|https://github.com/other/repo/pull/18> {PR}"),
             );
             let socket = spawn_socket_mock(vec![
                 events_envelope("start", event.clone()),
@@ -236,19 +290,28 @@ async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_foll
             assert!(
                 matches!(request.request, BrokerRequest::Capabilities { attestation: Some(Attestation { subject, scope: Some(ref scope), .. }) } if subject == inbound.subject && scope.trigger == dekopon_broker_protocol::Trigger::Message)
             );
-            for request in broker.recorded() {
-                if let BrokerRequest::Invoke {
-                    attestation: Some(claim),
-                    ..
-                } = request.request
-                {
-                    assert_eq!(claim.subject, inbound.subject);
-                    assert_eq!(
-                        claim.scope.unwrap().participant.as_deref(),
-                        mapped.then_some("p1")
-                    );
-                }
-            }
+            let runs = broker
+                .recorded()
+                .into_iter()
+                .filter(|request| matches!(request.request, BrokerRequest::Run { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(runs.len(), 1);
+            let BrokerRequest::Run {
+                word,
+                argv,
+                attestation: Some(claim),
+                ..
+            } = &runs[0].request
+            else {
+                panic!("follow command expected")
+            };
+            assert_eq!(word, "follow");
+            assert_eq!(argv, &[dekopon_broker_protocol::Arg::Text("stay".into())]);
+            assert_eq!(claim.subject, inbound.subject);
+            assert_eq!(
+                claim.scope.as_ref().unwrap().participant.as_deref(),
+                mapped.then_some("p1")
+            );
         }
     }
 }
