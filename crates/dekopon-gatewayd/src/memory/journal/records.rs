@@ -152,11 +152,17 @@ struct RawHeaderLine {
 }
 
 #[cfg(test)]
-thread_local! { pub(super) static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    pub(super) static DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DECODED_HEADERS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 fn decode_line<T: serde::de::DeserializeOwned>(line: &[u8]) -> Result<T, JournalError> {
     #[cfg(test)]
-    DECODED_BYTES.with(|bytes| bytes.set(bytes.get() + line.len()));
+    {
+        DECODED_BYTES.with(|bytes| bytes.set(bytes.get() + line.len()));
+        DECODED_HEADERS.with_borrow_mut(|kinds| kinds.push(line.starts_with(b"{\"h\":")));
+    }
     serde_json::from_slice(line).map_err(corrupt)
 }
 
@@ -1230,6 +1236,11 @@ impl Journal {
                     if path.exists() {
                         fs::remove_file(path)?;
                         boot.reset = boot.reset.saturating_add(1);
+                        tracing::warn!(
+                            event = "gateway_journal_reset",
+                            reason = "crashed",
+                            "gateway.journal.reset"
+                        );
                     }
                     boot.crashed_files = boot.crashed_files.saturating_add(1);
                 }
@@ -1285,6 +1296,11 @@ impl Journal {
                     Err(_unloadable) => {
                         fs::remove_file(&path)?;
                         boot.reset = boot.reset.saturating_add(1);
+                        tracing::warn!(
+                            event = "gateway_journal_reset",
+                            reason = "corrupt",
+                            "gateway.journal.reset"
+                        );
                     }
                 }
                 fs::remove_file(&marker)?;

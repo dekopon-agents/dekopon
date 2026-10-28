@@ -5805,6 +5805,22 @@ async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     assert_eq!(driver.events(), ["working-start", "reply", "idle"]);
 }
 
+async fn first_indicator(driver: &RecordingDriver) {
+    use dekopon_test_support::DriverCall;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !driver.calls().iter().any(|call| {
+            matches!(
+                call,
+                DriverCall::Reaction { .. } | DriverCall::Status { .. } | DriverCall::Typing { .. }
+            )
+        }) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("an indicator opens before the reply");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
     use dekopon_test_support::DriverCall;
@@ -5880,6 +5896,13 @@ async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         ));
         model.wait_until_entered().await;
+        let indicator_expected = reaction_expected
+            || (status && !status_off)
+            || (typing && !typing_off && (status_off || !status));
+        // The progress task opens indicators on `Started`, and a reply that beats it never shows one.
+        if indicator_expected {
+            first_indicator(&driver).await;
+        }
         model.release();
         session.await.expect("session completes");
         if reaction_expected {
