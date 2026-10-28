@@ -4,9 +4,11 @@ use dekopon_process::{
     CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, ShellThreads, ThreadName, ThreadPermit,
     TreeContext,
 };
+mod case;
 mod ifs;
 mod nesting;
 pub(crate) mod stage_out;
+use case::CaseExpansion;
 use ifs::{Action, Boundary, Ifs, Kind};
 use stage_out::{OutputMode, StageOut};
 
@@ -27,10 +29,10 @@ use serde_json::Value;
 use crate::{
     CapabilityCallResult, CapabilityInvoker, JobSeed, ScriptOutcome,
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
-        CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
-        Index, Modifier, Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget,
-        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CaseStatement,
+        Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
+        Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget, SimpleCommand, Statement,
+        Stream, WhileLoop, Word, WordPart,
     },
     builtins::{
         self, Builtin, BuiltinContext, CommandFailure, CommandResult, ControlWord, FatalError,
@@ -621,8 +623,9 @@ enum PreservedExpansion {
     Unsplit,
 }
 
-struct FieldExpansion<'a> {
-    spans: &'a mut Vec<ExpansionSpan>,
+enum ParameterExpansion<'a> {
+    Fields(&'a mut Vec<ExpansionSpan>),
+    Case(&'a mut CaseExpansion),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1017,38 +1020,12 @@ impl<'a> Evaluator<'a> {
         for clause in &statement.clauses {
             for pattern in &clause.patterns {
                 self.budget.charge_step()?;
-                let matched = match pattern {
-                    CasePattern::Any => true,
-                    CasePattern::Literal(word) => {
-                        match self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit) {
-                            Ok(expanded) => expanded.join(" ") == subject,
-                            Err(failure) => {
-                                let status = self.absorb(failure)?;
-                                self.last_status = status;
-                                return Ok(Flow::Normal);
-                            }
-                        }
-                    }
-                    CasePattern::Expanded(word) => {
-                        let expanded = match self
-                            .expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)
-                        {
-                            Ok(expanded) => expanded.join(" "),
-                            Err(failure) => {
-                                let status = self.absorb(failure)?;
-                                self.last_status = status;
-                                return Ok(Flow::Normal);
-                            }
-                        };
-                        if let Some(character) = pattern_metacharacter(&expanded) {
-                            self.write_line(&format!(
-                                "dekopon-shell: {}",
-                                expanded_pattern(character)
-                            ));
-                            self.last_status = ExitCode::SYNTAX;
-                            return Ok(Flow::Normal);
-                        }
-                        expanded == subject
+                let matched = match self.case_matches(pattern, &subject) {
+                    Ok(matched) => matched,
+                    Err(failure) => {
+                        let status = self.absorb(failure)?;
+                        self.last_status = status;
+                        return Ok(Flow::Normal);
                     }
                 };
                 if matched {
@@ -3583,7 +3560,7 @@ impl<'a> Evaluator<'a> {
                     name,
                     indices,
                     modifier,
-                    Some(FieldExpansion { spans }),
+                    Some(ParameterExpansion::Fields(spans)),
                     ExpansionOutput::Unsplit,
                 )
             }),
@@ -3607,11 +3584,12 @@ impl<'a> Evaluator<'a> {
     fn expand_selected_word(
         &mut self,
         word: &Word,
-        split: Option<FieldExpansion<'_>>,
+        split: Option<ParameterExpansion<'_>>,
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         match split {
-            Some(split) => self.expand_replacement(word, split.spans),
+            Some(ParameterExpansion::Fields(spans)) => self.expand_replacement(word, spans),
+            Some(ParameterExpansion::Case(pattern)) => self.expand_case_replacement(word, pattern),
             None => self.expansion_value(word, output),
         }
     }
@@ -3619,10 +3597,12 @@ impl<'a> Evaluator<'a> {
     fn finish_parameter(
         &mut self,
         value: Value,
-        split: Option<FieldExpansion<'_>>,
+        split: Option<ParameterExpansion<'_>>,
     ) -> Result<Value, CommandFailure> {
-        if let Some(split) = split {
-            self.record_value(split.spans, &value)?;
+        match split {
+            Some(ParameterExpansion::Fields(spans)) => self.record_value(spans, &value)?,
+            Some(ParameterExpansion::Case(pattern)) => pattern.append_value(&value)?,
+            None => {}
         }
         Ok(value)
     }
@@ -3894,16 +3874,15 @@ impl<'a> Evaluator<'a> {
         name: &str,
         indices: &[Index],
         modifier: &Modifier,
-        mut split: Option<FieldExpansion<'_>>,
+        mut split: Option<ParameterExpansion<'_>>,
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         let (value, bound) = self.select_parameter(
             name,
             indices,
-            if split.is_some() {
-                ExpansionOutput::Fields
-            } else {
-                output
+            match &split {
+                Some(ParameterExpansion::Fields(_)) => ExpansionOutput::Fields,
+                Some(ParameterExpansion::Case(_)) | None => output,
             },
         )?;
         if self.options.nounset && !bound && *modifier == Modifier::None {

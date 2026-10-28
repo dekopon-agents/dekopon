@@ -12,7 +12,7 @@ use refusal::{Found, Refusal, TooDeep};
 use crate::{
     ast::{
         AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Assignment, Background,
-        CaseClause, CasePattern, CaseStatement, Command, Conditional, ConditionalTest, ForLoop,
+        CaseClause, CaseStatement, Command, Conditional, ConditionalTest, ForLoop,
         FunctionDefinition, IfStatement, Pattern, Pipeline, Program, Redirect, RedirectTarget,
         SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
@@ -497,7 +497,7 @@ impl<'a> Parser<'a> {
         self.nest(Construct::Case)?.parse_case_body(patterns)
     }
 
-    fn parse_case_pattern(&mut self) -> Result<CasePattern, ParseError> {
+    fn parse_case_pattern(&mut self) -> Result<Word, ParseError> {
         let line = self.line();
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
             let found = self.peek_kind().cloned();
@@ -512,20 +512,7 @@ impl<'a> Parser<'a> {
 
         self.position += 1;
 
-        if word.as_literal() == Some("*") {
-            return Ok(CasePattern::Any);
-        }
-
-        if word_is_constant(&word) {
-            if let Some(character) = literal_pattern_metacharacter(&word) {
-                return Err(ParseError::refused(
-                    line,
-                    Refusal::CasePattern { character },
-                ));
-            }
-            return Ok(CasePattern::Literal(word));
-        }
-        Ok(CasePattern::Expanded(word))
+        Ok(word)
     }
 
     fn parse_and_or_list(&mut self) -> Result<AndOrList, ParseError> {
@@ -846,11 +833,11 @@ impl<'a> Parser<'a> {
 
 /// `]` is deliberately absent from this table: only `[` opens a character class, so `[ab]` is still
 /// caught by its bracket while a lone `a]` is left alone.
-const CASE_METACHARACTERS: &[char] = &['*', '?', '['];
+const PATTERN_METACHARACTERS: &[char] = &['*', '?', '['];
 
 pub(crate) fn pattern_metacharacter(text: &str) -> Option<char> {
     text.chars()
-        .find(|character| CASE_METACHARACTERS.contains(character))
+        .find(|character| PATTERN_METACHARACTERS.contains(character))
 }
 
 pub(crate) fn expanded_pattern(character: char) -> String {
@@ -872,14 +859,15 @@ fn word_is_constant(word: &Word) -> bool {
     parts_are_constant(&word.parts)
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "reshaped by the unit that next rewrites this"
-)]
 fn literal_pattern_metacharacter(word: &Word) -> Option<char> {
     word.parts.iter().find_map(|part| match part {
         WordPart::Literal(text) => pattern_metacharacter(text),
-        _ => None,
+        WordPart::Asset(_)
+        | WordPart::SingleQuoted(_)
+        | WordPart::DoubleQuoted(_)
+        | WordPart::Parameter(_)
+        | WordPart::CommandSubstitution(_)
+        | WordPart::Arithmetic(_) => None,
     })
 }
 
@@ -1268,8 +1256,8 @@ impl ArithParser {
 #[cfg(test)]
 mod tests {
     use crate::ast::{
-        ArithBinaryOp, ArithExpr, CasePattern, Command, Redirect, RedirectTarget, SimpleCommand,
-        Statement, Stream, Word, WordPart,
+        ArithBinaryOp, ArithExpr, Command, Redirect, RedirectTarget, SimpleCommand, Statement,
+        Stream, Word, WordPart,
     };
 
     use super::{Construct, ParseError, Refusal, TokenKind, parse};
@@ -1361,11 +1349,11 @@ mod tests {
                                                 parts: vec![WordPart::Literal("ready".to_owned())]
                                             },
                                             clauses: vec![crate::ast::CaseClause {
-                                                patterns: vec![CasePattern::Literal(Word {
+                                                patterns: vec![Word {
                                                     parts: vec![WordPart::Literal(
                                                         "ready".to_owned()
                                                     )]
-                                                })],
+                                                }],
                                                 body: crate::ast::Program {
                                                     statements: vec![Statement::List(
                                                         crate::ast::AndOrList {
@@ -1719,7 +1707,7 @@ mod tests {
         };
         assert_eq!(statement.clauses.len(), 3);
         assert_eq!(statement.clauses[0].patterns.len(), 2);
-        assert!(matches!(statement.clauses[2].patterns[0], CasePattern::Any));
+        assert_eq!(statement.clauses[2].patterns[0].as_literal(), Some("*"));
     }
 
     #[test]
@@ -1732,31 +1720,27 @@ mod tests {
     }
 
     #[test]
-    fn case_patterns_that_would_glob_are_rejected_by_name() {
-        for (source, expected) in [
-            ("case $f in *.json) echo j ;; esac", '*'),
-            ("case $f in a?c) echo q ;; esac", '?'),
-            ("case $f in [ab]) echo c ;; esac", '['),
+    fn case_patterns_preserve_globs_and_quoted_parts() {
+        for (pattern, parts) in [
+            ("*.json", vec![WordPart::Literal("*.json".to_owned())]),
+            ("a?c", vec![WordPart::Literal("a?c".to_owned())]),
+            ("[ab]", vec![WordPart::Literal("[ab]".to_owned())]),
+            (
+                "'*'.json",
+                vec![
+                    WordPart::SingleQuoted("*".to_owned()),
+                    WordPart::Literal(".json".to_owned()),
+                ],
+            ),
+            (r"\*", vec![WordPart::SingleQuoted("*".to_owned())]),
         ] {
-            assert_refusal(
-                source,
-                Refusal::CasePattern {
-                    character: expected,
-                },
-            );
+            let source = format!("case $f in {pattern}) echo yes ;; esac");
+            let program = parse(&source).expect("case pattern");
+            let Statement::Case(statement) = &compound_in(&program.statements[0]) else {
+                panic!("expected a case statement");
+            };
+            assert_eq!(statement.clauses[0].patterns, vec![Word { parts }]);
         }
-
-        assert!(parse("case $f in '*') echo star ;; esac").is_ok());
-
-        let program = parse("case $f in \\*) echo star ;; esac").expect("valid script");
-        let Statement::Case(statement) = &compound_in(&program.statements[0]) else {
-            panic!("expected a case statement");
-        };
-        assert!(matches!(
-            statement.clauses[0].patterns[0],
-            CasePattern::Literal(_)
-        ));
-        assert!(parse("case $f in a\\*b) echo star ;; esac").is_ok());
     }
 
     #[test]

@@ -104,9 +104,6 @@ pub(crate) enum Refusal {
     ExpectedCasePattern {
         found: Found,
     },
-    CasePattern {
-        character: char,
-    },
     ExpectedCondition {
         found: Found,
     },
@@ -194,7 +191,6 @@ impl std::fmt::Display for Refusal {
             Self::ExpectedCaseSubject => formatter.write_str("expected a word to match after `case`"),
             Self::ExpectedCasePatternClose => formatter.write_str("expected `)` to close a `case` pattern list"),
             Self::ExpectedCasePattern { found } => write!(formatter, "expected a `case` pattern, found {found}"),
-            Self::CasePattern { character } => write!(formatter, "`case` patterns are literal: `{character}` is not supported; quote it as `'{character}'`, list alternatives with `|`, or use `*)` for the default"),
             Self::ExpectedCondition { found } => write!(formatter, "expected a condition inside `[[ ... ]]`, found {found}"),
             Self::TooManyConditionOperands => formatter.write_str("a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses"),
             Self::RegexCondition => formatter.write_str("`=~` regex matching is not supported: every pattern in this shell is literal text; compare with `==`, or match structurally with `jq`"),
