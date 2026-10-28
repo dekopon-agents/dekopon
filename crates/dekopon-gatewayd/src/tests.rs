@@ -1063,6 +1063,28 @@ async fn summaries_refuse_unknown_and_proxy_only_models_and_parts_past_a_rung() 
 }
 
 #[tokio::test]
+async fn a_summary_queue_past_the_channel_limit_refuses_at_config_load() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    let limit = tokio::sync::Semaphore::MAX_PERMITS;
+    input["sessions"] = json!({"memory": {"summaries": {"queue": limit}}});
+    load(directory.path(), &input)
+        .await
+        .expect("the channel's own limit is accepted");
+    input["sessions"] = json!({"memory": {"summaries": {"queue": limit + 1}}});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("past the channel limit");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: crate::config::memory::PolicyProblem::Bound("summaries.queue"),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn deleted_and_invalid_memory_keys_refuse_at_config_load() {
     let directory = temporary();
     let mut input = document(directory.path());

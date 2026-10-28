@@ -446,7 +446,8 @@ impl Journal {
         let horizon_ms = now_ms.saturating_sub(duration_millis(window.forget_after));
         let age_horizon_ms = now_ms.saturating_sub(duration_millis(self.age_for(stem)));
         let media_horizon_ms = now_ms.saturating_sub(duration_millis(WHATSAPP_MEDIA_LIFETIME));
-        let limit = NonZeroUsize::new(window.limits.max_turns.saturating_mul(2))
+        // One record past twice the window lets projection see the count that forces a repack.
+        let limit = NonZeroUsize::new(window.limits.max_turns.saturating_mul(2).saturating_add(1))
             .unwrap_or(NonZeroUsize::MIN);
         let mut snapshot = match File::open(self.path(stem)) {
             Ok(file) => walk::window(file, limit).map_err(failed)?,

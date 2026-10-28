@@ -13,7 +13,10 @@ use dekopon_agent::{
     memory_tools::{MemoryRefusal, MemoryTools as _, Rung},
     prompt::HistoryLimits,
 };
-use dekopon_model::model::{Backend, ModelKey, OpaqueReasoning};
+use dekopon_model::{
+    model::{Backend, ModelKey, ModelMessage, OpaqueReasoning},
+    text::Text,
+};
 use serde_json::{Value, json};
 
 use super::*;
@@ -947,4 +950,148 @@ fn published_and_expired_records_name_their_ids_and_reason() {
         ]
     );
     let _ = capped;
+}
+
+#[test]
+fn a_warm_window_repacks_down_to_max_turns_on_count_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = open(dir.path());
+    let now = SystemTime::now();
+    let mut limits = window();
+    limits.limits.max_turns = 4;
+    limits.limits.max_bytes = 1024 * 1024;
+    let model = ModelKey::new(Backend::OpenAiCompatible, "model");
+    let mut prior = Vec::new();
+    let mut shown_after_repack = Vec::new();
+    for turn in 0..12 {
+        append_user(&journal, STEM, now, &format!("turn {turn}"));
+        let snapshot = journal
+            .recall(STEM, &grant(), limits, now)
+            .unwrap()
+            .snapshot
+            .unwrap();
+        let projected = project(&ProjectionInput {
+            file: &snapshot.file,
+            records: &snapshot.records,
+            prior: &prior,
+            hot_turns: 4,
+            max_turns: 4,
+            max_bytes: limits.limits.max_bytes,
+            model: &model,
+        })
+        .unwrap();
+        if projected.repacked {
+            shown_after_repack.push(
+                projected
+                    .prior
+                    .iter()
+                    .filter(|prior| prior.rung.is_some())
+                    .count(),
+            );
+        }
+        prior = projected.prior;
+    }
+    assert!(!shown_after_repack.is_empty());
+    assert!(shown_after_repack.iter().all(|shown| *shown == 4));
+}
+
+fn project_native(journal: &Journal) -> Vec<ModelMessage> {
+    let snapshot = journal
+        .recall(STEM, &grant(), window(), SystemTime::now())
+        .unwrap()
+        .snapshot
+        .unwrap();
+    project(&ProjectionInput {
+        file: &snapshot.file,
+        records: &snapshot.records,
+        prior: &[],
+        hot_turns: 8,
+        max_turns: 8,
+        max_bytes: 4 * 1024 * 1024,
+        model: &ModelKey::new(Backend::OpenAiCompatible, "model"),
+    })
+    .unwrap()
+    .messages
+}
+
+#[test]
+fn an_argument_past_the_scratch_buffer_is_validated_without_leaving_the_journal() {
+    use dekopon_agent::memory::{Call, Exchange, Outcome, Tool, ToolResult};
+    use dekopon_model::replay::ReplayMessage;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = open(dir.path());
+    let large = "é\\\"".repeat(48 * 1024);
+    let exchange = |id: &str, arguments: String| {
+        Item::Exchange(Exchange {
+            call: Call {
+                id: id.into(),
+                tool: Tool::Bash,
+                arguments: Kept::new(&arguments, usize::MAX),
+            },
+            result: ToolResult {
+                outcome: Outcome::Exit(0),
+                text: Kept::new("done", usize::MAX),
+            },
+        })
+    };
+    let mut turn = captured("question", Some("answer"));
+    turn.original
+        .insert(1, exchange("object", json!({"command": large}).to_string()));
+    turn.original
+        .insert(2, exchange("array", json!([large]).to_string()));
+    append_turn(&journal, STEM, SystemTime::now(), &turn, None);
+    let arguments: Vec<_> = project_native(&journal)
+        .into_iter()
+        .filter_map(|message| match message {
+            ModelMessage::Journal {
+                message: ReplayMessage::Assistant { calls, .. },
+            } => Some(calls),
+            ModelMessage::Journal {
+                message: ReplayMessage::User(_) | ReplayMessage::Tool { .. },
+            }
+            | ModelMessage::System { .. }
+            | ModelMessage::User { .. }
+            | ModelMessage::Assistant { .. }
+            | ModelMessage::ToolResults { .. } => None,
+        })
+        .flatten()
+        .map(|call| (call.id.as_str().to_owned(), call.arguments))
+        .collect();
+    assert_eq!(arguments.len(), 2);
+    assert!(
+        matches!(&arguments[0], (id, Text::File { len, .. }) if id == "object" && len > &(64 * 1024))
+    );
+    assert!(
+        matches!(&arguments[1], (id, Text::Owned(cut)) if id == "array" && cut.starts_with("{\"cut\":"))
+    );
+}
+
+#[test]
+fn asset_markers_replay_as_nothing_beside_native_user_and_steer_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = open(dir.path());
+    let mut turn = captured("question", None);
+    turn.original = vec![
+        Item::User(Kept::new("question", usize::MAX)),
+        Item::Asset(1.try_into().unwrap()),
+        Item::Steer(Kept::new("steer text", usize::MAX)),
+        Item::Asset(2.try_into().unwrap()),
+    ];
+    append_turn(&journal, STEM, SystemTime::now(), &turn, None);
+    drop(journal);
+    let journal = open(dir.path());
+    let messages = project_native(&journal);
+    let texts: Vec<_> = messages.iter().map(message_text).collect();
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["question", "steer text"]
+    );
+    for message in &messages {
+        let encoded = serde_json::to_string(&message_text(message)).unwrap();
+        assert!(!encoded.contains("asset"), "{encoded}");
+    }
 }

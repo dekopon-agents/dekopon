@@ -97,6 +97,23 @@ pub(crate) enum NamedTool {
     Rejected,
 }
 
+impl NamedTool {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::ReadSkill => "read_skill",
+            Self::FetchChatAsset => "fetch_chat_asset",
+            Self::ReadMemoryRecord => "read_memory_record",
+            Self::SetMemoryPin => "set_memory_pin",
+            Self::ClearMemoryPin => "clear_memory_pin",
+            Self::InspectAgentConfig => "inspect_agent_config",
+            Self::SuggestImprovement => "suggest_improvement",
+            Self::Wake => "wake",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Kind {
@@ -947,7 +964,7 @@ pub(crate) fn record_text(
                     | NamedTool::ClearMemoryPin
                     | NamedTool::InspectAgentConfig
                     | NamedTool::SuggestImprovement
-                    | NamedTool::Wake) => tool_name(*named).to_owned(),
+                    | NamedTool::Wake) => named.name().to_owned(),
                 };
                 let outcome = head
                     .header
@@ -985,21 +1002,6 @@ pub(crate) fn record_text(
     })
 }
 
-const fn tool_name(tool: NamedTool) -> &'static str {
-    match tool {
-        NamedTool::Bash => "bash",
-        NamedTool::ReadSkill => "read_skill",
-        NamedTool::FetchChatAsset => "fetch_chat_asset",
-        NamedTool::ReadMemoryRecord => "read_memory_record",
-        NamedTool::SetMemoryPin => "set_memory_pin",
-        NamedTool::ClearMemoryPin => "clear_memory_pin",
-        NamedTool::InspectAgentConfig => "inspect_agent_config",
-        NamedTool::SuggestImprovement => "suggest_improvement",
-        NamedTool::Wake => "wake",
-        NamedTool::Rejected => "rejected",
-    }
-}
-
 /// Streams a stored JSON string's escaped bytes as their decoded UTF-8, through one buffer.
 pub(crate) fn decode_escaped(
     file: &File,
@@ -1009,13 +1011,26 @@ pub(crate) fn decode_escaped(
     sink: &mut dyn FnMut(&[u8]),
 ) -> Result<(), JournalError> {
     let mut at = 0_u64;
-    let mut pending: Vec<u8> = Vec::new();
-    let mut high: Option<u16> = None;
+    let mut unescaper = Unescaper::default();
     while at < len {
         let count = usize::try_from((len - at).min(buffer.len() as u64)).unwrap_or(buffer.len());
         let chunk = &mut buffer[..count];
         file.read_exact_at(chunk, offset + at)?;
         at += count as u64;
+        unescaper.feed(chunk, sink)?;
+    }
+    unescaper.finish()
+}
+
+#[derive(Default)]
+struct Unescaper {
+    pending: Vec<u8>,
+    high: Option<u16>,
+}
+
+impl Unescaper {
+    fn feed(&mut self, chunk: &[u8], sink: &mut dyn FnMut(&[u8])) -> Result<(), JournalError> {
+        let Self { pending, high } = self;
         let mut run = 0;
         let mut index = 0;
         while index < chunk.len() {
@@ -1053,7 +1068,7 @@ pub(crate) fn decode_escaped(
                         .ok_or(JournalError::Corrupt)?;
                     match (high.take(), code) {
                         (None, 0xd800..=0xdbff) => {
-                            high = Some(code);
+                            *high = Some(code);
                             None
                         }
                         (Some(high), 0xdc00..=0xdfff) => char::from_u32(
@@ -1086,11 +1101,75 @@ pub(crate) fn decode_escaped(
         if pending.is_empty() {
             sink(&chunk[run..]);
         }
+        Ok(())
     }
-    if !pending.is_empty() || high.is_some() {
-        return Err(JournalError::Corrupt);
+
+    fn finish(self) -> Result<(), JournalError> {
+        if !self.pending.is_empty() || self.high.is_some() {
+            return Err(JournalError::Corrupt);
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+pub(crate) struct Unescaped<'a> {
+    file: &'a File,
+    offset: u64,
+    len: u64,
+    raw: Vec<u8>,
+    out: Vec<u8>,
+    served: usize,
+    state: Option<Unescaper>,
+}
+
+impl<'a> Unescaped<'a> {
+    pub(crate) fn new(file: &'a File, offset: u64, len: u64, chunk: usize) -> Self {
+        Self {
+            file,
+            offset,
+            len,
+            raw: vec![0; chunk],
+            out: Vec::with_capacity(chunk),
+            served: 0,
+            state: Some(Unescaper::default()),
+        }
+    }
+}
+
+impl Read for Unescaped<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let invalid = |_corrupt: JournalError| io::Error::from(io::ErrorKind::InvalidData);
+        while self.served == self.out.len() {
+            let Some(state) = self.state.as_mut() else {
+                return Ok(0);
+            };
+            if self.len == 0 {
+                self.state
+                    .take()
+                    .map_or(Ok(()), Unescaper::finish)
+                    .map_err(invalid)?;
+                return Ok(0);
+            }
+            let count =
+                usize::try_from(self.len.min(self.raw.len() as u64)).unwrap_or(self.raw.len());
+            self.file
+                .read_exact_at(&mut self.raw[..count], self.offset)?;
+            self.offset += count as u64;
+            self.len -= count as u64;
+            self.out.clear();
+            self.served = 0;
+            let out = &mut self.out;
+            state
+                .feed(&self.raw[..count], &mut |bytes| {
+                    out.extend_from_slice(bytes)
+                })
+                .map_err(invalid)?;
+        }
+        let count = buf.len().min(self.out.len() - self.served);
+        buf[..count].copy_from_slice(&self.out[self.served..self.served + count]);
+        self.served += count;
+        Ok(count)
+    }
 }
 
 pub(crate) fn escaped_text(
@@ -1236,11 +1315,6 @@ impl Journal {
                     if path.exists() {
                         fs::remove_file(path)?;
                         boot.reset = boot.reset.saturating_add(1);
-                        tracing::warn!(
-                            event = "gateway_journal_reset",
-                            reason = "crashed",
-                            "gateway.journal.reset"
-                        );
                     }
                     boot.crashed_files = boot.crashed_files.saturating_add(1);
                 }
@@ -1296,11 +1370,6 @@ impl Journal {
                     Err(_unloadable) => {
                         fs::remove_file(&path)?;
                         boot.reset = boot.reset.saturating_add(1);
-                        tracing::warn!(
-                            event = "gateway_journal_reset",
-                            reason = "corrupt",
-                            "gateway.journal.reset"
-                        );
                     }
                 }
                 fs::remove_file(&marker)?;
