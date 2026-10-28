@@ -137,6 +137,7 @@ pub struct StorageConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TelemetryConfig {
     pub endpoint: String,
+    #[serde(default)]
     pub transport: Transport,
     pub service_name: String,
     pub export_timeout_ms: u64,

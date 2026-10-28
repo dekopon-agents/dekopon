@@ -217,12 +217,14 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         }
     };
 
-    if let Err(error) = telemetry.shutdown() {
-        tracing::error!(
+    match tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
             event = "gateway_telemetry_shutdown_failed",
             error = %error,
             "gateway.telemetry.shutdown.failed"
-        );
+        ),
+        Err(error) => eprintln!("dekopon-gatewayd: telemetry flush failed: {error}"),
     }
     code
 }

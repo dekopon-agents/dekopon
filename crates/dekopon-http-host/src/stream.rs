@@ -1613,8 +1613,11 @@ mod tests {
                 },
             )
         };
-        let transport =
-            crate::test_transport::Transport::new(script("127.0.0.1"), script("storage.test"), 3);
+        let transport = crate::test_transport::Transport::new(
+            ("127.0.0.1".to_owned(), vec![script("127.0.0.1").1]),
+            script("storage.test"),
+            3,
+        );
         let mut client = BufferedHttpClient::authorized(
             HttpConstraints {
                 allowed_hosts: vec!["127.0.0.1".to_owned()],

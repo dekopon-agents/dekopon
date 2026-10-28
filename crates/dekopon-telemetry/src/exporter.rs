@@ -1,7 +1,5 @@
 use std::{
-    fmt,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::OnceLock,
     time::Duration,
 };
@@ -11,8 +9,6 @@ use opentelemetry::KeyValue;
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{
     ExporterBuildError, LogExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig,
-    WithTonicConfig,
-    tonic_types::transport::{Certificate, ClientTlsConfig},
 };
 use opentelemetry_sdk::{
     Resource, logs,
@@ -23,42 +19,14 @@ use opentelemetry_sdk::{
 use serde::Deserialize;
 use thiserror::Error;
 
+/// `Grpc` is still a recognised token so a configuration that names it gets
+/// [`TelemetryError::GrpcTransport`] rather than an unknown-value parse error.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
-    Grpc,
     #[default]
     Http,
-}
-
-impl Transport {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Grpc => "grpc",
-            Self::Http => "http",
-        }
-    }
-}
-
-impl fmt::Display for Transport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Transport {
-    type Err = TelemetryError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim() {
-            "grpc" => Ok(Self::Grpc),
-            "http" => Ok(Self::Http),
-            other => Err(TelemetryError::Configuration(format!(
-                "OTLP transport must be `grpc` or `http`, not {other:?}"
-            ))),
-        }
-    }
+    Grpc,
 }
 
 const MAX_QUEUED_SPANS: usize = 1024;
@@ -74,7 +42,6 @@ pub const CA_CERTIFICATE_ENV: &str = "OTEL_EXPORTER_OTLP_CERTIFICATE";
 #[derive(Clone, Debug)]
 pub struct ExporterSettings {
     endpoint: String,
-    transport: Transport,
     service_name: String,
     executable_name: String,
     service_version: String,
@@ -92,6 +59,10 @@ impl ExporterSettings {
         service_version: &str,
         timeout: Duration,
     ) -> Result<Self, TelemetryError> {
+        match transport {
+            Transport::Http => {}
+            Transport::Grpc => return Err(TelemetryError::GrpcTransport),
+        }
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
             return Err(TelemetryError::Configuration(
@@ -137,7 +108,6 @@ impl ExporterSettings {
             .transpose()?;
         Ok(Self {
             endpoint: endpoint.to_owned(),
-            transport,
             service_name: service_name.to_owned(),
             executable_name: executable_name.to_owned(),
             service_version: service_version.to_owned(),
@@ -160,11 +130,6 @@ impl ExporterSettings {
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
-    }
-
-    #[must_use]
-    pub const fn transport(&self) -> Transport {
-        self.transport
     }
 
     fn resource(&self) -> Resource {
@@ -190,40 +155,18 @@ impl ExporterSettings {
         Ok(self.http_client.get_or_init(|| client).clone())
     }
 
-    fn tonic_tls<B: WithTonicConfig>(&self, builder: B) -> B {
-        match &self.ca_certificate {
-            Some(pem) => builder.with_tls_config(
-                ClientTlsConfig::new()
-                    .with_webpki_roots()
-                    .ca_certificate(Certificate::from_pem(pem)),
-            ),
-            None => builder,
-        }
-    }
-
     pub fn tracer_provider(&self) -> Result<SdkTracerProvider, TelemetryError> {
-        let builder = SpanExporter::builder();
-        let exporter = match self.transport {
-            Transport::Grpc => self
-                .tonic_tls(
-                    builder
-                        .with_tonic()
-                        .with_endpoint(self.endpoint.clone())
-                        .with_timeout(self.timeout),
-                )
-                .build(),
-            Transport::Http => builder
-                .with_http()
-                .with_http_client(self.http_client()?)
-                .with_protocol(Protocol::HttpBinary)
-                .with_endpoint(signal_endpoint(&self.endpoint, "traces"))
-                .with_timeout(self.timeout)
-                .build(),
-        }
-        .map_err(|source| TelemetryError::Exporter {
-            signal: "trace",
-            source,
-        })?;
+        let exporter = SpanExporter::builder()
+            .with_http()
+            .with_http_client(self.http_client()?)
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(signal_endpoint(&self.endpoint, "traces"))
+            .with_timeout(self.timeout)
+            .build()
+            .map_err(|source| TelemetryError::Exporter {
+                signal: "trace",
+                source,
+            })?;
         let processor = BatchSpanProcessor::builder(exporter)
             .with_batch_config(
                 trace::BatchConfigBuilder::default()
@@ -239,28 +182,17 @@ impl ExporterSettings {
     }
 
     pub fn logger_provider(&self) -> Result<SdkLoggerProvider, TelemetryError> {
-        let builder = LogExporter::builder();
-        let exporter = match self.transport {
-            Transport::Grpc => self
-                .tonic_tls(
-                    builder
-                        .with_tonic()
-                        .with_endpoint(self.endpoint.clone())
-                        .with_timeout(self.timeout),
-                )
-                .build(),
-            Transport::Http => builder
-                .with_http()
-                .with_http_client(self.http_client()?)
-                .with_protocol(Protocol::HttpBinary)
-                .with_endpoint(signal_endpoint(&self.endpoint, "logs"))
-                .with_timeout(self.timeout)
-                .build(),
-        }
-        .map_err(|source| TelemetryError::Exporter {
-            signal: "log",
-            source,
-        })?;
+        let exporter = LogExporter::builder()
+            .with_http()
+            .with_http_client(self.http_client()?)
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint(signal_endpoint(&self.endpoint, "logs"))
+            .with_timeout(self.timeout)
+            .build()
+            .map_err(|source| TelemetryError::Exporter {
+                signal: "log",
+                source,
+            })?;
         let processor = BatchLogProcessor::builder(exporter)
             .with_batch_config(
                 logs::BatchConfigBuilder::default()
@@ -298,19 +230,18 @@ fn signal_endpoint(base: &str, signal: &str) -> String {
 }
 
 #[derive(Clone, Debug)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "owner: the exporter's OnceLock; bound: one client and its one runtime thread per exporter"
-)]
-struct OtlpHttpClient(reqwest::blocking::Client);
+struct OtlpHttpClient {
+    client: reqwest::Client,
+    runtime: tokio::runtime::Handle,
+}
 
 /// Redirects are disabled so the ingest credential header can't follow a redirect to an unnamed
 /// host, and environment proxies are disabled so it never routes through one either.
 fn otlp_client_from(
-    builder: reqwest::blocking::ClientBuilder,
+    builder: reqwest::ClientBuilder,
     timeout: Duration,
     ca_certificate: Option<&[u8]>,
-) -> Result<reqwest::blocking::ClientBuilder, reqwest::Error> {
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
     let mut builder = builder
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -324,31 +255,13 @@ fn otlp_client_from(
 }
 
 impl OtlpHttpClient {
-    #[expect(
-        clippy::disallowed_methods,
-        clippy::disallowed_types,
-        reason = "owner: this call, which joins the one builder thread before returning; bound: one thread, not a shell thread, so not ShellThreads"
-    )]
     fn new(timeout: Duration, ca_certificate: Option<&[u8]>) -> Result<Self, TelemetryError> {
-        let client = std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .name("dekopon-otlp-http-client".to_owned())
-                .spawn_scoped(scope, move || {
-                    otlp_client_from(
-                        reqwest::blocking::Client::builder(),
-                        timeout,
-                        ca_certificate,
-                    )?
-                    .build()
-                })
-                .map_err(TelemetryError::HttpClientThread)?
-                .join()
-                .map_err(|payload| TelemetryError::HttpClientThreadPanicked {
-                    message: panic_message(&*payload),
-                })
-        })?
-        .map_err(TelemetryError::HttpClient)?;
-        Ok(Self(client))
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_outside| TelemetryError::NoRuntime)?;
+        let client = otlp_client_from(reqwest::Client::builder(), timeout, ca_certificate)
+            .and_then(reqwest::ClientBuilder::build)
+            .map_err(TelemetryError::HttpClient)?;
+        Ok(Self { client, runtime })
     }
 }
 
@@ -365,16 +278,28 @@ pub(super) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[async_trait]
 impl HttpClient for OtlpHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let request: reqwest::blocking::Request = request.try_into()?;
-        // This deliberately skips `error_for_status()`: converting a 4xx to an `Err` here would
-        // force it down the SDK's generic network-error branch, indistinguishable from a dead
-        // socket.
-        let mut response = self.0.execute(request)?;
-        let headers = std::mem::take(response.headers_mut());
-        let status = response.status();
-        let mut response = Response::builder().status(status).body(response.bytes()?)?;
-        *response.headers_mut() = headers;
-        Ok(response)
+        let request: reqwest::Request = request.try_into()?;
+        let client = self.client.clone();
+        // The SDK's batch threads poll this future under `futures_executor`, which has no tokio
+        // reactor or timer; the request must run on the daemon's runtime.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: this call awaits the handle; bound: each SDK batch thread runs one export at a time"
+        )]
+        let exported = self.runtime.spawn(async move {
+            // This deliberately skips `error_for_status()`: converting a 4xx to an `Err` here
+            // would force it down the SDK's generic network-error branch, indistinguishable from a
+            // dead socket.
+            let mut response = client.execute(request).await?;
+            let headers = std::mem::take(response.headers_mut());
+            let status = response.status();
+            let mut response = Response::builder()
+                .status(status)
+                .body(response.bytes().await?)?;
+            *response.headers_mut() = headers;
+            Ok(response)
+        });
+        exported.await?
     }
 }
 
@@ -382,10 +307,10 @@ impl HttpClient for OtlpHttpClient {
 pub enum TelemetryError {
     #[error("invalid telemetry configuration: {0}")]
     Configuration(String),
-    #[error("could not start OTLP HTTP client builder")]
-    HttpClientThread(#[source] std::io::Error),
-    #[error("OTLP HTTP client builder panicked: {message}")]
-    HttpClientThreadPanicked { message: String },
+    #[error("OTLP transport `grpc` is no longer supported; use `http`")]
+    GrpcTransport,
+    #[error("the OTLP HTTP client must be built inside a tokio runtime")]
+    NoRuntime,
     #[error("could not build OTLP HTTP client")]
     HttpClient(#[source] reqwest::Error),
     #[error("could not read OTLP CA certificate {}", path.display())]
@@ -405,16 +330,93 @@ pub enum TelemetryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExporterSettings, TelemetryError, Transport, otlp_client_from, panic_message,
-        read_ca_certificate, signal_endpoint,
+        ExporterSettings, OtlpHttpClient, TelemetryError, Transport, otlp_client_from,
+        panic_message, read_ca_certificate, signal_endpoint,
     };
-    use std::time::Duration;
+    use opentelemetry::{
+        logs::{Logger as _, LoggerProvider as _},
+        trace::{Tracer as _, TracerProvider as _},
+    };
+    use parking_lot::Mutex;
+    use std::{sync::Arc, time::Duration};
+    use tokio::{
+        io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+        net::TcpListener,
+    };
 
     const AMBIENT_PROXY: &str = "http://127.0.0.1:9";
 
-    fn proxied_builder() -> reqwest::blocking::ClientBuilder {
-        reqwest::blocking::Client::builder()
+    fn proxied_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(AMBIENT_PROXY).expect("a well-formed proxy uri"))
+    }
+
+    fn settings(endpoint: &str) -> ExporterSettings {
+        ExporterSettings::new(
+            endpoint,
+            Transport::Http,
+            "svc",
+            "exe",
+            "1.2.3",
+            Duration::from_secs(5),
+        )
+        .expect("valid settings")
+    }
+
+    struct Receiver {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Receiver {
+        async fn start(reply: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let path = line.split(' ').nth(1).unwrap().to_owned();
+                    let (mut host, mut length) = (String::new(), 0);
+                    loop {
+                        line.clear();
+                        stream.read_line(&mut line).await.unwrap();
+                        let header = line.trim_end();
+                        if header.is_empty() {
+                            break;
+                        }
+                        let (name, value) = header.split_once(": ").unwrap();
+                        match name.to_ascii_lowercase().as_str() {
+                            "host" => value.clone_into(&mut host),
+                            "content-length" => length = value.parse().unwrap(),
+                            _ => {}
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    recorded.lock().push(format!("{host}{path}"));
+                    let reply = reply.replace("{endpoint}", &format!("http://{host}"));
+                    stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            Self { endpoint, requests }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().clone()
+        }
+    }
+
+    const ACCEPTED: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    const REDIRECTED: &str = "HTTP/1.1 307 Temporary Redirect\r\nlocation: {endpoint}/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    async fn shut_down(providers: impl FnOnce() + Send + 'static) {
+        tokio::task::spawn_blocking(providers).await.unwrap();
     }
 
     #[test]
@@ -440,8 +442,61 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_signals_export_from_the_sdk_threads_to_their_full_signal_uris() {
+        let receiver = Receiver::start(ACCEPTED).await;
+        let settings = settings(&format!("{}/api/default", receiver.endpoint));
+        let traces = settings.tracer_provider().expect("trace exporter builds");
+        let logs = settings.logger_provider().expect("log exporter builds");
+
+        traces.tracer("export-test").start("exported");
+        let logger = logs.logger("export-test");
+        logger.emit(logger.create_log_record());
+        shut_down(move || {
+            traces.shutdown().expect("traces exported");
+            logs.shutdown().expect("logs exported");
+        })
+        .await;
+
+        let authority = receiver.endpoint.trim_start_matches("http://");
+        let mut requests = receiver.requests();
+        requests.sort();
+        assert_eq!(
+            requests,
+            [
+                format!("{authority}/api/default/v1/logs"),
+                format!("{authority}/api/default/v1/traces"),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirecting_receiver_gets_no_second_request() {
+        let receiver = Receiver::start(REDIRECTED).await;
+        let traces = settings(&receiver.endpoint)
+            .tracer_provider()
+            .expect("trace exporter builds");
+
+        traces.tracer("redirect-test").start("redirected");
+        shut_down(move || {
+            traces.shutdown().expect("the processor stops");
+        })
+        .await;
+
+        let authority = receiver.endpoint.trim_start_matches("http://");
+        assert_eq!(receiver.requests(), [format!("{authority}/v1/traces")]);
+    }
+
     #[test]
-    fn a_client_thread_panic_keeps_its_message() {
+    fn the_http_client_outside_a_runtime_is_refused() {
+        assert!(matches!(
+            OtlpHttpClient::new(Duration::from_secs(5), None),
+            Err(TelemetryError::NoRuntime)
+        ));
+    }
+
+    #[test]
+    fn a_panic_payload_keeps_its_message() {
         let literal = std::panic::catch_unwind(|| panic!("failed to create tokio runtime"))
             .expect_err("the closure panics");
         assert_eq!(panic_message(&*literal), "failed to create tokio runtime");
@@ -449,14 +504,6 @@ mod tests {
         let formatted = std::panic::catch_unwind(|| panic!("{} roots missing", 3))
             .expect_err("the closure panics");
         assert_eq!(panic_message(&*formatted), "3 roots missing");
-
-        assert_eq!(
-            TelemetryError::HttpClientThreadPanicked {
-                message: panic_message(&*literal),
-            }
-            .to_string(),
-            "OTLP HTTP client builder panicked: failed to create tokio runtime"
-        );
     }
 
     #[test]
@@ -472,22 +519,20 @@ mod tests {
     }
 
     #[test]
-    fn transport_round_trips_through_its_stable_token() {
-        for transport in [Transport::Grpc, Transport::Http] {
-            assert_eq!(
-                transport
-                    .as_str()
-                    .parse::<Transport>()
-                    .expect("valid token"),
-                transport
-            );
-        }
-    }
-
-    #[test]
-    fn transport_rejects_unknown_tokens() {
-        assert!("thrift".parse::<Transport>().is_err());
-        assert!("".parse::<Transport>().is_err());
+    fn grpc_is_refused_and_http_is_the_default() {
+        assert_eq!(Transport::default(), Transport::Http);
+        assert!(matches!(
+            ExporterSettings::new(
+                "http://host",
+                Transport::Grpc,
+                "svc",
+                "exe",
+                "1.2.3",
+                Duration::from_secs(5)
+            ),
+            Err(TelemetryError::GrpcTransport)
+        ));
+        assert!(serde_json::from_str::<Transport>("\"thrift\"").is_err());
     }
 
     #[test]
@@ -511,30 +556,17 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            ExporterSettings::new(
-                "http://host",
-                Transport::Grpc,
-                "svc",
-                "exe",
-                "1.2.3",
-                timeout
-            )
-            .is_ok()
-        );
     }
 
     #[test]
     fn settings_reject_endpoints_carrying_a_query_or_fragment() {
         let timeout = Duration::from_secs(5);
-        for transport in [Transport::Grpc, Transport::Http] {
-            for endpoint in ["http://host/api/default?org=x", "http://host/api/default#f"] {
-                assert!(
-                    ExporterSettings::new(endpoint, transport, "svc", "exe", "1.2.3", timeout)
-                        .is_err(),
-                    "accepted {endpoint} on {transport}"
-                );
-            }
+        for endpoint in ["http://host/api/default?org=x", "http://host/api/default#f"] {
+            assert!(
+                ExporterSettings::new(endpoint, Transport::Http, "svc", "exe", "1.2.3", timeout)
+                    .is_err(),
+                "accepted {endpoint}"
+            );
         }
     }
 
@@ -577,17 +609,9 @@ mod tests {
         assert_eq!(version("  "), env!("CARGO_PKG_VERSION"));
     }
 
-    #[test]
-    fn both_signals_share_one_blocking_http_client() {
-        let settings = ExporterSettings::new(
-            "http://host",
-            Transport::Http,
-            "svc",
-            "exe",
-            "1.2.3",
-            Duration::from_secs(5),
-        )
-        .expect("valid settings");
+    #[tokio::test]
+    async fn both_signals_share_one_http_client() {
+        let settings = settings("http://host");
 
         assert!(
             settings.http_client.get().is_none(),
@@ -623,26 +647,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_transports_build_exporters_that_trust_an_extra_ca() {
-        for (endpoint, transport) in [
-            ("https://collector.internal:4317", Transport::Grpc),
-            ("https://collector.internal:4318", Transport::Http),
-        ] {
-            let mut settings = ExporterSettings::new(
-                endpoint,
-                transport,
-                "svc",
-                "exe",
-                "1.2.3",
-                Duration::from_secs(5),
-            )
-            .expect("valid settings");
-            settings.ca_certificate = Some(
-                read_ca_certificate(std::path::Path::new(PRIVATE_ROOT)).expect("fixture root"),
-            );
-            settings.tracer_provider().expect("trace exporter builds");
-            settings.logger_provider().expect("log exporter builds");
-        }
+    async fn exporters_trust_an_extra_ca() {
+        let mut settings = settings("https://collector.internal:4318");
+        settings.ca_certificate =
+            Some(read_ca_certificate(std::path::Path::new(PRIVATE_ROOT)).expect("fixture root"));
+        settings.tracer_provider().expect("trace exporter builds");
+        settings.logger_provider().expect("log exporter builds");
     }
 }
 

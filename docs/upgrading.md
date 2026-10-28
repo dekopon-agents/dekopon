@@ -8,6 +8,28 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## OTLP export is HTTP only (0.63.0)
+
+Before or with the upgrade, change `telemetry.transport: grpc` to `http` in brokerd,
+gatewayd and console configurations, or leave transport unset to use the new HTTP default.
+All three refuse `grpc` at configuration load. An endpoint that pointed at a gRPC receiver
+(typically port 4317) must move to that receiver's OTLP/HTTP endpoint (typically port 4318).
+HTTP export uses protobuf; use the receiver's configured endpoint rather than
+assuming its port.
+
+Existing production providers require no re-pin: these changes add no provider WIT, wire
+format or grant change. The shell builtin consolidation in #797 preserves operator-visible
+shell behavior, including command resolution and refusal messages. #801 changes only the
+testkit and its test transport: provider test suites that re-pin the testkit can pass ordered
+API responses to `signed_download`, with exactly one redirect; existing single-`HttpScript`
+calls remain accepted. Production provider components do not need rebuilding for it.
+
+Upgrade the binaries after preparing the telemetry configuration. Reverting 0.63.0 to
+0.62.0 is revert-safe for these changes when `transport: http` is explicit: that configuration
+loads on both versions, and no persisted-state or production wire format changed. Keep the
+OTLP/HTTP endpoint on downgrade. An omitted console transport defaults to gRPC in 0.62.0,
+so set `http` explicitly before reverting the console.
+
 ## Shell IFS handling in the bash tool (0.62.0)
 
 No configuration change or provider re-pin is required for existing deployments. Unquoted

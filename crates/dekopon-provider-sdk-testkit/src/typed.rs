@@ -84,6 +84,15 @@ impl HttpScript {
     }
 }
 
+impl IntoIterator for HttpScript {
+    type Item = Self;
+    type IntoIter = std::iter::Once<Self>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self)
+    }
+}
+
 const UNEXPECTED_CHILD: &str = "unexpected child script";
 const CHILD_INPUT_LIMIT: u64 = 1024 * 1024;
 pub(crate) const HTTP_BYTES: usize = 64 * 1024;
@@ -243,17 +252,18 @@ impl<P: Provider> Run<P> {
         self
     }
 
-    /// Scripts an API 302 and bounded storage ranges through the real signed-download host.
+    /// Scripts ordered API responses, exactly one a 302, and bounded storage ranges through the
+    /// real signed-download host; each API response answers one request, buffered or signed.
     #[must_use]
     pub fn signed_download(
         mut self,
-        api: HttpScript,
+        api: impl IntoIterator<Item = HttpScript>,
         storage: HttpScript,
         max_requests: u32,
     ) -> Self {
         self.http = None;
         self.signed = Some(crate::signed_download::Scenario::new(
-            api,
+            api.into_iter().collect(),
             storage,
             max_requests,
         ));
@@ -779,17 +789,18 @@ impl<P: Provider> Native<P> {
         self.settings = Some(settings);
         self
     }
-    /// Scripts an API 302 and bounded storage ranges through the real signed-download host.
+    /// Scripts ordered API responses, exactly one a 302, and bounded storage ranges through the
+    /// real signed-download host; each API response answers one request, buffered or signed.
     #[must_use]
     pub fn signed_download(
         mut self,
-        api: HttpScript,
+        api: impl IntoIterator<Item = HttpScript>,
         storage: HttpScript,
         max_requests: u32,
     ) -> Self {
         self.http = None;
         self.signed = Some(crate::signed_download::Scenario::new(
-            api,
+            api.into_iter().collect(),
             storage,
             max_requests,
         ));
@@ -909,6 +920,24 @@ struct FakePort {
     children: Arc<Mutex<Vec<ChildRun>>>,
 }
 
+impl FakePort {
+    fn signed_client(
+        &mut self,
+    ) -> Result<&mut dekopon_http_host::BufferedHttpClient, HarnessError> {
+        let scenario = self
+            .signed
+            .as_ref()
+            .ok_or(HarnessError::Fixture("no signed-download scenario"))?;
+        if self.download_client.is_none() {
+            self.download_client = Some(scenario.client()?);
+            self.download_assets = Fixtures::new(Some(&AssetConstraints::default()), vec![])?;
+        }
+        self.download_client
+            .as_mut()
+            .ok_or(HarnessError::Fixture("no signed-download client"))
+    }
+}
+
 impl Port for FakePort {
     fn signed_download(
         &mut self,
@@ -921,14 +950,15 @@ impl Port for FakePort {
         let denied = || sdk::DownloadError {
             code: sdk::ErrorCode::Denied,
         };
-        let scenario = self.signed.as_ref().ok_or_else(denied)?;
-        if self.download_client.is_none() {
-            self.download_client = Some(scenario.client().map_err(|_error| denied())?);
-            self.download_assets = Fixtures::new(Some(&AssetConstraints::default()), vec![])
-                .map_err(|_error| denied())?;
-        }
-        let client = self.download_client.as_mut().ok_or_else(denied)?;
-        let directory = &self.download_assets.as_ref().ok_or_else(denied)?.directory;
+        self.signed_client().map_err(|_error| denied())?;
+        let (Some(scenario), Some(client), Some(assets)) = (
+            self.signed.as_ref(),
+            self.download_client.as_mut(),
+            self.download_assets.as_ref(),
+        ) else {
+            return Err(denied());
+        };
+        let directory = &assets.directory;
         let window = match request.window {
             sdk::Window::Tail(length) => dekopon_http_host::Window::Tail(length),
             sdk::Window::Offset(window) => dekopon_http_host::Window::Offset {
@@ -1016,6 +1046,16 @@ impl Port for FakePort {
     }
     fn send(&mut self, request: Request) -> Result<Response, HttpError> {
         self.requests.lock().push(request.clone());
+        if self.signed.is_some() {
+            let client = self.signed_client().map_err(|_error| HttpError {
+                code: HttpErrorCode::Denied,
+                message: "invalid signed-download scenario".to_owned(),
+            })?;
+            return runtime()
+                .block_on(client.send(crate::signed_download::host_request(request)))
+                .map(crate::signed_download::guest_response)
+                .map_err(crate::signed_download::http_error);
+        }
         let script = self.http.as_ref().ok_or_else(|| HttpError {
             code: HttpErrorCode::Denied,
             message: "no HTTP script".to_owned(),

@@ -762,6 +762,32 @@ async fn a_writable_projection_is_refused_even_when_its_target_is_valid() {
 }
 
 #[tokio::test]
+async fn telemetry_transport_defaults_to_http_and_refuses_grpc() {
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["telemetry"] = json!({
+        "endpoint": "http://openobserve:5080/api/default",
+        "serviceName": "dekopon-gatewayd",
+        "exportTimeoutMs": 5000
+    });
+    let resolved = load(directory.path(), &input)
+        .await
+        .expect("telemetry without a transport resolves");
+    assert!(resolved.telemetry.is_some());
+
+    input["telemetry"]["transport"] = json!("grpc");
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("the grpc transport is refused");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::Telemetry {
+            source: dekopon_telemetry::TelemetryError::GrpcTransport
+        }
+    )));
+}
+
+#[tokio::test]
 async fn a_complete_configuration_resolves_with_documented_defaults() {
     let directory = temporary();
     let resolved = load(directory.path(), &document(directory.path()))
