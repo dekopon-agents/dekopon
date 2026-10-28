@@ -2262,7 +2262,7 @@ where
                 github_denial: None,
             };
             if let Some(id) = space {
-                let verdict = evaluate(
+                let mut verdict = evaluate(
                     PolicyRequest {
                         principal: id.clone(),
                         ..request
@@ -2273,7 +2273,7 @@ where
                     id: id.clone(),
                     asker_allowed: Some(pass.policy.allowed),
                     allowed: Some(verdict.allowed),
-                    policy_ids: verdict.determining_policy_ids.clone(),
+                    policy_ids: std::mem::take(&mut verdict.determining_policy_ids),
                     denied_by: denying_principal(pass.policy.allowed, verdict.allowed),
                 });
                 merge_policy_decision(&mut pass.policy, verdict);
