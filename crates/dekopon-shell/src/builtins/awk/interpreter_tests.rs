@@ -368,6 +368,14 @@ fn maximum_format_precision_fits_the_bounded_numeric_renderer() {
 }
 
 #[test]
+fn numeric_characters_truncate_before_selecting_the_unicode_scalar() {
+    stdout(
+        "awk 'BEGIN{printf \"[%c][%c][%c]\",-0.5,65.9,1114111.5}'",
+        "[\0][A][\u{10ffff}]",
+    );
+}
+
+#[test]
 fn lazy_begin_and_refusals_preserve_the_groups_input() {
     for (program, expected) in [
         ("BEGIN{print 1}", "1\nhi\n"),

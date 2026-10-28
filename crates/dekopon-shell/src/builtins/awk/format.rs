@@ -428,8 +428,9 @@ fn conversion<E: From<AwkError>>(
         Conversion::Character => {
             let c = match value {
                 Value::Num(n) | Value::StrNum(_, n) => {
-                    if n.is_finite() && *n >= 0.0 && *n <= 0x10ffff as f64 {
-                        char::from_u32(n.trunc() as u32).unwrap_or('\u{fffd}')
+                    let point = n.trunc();
+                    if point.is_finite() && point >= 0.0 && point <= 0x10ffff as f64 {
+                        char::from_u32(point as u32).unwrap_or('\u{fffd}')
                     } else {
                         '\u{fffd}'
                     }
