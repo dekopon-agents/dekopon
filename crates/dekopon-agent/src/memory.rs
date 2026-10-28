@@ -196,7 +196,8 @@ impl RecordBuilder {
             ModelMessage::ToolResults { .. }
             | ModelMessage::User { .. }
             | ModelMessage::Assistant { .. }
-            | ModelMessage::System { .. } => None,
+            | ModelMessage::System { .. }
+            | ModelMessage::Journal { .. } => None,
         }) {
             self.exchange(call, text, outcome);
         }
