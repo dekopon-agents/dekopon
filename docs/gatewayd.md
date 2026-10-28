@@ -715,6 +715,8 @@ and one trailing slash are accepted, and query/fragment do not change the target
 and reviewed in one turn; structured owner, repository and positive number reach the prompt.
 Bot posts, edits, other GitHub URLs and thread replies gain no trigger. A mention retains
 ordinary mention behavior. Both classic and Agent Slack experiences support the opt-in.
+An ambient link from an unmapped or agent-denied poster gets no reply or reaction; the refusal
+is still traced with `admission.trigger = "pull-request-link"`.
 
 A PR-link turn keeps only the poster's broker leg throughout execution, downscoped by the channel
 when mapped. Other speakers wait for separate, freshly authorized turns; their additional grants

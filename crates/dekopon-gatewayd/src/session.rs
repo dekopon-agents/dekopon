@@ -2153,6 +2153,11 @@ async fn session_turn(
             refusal,
         )))) => {
             revoke_thread_ownership(runner, message);
+            let quiet = message.pull_request_links.is_some()
+                && match &refusal {
+                    SessionRefusal::UnmappedSubject | SessionRefusal::AgentDenied { .. } => true,
+                    SessionRefusal::Other => false,
+                };
             let reply = match refusal {
                 SessionRefusal::UnmappedSubject => {
                     tracing::info!(
@@ -2171,9 +2176,10 @@ async fn session_turn(
                             message.conversation.thread.as_deref().unwrap_or_default(),
                         subject = message.subject.canonical(),
                         reason = "unmapped-subject",
+                        admission.trigger = quiet.then_some("pull-request-link"),
                         "gateway.session.rejected"
                     );
-                    if !runner.gate.stranger_reply() {
+                    if !quiet && !runner.gate.stranger_reply() {
                         return MessageOutcome::Unauthorized.into();
                     }
                     UNMAPPED_REPLY.to_owned()
@@ -2194,6 +2200,7 @@ async fn session_turn(
                             message.conversation.thread.as_deref().unwrap_or_default(),
                         subject = message.subject.canonical(),
                         reason = "agent-denied",
+                        admission.trigger = quiet.then_some("pull-request-link"),
                         "gateway.session.rejected"
                     );
                     permission_reply(&principal)
@@ -2207,7 +2214,7 @@ async fn session_turn(
                     UNAUTHORIZED_REPLY.to_owned()
                 }
             };
-            if !is_follow && answer(driver, message, &reply).await {
+            if !is_follow && !quiet && answer(driver, message, &reply).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();

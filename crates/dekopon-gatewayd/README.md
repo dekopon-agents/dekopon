@@ -23,7 +23,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   unmentioned follow-ups can continue. Slack routes may opt into `ambient.pullRequestLinks`
   with existing follow and journal configuration: a PR link starts a threaded review turn using
   only the poster’s broker leg, downscoped by a mapped channel. Other speakers wait for separate
-  turns. See [Slack pull-request links](../../docs/gatewayd.md#slack-pull-request-links).
+  turns. Unmapped or denied posters' ambient links are silently refused, with a trace record
+  and no thread reply or reaction. See [Slack pull-request links](../../docs/gatewayd.md#slack-pull-request-links).
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Feature-only fauxlack also reads manifest files from its world. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
