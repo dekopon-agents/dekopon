@@ -4161,8 +4161,8 @@ impl TextStream for RecordingStream {
 #[async_trait]
 impl InboundReaction for RecordingReaction {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
-        let failure = self.charge();
         self.record(rendered_target(target), present);
+        let failure = self.charge();
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
     }
 }
@@ -6119,6 +6119,11 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
             "{transport}"
         );
         if transport == "discord" {
+            driver
+                .reaction_object()
+                .expect("working reaction")
+                .wait_for_calls(1)
+                .await;
             assert!(driver.calls().iter().any(|call| matches!(call, DriverCall::Reaction { target: reaction_target, present: true } if reaction_target == &rendered_target(&target("inbound-1")))));
         } else {
             assert!(
