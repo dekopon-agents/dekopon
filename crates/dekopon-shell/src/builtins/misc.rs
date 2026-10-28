@@ -357,6 +357,24 @@ pub(crate) fn sleep(
     Ok(CommandResult::status(ExitCode::SUCCESS))
 }
 
+pub(crate) fn cat_stream(
+    arguments: &[String],
+    mut emit: impl FnMut(&str) -> Result<bool, CommandFailure>,
+) -> Result<(), CommandFailure> {
+    for name in arguments {
+        if name.starts_with('-') && name.len() > 1 {
+            return Err(CommandFailure::usage(format!(
+                "cat: unsupported flag {name}"
+            )));
+        }
+        if !emit(name)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn cat(
     _context: &mut BuiltinContext<'_>,
     _arguments: &[String],

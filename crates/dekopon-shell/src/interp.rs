@@ -6,7 +6,9 @@ use dekopon_process::{
 };
 mod ifs;
 mod nesting;
+mod stage_out;
 use ifs::{Action, Boundary, Ifs, Kind};
+use stage_out::{OutputMode, StageOut};
 
 use std::{
     cmp::Ordering,
@@ -88,7 +90,9 @@ enum BuiltinMode {
     Run { capture_output: bool },
 }
 
-enum ParsedStream {
+enum ParsedStream<'a> {
+    Cat(&'a [String]),
+    Base64(&'a [String]),
     Lines(builtins::text::lines::Selection),
     Text(builtins::text::stream::Operation),
     Extra(builtins::text::extra::Operation),
@@ -122,94 +126,117 @@ impl Builtin {
             Self::False => builtins::misc::fail,
             Self::Progress => builtins::misc::progress,
             Self::Sleep => builtins::misc::sleep,
-            Self::Cat => return evaluator.run_cat(arguments, input, capture_output, stdout_sink),
+            Self::Cat => {
+                return evaluator.run_stream(
+                    self.name(),
+                    Ok((ParsedStream::Cat(arguments), None)),
+                    input,
+                    stdout_sink,
+                    capture_output,
+                );
+            }
             Self::Jobs => builtins::jobs::jobs,
             Self::Wait => builtins::jobs::wait,
             Self::Kill => builtins::jobs::kill,
             Self::Cap => builtins::cap::cap,
             Self::Head => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::lines::head(arguments)
                         .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Tail => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::lines::tail(arguments)
                         .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Grep => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::stream::grep(arguments)
                         .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Sed => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::stream::sed(arguments)
                         .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Cut => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::extra::cut(arguments)
                         .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Uniq => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::extra::uniq(arguments)
                         .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Wc => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::extra::wc(arguments)
                         .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Sort => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::text::extra::sort(arguments)
                         .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Jq => {
-                return evaluator.run_lines(
+                return evaluator.run_stream(
                     self.name(),
                     builtins::jq::options(arguments)
                         .map(|options| (ParsedStream::Jq(options), None)),
                     input,
                     stdout_sink,
+                    false,
                 );
             }
             Self::Base64 => {
-                return evaluator.run_base64(arguments, input, capture_output, stdout_sink, false);
+                return evaluator.run_stream(
+                    self.name(),
+                    Ok((ParsedStream::Base64(arguments), None)),
+                    input,
+                    stdout_sink,
+                    capture_output,
+                );
             }
             Self::Xargs => return evaluator.run_xargs(arguments, input, stdout_sink),
         };
@@ -803,54 +830,8 @@ impl<'a> Evaluator<'a> {
             .is_some_and(|depth| self.captures.len() <= depth)
     }
 
-    fn stdin_to_diagnostics(&self, sink: &Sink) -> bool {
-        matches!(sink, Sink::Diagnostics)
-            || (matches!(sink, Sink::Value)
-                && self.diagnostics_redirected()
-                && !self.output_discarded()
-                && self.active_buffer_name().is_none())
-    }
-
-    fn emit(&mut self, mut result: CommandResult) -> Result<(), LimitExceeded> {
-        if result.value.is_null() || self.output_discarded() {
-            return Ok(());
-        }
-        if let Some(name) = self.active_buffer_name().map(str::to_owned) {
-            self.append_buffer(&name, result)?;
-            return Ok(());
-        }
-        if self.diagnostics_redirected() {
-            self.write_redirected_diagnostics(&result);
-            return Ok(());
-        }
-        if let Some(capture) = self.captures.last_mut() {
-            retain_value(&self.budget, &result.value, &mut result.retained)?;
-            capture.push(result);
-            return Ok(());
-        }
-        if let Some(stdout) = self.stdout.as_mut() {
-            let written = match write_display(stdout, &result.value) {
-                WriteOutcome::Accepted if !result.suppress_newline => stdout.write(b"\n"),
-                written @ (WriteOutcome::Accepted | WriteOutcome::ReaderGone) => written,
-            };
-            match written {
-                WriteOutcome::Accepted => {}
-                WriteOutcome::ReaderGone => self.reader_gone = true,
-            }
-            return Ok(());
-        }
-        let text = display(&result.value);
-        telemetry::stage_write(
-            text.len() + usize::from(!result.suppress_newline),
-            true,
-            &None,
-        );
-        if result.suppress_newline {
-            self.output.push_fragment(&text);
-        } else {
-            self.output.push_block(&text);
-        }
-        Ok(())
+    fn emit(&mut self, result: CommandResult) -> Result<(), LimitExceeded> {
+        StageOut::new(self, &Sink::Value, OutputMode::Value, false).value(self, result)
     }
 
     /// Whether a command produced no value has to be recognized before it reaches a capture, not
@@ -1861,137 +1842,24 @@ impl<'a> Evaluator<'a> {
         capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
-        if self.stdin_to_diagnostics(sink) {
-            let mut piped = match input {
-                StageInput::Piped(reader) => Some(reader),
-                StageInput::Inherited => None,
-            };
-            let mut excerpt = Vec::new();
-            let mut truncated = false;
-            while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
-                let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
-                    break;
-                };
-                self.budget.charge_step()?;
-                let room = self.limits.max_output_bytes.saturating_sub(excerpt.len());
-                truncated |= chunk.len() > room;
-                excerpt.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            }
-            if let Some(capture) = self.stderr_capture.last_mut() {
-                capture.push_bytes(&excerpt);
-                if truncated {
-                    capture.truncated = true;
-                }
-            } else {
-                push_lossy_bytes(&mut self.output, &excerpt);
-                if truncated {
-                    self.output
-                        .push_block("... redirected diagnostics truncated ...");
-                }
-            }
+        let mut output = StageOut::new(self, sink, OutputMode::Copy, capture_output);
+        let mut piped = match input {
+            StageInput::Piped(reader) => Some(reader),
+            StageInput::Inherited => None,
+        };
+        if piped.is_none() && self.stdin.is_empty() {
             return Ok(CommandResult::status(ExitCode::SUCCESS));
         }
-        if let Some(name) = self.active_buffer_name().map(str::to_owned) {
-            let mut piped = match input {
-                StageInput::Piped(reader) => Some(reader),
-                StageInput::Inherited => None,
+        while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
+            let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
+                break;
             };
-            while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
-                let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
-                    break;
-                };
-                self.budget.charge_step()?;
-                self.append_buffer_bytes(&name, &chunk)?;
-            }
-            return Ok(CommandResult::status(ExitCode::SUCCESS));
-        }
-        let discard = self.output_discarded() || matches!(sink, Sink::Discard);
-        let routed = discard || !self.captures.is_empty() || self.diagnostics_redirected();
-        let Self {
-            stdin,
-            stdout,
-            output,
-            captures,
-            budget,
-            reader_gone,
-            ..
-        } = self;
-        let mut collected = Vec::new();
-        let into_capture = !captures.is_empty();
-        let collect = capture_output;
-        let mut piped;
-        let reader = match input {
-            StageInput::Piped(reader) => {
-                piped = reader;
-                &mut piped
-            }
-            StageInput::Inherited => match stdin.last_mut() {
-                Some(reader) => reader,
-                None => return Ok(CommandResult::status(ExitCode::SUCCESS)),
-            },
-        };
-        let mut partial = Vec::new();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
-            budget.charge_step()?;
-            if discard {
-                continue;
-            }
-            let Some(writer) = stdout.as_mut().filter(|_| !routed) else {
-                telemetry::stage_write(chunk.len(), true, &None);
-                partial.extend_from_slice(&chunk);
-                let complete = lossy_complete_prefix(&partial);
-                if !into_capture && !collect {
-                    output.push_fragment(&String::from_utf8_lossy(&partial[..complete]));
-                } else if complete > 0 {
-                    let text =
-                        std::str::from_utf8(&partial[..complete]).map_err(|_invalid_utf8| {
-                            CommandFailure::failed("standard input is not valid UTF-8 text")
-                        })?;
-                    let charge = budget.charge_value_bytes(complete as u64)?;
-                    let mut result =
-                        CommandResult::value(Value::String(text.to_owned())).without_newline();
-                    result.retained.push(charge);
-                    if into_capture {
-                        if let Some(capture) = captures.last_mut() {
-                            capture.push(result);
-                        }
-                    } else {
-                        collected.push(result);
-                    }
-                }
-                partial.drain(..complete);
-                continue;
-            };
-            match writer.write(&chunk) {
-                WriteOutcome::Accepted => {}
-                WriteOutcome::ReaderGone => {
-                    *reader_gone = true;
-                    break;
-                }
+            self.budget.charge_step()?;
+            if !output.write(self, &chunk)? {
+                break;
             }
         }
-        if !partial.is_empty() {
-            if !into_capture && !collect {
-                output.push_fragment(&String::from_utf8_lossy(&partial));
-            } else {
-                return Err(CommandFailure::failed(
-                    "standard input is not valid UTF-8 text",
-                ));
-            }
-        }
-        let mut retained = capture_charges(&mut collected);
-        let value = if collected.is_empty() {
-            Value::Null
-        } else {
-            reduce_charged(budget, collected, &mut retained)?
-        };
-        retain_value(budget, &value, &mut retained)?;
-        Ok(CommandResult {
-            value,
-            status: ExitCode::SUCCESS,
-            suppress_newline: true,
-            retained,
-        })
+        output.finish(self, ExitCode::SUCCESS)
     }
 
     fn execute_command(
@@ -2028,8 +1896,7 @@ impl<'a> Evaluator<'a> {
         let (stdout, stderr) = match self.resolve_redirects(redirects) {
             Ok(sinks) => sinks,
             Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
         let collect = stdout == Sink::Value && capture_output;
@@ -2176,8 +2043,7 @@ impl<'a> Evaluator<'a> {
         let argv = match self.expand_command_argv(&command.words) {
             Ok(argv) => argv,
             Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
 
@@ -2197,8 +2063,7 @@ impl<'a> Evaluator<'a> {
                 Ok(value) => value,
                 Err(failure) => {
                     self.restore_all(restore);
-                    let status = self.absorb(failure)?;
-                    return Ok(Executed::Result(CommandResult::status(status)));
+                    return self.failed(failure);
                 }
             };
             assignment_status = self.last_substitution_status;
@@ -2237,8 +2102,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Err(failure) => {
                     self.restore_all(restore);
-                    let status = self.absorb(failure)?;
-                    return Ok(Executed::Result(CommandResult::status(status)));
+                    return self.failed(failure);
                 }
             },
         };
@@ -2247,8 +2111,7 @@ impl<'a> Evaluator<'a> {
             Ok(sinks) => sinks,
             Err(failure) => {
                 self.restore_all(restore);
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
 
@@ -2532,128 +2395,6 @@ impl<'a> Evaluator<'a> {
         executed
     }
 
-    fn run_base64(
-        &mut self,
-        arguments: &[String],
-        input: StageInput,
-        capture_output: bool,
-        stdout_sink: &Sink,
-        literal_help: bool,
-    ) -> Result<Executed, FatalError> {
-        if literal_help {
-            return Ok(Executed::Result(builtins::help_result(
-                "base64",
-                crate::builtins::encode::HELP,
-            )));
-        }
-        let mut reader = match input {
-            StageInput::Piped(reader) => reader,
-            StageInput::Inherited => self
-                .stdin
-                .last_mut()
-                .map(std::mem::take)
-                .unwrap_or_default(),
-        };
-        let mut bytes = Vec::new();
-        let mut charges = Vec::new();
-        let mut utf8_pending = Vec::new();
-        let retention_budget = self.budget.fork();
-        let discard = self.output_discarded();
-        let diagnostics = self.diagnostics_redirected();
-        let active_buffer = self.active_buffer_name().map(str::to_owned);
-        let outcome =
-            crate::builtins::encode::stream(arguments, &mut reader, &mut self.budget, |chunk| {
-                if matches!(stdout_sink, Sink::Discard) {
-                    return Ok(true);
-                }
-                if matches!(stdout_sink, Sink::Value)
-                    && diagnostics
-                    && !discard
-                    && active_buffer.is_none()
-                {
-                    push_diagnostic_bytes(chunk, &mut self.stderr_capture, &mut self.output);
-                    return Ok(true);
-                }
-                if !discard
-                    && self.captures.is_empty()
-                    && active_buffer.is_none()
-                    && matches!(stdout_sink, Sink::Value)
-                    && let Some(writer) = self.stdout.as_mut()
-                {
-                    return Ok(match writer.write(chunk) {
-                        WriteOutcome::Accepted => true,
-                        WriteOutcome::ReaderGone => {
-                            self.reader_gone = true;
-                            false
-                        }
-                    });
-                }
-                if matches!(stdout_sink, Sink::Value) && discard {
-                    return Ok(true);
-                }
-                if matches!(stdout_sink, Sink::Value)
-                    && let Some(name) = active_buffer.as_deref()
-                {
-                    let charge = retention_budget.charge_value_bytes(chunk.len() as u64)?;
-                    append_charged_buffer(
-                        &retention_budget,
-                        BufferStorage {
-                            buffers: &mut self.buffers,
-                            charges: &mut self.buffer_charges,
-                            shared_charges: &mut self.shared_charges,
-                        },
-                        name,
-                        chunk,
-                        vec![charge],
-                    )?;
-                    return Ok(true);
-                }
-                if matches!(stdout_sink, Sink::Value) && !capture_output && self.captures.is_empty()
-                {
-                    telemetry::stage_write(chunk.len(), true, &None);
-                    utf8_pending.extend_from_slice(chunk);
-                    let complete = lossy_complete_prefix(&utf8_pending);
-                    self.output
-                        .push_fragment(&String::from_utf8_lossy(&utf8_pending[..complete]));
-                    utf8_pending.drain(..complete);
-                } else {
-                    charges.push(retention_budget.charge_value_bytes(chunk.len() as u64)?);
-                    bytes.extend_from_slice(chunk);
-                }
-                Ok(true)
-            });
-        let status = match outcome {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(failure) => self.absorb(failure)?,
-        };
-        if !utf8_pending.is_empty() {
-            self.output
-                .push_fragment(&String::from_utf8_lossy(&utf8_pending));
-        }
-        if bytes.is_empty() || status != ExitCode::SUCCESS {
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
-        if let Sink::Buffer { name, .. } = stdout_sink {
-            self.append_charged_buffer_bytes(name, &bytes, charges)?;
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_invalid_utf8) => {
-                let status = self.absorb(CommandFailure::failed(
-                    "standard input is not valid UTF-8 text",
-                ))?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-        };
-        Ok(Executed::Result(CommandResult {
-            value: Value::String(text),
-            status,
-            suppress_newline: true,
-            retained: charges,
-        }))
-    }
-
     fn stream_input(
         &mut self,
         command: &str,
@@ -2695,175 +2436,100 @@ impl<'a> Evaluator<'a> {
         ))
     }
 
-    fn run_lines(
+    fn run_stream(
         &mut self,
         name: &str,
-        parsed: Result<(ParsedStream, Option<String>), CommandFailure>,
+        parsed: Result<(ParsedStream<'_>, Option<String>), CommandFailure>,
         input: StageInput,
         stdout_sink: &Sink,
+        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let (parsed, operand) = match parsed {
             Ok(parsed) => parsed,
-            Err(failure) => {
-                return Ok(Executed::Result(CommandResult::status(
-                    self.absorb(failure)?,
-                )));
-            }
+            Err(failure) => return self.failed(failure),
         };
-        let retention_budget = self.budget.fork();
-        let mut redirected_bytes = Vec::new();
-        let mut redirect_charges = Vec::new();
-        let mut utf8_pending = Vec::new();
-        let (mut reader, _input_charge) = match self.stream_input(name, operand.as_deref(), input) {
-            Ok(selected) => selected,
-            Err(failure) => {
-                return Ok(Executed::Result(CommandResult::status(
-                    self.absorb(failure)?,
-                )));
-            }
-        };
-        let discard = self.output_discarded();
-        let diagnostics = self.diagnostics_redirected();
-        let active_buffer = self.active_buffer_name().map(str::to_owned);
-        let mut emit = |line: &[u8]| {
-            if matches!(stdout_sink, Sink::Discard) {
-                return Ok(true);
-            }
-            if matches!(stdout_sink, Sink::Value)
-                && diagnostics
-                && !discard
-                && active_buffer.is_none()
-            {
-                push_diagnostic_bytes(line, &mut self.stderr_capture, &mut self.output);
-                return Ok(true);
-            }
-            if matches!(stdout_sink, Sink::Value)
-                && !discard
-                && self.captures.is_empty()
-                && active_buffer.is_none()
-                && let Some(writer) = self.stdout.as_mut()
-            {
-                match writer.write(line) {
-                    WriteOutcome::Accepted => return Ok(true),
-                    WriteOutcome::ReaderGone => {
-                        self.reader_gone = true;
-                        return Ok(false);
-                    }
-                }
-            }
-            if matches!(stdout_sink, Sink::Value) && discard {
-                return Ok(true);
-            }
-            if matches!(stdout_sink, Sink::Value)
-                && let Some(name) = active_buffer.as_deref()
-            {
-                append_stream_buffer(
-                    &retention_budget,
-                    BufferStorage {
-                        buffers: &mut self.buffers,
-                        charges: &mut self.buffer_charges,
-                        shared_charges: &mut self.shared_charges,
-                    },
-                    name,
-                    line,
-                )?;
-                return Ok(true);
-            }
-            if !matches!(stdout_sink, Sink::Value) {
-                let charge = retention_budget.charge_value_bytes(line.len() as u64)?;
-                redirected_bytes.extend_from_slice(line);
-                redirect_charges.push(charge);
-                return Ok(true);
-            }
-            telemetry::stage_terminal_write(line.len(), self.captures.is_empty());
-            utf8_pending.extend_from_slice(line);
-            let complete = match std::str::from_utf8(&utf8_pending) {
-                Ok(text) => text.len(),
-                Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                Err(_invalid_utf8) if self.captures.is_empty() => {
-                    lossy_complete_prefix(&utf8_pending)
-                }
-                Err(_invalid_utf8) => {
-                    return Err(CommandFailure::failed(
-                        "standard input is not valid UTF-8 text",
+        let mode = match &parsed {
+            ParsedStream::Cat(arguments) if arguments.is_empty() => {
+                if self.stdout.is_none()
+                    && !capture_output
+                    && self.captures.is_empty()
+                    && self.stdout_redirected
+                    && self.active_buffer_name().is_none()
+                    && stdout_sink != &Sink::Diagnostics
+                {
+                    return Ok(Executed::Result(
+                        CommandResult::value(Value::Null).without_newline(),
                     ));
                 }
-            };
-            if complete > 0 {
-                let text = String::from_utf8_lossy(&utf8_pending[..complete]);
-                if let Some(capture) = self.captures.last_mut() {
-                    let charge = retention_budget.charge_value_bytes(complete as u64)?;
-                    let mut result =
-                        CommandResult::value(Value::String(text.into_owned())).without_newline();
-                    result.retained.push(charge);
-                    capture.push(result);
-                } else {
-                    self.output.push_fragment(&text);
-                }
-                utf8_pending.drain(..complete);
+                let outcome = self.copy_stdin(input, capture_output, stdout_sink);
+                return self.completed(outcome);
             }
-            Ok(true)
+            ParsedStream::Cat(_) => OutputMode::Named,
+            ParsedStream::Base64(_) => OutputMode::Base64,
+            ParsedStream::Lines(_)
+            | ParsedStream::Text(_)
+            | ParsedStream::Extra(_)
+            | ParsedStream::Jq(_) => OutputMode::Lines,
         };
+        let mut output = StageOut::new(self, stdout_sink, mode, capture_output);
+        let mut budget = self.budget.fork();
+        let (mut reader, _input_charge) = match &parsed {
+            ParsedStream::Cat(_) => (PipeReader::default(), None),
+            ParsedStream::Base64(_)
+            | ParsedStream::Lines(_)
+            | ParsedStream::Text(_)
+            | ParsedStream::Extra(_)
+            | ParsedStream::Jq(_) => match self.stream_input(name, operand.as_deref(), input) {
+                Ok(selected) => selected,
+                Err(failure) => return self.failed(failure),
+            },
+        };
+        let mut emit = |bytes: &[u8]| output.write(self, bytes);
         let outcome = match parsed {
             ParsedStream::Lines(selection) => {
-                builtins::text::lines::run(selection, &mut reader, &mut self.budget, &mut emit)
+                builtins::text::lines::run(selection, &mut reader, &mut budget, &mut emit)
                     .map(|()| ExitCode::SUCCESS)
             }
-            ParsedStream::Extra(operation) => builtins::text::extra::run_parsed(
-                operation,
-                &mut reader,
-                &mut self.budget,
-                &mut emit,
-            ),
-            ParsedStream::Text(operation) => builtins::text::stream::run_parsed(
-                operation,
-                &mut reader,
-                &mut self.budget,
-                &mut emit,
-            ),
-            ParsedStream::Jq(opts) => {
-                builtins::jq::stream(opts, &mut reader, &mut self.budget, &mut emit)
+            ParsedStream::Text(operation) => {
+                builtins::text::stream::run_parsed(operation, &mut reader, &mut budget, &mut emit)
+            }
+            ParsedStream::Extra(operation) => {
+                builtins::text::extra::run_parsed(operation, &mut reader, &mut budget, &mut emit)
+            }
+            ParsedStream::Jq(options) => {
+                builtins::jq::stream(options, &mut reader, &mut budget, &mut emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            ParsedStream::Base64(arguments) => {
+                builtins::encode::stream(arguments, &mut reader, &mut budget, &mut emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            ParsedStream::Cat(arguments) => {
+                builtins::misc::cat_stream(arguments, |name| output.named(self, name))
                     .map(|()| ExitCode::SUCCESS)
             }
         };
-        let mut status = match outcome {
+        let status = match outcome {
             Ok(status) => status,
             Err(failure) => self.absorb(failure)?,
         };
-        if status == ExitCode::SUCCESS && !utf8_pending.is_empty() {
-            if self.captures.is_empty() {
-                self.output
-                    .push_fragment(&String::from_utf8_lossy(&utf8_pending));
-            } else {
-                status = self.absorb(CommandFailure::failed(
-                    "standard input is not valid UTF-8 text",
-                ))?;
-            }
-        }
-        self.finish_stream_redirect(stdout_sink, redirected_bytes, redirect_charges, status)
+        let outcome = output.finish(self, status);
+        self.completed(outcome)
     }
 
-    fn finish_stream_redirect(
+    fn failed(&mut self, failure: CommandFailure) -> Result<Executed, FatalError> {
+        self.absorb(failure)
+            .map(|status| Executed::Result(CommandResult::status(status)))
+    }
+
+    fn completed(
         &mut self,
-        sink: &Sink,
-        bytes: Vec<u8>,
-        charges: Vec<dekopon_process::RetainedBytes>,
-        status: ExitCode,
+        outcome: Result<CommandResult, CommandFailure>,
     ) -> Result<Executed, FatalError> {
-        if bytes.is_empty() {
-            return Ok(Executed::Result(CommandResult::status(status)));
+        match outcome {
+            Ok(result) => Ok(Executed::Result(result)),
+            Err(failure) => self.failed(failure),
         }
-        if let Sink::Buffer { name, .. } = sink {
-            self.append_charged_buffer_bytes(name, &bytes, charges)?;
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
-        let text = String::from_utf8(bytes).map_err(|_invalid_utf8| {
-            FatalError::Unsupported("standard input is not valid UTF-8 text".to_owned())
-        })?;
-        let mut result = CommandResult::value(Value::String(text)).without_newline();
-        result.status = status;
-        result.retained = charges;
-        Ok(Executed::Result(result))
     }
 
     fn append_named_buffer(
@@ -2893,115 +2559,6 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn run_named_cat(&mut self, arguments: &[String], sink: &Sink) -> Result<Executed, FatalError> {
-        for name in arguments {
-            if name.starts_with('-') && name.len() > 1 {
-                let status = self.absorb(CommandFailure::usage(format!(
-                    "cat: unsupported flag {name}"
-                )))?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-            if let Err(failure) = check_buffer_operand("cat", name) {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-            if name == DEV_NULL {
-                continue;
-            }
-            let Some(bytes) = self.buffers.get(name) else {
-                let status = self.absorb(CommandFailure::failed(format!(
-                    "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"
-                )))?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            };
-            match sink {
-                Sink::Buffer {
-                    name: destination, ..
-                } => self.append_named_buffer(name, destination)?,
-                Sink::Discard => {}
-                Sink::Diagnostics => {
-                    if let Some(capture) = self.stderr_capture.last_mut() {
-                        capture.push_bytes(bytes);
-                    } else {
-                        push_lossy_bytes(&mut self.output, bytes);
-                    }
-                }
-                Sink::Value => {
-                    if let Some(destination) = self.active_buffer_name().map(str::to_owned) {
-                        self.append_named_buffer(name, &destination)?;
-                        continue;
-                    }
-                    if self.output_discarded() {
-                        continue;
-                    }
-                    if self.diagnostics_redirected() {
-                        push_diagnostic_bytes(bytes, &mut self.stderr_capture, &mut self.output);
-                        continue;
-                    }
-                    if let Some(writer) = self.stdout.as_mut() {
-                        if writer.write(bytes) == WriteOutcome::ReaderGone {
-                            self.reader_gone = true;
-                            break;
-                        }
-                    } else {
-                        let text = match std::str::from_utf8(bytes) {
-                            Ok(text) => text,
-                            Err(_) if self.captures.is_empty() => {
-                                push_lossy_bytes(&mut self.output, bytes);
-                                continue;
-                            }
-                            Err(_) => {
-                                let status = self.absorb(CommandFailure::failed(
-                                    "standard input is not valid UTF-8 text",
-                                ))?;
-                                return Ok(Executed::Result(CommandResult::status(status)));
-                            }
-                        };
-                        if let Some(capture) = self.captures.last_mut() {
-                            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-                            let mut result = CommandResult::value(Value::String(text.to_owned()))
-                                .without_newline();
-                            result.retained.push(charge);
-                            capture.push(result);
-                        } else {
-                            self.output.push_fragment(text);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Executed::Result(CommandResult::status(ExitCode::SUCCESS)))
-    }
-
-    fn run_cat(
-        &mut self,
-        arguments: &[String],
-        input: StageInput,
-        capture_output: bool,
-        stdout_sink: &Sink,
-    ) -> Result<Executed, FatalError> {
-        if !arguments.is_empty() {
-            return self.run_named_cat(arguments, stdout_sink);
-        }
-        if arguments.is_empty()
-            && (self.stdout.is_some()
-                || capture_output
-                || !self.captures.is_empty()
-                || !self.stdout_redirected
-                || self.active_buffer_name().is_some()
-                || matches!(stdout_sink, Sink::Diagnostics))
-        {
-            return match self.copy_stdin(input, capture_output, stdout_sink) {
-                Ok(result) => Ok(Executed::Result(result)),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Ok(Executed::Result(CommandResult::status(status)))
-                }
-            };
-        }
-        self.run_simple_builtin(builtins::misc::cat, arguments, input)
-    }
-
     fn run_simple_builtin(
         &mut self,
         run: builtins::Run,
@@ -3019,10 +2576,7 @@ impl<'a> Evaluator<'a> {
         };
         match outcome {
             Ok(result) => Ok(Executed::Result(result)),
-            Err(failure) => {
-                let status = self.absorb(failure)?;
-                Ok(Executed::Result(CommandResult::status(status)))
-            }
+            Err(failure) => self.failed(failure),
         }
     }
 
@@ -3083,10 +2637,7 @@ impl<'a> Evaluator<'a> {
                 };
                 match self.run_provider(call, input, capture_output, stdout_sink) {
                     Ok(result) => Ok(Executed::Result(result)),
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        Ok(Executed::Result(CommandResult::status(status)))
-                    }
+                    Err(failure) => self.failed(failure),
                 }
             }
             Resolution::NotFound => {
@@ -3517,8 +3068,7 @@ impl<'a> Evaluator<'a> {
         let template = match xargs::parse(arguments) {
             Ok(template) => template,
             Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
         let mut piped = match input {
@@ -4891,16 +4441,6 @@ fn invert(status: ExitCode) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
-}
-
-fn append_stream_buffer(
-    budget: &Budget,
-    storage: BufferStorage<'_>,
-    name: &str,
-    bytes: &[u8],
-) -> Result<(), LimitExceeded> {
-    let charge = budget.charge_value_bytes(bytes.len() as u64)?;
-    append_charged_buffer(budget, storage, name, bytes, vec![charge])
 }
 
 struct BufferStorage<'a> {
