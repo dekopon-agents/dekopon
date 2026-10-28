@@ -79,6 +79,7 @@ fn failure(error: AwkError) -> CommandFailure {
 }
 
 fn compile_separator(source: &str, budget: &Budget) -> Result<Option<CompiledRegex>, AwkError> {
+    let _decode_charge = budget.charge_value_bytes(source.len() as u64)?;
     let decoded = lex::decode_escapes(source)?;
     if decoded.is_empty() {
         return Err(Refusal::EmptySeparator.into());

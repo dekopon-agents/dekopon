@@ -547,6 +547,15 @@ fn regex_extensions_are_refused_and_awk_escapes_are_translated() {
 
 #[test]
 fn regex_and_parser_charges_are_reserved_and_refunded() {
+    let separator_budget = Budget::start(Limits {
+        max_value_bytes: 0,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        compile_separator(":", &separator_budget),
+        Err(AwkError::Limit(LimitExceeded::ValueBytes { .. }))
+    ));
+    assert_eq!(separator_budget.value_bytes(), 0);
     let budget = Budget::start(Limits {
         max_value_bytes: 2 * 1024 * 1024 - 1,
         ..Limits::default()
