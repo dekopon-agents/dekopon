@@ -46,7 +46,7 @@ fn parse_nested(source: &str, depth: Depth, line: usize) -> Result<Program, Pars
         let kind = token.kind.clone();
         return Err(ParseError::refused(
             line,
-            Refusal::UnexpectedToken(Box::new(kind.clone())),
+            Refusal::UnexpectedToken(Box::new(kind)),
         ));
     }
     Ok(program)
@@ -1283,32 +1283,151 @@ mod tests {
         Statement, Stream, Word, WordPart,
     };
 
-    use super::{ParseError, parse};
+    use super::errors::{ArithmeticOperator, Context, Found, Keyword, PatternContext};
+    use super::{ParseError, Refusal, parse};
+    use crate::lexer::TokenKind;
 
-    fn syntax_error(source: &str) -> String {
-        match parse(source).expect_err("must be rejected") {
-            ParseError::Syntax { message, .. } => message,
-            ParseError::Lex(error) => error.message,
+    #[test]
+    fn substitution_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\n:\necho $(echo })").expect_err("refusal"),
+            ParseError::refused(3, Refusal::UnexpectedToken(Box::new(TokenKind::RightBrace)))
+        );
+    }
+
+    #[test]
+    fn parameter_word_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\n:\necho ${name:-$(echo })}").expect_err("refusal"),
+            ParseError::refused(3, Refusal::UnexpectedToken(Box::new(TokenKind::RightBrace)))
+        );
+    }
+
+    #[test]
+    fn here_document_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\ncat <<EOF\n$(echo })\nEOF\n").expect_err("refusal"),
+            ParseError::refused(3, Refusal::UnexpectedToken(Box::new(TokenKind::RightBrace)))
+        );
+    }
+
+    #[test]
+    fn arithmetic_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\necho $((\n1 ** 2\n))").expect_err("refusal"),
+            ParseError::refused(3, Refusal::ArithmeticOperator(ArithmeticOperator::Power))
+        );
+    }
+
+    #[test]
+    fn parameter_index_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\n:\necho ${name[`x`]}").expect_err("refusal"),
+            ParseError::refused(3, Refusal::Backtick)
+        );
+    }
+
+    #[test]
+    fn multiline_composition_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\necho ${name:-$(\necho })}").expect_err("refusal"),
+            ParseError::refused(3, Refusal::UnexpectedToken(Box::new(TokenKind::RightBrace)))
+        );
+    }
+
+    #[test]
+    fn bounded_prefix_refusal_reports_the_absolute_script_line() {
+        assert_eq!(
+            parse(":\n:\necho \"$(cat <<EOF)\"\nhi\nEOF\n").expect_err("refusal"),
+            ParseError::refused(3, Refusal::MissingHereDelimiter("EOF".to_owned()))
+        );
+    }
+
+    #[test]
+    fn arithmetic_refusals_preserve_their_variants_and_source_fragments() {
+        for (body, refusal) in [
+            (
+                "1 ** 2",
+                Refusal::ArithmeticOperator(ArithmeticOperator::Power),
+            ),
+            (
+                "1 << 2",
+                Refusal::ArithmeticOperator(ArithmeticOperator::Bitwise),
+            ),
+            (
+                "1 ? 2 : 3",
+                Refusal::ArithmeticOperator(ArithmeticOperator::Ternary),
+            ),
+            ("", Refusal::EmptyArithmetic),
+            ("1 2", Refusal::TrailingArithmetic),
+            ("1 +", Refusal::ArithmeticEnded),
+            ("$", Refusal::ExpectedArithmeticVariable),
+            ("é", Refusal::ArithmeticCharacter('é')),
+            (
+                "9223372036854775808",
+                Refusal::ArithmeticLiteralOutOfRange("9223372036854775808".to_owned()),
+            ),
+        ] {
+            assert_eq!(syntax_error(&format!("echo $(( {body} ))")), refusal);
         }
     }
 
     #[test]
-    fn substitution_reports_unexpected_tokens_at_their_body_lines() {
-        let cases = [
-            ("$(echo })", "line 1: unexpected }"),
-            ("$(echo a ;; )", "line 1: unexpected ;;"),
-        ];
-        let actual = cases.map(|(source, _)| parse(source).expect_err(source).to_string());
-        let expected = cases.map(|(_, expected)| expected.to_owned());
-        assert_eq!(actual, expected);
+    fn expected_tokens_and_invalid_names_keep_typed_context() {
+        for (source, refusal) in [
+            (
+                "|",
+                Refusal::ExpectedCommand(Found::Token(Box::new(TokenKind::Pipe))),
+            ),
+            (
+                "case x in )",
+                Refusal::ExpectedCasePattern(Found::Token(Box::new(TokenKind::RightParen))),
+            ),
+            (
+                "1bad() { :; }",
+                Refusal::InvalidFunctionName("1bad".to_owned()),
+            ),
+            (
+                "for 1bad in a; do :; done",
+                Refusal::InvalidForVariable("1bad".to_owned()),
+            ),
+            (
+                "[[ ]]",
+                Refusal::ExpectedCondition(Found::Token(Box::new(TokenKind::Word(Word {
+                    parts: vec![WordPart::Literal("]]".to_owned())],
+                })))),
+            ),
+        ] {
+            assert_eq!(syntax_error(source), refusal);
+        }
+    }
+
+    fn syntax_error(source: &str) -> Refusal {
+        match parse(source).expect_err("must be rejected") {
+            ParseError::Refused { refusal, .. } => refusal,
+            ParseError::TooDeep { .. } => panic!("expected a syntax refusal"),
+        }
+    }
+
+    #[test]
+    fn substitution_reports_unexpected_tokens_with_their_variants() {
+        for (source, token) in [
+            ("$(echo })", TokenKind::RightBrace),
+            ("$(echo a ;; )", TokenKind::DoubleSemicolon),
+        ] {
+            assert_eq!(
+                parse(source).expect_err(source),
+                ParseError::refused(1, Refusal::UnexpectedToken(Box::new(token)))
+            );
+        }
     }
 
     #[test]
     fn pending_substitution_close_keeps_the_here_doc_refusal() {
         let source = "echo \"$(cat <<EOF)\"\nhi\nEOF\n";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\""
+            parse(source).expect_err(source),
+            ParseError::refused(1, Refusal::MissingHereDelimiter("EOF".to_owned()))
         );
     }
 
@@ -1316,8 +1435,8 @@ mod tests {
     fn a_here_doc_interpolation_failure_keeps_its_own_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\n`x`\nEOF\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 2: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+            parse(source).expect_err(source),
+            ParseError::refused(2, Refusal::Backtick)
         );
     }
 
@@ -1325,8 +1444,8 @@ mod tests {
     fn completed_here_doc_keeps_a_later_backtick_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\n`x`\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 4: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+            parse(source).expect_err(source),
+            ParseError::refused(4, Refusal::Backtick)
         );
     }
 
@@ -1334,8 +1453,8 @@ mod tests {
     fn completed_here_doc_keeps_a_later_quote_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\necho \"oops\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 4: unterminated double-quoted string"
+            parse(source).expect_err(source),
+            ParseError::refused(4, Refusal::UnterminatedDoubleQuote)
         );
     }
 
@@ -1343,8 +1462,8 @@ mod tests {
     fn completed_empty_quoted_here_doc_keeps_a_later_backtick_refusal() {
         let source = "echo $(cat <<'EOF'; case a in a) true;; esac\nEOF\n`x`\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 3: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+            parse(source).expect_err(source),
+            ParseError::refused(3, Refusal::Backtick)
         );
     }
 
@@ -1577,12 +1696,22 @@ mod tests {
 
     #[test]
     fn redirections_that_would_do_nothing_or_mislead_are_refused() {
-        for source in ["cmd >&1", "cmd 2>&2"] {
-            let error = parse(source).expect_err("self-duplication is refused");
-            assert!(format!("{error}").contains("onto itself"), "{source}");
+        for (source, stream) in [("cmd >&1", Stream::Stdout), ("cmd 2>&2", Stream::Stderr)] {
+            assert_eq!(
+                syntax_error(source),
+                Refusal::SelfDuplication {
+                    source: stream,
+                    target: stream
+                }
+            );
         }
-        let error = parse("cmd 2>&1 > buf").expect_err("reversed duplication is refused");
-        assert!(format!("{error}").contains("before"), "{error}");
+        assert_eq!(
+            syntax_error("cmd 2>&1 > buf"),
+            Refusal::DuplicationOrder {
+                source: Stream::Stderr,
+                copied: Stream::Stdout
+            }
+        );
         assert_eq!(redirects_of("cmd > buf 2>&1").len(), 2);
     }
 
@@ -1634,19 +1763,25 @@ mod tests {
 
     #[test]
     fn a_function_definition_cannot_be_started_as_a_job() {
-        let message = syntax_error("f() { echo x; } &");
-        assert!(message.contains("function definition `f()"), "{message}");
+        assert_eq!(
+            syntax_error("f() { echo x; } &"),
+            Refusal::BackgroundFunction("f".to_owned())
+        );
     }
 
     #[test]
     fn dropped_grammar_is_rejected_by_name() {
-        assert!(syntax_error("(echo hi)").contains("subshells"));
-        assert!(syntax_error("cat <<<\"$x\"").contains("here-string"));
-        assert!(syntax_error("diff <(a) b").contains("process substitution"));
-        assert!(syntax_error("cat < file").contains("input redirection"));
-        assert!(syntax_error("select x in a; do echo $x; done").contains("select"));
-        assert!(syntax_error("function f { echo hi; }").contains("`function` keyword"));
-        assert!(syntax_error("esac").contains("without a matching `case`"));
+        for (source, refusal) in [
+            ("(echo hi)", Refusal::Subshell),
+            ("cat <<<\"$x\"", Refusal::HereString),
+            ("diff <(a) b", Refusal::ProcessSubstitution),
+            ("cat < file", Refusal::InputRedirection),
+            ("select x in a; do echo $x; done", Refusal::Select),
+            ("function f { echo hi; }", Refusal::FunctionKeyword),
+            ("esac", Refusal::UnmatchedEsac),
+        ] {
+            assert_eq!(syntax_error(source), refusal);
+        }
     }
 
     #[test]
@@ -1677,15 +1812,16 @@ mod tests {
     #[test]
     fn case_patterns_that_would_glob_are_rejected_by_name() {
         for (source, expected) in [
-            ("case $f in *.json) echo j ;; esac", "`*`"),
-            ("case $f in a?c) echo q ;; esac", "`?`"),
-            ("case $f in [ab]) echo c ;; esac", "`[`"),
+            ("case $f in *.json) echo j ;; esac", '*'),
+            ("case $f in a?c) echo q ;; esac", '?'),
+            ("case $f in [ab]) echo c ;; esac", '['),
         ] {
-            let message = syntax_error(source);
-            assert!(message.contains(expected), "{source}: {message}");
-            assert!(
-                message.contains("patterns are literal"),
-                "{source}: {message}"
+            assert_eq!(
+                syntax_error(source),
+                Refusal::Pattern {
+                    context: PatternContext::Case,
+                    character: expected
+                }
             );
         }
 
@@ -1704,9 +1840,24 @@ mod tests {
 
     #[test]
     fn malformed_case_statements_are_reported() {
-        assert!(syntax_error("case $x in a) echo a ;;").contains("expected `esac`"));
-        assert!(syntax_error("case $x in a echo a ;; esac").contains("expected `)`"));
-        assert!(syntax_error("case in a) echo a ;; esac").contains("expected `in`"));
+        assert_eq!(
+            syntax_error("case $x in a) echo a ;;"),
+            Refusal::ExpectedKeyword {
+                expected: Keyword::Esac,
+                context: Context::Case
+            }
+        );
+        assert_eq!(
+            syntax_error("case $x in a echo a ;; esac"),
+            Refusal::ExpectedCasePatternClose
+        );
+        assert_eq!(
+            syntax_error("case in a) echo a ;; esac"),
+            Refusal::ExpectedKeyword {
+                expected: Keyword::In,
+                context: Context::Case
+            }
+        );
     }
 
     #[test]
@@ -1719,7 +1870,10 @@ mod tests {
 
     #[test]
     fn a_command_accepts_at_most_one_here_document() {
-        assert!(syntax_error("cat <<A <<B\na\nA\nb\nB\n").contains("at most one here-document"));
+        assert_eq!(
+            syntax_error("cat <<A <<B\na\nA\nb\nB\n"),
+            Refusal::MultipleHereDocuments
+        );
     }
 
     #[test]
@@ -1747,10 +1901,9 @@ mod tests {
 
     #[test]
     fn functions_cannot_shadow_rejected_commands() {
-        let message = syntax_error("eval() { echo hi; }");
-        assert!(
-            message.contains("cannot define a function named"),
-            "{message}"
+        assert_eq!(
+            syntax_error("eval() { echo hi; }"),
+            Refusal::RejectedFunction(crate::builtins::RejectedCommand::Eval)
         );
     }
 
@@ -1773,12 +1926,31 @@ mod tests {
 
     #[test]
     fn unterminated_blocks_are_reported() {
-        assert!(syntax_error("if true; then echo hi").contains("expected `fi`"));
-        assert!(syntax_error("for x in a; do echo $x").contains("expected `done`"));
-        assert!(syntax_error("f() { echo hi").contains("expected `}`"));
+        assert_eq!(
+            syntax_error("if true; then echo hi"),
+            Refusal::ExpectedKeyword {
+                expected: Keyword::Fi,
+                context: Context::If
+            }
+        );
+        assert_eq!(
+            syntax_error("for x in a; do echo $x"),
+            Refusal::ExpectedKeyword {
+                expected: Keyword::Done,
+                context: Context::For
+            }
+        );
+        assert_eq!(
+            syntax_error("f() { echo hi"),
+            Refusal::ExpectedFunctionClose("f".to_owned())
+        );
     }
 }
 
 #[cfg(test)]
 #[path = "nesting_tests.rs"]
 mod nesting_tests;
+
+#[cfg(test)]
+#[path = "fuzz_tests.rs"]
+mod fuzz_tests;

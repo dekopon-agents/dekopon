@@ -1220,6 +1220,7 @@ impl<'a> Lexer<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Index, Modifier, Parameter, Stream, TokenKind, Word, WordPart, tokenize};
+    use crate::parser::{ParseError, Refusal};
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         tokenize(source)
@@ -1340,10 +1341,7 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert_eq!(
-            error.to_string(),
-            "line 1: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
-        );
+        assert_eq!(error, ParseError::refused(1, Refusal::Backtick));
         assert_eq!(lexer.pending_here_doc_close(), source.find(')'));
     }
 
@@ -1358,10 +1356,7 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert_eq!(
-            error.to_string(),
-            "line 1: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
-        );
+        assert_eq!(error, ParseError::refused(1, Refusal::Backtick));
         assert_eq!(lexer.pending_here_doc_close(), source.find(')'));
     }
 
@@ -1376,18 +1371,24 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert_eq!(
-            error.to_string(),
-            "line 5: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
-        );
+        assert_eq!(error, ParseError::refused(5, Refusal::Backtick));
         assert_eq!(lexer.pending_here_doc_close(), None);
     }
 
     #[test]
     fn parameter_word_newlines_preserve_following_diagnostic_lines() {
         let error = tokenize("echo \"${x:-a\nb}\"\n${y:^^}").expect_err("unsupported modifier");
-        assert!(error.message.contains("this shell keeps"), "{error}");
-        assert_eq!(error.line, 3);
+        assert_eq!(
+            error,
+            ParseError::refused(
+                3,
+                Refusal::UnsupportedParameter {
+                    name: "y".to_owned(),
+                    colon: true,
+                    operator: '^'
+                }
+            )
+        );
     }
 
     #[test]
@@ -1525,29 +1526,75 @@ mod tests {
 
     #[test]
     fn every_dropped_parameter_expansion_is_rejected_by_name() {
-        for (source, expected) in [
-            ("echo ${arr[@][0]}", "cannot be indexed further"),
+        for (source, refusal) in [
+            (
+                "echo ${arr[@][0]}",
+                Refusal::IndexAfterAll("arr".to_owned()),
+            ),
             (
                 "echo ${#items:-x}",
-                "combines a length with a transformation",
+                Refusal::LengthWithTransformation {
+                    name: "items".to_owned(),
+                    operator: ':',
+                },
             ),
-            ("echo ${name:#a}", "drop the colon"),
-            ("echo ${name^^}", "this shell keeps"),
-            ("echo ${name@Q}", "this shell keeps"),
-            ("echo ${}", "empty ${} parameter reference"),
-            ("echo ${name", "unterminated"),
-            ("echo ${name:-a|b}", "is not allowed inside"),
-            ("echo ${name:-a;b}", "is not allowed inside"),
-            ("echo ${name:-a&b}", "is not allowed inside"),
-            ("echo ${name:-a<b}", "is not allowed inside"),
-            ("echo ${name:-a>b}", "is not allowed inside"),
-            ("echo ${name:-a(b)c}", "is not allowed inside"),
-            ("echo ${name:-a)b}", "is not allowed inside"),
+            (
+                "echo ${name:#a}",
+                Refusal::ColonInPattern {
+                    name: "name".to_owned(),
+                    operator: '#',
+                },
+            ),
+            (
+                "echo ${name^^}",
+                Refusal::UnsupportedParameter {
+                    name: "name".to_owned(),
+                    colon: false,
+                    operator: '^',
+                },
+            ),
+            (
+                "echo ${name@Q}",
+                Refusal::UnsupportedParameter {
+                    name: "name".to_owned(),
+                    colon: false,
+                    operator: '@',
+                },
+            ),
+            ("echo ${}", Refusal::EmptyParameter),
+            ("echo ${name", Refusal::UnterminatedParameter),
         ] {
-            let error = tokenize(source)
-                .map(|tokens| format!("{tokens:?}"))
-                .expect_err(source);
-            assert!(error.message.contains(expected), "{source}: {error}");
+            assert_eq!(
+                tokenize(source).expect_err(source),
+                ParseError::refused(1, refusal)
+            );
+        }
+        for (character, token) in [
+            ('|', TokenKind::Pipe),
+            (';', TokenKind::Semicolon),
+            ('&', TokenKind::Ampersand),
+            ('<', TokenKind::Less),
+            (
+                '>',
+                TokenKind::Redirect {
+                    source: Stream::Stdout,
+                    append: false,
+                },
+            ),
+            ('(', TokenKind::LeftParen),
+            (')', TokenKind::RightParen),
+        ] {
+            let source = format!("echo ${{name:-a{character}b}}");
+            assert_eq!(
+                tokenize(&source).expect_err(&source),
+                ParseError::refused(
+                    1,
+                    Refusal::ParameterOperator {
+                        character,
+                        operator: Some(Box::new(token))
+                    }
+                )
+            );
         }
     }
 
@@ -1575,8 +1622,7 @@ mod tests {
     fn backtick_substitution_is_rejected_by_name() {
         for source in ["echo `echo hi`", r#"echo "`echo hi`""#, "x=`date`"] {
             let error = tokenize(source).expect_err("backticks are dropped");
-            assert!(error.message.contains("backtick"), "{source}: {error}");
-            assert!(error.message.contains("$( ... )"), "{source}: {error}");
+            assert_eq!(error, ParseError::refused(1, Refusal::Backtick));
         }
         assert_eq!(
             single_word(r"\`"),
@@ -1637,17 +1683,19 @@ mod tests {
 
     #[test]
     fn descriptors_this_shell_does_not_have_are_rejected_by_name() {
-        for (source, expected) in [
-            ("cmd 3> buf", "only descriptors 1"),
-            ("cmd 2>&3", "must name a stream"),
-            ("cmd >&12", "only descriptors 1"),
-            ("cmd 0< buf", "input duplication"),
-            ("cmd <& 1", "input duplication"),
-            ("cmd &>& buf", "`&>&` is not a redirection"),
-            ("cmd >& buf", "must name a stream"),
+        for (source, refusal) in [
+            ("cmd 3> buf", Refusal::UnknownDescriptor),
+            ("cmd 2>&3", Refusal::DuplicationTarget),
+            ("cmd >&12", Refusal::UnknownDescriptor),
+            ("cmd 0< buf", Refusal::InputDuplication),
+            ("cmd <& 1", Refusal::InputDuplication),
+            ("cmd &>& buf", Refusal::BothDuplication),
+            ("cmd >& buf", Refusal::DuplicationTarget),
         ] {
-            let error = tokenize(source).expect_err("rejected");
-            assert!(error.message.contains(expected), "{source}: {error}");
+            assert_eq!(
+                tokenize(source).expect_err(source),
+                ParseError::refused(1, refusal)
+            );
         }
     }
 
@@ -1656,7 +1704,7 @@ mod tests {
         assert!(kinds("a;;").contains(&TokenKind::DoubleSemicolon));
         for source in ["a;;&", "a;&"] {
             let error = tokenize(source).expect_err("fall-through is dropped");
-            assert!(error.message.contains("falls through"), "{source}: {error}");
+            assert_eq!(error, ParseError::refused(1, Refusal::CaseFallthrough));
         }
     }
 
@@ -1759,25 +1807,30 @@ mod tests {
     #[test]
     fn a_diagnostic_inside_a_here_document_body_counts_from_the_body() {
         let error = tokenize("echo one\ncat <<EOF\nbad `sub`\nEOF\n").expect_err("backticks");
-        assert_eq!(error.line, 3, "{error}");
+        assert_eq!(error, ParseError::refused(3, Refusal::Backtick));
     }
 
     #[test]
     fn a_here_document_delimiter_cannot_be_split_across_lines() {
         let error = tokenize("cat <<\\\nEOF\nbody\nEOF\n").expect_err("a split delimiter");
-        assert!(error.message.contains("cannot be split"), "{error}");
+        assert_eq!(error, ParseError::refused(1, Refusal::SplitHereDelimiter));
     }
 
     #[test]
     fn malformed_here_documents_are_rejected_by_name() {
-        for (source, expected) in [
-            ("cat <<EOF\nbody\n", Refusal::UnterminatedHereDocument),
-            ("cat <<EOF", Refusal::UnterminatedHereDocument),
-            ("cat <<\n", "expected a here-document delimiter"),
-            ("cat <<<\"$x\"", "here-string"),
+        for (source, refusal) in [
+            (
+                "cat <<EOF\nbody\n",
+                Refusal::MissingHereDelimiter("EOF".to_owned()),
+            ),
+            ("cat <<EOF", Refusal::MissingHereDelimiter("EOF".to_owned())),
+            ("cat <<\n", Refusal::ExpectedHereDelimiter),
+            ("cat <<<\"$x\"", Refusal::HereString),
         ] {
-            let error = tokenize(source).expect_err(source);
-            assert!(error.message.contains(expected), "{source}: {error}");
+            assert_eq!(
+                tokenize(source).expect_err(source),
+                ParseError::refused(1, refusal)
+            );
         }
     }
 
@@ -1835,7 +1888,9 @@ mod tests {
     #[test]
     fn unterminated_quotes_are_reported_with_a_line() {
         let error = tokenize("echo 'open").expect_err("unterminated quote");
-        assert_eq!(error.line, 1);
-        assert!(error.message.contains("unterminated"), "{error}");
+        assert_eq!(
+            error,
+            ParseError::refused(1, Refusal::UnterminatedSingleQuote)
+        );
     }
 }

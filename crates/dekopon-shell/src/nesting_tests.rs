@@ -1,4 +1,4 @@
-use super::{ParseError, parse};
+use super::{ParseError, errors::DepthConstruct, nested::Construct, parse};
 
 struct Case {
     name: &'static str,
@@ -8,13 +8,7 @@ struct Case {
     close: &'static str,
     suffix: &'static str,
     ceiling: usize,
-    refusal: Refusal,
-}
-
-enum Refusal {
-    Nesting(&'static str),
-    Parameter,
-    Arithmetic,
+    refusal: DepthConstruct,
 }
 
 impl Case {
@@ -29,11 +23,10 @@ impl Case {
         )
     }
 
-    fn message(&self) -> String {
-        match self.refusal {
-            Refusal::Parameter => "parameter expansions nested deeper than 32".to_owned(),
-            Refusal::Arithmetic => "an arithmetic expansion may nest at most 64 operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments".to_owned(),
-            Refusal::Nesting(construct) => format!("{construct} nested more than 64 levels deep; this shell parses on a fixed stack and refuses rather than risking it"),
+    fn error(&self) -> ParseError {
+        ParseError::TooDeep {
+            line: 1,
+            construct: self.refusal,
         }
     }
 }
@@ -46,48 +39,84 @@ fn cases() -> Vec<Case> {
             "if ",
             "; then :; fi",
             63,
-            "an `if` statement",
+            DepthConstruct::Block(Construct::If),
         ),
-        ("if body", "if :; then ", "; fi", 63, "an `if` statement"),
+        (
+            "if body",
+            "if :; then ",
+            "; fi",
+            63,
+            DepthConstruct::Block(Construct::If),
+        ),
         (
             "elif condition",
             "if :; then :; elif ",
             "; then :; fi",
             63,
-            "an `if` statement",
+            DepthConstruct::Block(Construct::If),
         ),
         (
             "while condition",
             "while ",
             "; do :; done",
             63,
-            "a `while` loop",
+            DepthConstruct::Block(Construct::While),
         ),
-        ("while body", "while :; do ", "; done", 63, "a `while` loop"),
+        (
+            "while body",
+            "while :; do ",
+            "; done",
+            63,
+            DepthConstruct::Block(Construct::While),
+        ),
         (
             "until condition",
             "until ",
             "; do :; done",
             63,
-            "an `until` loop",
+            DepthConstruct::Block(Construct::Until),
         ),
         (
             "until body",
             "until :; do ",
             "; done",
             63,
-            "an `until` loop",
+            DepthConstruct::Block(Construct::Until),
         ),
-        ("for", "for x in a; do ", "; done", 63, "a `for` loop"),
-        ("case", "case x in x) ", ";; esac", 63, "a `case` statement"),
-        ("group", "{ ", "; }", 31, "a `{ ...; }` group"),
-        ("function", "f() { ", "; }", 63, "a function body"),
+        (
+            "for",
+            "for x in a; do ",
+            "; done",
+            63,
+            DepthConstruct::Block(Construct::For),
+        ),
+        (
+            "case",
+            "case x in x) ",
+            ";; esac",
+            63,
+            DepthConstruct::Block(Construct::Case),
+        ),
+        (
+            "group",
+            "{ ",
+            "; }",
+            31,
+            DepthConstruct::Block(Construct::Group),
+        ),
+        (
+            "function",
+            "f() { ",
+            "; }",
+            63,
+            DepthConstruct::Block(Construct::Function),
+        ),
         (
             "substitution",
             "echo $(",
             ")",
             31,
-            "command substitution `$( ... )`",
+            DepthConstruct::Substitution,
         ),
     ] {
         cases.push(Case {
@@ -98,7 +127,7 @@ fn cases() -> Vec<Case> {
             close,
             suffix: "",
             ceiling,
-            refusal: Refusal::Nesting(construct),
+            refusal: construct,
         });
     }
     cases.push(Case {
@@ -109,7 +138,7 @@ fn cases() -> Vec<Case> {
         close: "}",
         suffix: "",
         ceiling: 31,
-        refusal: Refusal::Parameter,
+        refusal: DepthConstruct::Parameter,
     });
     for (name, prefix, open, close, suffix, ceiling, refusal) in [
         (
@@ -119,7 +148,7 @@ fn cases() -> Vec<Case> {
             "",
             " ]]",
             62,
-            Refusal::Nesting("a `!` inside `[[ ... ]]`"),
+            DepthConstruct::Block(Construct::TestNot),
         ),
         (
             "conditional group",
@@ -128,7 +157,7 @@ fn cases() -> Vec<Case> {
             " )",
             " ]]",
             62,
-            Refusal::Nesting("a group inside `[[ ... ]]`"),
+            DepthConstruct::Block(Construct::TestGroup),
         ),
         (
             "arithmetic group",
@@ -137,7 +166,7 @@ fn cases() -> Vec<Case> {
             " )",
             " ))",
             63,
-            Refusal::Nesting("an arithmetic expansion"),
+            DepthConstruct::ArithmeticGroup,
         ),
         (
             "arithmetic unary",
@@ -146,7 +175,7 @@ fn cases() -> Vec<Case> {
             "",
             " ))",
             64,
-            Refusal::Arithmetic,
+            DepthConstruct::ArithmeticOperators,
         ),
         (
             "arithmetic binary",
@@ -155,7 +184,7 @@ fn cases() -> Vec<Case> {
             "",
             " ))",
             64,
-            Refusal::Arithmetic,
+            DepthConstruct::ArithmeticOperators,
         ),
     ] {
         cases.push(Case {
@@ -172,30 +201,17 @@ fn cases() -> Vec<Case> {
     cases
 }
 
-fn refusal_message(error: ParseError) -> String {
-    match error {
-        ParseError::Syntax { line, message } => {
-            assert_eq!(line, 1);
-            message
-        }
-        ParseError::Lex(error) => {
-            assert_eq!(error.line, 1);
-            error.message
-        }
-    }
-}
-
 #[test]
 fn each_production_preserves_its_measured_ceiling_and_refusal() {
     for case in cases() {
         parse(&case.script(case.ceiling))
             .unwrap_or_else(|e| panic!("{} at {}: {e}", case.name, case.ceiling));
         let error = parse(&case.script(case.ceiling + 1)).expect_err(case.name);
-        assert_eq!(refusal_message(error), case.message(), "{}", case.name);
+        assert_eq!(error, case.error(), "{}", case.name);
     }
 }
 
-fn two_mib<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+pub(super) fn two_mib<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     let [permit] = crate::test_threads().reserve().unwrap();
     std::thread::scope(|scope| {
         permit
@@ -215,7 +231,7 @@ fn every_production_refuses_two_thousand_levels_on_a_two_mib_stack() {
     for case in cases() {
         let script = case.script(2_000);
         let error = two_mib(|| parse(&script)).expect_err(case.name);
-        assert_eq!(refusal_message(error), case.message(), "{}", case.name);
+        assert_eq!(error, case.error(), "{}", case.name);
     }
     let mut script = ":".to_owned();
     for _ in 0..2_000 {
@@ -223,7 +239,7 @@ fn every_production_refuses_two_thousand_levels_on_a_two_mib_stack() {
     }
     let error = two_mib(|| parse(&script)).expect_err("alternating nesting");
     match error {
-        ParseError::Lex(_) | ParseError::Syntax { .. } => {}
+        ParseError::Refused { .. } | ParseError::TooDeep { .. } => {}
     }
 }
 
