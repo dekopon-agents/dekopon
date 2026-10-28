@@ -23,6 +23,25 @@ dekopon-gatewayd --config /path/to/gatewayd.yaml
 
 The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
 
+## Runtime threads
+
+Thread sizing is parsed before configuration; flags override their environment fallbacks and
+no configuration key controls a pool. Counts must be positive. Omitted runtime options retain
+Tokio's defaults.
+
+| Flag | Environment fallback | Default |
+|---|---|---|
+| `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
+| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 512 |
+| `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
+| `--shell-threads` | `DEKOPON_SHELL_THREADS` | 32 |
+
+With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (512 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=8, S=32` give 6 idle and at most 46 threads.
+Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
+`gw-rt-N` namespace and retire after the keep-alive. The stdout worker and OTel providers drain
+before runtime shutdown. The Pi settings are deployment values, not binary defaults; moving
+turns off the blocking pool is a separate change.
+
 ## Check a configuration
 
 ```console

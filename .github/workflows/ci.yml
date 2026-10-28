@@ -558,6 +558,8 @@ jobs:
         run: python3 charts/dekopon/ci/test-private-files.py
       - name: Verify live gateway source mounts and restart boundaries
         run: python3 charts/dekopon/ci/test-live-sources.py
+      - name: Render runtime thread flags
+        run: python3 charts/dekopon/ci/test-runtime-sizing.py
       - name: Render with default and realistic values
         shell: bash
         run: |

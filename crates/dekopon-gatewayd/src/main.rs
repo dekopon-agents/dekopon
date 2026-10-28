@@ -63,7 +63,7 @@ fn main() -> ExitCode {
                 eprintln!("dekopon-gatewayd: --config cannot be used with check");
                 return ExitCode::from(2);
             }
-            return match bounded_runtime(BLOCKING_EXIT_TIMEOUT, run_check(check)) {
+            return match bounded_runtime(&cli, BLOCKING_EXIT_TIMEOUT, run_check(check)) {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("dekopon-gatewayd: could not start the async runtime: {error}");
@@ -73,7 +73,7 @@ fn main() -> ExitCode {
         }
         None => {}
     }
-    let Some(config) = cli.config else {
+    let Some(config) = cli.config.as_ref() else {
         eprintln!("dekopon-gatewayd: --config is required for serving");
         return ExitCode::from(2);
     };
@@ -88,7 +88,11 @@ fn main() -> ExitCode {
         eprintln!("dekopon-gatewayd: jq worker executable already supplied");
         return ExitCode::FAILURE;
     }
-    match bounded_runtime(BLOCKING_EXIT_TIMEOUT, serve(config)) {
+    match bounded_runtime(
+        &cli,
+        BLOCKING_EXIT_TIMEOUT,
+        serve(config, cli.shell_threads.get()),
+    ) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("dekopon-gatewayd: could not start the async runtime: {error}");
@@ -100,15 +104,34 @@ fn main() -> ExitCode {
 #[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,
-    reason = "owner: bounded_runtime, which shuts it down within exit_timeout; bound: the daemon's one runtime, one worker per core"
+    reason = "owner: bounded_runtime shuts it down within exit_timeout; bound: one runtime, configured workers and blocking cap or Tokio defaults"
 )]
+fn runtime_builder(cli: &Cli) -> tokio::runtime::Builder {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    builder.enable_all().thread_name_fn(move || {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100_000_000;
+        format!("gw-rt-{index}")
+    });
+    if let Some(workers) = cli.worker_threads {
+        builder.worker_threads(workers.get());
+    }
+    if let Some(blocking) = cli.blocking_threads {
+        builder.max_blocking_threads(blocking.get());
+    }
+    if let Some(keep_alive) = cli.blocking_keep_alive {
+        builder.thread_keep_alive(keep_alive.into());
+    }
+    builder
+}
+
+#[cfg(unix)]
 fn bounded_runtime<T>(
+    cli: &Cli,
     exit_timeout: Duration,
     body: impl Future<Output = T>,
 ) -> Result<T, io::Error> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = runtime_builder(cli).build()?;
     let value = runtime.block_on(body);
     runtime.shutdown_timeout(exit_timeout);
     Ok(value)
@@ -171,7 +194,7 @@ async fn run_check(check: &cli::CheckArgs) -> ExitCode {
 }
 
 #[cfg(unix)]
-async fn serve(config: std::path::PathBuf) -> ExitCode {
+async fn serve(config: &std::path::Path, shell_threads: u32) -> ExitCode {
     let settings = dekopon_gatewayd::telemetry_settings(&config, dekopon_gatewayd::current_uid())
         .await
         .ok()
@@ -188,7 +211,7 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
     );
     let mut install = Install::new(Console {
         format: ConsoleFormat::Json,
-        writer: ConsoleWriter::Stdout,
+        writer: ConsoleWriter::Stdout("gw-stdout"),
         filter: ConsoleFilter::Environment("info".to_owned()),
     });
     if let Some(provider) = tracer_provider {
@@ -209,7 +232,7 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         }
     };
 
-    let code = match execute(config).await {
+    let code = match execute(config, shell_threads).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(event = "gateway_exit", error = %error_chain(&error), "gateway.exit");
@@ -230,7 +253,7 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
 }
 
 #[cfg(unix)]
-async fn execute(config: std::path::PathBuf) -> Result<(), AppError> {
+async fn execute(config: &std::path::Path, shell_threads: u32) -> Result<(), AppError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(AppError::Signal)?;
     let shutdown = async move {
         tokio::select! {
@@ -246,7 +269,7 @@ async fn execute(config: std::path::PathBuf) -> Result<(), AppError> {
             _ = terminate.recv() => {}
         }
     };
-    dekopon_gatewayd::run(config, shutdown)
+    dekopon_gatewayd::run(config, shutdown, shell_threads)
         .await
         .map_err(AppError::Gateway)?;
     Ok(())
@@ -265,7 +288,7 @@ enum AppError {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use clap::CommandFactory as _;
+    use clap::{CommandFactory as _, Parser as _};
     use dekopon_gatewayd::cli::Cli;
 
     #[test]
@@ -277,7 +300,7 @@ mod tests {
     fn exit_does_not_wait_for_blocking_work_that_outlived_its_session() {
         let started = Instant::now();
         let (running, is_running) = tokio::sync::oneshot::channel();
-        let value = super::bounded_runtime(Duration::from_millis(50), async move {
+        let value = super::bounded_runtime(&Cli::parse_from(["gateway", "--config=gateway.yaml"]), Duration::from_millis(50), async move {
             tokio::task::spawn_blocking(move || {
                 #[allow(
                     clippy::let_underscore_must_use,
@@ -305,4 +328,128 @@ mod tests {
 fn main() -> std::process::ExitCode {
     eprintln!("dekopon-gatewayd requires Unix peer credentials and Unix-domain sockets");
     std::process::ExitCode::FAILURE
+}
+
+#[cfg(all(test, unix))]
+mod runtime_sizing_tests {
+    use super::*;
+    use clap::Parser as _;
+    use std::{collections::BTreeSet, process::Command, time::Duration};
+
+    #[test]
+    fn flags_and_environment() {
+        const CHILD: &str = "DEKOPON_RUNTIME_SIZING_TEST";
+        let variables = [
+            "DEKOPON_WORKER_THREADS",
+            "DEKOPON_BLOCKING_THREADS",
+            "DEKOPON_BLOCKING_KEEP_ALIVE",
+            "DEKOPON_SHELL_THREADS",
+        ];
+        let mode = std::env::var(CHILD).ok();
+        let Some(mode) = mode else {
+            for case in ["defaults", "environment", "0", "1", "2", "3"] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", "runtime_sizing_tests::flags_and_environment"])
+                    .env(CHILD, case);
+                for (variable, value) in variables.iter().zip(["2", "3", "250ms", "4"]) {
+                    if case == "defaults" {
+                        child.env_remove(variable);
+                    } else {
+                        child.env(variable, value);
+                    }
+                }
+                if let Ok(index) = case.parse::<usize>() {
+                    child.env(variables[index], if index == 2 { "invalid" } else { "0" });
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if mode.parse::<usize>().is_ok() {
+            let error = Cli::try_parse_from(["daemon", "--config=unused.yaml"]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        } else {
+            let cli = Cli::try_parse_from(["daemon", "--config=unused.yaml"]).unwrap();
+            if mode == "defaults" {
+                assert_eq!(cli.worker_threads, None);
+                assert_eq!(cli.blocking_threads, None);
+                assert_eq!(cli.blocking_keep_alive, None);
+                assert_eq!(Some(cli.shell_threads.get() as usize), Some(32));
+            } else {
+                assert_eq!(cli.worker_threads.unwrap().get(), 2);
+                assert_eq!(cli.blocking_threads.unwrap().get(), 3);
+                assert_eq!(
+                    Duration::from(cli.blocking_keep_alive.unwrap()),
+                    Duration::from_millis(250)
+                );
+                assert_eq!(Some(cli.shell_threads.get() as usize), Some(4));
+            }
+            for argument in [
+                "--worker-threads=0",
+                "--blocking-threads=0",
+                "--blocking-keep-alive=invalid",
+                "--shell-threads=0",
+            ] {
+                let error =
+                    Cli::try_parse_from(["daemon", "--config=unused.yaml", argument]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            }
+        }
+        let cli = Cli::try_parse_from([
+            "daemon",
+            "--config=unused.yaml",
+            "--worker-threads=3",
+            "--blocking-threads=4",
+            "--blocking-keep-alive=500ms",
+            "--shell-threads=5",
+        ])
+        .unwrap();
+        assert_eq!(cli.worker_threads.unwrap().get(), 3);
+        assert_eq!(cli.blocking_threads.unwrap().get(), 4);
+        assert_eq!(
+            Duration::from(cli.blocking_keep_alive.unwrap()),
+            Duration::from_millis(500)
+        );
+        assert_eq!(Some(cli.shell_threads.get() as usize), Some(5));
+    }
+
+    #[test]
+    fn configured_runtime_names_workers_and_blocking_threads() {
+        let cli = Cli::parse_from([
+            "daemon",
+            "--config=unused.yaml",
+            "--worker-threads=2",
+            "--blocking-threads=1",
+        ]);
+        let (started, names) = std::sync::mpsc::sync_channel(2);
+        let runtime = runtime_builder(&cli)
+            .on_thread_start(move || {
+                started
+                    .send(std::thread::current().name().unwrap().to_owned())
+                    .unwrap()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(runtime.metrics().num_workers(), 2);
+        let workers: BTreeSet<_> = (0..2)
+            .map(|_| names.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(
+            workers,
+            BTreeSet::from(["gw-rt-0".to_owned(), "gw-rt-1".to_owned()])
+        );
+        let blocking = runtime.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::current().name().unwrap().to_owned())
+                .await
+                .unwrap()
+        });
+        assert_eq!(blocking, "gw-rt-2");
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
 }

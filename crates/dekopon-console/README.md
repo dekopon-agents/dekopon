@@ -42,6 +42,25 @@ dekopon-console --idle
 
 Interactive commands need stdin/stdout TTY (`kubectl exec -it`). For bounded non-interactive shell commands, use `kubectl exec -i … -- dekopon-console --agent <AGENT> --structured --no-color` with **both** stdin and stdout non-TTY. Supply newline-terminated commands on stdin (up to 64 commands, 16 KiB each). A random process nonce frames `READY <nonce>` after the agent hop, then `RESULT <nonce> ok|error|timeout`, sanitized result lines and `END <nonce>` for each command. A submitted 65th command is refused in its own error frame and the process exits nonzero; a timeout emits an outcome-unknown frame and exits nonzero without running later commands. Result lines that begin with the active nonce marker are prefixed `> `; do not infer broker success solely from an `ok` frame. Output is bounded to 64 KiB per result. Input is not echoed; local asset input uses the TUI's `[input redacted]` label internally, but TUI audit/history do not promise general secret redaction. `--no-color` affects diagnostics, not the TTY guard. Default mode remains interactive.  A missing broker, incorrect server UID, refused peer/agent, unknown agent, missing profile, ambiguous same-agent profiles, or absent TTY fails clearly. The picker still shows every catalog agent; selecting one with no matching profile refuses rather than borrowing another agent's identity. An empty broker surface and a failed fresh `agent.prompt` gate prevent execution. An idle process never makes a model or broker request.
 
+### Runtime threads
+
+Thread sizing is parsed before configuration; flags override their environment fallbacks and
+no configuration key controls a pool. Counts must be positive. Omitted runtime options retain
+Tokio's defaults.
+
+| Flag | Environment fallback | Default |
+|---|---|---|
+| `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
+| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 512 |
+| `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
+| `--shell-threads` | `DEKOPON_SHELL_THREADS` | 16 |
+
+The active console names runtime threads `con-rt-N` and owns one shared `ShellThreads` budget.
+`--idle` keeps its current-thread scheduler unless `--worker-threads` or its environment fallback
+selects a worker count; blocking sizing applies in either mode. An idle PID1 with no worker
+selection has one thread. The interactive console also has crossterm's event thread and, when
+configured, the two SDK-owned OTel export threads; its console writer uses stderr.
+
 ### Authored profiles
 
 This strict YAML or JSON document is **read-only, credential-free operator data**. Only `defaultProfile`, when explicitly present, selects the bare invocation's subject; bare launch still opens the picker. `--profile` selects a bound agent and may not be combined with `--subject`. `--agent` selects an exact catalog name; if multiple profiles bind it, pass `--profile`. A profile bound to another agent is a refusal. Without an authored default/selected profile, an explicit `--subject` (or `DEKOPON_CONSOLE_SUBJECT`) is required. Unknown keys, duplicate names, unknown catalog agents, zero or excessive limits refuse before broker/model setup. Profile names use ASCII letters/digits/`-`/`_`; `maxSteps` is 1–64 and `maxCapabilityCalls` is 1–256. CLI `--model`, `--max-steps`, `--max-capability-calls` override profile fields; then the fallback is model `gpt-5.6-luna`, 8 steps, 16 calls. The selected model is always visible in the header. Keep the full credential-free catalog and referenced skill paths available; the catalog loader refuses missing skills.

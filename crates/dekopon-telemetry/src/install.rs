@@ -31,7 +31,7 @@ const EXPORTER_DIAGNOSTICS_OFF: &str = "opentelemetry=off";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsoleWriter {
-    Stdout,
+    Stdout(&'static str),
     Stderr,
 }
 
@@ -123,7 +123,10 @@ impl ConsoleSink {
     const MAX_LINES: usize = 1024;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
 
-    fn new(mut output: ConsoleOutput) -> Result<(Self, ConsoleWorker), InstallError> {
+    fn new(
+        thread_name: &str,
+        mut output: ConsoleOutput,
+    ) -> Result<(Self, ConsoleWorker), InstallError> {
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(Self::MAX_LINES);
         let (completed, completion) = mpsc::sync_channel(1);
         let sink = Self {
@@ -138,7 +141,7 @@ impl ConsoleSink {
             reason = "owner: TelemetryGuard joins it at shutdown; bound: one writer thread per install, 1024 queued lines and 4 MiB"
         )]
         let handle = std::thread::Builder::new()
-            .name("dekopon-console-stdout".into())
+            .name(thread_name.to_owned())
             .spawn(move || {
                 CONSOLE_WRITER_THREAD.set(true);
                 let mut reported = 0;
@@ -395,8 +398,8 @@ impl Install {
         } = self;
 
         let (writer, console_worker) = match console.writer {
-            ConsoleWriter::Stdout => {
-                let (sink, worker) = ConsoleSink::new(Box::new(io::stdout()))?;
+            ConsoleWriter::Stdout(thread_name) => {
+                let (sink, worker) = ConsoleSink::new(thread_name, Box::new(io::stdout()))?;
                 (BoxMakeWriter::new(sink), Some(worker))
             }
             ConsoleWriter::Stderr => (BoxMakeWriter::new(io::stderr), None),
@@ -677,14 +680,18 @@ mod tests {
         let (started, start) = std::sync::mpsc::sync_channel(1);
         let (release, released) = std::sync::mpsc::sync_channel(1);
         let (written, writes) = std::sync::mpsc::sync_channel(super::ConsoleSink::MAX_LINES + 2);
-        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
-            output: output.clone(),
-            started: Some(started),
-            release: released,
-            written,
-            dispatch: None,
-        }))
+        let (sink, worker) = super::ConsoleSink::new(
+            "test-stdout",
+            Box::new(StalledOutput {
+                output: output.clone(),
+                started: Some(started),
+                release: released,
+                written,
+                dispatch: None,
+            }),
+        )
         .expect("console writer spawned");
+        assert_eq!(worker.handle.thread().name(), Some("test-stdout"));
         let subscriber = registry().with(
             tracing_subscriber::fmt::layer()
                 .json()
@@ -733,13 +740,16 @@ mod tests {
         let (started, start) = std::sync::mpsc::sync_channel(1);
         let (release, released) = std::sync::mpsc::sync_channel(1);
         let (written, _writes) = std::sync::mpsc::sync_channel(4);
-        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
-            output: output.clone(),
-            started: Some(started),
-            release: released,
-            written,
-            dispatch: None,
-        }))
+        let (sink, worker) = super::ConsoleSink::new(
+            "test-stdout",
+            Box::new(StalledOutput {
+                output: output.clone(),
+                started: Some(started),
+                release: released,
+                written,
+                dispatch: None,
+            }),
+        )
         .expect("console writer spawned");
         let state = Arc::clone(&sink.state);
         let subscriber = registry().with(
@@ -780,13 +790,16 @@ mod tests {
         let queued = super::ConsoleSink::MAX_LINES;
         let (written, _writes) = std::sync::mpsc::sync_channel(queued + 2);
         let (dispatch_sender, dispatch_receiver) = std::sync::mpsc::sync_channel(1);
-        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
-            output: output.clone(),
-            started: Some(started),
-            release: released,
-            written,
-            dispatch: Some(dispatch_receiver),
-        }))
+        let (sink, worker) = super::ConsoleSink::new(
+            "test-stdout",
+            Box::new(StalledOutput {
+                output: output.clone(),
+                started: Some(started),
+                release: released,
+                written,
+                dispatch: Some(dispatch_receiver),
+            }),
+        )
         .expect("console writer spawned");
         let state = Arc::clone(&sink.state);
         let dropped = Arc::clone(&sink.dropped);

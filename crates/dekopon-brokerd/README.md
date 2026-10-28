@@ -30,6 +30,27 @@ Success exits 0 without output; absent, refused, unmapped, wrong-server, malform
 endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects `--config`, loads no
 components or credentials, invokes nothing, and initializes no telemetry.
 
+## Runtime threads
+
+Thread sizing is parsed before configuration; flags override their environment fallbacks and
+no configuration key controls a pool. Counts must be positive. Omitted runtime options retain
+Tokio's defaults.
+
+| Flag | Environment fallback | Default |
+|---|---|---|
+| `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
+| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 512 |
+| `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
+| `--cpu-threads` | `DEKOPON_CPU_THREADS` | `RAYON_NUM_THREADS`, otherwise available CPUs |
+
+The process builds its Rayon global pool at startup; it owns that pool until process exit.
+Runtime flags precede a subcommand, for example `dekopon-brokerd --cpu-threads=2 provider precompile`.
+
+With both OTel exporters enabled and idle blocking threads retired, brokerd has `W + C + 4` idle threads (main, `W` workers named `bk-rt-N`, `C` CPU threads named `bk-cpu-N`, `bk-stdout`, and two SDK-owned export threads) and a process ceiling of `W + C + 4 + B`, where `B` is the blocking cap (512 by default); the Pi settings `W=2, C=2, B=8` give 8 idle and at most 16 threads.
+Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
+`bk-rt-N` namespace and retire after the keep-alive. Telemetry shuts down before the runtime.
+The Pi settings are deployment values, not binary defaults.
+
 ## Check a configuration
 
 ```console

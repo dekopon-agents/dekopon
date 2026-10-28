@@ -55,6 +55,23 @@ mod telemetry;
     reason = "independent CLI switches preserve the existing command-line contract"
 )]
 struct Cli {
+    /// Tokio worker threads; otherwise TOKIO_WORKER_THREADS or the available CPU count.
+    #[arg(long, env = "DEKOPON_WORKER_THREADS", value_name = "COUNT")]
+    worker_threads: Option<std::num::NonZeroUsize>,
+    /// Maximum additional Tokio blocking threads (default: 512).
+    #[arg(long, env = "DEKOPON_BLOCKING_THREADS", value_name = "COUNT")]
+    blocking_threads: Option<std::num::NonZeroUsize>,
+    /// Retire idle blocking threads after this duration (default: 10s).
+    #[arg(long, env = "DEKOPON_BLOCKING_KEEP_ALIVE", value_name = "DURATION")]
+    blocking_keep_alive: Option<humantime::Duration>,
+    /// Maximum native shell threads shared by the process.
+    #[arg(
+        long,
+        env = "DEKOPON_SHELL_THREADS",
+        value_name = "COUNT",
+        default_value = "16"
+    )]
+    shell_threads: std::num::NonZeroU32,
     /// Path to a YAML or JSON agent catalog.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -188,11 +205,13 @@ enum ConsoleError {
     StructuredAgent,
 }
 
-const SHELL_THREADS: u32 = 16;
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match if cli.idle { idle() } else { run_console(&cli) } {
+    match if cli.idle {
+        idle(&cli)
+    } else {
+        run_console(&cli)
+    } {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {}", dekopon_tui::report::chain(&error));
@@ -303,7 +322,7 @@ fn execute(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<(), ConsoleEr
     let mut options = ConsoleOptions::new(
         subject.clone(),
         model,
-        ShellThreads::new(SHELL_THREADS, runtime.handle().clone()),
+        ShellThreads::new(cli.shell_threads.get(), runtime.handle().clone()),
     );
     options.model_source = model_source;
     options.scope = cli
@@ -521,11 +540,33 @@ fn read_profiles(path: &Path) -> Result<ProfilesDocument, ConsoleError> {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "owner: idle, which drops it when a signal arrives; bound: one current-thread runtime with no workers"
+    reason = "owner: idle drops it at termination; run_console uses shutdown_console_runtime; bound: one runtime, configured workers and blocking cap or Tokio defaults"
 )]
-fn idle() -> Result<(), ConsoleError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+fn runtime_builder(cli: &Cli) -> tokio::runtime::Builder {
+    let mut builder = if cli.idle && cli.worker_threads.is_none() {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    builder.enable_all().thread_name_fn(move || {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100_000_000;
+        format!("con-rt-{index}")
+    });
+    if let Some(workers) = cli.worker_threads {
+        builder.worker_threads(workers.get());
+    }
+    if let Some(blocking) = cli.blocking_threads {
+        builder.max_blocking_threads(blocking.get());
+    }
+    if let Some(keep_alive) = cli.blocking_keep_alive {
+        builder.thread_keep_alive(keep_alive.into());
+    }
+    builder
+}
+
+fn idle(cli: &Cli) -> Result<(), ConsoleError> {
+    let runtime = runtime_builder(cli)
         .build()
         .map_err(ConsoleError::Runtime)?;
     runtime.block_on(async {
@@ -538,13 +579,8 @@ fn idle() -> Result<(), ConsoleError> {
 }
 
 /// Exporters are created and drained while their runtime is alive, including startup refusals.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "owner: run_console, which shuts it down with a timeout; bound: the console's one runtime, one worker per core"
-)]
 fn run_console(cli: &Cli) -> Result<(), ConsoleError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let runtime = runtime_builder(cli)
         .build()
         .map_err(ConsoleError::Runtime)?;
     let _entered = runtime.enter();
@@ -571,5 +607,132 @@ fn shutdown_console_runtime(
         runtime.shutdown_timeout(grace);
     } else {
         drop(runtime);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_sizing_tests {
+    use super::*;
+    use std::{collections::BTreeSet, process::Command, time::Duration};
+
+    #[test]
+    fn flags_and_environment() {
+        const CHILD: &str = "DEKOPON_RUNTIME_SIZING_TEST";
+        let variables = [
+            "DEKOPON_WORKER_THREADS",
+            "DEKOPON_BLOCKING_THREADS",
+            "DEKOPON_BLOCKING_KEEP_ALIVE",
+            "DEKOPON_SHELL_THREADS",
+        ];
+        let mode = std::env::var(CHILD).ok();
+        let Some(mode) = mode else {
+            for case in ["defaults", "environment", "0", "1", "2", "3"] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", "runtime_sizing_tests::flags_and_environment"])
+                    .env(CHILD, case);
+                for (variable, value) in variables.iter().zip(["2", "3", "250ms", "4"]) {
+                    if case == "defaults" {
+                        child.env_remove(variable);
+                    } else {
+                        child.env(variable, value);
+                    }
+                }
+                if let Ok(index) = case.parse::<usize>() {
+                    child.env(variables[index], if index == 2 { "invalid" } else { "0" });
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if mode.parse::<usize>().is_ok() {
+            let error = Cli::try_parse_from(["daemon"]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        } else {
+            let cli = Cli::try_parse_from(["daemon"]).unwrap();
+            if mode == "defaults" {
+                assert_eq!(cli.worker_threads, None);
+                assert_eq!(cli.blocking_threads, None);
+                assert_eq!(cli.blocking_keep_alive, None);
+                assert_eq!(Some(cli.shell_threads.get() as usize), Some(16));
+            } else {
+                assert_eq!(cli.worker_threads.unwrap().get(), 2);
+                assert_eq!(cli.blocking_threads.unwrap().get(), 3);
+                assert_eq!(
+                    Duration::from(cli.blocking_keep_alive.unwrap()),
+                    Duration::from_millis(250)
+                );
+                assert_eq!(Some(cli.shell_threads.get() as usize), Some(4));
+            }
+            for argument in [
+                "--worker-threads=0",
+                "--blocking-threads=0",
+                "--blocking-keep-alive=invalid",
+                "--shell-threads=0",
+            ] {
+                let error = Cli::try_parse_from(["daemon", argument]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            }
+        }
+        let cli = Cli::try_parse_from([
+            "daemon",
+            "--worker-threads=3",
+            "--blocking-threads=4",
+            "--blocking-keep-alive=500ms",
+            "--shell-threads=5",
+        ])
+        .unwrap();
+        assert_eq!(cli.worker_threads.unwrap().get(), 3);
+        assert_eq!(cli.blocking_threads.unwrap().get(), 4);
+        assert_eq!(
+            Duration::from(cli.blocking_keep_alive.unwrap()),
+            Duration::from_millis(500)
+        );
+        assert_eq!(Some(cli.shell_threads.get() as usize), Some(5));
+    }
+
+    #[test]
+    fn configured_runtime_names_workers_and_blocking_threads() {
+        let cli = Cli::parse_from(["daemon", "--worker-threads=2", "--blocking-threads=1"]);
+        let (started, names) = std::sync::mpsc::sync_channel(2);
+        let runtime = runtime_builder(&cli)
+            .on_thread_start(move || {
+                started
+                    .send(std::thread::current().name().unwrap().to_owned())
+                    .unwrap()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(runtime.metrics().num_workers(), 2);
+        let workers: BTreeSet<_> = (0..2)
+            .map(|_| names.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(
+            workers,
+            BTreeSet::from(["con-rt-0".to_owned(), "con-rt-1".to_owned()])
+        );
+        let blocking = runtime.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::current().name().unwrap().to_owned())
+                .await
+                .unwrap()
+        });
+        assert_eq!(blocking, "con-rt-2");
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+    #[test]
+    fn idle_keeps_the_current_thread_scheduler_until_workers_are_selected() {
+        for (arguments, workers) in [
+            (vec!["console", "--idle"], 0),
+            (vec!["console", "--idle", "--worker-threads=1"], 1),
+        ] {
+            let cli = Cli::parse_from(arguments);
+            let runtime = runtime_builder(&cli).build().unwrap();
+            assert_eq!(runtime.metrics().num_workers(), workers);
+        }
     }
 }
