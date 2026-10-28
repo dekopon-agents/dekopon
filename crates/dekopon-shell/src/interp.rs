@@ -399,7 +399,7 @@ fn record_compound_outcome(span: Option<&tracing::Span>, executed: &Result<Execu
 
 struct StageOutcome {
     status: Result<ExitCode, FatalError>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
     enclosing: Option<PipeReader<StageObservation>>,
 }
 
@@ -429,11 +429,26 @@ impl Stage<'_> {
     }
 }
 
+#[derive(Debug)]
+enum Diagnostic {
+    Line(String),
+    Fragment(String),
+}
+
+impl Diagnostic {
+    fn into_result(self) -> CommandResult {
+        match self {
+            Self::Line(text) => CommandResult::value(Value::String(text)),
+            Self::Fragment(text) => CommandResult::value(Value::String(text)).without_newline(),
+        }
+    }
+}
+
 /// A redirected stderr capture must stay bounded by the same output ceilings, since a function can
 /// run thousands of commands into it.
 #[derive(Debug)]
 struct StderrCapture {
-    lines: Vec<String>,
+    lines: Vec<Diagnostic>,
     pending: String,
     bytes: usize,
     max_lines: usize,
@@ -464,7 +479,7 @@ impl StderrCapture {
             return;
         }
         self.bytes += line.len();
-        self.lines.push(line.to_owned());
+        self.lines.push(Diagnostic::Line(line.to_owned()));
     }
 
     fn push_fragment(&mut self, text: &str) {
@@ -483,14 +498,16 @@ impl StderrCapture {
             self.bytes += end;
             self.truncated |= end < line.len();
             if part.ends_with('\n') {
-                self.lines.push(std::mem::take(&mut self.pending));
+                self.lines
+                    .push(Diagnostic::Line(std::mem::take(&mut self.pending)));
             }
         }
     }
 
     fn flush_pending(&mut self) {
         if !self.pending.is_empty() {
-            self.lines.push(std::mem::take(&mut self.pending));
+            self.lines
+                .push(Diagnostic::Line(std::mem::take(&mut self.pending)));
         }
     }
 
@@ -515,11 +532,14 @@ impl StderrCapture {
         }
     }
 
-    fn finish(mut self) -> Vec<String> {
-        self.flush_pending();
+    fn finish(mut self) -> Vec<Diagnostic> {
         if self.truncated {
-            self.lines
-                .push("... redirected diagnostics truncated ...".to_owned());
+            self.flush_pending();
+            self.lines.push(Diagnostic::Line(
+                "... redirected diagnostics truncated ...".to_owned(),
+            ));
+        } else if !self.pending.is_empty() {
+            self.lines.push(Diagnostic::Fragment(self.pending));
         }
         self.lines
     }
@@ -857,6 +877,15 @@ impl<'a> Evaluator<'a> {
             return;
         }
         self.output.push_block(line);
+    }
+
+    fn write_diagnostic(&mut self, diagnostic: Diagnostic) {
+        match diagnostic {
+            Diagnostic::Line(text) => self.write_line(&text),
+            Diagnostic::Fragment(text) => {
+                push_diagnostic_fragment(&text, &mut self.stderr_capture, &mut self.output)
+            }
+        }
     }
 
     fn active_buffer_name(&self) -> Option<&str> {
@@ -1575,8 +1604,8 @@ impl<'a> Evaluator<'a> {
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
                 Ok(outcome) => {
-                    for line in outcome.diagnostics {
-                        self.write_line(&line);
+                    for diagnostic in outcome.diagnostics {
+                        self.write_diagnostic(diagnostic);
                     }
                     match outcome.status {
                         Ok(status) => {
@@ -1600,8 +1629,8 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        for line in diagnostics {
-            self.write_line(&line);
+        for diagnostic in diagnostics {
+            self.write_diagnostic(diagnostic);
         }
         let executed = executed.map_err(|error| fatal.take().unwrap_or(error))?;
         if let Some(error) = fatal {
@@ -2003,11 +2032,11 @@ impl<'a> Evaluator<'a> {
         let mut result = CommandResult::status(status);
         if stderr == Sink::Value {
             if let Sink::Buffer { name, .. } = &stdout {
-                for line in diagnostics.drain(..) {
-                    self.append_buffer_bytes(name, format!("{line}\n").as_bytes())?;
+                for diagnostic in diagnostics.drain(..) {
+                    self.append_buffer(name, diagnostic.into_result())?;
                 }
             } else {
-                result.value = merge_diagnostics(result.value, diagnostics);
+                merge_diagnostics(&mut result, diagnostics);
                 diagnostics = Vec::new();
             }
         }
@@ -2183,7 +2212,7 @@ impl<'a> Evaluator<'a> {
         };
 
         if stderr == Sink::Value {
-            result.value = merge_diagnostics(result.value, diagnostics);
+            merge_diagnostics(&mut result, diagnostics);
             diagnostics = Vec::new();
         }
 
@@ -2269,7 +2298,7 @@ impl<'a> Evaluator<'a> {
 
     fn route_diagnostics(
         &mut self,
-        diagnostics: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
         sink: &Sink,
     ) -> Result<(), FatalError> {
         if diagnostics.is_empty() {
@@ -2278,14 +2307,14 @@ impl<'a> Evaluator<'a> {
         match sink {
             Sink::Discard => {}
             Sink::Diagnostics | Sink::Value => {
-                for line in diagnostics {
-                    self.write_line(&line);
+                for diagnostic in diagnostics {
+                    self.write_diagnostic(diagnostic);
                 }
             }
             Sink::Buffer { name, .. } => {
                 let name = name.clone();
-                for line in diagnostics {
-                    self.append_buffer_bytes(&name, format!("{line}\n").as_bytes())?;
+                for diagnostic in diagnostics {
+                    self.append_buffer(&name, diagnostic.into_result())?;
                 }
             }
         }
@@ -4324,13 +4353,21 @@ fn parameter_length(value: &Value) -> Value {
     }
 }
 
-fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
+fn merge_diagnostics(result: &mut CommandResult, diagnostics: Vec<Diagnostic>) {
     if diagnostics.is_empty() {
-        return value;
+        return;
     }
-    let mut lines = value::to_lines(&value);
-    lines.extend(diagnostics);
-    value::from_lines(lines)
+    let mut lines = value::to_lines(&result.value);
+    for diagnostic in diagnostics {
+        match diagnostic {
+            Diagnostic::Line(text) => lines.push(text),
+            Diagnostic::Fragment(text) => {
+                lines.push(text);
+                result.suppress_newline = true;
+            }
+        }
+    }
+    result.value = value::from_lines(lines);
 }
 
 fn write_display(stdout: &mut PipeWriter<StageObservation>, value: &Value) -> WriteOutcome {

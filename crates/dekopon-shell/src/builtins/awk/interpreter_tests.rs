@@ -312,6 +312,27 @@ fn the_twenty_nine_frozen_programs_run_through_interpreter() {
 }
 
 #[test]
+fn awk_diagnostics_capture_completion_preserves_the_buffer_byte_count() {
+    for script in [
+        "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>diag; wc -c diag",
+        "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2 | cat; } 2>diag; wc -c diag",
+        "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2; } >diag 2>&1; wc -c diag",
+        "{ awk 'BEGIN{printf \"[%03d]\",1}' >&2; } 2>&1 | wc -c",
+        "emit() { awk 'BEGIN{printf \"[%03d]\",1}' >&2; }; emit 2>&1 | wc -c",
+    ] {
+        stdout(script, "5\n");
+    }
+}
+
+#[test]
+fn awk_diagnostics_capture_completion_preserves_the_following_fragment() {
+    stdout(
+        "awk 'BEGIN{printf \"[%03d]\",1}' >&2 | cat; printf END",
+        "[001]END",
+    );
+}
+
+#[test]
 fn awk_diagnostics_preserve_formatted_fragments() {
     for sink in [" | cat", ""] {
         let outcome = run(
@@ -382,7 +403,7 @@ fn awk_diagnostics_keep_partial_lines_when_execution_fails() {
     assert_eq!(
         outcome.output,
         format!(
-            "[001]\n{}",
+            "[001]{}",
             crate::interp::fatal_message(&crate::builtins::FatalError::Limit(
                 dekopon_process::LimitExceeded::Steps { maximum: 100 }
             ))
