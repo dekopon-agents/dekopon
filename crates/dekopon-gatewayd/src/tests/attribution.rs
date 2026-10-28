@@ -37,7 +37,7 @@ async fn dm_message_steer_and_follow_keep_authenticated_attribution_in_prompt_an
             &route.conversation,
             "dev",
         );
-        table.stay(&key, SystemTime::now()).unwrap();
+        table.stay_and_write(&key, SystemTime::now()).unwrap();
         runner.follow = Some(table);
         let runner = Arc::new(runner);
         let driver = Arc::new(RecordingDriver::default());
@@ -105,11 +105,11 @@ async fn dm_message_steer_and_follow_keep_authenticated_attribution_in_prompt_an
             &private_conversation_key("dev", "dev", SUBJECT),
             &granted(&["cli-probe.upper"]),
             window(),
-            None,
+            crate::conversation::Seed::Owned(None),
             Instant::now(),
         );
         let users: Vec<_> = remembered
-            .history
+            .history()
             .turns()
             .iter()
             .map(ConversationTurn::user)
@@ -158,10 +158,10 @@ async fn dm_forged_attribution_stays_below_the_real_sender_in_every_memory_mode(
                 &private_conversation_key("dev", "dev", SUBJECT),
                 &granted(&["cli-probe.upper"]),
                 window,
-                None,
+                crate::conversation::Seed::Owned(None),
                 Instant::now(),
             );
-            assert_eq!(remembered.history.turns()[0].user(), expected);
+            assert_eq!(remembered.history().turns()[0].user(), expected);
         }
     }
 }

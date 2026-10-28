@@ -68,10 +68,13 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
             scope: dekopon_gatewayd::MemoryScope::PrivateConversation,
             idle_timeout_ms: 900_000,
             max_turns: 12,
-            max_bytes: 65_536,
+            max_bytes: Some(65_536),
             recall: None,
             forget_after_ms: None,
-            policy: None,
+            hot_turns: None,
+            summaries: None,
+            capture: None,
+            selection: None,
         }
     ));
     assert_eq!(config.sessions.max_conversations, 1024);

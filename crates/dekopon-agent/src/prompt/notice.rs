@@ -2,7 +2,6 @@
 pub enum ReplaySource {
     Journal,
     Conversation,
-    Mixed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,9 +100,8 @@ impl MemoryNotice {
                 MemoryFact::ThreadWithoutMemory => "This message replies in a thread with earlier messages; none are in your memory.\n".into(),
                 MemoryFact::RecallFailed { reason } => format!("Memory recall or projection failed this turn ({reason}).\n"),
                 MemoryFact::Fidelity { source } => match source {
-                    ReplaySource::Journal => "Replayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n",
+                    ReplaySource::Journal => "Replayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\n",
                     ReplaySource::Conversation => "Replayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n",
-                    ReplaySource::Mixed => "Replayed turns keep the request and your final reply; journal records retain captured bash exchanges, but resident turns do not. Reasoning and other tool calls are not kept.\n",
                 }.into(),
             };
             notice.text.push_str(&line);
@@ -193,7 +191,7 @@ mod tests {
             MemoryFact::ThreadWithoutMemory,
             MemoryFact::RecallFailed { reason: "corrupt" },
             MemoryFact::Fidelity {
-                source: ReplaySource::Mixed,
+                source: ReplaySource::Journal,
             },
         ];
         for record in 1..1000 {
