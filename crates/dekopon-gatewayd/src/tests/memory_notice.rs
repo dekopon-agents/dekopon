@@ -195,10 +195,7 @@ async fn a_whole_window_carries_no_omission_fact() {
     let fixture = Fixture::new(&["cli-probe.upper"]).await;
     fixture.append(&["cli-probe.upper"], "whole conversation");
     fixture.run().await;
-    assert_eq!(
-        fixture.notice(0),
-        "[gateway: memory]\nReplayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\n"
-    );
+    assert_eq!(fixture.notice(0), JOURNAL_FIDELITY_NOTICE);
 }
 
 #[tokio::test]

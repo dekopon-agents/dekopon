@@ -927,3 +927,124 @@ async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_de
     assert_ne!(references[0], references[1]);
     provider.shutdown().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_speakers_grant_cannot_authorize_a_pr_link_turn() {
+    let fixture = SlackFollowFixture::with_pull_request_links(true).await;
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "alice",
+            channel_message(
+                "u9xyz",
+                "1700000000.000001",
+                None,
+                "https://github.com/acme/widget/pull/17",
+            ),
+        ),
+        events_envelope(
+            "bob",
+            channel_message(
+                "u8xyz",
+                "1700000000.000002",
+                Some("1700000000.000001"),
+                "<@u0botbot> use my additional reverse grant",
+            ),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base).with_generation(fixture.generation.clone());
+    transport.connect().await.unwrap();
+    let first = next_message(&mut transport).await;
+    let other = next_message(&mut transport).await;
+    let proposal =
+        || {
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+        "outcome":"proposed", "capability":"cli-probe.reverse", "input":{"text":"bob-only"}
+    })).unwrap())
+        };
+    let (broker, mut observed) = stub_broker(
+        fixture.directory.path(),
+        vec![
+            listing("alice", true),
+            proposal(),
+            ResponseEnvelope::chat_capabilities(
+                vec![
+                    capability("cli-probe.upper"),
+                    capability("cli-probe.reverse"),
+                ],
+                vec!["probe".into()],
+                BTreeMap::new(),
+                None,
+                Some("bob".parse().unwrap()),
+            )
+            .with_space(Some(vec![
+                "cli-probe.upper".parse().unwrap(),
+                "cli-probe.reverse".parse().unwrap(),
+            ])),
+            proposal(),
+            ResponseEnvelope::invocation(record_success(), vec![], vec![], vec![]),
+        ],
+    )
+    .await;
+    let mut selected = script_call("probe reverse --text bob-only");
+    selected.tool_calls[0].function.arguments =
+        json!({"command":"probe reverse --text bob-only","as":"p2"}).to_string();
+    let models = InterruptibleModel::new([
+        selected,
+        script_call("probe reverse --text bob-only"),
+        answer("Alice's review finished."),
+        script_call("probe reverse --text bob-only"),
+        answer("Bob's separate turn finished."),
+    ]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let route = fixture.routes.route(&first).unwrap().clone();
+    let task = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        first.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    models.wait_until_entered().await;
+    let initial = observed.recv().await.unwrap();
+    assert!(
+        matches!(initial.request,BrokerRequest::Capabilities { attestation: Some(Attestation { subject, .. }) } if subject == first.subject)
+    );
+    run_session(
+        Arc::clone(&runner),
+        route,
+        other.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert!(
+        observed.try_recv().is_err(),
+        "Bob opens no leg within Alice's PR-link turn"
+    );
+    models.release();
+    finish(task).await;
+    assert_eq!(
+        driver.replies(),
+        ["Alice's review finished.", "Bob's separate turn finished."]
+    );
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(role, text)| role == "tool" && text.contains("Unknown participant handle"))
+    );
+    let requests = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
+    assert!(models.prompt(2).iter().any(|(role, text)| role == "tool"
+        && text.contains("cli-probe.reverse")
+        && text.contains("not granted")));
+    assert_eq!(requests.len(), 3);
+    assert!(
+        matches!(&requests[0].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subject == first.subject)
+    );
+    assert!(
+        matches!(&requests[1].request,BrokerRequest::Capabilities { attestation: Some(claim) } if claim.subject == other.subject)
+    );
+    assert!(
+        matches!(&requests[2].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subject == other.subject)
+    );
+}

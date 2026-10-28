@@ -35,15 +35,26 @@ pub struct EventStringArray {
     pub values: Vec<String>,
 }
 
+#[derive(Clone, Default)]
+struct EventStringArrays(Vec<EventStringArray>);
+
 pub fn with_event_string_array<T>(
     name: &'static str,
     values: &[&str],
     emit: impl FnOnce() -> T,
 ) -> T {
-    let context = Context::current().with_value(EventStringArray {
+    let current = Context::current();
+    let mut arrays = current
+        .get::<EventStringArrays>()
+        .cloned()
+        .unwrap_or_default();
+    let array = EventStringArray {
         name,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
-    });
+    };
+    arrays.0.retain(|existing| existing.name != name);
+    arrays.0.push(array.clone());
+    let context = current.with_value(arrays).with_value(array);
     let _scope = context.attach();
     emit()
 }

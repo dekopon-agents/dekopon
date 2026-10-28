@@ -355,6 +355,7 @@ pub(crate) mod tests {
 
     fn message(photos: usize, text: &str) -> InboundMessage {
         InboundMessage {
+            pull_request_links: None,
             transport: "wa".into(),
             transport_kind: ChatTransportKind::Whatsapp,
             subject: "whatsapp.15551234567".parse().unwrap(),

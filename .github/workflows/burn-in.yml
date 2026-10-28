@@ -1,0 +1,56 @@
+name: Burn-in
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'Burn-in note (for example core 0.64.0 / chart 0.51.0 (xrl/rpi-homelab#338))'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: burn-in-webhook-turn
+  cancel-in-progress: false
+
+jobs:
+  push-turn:
+    name: Push a burn-in turn
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Mint a release App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEKOPON_RELEASE_APP_ID }}
+          private-key: ${{ secrets.DEKOPON_RELEASE_APP_KEY }}
+          permission-contents: write
+
+      - name: Check out the standing burn-in branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/burn-in/webhook-turn
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Append and push the burn-in turn
+        env:
+          NOTE: ${{ inputs.note }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$NOTE" || "$NOTE" == *$'\n'* || "$NOTE" == *$'\r'* ]]; then
+            echo 'The note must be a nonempty single line.' >&2
+            exit 1
+          fi
+          git ls-files --error-unmatch docs/burn-in/TURNS.md
+          test -f docs/burn-in/TURNS.md
+          printf -- '- %s: %s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$NOTE" >> docs/burn-in/TURNS.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- docs/burn-in/TURNS.md
+          git commit -m "burn-in: $NOTE"
+          git push origin HEAD:refs/heads/burn-in/webhook-turn
+          printf 'Pushed burn-in commit: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

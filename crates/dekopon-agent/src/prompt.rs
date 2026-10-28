@@ -6148,49 +6148,147 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_are_recorded_bounded_and_returned_with_the_outcome() {
-        let model = ScriptedModel::new([
-            suggestion("s-1", "gh.pull-request.read"),
-            suggestion("s-2", "gh.pull-request.comment"),
-            suggestion("s-3", "gh.issue.read"),
-            suggestion("s-4", "gh.issue.comment"),
-            answer("Done."),
-        ]);
+    fn suggestions_across_messages_receive_unnumbered_receipts_and_events() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
         let runtime = RecordingRuntime::new(0);
-
-        let outcome = run_prompt_session(
-            &model,
-            &runtime,
-            SessionInputs::new("do the thing", limits(6, 2)),
-            &[],
-        )
-        .0
-        .expect("suggestions never fail a session");
-
-        assert_eq!(outcome.answer, "Done.");
-        assert_eq!(outcome.suggestions.len(), 3);
-        assert_eq!(outcome.suggestions[0].target, "gh.pull-request.read");
+        let mut history = History::default();
+        for (message, ids) in [
+            ("first message", ["s-1", "s-2"]),
+            ("next message", ["s-3", "s-4"]),
+        ] {
+            let model = ScriptedModel::new([
+                suggestion(ids[0], "gh.pull-request.read"),
+                suggestion(ids[1], "gh.pull-request.comment"),
+                answer("Done."),
+            ]);
+            let outcome = remember(&mut history, |prior| {
+                run_prompt_session(
+                    &model,
+                    &runtime,
+                    SessionInputs::new(message, limits(3, 2)),
+                    prior,
+                )
+            })
+            .expect("suggestions never fail a message");
+            assert_eq!(outcome.answer, "Done.");
+            assert_eq!(outcome.suggestions.len(), 2);
+            assert_eq!(
+                last_tool_results(&model),
+                vec!["Recorded suggestion for the operator. Continue with the task, or finish."; 2]
+            );
+        }
+        let events = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "agent.improvement.suggested")],
+        );
+        assert_eq!(events.len(), 4);
+        let fields = events
+            .iter()
+            .map(|event| {
+                (
+                    event.field("gen_ai.tool.call.id"),
+                    event.field("suggestion.index"),
+                    event.field("suggestion.category"),
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            outcome.suggestions[2].category,
-            crate::improvement::ImprovementCategory::Capability
+            fields,
+            [
+                (Some("s-1"), Some("1"), Some("capability")),
+                (Some("s-2"), Some("2"), Some("capability")),
+                (Some("s-3"), Some("1"), Some("capability")),
+                (Some("s-4"), Some("2"), Some("capability")),
+            ]
         );
+    }
+
+    #[test]
+    fn promising_a_suggestion_without_a_tool_call_records_nothing_and_delivers_the_reply() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let reply = "I will send the operator a suggestion.";
+        let model = ScriptedModel::new([answer(reply)]);
+        let outcome = run_prompt(
+            &model,
+            &RecordingRuntime::new(0),
+            "Please record a suggestion for the operator.",
+            None,
+            limits(2, 2),
+        )
+        .expect("text alone is a reply");
+        assert_eq!(outcome.answer, reply);
+        assert!(outcome.suggestions.is_empty());
+        assert!(
+            capture
+                .events_where(
+                    "dekopon_agent::audit",
+                    &[("audit.event", "agent.improvement.suggested")],
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn runaway_suggestions_in_one_execution_are_refused_without_recording_more_notes() {
+        use dekopon_test_support::CaptureLayer;
+        use tracing_subscriber::prelude::*;
+
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let model = ScriptedModel::new(
+            (1..=12)
+                .map(|index| suggestion(&format!("s-{index}"), "gh.issue.read"))
+                .chain([answer("Done.")]),
+        );
+        let outcome = run_prompt(
+            &model,
+            &RecordingRuntime::new(0),
+            "do the thing",
+            None,
+            limits(13, 2),
+        )
+        .expect("the runaway stop preserves the answer");
+        assert_eq!(outcome.answer, "Done.");
+        assert_eq!(outcome.suggestions.len(), 10);
         let results = last_tool_results(&model);
-        assert!(
-            results[0].contains("Recorded suggestion 1 of 3"),
-            "{}",
-            results[0]
+        assert_eq!(results.len(), 12);
+        assert_eq!(
+            &results[10..],
+            &["No more notes this message; this one was not recorded. Continue with the task."; 2]
         );
-        assert!(
-            results[2].contains("Recorded suggestion 3 of 3"),
-            "{}",
-            results[2]
+        let events = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "agent.improvement.suggested")],
         );
-        assert!(results[3].contains("already recorded"), "{}", results[3]);
-        let tools = model.observed_tools.lock();
-        assert!(
-            tools[0]
+        assert_eq!(events.len(), 10);
+        assert_eq!(events.last().unwrap().field("suggestion.index"), Some("10"));
+        let refused = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "agent.improvement.refused")],
+        );
+        assert_eq!(
+            refused
                 .iter()
-                .any(|tool| tool.name == IMPROVEMENT_TOOL_NAME)
+                .map(|event| (event.field("gen_ai.tool.call.id"), event.field("reason"),))
+                .collect::<Vec<_>>(),
+            [
+                (Some("s-11"), Some("session-limit")),
+                (Some("s-12"), Some("session-limit")),
+            ]
         );
     }
 

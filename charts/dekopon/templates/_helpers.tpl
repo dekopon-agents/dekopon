@@ -848,7 +848,7 @@ Arguments: dict "ctx" $ "sidecar" bool
   imagePullPolicy: {{ $.Values.image.pullPolicy }}
   # No ENTRYPOINT in the image: the command selects which of the four binaries runs.
   command: ["dekopon-brokerd"]
-  args: ["--config", "{{ $.Values.paths.configDir }}/{{ if $.Values.broker.configDirectory.configMap }}broker.d{{ else }}broker.yaml{{ end }}"]
+  args: ["--config", "{{ $.Values.paths.configDir }}/{{ if $.Values.broker.configDirectory.configMap }}broker.d{{ else }}broker.yaml{{ end }}"{{- range include "dekopon.runtimeArgs" (dict "ctx" $ "daemon" "broker") | fromJsonArray }}, {{ . | quote }}{{- end }}]
   securityContext:
     {{- toYaml (mergeOverwrite (deepCopy $.Values.securityContext) (dict "runAsUser" ($.Values.podSecurityContext.runAsUser | int) "runAsGroup" ($.Values.podSecurityContext.runAsGroup | int))) | nindent 4 }}
   env:
@@ -867,11 +867,11 @@ Arguments: dict "ctx" $ "sidecar" bool
   # policy and the constraint catalog and emits no audit record.
   startupProbe:
     exec:
-      command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
+      command: ["dekopon-brokerd"{{- range include "dekopon.runtimeArgs" (dict "ctx" $ "daemon" "broker") | fromJsonArray }}, {{ . | quote }}{{- end }}, "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
     {{- toYaml $.Values.broker.startupProbe | nindent 4 }}
   readinessProbe:
     exec:
-      command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
+      command: ["dekopon-brokerd"{{- range include "dekopon.runtimeArgs" (dict "ctx" $ "daemon" "broker") | fromJsonArray }}, {{ . | quote }}{{- end }}, "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
     {{- toYaml $.Values.broker.readinessProbe | nindent 4 }}
   resources:
     {{- toYaml $.Values.broker.resources | nindent 4 }}
@@ -921,4 +921,21 @@ Arguments: dict "ctx" $ "sidecar" bool
       mountPath: {{ $.Values.brokerAssets.rootPath }}
     - name: tmp
       mountPath: /tmp
+{{- end -}}
+
+{{- define "dekopon.runtimeArgs" -}}
+{{- $runtime := default dict (index .ctx.Values .daemon).runtime -}}
+{{- $flags := dict "workerThreads" "worker-threads" "blockingThreads" "blocking-threads" "blockingKeepAlive" "blocking-keep-alive" -}}
+{{- if eq .daemon "broker" -}}
+{{- $_ := set $flags "cpuThreads" "cpu-threads" -}}
+{{- else -}}
+{{- $_ := set $flags "shellThreads" "shell-threads" -}}
+{{- end -}}
+{{- $args := list -}}
+{{- range $key, $flag := $flags -}}
+{{- if and (hasKey $runtime $key) (ne (get $runtime $key) nil) -}}
+{{- $args = append $args (printf "--%s=%v" $flag (get $runtime $key)) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $args -}}
 {{- end -}}
