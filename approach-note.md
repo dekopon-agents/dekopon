@@ -107,7 +107,13 @@ Required regressions include these line-3 refusals, with typed payload assertion
 - `:\n:\necho $(echo })`
 - `:\n:\necho ${name:-$(echo })}` (direct modifier scanning already keeps its line; this exercises its nested parse)
 - `:\ncat <<EOF\n$(echo })\nEOF\n`
-- `:\necho $((\n1 ** 2))`
+- `:\necho $((\n1 ** 2\n))`
+
+The arithmetic case puts `**` on line 3 and the closing `))` on line 4. Source
+inspection at the stamped base shows `read_balanced` advances `self.line` to 4
+before the lexer passes it to the arithmetic parser, so expecting line 3 exposes
+the defect. After note acceptance, verify that failure through the base's existing
+error fields, then assert the typed refusal and line 3 after implementation.
 
 Also cover a separately lexed parameter index and multiline nesting composition,
 including the here-document bounded-prefix path. Run the line expectations against
