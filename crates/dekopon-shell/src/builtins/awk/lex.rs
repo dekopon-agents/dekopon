@@ -270,8 +270,29 @@ impl<'a> Lexer<'a> {
     }
     pub(super) fn regex(&mut self, prefix: &str) -> Result<String, AwkError> {
         let mut source = prefix.to_owned();
-        source.push_str(&self.quoted('/', "a closing regex slash")?);
-        Ok(source)
+        let mut bracket = Bracket::Outside;
+        while let Some(ch) = self.bump() {
+            if ch == '/' && !bracket.inside() {
+                return Ok(source);
+            }
+            if ch == '\n' {
+                return self.error("a closing regex slash");
+            }
+            if ch == '\\' {
+                let Some(next) = self.bump() else {
+                    return self.error("a closing regex slash");
+                };
+                if next != '\n' {
+                    source.push(ch);
+                    source.push(next);
+                    bracket.escaped();
+                }
+            } else {
+                source.push(ch);
+                bracket.advance(ch, self.peek());
+            }
+        }
+        self.error("a closing regex slash")
     }
 }
 
@@ -325,11 +346,75 @@ pub(super) fn decode_escapes(source: &str) -> Result<String, AwkError> {
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+enum Bracket {
+    Outside,
+    First,
+    AfterCaret,
+    Body,
+    Posix(char),
+    PosixEnd,
+}
+impl Bracket {
+    fn inside(self) -> bool {
+        match self {
+            Self::Outside => false,
+            Self::First | Self::AfterCaret | Self::Body | Self::Posix(_) | Self::PosixEnd => true,
+        }
+    }
+    fn escaped(&mut self) {
+        match self {
+            Self::First | Self::AfterCaret => *self = Self::Body,
+            Self::Outside | Self::Body | Self::Posix(_) | Self::PosixEnd => {}
+        }
+    }
+    fn advance(&mut self, ch: char, next: Option<char>) {
+        *self = match *self {
+            Self::Outside => {
+                if ch == '[' {
+                    Self::First
+                } else {
+                    Self::Outside
+                }
+            }
+            Self::First if ch == '^' => Self::AfterCaret,
+            Self::First | Self::AfterCaret | Self::Body => {
+                if ch == '['
+                    && let Some(marker @ (':' | '=' | '.')) = next
+                {
+                    Self::Posix(marker)
+                } else if ch == ']' && self_is_body(*self) {
+                    Self::Outside
+                } else {
+                    Self::Body
+                }
+            }
+            Self::Posix(marker) => {
+                if ch == marker && next == Some(']') {
+                    Self::PosixEnd
+                } else {
+                    Self::Posix(marker)
+                }
+            }
+            Self::PosixEnd => Self::Body,
+        };
+    }
+}
+fn self_is_body(state: Bracket) -> bool {
+    match state {
+        Bracket::Body => true,
+        Bracket::Outside
+        | Bracket::First
+        | Bracket::AfterCaret
+        | Bracket::Posix(_)
+        | Bracket::PosixEnd => false,
+    }
+}
+
 pub(super) fn regex_source(source: &str) -> Result<String, AwkError> {
     let mut chars = source.chars().peekable();
     let mut output = String::new();
-    let mut bracket = false;
-    let mut first = false;
+    let mut bracket = Bracket::Outside;
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             match chars.next() {
@@ -351,37 +436,10 @@ pub(super) fn regex_source(source: &str) -> Result<String, AwkError> {
                 }
                 None => output.push('\\'),
             }
-            first = false;
+            bracket.escaped();
             continue;
         }
-        if bracket {
-            output.push(ch);
-            if ch == '['
-                && let Some(marker @ (':' | '=' | '.')) = chars.peek().copied()
-            {
-                output.push(marker);
-                chars.next();
-                while let Some(inner) = chars.next() {
-                    output.push(inner);
-                    if inner == marker && chars.peek() == Some(&']') {
-                        output.push(']');
-                        chars.next();
-                        break;
-                    }
-                }
-            } else if ch == ']' {
-                if !first {
-                    bracket = false;
-                }
-            } else if ch == '^' && first {
-                continue;
-            }
-            first = false;
-        } else if ch == '[' {
-            output.push(ch);
-            bracket = true;
-            first = true;
-        } else if ch == '(' {
+        if ch == '(' && !bracket.inside() {
             if chars.peek() == Some(&'?') {
                 return Err(Refusal::RegexExtension.into());
             }
@@ -389,6 +447,7 @@ pub(super) fn regex_source(source: &str) -> Result<String, AwkError> {
         } else {
             output.push(ch);
         }
+        bracket.advance(ch, chars.peek().copied());
     }
     Ok(output)
 }

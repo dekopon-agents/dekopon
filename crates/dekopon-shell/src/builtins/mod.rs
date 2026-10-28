@@ -261,14 +261,16 @@ pub(crate) type Run =
     fn(&mut BuiltinContext<'_>, &[String], Option<Value>) -> Result<CommandResult, CommandFailure>;
 
 pub(crate) fn unsupported_flag(command: &str, flag: &str, supported: &str) -> CommandFailure {
+    CommandFailure::usage(unsupported_flag_text(command, flag, supported))
+}
+
+pub(crate) fn unsupported_flag_text(command: &str, flag: &str, supported: &str) -> String {
     let suffix = if supported.is_empty() {
         String::new()
     } else {
         format!(" (supported: {supported})")
     };
-    CommandFailure::usage(format!(
-        "{command}: option not yet supported: {flag}{suffix}"
-    ))
+    format!("{command}: option not yet supported: {flag}{suffix}")
 }
 
 pub(crate) fn parse_flags(

@@ -15,165 +15,176 @@ fn refused(source: &str) -> Refusal {
     }
 }
 
+enum Case<'a> {
+    Program(&'a str),
+    Refusal(fn() -> Refusal),
+    Separator(&'a str),
+    LongRegex(usize),
+}
+const REFUSAL_CASES: &[(Case<'static>, &str)] = &[
+    (
+        Case::Program("{getline}"),
+        "awk: `getline` is not supported: awk reads only its one input, one record per rule pass; write a rule per record, or join inputs with the shell before the pipe",
+    ),
+    (
+        Case::Program("{system(\"x\")}"),
+        "awk: `system()` is not supported: this shell runs no processes; run the command in the script and pipe its output into awk",
+    ),
+    (
+        Case::Program("{print 1 > x}"),
+        "awk: output redirection is not supported: awk writes only to its stdout; redirect the whole command (`awk '…' > buf`, `awk '…' >&2`), or parenthesize a comparison: `print (a > b)`",
+    ),
+    (
+        Case::Program("{close(1)}"),
+        "awk: `close()` is not supported: awk opens no files or pipes here",
+    ),
+    (
+        Case::Program("{rand()}"),
+        "awk: `rand()` is not supported: the shell has no clock or entropy source",
+    ),
+    (
+        Case::Program("function f(){}"),
+        "awk: user-defined functions are not supported: write the expression inline, or call awk from a shell function",
+    ),
+    (
+        Case::Program("{gensub() }"),
+        "awk: `gensub()` is not a function here; the built-in functions are length substr index split sub gsub match sprintf tolower toupper int sqrt exp log sin cos atan2",
+    ),
+    (
+        Case::Program("RS"),
+        "awk: `RS` is not supported: records are always lines; split a record yourself with `split($0, parts, sep)`",
+    ),
+    (
+        Case::Program("OFMT"),
+        "awk: `OFMT` is not supported: numbers print as integers or with %.6g; use printf or sprintf for another format",
+    ),
+    (
+        Case::Program("ENVIRON"),
+        "awk: `ENVIRON` is not supported: awk sees only its input and its -v assignments; pass values with `-v name=value`",
+    ),
+    (
+        Case::Program("IGNORECASE"),
+        "awk: `IGNORECASE` is a gawk variable and is not supported; for case-insensitive matching compare `tolower($0) ~ /re/`",
+    ),
+    (
+        Case::Program("FPAT"),
+        "awk: `FPAT` is a gawk variable and is not supported; use FS, split() or substr()",
+    ),
+    (
+        Case::Program("{a[i,j]}"),
+        "awk: multi-dimensional subscripts are not supported: join the keys yourself, `a[i \",\" j]`",
+    ),
+    (
+        Case::Program("{2**3}"),
+        "awk: `**` is not supported: POSIX awk spells power `^`",
+    ),
+    (
+        Case::Program("{nextfile}"),
+        "awk: `nextfile` is not supported: awk has one input; use `exit` to stop reading",
+    ),
+    (
+        Case::Program("{switch(x){}}"),
+        "awk: `switch` is a gawk extension and is not supported; use if/else",
+    ),
+    (
+        Case::Program("BEGINFILE{}"),
+        "awk: `BEGINFILE` is a gawk extension and is not supported; awk has one input",
+    ),
+    (
+        Case::Program("{print a == b}"),
+        "awk: an unparenthesized comparison in a print list is not POSIX awk; write `print (a == b)`",
+    ),
+    (
+        Case::Program("BEGIN{next}"),
+        "awk: `next` is only allowed in a rule, not in BEGIN or END",
+    ),
+    (
+        Case::Program("{x=1; x[1]}"),
+        "awk: `x` is used both as an array and as a scalar",
+    ),
+    (
+        Case::Refusal(|| Refusal::Option("-f".into())),
+        "awk: option not yet supported: -f (supported: -F SEP -v NAME=VALUE)",
+    ),
+    (
+        Case::Refusal(|| Refusal::OperandAssignment("name=value".into())),
+        "awk: operand assignment `name=value` is not supported: use `-v name=value` before the program",
+    ),
+    (
+        Case::Refusal(|| Refusal::SecondInput),
+        "awk: at most one input operand (a named buffer or `-`); join buffers with `cat a b | awk '…'`",
+    ),
+    (
+        Case::Refusal(|| Refusal::NoProgram),
+        "awk: a program argument is required",
+    ),
+    (
+        Case::Refusal(|| Refusal::BadAssignment("1=x".into())),
+        "awk: -v needs NAME=VALUE with NAME an identifier, got `1=x`",
+    ),
+    (
+        Case::Separator("[a"),
+        "awk: -E pattern \"[a\" did not compile: non-empty character class has no closing bracket",
+    ),
+    (
+        Case::Program("{FS=\"\"}"),
+        "awk: an empty field separator is not supported; take characters with `substr($0, i, 1)`",
+    ),
+    (
+        Case::Program("{printf \"%*s\",x}"),
+        "awk: printf `*` width is not supported; build the format with sprintf or concatenation",
+    ),
+    (
+        Case::Program("{printf \"%n\",x}"),
+        "awk: printf conversion `%n` is not supported; use %c %d %i %o %u %x %X %e %E %f %F %g %G %s or %%",
+    ),
+    (
+        Case::Refusal(|| Refusal::ProgramBytes(8193)),
+        "awk: program is 8193 bytes; the limit is 8192",
+    ),
+    (
+        Case::Refusal(|| Refusal::ParseDepth),
+        "awk: program nests too deeply (more than 96 parser levels); split it across statements",
+    ),
+    (
+        Case::Refusal(|| Refusal::AstHeight),
+        "awk: program nests deeper than 32 levels; split it across statements",
+    ),
+    (
+        Case::Refusal(|| Refusal::PrintfWidth(4097)),
+        "awk: printf width is 4097; the limit is 4096",
+    ),
+    (
+        Case::Refusal(|| Refusal::PrintfPrecision(4097)),
+        "awk: printf precision is 4097; the limit is 4096",
+    ),
+    (
+        Case::Program("/(?i)a/"),
+        "awk: `(?` is not ERE syntax; awk regexes are POSIX extended regular expressions",
+    ),
+    (
+        Case::Program("/(a/"),
+        "awk: -E pattern \"(a\" did not compile: found open group without closing ')'",
+    ),
+    (
+        Case::LongRegex(1025),
+        "awk: -E pattern is 1025 bytes; the limit is 1024",
+    ),
+];
+
 #[test]
 fn every_refusal_class_has_its_exact_message() {
-    enum Case<'a> {
-        Program(&'a str),
-        Refusal(Refusal),
-        Separator(&'a str),
-    }
-    let cases = [
-        (
-            Case::Program("{getline}"),
-            "awk: `getline` is not supported: awk reads only its one input, one record per rule pass; write a rule per record, or join inputs with the shell before the pipe",
-        ),
-        (
-            Case::Program("{system(\"x\")}"),
-            "awk: `system()` is not supported: this shell runs no processes; run the command in the script and pipe its output into awk",
-        ),
-        (
-            Case::Program("{print 1 > x}"),
-            "awk: output redirection is not supported: awk writes only to its stdout; redirect the whole command (`awk '…' > buf`, `awk '…' >&2`), or parenthesize a comparison: `print (a > b)`",
-        ),
-        (
-            Case::Program("{close(1)}"),
-            "awk: `close()` is not supported: awk opens no files or pipes here",
-        ),
-        (
-            Case::Program("{rand()}"),
-            "awk: `rand()` is not supported: the shell has no clock or entropy source",
-        ),
-        (
-            Case::Program("function f(){}"),
-            "awk: user-defined functions are not supported: write the expression inline, or call awk from a shell function",
-        ),
-        (
-            Case::Program("{gensub() }"),
-            "awk: `gensub()` is not a function here; the built-in functions are length substr index split sub gsub match sprintf tolower toupper int sqrt exp log sin cos atan2",
-        ),
-        (
-            Case::Program("RS"),
-            "awk: `RS` is not supported: records are always lines; split a record yourself with `split($0, parts, sep)`",
-        ),
-        (
-            Case::Program("OFMT"),
-            "awk: `OFMT` is not supported: numbers print as integers or with %.6g; use printf or sprintf for another format",
-        ),
-        (
-            Case::Program("ENVIRON"),
-            "awk: `ENVIRON` is not supported: awk sees only its input and its -v assignments; pass values with `-v name=value`",
-        ),
-        (
-            Case::Program("IGNORECASE"),
-            "awk: `IGNORECASE` is a gawk variable and is not supported; for case-insensitive matching compare `tolower($0) ~ /re/`",
-        ),
-        (
-            Case::Program("FPAT"),
-            "awk: `FPAT` is a gawk variable and is not supported; use FS, split() or substr()",
-        ),
-        (
-            Case::Program("{a[i,j]}"),
-            "awk: multi-dimensional subscripts are not supported: join the keys yourself, `a[i \",\" j]`",
-        ),
-        (
-            Case::Program("{2**3}"),
-            "awk: `**` is not supported: POSIX awk spells power `^`",
-        ),
-        (
-            Case::Program("{nextfile}"),
-            "awk: `nextfile` is not supported: awk has one input; use `exit` to stop reading",
-        ),
-        (
-            Case::Program("{switch(x){}}"),
-            "awk: `switch` is a gawk extension and is not supported; use if/else",
-        ),
-        (
-            Case::Program("BEGINFILE{}"),
-            "awk: `BEGINFILE` is a gawk extension and is not supported; awk has one input",
-        ),
-        (
-            Case::Program("{print a == b}"),
-            "awk: an unparenthesized comparison in a print list is not POSIX awk; write `print (a == b)`",
-        ),
-        (
-            Case::Program("BEGIN{next}"),
-            "awk: `next` is only allowed in a rule, not in BEGIN or END",
-        ),
-        (
-            Case::Program("{x=1; x[1]}"),
-            "awk: `x` is used both as an array and as a scalar",
-        ),
-        (
-            Case::Refusal(Refusal::Option("-f".into())),
-            "awk: option not yet supported: -f (supported: -F SEP -v NAME=VALUE)",
-        ),
-        (
-            Case::Refusal(Refusal::OperandAssignment("name=value".into())),
-            "awk: operand assignment `name=value` is not supported: use `-v name=value` before the program",
-        ),
-        (
-            Case::Refusal(Refusal::SecondInput),
-            "awk: at most one input operand (a named buffer or `-`); join buffers with `cat a b | awk '…'`",
-        ),
-        (
-            Case::Refusal(Refusal::NoProgram),
-            "awk: a program argument is required",
-        ),
-        (
-            Case::Refusal(Refusal::BadAssignment("1=x".into())),
-            "awk: -v needs NAME=VALUE with NAME an identifier, got `1=x`",
-        ),
-        (
-            Case::Separator("[a"),
-            "awk: -E pattern \"[a\" did not compile: non-empty character class has no closing bracket",
-        ),
-        (
-            Case::Program("{FS=\"\"}"),
-            "awk: an empty field separator is not supported; take characters with `substr($0, i, 1)`",
-        ),
-        (
-            Case::Program("{printf \"%*s\",x}"),
-            "awk: printf `*` width is not supported; build the format with sprintf or concatenation",
-        ),
-        (
-            Case::Program("{printf \"%n\",x}"),
-            "awk: printf conversion `%n` is not supported; use %c %d %i %o %u %x %X %e %E %f %F %g %G %s or %%",
-        ),
-        (
-            Case::Refusal(Refusal::ProgramBytes(8193)),
-            "awk: program is 8193 bytes; the limit is 8192",
-        ),
-        (
-            Case::Refusal(Refusal::ParseDepth),
-            "awk: program nests too deeply (more than 96 parser levels); split it across statements",
-        ),
-        (
-            Case::Refusal(Refusal::AstHeight),
-            "awk: program nests deeper than 32 levels; split it across statements",
-        ),
-        (
-            Case::Refusal(Refusal::PrintfWidth(4097)),
-            "awk: printf width is 4097; the limit is 4096",
-        ),
-        (
-            Case::Refusal(Refusal::PrintfPrecision(4097)),
-            "awk: printf precision is 4097; the limit is 4096",
-        ),
-        (
-            Case::Program("/(?i)a/"),
-            "awk: `(?` is not ERE syntax; awk regexes are POSIX extended regular expressions",
-        ),
-        (
-            Case::Program("/(a/"),
-            "awk: -E pattern \"(a\" did not compile: found open group without closing ')'",
-        ),
-    ];
-    for (case, expected) in cases {
+    for (case, expected) in REFUSAL_CASES {
         let error = match case {
             Case::Program(source) => {
                 compile(source, &Budget::start(Limits::default())).expect_err(source)
             }
-            Case::Refusal(refusal) => AwkError::Refused(refusal),
+            Case::Refusal(refusal) => AwkError::Refused(refusal()),
+            Case::LongRegex(size) => compile(
+                &format!("/{}/", "a".repeat(*size)),
+                &Budget::start(Limits::default()),
+            )
+            .expect_err("oversized regex"),
             Case::Separator(source) => {
                 compile_separator(source, &Budget::start(Limits::default())).expect_err(source)
             }
@@ -181,7 +192,7 @@ fn every_refusal_class_has_its_exact_message() {
         assert_eq!(
             failure(error),
             CommandFailure::Status {
-                message: expected.into(),
+                message: (*expected).into(),
                 status: ExitCode::SYNTAX
             }
         );
@@ -222,10 +233,16 @@ fn all_forbidden_names_and_spellings_are_recognized() {
         "TEXTDOMAIN",
         "ERRNO",
     ] {
-        assert_eq!(refused(name), Refusal::GawkVariable(name.into()));
+        assert_eq!(
+            refused(name),
+            Refusal::GawkVariable(parse::GawkVariable::lookup(name).expect("gawk name"))
+        );
     }
     for name in ["BEGINFILE", "ENDFILE", "@include", "@load", "switch"] {
-        assert_eq!(refused(name), Refusal::GawkSyntax(name.into()));
+        assert_eq!(
+            refused(name),
+            Refusal::GawkSyntax(parse::GawkSyntax::lookup(name).expect("gawk syntax"))
+        );
     }
     for source in ["{a[i,j]}", "(i,j) in a", "{delete a[i,j]}", "SUBSEP"] {
         assert_eq!(refused(source), Refusal::MultiSubscript);
@@ -267,6 +284,9 @@ fn the_program_shape_preserves_source_order_and_ranges() {
         "BEGIN{print 1}",
         "END{print NR}",
         "/=/",
+        "/[/]/",
+        "/[[:alpha:]/]/",
+        "0 ? 1 : x=2",
         "{x = 8 / 2; x /= 2}",
     ] {
         parsed(source);
@@ -300,9 +320,21 @@ fn concatenation_and_power_have_the_frozen_precedence() {
                 assert_eq!(rest[0].0, Binary::Concat);
                 assert!(matches!(rest[0].1.kind, ExprKind::Chain(_, _)));
             }
-            other => panic!("{other:?}"),
+            other @ (ExprKind::Number(_)
+            | ExprKind::String(_)
+            | ExprKind::Regex(_)
+            | ExprKind::Variable(_)
+            | ExprKind::Array(_, _)
+            | ExprKind::Field(_)
+            | ExprKind::Group(_)
+            | ExprKind::Call(_, _)
+            | ExprKind::Unary(_, _)
+            | ExprKind::Increment(_, _)
+            | ExprKind::Binary(_, _, _)
+            | ExprKind::Conditional(_, _, _)
+            | ExprKind::In(_, _)) => panic!("{other:?}"),
         },
-        other => panic!("{other:?}"),
+        other @ (Pattern::Always | Pattern::Range(_, _)) => panic!("{other:?}"),
     }
     assert!(matches!(
         p.program.rules[1].pattern,
@@ -389,18 +421,22 @@ fn parse_bounds_cover_source_depth_height_and_flat_chains() {
         let p = parsed(&source);
         match &p.program.rules[0].pattern {
             Pattern::Expr(expr) => assert_eq!(expr.height, 32),
-            pattern => panic!("{pattern:?}"),
+            pattern @ (Pattern::Always | Pattern::Range(_, _)) => panic!("{pattern:?}"),
         }
         assert_eq!(
             refused(&format!("{}1{}", open.repeat(32), close.repeat(32))),
-            Refusal::AstHeight
+            if open == "a[" || open == "length(" {
+                Refusal::ParseDepth
+            } else {
+                Refusal::AstHeight
+            }
         );
     }
     let chain = std::iter::repeat_n("1", 500).collect::<Vec<_>>().join("+");
     let p = parsed(&chain);
     match &p.program.rules[0].pattern {
         Pattern::Expr(expr) => assert_eq!(expr.height, 2),
-        pattern => panic!("{pattern:?}"),
+        pattern @ (Pattern::Always | Pattern::Range(_, _)) => panic!("{pattern:?}"),
     }
     parsed(&format!(
         "{{print {}}}",
@@ -507,10 +543,10 @@ fn regex_and_parser_charges_are_reserved_and_refunded() {
     ));
     assert_eq!(budget.value_bytes(), 0);
     let budget = Budget::start(Limits::default());
-    assert_eq!(
+    assert!(matches!(
         refused(&format!("/{}/", "a".repeat(1025))),
-        Refusal::Regex("awk: -E pattern is 1025 bytes; the limit is 1024".into())
-    );
+        Refusal::Regex(_)
+    ));
     let result = compile(&"/(.{1,90}){1,8}z/;".repeat(200), &budget);
     assert!(matches!(
         result,
@@ -518,7 +554,7 @@ fn regex_and_parser_charges_are_reserved_and_refunded() {
     ));
     assert_eq!(budget.value_bytes(), 0);
     let p = compile("/(a)(b)/", &budget).expect("literal regex");
-    assert_eq!(budget.value_bytes(), 256 * 1024);
+    assert_eq!(budget.value_bytes(), 256 * 1024 + "/(a)(b)/".len() as u64);
     drop(p);
     assert_eq!(budget.value_bytes(), 0);
 }
@@ -532,7 +568,7 @@ fn error_mapping_keeps_limits_fatal_and_runtime_errors_at_exit_two() {
     );
     for error in [
         RuntimeError::DivisionByZero,
-        RuntimeError::FieldIndex(-1),
+        RuntimeError::FieldIndex(-1.0),
         RuntimeError::FieldCount,
         RuntimeError::InvalidUtf8,
         RuntimeError::EmptySeparator,
@@ -540,7 +576,7 @@ fn error_mapping_keeps_limits_fatal_and_runtime_errors_at_exit_two() {
         RuntimeError::Format(Refusal::PrintfStar),
     ] {
         assert!(matches!(
-            failure(AwkError::Runtime { error, record: 2 }),
+            failure(AwkError::Runtime { error, record: 2.0 }),
             CommandFailure::Status {
                 status: ExitCode::SYNTAX,
                 ..

@@ -19,12 +19,14 @@ struct CompiledRegex {
 struct CompiledProgram {
     program: Program,
     regexes: Vec<CompiledRegex>,
+    _source_charge: RetainedBytes,
 }
 
 fn compile(source: &str, budget: &Budget) -> Result<CompiledProgram, AwkError> {
     if source.len() > 8192 {
         return Err(Refusal::ProgramBytes(source.len()).into());
     }
+    let source_charge = budget.charge_value_bytes(source.len() as u64)?;
     let stack = budget.charge_value_bytes(ShellThreads::STACK_BYTES as u64)?;
     let [permit] = budget.tree().shell_threads().reserve()?;
     #[expect(
@@ -49,12 +51,17 @@ fn compile(source: &str, budget: &Budget) -> Result<CompiledProgram, AwkError> {
         .iter()
         .map(|source| compile_regex(source, budget))
         .collect::<Result<_, _>>()?;
-    Ok(CompiledProgram { program, regexes })
+    Ok(CompiledProgram {
+        program,
+        regexes,
+        _source_charge: source_charge,
+    })
 }
 
 fn compile_regex(source: &str, budget: &Budget) -> Result<CompiledRegex, AwkError> {
     use crate::builtins::text;
     text::check_extended_length("awk", source).map_err(AwkError::regex)?;
+    let _rewrite_charge = budget.charge_value_bytes((source.len() * 3) as u64)?;
     let rewritten = lex::regex_source(source)?;
     let charge = budget.charge_value_bytes(256 * 1024)?;
     let regex = text::build_extended("awk", source, &rewritten, false).map_err(AwkError::regex)?;

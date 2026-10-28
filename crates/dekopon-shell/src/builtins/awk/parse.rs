@@ -15,7 +15,7 @@ pub(super) enum AwkError {
     },
     Runtime {
         error: RuntimeError,
-        record: u64,
+        record: f64,
     },
     Limit(LimitExceeded),
 }
@@ -23,12 +23,85 @@ pub(super) enum AwkError {
 #[derive(Debug, PartialEq)]
 pub(super) enum RuntimeError {
     DivisionByZero,
-    FieldIndex(i64),
+    FieldIndex(f64),
     FieldCount,
     InvalidUtf8,
     EmptySeparator,
     Regex(String),
     Format(Refusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum GawkVariable {
+    IgnoreCase,
+    Fpat,
+    FieldWidths,
+    ProcInfo,
+    Rt,
+    BinMode,
+    Lint,
+    TextDomain,
+    Errno,
+}
+impl GawkVariable {
+    pub(super) fn lookup(name: &str) -> Option<Self> {
+        [
+            Self::IgnoreCase,
+            Self::Fpat,
+            Self::FieldWidths,
+            Self::ProcInfo,
+            Self::Rt,
+            Self::BinMode,
+            Self::Lint,
+            Self::TextDomain,
+            Self::Errno,
+        ]
+        .into_iter()
+        .find(|v| v.name() == name)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::IgnoreCase => "IGNORECASE",
+            Self::Fpat => "FPAT",
+            Self::FieldWidths => "FIELDWIDTHS",
+            Self::ProcInfo => "PROCINFO",
+            Self::Rt => "RT",
+            Self::BinMode => "BINMODE",
+            Self::Lint => "LINT",
+            Self::TextDomain => "TEXTDOMAIN",
+            Self::Errno => "ERRNO",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum GawkSyntax {
+    BeginFile,
+    EndFile,
+    Include,
+    Load,
+    Switch,
+}
+impl GawkSyntax {
+    pub(super) fn lookup(name: &str) -> Option<Self> {
+        [
+            Self::BeginFile,
+            Self::EndFile,
+            Self::Include,
+            Self::Load,
+            Self::Switch,
+        ]
+        .into_iter()
+        .find(|v| v.name() == name)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::BeginFile => "BEGINFILE",
+            Self::EndFile => "ENDFILE",
+            Self::Include => "@include",
+            Self::Load => "@load",
+            Self::Switch => "switch",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -43,11 +116,11 @@ pub(super) enum Refusal {
     RecordSeparator,
     NumberFormat(String),
     Environment(String),
-    GawkVariable(String),
+    GawkVariable(GawkVariable),
     MultiSubscript,
     PowerSpelling,
     Nextfile,
-    GawkSyntax(String),
+    GawkSyntax(GawkSyntax),
     PrintComparison(String),
     NextOutsideRule,
     ScalarArray(String),
@@ -85,27 +158,21 @@ impl fmt::Display for Refusal {
             Self::RecordSeparator => f.write_str("awk: `RS` is not supported: records are always lines; split a record yourself with `split($0, parts, sep)`"),
             Self::NumberFormat(name) => write!(f, "awk: `{name}` is not supported: numbers print as integers or with %.6g; use printf or sprintf for another format"),
             Self::Environment(name) => write!(f, "awk: `{name}` is not supported: awk sees only its input and its -v assignments; pass values with `-v name=value`"),
-            Self::GawkVariable(name) => {
-                if name == "IGNORECASE" {
-                    f.write_str("awk: `IGNORECASE` is a gawk variable and is not supported; for case-insensitive matching compare `tolower($0) ~ /re/`")
-                } else {
-                    write!(f, "awk: `{name}` is a gawk variable and is not supported; use FS, split() or substr()")
-                }
-            }
+            Self::GawkVariable(variable) => match variable {
+                GawkVariable::IgnoreCase => f.write_str("awk: `IGNORECASE` is a gawk variable and is not supported; for case-insensitive matching compare `tolower($0) ~ /re/`"),
+                name @ (GawkVariable::Fpat | GawkVariable::FieldWidths | GawkVariable::ProcInfo | GawkVariable::Rt | GawkVariable::BinMode | GawkVariable::Lint | GawkVariable::TextDomain | GawkVariable::Errno) => write!(f, "awk: `{}` is a gawk variable and is not supported; use FS, split() or substr()", name.name()),
+            },
             Self::MultiSubscript => f.write_str("awk: multi-dimensional subscripts are not supported: join the keys yourself, `a[i \",\" j]`"),
             Self::PowerSpelling => f.write_str("awk: `**` is not supported: POSIX awk spells power `^`"),
             Self::Nextfile => f.write_str("awk: `nextfile` is not supported: awk has one input; use `exit` to stop reading"),
-            Self::GawkSyntax(name) => {
-                if name == "switch" {
-                    f.write_str("awk: `switch` is a gawk extension and is not supported; use if/else")
-                } else {
-                    write!(f, "awk: `{name}` is a gawk extension and is not supported; awk has one input")
-                }
-            }
+            Self::GawkSyntax(syntax) => match syntax {
+                GawkSyntax::Switch => f.write_str("awk: `switch` is a gawk extension and is not supported; use if/else"),
+                name @ (GawkSyntax::BeginFile | GawkSyntax::EndFile | GawkSyntax::Include | GawkSyntax::Load) => write!(f, "awk: `{}` is a gawk extension and is not supported; awk has one input", name.name()),
+            },
             Self::PrintComparison(op) => write!(f, "awk: an unparenthesized comparison in a print list is not POSIX awk; write `print (a {op} b)`"),
             Self::NextOutsideRule => f.write_str("awk: `next` is only allowed in a rule, not in BEGIN or END"),
             Self::ScalarArray(name) => write!(f, "awk: `{name}` is used both as an array and as a scalar"),
-            Self::Option(flag) => write!(f, "awk: option not yet supported: {flag} (supported: -F SEP -v NAME=VALUE)"),
+            Self::Option(flag) => f.write_str(&super::super::unsupported_flag_text("awk", flag, "-F SEP -v NAME=VALUE")),
             Self::OperandAssignment(value) => write!(f, "awk: operand assignment `{value}` is not supported: use `-v {value}` before the program"),
             Self::SecondInput => f.write_str("awk: at most one input operand (a named buffer or `-`); join buffers with `cat a b | awk '…'`"),
             Self::NoProgram => f.write_str("awk: a program argument is required"),
@@ -139,7 +206,16 @@ impl fmt::Display for AwkError {
                 f,
                 "awk: syntax error at line {line}, column {column}: {expected}"
             ),
-            Self::Runtime { error, record } => write!(f, "awk: {error} (record {record})"),
+            Self::Runtime { error, record } => match error {
+                RuntimeError::Regex(_) | RuntimeError::Format(_) => {
+                    write!(f, "{error} (record {record})")
+                }
+                RuntimeError::DivisionByZero
+                | RuntimeError::FieldIndex(_)
+                | RuntimeError::FieldCount
+                | RuntimeError::InvalidUtf8
+                | RuntimeError::EmptySeparator => write!(f, "awk: {error} (record {record})"),
+            },
             Self::Limit(limit) => write!(f, "{limit:?}"),
         }
     }
@@ -192,19 +268,20 @@ impl From<AwkError> for CommandFailure {
 }
 
 pub(super) fn name_refusal(name: &str) -> Option<Refusal> {
+    if let Some(variable) = GawkVariable::lookup(name) {
+        return Some(Refusal::GawkVariable(variable));
+    }
+    if let Some(syntax) = GawkSyntax::lookup(name) {
+        return Some(Refusal::GawkSyntax(syntax));
+    }
     match name {
         "getline" => Some(Refusal::Getline),
         "function" | "func" => Some(Refusal::UserFunction),
         "RS" => Some(Refusal::RecordSeparator),
         "OFMT" | "CONVFMT" => Some(Refusal::NumberFormat(name.into())),
         "ENVIRON" | "ARGV" | "ARGC" | "FILENAME" => Some(Refusal::Environment(name.into())),
-        "IGNORECASE" | "FPAT" | "FIELDWIDTHS" | "PROCINFO" | "RT" | "BINMODE" | "LINT"
-        | "TEXTDOMAIN" | "ERRNO" => Some(Refusal::GawkVariable(name.into())),
         "SUBSEP" => Some(Refusal::MultiSubscript),
         "nextfile" => Some(Refusal::Nextfile),
-        "BEGINFILE" | "ENDFILE" | "switch" | "@include" | "@load" => {
-            Some(Refusal::GawkSyntax(name.into()))
-        }
         _ => None,
     }
 }
@@ -720,19 +797,47 @@ impl Parser<'_> {
         Ok(condition)
     }
     fn for_statement(&mut self, depth: u8) -> Result<Stmt, AwkError> {
+        let depth = deeper(depth)?;
         self.advance()?;
         self.require(Punct::LParen)?;
         let init = self.optional_expression(Punct::Semi, depth)?;
         let kind = if self.eat(Punct::RParen)? {
-            let Some(Expr {
-                kind: ExprKind::In(key, array),
-                height: _,
-            }) = init
-            else {
-                return self.error("for (name in array) or a three-part for header");
+            let Some(expr) = init else {
+                return self.error("a for-in header");
             };
-            let ExprKind::Variable(key) = key.kind else {
-                return self.error("a variable before in");
+            let (key, array) = match expr.kind {
+                ExprKind::In(key, array) => (key, array),
+                ExprKind::Number(_)
+                | ExprKind::String(_)
+                | ExprKind::Regex(_)
+                | ExprKind::Variable(_)
+                | ExprKind::Array(_, _)
+                | ExprKind::Field(_)
+                | ExprKind::Group(_)
+                | ExprKind::Call(_, _)
+                | ExprKind::Unary(_, _)
+                | ExprKind::Increment(_, _)
+                | ExprKind::Binary(_, _, _)
+                | ExprKind::Chain(_, _)
+                | ExprKind::Conditional(_, _, _) => {
+                    return self.error("for (name in array) or a three-part for header");
+                }
+            };
+            let key = match key.kind {
+                ExprKind::Variable(key) => key,
+                ExprKind::Number(_)
+                | ExprKind::String(_)
+                | ExprKind::Regex(_)
+                | ExprKind::Array(_, _)
+                | ExprKind::Field(_)
+                | ExprKind::Group(_)
+                | ExprKind::Call(_, _)
+                | ExprKind::Unary(_, _)
+                | ExprKind::Increment(_, _)
+                | ExprKind::Binary(_, _, _)
+                | ExprKind::Chain(_, _)
+                | ExprKind::Conditional(_, _, _)
+                | ExprKind::In(_, _) => return self.error("a variable before in"),
             };
             self.newlines()?;
             self.loops += 1;
@@ -812,7 +917,63 @@ impl Parser<'_> {
         let left = self.prefix(depth)?;
         self.tail(left, minimum, depth, context)
     }
+    fn named_expression(&mut self, name: String, depth: u8) -> Result<Expr, AwkError> {
+        let depth = deeper(depth)?;
+        if [
+            "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "break",
+            "continue", "next", "exit", "delete", "in",
+        ]
+        .contains(&name.as_str())
+        {
+            return self.error("an expression");
+        }
+        let line = self.token.line;
+        let column = self.token.column + name.chars().count();
+        self.advance()?;
+        if self.at(Punct::LParen)
+            && (Function::from_name(&name).is_ok()
+                || ["system", "close", "fflush", "rand", "srand"].contains(&name.as_str())
+                || (line == self.token.line && column == self.token.column))
+        {
+            let function = Function::from_name(&name)?;
+            self.advance()?;
+            let mut arguments = Vec::new();
+            if !self.at(Punct::RParen) {
+                loop {
+                    arguments.push(self.expression(0, depth, ExprContext::Normal)?);
+                    if !self.eat(Punct::Comma)? {
+                        break;
+                    }
+                    self.newlines()?;
+                }
+            }
+            self.require(Punct::RParen)?;
+            if !function.accepts(arguments.len()) {
+                return self.error(format!("the arguments required by {name}()"));
+            }
+            if function == Function::Sprintf
+                && let Some(format) = arguments.first().and_then(literal_string)
+            {
+                check_format(format)?;
+            }
+            let h = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
+            Expr::new(ExprKind::Call(function, arguments), h)
+        } else if self.eat(Punct::LBracket)? {
+            let key = self.expression(0, depth, ExprContext::Normal)?;
+            if self.at(Punct::Comma) {
+                return Err(Refusal::MultiSubscript.into());
+            }
+            self.require(Punct::RBracket)?;
+            let h = key.height;
+            Expr::new(ExprKind::Array(name, Box::new(key)), h)
+        } else if name == "length" {
+            Expr::new(ExprKind::Call(Function::Length, Vec::new()), 0)
+        } else {
+            Expr::new(ExprKind::Variable(name), 0)
+        }
+    }
     fn prefix(&mut self, depth: u8) -> Result<Expr, AwkError> {
+        let depth = deeper(depth)?;
         let token = std::mem::replace(&mut self.token.kind, TokenKind::Eof);
         match token {
             TokenKind::Number(value) => {
@@ -823,59 +984,7 @@ impl Parser<'_> {
                 self.advance()?;
                 Expr::new(ExprKind::String(value), 0)
             }
-            TokenKind::Name(name) => {
-                if [
-                    "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "break",
-                    "continue", "next", "exit", "delete", "in",
-                ]
-                .contains(&name.as_str())
-                {
-                    return self.error("an expression");
-                }
-                let line = self.token.line;
-                let column = self.token.column + name.chars().count();
-                self.advance()?;
-                if self.at(Punct::LParen)
-                    && (Function::from_name(&name).is_ok()
-                        || (line == self.token.line && column == self.token.column))
-                {
-                    let function = Function::from_name(&name)?;
-                    self.advance()?;
-                    let mut arguments = Vec::new();
-                    if !self.at(Punct::RParen) {
-                        loop {
-                            arguments.push(self.expression(0, depth, ExprContext::Normal)?);
-                            if !self.eat(Punct::Comma)? {
-                                break;
-                            }
-                            self.newlines()?;
-                        }
-                    }
-                    self.require(Punct::RParen)?;
-                    if !function.accepts(arguments.len()) {
-                        return self.error(format!("the arguments required by {name}()"));
-                    }
-                    if function == Function::Sprintf
-                        && let Some(format) = arguments.first().and_then(literal_string)
-                    {
-                        check_format(format)?;
-                    }
-                    let h = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
-                    Expr::new(ExprKind::Call(function, arguments), h)
-                } else if self.eat(Punct::LBracket)? {
-                    let key = self.expression(0, depth, ExprContext::Normal)?;
-                    if self.at(Punct::Comma) {
-                        return Err(Refusal::MultiSubscript.into());
-                    }
-                    self.require(Punct::RBracket)?;
-                    let h = key.height;
-                    Expr::new(ExprKind::Array(name, Box::new(key)), h)
-                } else if name == "length" {
-                    Expr::new(ExprKind::Call(Function::Length, Vec::new()), 0)
-                } else {
-                    Expr::new(ExprKind::Variable(name), 0)
-                }
-            }
+            TokenKind::Name(name) => self.named_expression(name, depth),
             TokenKind::Punct(Punct::LParen) => {
                 self.advance()?;
                 let inner = self.expression(0, depth, ExprContext::Normal)?;
@@ -985,6 +1094,7 @@ impl Parser<'_> {
         depth: u8,
         context: ExprContext,
     ) -> Result<Expr, AwkError> {
+        let depth = deeper(depth)?;
         loop {
             if minimum <= 13 && (self.at(Punct::Inc) || self.at(Punct::Dec)) {
                 if !left.lvalue() {
@@ -1001,9 +1111,9 @@ impl Parser<'_> {
                 continue;
             }
             if minimum <= 2 && self.eat(Punct::Question)? {
-                let yes = self.expression(0, depth, ExprContext::Normal)?;
+                let yes = self.expression(0, depth, context)?;
                 self.require(Punct::Colon)?;
-                let no = self.expression(2, depth, context)?;
+                let no = self.expression(1, depth, context)?;
                 let h = left.height.max(yes.height).max(no.height);
                 left = Expr::new(
                     ExprKind::Conditional(Box::new(left), Box::new(yes), Box::new(no)),
@@ -1089,14 +1199,11 @@ impl Parser<'_> {
             ]
             .contains(&op)
             {
-                if let ExprKind::Chain(_, rest) = &left.kind
+                if let ExprKind::Chain(_, rest) = &mut left.kind
                     && rest
                         .last()
                         .is_some_and(|(previous, _)| precedence(*previous) == binding)
                 {
-                    let ExprKind::Chain(_, rest) = &mut left.kind else {
-                        return self.error("an operator chain");
-                    };
                     left.height = left.height.max(height(right.height)?);
                     rest.push((op, right));
                 } else {
