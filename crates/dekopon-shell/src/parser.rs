@@ -5,7 +5,9 @@ mod nested;
 
 use depth::Depth;
 use nested::Construct;
-use thiserror::Error;
+mod errors;
+use errors::{ArithmeticOperator, Context, DepthConstruct, Found, Keyword, PatternContext};
+pub(crate) use errors::{ParseError, Refusal};
 
 use crate::{
     ast::{
@@ -28,38 +30,24 @@ pub(crate) const RESERVED_WORDS: &[&str] = &[
     "until", "select", "function", "[[", "]]",
 ];
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ParseError {
-    #[error(transparent)]
-    Lex(#[from] LexError),
-    #[error("line {line}: {message}")]
-    Syntax { line: usize, message: String },
-}
-
-impl ParseError {
-    fn syntax(line: usize, message: impl Into<String>) -> Self {
-        Self::Syntax {
-            line,
-            message: message.into(),
-        }
-    }
-}
-
 pub fn parse(source: &str) -> Result<Program, ParseError> {
     depth::parse(source)
 }
 
-fn parse_nested(source: &str, depth: Depth) -> Result<Program, ParseError> {
-    let mut parser = Parser::new(source, depth);
+fn parse_nested(source: &str, depth: Depth, line: usize) -> Result<Program, ParseError> {
+    let mut parser = Parser::new(source, depth, line);
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
-        return Err(error.into());
+        return Err(error);
     }
     let program = result?;
     if let Some(token) = parser.peek() {
         let line = token.line;
         let kind = token.kind.clone();
-        return Err(ParseError::syntax(line, format!("unexpected {kind}")));
+        return Err(ParseError::refused(
+            line,
+            Refusal::UnexpectedToken(Box::new(kind.clone())),
+        ));
     }
     Ok(program)
 }
@@ -70,18 +58,18 @@ pub(crate) fn parse_substitution(
     line: usize,
 ) -> Result<(Program, usize), ParseError> {
     let depth = depth.substitution(line)?;
-    let mut parser = Parser::new(source, depth);
+    let mut parser = Parser::new(source, depth, line);
     parser.substitution = true;
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
         if let Some(close) = parser.lexer.pending_here_doc_close() {
-            parse_nested(&source[..close + 1], depth)?;
+            parse_nested(&source[..close + 1], depth, line)?;
         }
-        return Err(error.into());
+        return Err(error);
     }
     let program = result?;
     let Some(token) = parser.peek() else {
-        return Err(ParseError::syntax(line, "unterminated $( ... )"));
+        return Err(ParseError::refused(line, Refusal::UnterminatedSubstitution));
     };
     let token_line = token.line;
     let end = token.offset + 1;
@@ -89,9 +77,9 @@ pub(crate) fn parse_substitution(
         TokenKind::RightParen => {
             if parser.lexer.offset() != end {
                 // Reparse the bounded prefix to preserve the here-document's delimiter-specific refusal.
-                return parse_nested(&source[..end], depth).and(Err(ParseError::syntax(
+                return parse_nested(&source[..end], depth, line).and(Err(ParseError::refused(
                     token_line,
-                    "unterminated here-document",
+                    Refusal::UnterminatedHereDocument,
                 )));
             }
             Ok((program, end))
@@ -111,9 +99,10 @@ pub(crate) fn parse_substitution(
         | TokenKind::Duplicate { .. }
         | TokenKind::Less
         | TokenKind::HereDoc(_)
-        | TokenKind::LessParen) => {
-            Err(ParseError::syntax(token_line, format!("unexpected {kind}")))
-        }
+        | TokenKind::LessParen) => Err(ParseError::refused(
+            token_line,
+            Refusal::UnexpectedToken(Box::new(kind.clone())),
+        )),
     }
 }
 
@@ -127,35 +116,20 @@ fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), Pa
                 && (later.source == copied || later.source == Stream::Both)
         });
         if reassigned {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!(
-                    "`{}>&{}` must come after the redirection of stream {}, not before it: \
-                     write `> name {}>&{}` rather than `{}>&{} > name`",
-                    redirect.source.descriptor(),
-                    copied.descriptor(),
-                    copied.descriptor(),
-                    redirect.source.descriptor(),
-                    copied.descriptor(),
-                    redirect.source.descriptor(),
-                    copied.descriptor(),
-                ),
+                Refusal::DuplicationOrder {
+                    source: redirect.source,
+                    copied,
+                },
             ));
         }
     }
     Ok(())
 }
 
-fn too_deep(line: usize, construct: &str) -> ParseError {
-    ParseError::syntax(
-        line,
-        format!(
-            "{construct} nested more than {MAX_NESTING_DEPTH} levels deep; this shell parses on a fixed stack and refuses rather than risking it"
-        ),
-    )
-}
-
 struct Parser<'a> {
+    start_line: usize,
     source: &'a str,
     tokens: Vec<Token>,
     position: usize,
@@ -166,13 +140,14 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, depth: Depth) -> Self {
+    fn new(source: &'a str, depth: Depth, start_line: usize) -> Self {
         Self {
+            start_line,
             source,
             tokens: Vec::new(),
             position: 0,
             depth,
-            lexer: Lexer::new(source, depth),
+            lexer: Lexer::new(source, depth, start_line),
             lex_error: None,
             substitution: false,
         }
@@ -201,7 +176,10 @@ impl<'a> Parser<'a> {
     fn line(&mut self) -> usize {
         match self.peek() {
             Some(token) => token.line,
-            None => self.tokens.last().map_or(1, |token| token.line),
+            None => self
+                .tokens
+                .last()
+                .map_or(self.start_line, |token| token.line),
         }
     }
 
@@ -245,14 +223,14 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn expect_reserved(&mut self, expected: &str, context: &str) -> Result<(), ParseError> {
-        if self.eat_reserved(expected) {
+    fn expect_reserved(&mut self, expected: Keyword, context: Context) -> Result<(), ParseError> {
+        if self.eat_reserved(expected.name()) {
             return Ok(());
         }
         let line = self.line();
-        Err(ParseError::syntax(
+        Err(ParseError::refused(
             line,
-            format!("expected `{expected}` in {context}"),
+            Refusal::ExpectedKeyword { expected, context },
         ))
     }
 
@@ -300,9 +278,9 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Word(_)) if reserved => {}
                 Some(other) => {
                     let other = other.clone();
-                    return Err(ParseError::syntax(
+                    return Err(ParseError::refused(
                         line,
-                        format!("unexpected {other} after a command"),
+                        Refusal::UnexpectedAfterCommand(Box::new(other)),
                     ));
                 }
             }
@@ -313,12 +291,9 @@ impl<'a> Parser<'a> {
     fn background(&mut self, statement: Statement, start: usize) -> Result<Statement, ParseError> {
         let line = self.line();
         if let Statement::Function(definition) = &statement {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!(
-                    "`&` cannot follow the function definition `{}() {{ ... }}`: define the function, then start it as a job with `{} &`",
-                    definition.name, definition.name
-                ),
+                Refusal::BackgroundFunction(definition.name.clone()),
             ));
         }
         let source_end = self.source.len();
@@ -338,25 +313,22 @@ impl<'a> Parser<'a> {
             }
             Some("esac") => {
                 let line = self.line();
-                return Err(ParseError::syntax(line, "`esac` without a matching `case`"));
+                return Err(ParseError::refused(line, Refusal::UnmatchedEsac));
             }
             Some("select") => {
                 let line = self.line();
-                return Err(ParseError::syntax(
-                    line,
-                    "`select` is not part of this shell: there is no interactive terminal to prompt",
-                ));
+                return Err(ParseError::refused(line, Refusal::Select));
             }
             Some("function") => {
                 let line = self.line();
-                return Err(ParseError::syntax(
-                    line,
-                    "the `function` keyword is not part of this shell; define functions as `name() { ... }`",
-                ));
+                return Err(ParseError::refused(line, Refusal::FunctionKeyword));
             }
             Some(other) => {
                 let line = self.line();
-                return Err(ParseError::syntax(line, format!("unexpected `{other}`")));
+                return Err(ParseError::refused(
+                    line,
+                    Refusal::UnexpectedKeyword(other.to_owned()),
+                ));
             }
             None => {}
         }
@@ -387,41 +359,37 @@ impl<'a> Parser<'a> {
 
         let line = self.line();
         if !is_valid_name(&name) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("{name:?} is not a valid function name"),
+                Refusal::InvalidFunctionName(name),
             ));
         }
         if let Some(rejected) = crate::builtins::RejectedCommand::lookup(&name) {
-            let reason = rejected.reason();
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("cannot define a function named {name:?}: {reason}"),
+                Refusal::RejectedFunction(rejected),
             ));
         }
         if RESERVED_WORDS.contains(&name.as_str()) {
-            return Err(ParseError::syntax(
-                line,
-                format!("cannot define a function named {name:?}: it is a reserved word"),
-            ));
+            return Err(ParseError::refused(line, Refusal::ReservedFunction(name)));
         }
 
         self.position += 3;
         self.skip_newlines();
         if !matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) {
             let line = self.line();
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("expected `{{` to open the body of function {name:?}"),
+                Refusal::ExpectedFunctionOpen(name),
             ));
         }
         self.position += 1;
         let body = self.nest(Construct::Function)?.parse_function_body()?;
         if !matches!(self.peek_kind(), Some(TokenKind::RightBrace)) {
             let line = self.line();
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("expected `}}` to close the body of function {name:?}"),
+                Refusal::ExpectedFunctionClose(name),
             ));
         }
         self.position += 1;
@@ -429,31 +397,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for(&mut self) -> Result<ForLoop, ParseError> {
-        self.expect_reserved("for", "a `for` loop")?;
+        self.expect_reserved(Keyword::For, Context::For)?;
         let line = self.line();
         if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
-            return Err(ParseError::syntax(
-                line,
-                "C-style `for (( ... ))` loops are not supported; use `for x in ...` over a list, or a `while` loop with `i=$(( i + 1 ))`",
-            ));
+            return Err(ParseError::refused(line, Refusal::CStyleFor));
         }
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
-            return Err(ParseError::syntax(line, "expected a `for` loop variable"));
+            return Err(ParseError::refused(line, Refusal::ExpectedForVariable));
         };
         let Some(variable) = word.as_literal().map(str::to_owned) else {
-            return Err(ParseError::syntax(
-                line,
-                "a `for` loop variable must be a plain name",
-            ));
+            return Err(ParseError::refused(line, Refusal::NonLiteralForVariable));
         };
         if !is_valid_name(&variable) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("{variable:?} is not a valid `for` loop variable name"),
+                Refusal::InvalidForVariable(variable),
             ));
         }
         self.position += 1;
-        self.expect_reserved("in", "a `for` loop")?;
+        self.expect_reserved(Keyword::In, Context::For)?;
 
         let mut words = Vec::new();
         while let Some(TokenKind::Word(word)) = self.peek_kind().cloned() {
@@ -465,23 +427,20 @@ impl<'a> Parser<'a> {
         }
 
         self.skip_separators();
-        self.expect_reserved("do", "a `for` loop")?;
+        self.expect_reserved(Keyword::Do, Context::For)?;
         self.nest(Construct::For)?.parse_for_body(variable, words)
     }
 
     fn parse_case(&mut self) -> Result<CaseStatement, ParseError> {
-        self.expect_reserved("case", "a `case` statement")?;
+        self.expect_reserved(Keyword::Case, Context::Case)?;
         let line = self.line();
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
-            return Err(ParseError::syntax(
-                line,
-                "expected a word to match after `case`",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedCaseSubject));
         };
         let subject = word.clone();
         self.position += 1;
         self.skip_newlines();
-        self.expect_reserved("in", "a `case` statement")?;
+        self.expect_reserved(Keyword::In, Context::Case)?;
 
         let mut clauses = Vec::new();
         loop {
@@ -491,14 +450,17 @@ impl<'a> Parser<'a> {
             }
             if self.peek().is_none() {
                 let line = self.line();
-                return Err(ParseError::syntax(
+                return Err(ParseError::refused(
                     line,
-                    "expected `esac` in a `case` statement",
+                    Refusal::ExpectedKeyword {
+                        expected: Keyword::Esac,
+                        context: Context::Case,
+                    },
                 ));
             }
             clauses.push(self.parse_case_clause()?);
         }
-        self.expect_reserved("esac", "a `case` statement")?;
+        self.expect_reserved(Keyword::Esac, Context::Case)?;
         Ok(CaseStatement { subject, clauses })
     }
 
@@ -515,10 +477,7 @@ impl<'a> Parser<'a> {
         }
         if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
             let line = self.line();
-            return Err(ParseError::syntax(
-                line,
-                "expected `)` to close a `case` pattern list",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedCasePatternClose));
         }
         self.position += 1;
 
@@ -530,10 +489,10 @@ impl<'a> Parser<'a> {
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
             let found = self
                 .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
+                .map_or(Found::End, |token| Found::Token(Box::new(token.clone())));
+            return Err(ParseError::refused(
                 line,
-                format!("expected a `case` pattern, found {found}"),
+                Refusal::ExpectedCasePattern(found),
             ));
         };
         let word = word.clone();
@@ -546,9 +505,12 @@ impl<'a> Parser<'a> {
 
         if word_is_constant(&word) {
             if let Some(character) = literal_pattern_metacharacter(&word) {
-                return Err(ParseError::syntax(
+                return Err(ParseError::refused(
                     line,
-                    unsupported_case_pattern(character),
+                    Refusal::Pattern {
+                        context: PatternContext::Case,
+                        character,
+                    },
                 ));
             }
             return Ok(CasePattern::Literal(word));
@@ -690,34 +652,28 @@ impl<'a> Parser<'a> {
         if words.is_empty() {
             let found = self
                 .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
-                line,
-                format!("expected a condition inside `[[ ... ]]`, found {found}"),
-            ));
+                .map_or(Found::End, |token| Found::Token(Box::new(token.clone())));
+            return Err(ParseError::refused(line, Refusal::ExpectedCondition(found)));
         }
         if words.len() > 3 {
-            return Err(ParseError::syntax(
-                line,
-                "a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses",
-            ));
+            return Err(ParseError::refused(line, Refusal::TooManyConditionOperands));
         }
 
         let mut check_right_pattern = false;
         if let [_, operator, right] = words.as_slice() {
             let operator = operator.as_literal().unwrap_or_default().to_owned();
             if operator == "=~" {
-                return Err(ParseError::syntax(
-                    line,
-                    "`=~` regex matching is not supported: every pattern in this shell is literal text; compare with `==`, or match structurally with `jq`",
-                ));
+                return Err(ParseError::refused(line, Refusal::RegexCondition));
             }
             if matches!(operator.as_str(), "=" | "==" | "!=") {
                 if word_is_constant(right) {
                     if let Some(character) = literal_pattern_metacharacter(right) {
-                        return Err(ParseError::syntax(
+                        return Err(ParseError::refused(
                             line,
-                            unsupported_conditional_pattern(character),
+                            Refusal::Pattern {
+                                context: PatternContext::Conditional,
+                                character,
+                            },
                         ));
                     }
                 } else {
@@ -741,10 +697,7 @@ impl<'a> Parser<'a> {
                     let line = self.line();
                     self.position += 1;
                     let Some(TokenKind::Word(word)) = self.peek_kind() else {
-                        return Err(ParseError::syntax(
-                            line,
-                            "expected an in-memory buffer name after a redirection operator",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::ExpectedBuffer));
                     };
                     let word = word.clone();
                     self.position += 1;
@@ -761,13 +714,9 @@ impl<'a> Parser<'a> {
                     let line = self.line();
                     self.position += 1;
                     if source == target {
-                        return Err(ParseError::syntax(
+                        return Err(ParseError::refused(
                             line,
-                            format!(
-                                "`{}>&{}` redirects a stream onto itself and would do nothing",
-                                source.descriptor(),
-                                target.descriptor()
-                            ),
+                            Refusal::SelfDuplication { source, target },
                         ));
                     }
                     redirects.push(Redirect {
@@ -826,57 +775,39 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::LeftParen) => {
                     let line = self.line();
                     if after_empty_assignment {
-                        return Err(ParseError::syntax(
-                            line,
-                            "bash array literals `name=(a b c)` are not supported: arrays here are real JSON, so write `name='[\"a\",\"b\",\"c\"]'` or `name=$(... | jq ...)` and index it with `${name[0]}`",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::ArrayLiteral));
                     }
                     if matches!(
                         self.token_at(self.position + 1).map(|token| &token.kind),
                         Some(TokenKind::LeftParen)
                     ) {
-                        return Err(ParseError::syntax(
-                            line,
-                            "the arithmetic command `(( ... ))` is not supported; use the arithmetic expansion `x=$(( ... ))`, or `[ ... ]` to test a value",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::ArithmeticCommand));
                     }
-                    return Err(ParseError::syntax(
-                        line,
-                        "subshells `( ... )` are not supported: this shell forks no processes; use a function instead",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::Subshell));
                 }
                 Some(TokenKind::RightParen) => {
                     if self.substitution {
                         break;
                     }
                     let line = self.line();
-                    return Err(ParseError::syntax(line, "unexpected `)`"));
+                    return Err(ParseError::refused(line, Refusal::UnexpectedRightParen));
                 }
                 Some(TokenKind::HereDoc(word)) => {
                     let line = self.line();
                     self.position += 1;
                     if here_doc.is_some() {
-                        return Err(ParseError::syntax(
-                            line,
-                            "a command accepts at most one here-document",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::MultipleHereDocuments));
                     }
                     after_empty_assignment = false;
                     here_doc = Some(word);
                 }
                 Some(TokenKind::LessParen) => {
                     let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "process substitution `<( ... )` is not supported: this shell forks no processes and has no file descriptors",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::ProcessSubstitution));
                 }
                 Some(TokenKind::Less) => {
                     let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "input redirection `<` is not supported: there are no files; pipe a value or `cat` a named buffer instead",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::InputRedirection));
                 }
                 _ => break,
             }
@@ -886,11 +817,8 @@ impl<'a> Parser<'a> {
             let line = self.line();
             let found = self
                 .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
-                line,
-                format!("expected a command, found {found}"),
-            ));
+                .map_or(Found::End, |token| Found::Token(Box::new(token.clone())));
+            return Err(ParseError::refused(line, Refusal::ExpectedCommand(found)));
         }
 
         check_duplication_order(&redirects, self.line())?;
@@ -910,22 +838,6 @@ const CASE_METACHARACTERS: &[char] = &['*', '?', '['];
 pub(crate) fn pattern_metacharacter(text: &str) -> Option<char> {
     text.chars()
         .find(|character| CASE_METACHARACTERS.contains(character))
-}
-
-pub(crate) fn unsupported_case_pattern(character: char) -> String {
-    format!(
-        "`case` patterns are literal: `{character}` is not supported; quote it as `'{character}'`, list alternatives with `|`, or use `*)` for the default"
-    )
-}
-
-pub(crate) fn unsupported_parameter_pattern(character: char) -> String {
-    format!("`${{NAME}}` patterns are literal: `{character}` is not supported; slice with `jq`")
-}
-
-pub(crate) fn unsupported_conditional_pattern(character: char) -> String {
-    format!(
-        "`[[ == ]]` patterns are literal: `{character}` is not supported; quote it as `'{character}'` or use `jq`"
-    )
 }
 
 pub(crate) fn expanded_pattern(character: char) -> String {
@@ -990,9 +902,12 @@ fn split_assignment(word: &Word) -> Option<(String, Word)> {
 pub(crate) fn parameter_pattern(word: Word, line: usize) -> Result<Pattern, ParseError> {
     if word_is_constant(&word) {
         if let Some(character) = literal_pattern_metacharacter(&word) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                unsupported_parameter_pattern(character),
+                Refusal::Pattern {
+                    context: PatternContext::Parameter,
+                    character,
+                },
             ));
         }
         return Ok(Pattern::Literal(word));
@@ -1001,39 +916,54 @@ pub(crate) fn parameter_pattern(word: Word, line: usize) -> Result<Pattern, Pars
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum ArithToken {
+enum ArithKind {
     Integer(i64),
     Float(f64),
     Name(String),
     Symbol(&'static str),
 }
 
+struct ArithToken {
+    kind: ArithKind,
+    line: usize,
+}
+struct ArithTokens {
+    tokens: Vec<ArithToken>,
+    end_line: usize,
+}
+
 enum ArithSymbol {
     Kept,
-    Rejected(&'static str),
+    Rejected(ArithmeticOperator),
 }
 
 /// Operator spellings, longest first so `&&` is never mistaken for a rejected bitwise `&`.
 const ARITH_SYMBOLS: &[(&str, ArithSymbol)] = &[
+    ("**", ArithSymbol::Rejected(ArithmeticOperator::Power)),
+    ("++", ArithSymbol::Rejected(ArithmeticOperator::Increment)),
+    ("--", ArithSymbol::Rejected(ArithmeticOperator::Decrement)),
     (
-        "**",
-        ArithSymbol::Rejected("`**` is not supported; multiply repeatedly, or use `jq pow`"),
+        "+=",
+        ArithSymbol::Rejected(ArithmeticOperator::CompoundAssignment),
     ),
     (
-        "++",
-        ArithSymbol::Rejected("`++` is not supported; write `i=$(( i + 1 ))`"),
+        "-=",
+        ArithSymbol::Rejected(ArithmeticOperator::CompoundAssignment),
     ),
     (
-        "--",
-        ArithSymbol::Rejected("`--` is not supported; write `i=$(( i - 1 ))`"),
+        "*=",
+        ArithSymbol::Rejected(ArithmeticOperator::CompoundAssignment),
     ),
-    ("+=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("-=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("*=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("/=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("%=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("<<", ArithSymbol::Rejected(BITWISE)),
-    (">>", ArithSymbol::Rejected(BITWISE)),
+    (
+        "/=",
+        ArithSymbol::Rejected(ArithmeticOperator::CompoundAssignment),
+    ),
+    (
+        "%=",
+        ArithSymbol::Rejected(ArithmeticOperator::CompoundAssignment),
+    ),
+    ("<<", ArithSymbol::Rejected(ArithmeticOperator::Bitwise)),
+    (">>", ArithSymbol::Rejected(ArithmeticOperator::Bitwise)),
     ("&&", ArithSymbol::Kept),
     ("||", ArithSymbol::Kept),
     ("<=", ArithSymbol::Kept),
@@ -1050,28 +980,15 @@ const ARITH_SYMBOLS: &[(&str, ArithSymbol)] = &[
     ("<", ArithSymbol::Kept),
     (">", ArithSymbol::Kept),
     ("!", ArithSymbol::Kept),
-    (
-        "=",
-        ArithSymbol::Rejected(
-            "assignment inside `$(( ... ))` is not supported; assign the expansion instead, as `name=$(( ... ))`",
-        ),
-    ),
-    ("?", ArithSymbol::Rejected(TERNARY)),
-    (":", ArithSymbol::Rejected(TERNARY)),
-    ("&", ArithSymbol::Rejected(BITWISE)),
-    ("|", ArithSymbol::Rejected(BITWISE)),
-    ("^", ArithSymbol::Rejected(BITWISE)),
-    ("~", ArithSymbol::Rejected(BITWISE)),
-    (
-        ",",
-        ArithSymbol::Rejected("the comma operator is not supported; write one expansion per value"),
-    ),
+    ("=", ArithSymbol::Rejected(ArithmeticOperator::Assignment)),
+    ("?", ArithSymbol::Rejected(ArithmeticOperator::Ternary)),
+    (":", ArithSymbol::Rejected(ArithmeticOperator::Ternary)),
+    ("&", ArithSymbol::Rejected(ArithmeticOperator::Bitwise)),
+    ("|", ArithSymbol::Rejected(ArithmeticOperator::Bitwise)),
+    ("^", ArithSymbol::Rejected(ArithmeticOperator::Bitwise)),
+    ("~", ArithSymbol::Rejected(ArithmeticOperator::Bitwise)),
+    (",", ArithSymbol::Rejected(ArithmeticOperator::Comma)),
 ];
-
-const COMPOUND_ASSIGNMENT: &str =
-    "compound assignment is not supported inside `$(( ... ))`; write `name=$(( name + 1 ))`";
-const BITWISE: &str = "bitwise operators are not supported; this arithmetic is numeric only, so use `jq` for bit manipulation";
-const TERNARY: &str = "the ternary `? :` is not supported; use `if`/`else`";
 
 #[allow(
     clippy::map_err_ignore,
@@ -1079,21 +996,19 @@ const TERNARY: &str = "the ternary `? :` is not supported; use `if`/`else`";
               ASCII digit run with at most one interior dot: ParseFloatError is unreachable and \
               ParseIntError can only be overflow, which the message it is replaced by states"
 )]
-fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, ParseError> {
+fn tokenize_arithmetic(source: &str, mut line: usize) -> Result<ArithTokens, ParseError> {
     let mut tokens = Vec::new();
     let bytes = source.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
         if tokens.len() >= MAX_ARITHMETIC_TOKENS {
-            return Err(ParseError::syntax(
-                line,
-                format!(
-                    "an arithmetic expansion may hold at most {MAX_ARITHMETIC_TOKENS} tokens; split the calculation across assignments"
-                ),
-            ));
+            return Err(ParseError::refused(line, Refusal::ArithmeticTokens));
         }
         let character = source[index..].chars().next().unwrap_or('\0');
         if character.is_ascii_whitespace() {
+            if character == '\n' {
+                line += 1;
+            }
             index += 1;
             continue;
         }
@@ -1109,18 +1024,24 @@ fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, Par
                 }
                 let literal = &source[start..index];
                 let value = literal.parse::<f64>().map_err(|_| {
-                    ParseError::syntax(line, format!("invalid arithmetic literal {literal:?}"))
+                    ParseError::refused(line, Refusal::InvalidArithmeticLiteral(literal.to_owned()))
                 })?;
-                tokens.push(ArithToken::Float(value));
+                tokens.push(ArithToken {
+                    kind: ArithKind::Float(value),
+                    line,
+                });
             } else {
                 let literal = &source[start..index];
                 let value = literal.parse::<i64>().map_err(|_| {
-                    ParseError::syntax(
+                    ParseError::refused(
                         line,
-                        format!("arithmetic literal {literal:?} is out of range"),
+                        Refusal::ArithmeticLiteralOutOfRange(literal.to_owned()),
                     )
                 })?;
-                tokens.push(ArithToken::Integer(value));
+                tokens.push(ArithToken {
+                    kind: ArithKind::Integer(value),
+                    line,
+                });
             }
             continue;
         }
@@ -1135,37 +1056,46 @@ fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, Par
                 index += 1;
             }
             if start == index {
-                return Err(ParseError::syntax(
+                return Err(ParseError::refused(
                     line,
-                    "expected a variable name after `$` in an arithmetic expansion",
+                    Refusal::ExpectedArithmeticVariable,
                 ));
             }
-            tokens.push(ArithToken::Name(source[start..index].to_owned()));
+            tokens.push(ArithToken {
+                kind: ArithKind::Name(source[start..index].to_owned()),
+                line,
+            });
             continue;
         }
         let (matched, symbol) = ARITH_SYMBOLS
             .iter()
             .find(|(symbol, _)| source[index..].starts_with(*symbol))
-            .ok_or_else(|| {
-                ParseError::syntax(
-                    line,
-                    format!("unsupported character {character:?} in an arithmetic expansion"),
-                )
-            })?;
+            .ok_or_else(|| ParseError::refused(line, Refusal::ArithmeticCharacter(character)))?;
         match symbol {
             ArithSymbol::Kept => {}
-            ArithSymbol::Rejected(reason) => return Err(ParseError::syntax(line, *reason)),
+            ArithSymbol::Rejected(reason) => {
+                return Err(ParseError::refused(
+                    line,
+                    Refusal::ArithmeticOperator(*reason),
+                ));
+            }
         }
         index += matched.len();
-        tokens.push(ArithToken::Symbol(matched));
+        tokens.push(ArithToken {
+            kind: ArithKind::Symbol(matched),
+            line,
+        });
     }
-    Ok(tokens)
+    Ok(ArithTokens {
+        tokens,
+        end_line: line,
+    })
 }
 
 struct ArithParser {
     tokens: Vec<ArithToken>,
     position: usize,
-    line: usize,
+    end_line: usize,
     depth: Depth,
 }
 
@@ -1174,30 +1104,35 @@ pub(crate) fn parse_arithmetic(
     line: usize,
     depth: Depth,
 ) -> Result<ArithExpr, ParseError> {
-    let tokens = tokenize_arithmetic(source, line)?;
+    let ArithTokens { tokens, end_line } = tokenize_arithmetic(source, line)?;
     if tokens.is_empty() {
-        return Err(ParseError::syntax(line, "empty arithmetic expansion"));
+        return Err(ParseError::refused(end_line, Refusal::EmptyArithmetic));
     }
     let mut parser = ArithParser {
         tokens,
         position: 0,
-        line,
+        end_line,
         depth,
     };
     let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
-        return Err(ParseError::syntax(
-            line,
-            "trailing tokens in an arithmetic expansion",
+        return Err(ParseError::refused(
+            parser.line(),
+            Refusal::TrailingArithmetic,
         ));
     }
     Ok(expression)
 }
 
 impl ArithParser {
+    fn line(&self) -> usize {
+        self.tokens
+            .get(self.position)
+            .map_or(self.end_line, |token| token.line)
+    }
     fn peek_symbol(&self) -> Option<&'static str> {
-        match self.tokens.get(self.position) {
-            Some(ArithToken::Symbol(symbol)) => Some(symbol),
+        match self.tokens.get(self.position).map(|token| &token.kind) {
+            Some(ArithKind::Symbol(symbol)) => Some(symbol),
             _ => None,
         }
     }
@@ -1210,13 +1145,11 @@ impl ArithParser {
         false
     }
 
-    fn arithmetic_too_deep(&self, _error: crate::ast::ArithTooDeep) -> ParseError {
-        ParseError::syntax(
-            self.line,
-            format!(
-                "an arithmetic expansion may nest at most {MAX_NESTING_DEPTH} operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments"
-            ),
-        )
+    fn arithmetic_too_deep(line: usize, _error: crate::ast::ArithTooDeep) -> ParseError {
+        ParseError::TooDeep {
+            line,
+            construct: DepthConstruct::ArithmeticOperators,
+        }
     }
 
     fn parse_binary_level(
@@ -1230,10 +1163,11 @@ impl ArithParser {
                 break;
             };
             let operator = *operator;
+            let line = self.line();
             self.position += 1;
             let right = next(self)?;
             left = ArithExpr::binary(operator, left, right)
-                .map_err(|error| self.arithmetic_too_deep(error))?;
+                .map_err(|error| Self::arithmetic_too_deep(line, error))?;
         }
         Ok(left)
     }
@@ -1289,56 +1223,55 @@ impl ArithParser {
     fn parse_unary(&mut self) -> Result<ArithExpr, ParseError> {
         let mut operators = Vec::new();
         loop {
+            let line = self.line();
             if self.eat_symbol("-") {
-                operators.push(ArithUnaryOp::Negate);
+                operators.push((ArithUnaryOp::Negate, line));
             } else if self.eat_symbol("!") {
-                operators.push(ArithUnaryOp::Not);
+                operators.push((ArithUnaryOp::Not, line));
             } else if !self.eat_symbol("+") {
                 break;
             }
         }
         let mut operand = self.parse_primary()?;
-        for operator in operators.into_iter().rev() {
+        for (operator, line) in operators.into_iter().rev() {
             operand = ArithExpr::unary(operator, operand)
-                .map_err(|error| self.arithmetic_too_deep(error))?;
+                .map_err(|error| Self::arithmetic_too_deep(line, error))?;
         }
         Ok(operand)
     }
 
     fn parse_primary(&mut self) -> Result<ArithExpr, ParseError> {
-        let line = self.line;
-        match self.tokens.get(self.position).cloned() {
-            Some(ArithToken::Integer(value)) => {
+        let line = self.line();
+        match self
+            .tokens
+            .get(self.position)
+            .map(|token| token.kind.clone())
+        {
+            Some(ArithKind::Integer(value)) => {
                 self.position += 1;
                 Ok(ArithExpr::integer(value))
             }
-            Some(ArithToken::Float(value)) => {
+            Some(ArithKind::Float(value)) => {
                 self.position += 1;
                 Ok(ArithExpr::float(value))
             }
-            Some(ArithToken::Name(name)) => {
+            Some(ArithKind::Name(name)) => {
                 self.position += 1;
                 Ok(ArithExpr::variable(name))
             }
-            Some(ArithToken::Symbol("(")) => {
+            Some(ArithKind::Symbol("(")) => {
                 self.position += 1;
                 let inner = self.group()?.parse_or()?;
                 if !self.eat_symbol(")") {
-                    return Err(ParseError::syntax(
-                        line,
-                        "unbalanced parentheses in an arithmetic expansion",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::UnbalancedArithmetic));
                 }
                 Ok(inner)
             }
-            Some(ArithToken::Symbol(symbol)) => Err(ParseError::syntax(
+            Some(ArithKind::Symbol(symbol)) => Err(ParseError::refused(
                 line,
-                format!("unexpected `{symbol}` in an arithmetic expansion"),
+                Refusal::UnexpectedArithmeticSymbol(symbol),
             )),
-            None => Err(ParseError::syntax(
-                line,
-                "arithmetic expansion ended unexpectedly",
-            )),
+            None => Err(ParseError::refused(line, Refusal::ArithmeticEnded)),
         }
     }
 }

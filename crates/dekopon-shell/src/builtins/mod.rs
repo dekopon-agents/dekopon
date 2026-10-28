@@ -669,7 +669,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RejectedCommand {
     Eval,
     Exec,
@@ -696,7 +696,6 @@ impl RejectedCommand {
             _ => None,
         }
     }
-    #[cfg(test)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Eval => "eval",
