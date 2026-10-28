@@ -7391,8 +7391,8 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
-const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
-const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
+const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
 
 fn expected_instructions() -> String {
     "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
@@ -7471,6 +7471,51 @@ fn commit(
         cache_key, lease, ..
     } = store.begin(key, granted, window, None, now);
     lease.commit(window, turn, TakenIn::default(), &cache_key, now);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_replayed_suggestion_receipts_do_not_imply_the_calls_did_not_run() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        suggest_improvement(),
+        suggest_improvement(),
+        answer("I sent two suggestions."),
+        answer("Two suggestions."),
+    ]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for text in ["send two suggestions", "did you send them?"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    assert!(tool_message(&models, 1).contains("Recorded suggestion 1 of 3"));
+    assert!(tool_message(&models, 2).contains("Recorded suggestion 2 of 3"));
+    assert_eq!(
+        models.prompt(3),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
+            (
+                "user",
+                "[gateway: unmapped participant]\nsend two suggestions"
+            ),
+            ("assistant", "I sent two suggestions."),
+            (
+                "user",
+                "[gateway: unmapped participant]\ndid you send them?"
+            ),
+        ]),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -202,10 +202,7 @@ async fn a_whole_window_carries_no_omission_fact() {
     let fixture = Fixture::new(&["cli-probe.upper"]).await;
     fixture.append(&["cli-probe.upper"], "whole conversation");
     fixture.run().await;
-    assert_eq!(
-        fixture.notice(0),
-        "[gateway: memory]\nReplayed turns keep the request, your final reply and bash script exchanges; reasoning and other tool calls are not kept.\n"
-    );
+    assert_eq!(fixture.notice(0), JOURNAL_FIDELITY_NOTICE);
 }
 
 #[tokio::test]
