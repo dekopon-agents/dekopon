@@ -36,10 +36,10 @@ use tokio::signal::unix::{SignalKind, signal};
     about = "Run the authenticated broker or manage its provider set"
 )]
 struct Cli {
-    /// Tokio worker threads; otherwise TOKIO_WORKER_THREADS or the available CPU count.
+    /// Tokio worker threads (1 to 4096); otherwise TOKIO_WORKER_THREADS or the available CPU count.
     #[arg(long, env = "DEKOPON_WORKER_THREADS", value_name = "COUNT")]
     worker_threads: Option<std::num::NonZeroUsize>,
-    /// Maximum additional Tokio blocking threads (default: 512).
+    /// Maximum additional Tokio blocking threads (1 to 4096; default: 512).
     #[arg(long, env = "DEKOPON_BLOCKING_THREADS", value_name = "COUNT")]
     blocking_threads: Option<std::num::NonZeroUsize>,
     /// Retire idle blocking threads after this duration (default: 10s).
@@ -165,6 +165,9 @@ const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,deko
 const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
 
 #[cfg(unix)]
+const MAX_RUNTIME_THREADS: usize = 4096;
+
+#[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,
     reason = "owner: main passes it to observed::finish for shutdown; bound: one runtime, configured workers and blocking cap or Tokio defaults"
@@ -193,6 +196,12 @@ fn runtime_builder(cli: &Cli) -> Result<tokio::runtime::Builder, clap::Error> {
     let blocking = cli
         .blocking_threads
         .map_or(512, std::num::NonZeroUsize::get);
+    if workers > MAX_RUNTIME_THREADS || blocking > MAX_RUNTIME_THREADS {
+        return Err(Cli::command().error(
+            ErrorKind::ValueValidation,
+            format!("worker and blocking thread counts must each be at most {MAX_RUNTIME_THREADS}"),
+        ));
+    }
     if workers.checked_add(blocking).is_none() {
         return Err(Cli::command().error(
             ErrorKind::ValueValidation,
@@ -965,8 +974,8 @@ mod runtime_sizing_tests {
     }
 
     #[test]
-    fn runtime_pool_limit_overflow_is_a_cli_error() {
-        const CHILD: &str = "DEKOPON_RUNTIME_OVERFLOW_TEST";
+    fn runtime_thread_limits_are_cli_errors() {
+        const CHILD: &str = "DEKOPON_RUNTIME_LIMIT_TEST";
         let arguments = ["daemon"];
         if std::env::var_os(CHILD).is_some() {
             let cli = Cli::try_parse_from(arguments).unwrap();
@@ -975,45 +984,47 @@ mod runtime_sizing_tests {
             assert_eq!(error.exit_code(), 2);
             return;
         }
-        let maximum = usize::MAX.to_string();
-        for flags in [
-            vec![format!("--worker-threads={maximum}")],
-            vec![
-                "--worker-threads=1".to_owned(),
-                format!("--blocking-threads={maximum}"),
-            ],
-            vec![format!("--blocking-threads={maximum}")],
-        ] {
-            let cli =
-                Cli::try_parse_from(arguments.into_iter().map(str::to_owned).chain(flags)).unwrap();
-            let error = runtime_builder(&cli).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::ValueValidation);
-            assert_eq!(error.exit_code(), 2);
+        let invalid_counts = [usize::MAX, usize::MAX - 512, MAX_RUNTIME_THREADS + 1];
+        for count in invalid_counts {
+            for flag in ["--worker-threads", "--blocking-threads"] {
+                let cli = Cli::try_parse_from(
+                    arguments
+                        .into_iter()
+                        .map(str::to_owned)
+                        .chain([format!("{flag}={count}")]),
+                )
+                .unwrap();
+                let error = runtime_builder(&cli).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::ValueValidation);
+                assert_eq!(error.exit_code(), 2);
+            }
         }
         let variables = [
             "DEKOPON_WORKER_THREADS",
             "DEKOPON_BLOCKING_THREADS",
             "TOKIO_WORKER_THREADS",
         ];
-        for variable in variables {
-            let mut child = Command::new(std::env::current_exe().unwrap());
-            child.args([
-                "--exact",
-                "runtime_sizing_tests::runtime_pool_limit_overflow_is_a_cli_error",
-            ]);
+        for count in invalid_counts {
             for variable in variables {
-                child.env_remove(variable);
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child.args([
+                    "--exact",
+                    "runtime_sizing_tests::runtime_thread_limits_are_cli_errors",
+                ]);
+                for variable in variables {
+                    child.env_remove(variable);
+                }
+                let output = child
+                    .env(CHILD, "1")
+                    .env(variable, count.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{variable}={count}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
-            let output = child
-                .env(CHILD, "1")
-                .env(variable, &maximum)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{variable}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
         }
     }
 

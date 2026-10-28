@@ -5,7 +5,8 @@ wakeup, routes each authenticated message to a named agent from the catalog, run
 session with the sandboxed shell plus safe on-demand meta tools, and replies with the answer.
 
 Runtime sizing uses `--worker-threads`, `--blocking-threads`, `--blocking-keep-alive` and
-`--shell-threads`, with `DEKOPON_*` environment fallbacks; see
+`--shell-threads`, with `DEKOPON_*` environment fallbacks; worker and blocking counts are each
+limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
 [runtime threads](../../docs/gatewayd.md#runtime-threads) for defaults and thread ceilings.
 
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long

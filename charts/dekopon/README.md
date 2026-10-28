@@ -52,7 +52,9 @@ existing environment settings.
 | `broker.runtime.blockingKeepAlive` | `--blocking-keep-alive` |
 | `broker.runtime.cpuThreads` | `--cpu-threads` |
 
-Counts must be positive; `blockingKeepAlive` uses humantime syntax such as `10s`.
+Counts must be positive; `workerThreads` and `blockingThreads` must each be at most 4096.
+The binaries reject larger counts before constructing any pool. `blockingKeepAlive` uses
+humantime syntax such as `10s`.
 Broker settings also reach precompile, provider sync, configuration checks and probes;
 gateway settings reach serving and configuration checks. The Pi values are set separately
 by the homelab deployment; the chart does not select them.

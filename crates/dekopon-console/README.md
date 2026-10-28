@@ -48,6 +48,10 @@ Thread sizing is parsed before configuration; flags override their environment f
 no configuration key controls a pool. Counts must be positive. Omitted runtime options retain
 Tokio's defaults.
 
+Effective Tokio worker and blocking counts must each be at most 4096, including values from
+flags, `DEKOPON_WORKER_THREADS`, `DEKOPON_BLOCKING_THREADS`, `TOKIO_WORKER_THREADS`, or available
+CPUs; larger counts are command-line validation errors (exit 2) before any pool is constructed.
+
 | Flag | Environment fallback | Default |
 |---|---|---|
 | `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
