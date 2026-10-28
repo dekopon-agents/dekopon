@@ -193,7 +193,7 @@ fn unavailable_stderr_preserves_the_broker_failure_exit_within_the_deadline() {
             observed::observed(
                 Install::new(Console {
                     format: ConsoleFormat::Json,
-                    writer: ConsoleWriter::Stdout,
+                    writer: ConsoleWriter::Stdout("bk-stdout"),
                     filter: ConsoleFilter::Directive("info".into()),
                 }),
                 async { Err::<(), _>(dekopon_brokerd::ServerError::ShutdownTimeout) },
@@ -289,7 +289,7 @@ async fn over_deadline_child() -> std::process::ExitCode {
     let deadline = dekopon_brokerd::ShutdownDeadline::default();
     let install = Install::new(Console {
         format: ConsoleFormat::Json,
-        writer: ConsoleWriter::Stdout,
+        writer: ConsoleWriter::Stdout("bk-stdout"),
         filter: ConsoleFilter::Directive("info".into()),
     });
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

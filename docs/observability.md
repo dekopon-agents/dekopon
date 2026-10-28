@@ -279,6 +279,11 @@ Every broker-confirmed unmapped refusal emits a notice, including repeats and un
 
 Mapped agent-permission refusals emit one structured `gateway_session_rejected` record with message `gateway.session.rejected`, carrying the same typed transport, route, conversation and subject fields listed above, and `reason=agent-denied` or `unauthorized` for an empty grant. These records contain no message text and omit the `audit.event` owner-notice selector; only unmapped strangers trigger owner notices. Other authentication failures retain their existing behavior. OpenObserve alert routing and delivery are the homelab's responsibility; the notice is best-effort telemetry, not a DM or channel post.
 
+For an ambient PR-link turn, unmapped-subject and agent-denied refusal records also carry the
+string `admission.trigger = "pull-request-link"`. These refusals send no chat reply or reaction
+and do not consume the stranger-reply slot; mentions and direct messages keep their existing
+refusal replies and records.
+
 ## The broker audit record
 
 Every broker decision is one structured log record, emitted from inside the span that made it and

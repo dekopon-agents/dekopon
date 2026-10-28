@@ -382,6 +382,9 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["dekopon-brokerd"]
           args:
+{{- range include "dekopon.runtimeArgs" (dict "ctx" . "daemon" "broker") | fromJsonArray }}
+            - {{ . | quote }}
+{{- end }}
             - provider
             - --lock-file={{ .Values.broker.providerSet.mountPath }}/providers.lock.yaml
             - --store={{ .Values.broker.providerSet.mountPath }}/store
@@ -405,7 +408,7 @@ spec:
           image: {{ include "dekopon.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["dekopon-gatewayd"]
-          args: ["--config", "{{ $gcfg }}{{ if not .Values.gateway.configDirectory.configMap }}/gatewayd.yaml{{ end }}"]
+          args: ["--config", "{{ $gcfg }}{{ if not .Values.gateway.configDirectory.configMap }}/gatewayd.yaml{{ end }}"{{- range include "dekopon.runtimeArgs" (dict "ctx" . "daemon" "gateway") | fromJsonArray }}, {{ . | quote }}{{- end }}]
           securityContext:
             {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" 65533 "runAsGroup" 65533)) | nindent 12 }}
           env:

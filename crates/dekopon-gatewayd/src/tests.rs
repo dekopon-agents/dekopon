@@ -2787,7 +2787,7 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
     document["routes"][0]["transport"] = json!("support-slack");
     let path = write_config(directory.path(), &document);
 
-    let error = crate::run(&path, std::future::pending())
+    let error = crate::run(&path, std::future::pending(), 32)
         .await
         .expect_err("two unset chat credentials are a startup refusal");
     let crate::GatewaydError::Startup { problems } = &error else {
@@ -2851,7 +2851,7 @@ async fn a_permanent_transport_failure_stops_the_gateway_and_preserves_its_cause
     let path = write_config(directory.path(), &document);
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        crate::run(&path, std::future::pending()),
+        crate::run(&path, std::future::pending(), 32),
     )
     .await
     .expect("startup is bounded")
@@ -19984,7 +19984,7 @@ async fn run_refuses_with_exactly_the_problem_check_reports() {
     let directory = check_fixture(root.path(), "nobody", &[]);
 
     let report = crate::check(&directory, None, None).await;
-    let error = crate::run(&directory, std::future::pending())
+    let error = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("a route naming an absent agent cannot serve");
 
@@ -20018,7 +20018,7 @@ async fn invalid_indicators_have_the_same_check_and_boot_refusal() {
     )
     .expect("write fragment");
     let report = crate::check(&directory, None, None).await;
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("invalid surface refuses boot");
     let [problem] = report.problems.as_slice() else {
@@ -20047,7 +20047,7 @@ async fn unsupported_and_non_durable_follow_refuses_check_and_boot() {
     chat["routes"][0]["follow"] = json!(true);
     fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
     let report = crate::check(&directory, None, None).await;
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("invalid follow refuses boot");
     let [problem] = report.problems.as_slice() else {
@@ -20086,7 +20086,7 @@ async fn unknown_indicator_value_produces_only_a_file_parse_diagnostic() {
         problem,
         crate::GatewaydError::Config(ConfigError::Invalid { .. })
     )));
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("parse failure refuses boot");
     assert!(matches!(
@@ -20113,7 +20113,7 @@ async fn deployed_liveness_fragment_refuses_in_check_and_boot() {
         problem,
         crate::GatewaydError::Config(ConfigError::Decode { .. })
     )));
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("legacy key refuses boot");
     assert!(matches!(
