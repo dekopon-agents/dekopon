@@ -4,6 +4,11 @@ The unprivileged Dekopon chat gateway and agent daemon. It connects to chat serv
 wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model
 session with the sandboxed shell plus safe on-demand meta tools, and replies with the answer.
 
+Runtime sizing uses `--worker-threads`, `--blocking-threads`, `--blocking-keep-alive` and
+`--shell-threads`, with `DEKOPON_*` environment fallbacks; worker and blocking counts are each
+limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
+[runtime threads](../../docs/gatewayd.md#runtime-threads) for defaults and thread ceilings.
+
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
   polling, a raw-body-HMAC-authenticated text/image WhatsApp Cloud API webhook with pinned Graph
   replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;
@@ -23,7 +28,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   unmentioned follow-ups can continue. Slack routes may opt into `ambient.pullRequestLinks`
   with existing follow and journal configuration: a PR link starts a threaded review turn using
   only the poster’s broker leg, downscoped by a mapped channel. Other speakers wait for separate
-  turns. See [Slack pull-request links](../../docs/gatewayd.md#slack-pull-request-links).
+  turns. Unmapped or denied posters' ambient links are silently refused, with a trace record
+  and no thread reply or reaction. See [Slack pull-request links](../../docs/gatewayd.md#slack-pull-request-links).
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Feature-only fauxlack also reads manifest files from its world. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
@@ -90,7 +96,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   untrusted model text exactly like `instructions`: it shapes answers and grants nothing.
 - **Improvement suggestions** — every session offers `suggest_improvement`, a bounded channel
   for the model to tell the operator what to fix, or what cost it an awkward extra step even on
-  a task that succeeded, at most three notes per session. Each note is written to telemetry as
+  a task that succeeded, at most ten notes per message execution. Each note is written to telemetry as
   `agent.improvement.suggested` like every other model-authored record. A suggestion is advisory
   by construction — no instruction, skill, limit, or grant moves because a model asked — and the
   gateway never relays it to chat.

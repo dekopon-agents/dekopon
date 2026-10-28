@@ -36,6 +36,18 @@ use tokio::signal::unix::{SignalKind, signal};
     about = "Run the authenticated broker or manage its provider set"
 )]
 struct Cli {
+    /// Tokio worker threads (1 to 4096); otherwise TOKIO_WORKER_THREADS or the available CPU count.
+    #[arg(long, env = "DEKOPON_WORKER_THREADS", value_name = "COUNT")]
+    worker_threads: Option<std::num::NonZeroUsize>,
+    /// Maximum additional Tokio blocking threads (1 to 4096; default: 512).
+    #[arg(long, env = "DEKOPON_BLOCKING_THREADS", value_name = "COUNT")]
+    blocking_threads: Option<std::num::NonZeroUsize>,
+    /// Retire idle blocking threads after this duration (default: 10s).
+    #[arg(long, env = "DEKOPON_BLOCKING_KEEP_ALIVE", value_name = "DURATION")]
+    blocking_keep_alive: Option<humantime::Duration>,
+    /// Rayon CPU threads (1 to 4096); otherwise RAYON_NUM_THREADS or the available CPU count.
+    #[arg(long, env = "DEKOPON_CPU_THREADS", value_name = "COUNT")]
+    cpu_threads: Option<std::num::NonZeroUsize>,
     /// Strict owner-controlled broker YAML/JSON configuration.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -153,26 +165,100 @@ const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,deko
 const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
 
 #[cfg(unix)]
+const MAX_RUNTIME_THREADS: usize = 4096;
+
+#[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,
-    reason = "owner: main, which drops it after the broker returns; bound: the daemon's one runtime, one worker per core"
+    reason = "owner: main passes it to observed::finish for shutdown; bound: one runtime, configured workers and blocking cap or Tokio defaults"
 )]
-fn main() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("dekopon-brokerd: could not start the async runtime: {error}");
-            return ExitCode::FAILURE;
-        }
+fn runtime_builder(cli: &Cli) -> Result<tokio::runtime::Builder, clap::Error> {
+    let workers = match cli.worker_threads {
+        Some(workers) => workers.get(),
+        None => match std::env::var("TOKIO_WORKER_THREADS") {
+            Ok(value) => value
+                .parse::<std::num::NonZeroUsize>()
+                .map_err(|error| {
+                    Cli::command().error(
+                        ErrorKind::ValueValidation,
+                        format!("invalid TOKIO_WORKER_THREADS: {error}"),
+                    )
+                })?
+                .get(),
+            Err(std::env::VarError::NotPresent) => {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            }
+            Err(error) => {
+                return Err(Cli::command().error(ErrorKind::ValueValidation, error));
+            }
+        },
     };
-    observed::finish(runtime, start())
+    let blocking = cli
+        .blocking_threads
+        .map_or(512, std::num::NonZeroUsize::get);
+    if workers > MAX_RUNTIME_THREADS || blocking > MAX_RUNTIME_THREADS {
+        return Err(Cli::command().error(
+            ErrorKind::ValueValidation,
+            format!("worker and blocking thread counts must each be at most {MAX_RUNTIME_THREADS}"),
+        ));
+    }
+    if workers.checked_add(blocking).is_none() {
+        return Err(Cli::command().error(
+            ErrorKind::ValueValidation,
+            "worker threads plus blocking threads exceed the platform thread-count limit",
+        ));
+    }
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    builder.enable_all().thread_name_fn(move || {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100_000_000;
+        format!("bk-rt-{index}")
+    });
+    builder
+        .worker_threads(workers)
+        .max_blocking_threads(blocking);
+    if let Some(keep_alive) = cli.blocking_keep_alive {
+        builder.thread_keep_alive(keep_alive.into());
+    }
+    Ok(builder)
 }
 
 #[cfg(unix)]
-async fn start() -> ExitCode {
+fn cpu_pool_builder(cli: &Cli) -> Result<rayon::ThreadPoolBuilder, clap::Error> {
+    let threads = match cli.cpu_threads {
+        Some(threads) => threads.get(),
+        None => match std::env::var("RAYON_NUM_THREADS") {
+            Ok(value) => value
+                .parse::<std::num::NonZeroUsize>()
+                .map_err(|error| {
+                    Cli::command().error(
+                        ErrorKind::ValueValidation,
+                        format!("invalid RAYON_NUM_THREADS: {error}"),
+                    )
+                })?
+                .get(),
+            Err(std::env::VarError::NotPresent) => {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            }
+            Err(error) => {
+                return Err(Cli::command().error(ErrorKind::ValueValidation, error));
+            }
+        },
+    };
+    if threads > MAX_RUNTIME_THREADS {
+        return Err(Cli::command().error(
+            ErrorKind::ValueValidation,
+            format!("CPU thread count must be at most {MAX_RUNTIME_THREADS}"),
+        ));
+    }
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("bk-cpu-{}", index % 100_000_000)))
+}
+
+#[cfg(unix)]
+fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(error) = validate_cli(&cli) {
         if let Err(print_error) = error.print() {
@@ -180,7 +266,20 @@ async fn start() -> ExitCode {
         }
         return ExitCode::from(2);
     }
-    execute(cli).await
+    let mut builder = runtime_builder(&cli).unwrap_or_else(|error| error.exit());
+    let cpu_builder = cpu_pool_builder(&cli).unwrap_or_else(|error| error.exit());
+    if let Err(error) = cpu_builder.build_global() {
+        eprintln!("dekopon-brokerd: could not start the CPU pool: {error}");
+        return ExitCode::FAILURE;
+    }
+    let runtime = match builder.build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    observed::finish(runtime, execute(cli))
 }
 
 #[cfg(unix)]
@@ -276,7 +375,7 @@ async fn execute(cli: Cli) -> ExitCode {
                 dekopon_telemetry::optional_logger_provider(exporter, "dekopon-brokerd");
             let mut install = Install::new(Console {
                 format: ConsoleFormat::Json,
-                writer: ConsoleWriter::Stdout,
+                writer: ConsoleWriter::Stdout("bk-stdout"),
                 filter: ConsoleFilter::Environment("info".to_owned()),
             });
             if let Some(provider) = tracer_provider {
@@ -810,4 +909,286 @@ mod tests {
 fn main() -> std::process::ExitCode {
     eprintln!("dekopon-brokerd requires Unix peer credentials and Unix-domain sockets");
     std::process::ExitCode::FAILURE
+}
+
+#[cfg(all(test, unix))]
+mod runtime_sizing_tests {
+    use super::*;
+    use std::{collections::BTreeSet, process::Command, time::Duration};
+
+    #[test]
+    fn flags_and_environment() {
+        const CHILD: &str = "DEKOPON_RUNTIME_SIZING_TEST";
+        let variables = [
+            "DEKOPON_WORKER_THREADS",
+            "DEKOPON_BLOCKING_THREADS",
+            "DEKOPON_BLOCKING_KEEP_ALIVE",
+            "DEKOPON_CPU_THREADS",
+        ];
+        let mode = std::env::var(CHILD).ok();
+        let Some(mode) = mode else {
+            for case in ["defaults", "environment", "0", "1", "2", "3"] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", "runtime_sizing_tests::flags_and_environment"])
+                    .env(CHILD, case);
+                for (variable, value) in variables.iter().zip(["2", "3", "250ms", "4"]) {
+                    if case == "defaults" {
+                        child.env_remove(variable);
+                    } else {
+                        child.env(variable, value);
+                    }
+                }
+                if let Ok(index) = case.parse::<usize>() {
+                    child.env(variables[index], if index == 2 { "invalid" } else { "0" });
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if mode.parse::<usize>().is_ok() {
+            let error = Cli::try_parse_from(["daemon"]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        } else {
+            let cli = Cli::try_parse_from(["daemon"]).unwrap();
+            if mode == "defaults" {
+                assert_eq!(cli.worker_threads, None);
+                assert_eq!(cli.blocking_threads, None);
+                assert_eq!(cli.blocking_keep_alive, None);
+                assert_eq!(cli.cpu_threads.map(std::num::NonZeroUsize::get), None);
+            } else {
+                assert_eq!(cli.worker_threads.unwrap().get(), 2);
+                assert_eq!(cli.blocking_threads.unwrap().get(), 3);
+                assert_eq!(
+                    Duration::from(cli.blocking_keep_alive.unwrap()),
+                    Duration::from_millis(250)
+                );
+                assert_eq!(cli.cpu_threads.map(std::num::NonZeroUsize::get), Some(4));
+            }
+            for argument in [
+                "--worker-threads=0",
+                "--blocking-threads=0",
+                "--blocking-keep-alive=invalid",
+                "--cpu-threads=0",
+            ] {
+                let error = Cli::try_parse_from(["daemon", argument]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            }
+        }
+        let cli = Cli::try_parse_from([
+            "daemon",
+            "--worker-threads=3",
+            "--blocking-threads=4",
+            "--blocking-keep-alive=500ms",
+            "--cpu-threads=5",
+        ])
+        .unwrap();
+        assert_eq!(cli.worker_threads.unwrap().get(), 3);
+        assert_eq!(cli.blocking_threads.unwrap().get(), 4);
+        assert_eq!(
+            Duration::from(cli.blocking_keep_alive.unwrap()),
+            Duration::from_millis(500)
+        );
+        assert_eq!(cli.cpu_threads.map(std::num::NonZeroUsize::get), Some(5));
+    }
+
+    #[test]
+    fn runtime_thread_limits_are_cli_errors() {
+        const CHILD: &str = "DEKOPON_RUNTIME_LIMIT_TEST";
+        let arguments = ["daemon"];
+        if std::env::var_os(CHILD).is_some() {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let error = runtime_builder(&cli).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+            return;
+        }
+        let invalid_counts = [usize::MAX, usize::MAX - 512, MAX_RUNTIME_THREADS + 1];
+        for count in invalid_counts {
+            for flag in ["--worker-threads", "--blocking-threads"] {
+                let cli = Cli::try_parse_from(
+                    arguments
+                        .into_iter()
+                        .map(str::to_owned)
+                        .chain([format!("{flag}={count}")]),
+                )
+                .unwrap();
+                let error = runtime_builder(&cli).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::ValueValidation);
+                assert_eq!(error.exit_code(), 2);
+            }
+        }
+        let variables = [
+            "DEKOPON_WORKER_THREADS",
+            "DEKOPON_BLOCKING_THREADS",
+            "TOKIO_WORKER_THREADS",
+        ];
+        for count in invalid_counts {
+            for variable in variables {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child.args([
+                    "--exact",
+                    "runtime_sizing_tests::runtime_thread_limits_are_cli_errors",
+                ]);
+                for variable in variables {
+                    child.env_remove(variable);
+                }
+                let output = child
+                    .env(CHILD, "1")
+                    .env(variable, count.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{variable}={count}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_thread_limits_are_cli_errors() {
+        const CHILD: &str = "DEKOPON_CPU_LIMIT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let error = Cli::try_parse_from(["daemon"])
+                .and_then(|cli| cpu_pool_builder(&cli))
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+            return;
+        }
+        let invalid_counts = [usize::MAX, usize::MAX - 512, MAX_RUNTIME_THREADS + 1];
+        for count in invalid_counts {
+            let cli = Cli::try_parse_from(["daemon".to_owned(), format!("--cpu-threads={count}")])
+                .unwrap();
+            let error = cpu_pool_builder(&cli).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+        }
+        for variable in ["DEKOPON_CPU_THREADS", "RAYON_NUM_THREADS"] {
+            let mut values: Vec<_> = invalid_counts.into_iter().map(|n| n.to_string()).collect();
+            if variable == "RAYON_NUM_THREADS" {
+                values.extend(["0".to_owned(), "invalid".to_owned()]);
+            }
+            for value in values {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime_sizing_tests::cpu_thread_limits_are_cli_errors",
+                    ])
+                    .env_remove("DEKOPON_CPU_THREADS")
+                    .env_remove("RAYON_NUM_THREADS")
+                    .env(CHILD, "1")
+                    .env(variable, &value)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{variable}={value}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_runtime_names_workers_and_blocking_threads() {
+        let cli = Cli::parse_from(["daemon", "--worker-threads=2", "--blocking-threads=1"]);
+        let runtime = runtime_builder(&cli).unwrap().build().unwrap();
+        assert_eq!(runtime.metrics().num_workers(), 2);
+        let workers = runtime.block_on(async {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let barrier = std::sync::Arc::clone(&barrier);
+                tasks.spawn(async move {
+                    let name = std::thread::current().name().unwrap().to_owned();
+                    barrier.wait();
+                    name
+                });
+            }
+            let mut names = BTreeSet::new();
+            while let Some(name) = tasks.join_next().await {
+                names.insert(name.unwrap());
+            }
+            names
+        });
+        assert_eq!(
+            workers,
+            BTreeSet::from(["bk-rt-0".to_owned(), "bk-rt-1".to_owned()])
+        );
+        let blocking = runtime.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::current().name().unwrap().to_owned())
+                .await
+                .unwrap()
+        });
+        assert!(blocking.starts_with("bk-rt-"));
+        assert!(blocking.len() <= 15);
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+    #[test]
+    fn global_cpu_pool_has_the_selected_size_and_names() {
+        const CHILD: &str = "DEKOPON_CPU_POOL_TEST";
+        let mode = std::env::var(CHILD).ok();
+        let Some(mode) = mode else {
+            for (mode, dekopon, rayon) in [
+                ("flag", Some("3"), Some("1000000")),
+                ("environment", Some("2"), Some("1000000")),
+                ("legacy", None, Some("2")),
+                ("default", None, None),
+            ] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "runtime_sizing_tests::global_cpu_pool_has_the_selected_size_and_names",
+                    ])
+                    .env(CHILD, mode);
+                for (variable, value) in [
+                    ("DEKOPON_CPU_THREADS", dekopon),
+                    ("RAYON_NUM_THREADS", rayon),
+                ] {
+                    if let Some(value) = value {
+                        child.env(variable, value);
+                    } else {
+                        child.env_remove(variable);
+                    }
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let arguments = if mode == "flag" {
+            vec!["broker", "--cpu-threads=2"]
+        } else {
+            vec!["broker"]
+        };
+        let expected = if mode == "default" {
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        } else {
+            2
+        };
+        let cli = Cli::parse_from(arguments);
+        cpu_pool_builder(&cli).unwrap().build_global().unwrap();
+        assert_eq!(rayon::current_num_threads(), expected);
+        let names: BTreeSet<_> =
+            rayon::broadcast(|_| std::thread::current().name().unwrap().to_owned())
+                .into_iter()
+                .collect();
+        assert_eq!(
+            names,
+            (0..expected).map(|n| format!("bk-cpu-{n}")).collect()
+        );
+    }
 }

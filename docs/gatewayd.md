@@ -23,6 +23,30 @@ dekopon-gatewayd --config /path/to/gatewayd.yaml
 
 The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
 
+## Runtime threads
+
+Thread sizing is parsed before configuration; flags override their environment fallbacks and
+no configuration key controls a pool. Counts must be positive. Omitted runtime options retain
+Tokio's defaults.
+
+Effective Tokio worker and blocking counts must each be at most 4096, including values from
+flags, `DEKOPON_WORKER_THREADS`, `DEKOPON_BLOCKING_THREADS`, `TOKIO_WORKER_THREADS`, or available
+CPUs; larger counts are command-line validation errors (exit 2) before any pool is constructed.
+
+| Flag | Environment fallback | Default |
+|---|---|---|
+| `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
+| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 512 |
+| `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
+| `--shell-threads` | `DEKOPON_SHELL_THREADS` | 32 |
+
+With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (512 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=16, S=32` give 6 idle and at most 54 threads.
+Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
+`gw-rt-N` namespace and retire after the keep-alive. The stdout worker and OTel providers drain
+before runtime shutdown. The Pi settings are deployment values, not binary defaults.
+Until turns move to `ShellThreads`, the Pi must use `B=16` with a startup arithmetic check;
+`threads/homelab` must not set `B=8` before that move. Afterward, `B=8` gives a ceiling of 46 threads.
+
 ## Check a configuration
 
 ```console
@@ -588,7 +612,7 @@ additional bot permission.
 
 The `fauxlack` Cargo feature enables an in-process chat service for Rust gateway tests. It has
 no credentials, socket or listener. Build a `dekopon_gatewayd::fauxlack::Fauxlack` from one YAML
-manifest, then pass it to `run_fauxlack(config_path, shutdown, service)`. Ordinary `run`, `check`
+manifest, then pass it to `run_fauxlack(config_path, shutdown, service, shell_threads)`. Ordinary `run`, `check`
 and the executable have no service and refuse every fauxlack transport, even in a feature build.
 
 ```yaml
@@ -715,6 +739,8 @@ and one trailing slash are accepted, and query/fragment do not change the target
 and reviewed in one turn; structured owner, repository and positive number reach the prompt.
 Bot posts, edits, other GitHub URLs and thread replies gain no trigger. A mention retains
 ordinary mention behavior. Both classic and Agent Slack experiences support the opt-in.
+An ambient link from an unmapped or agent-denied poster gets no reply or reaction; the refusal
+is still traced with `admission.trigger = "pull-request-link"`.
 
 A PR-link turn keeps only the poster's broker leg throughout execution, downscoped by the channel
 when mapped. Other speakers wait for separate, freshly authorized turns; their additional grants

@@ -15,6 +15,7 @@ include = ["src/**", "tests/**", "Cargo.toml"]
 
 [dependencies]
 clap.workspace = true
+humantime.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
 dekopon-process.workspace = true

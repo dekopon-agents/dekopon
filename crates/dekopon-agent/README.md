@@ -128,14 +128,18 @@ are: it shapes an answer and grants nothing, so nothing secret belongs in one.
 `category` (`instructions`, `skill`, `capability`, `tool`, `limits`, `efficiency`, `other`), `target` (at most
 `MAX_SUGGESTION_TARGET_BYTES`, 128), `summary` (`MAX_SUGGESTION_SUMMARY_BYTES`, 512), `evidence`
 and `proposal` (`MAX_SUGGESTION_DETAIL_BYTES`, 2048 each), and `confidence` (`low`, `medium`,
-`high`), at most `MAX_SUGGESTIONS_PER_SESSION` (3) times per session. Its description invites a
-note after the model has answered and says the person never sees it; every result tells the
-model to continue with the task.
+`high`). Its description invites notes that would change how the agent is run, guides the
+number per answered message, and says the person never sees the note. A note exists only after
+a tool receipt; a promise records nothing. An explicit request to record one calls for a tool
+call or an admission it was not recorded. Every result tells the model to continue with the task.
 The four text fields are trimmed and stripped of control characters other than newline and tab
 before their bounds are checked; a well-formed object that fails a bound or names an unknown
-token is answered with the reason so the model can fix it or move on, a fourth note is refused
-with `session-limit`, and the session continues either way. Malformed JSON or a non-object ends
-the session as it does for every tool, and an object that is not the six-string-field shape ends
+token is answered with the reason so the model can fix it or move on. Accepted notes receive
+`Recorded suggestion for the operator. Continue with the task, or finish.` A private runaway
+stop after ten recorded notes in one message execution refuses further calls with
+`No more notes this message; this one was not recorded. Continue with the task.` and reason
+`session-limit`. There is no persisted or per-conversation counter; the session continues either
+way. Malformed JSON or a non-object ends the session as it does for every tool, and an object that is not the six-string-field shape ends
 it with `PromptError::InvalidSuggestion` (telemetry kind `invalid-suggestion`). Accepted notes
 arrive in `PromptOutcome.suggestions` as `improvement::ImprovementSuggestion` values, already
 written to telemetry; the copy is for an embedder that shows them to the operator directly, without requiring telemetry to be their only presentation. A suggestion is advisory by construction: no

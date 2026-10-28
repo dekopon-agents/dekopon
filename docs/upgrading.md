@@ -8,6 +8,52 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Daemon thread pools can be sized (0.68.0)
+
+No configuration change or provider re-pin is required. Every new flag and chart value is
+optional; existing defaults are unchanged when no sizing option is supplied.
+
+Brokerd, gatewayd and console accept `--worker-threads` (`DEKOPON_WORKER_THREADS`),
+`--blocking-threads` (`DEKOPON_BLOCKING_THREADS`) and `--blocking-keep-alive`
+(`DEKOPON_BLOCKING_KEEP_ALIVE`). Brokerd also accepts `--cpu-threads` (`DEKOPON_CPU_THREADS`);
+gatewayd and console accept `--shell-threads` (`DEKOPON_SHELL_THREADS`). Explicit flags override
+the corresponding environment variables. Without a worker setting, `TOKIO_WORKER_THREADS`
+then the available CPU count selects workers; console idle mode keeps no workers unless
+`--worker-threads` or `DEKOPON_WORKER_THREADS` is supplied. Without a CPU setting, brokerd uses
+`RAYON_NUM_THREADS` then the available CPU count. Blocking threads default to 512 and their
+keep-alive to 10s; shell threads default to 32 for gatewayd and 16 for console.
+
+Chart values `gateway.runtime.workerThreads`, `gateway.runtime.blockingThreads`,
+`gateway.runtime.blockingKeepAlive` and `gateway.runtime.shellThreads` render the corresponding
+gateway flags. Values `broker.runtime.workerThreads`, `broker.runtime.blockingThreads`,
+`broker.runtime.blockingKeepAlive` and `broker.runtime.cpuThreads` render the broker flags,
+including for precompile, provider sync, configuration checks and probes. Unset or null values
+render no flags; console can use the environment variables through its existing environment
+settings. Counts must be positive, with worker, blocking and broker CPU counts capped at 4096;
+keep-alive accepts humantime durations such as `10s`.
+
+Run chart 0.55.0 only with a v0.68.0 image: 0.67.0 binaries refuse the new flags. These changes
+are revert-safe while no sizing value is set; remove new flags and environment settings and
+unset chart runtime values before downgrading core and chart together. No broker wire, provider
+WIT or daemon configuration key changes accompany these options.
+
+When pinning a container image, use the published image digests now listed in the release notes.
+
+## Slack routes can review pull-request links (0.67.0)
+
+No configuration change or provider re-pin is required for existing deployments.
+Slack channel/thread routes can opt in with `ambient: {pullRequestLinks: true}` alongside
+`follow: true` and `sessions.journal`; the boolean defaults to false. Install the follow provider
+and reviewed broker grants before enabling it. An unaddressed human top-level post containing a
+GitHub pull-request link starts one review turn threaded under that post. Bot posts, edits and
+thread replies do not trigger it. Only the posting user's broker authority can authorize the
+review, downscoped by the channel when mapped; other speakers' grants cannot join that turn.
+
+Run gatewayd 0.67.0 before adding `ambient.pullRequestLinks` to a route. Version 0.66.0 rejects
+the new `ambient` route field, even when `pullRequestLinks` is false. No broker wire, provider WIT
+or journal format changes accompany this opt-in. Reverting to 0.66.0 is revert-safe for these
+changes only if no route sets it: remove the `ambient` field before downgrading.
+
 ## Conversation memory records, summaries and removed memory keys (0.65.0)
 
 One configuration change on gateways that set the removed memory keys; no provider WIT or SDK

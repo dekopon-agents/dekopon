@@ -100,6 +100,9 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["dekopon-brokerd"]
           args:
+{{- range include "dekopon.runtimeArgs" (dict "ctx" . "daemon" "broker") | fromJsonArray }}
+            - {{ . | quote }}
+{{- end }}
             - provider
             - --provider-set={{ $mount }}/providers.yaml
             - --lock-file={{ $mount }}/providers.lock.yaml
