@@ -6530,7 +6530,7 @@ async fn the_suggestion_tool_is_offered_on_every_route() {
     );
     let recorded = tool_message(&models, 1);
     assert!(
-        recorded.contains("Recorded suggestion 1 of 3"),
+        recorded == "Recorded suggestion for the operator. Continue with the task, or finish.",
         "{recorded}"
     );
 }
