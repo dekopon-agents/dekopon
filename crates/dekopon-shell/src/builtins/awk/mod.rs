@@ -1,6 +1,7 @@
 mod eval;
 #[cfg(test)]
 mod eval_tests;
+mod format;
 mod lex;
 mod parse;
 #[cfg(test)]
@@ -18,7 +19,7 @@ use parse::{Program, Refusal};
 use regex_bites::Regex;
 
 #[derive(Debug, PartialEq)]
-enum AwkError {
+pub(crate) enum AwkError {
     Refused(Refusal),
     Syntax {
         line: usize,
@@ -30,7 +31,7 @@ enum AwkError {
 }
 
 #[derive(Debug, PartialEq)]
-struct RuntimeError {
+pub(crate) struct RuntimeError {
     kind: RuntimeKind,
     record: f64,
 }
@@ -43,7 +44,7 @@ enum RuntimeKind {
     Utf8,
     EmptySeparator,
     Refused(Refusal),
-    FormatterPending,
+    FormatSyntax(String),
 }
 
 impl RuntimeKind {
@@ -55,9 +56,7 @@ impl RuntimeKind {
             Self::Utf8 => "awk: record is not valid UTF-8".into(),
             Self::EmptySeparator => "awk: an empty field separator is not supported".into(),
             Self::Refused(refusal) => refusal.message(),
-            Self::FormatterPending => {
-                "awk: internal error: formatter awaits pr3 registration".into()
-            }
+            Self::FormatSyntax(expected) => format!("awk: invalid format: {expected}"),
         }
     }
 }
@@ -156,14 +155,14 @@ fn compile(source: &str, budget: &Budget) -> Result<Compiled, AwkError> {
 }
 
 #[derive(Debug)]
-struct Options {
+pub(crate) struct Options {
     compiled: Compiled,
     assignments: Vec<(Text, Value)>,
     separators: Vec<(Text, ChargedRegex)>,
 }
 
 #[derive(Debug, PartialEq)]
-enum RunError {
+pub(crate) enum RunError {
     Awk(AwkError),
     Output(CommandFailure),
 }
@@ -199,13 +198,13 @@ impl From<RunError> for CommandFailure {
     }
 }
 
-enum StageReader<'a> {
+pub(crate) enum StageReader<'a> {
     Ready(PipeReader<StageObservation>, Option<RetainedBytes>),
     Inherited(Option<&'a mut PipeReader<StageObservation>>),
 }
 
 impl StageReader<'_> {
-    fn open(self) -> (PipeReader<StageObservation>, Option<RetainedBytes>) {
+    pub(crate) fn open(self) -> (PipeReader<StageObservation>, Option<RetainedBytes>) {
         match self {
             Self::Ready(reader, charge) => (reader, charge),
             Self::Inherited(reader) => (reader.map(std::mem::take).unwrap_or_default(), None),
@@ -221,7 +220,10 @@ fn identifier(name: &str) -> bool {
         && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
-fn parse(arguments: &[String], budget: &Budget) -> Result<(Options, Option<String>), AwkError> {
+pub(crate) fn parse(
+    arguments: &[String],
+    budget: &Budget,
+) -> Result<(Options, Option<String>), AwkError> {
     let mut assignments = Vec::new();
     let mut separators = Vec::new();
     let mut arguments = arguments.iter();
@@ -312,7 +314,7 @@ fn parse(arguments: &[String], budget: &Budget) -> Result<(Options, Option<Strin
     ))
 }
 
-fn run_stream(
+pub(crate) fn run_stream(
     options: Options,
     input: StageReader<'_>,
     budget: &mut Budget,

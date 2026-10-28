@@ -6,6 +6,7 @@ pub(super) enum OutputMode {
     Copy,
     Named,
     Lines,
+    Awk,
     Base64,
 }
 
@@ -30,6 +31,57 @@ pub(crate) struct StageOut {
     truncated: bool,
 }
 
+pub(super) struct WriteTarget<'a> {
+    budget: &'a Budget,
+    limits: &'a Limits,
+    output: &'a mut OutputBuffer,
+    stderr_capture: &'a mut Vec<StderrCapture>,
+    stdout: &'a mut Option<PipeWriter<StageObservation>>,
+    reader_gone: &'a mut bool,
+    captures: &'a mut Vec<Vec<CommandResult>>,
+    storage: BufferStorage<'a>,
+}
+
+impl<'a> WriteTarget<'a> {
+    pub(super) fn split(
+        evaluator: &'a mut Evaluator<'_>,
+    ) -> (&'a mut Vec<PipeReader<StageObservation>>, Self) {
+        (
+            &mut evaluator.stdin,
+            Self {
+                budget: &evaluator.budget,
+                limits: &evaluator.limits,
+                output: &mut evaluator.output,
+                stderr_capture: &mut evaluator.stderr_capture,
+                stdout: &mut evaluator.stdout,
+                reader_gone: &mut evaluator.reader_gone,
+                captures: &mut evaluator.captures,
+                storage: BufferStorage {
+                    buffers: &mut evaluator.buffers,
+                    charges: &mut evaluator.buffer_charges,
+                    shared_charges: &mut evaluator.shared_charges,
+                },
+            },
+        )
+    }
+    pub(super) fn input<'b>(
+        &self,
+        stdin: &'b mut Vec<PipeReader<StageObservation>>,
+        command: &str,
+        operand: Option<&str>,
+        input: StageInput,
+    ) -> Result<builtins::awk::StageReader<'b>, CommandFailure> {
+        stage_input(
+            stdin,
+            self.storage.buffers,
+            self.budget,
+            command,
+            operand,
+            input,
+        )
+    }
+}
+
 impl StageOut {
     pub(super) fn new(evaluator: &Evaluator<'_>, sink: &Sink, mode: OutputMode) -> Self {
         let active = evaluator.active_buffer_name();
@@ -43,7 +95,10 @@ impl StageOut {
             Sink::Value => {
                 let buffer_first = match mode {
                     OutputMode::Copy | OutputMode::Named => true,
-                    OutputMode::Value | OutputMode::Lines | OutputMode::Base64 => false,
+                    OutputMode::Value
+                    | OutputMode::Lines
+                    | OutputMode::Awk
+                    | OutputMode::Base64 => false,
                 };
                 if discarded && !(buffer_first && active.is_some()) {
                     Destination::Discard
@@ -77,7 +132,7 @@ impl StageOut {
                         | Destination::Terminal => false,
                     }
             }
-            OutputMode::Value | OutputMode::Copy | OutputMode::Named => false,
+            OutputMode::Value | OutputMode::Copy | OutputMode::Named | OutputMode::Awk => false,
         };
         Self {
             destination,
@@ -133,13 +188,22 @@ impl StageOut {
 
     pub(super) fn write(
         &mut self,
-        evaluator: &mut Evaluator<'_>,
+        evaluator: &mut WriteTarget<'_>,
         bytes: &[u8],
     ) -> Result<bool, CommandFailure> {
         match &self.destination {
             Destination::Discard => return Ok(true),
             Destination::Buffer(name) if !self.deferred => {
-                evaluator.append_buffer_bytes(name, bytes)?;
+                append_buffer_bytes(
+                    evaluator.budget,
+                    BufferStorage {
+                        buffers: evaluator.storage.buffers,
+                        charges: evaluator.storage.charges,
+                        shared_charges: evaluator.storage.shared_charges,
+                    },
+                    name,
+                    bytes,
+                )?;
                 return Ok(true);
             }
             Destination::Diagnostics if !self.deferred => {
@@ -164,7 +228,7 @@ impl StageOut {
                 if let Some(writer) = evaluator.stdout.as_mut()
                     && writer.write(bytes) == WriteOutcome::ReaderGone
                 {
-                    evaluator.reader_gone = true;
+                    *evaluator.reader_gone = true;
                     return Ok(false);
                 }
                 return Ok(true);
@@ -189,22 +253,25 @@ impl StageOut {
             | Destination::Pipe => return Ok(true),
         };
         match self.mode {
-            OutputMode::Lines => telemetry::stage_terminal_write(bytes.len(), !captured),
+            OutputMode::Lines | OutputMode::Awk => {
+                telemetry::stage_terminal_write(bytes.len(), !captured)
+            }
             OutputMode::Copy | OutputMode::Base64 => {
                 telemetry::stage_write(bytes.len(), true, &None)
             }
             OutputMode::Value | OutputMode::Named => {}
         }
         self.pending.extend_from_slice(bytes);
-        let complete = if self.mode == OutputMode::Lines && captured {
-            match std::str::from_utf8(&self.pending) {
-                Ok(text) => text.len(),
-                Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                Err(_invalid_utf8) => return Err(invalid_utf8()),
-            }
-        } else {
-            lossy_complete_prefix(&self.pending)
-        };
+        let complete =
+            if (self.mode == OutputMode::Lines || self.mode == OutputMode::Awk) && captured {
+                match std::str::from_utf8(&self.pending) {
+                    Ok(text) => text.len(),
+                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                    Err(_invalid_utf8) => return Err(invalid_utf8()),
+                }
+            } else {
+                lossy_complete_prefix(&self.pending)
+            };
         if captured && complete > 0 {
             let text = std::str::from_utf8(&self.pending[..complete])
                 .map_err(|_invalid_utf8| invalid_utf8())?;

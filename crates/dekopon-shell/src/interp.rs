@@ -8,7 +8,7 @@ mod ifs;
 mod nesting;
 pub(crate) mod stage_out;
 use ifs::{Action, Boundary, Ifs, Kind};
-use stage_out::{OutputMode, StageOut};
+use stage_out::{OutputMode, StageOut, WriteTarget};
 
 use std::{
     cmp::Ordering,
@@ -97,6 +97,75 @@ enum ParsedStream<'a> {
     Text(builtins::text::stream::Operation),
     Extra(builtins::text::extra::Operation),
     Jq(builtins::jq::Options),
+    Awk(builtins::awk::Options),
+}
+
+impl ParsedStream<'_> {
+    fn run(
+        self,
+        input: builtins::awk::StageReader<'_>,
+        budget: &mut Budget,
+        emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<ExitCode, CommandFailure> {
+        match self {
+            Self::Awk(options) => {
+                return builtins::awk::run_stream(options, input, budget, emit)
+                    .map_err(CommandFailure::from);
+            }
+            Self::Cat(_) => unreachable!("named cat streams resolve each buffer separately"),
+            Self::Base64(_) | Self::Lines(_) | Self::Text(_) | Self::Extra(_) | Self::Jq(_) => {}
+        }
+        let (mut reader, _charge) = input.open();
+        match self {
+            Self::Lines(selection) => {
+                builtins::text::lines::run(selection, &mut reader, budget, emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            Self::Text(operation) => {
+                builtins::text::stream::run_parsed(operation, &mut reader, budget, emit)
+            }
+            Self::Extra(operation) => {
+                builtins::text::extra::run_parsed(operation, &mut reader, budget, emit)
+            }
+            Self::Jq(options) => {
+                builtins::jq::stream(options, &mut reader, budget, emit).map(|()| ExitCode::SUCCESS)
+            }
+            Self::Base64(arguments) => {
+                builtins::encode::stream(arguments, &mut reader, budget, emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            Self::Cat(_) | Self::Awk(_) => unreachable!("handled before opening inherited input"),
+        }
+    }
+}
+
+fn stage_input<'a>(
+    stdin: &'a mut Vec<PipeReader<StageObservation>>,
+    buffers: &BTreeMap<String, Vec<u8>>,
+    budget: &Budget,
+    command: &str,
+    operand: Option<&str>,
+    input: StageInput,
+) -> Result<builtins::awk::StageReader<'a>, CommandFailure> {
+    use builtins::awk::StageReader;
+    if let Some(name) = operand.filter(|name| *name != "-") {
+        check_buffer_operand(command, name)?;
+        if name == DEV_NULL {
+            return Ok(StageReader::Ready(PipeReader::default(), None));
+        }
+        let bytes = buffers.get(name).ok_or_else(|| CommandFailure::failed(format!(
+            "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
+        )))?;
+        let charge = budget.charge_value_bytes(bytes.len() as u64)?;
+        return Ok(StageReader::Ready(
+            PipeReader::from_bytes(bytes.clone(), None, telemetry::stage_read),
+            Some(charge),
+        ));
+    }
+    Ok(match input {
+        StageInput::Piped(reader) => StageReader::Ready(reader, None),
+        StageInput::Inherited => StageReader::Inherited(stdin.last_mut()),
+    })
 }
 
 impl Builtin {
@@ -175,6 +244,9 @@ impl Builtin {
             Self::Jq => {
                 builtins::jq::options(arguments).map(|options| (ParsedStream::Jq(options), None))
             }
+            Self::Awk => builtins::awk::parse(arguments, &evaluator.budget)
+                .map(|(options, operand)| (ParsedStream::Awk(options), operand))
+                .map_err(CommandFailure::from),
             Self::Cat => Ok((ParsedStream::Cat(arguments), None)),
             Self::Base64 => Ok((ParsedStream::Base64(arguments), None)),
             Self::Xargs => return evaluator.run_xargs(arguments, input, stdout_sink),
@@ -1796,7 +1868,7 @@ impl<'a> Evaluator<'a> {
                 break;
             };
             self.budget.charge_step()?;
-            if !output.write(self, &chunk)? {
+            if !output.write(&mut WriteTarget::split(self).1, &chunk)? {
                 break;
             }
         }
@@ -2212,11 +2284,16 @@ impl<'a> Evaluator<'a> {
     }
 
     fn append_buffer_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<(), LimitExceeded> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-        self.append_charged_buffer_bytes(name, bytes, vec![charge])
+        append_buffer_bytes(
+            &self.budget,
+            BufferStorage {
+                buffers: &mut self.buffers,
+                charges: &mut self.buffer_charges,
+                shared_charges: &mut self.shared_charges,
+            },
+            name,
+            bytes,
+        )
     }
 
     fn append_charged_buffer_bytes(
@@ -2306,47 +2383,6 @@ impl<'a> Evaluator<'a> {
         executed
     }
 
-    fn stream_input(
-        &mut self,
-        command: &str,
-        operand: Option<&str>,
-        input: StageInput,
-    ) -> Result<
-        (
-            PipeReader<StageObservation>,
-            Option<dekopon_process::RetainedBytes>,
-        ),
-        CommandFailure,
-    > {
-        if let Some(name) = operand.filter(|name| *name != "-") {
-            check_buffer_operand(command, name)?;
-            if name == DEV_NULL {
-                return Ok((PipeReader::default(), None));
-            }
-            let bytes = self.buffers.get(name).ok_or_else(|| {
-                CommandFailure::failed(format!(
-                    "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
-                ))
-            })?;
-            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-            return Ok((
-                PipeReader::from_bytes(bytes.clone(), None, crate::interp::telemetry::stage_read),
-                Some(charge),
-            ));
-        }
-        Ok((
-            match input {
-                StageInput::Piped(reader) => reader,
-                StageInput::Inherited => self
-                    .stdin
-                    .last_mut()
-                    .map(std::mem::take)
-                    .unwrap_or_default(),
-            },
-            None,
-        ))
-    }
-
     fn run_stream(
         &mut self,
         name: &str,
@@ -2375,6 +2411,7 @@ impl<'a> Evaluator<'a> {
             }
             ParsedStream::Cat(_) => OutputMode::Named,
             ParsedStream::Base64(_) => OutputMode::Base64,
+            ParsedStream::Awk(_) => OutputMode::Awk,
             ParsedStream::Lines(_)
             | ParsedStream::Text(_)
             | ParsedStream::Extra(_)
@@ -2382,40 +2419,24 @@ impl<'a> Evaluator<'a> {
         };
         let mut output = StageOut::new(self, stdout_sink, mode);
         let mut budget = self.budget.fork();
-        let (mut reader, _input_charge) = match &parsed {
-            ParsedStream::Cat(_) => (PipeReader::default(), None),
-            ParsedStream::Base64(_)
-            | ParsedStream::Lines(_)
-            | ParsedStream::Text(_)
-            | ParsedStream::Extra(_)
-            | ParsedStream::Jq(_) => match self.stream_input(name, operand.as_deref(), input) {
-                Ok(selected) => selected,
-                Err(failure) => return self.failed(failure),
-            },
-        };
-        let mut emit = |bytes: &[u8]| output.write(self, bytes);
         let outcome = match parsed {
-            ParsedStream::Lines(selection) => {
-                builtins::text::lines::run(selection, &mut reader, &mut budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
-            }
-            ParsedStream::Text(operation) => {
-                builtins::text::stream::run_parsed(operation, &mut reader, &mut budget, &mut emit)
-            }
-            ParsedStream::Extra(operation) => {
-                builtins::text::extra::run_parsed(operation, &mut reader, &mut budget, &mut emit)
-            }
-            ParsedStream::Jq(options) => {
-                builtins::jq::stream(options, &mut reader, &mut budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
-            }
-            ParsedStream::Base64(arguments) => {
-                builtins::encode::stream(arguments, &mut reader, &mut budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
-            }
             ParsedStream::Cat(arguments) => {
                 builtins::misc::cat_stream(arguments, |name| output.named(self, name))
                     .map(|()| ExitCode::SUCCESS)
+            }
+            parsed @ (ParsedStream::Base64(_)
+            | ParsedStream::Lines(_)
+            | ParsedStream::Text(_)
+            | ParsedStream::Extra(_)
+            | ParsedStream::Jq(_)
+            | ParsedStream::Awk(_)) => {
+                let (stdin, mut target) = WriteTarget::split(self);
+                match target.input(stdin, name, operand.as_deref(), input) {
+                    Ok(input) => parsed.run(input, &mut budget, &mut |bytes| {
+                        output.write(&mut target, bytes)
+                    }),
+                    Err(failure) => Err(failure),
+                }
             }
         };
         let status = outcome.or_else(|failure| self.absorb(failure))?;
@@ -4297,6 +4318,19 @@ struct BufferStorage<'a> {
     buffers: &'a mut Arc<BTreeMap<String, Vec<u8>>>,
     charges: &'a mut BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
     shared_charges: &'a mut Vec<dekopon_process::RetainedBytes>,
+}
+
+fn append_buffer_bytes(
+    budget: &Budget,
+    storage: BufferStorage<'_>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), LimitExceeded> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let charge = budget.charge_value_bytes(bytes.len() as u64)?;
+    append_charged_buffer(budget, storage, name, bytes, vec![charge])
 }
 
 fn append_charged_buffer(

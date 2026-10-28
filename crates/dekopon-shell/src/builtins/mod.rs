@@ -4,8 +4,7 @@ use std::collections::BTreeSet;
 
 use crate::{CapabilityInvoker, limits::Budget};
 
-#[cfg(test)]
-mod awk;
+pub(crate) mod awk;
 
 pub(crate) mod cap;
 pub(crate) mod encode;
@@ -110,6 +109,7 @@ pub(crate) struct BuiltinContext<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Builtin {
+    Awk,
     Echo,
     Printf,
     Test,
@@ -139,6 +139,7 @@ pub(crate) enum Builtin {
 impl Builtin {
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::Awk => "awk",
             Self::Echo => "echo",
             Self::Printf => "printf",
             Self::Test => "test",
@@ -167,6 +168,7 @@ impl Builtin {
     }
     pub(crate) const fn help(self) -> &'static str {
         match self {
+            Self::Awk => "-F SEP -v NAME=VALUE",
             Self::Echo => misc::ECHO_HELP,
             Self::Printf => "",
             Self::Test => misc::TEST_HELP,
@@ -199,6 +201,7 @@ impl Builtin {
 
 pub(crate) fn lookup(name: &str) -> Option<Builtin> {
     match name {
+        "awk" => Some(Builtin::Awk),
         "echo" => Some(Builtin::Echo),
         "printf" => Some(Builtin::Printf),
         "test" => Some(Builtin::Test),
@@ -230,6 +233,7 @@ pub(crate) fn lookup(name: &str) -> Option<Builtin> {
 #[cfg(test)]
 pub(crate) fn names() -> Vec<&'static str> {
     let mut names = [
+        Builtin::Awk,
         Builtin::Echo,
         Builtin::Printf,
         Builtin::Test,
@@ -843,7 +847,8 @@ impl Builtin {
         match self {
             Self::Grep => text::stream::grep(arguments),
             Self::Sed => text::stream::sed(arguments),
-            Self::Echo
+            Self::Awk
+            | Self::Echo
             | Self::Printf
             | Self::Test
             | Self::TestBracket
@@ -890,7 +895,8 @@ impl Builtin {
             Self::Sort => {
                 text::extra::run_parsed(text::extra::sort(arguments)?.0, reader, budget, emit)
             }
-            Self::Echo
+            Self::Awk
+            | Self::Echo
             | Self::Printf
             | Self::Test
             | Self::TestBracket

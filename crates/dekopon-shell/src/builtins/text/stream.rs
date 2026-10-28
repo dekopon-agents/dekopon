@@ -300,7 +300,8 @@ mod tests {
             let args = match command {
                 Builtin::Grep => vec!["x".to_owned()],
                 Builtin::Sed => vec!["s/x/y/".to_owned()],
-                Builtin::Echo
+                Builtin::Awk
+                | Builtin::Echo
                 | Builtin::Printf
                 | Builtin::Test
                 | Builtin::TestBracket
@@ -527,7 +528,8 @@ mod tests {
             let args = match command {
                 Builtin::Grep => vec!["x".to_owned()],
                 Builtin::Sed => vec!["s/x/y/".to_owned()],
-                Builtin::Echo
+                Builtin::Awk
+                | Builtin::Echo
                 | Builtin::Printf
                 | Builtin::Test
                 | Builtin::TestBracket
@@ -577,7 +579,8 @@ mod tests {
             let args = match command {
                 Builtin::Grep => vec!["x".to_owned()],
                 Builtin::Sed => vec!["s/x/y/".to_owned()],
-                Builtin::Echo
+                Builtin::Awk
+                | Builtin::Echo
                 | Builtin::Printf
                 | Builtin::Test
                 | Builtin::TestBracket
