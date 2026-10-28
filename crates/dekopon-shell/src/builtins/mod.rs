@@ -462,6 +462,31 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn cat_stream(
+        context: &mut BuiltinContext<'_>,
+        arguments: &[String],
+        input: Option<Value>,
+    ) -> Result<CommandResult, CommandFailure> {
+        assert!(arguments.is_empty());
+        let reader = dekopon_process::pipe::PipeReader::from_bytes(
+            crate::value::display(&input.unwrap_or(Value::Null)).into_bytes(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
+        let tree = context.budget.tree();
+        let outcome = crate::interp::run_with_tree(
+            "cat",
+            None,
+            Some(reader),
+            context.invoker,
+            *tree.limits(),
+            tree,
+        );
+        let mut result = CommandResult::value(Value::String(outcome.output)).without_newline();
+        result.status = outcome.exit_code;
+        Ok(result)
+    }
+
     pub(crate) fn run_builtin(
         builtin: Run,
         arguments: &[&str],

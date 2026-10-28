@@ -386,7 +386,9 @@ mod tests {
         CapabilityCallResult, CapabilityInvoker, Interpreter,
         builtins::{
             CommandFailure,
-            test_support::{run_builtin, run_builtin_with, run_builtin_with_invoker},
+            test_support::{
+                cat_stream as Cat, run_builtin, run_builtin_with, run_builtin_with_invoker,
+            },
         },
     };
     use dekopon_process::Limits;
@@ -643,10 +645,8 @@ mod tests {
 
     #[test]
     fn cat_without_arguments_preserves_input() {
-        let result = Interpreter::new(Limits::default(), crate::test_threads()).run(
-            "printf hi | cat",
-            &crate::builtins::test_support::NoCapabilities,
-        );
-        assert_eq!(result.output, "hi");
+        let result =
+            run_builtin_with(Cat, &[], Some(json!("hi")), Limits::default()).expect("cat runs");
+        assert_eq!(result.value, json!("hi"));
     }
 }
