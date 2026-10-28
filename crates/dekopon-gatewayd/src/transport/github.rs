@@ -182,16 +182,6 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     values.next().is_none().then_some(value)
 }
 
-fn guid(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'-' | b'_' | b':')
-        })
-}
-
 async fn receive(
     State(state): State<StateData>,
     Extension(deadline): Extension<webhook::RequestDeadline>,
@@ -217,7 +207,8 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     if !webhook::headers_bounded(headers) {
         return refuse(state, Refusal::Headers, StatusCode::BAD_REQUEST);
     }
-    let delivery = header(headers, "x-github-delivery").filter(|value| guid(value));
+    let delivery = header(headers, "x-github-delivery")
+        .filter(|value| dekopon_core::github::GithubDeliveryId::new(value).is_ok());
     let event = header(headers, "x-github-event")
         .filter(|value| !value.is_empty() && value.len() <= 64 && value.is_ascii());
     let (Some(delivery), Some(event)) = (delivery, event) else {
@@ -1157,6 +1148,135 @@ mod typed_fact_tests {
     use super::tests::{pr, signed};
     use super::*;
     use serde_json::json;
+
+    async fn broker_round_trip(event: TypedGithubEvent) -> Value {
+        use dekopon_broker_protocol::{
+            Attestation, BrokerRequest, ChatScopeClaim, DeliveryIdentity, FrameLimits,
+            RequestEnvelope, Trigger, read_frame, write_frame,
+        };
+        use dekopon_core::github::GithubBatch;
+
+        let claim = Attestation::for_chat(
+            ExternalSubject::github("owner", "repo").unwrap(),
+            "reviewer".parse().unwrap(),
+            ChatScopeClaim {
+                participant: None,
+                transport: "github".parse().unwrap(),
+                kind: ChatTransportKind::Github,
+                conversation: Conversation {
+                    kind: ConversationKind::Thread,
+                    container: Some("owner".into()),
+                    id: "owner.repo".into(),
+                    thread: Some(event.thread().to_string()),
+                },
+                delivery: Some(DeliveryIdentity::Github {
+                    delivery: "ref-delivery".into(),
+                }),
+                trigger: Trigger::Message,
+                github: Some(GithubBatch::new(event)),
+            },
+        );
+        let request = RequestEnvelope::capabilities(Some(claim));
+        let (mut sender, mut receiver) = tokio::io::duplex(8192);
+        let (sent, received) = tokio::join!(
+            write_frame(&mut sender, &request, FrameLimits::default()),
+            read_frame::<_, RequestEnvelope>(&mut receiver, FrameLimits::default()),
+        );
+        sent.unwrap();
+        let BrokerRequest::Capabilities {
+            attestation: Some(claim),
+        } = received.unwrap().request
+        else {
+            panic!("broker capabilities claim");
+        };
+        let scope = claim.scope.unwrap();
+        let github = scope.github.unwrap();
+        serde_json::to_value(github.lead()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn git_ref_names_survive_the_gateway_to_broker_round_trip() {
+        for (family, payload_path, raw, fact_path, expected) in [
+            (
+                "push",
+                "/ref",
+                "refs/heads/refs/heads/main",
+                "/push/ref",
+                "refs/heads/main",
+            ),
+            (
+                "push",
+                "/ref",
+                "refs/tags/refs/tags/v1",
+                "/push/ref",
+                "refs/tags/v1",
+            ),
+            (
+                "create",
+                "/ref",
+                "refs/heads/main",
+                "/gitRef/name",
+                "refs/heads/main",
+            ),
+            (
+                "pull_request",
+                "/pull_request/base/ref",
+                "refs/heads/main",
+                "/pullRequest/baseRef",
+                "refs/heads/main",
+            ),
+            (
+                "release",
+                "/release/tag_name",
+                "refs/tags/v1",
+                "/release/tag",
+                "refs/tags/v1",
+            ),
+            (
+                "deployment",
+                "/deployment/environment",
+                "refs/heads/staging",
+                "/authorSet/environment",
+                "refs/heads/staging",
+            ),
+            (
+                "workflow_dispatch",
+                "/ref",
+                "refs/heads/refs/heads/main",
+                "/gitRef/name",
+                "refs/heads/main",
+            ),
+            (
+                "merge_group",
+                "/merge_group/base_ref",
+                "refs/heads/refs/heads/main",
+                "/mergeGroup/baseRef",
+                "refs/heads/main",
+            ),
+        ] {
+            let mut body = super::tests::sample(family);
+            if family == "deployment" {
+                body["deployment"]["environment"] = json!("staging");
+            }
+            body.pointer_mut(payload_path)
+                .unwrap()
+                .clone_from(&json!(raw));
+            let event = parse(
+                &body,
+                serde_json::from_value(json!(family)).unwrap(),
+                "ref-delivery",
+            )
+            .unwrap();
+            let gateway = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                gateway.pointer(fact_path).unwrap(),
+                &json!(expected),
+                "gateway {family}"
+            );
+            let github = broker_round_trip(event).await;
+            assert_eq!(github, gateway, "broker {family}");
+        }
+    }
 
     #[tokio::test]
     async fn an_unknown_field_is_ignored_and_only_a_required_fact_out_of_bound_is_malformed() {

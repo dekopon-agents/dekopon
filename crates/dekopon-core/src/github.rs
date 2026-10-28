@@ -228,10 +228,6 @@ string_fact!(GithubWord, |v: &str| !v.is_empty()
 pub struct GitRefName(String);
 impl GitRefName {
     pub fn new(value: &str) -> Result<Self, GithubFactError> {
-        let value = value
-            .strip_prefix("refs/heads/")
-            .or_else(|| value.strip_prefix("refs/tags/"))
-            .unwrap_or(value);
         (!value.is_empty()
             && value.len() <= 255
             && !value.contains("..")

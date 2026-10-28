@@ -24,6 +24,16 @@ fn word(root: &Value, path: &str) -> Option<GithubWord> {
 fn reference(root: &Value, path: &str) -> Option<GitRefName> {
     text(root, path, GitRefName::new)
 }
+fn qualified_reference(root: &Value, path: &str) -> Option<GitRefName> {
+    text(root, path, |value| {
+        GitRefName::new(
+            value
+                .strip_prefix("refs/heads/")
+                .or_else(|| value.strip_prefix("refs/tags/"))
+                .unwrap_or(value),
+        )
+    })
+}
 fn sha(root: &Value, path: &str) -> Option<Sha> {
     text(root, path, Sha::new)
 }
@@ -320,7 +330,7 @@ pub(super) fn parse(root: &Value, event: E, delivery: &str) -> Option<github::Gi
             at = root.pointer("/repository/pushed_at").and_then(timestamp);
             Target::Push {
                 push: PushFacts {
-                    git_ref: reference(root, "/ref")?,
+                    git_ref: qualified_reference(root, "/ref")?,
                     ref_type,
                     before: sha(root, "/before")?,
                     after: sha(root, "/after")?,
@@ -328,12 +338,16 @@ pub(super) fn parse(root: &Value, event: E, delivery: &str) -> Option<github::Gi
                     deleted: boolean(root, "/deleted")?,
                     forced: boolean(root, "/forced")?,
                     commits: i64::try_from(root.get("commits")?.as_array()?.len()).ok()?,
-                    base_ref: reference(root, "/base_ref"),
+                    base_ref: qualified_reference(root, "/base_ref"),
                 },
             }
         }
         E::Create | E::Delete | E::WorkflowDispatch => {
-            let name = Some(reference(root, "/ref")?);
+            let name = Some(if event == E::WorkflowDispatch {
+                qualified_reference(root, "/ref")?
+            } else {
+                reference(root, "/ref")?
+            });
             let ref_type = if event == E::WorkflowDispatch {
                 None
             } else {
@@ -472,8 +486,8 @@ pub(super) fn parse(root: &Value, event: E, delivery: &str) -> Option<github::Gi
             };
             if event == E::CodeScanningAlert {
                 author.alert_state = word(r, "/state");
-                author.alert_ref =
-                    reference(root, "/ref").or_else(|| reference(r, "/most_recent_instance/ref"));
+                author.alert_ref = qualified_reference(root, "/ref")
+                    .or_else(|| qualified_reference(r, "/most_recent_instance/ref"));
             } else if event == E::DependabotAlert {
                 alert.state = Some(word(r, "/state")?);
                 alert.severity = word(r, "/security_advisory/severity");
@@ -526,8 +540,8 @@ pub(super) fn parse(root: &Value, event: E, delivery: &str) -> Option<github::Gi
                 merge_group: MergeGroupFacts {
                     head_sha: sha(r, "/head_sha")?,
                     base_sha: sha(r, "/base_sha")?,
-                    base_ref: reference(r, "/base_ref")?,
-                    head_ref: reference(r, "/head_ref"),
+                    base_ref: qualified_reference(r, "/base_ref")?,
+                    head_ref: qualified_reference(r, "/head_ref"),
                 },
             }
         }
