@@ -9,7 +9,7 @@ This document follows one agent from a session that went badly to a catalog chan
 | Question | Current answer |
 |---|---|
 | How does an agent get knowledge it did not have? | An operator writes a skill — a directory holding a `SKILL.md` — and mounts it in the catalog. The model sees the skill's name and one-line description in every prompt and reads the rest on demand through `read_skill`. |
-| How does an operator learn what the agent lacked, or what cost it an awkward extra step even on a task that succeeded? | The model records at most three bounded, typed notes per session with `suggest_improvement`, written to telemetry as `agent.improvement.suggested`. They are advice: nothing moves because a model asked. |
+| How does an operator learn what the agent lacked, or what cost it an awkward extra step even on a task that succeeded? | The model records at most ten bounded, typed notes per message execution with `suggest_improvement`, written to telemetry as `agent.improvement.suggested`. They are advice: nothing moves because a model asked. |
 | Does anything improve itself? | **Only as data it was granted.** An agent with an agent-scoped `turso` grant and the `learned-skills` text keeps skills it wrote as rows in its own database and reads them in later sessions ([Skills the agent writes](#skills-the-agent-writes)). No operator-authored prompt is rewritten, no suggestion is applied, and a written skill grants nothing. |
 | Where do the artifacts live? | Skills and instructions in the catalog; agent-written skills in that agent's provider storage; accounting, transcripts, and suggestions in the telemetry backend. |
 

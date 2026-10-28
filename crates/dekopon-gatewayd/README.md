@@ -87,7 +87,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   untrusted model text exactly like `instructions`: it shapes answers and grants nothing.
 - **Improvement suggestions** — every session offers `suggest_improvement`, a bounded channel
   for the model to tell the operator what to fix, or what cost it an awkward extra step even on
-  a task that succeeded, at most three notes per session. Each note is written to telemetry as
+  a task that succeeded, at most ten notes per message execution. Each note is written to telemetry as
   `agent.improvement.suggested` like every other model-authored record. A suggestion is advisory
   by construction — no instruction, skill, limit, or grant moves because a model asked — and the
   gateway never relays it to chat.
