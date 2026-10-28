@@ -717,7 +717,7 @@ async fn large_reply_turn(limit: u64) -> LargeReply {
         5_000,
         (4, 1),
     );
-    let _ = observed.set(Arc::clone(&journal));
+    assert!(observed.set(Arc::clone(&journal)).is_ok());
     let runner = with_budget(runner, limit, 0);
     let record = journal
         .append(
@@ -1086,7 +1086,10 @@ async fn a_resident_journal_turn_projects_from_its_own_fd() {
         .iter()
         .filter_map(|message| match message {
             ModelMessage::Journal { message } => Some(message),
-            _ => None,
+            ModelMessage::System { .. }
+            | ModelMessage::User { .. }
+            | ModelMessage::Assistant { .. }
+            | ModelMessage::ToolResults { .. } => None,
         })
         .flat_map(|message| match message {
             dekopon_model::replay::ReplayMessage::User(texts) => texts.clone(),
@@ -1147,7 +1150,7 @@ async fn a_pin_is_appended_by_persist() {
         })
     };
     let runner = journaled_runner(broker, Arc::new(factory), journal_dir.path());
-    let _ = runner_slot.set(Arc::clone(&runner));
+    assert!(runner_slot.set(Arc::clone(&runner)).is_ok());
     let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
     let driver = Arc::new(RecordingDriver::default());
     for text in ["remember this", "pin it", "pin again and stop"] {
@@ -1209,7 +1212,11 @@ async fn admission_remains_held_until_the_record_is_appended() {
         })
     };
     let runner = journaled_runner(broker, Arc::new(factory), journal_dir.path());
-    let _ = journal_slot.set(Arc::clone(runner.journal.as_ref().unwrap()));
+    assert!(
+        journal_slot
+            .set(Arc::clone(runner.journal.as_ref().unwrap()))
+            .is_ok()
+    );
     let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
     let driver = Arc::new(RecordingDriver::default());
     let first = tokio::spawn(run_session(
@@ -1647,7 +1654,7 @@ fn hold_journal(journal: &Arc<crate::journal::Journal>) -> Held {
     let holder = std::thread::spawn(move || {
         let _lock = journal.hold_io_for_test();
         held.send(()).unwrap();
-        let _ = released.recv();
+        released.recv().unwrap();
     });
     holding.recv().unwrap();
     Held { release, holder }
@@ -1688,7 +1695,7 @@ async fn a_follow_left_mid_turn_is_not_revived() {
         })
     };
     let (runner, table) = followed(broker, Arc::new(factory), journal_dir.path());
-    let _ = table_slot.set(Arc::clone(&table));
+    assert!(table_slot.set(Arc::clone(&table)).is_ok());
     let driver = Arc::new(RecordingDriver::default());
     run_session(
         runner,
@@ -1842,13 +1849,12 @@ impl AssetFetcher for ChatFiles {
         source: &AssetSourceRef,
         _limit: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
-        let bytes = match source {
-            AssetSourceRef::Slack { file_id, .. } if file_id == "F-chart.png" => {
-                b"\x89PNG\r\n\x1a\nchart-pixels".to_vec()
-            }
-            AssetSourceRef::Slack { file_id, .. } if file_id == "F-report.pdf" => {
-                b"%PDF-1.4 report-bytes".to_vec()
-            }
+        let AssetSourceRef::Slack { file_id, .. } = source else {
+            panic!("the fixture assets come from Slack");
+        };
+        let bytes = match file_id.as_str() {
+            "F-chart.png" => b"\x89PNG\r\n\x1a\nchart-pixels".to_vec(),
+            "F-report.pdf" => b"%PDF-1.4 report-bytes".to_vec(),
             _ => b"text-asset-content".to_vec(),
         };
         Box::pin(async move { Ok(bytes) })
