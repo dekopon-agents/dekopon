@@ -905,9 +905,9 @@ async fn boot_with(
         };
         #[cfg(feature = "fauxlack")]
         if let Some(service) = service {
-            return dekopon_gatewayd::run_fauxlack(gateway_path, shutdown, service).await;
+            return dekopon_gatewayd::run_fauxlack(gateway_path, shutdown, service, 32).await;
         }
-        dekopon_gatewayd::run(gateway_path, shutdown).await
+        dekopon_gatewayd::run(gateway_path, shutdown, 32).await
     });
     #[cfg(feature = "fauxlack")]
     let in_process = timing.fauxlack.is_some();
