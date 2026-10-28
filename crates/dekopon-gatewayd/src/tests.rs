@@ -4126,8 +4126,8 @@ impl TextStream for RecordingStream {
 #[async_trait]
 impl InboundReaction for RecordingReaction {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
-        let failure = self.charge();
         self.record(rendered_target(target), present);
+        let failure = self.charge();
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
     }
 }
@@ -6214,6 +6214,11 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
             "{transport}"
         );
         if transport == "discord" {
+            driver
+                .reaction_object()
+                .expect("working reaction")
+                .wait_for_calls(1)
+                .await;
             assert!(driver.calls().iter().any(|call| matches!(call, DriverCall::Reaction { target: reaction_target, present: true } if reaction_target == &rendered_target(&target("inbound-1")))));
         } else {
             assert!(
@@ -7486,8 +7491,8 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
-const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
-const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\n";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
+const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
 
 fn expected_instructions() -> String {
     "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
@@ -7580,6 +7585,55 @@ fn commit(
         TakenIn::default(),
         &cache_key,
         now,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_replayed_suggestion_receipts_do_not_imply_the_calls_did_not_run() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        suggest_improvement(),
+        suggest_improvement(),
+        answer("I sent two suggestions."),
+        answer("Two suggestions."),
+    ]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for text in ["send two suggestions", "did you send them?"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    for index in [1, 2] {
+        assert_eq!(
+            tool_message(&models, index),
+            "Recorded suggestion for the operator. Continue with the task, or finish."
+        );
+    }
+    assert_eq!(
+        models.prompt(3),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
+            (
+                "user",
+                "[gateway: unmapped participant]\nsend two suggestions"
+            ),
+            ("assistant", "I sent two suggestions."),
+            (
+                "user",
+                "[gateway: unmapped participant]\ndid you send them?"
+            ),
+        ]),
     );
 }
 
