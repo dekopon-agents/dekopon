@@ -1096,10 +1096,7 @@ impl Parser<'_> {
     ) -> Result<Expr, AwkError> {
         let depth = deeper(depth)?;
         loop {
-            if minimum <= 13 && (self.at(Punct::Inc) || self.at(Punct::Dec)) {
-                if !left.lvalue() {
-                    return self.error("an assignable increment operand");
-                }
+            if minimum <= 13 && left.lvalue() && (self.at(Punct::Inc) || self.at(Punct::Dec)) {
                 let op = if self.at(Punct::Inc) {
                     Increment::PostAdd
                 } else {
@@ -1293,7 +1290,14 @@ fn starts_concat(token: &TokenKind) -> bool {
             "continue", "next", "exit", "delete", "in",
         ]
         .contains(&name.as_str()),
-        TokenKind::Punct(punct) => [Punct::LParen, Punct::Dollar, Punct::Not].contains(punct),
+        TokenKind::Punct(punct) => [
+            Punct::LParen,
+            Punct::Dollar,
+            Punct::Not,
+            Punct::Inc,
+            Punct::Dec,
+        ]
+        .contains(punct),
         TokenKind::Newline | TokenKind::Eof => false,
     }
 }

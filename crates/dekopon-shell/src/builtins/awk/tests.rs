@@ -287,6 +287,8 @@ fn the_program_shape_preserves_source_order_and_ranges() {
         "/[/]/",
         "/[[:alpha:]/]/",
         "0 ? 1 : x=2",
+        "\"x\" ++b",
+        "\"x\" --b",
         "{x = 8 / 2; x /= 2}",
     ] {
         parsed(source);
@@ -390,7 +392,7 @@ fn syntax_errors_preserve_line_and_column() {
         "{substr(1)}",
         "{split(1,2)}",
         "{sub(/x/,1,2)}",
-        "{1++}",
+        "{(1)++}",
         "{break}",
     ] {
         assert!(
