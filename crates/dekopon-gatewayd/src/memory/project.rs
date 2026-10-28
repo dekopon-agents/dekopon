@@ -11,7 +11,7 @@ use dekopon_model::{
 use super::{
     journal::{
         JournalError,
-        records::{Field, Head, NamedTool, decode_escaped, escaped_text},
+        records::{Field, Head, NamedTool, Unescaped, escaped_text},
         tools::envelope,
     },
     record::{RecordId, Slot},
@@ -112,49 +112,33 @@ fn summary_text(head: &Head, part: NonZeroU8) -> String {
 
 fn tool_lines(head: &Head) -> String {
     let mut lines = String::new();
+    let mut item = None;
+    let mut tool = NamedTool::Rejected;
     for span in &head.header.spans {
-        if let Field::Result { outcome, .. } = span.field {
-            let tool = head
-                .header
-                .spans
-                .iter()
-                .find_map(|other| match other.field {
-                    Field::Arguments { tool, .. } if other.item == span.item => Some(tool),
-                    Field::User { .. }
-                    | Field::Steer { .. }
-                    | Field::Assistant { .. }
-                    | Field::Plain { .. }
-                    | Field::Opaque { .. }
-                    | Field::CallId
-                    | Field::RejectedTool
-                    | Field::Arguments { .. }
-                    | Field::Result { .. } => None,
-                })
-                .unwrap_or(NamedTool::Rejected);
-            let outcome = match outcome {
-                dekopon_agent::memory::Outcome::Exit(code) => format!("exit {code}"),
-                dekopon_agent::memory::Outcome::Refused => "refused".to_owned(),
-                dekopon_agent::memory::Outcome::Failed => "failed".to_owned(),
-            };
-            lines.push_str(&format!("\n[tool: {}, {outcome}]", tool_label(tool)));
+        if item != Some(span.item) {
+            item = Some(span.item);
+            tool = NamedTool::Rejected;
+        }
+        match span.field {
+            Field::Arguments { tool: named, .. } => tool = named,
+            Field::Result { outcome, .. } => {
+                let outcome = match outcome {
+                    dekopon_agent::memory::Outcome::Exit(code) => format!("exit {code}"),
+                    dekopon_agent::memory::Outcome::Refused => "refused".to_owned(),
+                    dekopon_agent::memory::Outcome::Failed => "failed".to_owned(),
+                };
+                lines.push_str(&format!("\n[tool: {}, {outcome}]", tool.name()));
+            }
+            Field::User { .. }
+            | Field::Steer { .. }
+            | Field::Assistant { .. }
+            | Field::Plain { .. }
+            | Field::Opaque { .. }
+            | Field::CallId
+            | Field::RejectedTool => {}
         }
     }
     lines
-}
-
-const fn tool_label(tool: NamedTool) -> &'static str {
-    match tool {
-        NamedTool::Bash => "bash",
-        NamedTool::ReadSkill => "read_skill",
-        NamedTool::FetchChatAsset => "fetch_chat_asset",
-        NamedTool::ReadMemoryRecord => "read_memory_record",
-        NamedTool::SetMemoryPin => "set_memory_pin",
-        NamedTool::ClearMemoryPin => "clear_memory_pin",
-        NamedTool::InspectAgentConfig => "inspect_agent_config",
-        NamedTool::SuggestImprovement => "suggest_improvement",
-        NamedTool::Wake => "wake",
-        NamedTool::Rejected => "rejected",
-    }
 }
 
 fn envelope_text(head: &Head, rung: Rung) -> String {
@@ -212,12 +196,39 @@ fn slice(file: &Arc<File>, head: &Head, rel_offset: u64, len: u64) -> Result<Tex
 }
 
 fn is_object(file: &File, offset: u64, len: u64) -> Result<bool, JournalError> {
-    let mut decoded = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-    let mut buffer = vec![0; 64 * 1024];
-    decode_escaped(file, offset, len, &mut buffer, &mut |bytes| {
-        decoded.extend_from_slice(bytes);
-    })?;
-    Ok(serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&decoded).is_ok())
+    struct Object;
+    impl<'de> serde::Deserialize<'de> for Object {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Entries;
+            impl<'de> serde::de::Visitor<'de> for Entries {
+                type Value = Object;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Object, A::Error> {
+                    while map
+                        .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                        .is_some()
+                    {}
+                    Ok(Object)
+                }
+            }
+            deserializer.deserialize_map(Entries)
+        }
+    }
+    let mut decoded =
+        serde_json::Deserializer::from_reader(Unescaped::new(file, offset, len, 16 * 1024));
+    match serde::Deserialize::deserialize(&mut decoded).and_then(|Object| decoded.end()) {
+        Ok(()) => Ok(true),
+        Err(error) => match error.io_error_kind() {
+            Some(std::io::ErrorKind::InvalidData) => Err(JournalError::Corrupt),
+            Some(kind) => Err(JournalError::Io { kind }),
+            None => Ok(false),
+        },
+    }
 }
 
 /// Verbatim steps within the record's share: text items first, then exchanges, cutting only
@@ -319,7 +330,7 @@ fn native(
                             original_bytes,
                         } => {
                             if name.is_none() {
-                                name = Some(tool_label(*tool).to_owned());
+                                name = Some(tool.name().to_owned());
                             }
                             arguments =
                                 Some(if span.len <= left && is_object(file, offset, span.len)? {

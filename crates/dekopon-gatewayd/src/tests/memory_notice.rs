@@ -123,14 +123,14 @@ async fn a_window_that_omits_older_records_tells_the_model_the_first_record_show
     let subscriber = tracing_subscriber::registry().with(notices.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
     let fixture = Fixture::new(&["cli-probe.upper"]).await;
-    for _ in 0..25 {
+    for _ in 0..26 {
         fixture.append(&["cli-probe.upper"], "old question");
     }
     fixture.run().await;
     let notice = fixture.notice(0);
     assert!(notice.contains("Turns before record 2 are not shown: maxTurns=12, maxBytes=65536"));
     assert!(notice.contains("read_memory_record"));
-    assert!(notice.contains("Omitted window-fit: 12 records"));
+    assert!(notice.contains("Omitted window-fit: 13 records"));
     let events = notices.0.lock();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["span"], "gateway.session");
@@ -139,7 +139,7 @@ async fn a_window_that_omits_older_records_tells_the_model_the_first_record_show
         json!(["omitted", "window-omission", "fidelity"])
     );
     assert_eq!(events[0]["memory.record.first_shown"], json!(2_u64));
-    assert_eq!(events[0]["memory.records.omitted"], json!(12_u64));
+    assert_eq!(events[0]["memory.records.omitted"], json!(13_u64));
     assert_eq!(events[0]["memory.notice.bytes"], json!(notice.len() as u64));
 }
 

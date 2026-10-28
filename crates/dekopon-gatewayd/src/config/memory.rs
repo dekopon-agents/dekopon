@@ -254,6 +254,9 @@ pub fn resolve_settings(
     if max_bytes > usize::MAX as u64 {
         return Err(PolicyProblem::Bound("retention.maxBytesPerAgent"));
     }
+    if settings.summaries.queue.get() > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(PolicyProblem::Bound("summaries.queue"));
+    }
     let mut agents = BTreeMap::new();
     for (id, entry) in &settings.agents {
         if !agent_ids.contains(id) {

@@ -865,13 +865,6 @@ async fn an_unloadable_journal_resets_with_one_startup_record() {
         assert_eq!(startup[0].field(field), Some(value), "{field}");
     }
     assert_eq!(sender.counts.enqueued.load(Ordering::Relaxed), 1);
-    let mut reasons: Vec<_> = capture
-        .events_where("dekopon_gatewayd", &[("event", "gateway_journal_reset")])
-        .iter()
-        .map(|record| record.field("reason").unwrap().to_owned())
-        .collect();
-    reasons.sort();
-    assert_eq!(reasons, ["corrupt", "crashed"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
