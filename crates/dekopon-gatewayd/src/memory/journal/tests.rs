@@ -799,13 +799,37 @@ fn a_turn_larger_than_the_agent_cap_is_refused_without_evicting_older_turns() {
 
 #[test]
 fn a_file_untouched_past_the_retention_is_deleted() {
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone, Default)]
+    struct RecordIds(Arc<parking_lot::Mutex<Vec<Vec<String>>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordIds {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(array) = opentelemetry::Context::current()
+                .get::<dekopon_telemetry::EventStringArray>()
+                .filter(|array| array.name == "memory.record.ids")
+            {
+                self.0.lock().push(array.values.clone());
+            }
+        }
+    }
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let ids = RecordIds::default();
+    let _guard = tracing_subscriber::registry()
+        .with(capture.clone())
+        .with(ids.clone())
+        .set_default();
     let dir = tempfile::tempdir().unwrap();
     let journal = open(dir.path());
     let now = SystemTime::now();
     let agent = "reviewer".parse().unwrap();
     let [stale, fresh] = ["stale", "fresh"]
         .map(|conversation| ConversationKey::shared(&agent, "slack", conversation).journal_stem());
-    append_user(&journal, &stale, now, "stale");
+    let first = append_user(&journal, &stale, now, "stale");
+    let second = append_user(&journal, &stale, now, "stale again");
     append_user(&journal, &fresh, now, "fresh");
     File::options()
         .write(true)
@@ -816,6 +840,19 @@ fn a_file_untouched_past_the_retention_is_deleted() {
     journal.maintain(&fresh, now, 1);
     assert!(!journal.path(&stale).exists());
     assert_eq!(users(&journal.path(&fresh)), ["fresh"]);
+    let expired = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_journal_expired"),
+            ("memory.expiry.reason", "file-age"),
+        ],
+    );
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].field("memory.records.evicted"), Some("2"));
+    assert_eq!(
+        *ids.0.lock(),
+        [vec![first.0.to_string(), second.0.to_string()]]
+    );
 }
 
 #[test]

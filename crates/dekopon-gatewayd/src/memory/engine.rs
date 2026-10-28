@@ -75,6 +75,7 @@ type Binding = Arc<parking_lot::Mutex<Option<TurnId>>>;
 struct RunningTask {
     task: SlotTask,
     binding: Binding,
+    span: tracing::Span,
 }
 
 struct CancelOnDrop(watch::Sender<bool>);
@@ -161,18 +162,21 @@ impl Sender {
             Err(mpsc::error::TrySendError::Full(queued)) => {
                 let journal = Arc::clone(&self.journal);
                 let counts = Arc::clone(&self.counts);
+                let span = summarize_span(&queued.task, &queued.since);
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let result = tokio::task::spawn_blocking(move || {
                     let _subscriber = tracing::dispatcher::set_default(&subscriber);
-                    let count = mark_later(
-                        &journal,
-                        &queued.task,
-                        None,
-                        SummaryFailure::Overflow,
-                        "summary queue is full",
-                    )?;
-                    counts.overflowed.fetch_add(count, Ordering::Relaxed);
-                    Ok::<_, JournalError>(())
+                    span.in_scope(|| {
+                        let count = mark_later(
+                            &journal,
+                            &queued.task,
+                            None,
+                            SummaryFailure::Overflow,
+                            "summary queue is full",
+                        )?;
+                        counts.overflowed.fetch_add(count, Ordering::Relaxed);
+                        Ok::<_, JournalError>(())
+                    })
                 })
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
@@ -216,7 +220,9 @@ async fn dispatch(
                             let subscriber = tracing::dispatcher::get_default(Clone::clone);
                             let _written = tokio::task::spawn_blocking(move || {
                                 let _subscriber = tracing::dispatcher::set_default(&subscriber);
-                                mark_later(&journal, &running.task, turn, SummaryFailure::Panicked, "summary task panicked")
+                                running.span.in_scope(|| {
+                                    mark_later(&journal, &running.task, turn, SummaryFailure::Panicked, "summary task panicked")
+                                })
                             }).await;
                         }
                     }
@@ -227,11 +233,23 @@ async fn dispatch(
                 let Some(queued) = queued else { break; };
                 let task = queued.task.clone();
                 let binding: Binding = Arc::default();
-                let handle = running.spawn(run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding)));
-                tasks.insert(handle.id(), RunningTask { task, binding });
+                let span = summarize_span(&task, &queued.since);
+                let handle = running.spawn(run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding), span.clone()));
+                tasks.insert(handle.id(), RunningTask { task, binding, span });
             }
         }
     }
+}
+
+fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
+    tracing::info_span!(
+        "memory.summarize",
+        memory.record.id = task.record.0.get(),
+        memory.summary.part = task.part.get(),
+        memory.summary.queue_wait_ms = since.elapsed().as_millis() as u64,
+        gen_ai.request.model = tracing::field::Empty,
+        gen_ai.response.model = tracing::field::Empty,
+    )
 }
 
 async fn run(
@@ -239,15 +257,8 @@ async fn run(
     queued: Queued,
     cancel: watch::Receiver<bool>,
     binding: Binding,
+    span: tracing::Span,
 ) -> Next {
-    let span = tracing::info_span!(
-        "memory.summarize",
-        memory.record.id = queued.task.record.0.get(),
-        memory.summary.part = queued.task.part.get(),
-        memory.summary.queue_wait_ms = queued.since.elapsed().as_millis() as u64,
-        gen_ai.request.model = tracing::field::Empty,
-        gen_ai.response.model = tracing::field::Empty,
-    );
     let runtime = tokio::runtime::Handle::current();
     let task = queued.task;
     let blocking_span = span.clone();
@@ -773,6 +784,11 @@ fn mark_later(
             slot_line(&later, to.clone()),
             head.header.turn,
         )? {
+            transition(
+                &later,
+                &head.header.summaries[usize::from(part.get() - 1)],
+                &to,
+            );
             match kind {
                 SummaryFailure::Overflow => dropped(&later, Dropped::Overflow),
                 SummaryFailure::Timeout
@@ -781,13 +797,7 @@ fn mark_later(
                 | SummaryFailure::Empty
                 | SummaryFailure::Panicked
                 | SummaryFailure::Io { .. }
-                | SummaryFailure::Unconfigured => {
-                    transition(
-                        &later,
-                        &head.header.summaries[usize::from(part.get() - 1)],
-                        &to,
-                    );
-                }
+                | SummaryFailure::Unconfigured => {}
             }
             count += 1;
         }

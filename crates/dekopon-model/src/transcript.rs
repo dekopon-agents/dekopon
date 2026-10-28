@@ -29,10 +29,25 @@ impl ModelMessage {
             }
             match message {
                 Self::Journal { message } => message.transcript(&mut body)?,
-                Self::System { .. }
-                | Self::User { .. }
-                | Self::Assistant { .. }
-                | Self::ToolResults { .. } => body.value(&*message.prepared_for_trace())?,
+                Self::Assistant { turn } => {
+                    let markers: Vec<String> = turn
+                        .opaque_reasoning()?
+                        .iter()
+                        .map(|item| format!("[opaque {} B]", item.bytes().len()))
+                        .collect();
+                    if markers.is_empty() {
+                        body.value(message)?;
+                    } else {
+                        let mut visible = serde_json::to_value(message)?;
+                        if let Some(fields) = visible.as_object_mut() {
+                            fields.insert("reasoning_details".to_owned(), markers.into());
+                        }
+                        body.value(&visible)?;
+                    }
+                }
+                Self::System { .. } | Self::User { .. } | Self::ToolResults { .. } => {
+                    body.value(&*message.prepared_for_trace())?;
+                }
             }
         }
         body.raw(b"]");
@@ -178,6 +193,8 @@ fn boundary(bytes: &[u8]) -> usize {
 mod tests {
     use std::{io::Write as _, sync::Arc};
 
+    use serde_json::json;
+
     use super::{READ_BYTES, SEGMENT_BYTES};
     use crate::{
         body::OpaqueSource,
@@ -226,6 +243,31 @@ mod tests {
             })
             .unwrap();
         (transcript.count(), segments)
+    }
+
+    #[test]
+    fn live_opaque_reasoning_is_a_marker_and_never_its_bytes() {
+        let reasoning = json!({"type": "reasoning", "encrypted_content": "live-opaque-canary"});
+        let turn =
+            crate::model::AssistantTurn::new(Some("visible answer".to_owned()), Vec::new(), None)
+                .with_codex_continuation(
+                    vec![reasoning.clone(), json!({"type": "message", "content": []})],
+                    ModelKey::new(Backend::Codex, "alias"),
+                    Some("reported".to_owned()),
+                );
+        let expected = format!(
+            "[opaque {} B]",
+            crate::model::OpaqueReasoning::from_value(&reasoning)
+                .unwrap()
+                .bytes()
+                .len()
+        );
+        let (_, segments) = collect(&[crate::model::assistant_message(&turn)]);
+        let joined = segments.concat();
+        assert!(!joined.contains("live-opaque-canary"));
+        let parsed: serde_json::Value = serde_json::from_str(&joined).unwrap();
+        assert_eq!(parsed[0]["content"], "visible answer");
+        assert_eq!(parsed[0]["reasoning_details"], json!([expected]));
     }
 
     #[test]

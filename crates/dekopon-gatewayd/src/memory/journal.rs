@@ -823,8 +823,14 @@ impl Journal {
                             .and_then(|m| m.modified())
                             .is_ok_and(|modified| modified < limit)
                     }) {
-                        remove(&file_path);
-                        expired(&[], Expiry::FileAge);
+                        let evicted: Vec<RecordId> = records::scan_path(&file_path)
+                            .map(|snapshot| {
+                                snapshot.records.iter().map(|head| head.header.id).collect()
+                            })
+                            .unwrap_or_default();
+                        if remove(&file_path) {
+                            expired(&evicted, Expiry::FileAge);
+                        }
                     } else if records {
                         let age = self.age_for(&format!(
                             "{}/{}",

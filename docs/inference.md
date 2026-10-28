@@ -271,9 +271,10 @@ One long-lived optimization is in place: `dekopon-gatewayd` shares one model cli
 A route selects replay behavior with a `memory:` block, and [`gatewayd.md`](gatewayd.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
-`persistent` is the route default; `oneShot` disables history replay. A persistent route seeds the prompt with
-compacted `(question, final answer)` pairs ahead of the new message, oldest dropped first until both
-the turn and byte bounds hold. Every person-originated turn, in every scope, is prefixed with
+`persistent` is the route default; `oneShot` disables history replay. A journal-recall route
+replays its journal records ahead of the new message, as described below; other persistent routes
+seed the prompt from an owned window of `(question, final answer)` pairs, oldest dropped first
+until both the turn and byte bounds hold. Every person-originated turn, in every scope, is prefixed with
 `[gateway: authenticated participant: <principal>]` before it is sent and retained, naming the
 broker principal the sender maps to, or `[gateway: unmapped participant]` when the broker named
 none, so that principal name is model input whatever the telemetry gate says.
@@ -284,8 +285,9 @@ running session's leg. An empty grant stops before the
 model call and removes remembered state for that key; a broker or attestation failure stops before
 inference with no fresh grant vector to replace state with. A capability set that differs from the one
 stored beside the conversation drops the entry and closes its attachment generation, and on a shared
-route participants with different grant vectors reset the window between them. The new exchange is
-appended only if its generation remains current.
+route participants with different grant vectors reset the window between them. Whether the turn is
+kept is decided at its lease commit: a stopped completion, or one stale at that commit, records
+nothing, and a journal route appends the commit's record after the reply.
 
 ### What history keeps and drops
 
