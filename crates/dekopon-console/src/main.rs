@@ -25,7 +25,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::Parser;
+use clap::{CommandFactory as _, Parser, error::ErrorKind};
 use dekopon_config::load_discovered;
 use dekopon_core::{AgentId, ExternalSubject};
 use dekopon_process::ShellThreads;
@@ -208,10 +208,11 @@ enum ConsoleError {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let builder = runtime_builder(&cli).unwrap_or_else(|error| error.exit());
     match if cli.idle {
-        idle(&cli)
+        idle(builder)
     } else {
-        run_console(&cli)
+        run_console(&cli, builder)
     } {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -543,7 +544,38 @@ fn read_profiles(path: &Path) -> Result<ProfilesDocument, ConsoleError> {
     clippy::disallowed_methods,
     reason = "owner: idle drops it at termination; run_console uses shutdown_console_runtime; bound: one runtime, configured workers and blocking cap or Tokio defaults"
 )]
-fn runtime_builder(cli: &Cli) -> tokio::runtime::Builder {
+fn runtime_builder(cli: &Cli) -> Result<tokio::runtime::Builder, clap::Error> {
+    let workers = match cli.worker_threads {
+        None if cli.idle => 0,
+        Some(workers) => workers.get(),
+        None => match std::env::var("TOKIO_WORKER_THREADS") {
+            Ok(value) => value
+                .parse::<std::num::NonZeroUsize>()
+                .map_err(|error| {
+                    Cli::command().error(
+                        ErrorKind::ValueValidation,
+                        format!("invalid TOKIO_WORKER_THREADS: {error}"),
+                    )
+                })?
+                .get(),
+            Err(std::env::VarError::NotPresent) => {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            }
+            Err(error) => {
+                return Err(Cli::command().error(ErrorKind::ValueValidation, error));
+            }
+        },
+    };
+    let blocking = cli
+        .blocking_threads
+        .map_or(512, std::num::NonZeroUsize::get);
+    if workers.checked_add(blocking).is_none() {
+        return Err(Cli::command().error(
+            ErrorKind::ValueValidation,
+            "worker threads plus blocking threads exceed the platform thread-count limit",
+        ));
+    }
+
     let mut builder = if cli.idle && cli.worker_threads.is_none() {
         tokio::runtime::Builder::new_current_thread()
     } else {
@@ -554,22 +586,18 @@ fn runtime_builder(cli: &Cli) -> tokio::runtime::Builder {
         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100_000_000;
         format!("con-rt-{index}")
     });
-    if let Some(workers) = cli.worker_threads {
-        builder.worker_threads(workers.get());
+    if workers > 0 {
+        builder.worker_threads(workers);
     }
-    if let Some(blocking) = cli.blocking_threads {
-        builder.max_blocking_threads(blocking.get());
-    }
+    builder.max_blocking_threads(blocking);
     if let Some(keep_alive) = cli.blocking_keep_alive {
         builder.thread_keep_alive(keep_alive.into());
     }
-    builder
+    Ok(builder)
 }
 
-fn idle(cli: &Cli) -> Result<(), ConsoleError> {
-    let runtime = runtime_builder(cli)
-        .build()
-        .map_err(ConsoleError::Runtime)?;
+fn idle(mut builder: tokio::runtime::Builder) -> Result<(), ConsoleError> {
+    let runtime = builder.build().map_err(ConsoleError::Runtime)?;
     runtime.block_on(async {
         #[cfg(unix)] {
             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(ConsoleError::Runtime)?;
@@ -580,10 +608,8 @@ fn idle(cli: &Cli) -> Result<(), ConsoleError> {
 }
 
 /// Exporters are created and drained while their runtime is alive, including startup refusals.
-fn run_console(cli: &Cli) -> Result<(), ConsoleError> {
-    let runtime = runtime_builder(cli)
-        .build()
-        .map_err(ConsoleError::Runtime)?;
+fn run_console(cli: &Cli, mut builder: tokio::runtime::Builder) -> Result<(), ConsoleError> {
+    let runtime = builder.build().map_err(ConsoleError::Runtime)?;
     let _entered = runtime.enter();
     let telemetry = telemetry::initialize(cli.telemetry.as_deref(), cli.verbose, cli.no_color)?;
     let result = execute(cli, &runtime);
@@ -698,9 +724,62 @@ mod runtime_sizing_tests {
     }
 
     #[test]
+    fn runtime_pool_limit_overflow_is_a_cli_error() {
+        const CHILD: &str = "DEKOPON_RUNTIME_OVERFLOW_TEST";
+        let arguments = ["daemon"];
+        if std::env::var_os(CHILD).is_some() {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let error = runtime_builder(&cli).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+            return;
+        }
+        let maximum = usize::MAX.to_string();
+        for flags in [
+            vec![format!("--worker-threads={maximum}")],
+            vec![
+                "--worker-threads=1".to_owned(),
+                format!("--blocking-threads={maximum}"),
+            ],
+            vec![format!("--blocking-threads={maximum}")],
+        ] {
+            let cli =
+                Cli::try_parse_from(arguments.into_iter().map(str::to_owned).chain(flags)).unwrap();
+            let error = runtime_builder(&cli).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+        }
+        let variables = [
+            "DEKOPON_WORKER_THREADS",
+            "DEKOPON_BLOCKING_THREADS",
+            "TOKIO_WORKER_THREADS",
+        ];
+        for variable in variables {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "runtime_sizing_tests::runtime_pool_limit_overflow_is_a_cli_error",
+            ]);
+            for variable in variables {
+                child.env_remove(variable);
+            }
+            let output = child
+                .env(CHILD, "1")
+                .env(variable, &maximum)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{variable}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn configured_runtime_names_workers_and_blocking_threads() {
         let cli = Cli::parse_from(["daemon", "--worker-threads=2", "--blocking-threads=1"]);
-        let runtime = runtime_builder(&cli).build().unwrap();
+        let runtime = runtime_builder(&cli).unwrap().build().unwrap();
         assert_eq!(runtime.metrics().num_workers(), 2);
         let workers = runtime.block_on(async {
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -734,9 +813,14 @@ mod runtime_sizing_tests {
     }
     #[test]
     fn idle_keeps_the_current_thread_scheduler_until_workers_are_selected() {
+        let blocking = format!("--blocking-threads={}", usize::MAX);
         for (arguments, flavor) in [
             (
                 vec!["console", "--idle"],
+                tokio::runtime::RuntimeFlavor::CurrentThread,
+            ),
+            (
+                vec!["console", "--idle", &blocking],
                 tokio::runtime::RuntimeFlavor::CurrentThread,
             ),
             (
@@ -745,7 +829,7 @@ mod runtime_sizing_tests {
             ),
         ] {
             let cli = Cli::parse_from(arguments);
-            let runtime = runtime_builder(&cli).build().unwrap();
+            let runtime = runtime_builder(&cli).unwrap().build().unwrap();
             assert_eq!(runtime.handle().runtime_flavor(), flavor);
         }
     }
