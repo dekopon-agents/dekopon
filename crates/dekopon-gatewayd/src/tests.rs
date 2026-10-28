@@ -7613,8 +7613,12 @@ async fn missing_replayed_suggestion_receipts_do_not_imply_the_calls_did_not_run
         .await;
     }
 
-    assert!(tool_message(&models, 1).contains("Recorded suggestion 1 of 3"));
-    assert!(tool_message(&models, 2).contains("Recorded suggestion 2 of 3"));
+    for index in [1, 2] {
+        assert_eq!(
+            tool_message(&models, index),
+            "Recorded suggestion for the operator. Continue with the task, or finish."
+        );
+    }
     assert_eq!(
         models.prompt(3),
         transcript(&[
