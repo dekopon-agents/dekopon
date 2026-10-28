@@ -149,6 +149,10 @@ impl StageOut {
                     return Ok(false);
                 }
             }
+            Destination::Capture(Capture::Chunks) if self.mode == OutputMode::Named => {
+                let text = std::str::from_utf8(bytes).map_err(|_invalid_utf8| invalid_text())?;
+                capture_text(evaluator, text)?;
+            }
             Destination::Capture(Capture::Chunks) => {
                 match self.mode {
                     OutputMode::Copy => telemetry::stage_write(bytes.len(), true, &None),
@@ -158,21 +162,14 @@ impl StageOut {
                 self.pending.extend_from_slice(bytes);
                 let complete = match std::str::from_utf8(&self.pending) {
                     Ok(text) => text.len(),
-                    Err(error) if error.error_len().is_none() && self.mode != OutputMode::Named => {
-                        error.valid_up_to()
-                    }
+                    Err(error) if error.error_len().is_none() => error.valid_up_to(),
                     Err(_invalid_utf8) => return Err(invalid_text()),
                 };
-                if complete > 0 || self.mode == OutputMode::Named {
-                    let charge = evaluator.budget.charge_value_bytes(complete as u64)?;
-                    let mut result = CommandResult::value(Value::String(
-                        String::from_utf8_lossy(&self.pending[..complete]).into_owned(),
-                    ))
-                    .without_newline();
-                    result.retained.push(charge);
-                    if let Some(capture) = evaluator.captures.last_mut() {
-                        capture.push(result);
-                    }
+                if complete > 0 {
+                    capture_text(
+                        evaluator,
+                        &String::from_utf8_lossy(&self.pending[..complete]),
+                    )?;
                     self.pending.drain(..complete);
                 }
             }
@@ -342,6 +339,16 @@ impl StageOut {
         }
         Ok(())
     }
+}
+
+fn capture_text(evaluator: &mut Evaluator<'_>, text: &str) -> Result<(), CommandFailure> {
+    let charge = evaluator.budget.charge_value_bytes(text.len() as u64)?;
+    let mut result = CommandResult::value(Value::String(text.to_owned())).without_newline();
+    result.retained.push(charge);
+    if let Some(capture) = evaluator.captures.last_mut() {
+        capture.push(result);
+    }
+    Ok(())
 }
 
 fn invalid_text() -> CommandFailure {

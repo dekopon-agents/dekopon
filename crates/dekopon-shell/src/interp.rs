@@ -2430,10 +2430,7 @@ impl<'a> Evaluator<'a> {
                     .map(|()| ExitCode::SUCCESS)
             }
         };
-        let status = match outcome {
-            Ok(status) => status,
-            Err(failure) => self.absorb(failure)?,
-        };
+        let status = outcome.or_else(|failure| self.absorb(failure))?;
         match out.finish(self, status) {
             Ok(result) if !result.value.is_null() => Ok(Executed::Deferred(result, out)),
             Ok(result) => Ok(Executed::Result(result)),
@@ -2985,7 +2982,10 @@ impl<'a> Evaluator<'a> {
                         if result.status != ExitCode::SUCCESS {
                             status = result.status;
                         }
-                        StageOut::new(self, stdout_sink, OutputMode::Value).value(self, result)?;
+                        if !result.value.is_null() {
+                            StageOut::new(self, stdout_sink, OutputMode::Value)
+                                .value(self, result)?;
+                        }
                         if self.reader_gone {
                             return Ok(Executed::Result(CommandResult::status(status)));
                         }
