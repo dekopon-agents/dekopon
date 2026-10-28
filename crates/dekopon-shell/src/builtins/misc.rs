@@ -358,11 +358,20 @@ pub(crate) fn sleep(
 }
 
 pub(crate) fn cat(
-    _context: &mut BuiltinContext<'_>,
-    _arguments: &[String],
-    input: Option<Value>,
-) -> Result<CommandResult, CommandFailure> {
-    Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline())
+    arguments: &[String],
+    mut emit: impl FnMut(&str) -> Result<bool, CommandFailure>,
+) -> Result<ExitCode, CommandFailure> {
+    for name in arguments {
+        if name.starts_with('-') && name.len() > 1 {
+            return Err(CommandFailure::usage(format!(
+                "cat: unsupported flag {name}"
+            )));
+        }
+        if !emit(name)? {
+            break;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -383,8 +392,8 @@ mod tests {
     use dekopon_process::Limits;
 
     use super::{
-        cat as Cat, echo as Echo, fail as False, printf as Printf, progress as Progress,
-        sleep as Sleep, succeed as True, test as Test, test_bracket as TestBracket,
+        echo as Echo, fail as False, printf as Printf, progress as Progress, sleep as Sleep,
+        succeed as True, test as Test, test_bracket as TestBracket,
     };
 
     #[derive(Default)]
@@ -634,8 +643,10 @@ mod tests {
 
     #[test]
     fn cat_without_arguments_preserves_input() {
-        let result =
-            run_builtin_with(Cat, &[], Some(json!("hi")), Limits::default()).expect("cat runs");
-        assert_eq!(result.value, json!("hi"));
+        let result = Interpreter::new(Limits::default(), crate::test_threads()).run(
+            "printf hi | cat",
+            &crate::builtins::test_support::NoCapabilities,
+        );
+        assert_eq!(result.output, "hi");
     }
 }
