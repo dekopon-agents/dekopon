@@ -4,7 +4,9 @@ use dekopon_process::{
     CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, ShellThreads, ThreadName, ThreadPermit,
     TreeContext,
 };
+mod case_pattern;
 mod ifs;
+use case_pattern::PatternChar;
 mod nesting;
 pub(crate) mod stage_out;
 use ifs::{Action, Boundary, Ifs, Kind};
@@ -27,10 +29,10 @@ use serde_json::Value;
 use crate::{
     CapabilityCallResult, CapabilityInvoker, JobSeed, ScriptOutcome,
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
-        CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
-        Index, Modifier, Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget,
-        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CaseStatement,
+        Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
+        Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget, SimpleCommand, Statement,
+        Stream, WhileLoop, Word, WordPart,
     },
     builtins::{
         self, Builtin, BuiltinContext, CommandFailure, CommandResult, ControlWord, FatalError,
@@ -621,7 +623,14 @@ enum PreservedExpansion {
     Unsplit,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FieldContext {
+    Fields,
+    CasePattern,
+}
+
 struct FieldExpansion<'a> {
+    context: FieldContext,
     spans: &'a mut Vec<ExpansionSpan>,
 }
 
@@ -1017,38 +1026,14 @@ impl<'a> Evaluator<'a> {
         for clause in &statement.clauses {
             for pattern in &clause.patterns {
                 self.budget.charge_step()?;
-                let matched = match pattern {
-                    CasePattern::Any => true,
-                    CasePattern::Literal(word) => {
-                        match self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit) {
-                            Ok(expanded) => expanded.join(" ") == subject,
-                            Err(failure) => {
-                                let status = self.absorb(failure)?;
-                                self.last_status = status;
-                                return Ok(Flow::Normal);
-                            }
-                        }
-                    }
-                    CasePattern::Expanded(word) => {
-                        let expanded = match self
-                            .expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)
-                        {
-                            Ok(expanded) => expanded.join(" "),
-                            Err(failure) => {
-                                let status = self.absorb(failure)?;
-                                self.last_status = status;
-                                return Ok(Flow::Normal);
-                            }
-                        };
-                        if let Some(character) = pattern_metacharacter(&expanded) {
-                            self.write_line(&format!(
-                                "dekopon-shell: {}",
-                                expanded_pattern(character)
-                            ));
-                            self.last_status = ExitCode::SYNTAX;
-                            return Ok(Flow::Normal);
-                        }
-                        expanded == subject
+                let matched = match self
+                    .expand_case_pattern(pattern)
+                    .and_then(|expanded| case_pattern::matches(&expanded, &subject, &self.budget))
+                {
+                    Ok(matched) => matched,
+                    Err(failure) => {
+                        self.last_status = self.absorb(failure)?;
+                        return Ok(Flow::Normal);
                     }
                 };
                 if matched {
@@ -3051,7 +3036,7 @@ impl<'a> Evaluator<'a> {
             ExpansionOutput::Fields | ExpansionOutput::Value => {
                 let mut spans = Vec::new();
                 for part in &word.parts {
-                    self.collect_field_part(part, &mut spans, output)?;
+                    self.collect_field_part(part, &mut spans, output, FieldContext::Fields)?;
                 }
                 let resplit = word.parts.iter().any(|part| match part {
                     WordPart::Parameter(_)
@@ -3208,6 +3193,54 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
+    fn expand_case_pattern(&mut self, word: &Word) -> Result<Vec<PatternChar>, CommandFailure> {
+        let mut spans = Vec::new();
+        for part in &word.parts {
+            self.collect_field_part(
+                part,
+                &mut spans,
+                ExpansionOutput::Unsplit,
+                FieldContext::CasePattern,
+            )?;
+        }
+        let mut characters = Vec::new();
+        for span in spans {
+            let (text, protection) = match span.content {
+                SpanContent::Text(text, protection) => (text, protection),
+                SpanContent::Elements(items, _) => {
+                    (quoted_text(&Value::Array(items)), Protection::Unquoted)
+                }
+                SpanContent::Boundary(_) => (" ".to_owned(), Protection::Quoted),
+                SpanContent::SplitSpace => continue,
+            };
+            self.expansion_charges.push(
+                self.budget.charge_value_bytes(
+                    text.len().saturating_mul(size_of::<PatternChar>()) as u64,
+                )?,
+            );
+            characters.reserve_exact(text.chars().count());
+            characters.extend(text.chars().map(|character| match protection {
+                Protection::Unquoted | Protection::EmptyIfs => PatternChar::Unquoted(character),
+                Protection::Quoted | Protection::Checked => PatternChar::Literal(character),
+            }));
+        }
+        Ok(characters)
+    }
+
+    fn record_expanded_value(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        value: &Value,
+        context: FieldContext,
+    ) -> Result<(), CommandFailure> {
+        match context {
+            FieldContext::Fields => self.record_value(spans, value),
+            FieldContext::CasePattern => {
+                self.record_text(spans, &quoted_text(value), Protection::Unquoted)
+            }
+        }
+    }
+
     fn record_split_text(
         &mut self,
         spans: &mut Vec<ExpansionSpan>,
@@ -3280,10 +3313,16 @@ impl<'a> Evaluator<'a> {
         part: &WordPart,
         spans: &mut Vec<ExpansionSpan>,
         output: ExpansionOutput,
+        context: FieldContext,
     ) -> Result<Value, CommandFailure> {
         match part {
             WordPart::Literal(text) => {
-                self.collect_literal(spans, text)?;
+                match context {
+                    FieldContext::Fields => self.collect_literal(spans, text)?,
+                    FieldContext::CasePattern => {
+                        self.record_text(spans, text, Protection::Unquoted)?
+                    }
+                }
                 self.expansion_text(text, output)
             }
             WordPart::SingleQuoted(text) => {
@@ -3301,6 +3340,11 @@ impl<'a> Evaluator<'a> {
                 Ok(Value::String(text))
             }
             WordPart::DoubleQuoted(parts) => {
+                if context == FieldContext::CasePattern {
+                    let text = self.expand_quoted(parts)?;
+                    self.record_text(spans, &text, Protection::Quoted)?;
+                    return self.expansion_text(&text, output);
+                }
                 let start = spans.len();
                 self.collect_quoted_parts(parts, spans)?;
                 match output {
@@ -3340,7 +3384,7 @@ impl<'a> Evaluator<'a> {
                     | Parameter::LastStatus
                     | Parameter::LastJob => false,
                 };
-                if joined && self.ifs_separator().is_empty() {
+                if context == FieldContext::Fields && joined && self.ifs_separator().is_empty() {
                     let charge = self
                         .budget
                         .charge_value_bytes(size_of::<ExpansionSpan>() as u64)?;
@@ -3350,11 +3394,11 @@ impl<'a> Evaluator<'a> {
                         retained: Vec::new(),
                     });
                 }
-                self.expand_parameter_fields(parameter, spans)
+                self.expand_parameter_fields(parameter, spans, context)
             }
             WordPart::CommandSubstitution(program) => {
                 let result = self.run_substitution(program)?;
-                self.record_value(spans, &result.value)?;
+                self.record_expanded_value(spans, &result.value, context)?;
                 self.expansion_charges.extend(result.retained);
                 Ok(result.value)
             }
@@ -3571,6 +3615,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         parameter: &Parameter,
         spans: &mut Vec<ExpansionSpan>,
+        context: FieldContext,
     ) -> Result<Value, CommandFailure> {
         match parameter {
             Parameter::Named {
@@ -3583,11 +3628,16 @@ impl<'a> Evaluator<'a> {
                     name,
                     indices,
                     modifier,
-                    Some(FieldExpansion { spans }),
+                    Some(FieldExpansion { spans, context }),
                     ExpansionOutput::Unsplit,
                 )
             }),
             Parameter::AllPositional | Parameter::AllPositionalJoined => {
+                if context == FieldContext::CasePattern {
+                    let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
+                    self.record_expanded_value(spans, &value, context)?;
+                    return Ok(value);
+                }
                 let values = self.positional().to_vec();
                 self.record_value(spans, &Value::Array(values.clone()))?;
                 Ok(Value::Array(values))
@@ -3598,7 +3648,7 @@ impl<'a> Evaluator<'a> {
             | Parameter::LastStatus
             | Parameter::LastJob => {
                 let value = self.parameter_value(parameter)?;
-                self.record_value(spans, &value)?;
+                self.record_expanded_value(spans, &value, context)?;
                 Ok(value)
             }
         }
@@ -3611,7 +3661,7 @@ impl<'a> Evaluator<'a> {
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         match split {
-            Some(split) => self.expand_replacement(word, split.spans),
+            Some(split) => self.expand_replacement(word, split.spans, split.context),
             None => self.expansion_value(word, output),
         }
     }
@@ -3622,7 +3672,7 @@ impl<'a> Evaluator<'a> {
         split: Option<FieldExpansion<'_>>,
     ) -> Result<Value, CommandFailure> {
         if let Some(split) = split {
-            self.record_value(split.spans, &value)?;
+            self.record_expanded_value(split.spans, &value, split.context)?;
         }
         Ok(value)
     }
@@ -3631,10 +3681,11 @@ impl<'a> Evaluator<'a> {
         &mut self,
         word: &Word,
         spans: &mut Vec<ExpansionSpan>,
+        context: FieldContext,
     ) -> Result<Value, CommandFailure> {
         if let [WordPart::CommandSubstitution(_)] = word.parts.as_slice() {
             let result = self.assignment_value(word)?;
-            self.record_value(spans, &result.value)?;
+            self.record_expanded_value(spans, &result.value, context)?;
             self.expansion_charges.extend(result.retained);
             return Ok(result.value);
         }
@@ -3652,7 +3703,7 @@ impl<'a> Evaluator<'a> {
                 | WordPart::Parameter(_)
                 | WordPart::CommandSubstitution(_)
                 | WordPart::Arithmetic(_) => {
-                    self.collect_field_part(part, spans, ExpansionOutput::Value)?
+                    self.collect_field_part(part, spans, ExpansionOutput::Value, context)?
                 }
             };
             if matches!(part, WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_)) {
@@ -3900,7 +3951,10 @@ impl<'a> Evaluator<'a> {
         let (value, bound) = self.select_parameter(
             name,
             indices,
-            if split.is_some() {
+            if split
+                .as_ref()
+                .is_some_and(|split| split.context == FieldContext::Fields)
+            {
                 ExpansionOutput::Fields
             } else {
                 output

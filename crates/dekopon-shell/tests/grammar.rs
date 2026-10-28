@@ -1835,26 +1835,159 @@ fn case_composes_with_the_control_flow_around_it() {
 }
 
 #[test]
-fn a_case_pattern_assembled_at_run_time_is_still_checked() {
-    let outcome = run("p='*.json'\ncase report.json in $p) echo matched ;; esac");
-    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(
-        outcome.output.contains("expanded to text"),
-        "{}",
-        outcome.output
+fn a_case_pattern_assembled_at_run_time_matches_a_glob() {
+    assert_eq!(
+        output("p='*.json'\ncase report.json in $p) echo matched ;; esac"),
+        "matched"
     );
-    // An error here must not suggest quoting: quoting only exempts a metacharacter while the parser
-    // can still see it, and an expanded pattern has already lost its quotes.
-    assert!(
-        !outcome.output.contains("quote it as"),
-        "{}",
-        outcome.output
-    );
-
     assert_eq!(
         output("p=ready\ncase ready in $p) echo matched ;; esac"),
         "matched"
     );
+}
+
+#[test]
+fn case_patterns_match_bash_globs_and_preserve_quotes() {
+    for (script, expected) in [
+        (
+            "case report.json in *.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        ("case abc in a?c) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case abbc in a?c) echo yes ;; *) echo no ;; esac", "no"),
+        ("case b in [ab]) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case bcd in [!a]*) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case abc in [!a]*) echo yes ;; *) echo no ;; esac", "no"),
+        ("case bcd in [^a]*) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case bx in [a-c]x) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case dx in [a-c]x) echo yes ;; *) echo no ;; esac", "no"),
+        (
+            "case '*.json' in '*'.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "case report.json in '*'.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r#"p='*.json'; case '*.json' in "$p"|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "yes",
+        ),
+        (
+            r#"p='*.json'; case report.json in "$p"|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            "p='*.json'; case report.json in $p) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (r"case '*' in \*|?) echo yes ;; *) echo no ;; esac", "yes"),
+        (r"case hello in \*|?) echo yes ;; *) echo no ;; esac", "no"),
+        ("case a/b in *|?) echo yes ;; esac", "yes"),
+        ("case .hidden in *|?) echo yes ;; esac", "yes"),
+        ("case '[' in [) echo yes ;; *) echo no ;; esac", "yes"),
+        (
+            "case report.json in *.txt|*.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        ("case '' in *|?) echo yes ;; esac", "yes"),
+        ("case '' in ?) echo yes ;; *) echo no ;; esac", "no"),
+        ("case 'a\nc' in a?c) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case é in ?) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case ']' in []a]) echo yes ;; *) echo no ;; esac", "yes"),
+        ("case b in [a'-'c]) echo yes ;; *) echo no ;; esac", "no"),
+        (
+            "unset p; case '*.json' in ${p:-'*'}.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "unset p; case report.json in ${p:-'*'}.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            "p=set; case report.json in ${p:+'*'}.json|*.csv) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            "unset p; case report.json in ${p:='*'}.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "unset p; case report.json in ${p='*'}.json) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r#"unset p; case report.json in "${p:='*'}".json|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            r#"unset p; case report.json in "${p='*'}".json|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            "case report.json in $(printf '*.json')) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r#"case report.json in "$(printf '*.json')"|*.csv) echo yes ;; *) echo no ;; esac"#,
+            "no",
+        ),
+        (
+            r"p='\*'; case '*' in $p) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\*'; case other in $p) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r"case '\abc' in \\*|?) echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            "case A in a?) echo yes ;; [a]) echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
+
+#[test]
+fn a_case_pattern_with_many_stars_finishes_with_the_expected_non_match() {
+    let pattern = format!("{}b", "*a".repeat(64));
+    let script = format!(
+        "case '{}' in {pattern}) echo yes ;; *) echo no ;; esac",
+        "a".repeat(8192)
+    );
+    assert_eq!(output(&script), "no");
+}
+
+#[test]
+fn case_posix_bracket_constructs_are_refused_by_name() {
+    for (pattern, diagnostic) in [
+        (
+            "[[:alpha:]]",
+            "`case` POSIX bracket classes are not supported",
+        ),
+        (
+            "[[.a.]]",
+            "`case` POSIX collating symbols are not supported",
+        ),
+        (
+            "[[=a=]]",
+            "`case` POSIX equivalence classes are not supported",
+        ),
+    ] {
+        for script in [
+            format!("case a in {pattern}) echo yes ;; esac"),
+            format!("p='{pattern}'; case a in $p) echo yes ;; esac"),
+        ] {
+            let outcome = run(&script);
+            assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+            assert_eq!(outcome.output, diagnostic, "{script}");
+        }
+    }
 }
 
 #[test]
