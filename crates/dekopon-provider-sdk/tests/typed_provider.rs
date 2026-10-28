@@ -1071,7 +1071,7 @@ struct WideFixture;
 impl Provider for WideFixture {
     const ID: &'static str = "wide";
     const COMMAND_WORDS: &'static [&'static str] = &["wide"];
-    const DESCRIPTION: &'static str = "Twenty capabilities";
+    const DESCRIPTION: &'static str = "Sixty-four capabilities";
     type Args = ClockArgs;
     type Capabilities = (
         W1,
@@ -1094,6 +1094,50 @@ impl Provider for WideFixture {
         W18,
         W19,
         W20,
+        W21,
+        W22,
+        W23,
+        W24,
+        W25,
+        W26,
+        W27,
+        W28,
+        W29,
+        W30,
+        W31,
+        W32,
+        W33,
+        W34,
+        W35,
+        W36,
+        W37,
+        W38,
+        W39,
+        W40,
+        W41,
+        W42,
+        W43,
+        W44,
+        W45,
+        W46,
+        W47,
+        W48,
+        W49,
+        W50,
+        W51,
+        W52,
+        W53,
+        W54,
+        W55,
+        W56,
+        W57,
+        W58,
+        W59,
+        W60,
+        W61,
+        W62,
+        W63,
+        W64,
     );
     fn propose(_: ClockArgs, _: bool) -> Result<Proposal<Self>, Usage> {
         Ok(Proposal::to::<W1>(ClockInput {}))
@@ -1140,22 +1184,66 @@ wide!(
     W17 = "w17",
     W18 = "w18",
     W19 = "w19",
-    W20 = "w20"
+    W20 = "w20",
+    W21 = "w21",
+    W22 = "w22",
+    W23 = "w23",
+    W24 = "w24",
+    W25 = "w25",
+    W26 = "w26",
+    W27 = "w27",
+    W28 = "w28",
+    W29 = "w29",
+    W30 = "w30",
+    W31 = "w31",
+    W32 = "w32",
+    W33 = "w33",
+    W34 = "w34",
+    W35 = "w35",
+    W36 = "w36",
+    W37 = "w37",
+    W38 = "w38",
+    W39 = "w39",
+    W40 = "w40",
+    W41 = "w41",
+    W42 = "w42",
+    W43 = "w43",
+    W44 = "w44",
+    W45 = "w45",
+    W46 = "w46",
+    W47 = "w47",
+    W48 = "w48",
+    W49 = "w49",
+    W50 = "w50",
+    W51 = "w51",
+    W52 = "w52",
+    W53 = "w53",
+    W54 = "w54",
+    W55 = "w55",
+    W56 = "w56",
+    W57 = "w57",
+    W58 = "w58",
+    W59 = "w59",
+    W60 = "w60",
+    W61 = "w61",
+    W62 = "w62",
+    W63 = "w63",
+    W64 = "w64"
 );
 
 #[test]
-fn a_provider_with_twenty_capabilities_lists_them_in_order_and_dispatches_the_last() {
+fn a_provider_with_sixty_four_capabilities_lists_them_in_order_and_dispatches_the_last() {
     let manifest = manifest::<WideFixture>().expect("the wide identifiers are valid");
     let ids: Vec<&str> = manifest
         .capabilities
         .iter()
         .map(|capability| capability.id.as_str())
         .collect();
-    let expected: Vec<String> = (1..=20).map(|index| format!("wide.w{index}")).collect();
+    let expected: Vec<String> = (1..=64).map(|index| format!("wide.w{index}")).collect();
     assert_eq!(ids, expected);
-    let exit = call::<WideFixture>("wide.w20", "{}");
+    let exit = call::<WideFixture>("wide.w64", "{}");
     assert_eq!(
         (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
-        (0, "w20\n", "")
+        (0, "w64\n", "")
     );
 }
