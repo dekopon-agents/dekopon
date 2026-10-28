@@ -66,6 +66,30 @@ impl Builder {
     fn finish(self) -> Text {
         Text::owned(self.text, self.charge)
     }
+
+    fn replacement(
+        &mut self,
+        replacement: &str,
+        matched: &str,
+        budget: &Budget,
+    ) -> Result<(), AwkError> {
+        let mut chars = replacement.char_indices().peekable();
+        let mut plain = 0;
+        while let Some((at, c)) = chars.next() {
+            if c == '&' {
+                self.append(&replacement[plain..at], budget)?;
+                self.append(matched, budget)?;
+                plain = at + 1;
+            } else if c == '\\'
+                && let Some((next, escaped @ ('&' | '\\'))) = chars.next()
+            {
+                self.append(&replacement[plain..at], budget)?;
+                self.append(if escaped == '&' { "&" } else { "\\" }, budget)?;
+                plain = next + 1;
+            }
+        }
+        self.append(&replacement[plain..], budget)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +182,7 @@ impl Value {
         right: &Self,
         budget: &Budget,
     ) -> Result<Option<std::cmp::Ordering>, AwkError> {
+        budget.check_deadline()?;
         let numeric = match (self, right) {
             (
                 Self::Num(_) | Self::StrNum(_, _) | Self::Uninit,
@@ -483,7 +508,7 @@ impl<'a> Engine<'a> {
             let regex =
                 ChargedRegex::compile(source.as_str(), self.budget).map_err(
                     |error| match error {
-                        AwkError::Refused(refusal) => self.error(RuntimeKind::Pattern(refusal)),
+                        AwkError::Refused(refusal) => self.error(RuntimeKind::Refused(refusal)),
                         other @ (AwkError::Syntax { .. }
                         | AwkError::Runtime(_)
                         | AwkError::Limit(_)) => other,
@@ -595,6 +620,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
     fn expression(&mut self, expression: &Expr) -> Result<Value, AwkError> {
+        self.budget.check_deadline()?;
         match &expression.kind {
             ExprKind::Number(number) => Ok(Value::Num(*number)),
             ExprKind::String(text) => Ok(Value::Str(Text::new(text, self.budget)?)),
@@ -688,6 +714,7 @@ impl<'a> Engine<'a> {
         self.binary(operator, left, right)
     }
     fn binary(&self, operator: Binary, left: Value, right: Value) -> Result<Value, AwkError> {
+        self.budget.check_deadline()?;
         use std::cmp::Ordering::{Equal, Greater, Less};
         let number = match operator {
             Binary::Add => left.number() + right.number(),
@@ -773,6 +800,7 @@ impl Engine<'_> {
         statement: &Stmt,
         emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
     ) -> Result<Flow, RunError> {
+        self.budget.check_deadline()?;
         match &statement.kind {
             StmtKind::Block(statements) => {
                 for statement in statements {
@@ -943,7 +971,7 @@ impl Engine<'_> {
                 let value = match args.first() {
                     None => self.record.clone(),
                     Some(expr) => {
-                        if let ExprKind::Variable(name) = &expr.kind
+                        if let Some(name) = expr.variable()
                             && self.compiled.program.arrays.contains(name)
                         {
                             return Ok(Value::Num(
@@ -1088,13 +1116,7 @@ impl Engine<'_> {
             | ExprKind::Call(_, _) => unreachable!("parser validates split's array name"),
         };
         let separator = match args.get(2) {
-            Some(expr) if let ExprKind::Regex(index) = expr.kind => {
-                Separator::Regex(Pattern::Literal(index))
-            }
-            Some(expr) => {
-                let text = self.expression(expr)?.text(self.budget)?;
-                self.separator(text)?
-            }
+            Some(expr) => self.split_separator(expr)?,
             None => self.separator(self.fs.text(self.budget)?)?,
         };
         self.array(name)?.elements.clear();
@@ -1106,6 +1128,33 @@ impl Engine<'_> {
         }
         Ok(Value::Num(count as f64))
     }
+    fn split_separator(&mut self, expr: &Expr) -> Result<Separator, AwkError> {
+        match &expr.kind {
+            ExprKind::Regex(index) => {
+                if self.compiled.program.regex_sources[*index].is_empty() {
+                    return Err(self.error(RuntimeKind::EmptySeparator));
+                }
+                Ok(Separator::Regex(Pattern::Literal(*index)))
+            }
+            ExprKind::Group(inner) => self.split_separator(inner),
+            ExprKind::Number(_)
+            | ExprKind::String(_)
+            | ExprKind::Variable(_)
+            | ExprKind::Array(_, _)
+            | ExprKind::Field(_)
+            | ExprKind::Unary(_, _)
+            | ExprKind::Increment { .. }
+            | ExprKind::Binary(_, _, _)
+            | ExprKind::Chain { .. }
+            | ExprKind::Assign(_, _, _)
+            | ExprKind::Conditional(_, _, _)
+            | ExprKind::In(_, _)
+            | ExprKind::Call(_, _) => {
+                let text = self.expression(expr)?.text(self.budget)?;
+                self.separator(text)
+            }
+        }
+    }
     fn substitute(&mut self, args: &[Expr], global: bool) -> Result<Value, AwkError> {
         let pattern = self.pattern(&args[0])?;
         let replacement = self.expression(&args[1])?.text(self.budget)?;
@@ -1116,7 +1165,7 @@ impl Engine<'_> {
         let input = self.get(&place)?.text(self.budget)?;
         let text = input.as_str();
         let mut output = Builder::new(self.budget)?;
-        let (mut cursor, mut at, mut count) = (0, 0, 0);
+        let (mut cursor, mut at, mut count) = (0, 0, 0_usize);
         let mut nonempty_end = None;
         while let Some(found) = self.find(&pattern, text, at)? {
             if found.is_empty() && nonempty_end == Some(found.start) {
@@ -1127,20 +1176,7 @@ impl Engine<'_> {
                 continue;
             }
             output.append(&text[cursor..found.start], self.budget)?;
-            let mut chars = replacement.as_str().char_indices().peekable();
-            while let Some((start, c)) = chars.next() {
-                if c == '&' {
-                    output.append(&text[found.clone()], self.budget)?;
-                } else if c == '\\' && chars.peek().is_some_and(|(_, c)| *c == '&') {
-                    chars.next();
-                    output.append("&", self.budget)?;
-                } else {
-                    output.append(
-                        &replacement.as_str()[start..start + c.len_utf8()],
-                        self.budget,
-                    )?;
-                }
-            }
+            output.replacement(replacement.as_str(), &text[found.clone()], self.budget)?;
             count += 1;
             cursor = found.end;
             if !global {
@@ -1161,6 +1197,6 @@ impl Engine<'_> {
             output.append(&text[cursor..], self.budget)?;
             self.put(place, Value::Str(output.finish()))?;
         }
-        Ok(Value::Num(f64::from(count)))
+        Ok(Value::Num(count as f64))
     }
 }

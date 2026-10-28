@@ -42,7 +42,7 @@ enum RuntimeKind {
     Fields,
     Utf8,
     EmptySeparator,
-    Pattern(Refusal),
+    Refused(Refusal),
     FormatterPending,
 }
 
@@ -54,7 +54,7 @@ impl RuntimeKind {
             Self::Fields => "awk: more than 65 536 fields".into(),
             Self::Utf8 => "awk: record is not valid UTF-8".into(),
             Self::EmptySeparator => "awk: an empty field separator is not supported".into(),
-            Self::Pattern(refusal) => refusal.message(),
+            Self::Refused(refusal) => refusal.message(),
             Self::FormatterPending => {
                 "awk: internal error: formatter awaits pr3 registration".into()
             }
@@ -180,7 +180,14 @@ impl From<LimitExceeded> for RunError {
 }
 impl From<CommandFailure> for RunError {
     fn from(value: CommandFailure) -> Self {
-        Self::Output(value)
+        use crate::builtins::FatalError;
+        match value {
+            CommandFailure::Fatal(FatalError::Limit(limit)) => Self::Awk(AwkError::Limit(limit)),
+            other @ (CommandFailure::Status { .. }
+            | CommandFailure::Fatal(
+                FatalError::Unsupported(_) | FatalError::Assertion(_),
+            )) => Self::Output(other),
+        }
     }
 }
 impl From<RunError> for CommandFailure {
@@ -363,8 +370,12 @@ fn read_records(
                     std::mem::replace(&mut charge, next_charge),
                     emit,
                 )?;
-                if let Flow::Exit(_) = flow {
-                    return Ok(());
+                match flow {
+                    Flow::Exit(_) => return Ok(()),
+                    Flow::Normal | Flow::Next => {}
+                    Flow::Break | Flow::Continue => {
+                        unreachable!("parser requires a containing loop")
+                    }
                 }
             }
         }
@@ -383,7 +394,7 @@ fn record(
 ) -> Result<Flow, RunError> {
     engine.budget.check_deadline()?;
     engine.nr += 1.0;
-    let text = String::from_utf8(bytes).map_err(|_| engine.error(RuntimeKind::Utf8))?;
+    let text = String::from_utf8(bytes).map_err(|_invalid_utf8| engine.error(RuntimeKind::Utf8))?;
     engine.set_record(Value::input(Text::owned(text, charge)))?;
     engine.phase(parse::Phase::Record, emit)
 }

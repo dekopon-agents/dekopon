@@ -411,7 +411,7 @@ impl Expr {
             | ExprKind::Call(_, _) => false,
         }
     }
-    fn variable(&self) -> Option<&str> {
+    pub(super) fn variable(&self) -> Option<&str> {
         match &self.kind {
             ExprKind::Variable(name) => Some(name),
             ExprKind::Number(_)

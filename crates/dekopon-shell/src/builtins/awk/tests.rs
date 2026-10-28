@@ -196,7 +196,7 @@ fn every_refusal_class_has_its_exact_message() {
     let AwkError::Refused(dynamic) = lex::validate_format("sprintf", "%.4097f").unwrap_err() else {
         panic!("format bound refusal");
     };
-    assert_eq!(CommandFailure::from(AwkError::Runtime(RuntimeError { kind: RuntimeKind::Pattern(dynamic), record: 7.0 })), CommandFailure::Status {
+    assert_eq!(CommandFailure::from(AwkError::Runtime(RuntimeError { kind: RuntimeKind::Refused(dynamic), record: 7.0 })), CommandFailure::Status {
         message: "awk: `sprintf` precision 4097 is more than 4096; use a precision of at most 4096 (record 7)".into(), status: ExitCode::SYNTAX,
     });
 }
