@@ -10,6 +10,23 @@ use std::path::PathBuf;
     about = "Run the unprivileged Dekopon chat gateway and agent daemon"
 )]
 pub struct Cli {
+    /// Tokio worker threads (1 to 4096); otherwise TOKIO_WORKER_THREADS or the available CPU count.
+    #[arg(long, env = "DEKOPON_WORKER_THREADS", value_name = "COUNT")]
+    pub worker_threads: Option<std::num::NonZeroUsize>,
+    /// Maximum additional Tokio blocking threads (1 to 4096; default: 512).
+    #[arg(long, env = "DEKOPON_BLOCKING_THREADS", value_name = "COUNT")]
+    pub blocking_threads: Option<std::num::NonZeroUsize>,
+    /// Retire idle blocking threads after this duration (default: 10s).
+    #[arg(long, env = "DEKOPON_BLOCKING_KEEP_ALIVE", value_name = "DURATION")]
+    pub blocking_keep_alive: Option<humantime::Duration>,
+    /// Maximum native shell threads shared by the process.
+    #[arg(
+        long,
+        env = "DEKOPON_SHELL_THREADS",
+        value_name = "COUNT",
+        default_value = "32"
+    )]
+    pub shell_threads: std::num::NonZeroU32,
     /// Strict owner-controlled gateway YAML/JSON configuration; unused by auth.
     #[arg(long, value_name = "PATH", required = true)]
     pub config: Option<PathBuf>,

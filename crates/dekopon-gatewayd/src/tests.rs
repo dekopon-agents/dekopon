@@ -2787,7 +2787,7 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
     document["routes"][0]["transport"] = json!("support-slack");
     let path = write_config(directory.path(), &document);
 
-    let error = crate::run(&path, std::future::pending())
+    let error = crate::run(&path, std::future::pending(), 32)
         .await
         .expect_err("two unset chat credentials are a startup refusal");
     let crate::GatewaydError::Startup { problems } = &error else {
@@ -2851,7 +2851,7 @@ async fn a_permanent_transport_failure_stops_the_gateway_and_preserves_its_cause
     let path = write_config(directory.path(), &document);
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        crate::run(&path, std::future::pending()),
+        crate::run(&path, std::future::pending(), 32),
     )
     .await
     .expect("startup is bounded")
@@ -4126,8 +4126,8 @@ impl TextStream for RecordingStream {
 #[async_trait]
 impl InboundReaction for RecordingReaction {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
-        let failure = self.charge();
         self.record(rendered_target(target), present);
+        let failure = self.charge();
         failure.map_or(Ok(()), |kind| Err(injected(kind)))
     }
 }
@@ -4398,6 +4398,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         indicators: fixture_liveness(),
         wakes: false,
         follow: false,
+        ambient: crate::config::AmbientConfig::default(),
     }
 }
 
@@ -4560,6 +4561,7 @@ fn model_config() -> ModelConfig {
 
 fn message(text: &str) -> InboundMessage {
     InboundMessage {
+        pull_request_links: None,
         transport: "dev".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
         subject: subject(),
@@ -4640,6 +4642,7 @@ fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
 
 fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
     InboundMessage {
+        pull_request_links: None,
         transport: "scientist-slack".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
         subject: "slack.t0123abc.u9xyz"
@@ -6211,6 +6214,11 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
             "{transport}"
         );
         if transport == "discord" {
+            driver
+                .reaction_object()
+                .expect("working reaction")
+                .wait_for_calls(1)
+                .await;
             assert!(driver.calls().iter().any(|call| matches!(call, DriverCall::Reaction { target: reaction_target, present: true } if reaction_target == &rendered_target(&target("inbound-1")))));
         } else {
             assert!(
@@ -6622,7 +6630,7 @@ async fn the_suggestion_tool_is_offered_on_every_route() {
     );
     let recorded = tool_message(&models, 1);
     assert!(
-        recorded.contains("Recorded suggestion 1 of 3"),
+        recorded == "Recorded suggestion for the operator. Continue with the task, or finish.",
         "{recorded}"
     );
 }
@@ -7483,8 +7491,8 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
-const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
-const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\n";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
+const JOURNAL_FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request, your replies and every tool call with its result; older turns may be summaries or envelopes, and reasoning replays only to the model that wrote it.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
 
 fn expected_instructions() -> String {
     "Answer briefly.\n\n[gateway: 4 steps and 8 capability calls per message.]".to_owned()
@@ -7577,6 +7585,55 @@ fn commit(
         TakenIn::default(),
         &cache_key,
         now,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_replayed_suggestion_receipts_do_not_imply_the_calls_did_not_run() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        suggest_improvement(),
+        suggest_improvement(),
+        answer("I sent two suggestions."),
+        answer("Two suggestions."),
+    ]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), window());
+
+    for text in ["send two suggestions", "did you send them?"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    for index in [1, 2] {
+        assert_eq!(
+            tool_message(&models, index),
+            "Recorded suggestion for the operator. Continue with the task, or finish."
+        );
+    }
+    assert_eq!(
+        models.prompt(3),
+        transcript(&[
+            ("system", &expected_instructions()),
+            ("system", FIDELITY_NOTICE),
+            (
+                "user",
+                "[gateway: unmapped participant]\nsend two suggestions"
+            ),
+            ("assistant", "I sent two suggestions."),
+            (
+                "user",
+                "[gateway: unmapped participant]\ndid you send them?"
+            ),
+        ]),
     );
 }
 
@@ -18256,6 +18313,7 @@ mod memory;
 #[path = "tests/memory_notice.rs"]
 mod memory_notice;
 mod participants;
+mod pull_request_links;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
 #[path = "tests/sealed_handoff.rs"]
@@ -19980,7 +20038,7 @@ async fn run_refuses_with_exactly_the_problem_check_reports() {
     let directory = check_fixture(root.path(), "nobody", &[]);
 
     let report = crate::check(&directory, None, None).await;
-    let error = crate::run(&directory, std::future::pending())
+    let error = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("a route naming an absent agent cannot serve");
 
@@ -20014,7 +20072,7 @@ async fn invalid_indicators_have_the_same_check_and_boot_refusal() {
     )
     .expect("write fragment");
     let report = crate::check(&directory, None, None).await;
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("invalid surface refuses boot");
     let [problem] = report.problems.as_slice() else {
@@ -20043,7 +20101,7 @@ async fn unsupported_and_non_durable_follow_refuses_check_and_boot() {
     chat["routes"][0]["follow"] = json!(true);
     fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
     let report = crate::check(&directory, None, None).await;
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("invalid follow refuses boot");
     let [problem] = report.problems.as_slice() else {
@@ -20082,7 +20140,7 @@ async fn unknown_indicator_value_produces_only_a_file_parse_diagnostic() {
         problem,
         crate::GatewaydError::Config(ConfigError::Invalid { .. })
     )));
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("parse failure refuses boot");
     assert!(matches!(
@@ -20109,7 +20167,7 @@ async fn deployed_liveness_fragment_refuses_in_check_and_boot() {
         problem,
         crate::GatewaydError::Config(ConfigError::Decode { .. })
     )));
-    let boot = crate::run(&directory, std::future::pending())
+    let boot = crate::run(&directory, std::future::pending(), 32)
         .await
         .expect_err("legacy key refuses boot");
     assert!(matches!(
@@ -23293,11 +23351,18 @@ struct SlackFollowFixture {
 
 impl SlackFollowFixture {
     async fn new() -> Self {
+        Self::with_pull_request_links(false).await
+    }
+
+    async fn with_pull_request_links(enabled: bool) -> Self {
         let directory = temporary();
         let mut doc = document(directory.path());
         doc["routes"][0]["transport"] = json!("scientist-slack");
         doc["routes"][0]["conversation"] = json!({"kind": ["channel", "thread"]});
         doc["routes"][0]["follow"] = json!(true);
+        if enabled {
+            doc["routes"][0]["ambient"] = json!({"pullRequestLinks": true});
+        }
         doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
         doc["transports"][0] = json!({"name": "scientist-slack", "kind": "slackSocketMode", "appTokenEnv": "APP", "botTokenEnv": "BOT"});
         doc["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});

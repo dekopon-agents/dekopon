@@ -177,7 +177,7 @@ impl Nested<'_, '_> {
 
     pub(super) fn parse_case_body(
         &mut self,
-        patterns: Vec<CasePattern>,
+        patterns: Vec<Word>,
     ) -> Result<CaseClause, ParseError> {
         let body = self.parse_program(&["esac"])?;
         if matches!(self.peek_kind(), Some(TokenKind::DoubleSemicolon)) {

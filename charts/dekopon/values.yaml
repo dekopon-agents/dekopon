@@ -110,6 +110,7 @@ paths:
 # Broker
 # ---------------------------------------------------------------------------------------------
 broker:
+  runtime: {}
   # Every file below is supplied either inline (the chart writes a Secret) or by naming an object
   # that already exists. Inline and existing are mutually exclusive; setting both is an error.
   #
@@ -364,6 +365,7 @@ broker:
 # Gateway
 # ---------------------------------------------------------------------------------------------
 gateway:
+  runtime: {}
   # Off by default. Unlike the broker, dekopon-gatewayd cannot have a working default: it needs a chat
   # transport, a model endpoint, and an agent catalog, and the chart can invent none of them.
   enabled: false

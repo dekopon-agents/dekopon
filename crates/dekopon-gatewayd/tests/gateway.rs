@@ -33,7 +33,7 @@ const MAPPED_PRINCIPAL: &str = "cpetersen";
 const OTHER_MAPPED_PRINCIPAL: &str = "jortega";
 const GATEWAY_PRINCIPAL: &str = "dekopon-gatewayd";
 const AGENT: &str = "chat-agent";
-const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\n";
+const FIDELITY_NOTICE: &str = "[gateway: memory]\nReplayed turns keep the request and your final reply; bash exchanges, reasoning and other tool calls are not kept.\nA tool call missing from replayed turns is not evidence it did not run; your earlier replies record what you reported, so answer from them rather than retracting.\n";
 
 fn provider(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -905,9 +905,9 @@ async fn boot_with(
         };
         #[cfg(feature = "fauxlack")]
         if let Some(service) = service {
-            return dekopon_gatewayd::run_fauxlack(gateway_path, shutdown, service).await;
+            return dekopon_gatewayd::run_fauxlack(gateway_path, shutdown, service, 32).await;
         }
-        dekopon_gatewayd::run(gateway_path, shutdown).await
+        dekopon_gatewayd::run(gateway_path, shutdown, 32).await
     });
     #[cfg(feature = "fauxlack")]
     let in_process = timing.fauxlack.is_some();

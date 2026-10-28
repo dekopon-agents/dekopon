@@ -73,6 +73,8 @@ Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `
 
 **Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `unset`; the no-op `:`; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
+`case` patterns follow Bash globs: unquoted `*`, `?` and bracket expressions (members, ranges and `!`/`^` negation) match pattern characters, including those produced by unquoted expansions, while quoted or escaped characters stay literal; POSIX bracket classes, collating symbols and equivalence classes are refused by name.
+
 Bash 5.2 IFS field splitting applies to unquoted parameter expansions and command-substitution
 output. Unset `IFS` uses space, tab and newline; empty `IFS` disables splitting. ASCII whitespace
 characters present in `IFS` trim and collapse, while other IFS characters delimit fields,
@@ -97,9 +99,7 @@ Some Bash quoting and `read` combinations split a UTF-8 character into invalid b
 combinations fail explicitly with `IFS: Bash would produce a field that is not valid UTF-8`,
 because shell argument and variable values must remain valid UTF-8.
 
-**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
-
-"Rejected loudly" reaches inside `case` too. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
+**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern. A model must never be able to believe something happened that did not.
 
 An unquoted whole word `chat-asset:N`, with a nonzero canonical decimal number fitting `u64`, is
 a typed attachment reference only in a provider command's argv. It is never field-split or
@@ -107,7 +107,7 @@ joined. Quoting, escaping, larger words, assignments and variable expansion prod
 text. Builtins refuse attachment operands with an `asset cat` pipeline suggestion. Provider
 `--help` as the sole literal unquoted argument uses the cached page without spending a call.
 
-**Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
+**Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: filesystem pathname expansion (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
 ### IFS differential corpus
 

@@ -228,6 +228,7 @@ impl TelegramTransport {
         record_conversation(received, &conversation);
 
         Ok(Some(InboundMessage {
+            pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Telegram,
             subject: ExternalSubject::telegram(&user.to_string())
