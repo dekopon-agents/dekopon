@@ -556,6 +556,7 @@ mod tests {
     fn the_registry_covers_every_documented_builtin() {
         let expected = [
             "[",
+            "awk",
             "base64",
             "cap",
             "cat",

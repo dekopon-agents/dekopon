@@ -437,6 +437,7 @@ fn the_deepest_awk_trees_run_inside_thirty_one_shell_calls_on_two_mib() {
                         ("$", ""),
                         ("a[", "]"),
                         ("length(", ")"),
+                        ("sprintf(\"%.4096f\",", ")"),
                         ("2^", ""),
                         ("x=", ""),
                     ] {
