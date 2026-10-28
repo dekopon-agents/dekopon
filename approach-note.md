@@ -18,8 +18,11 @@ Implementation waits for the coordinator-launched note review.
   exhaustive WordPart arms, removing its `#[expect]`.
 - The README has a full literal-only case paragraph as well as the rejected-list
   entry. Delete that stale paragraph, state the new rule in the kept grammar, and
-  qualify the inert-globbing entry as filesystem pathname expansion. The meaning
-  of all other README rules, including `[[ == ]]`, stays unchanged.
+  qualify the inert-globbing entry as filesystem pathname expansion. Remove the
+  case comparison in the parameter-pattern paragraph (base README.md:233) and in
+  the grep/sed paragraph (base README.md:285), including the blanket claim that a
+  script need not know which construct it is in. Preserve the literal-pattern
+  rules for those remaining consumers; all other README rules stay unchanged.
 - The AST's three CasePattern variants encode literal matching and refusal, rather
   than the new grammar. Remove that private enum and its stale doc comment;
   CaseClause keeps patterns as `Vec<Word>`. The private ast module exports no
@@ -48,10 +51,13 @@ as SingleQuoted parts (`lexer.rs:365`); quoted sections therefore survive parsin
 
 A private `interp/case.rs` module will own case expansion and matching, following
 the existing interpreter submodule layout. Expanded patterns carry a sequence of
-tagged characters, `PatternChar::Literal(char)` or `PatternChar::Unquoted(char)`.
+`PatternFragment::Literal(char)`, `PatternFragment::Unquoted(char)`, or
+`PatternFragment::QuotedNull`. The first two retain per-character quote origin;
+the third preserves quoted-empty modifier fragments that have no character to tag.
 Literal script text and unquoted expansion results produce Unquoted characters.
-SingleQuoted and DoubleQuoted parts produce Literal characters, including quoted
-expansion results. No already-flattened pattern is rescanned to infer its quoting.
+SingleQuoted and DoubleQuoted parts protect their characters as Literal, including
+quoted expansion results. Empty fragments follow the context-sensitive rules below.
+No already-flattened pattern is rescanned to infer its quoting.
 
 Reuse the existing arithmetic, command-substitution, value-rendering, and parameter
 evaluators. Extend the optional FieldExpansion output destination into a closed
@@ -69,6 +75,30 @@ branch already evaluates the replacement separately before emitting the assigned
 value. Keep that behavior, including single evaluation and assignment effects.
 Quoted outer expansions protect the whole result.
 
+The case destination distinguishes the outer pattern from an unquoted selected
+Default/Alternate replacement word. While traversing such a replacement word,
+retain each quoted-empty fragment as QuotedNull, even beside nonempty text in that
+word; for example, `${p:-''x}` retains the marker before x. Keep markers through
+nested modifier expansion and concatenation. Direct empty quotes in the outer
+pattern contribute no marker. Quoted outer expansion and assignment-result
+expansion retain their existing quote-removal behavior, so `''*.json`,
+`"${p:-}"*.json`, and `${p:=''}*.json` do not acquire this marker. This context and
+metadata exist only in the case destination; field expansion and non-case pattern
+consumers do not change.
+
+After assembling the complete pattern, normalize a sole QuotedNull to the empty
+pattern. Otherwise preserve every embedded marker as a literal U+007F character
+before glob tokenization; do not discard it or classify the entire pattern as
+unmatchable. Thus `${p:-''}*.json` does not match report.json, but does match a
+subject beginning with U+007F followed by report.json. Two markers remain two
+characters. An actual U+007F from source or expansion stays a character fragment,
+never a QuotedNull marker, so it is not erased when it is the whole pattern.
+This follows Bash 5.2.37's
+[case expansion and QGLOB_CVTNULL conversion](https://github.com/tianon/mirror-bash/blob/c5c97b371044a44b701b6efa35984a3e1956344e/execute_cmd.c#L3603),
+[whole-pattern quoted-null test](https://github.com/tianon/mirror-bash/blob/c5c97b371044a44b701b6efa35984a3e1956344e/pathexp.c#L217),
+[QUOTED_NULL definition](https://github.com/tianon/mirror-bash/blob/c5c97b371044a44b701b6efa35984a3e1956344e/subst.h#L358), and
+[CTLNUL value](https://github.com/tianon/mirror-bash/blob/c5c97b371044a44b701b6efa35984a3e1956344e/shell.h#L143).
+
 Preserve existing case subject expansion and pattern field joining. Pattern
 expansion stays unsplit, retains substitution charges, and respects the existing
 nesting guard and value-byte accounting. Backslashes produced by an unquoted
@@ -83,8 +113,8 @@ No new production dependency. regex-bites remains available to its existing
 consumers; this matcher directly consumes character protection without translating
 between glob and regex grammars or introducing regex compilation limits.
 
-Normalize unquoted backslash escapes once, then tokenize. Brackets support members,
-ranges, initial `!`/`^` negation, literal leading `]`, and literal edge/quoted
+Normalize quoted-null fragments, then unquoted backslash escapes, then tokenize.
+Brackets support members, ranges, initial `!`/`^` negation, literal leading `]`, and literal edge/quoted
 hyphens. Quoted punctuation never starts or terminates pattern syntax. An unmatched
 opening bracket is literal; later wildcard tokens remain active. Use a right-to-left
 next-closing-bracket table so repeated unmatched openings cannot make preprocessing
@@ -100,8 +130,9 @@ Match Unicode scalar values under the existing UTF-8 value model, using C.UTF-8
 Bash oracle cases. `*` and `?` match slash, leading dot, and newline; matching
 covers the whole subject and is case-sensitive. No extglob or nocasematch support.
 
-For pattern length P and subject length S, tokenization is O(P). A one-row dynamic
-program records which subject prefixes the consumed pattern matches: a star uses
+For expanded pattern fragment count P and subject length S, normalization and
+tokenization are O(P). A one-row dynamic program records which subject prefixes
+the consumed pattern matches: a star uses
 the previous row at the same column or the current row's preceding column; other
 tokens consume one character from the previous diagonal. Bracket membership work,
 summed over a row traversal of all tokens, is at most P per subject character.
@@ -138,6 +169,17 @@ Where shown, setup `p='*.json'` occurs before the case statement.
 | report.json | unset p; `${p:-'*.json'}` / `${p:-*.json}` | no / yes |
 | report.json | unset p; `${p:='*.json'}` / `${p:=*.json}` | yes / yes |
 | report.json | p=x; `${p:+'*.json'}` | no |
+| report.json | unset p; `${p:-''}*.json` | no |
+| report.json | p=x; `${p:+''}*.json` | no |
+| report.json | `''*.json` / unset p; `${p:=''}*.json` | yes / yes |
+| empty | unset p; `${p:-''}` / p=x; `${p:+''}` | yes / yes |
+| xreport.json | unset p; `${p:-''x}*.json` | no |
+| report.json | unset p; `*.json${p:-''}` / `${p:-""}*.json` | no / no |
+| empty / two U+007F characters | unset p q; `${p:-''}${q:-''}` | no / yes |
+| U+007F followed by report.json | unset p; `${p:-''}*.json` | yes |
+| empty | unset p; `''${p:-''}` | yes |
+| report.json | unset p; `"${p:-}"*.json` / `"${p:-""}"*.json` | yes / yes |
+| one U+007F character | p contains U+007F; `$p` | yes |
 | report.json | `$(printf '*.json')` | yes |
 | ] | `[]a]` / `[a"]"]` | yes / yes |
 | b | `[a'-'c]` | no |
@@ -153,6 +195,11 @@ Use the existing grammar-test `run`/`output` helpers for one table-driven
 behavior test. Newly accepted glob rows and quoted-variable rows expose the base's
 parse/run-time refusals; the literal and universal-star rows remain controls.
 Rerun every exact checked-in script under Bash before reporting its expectation.
+Include the quoted-empty modifier rows and direct-quote/assignment controls in
+that table: dropping the marker makes the default/alternate rows fail, while
+emitting it for every empty quote makes the controls fail. The whole-pattern and
+U+007F rows distinguish normalization from dropping every marker or rejecting
+every pattern that contains one.
 
 Rewrite `case_patterns_that_would_glob_are_rejected_by_name` into a parser test
 that checks accepted pattern words and preserved quote parts. Rewrite
@@ -177,9 +224,11 @@ Do not edit CHANGELOG.md. Delete this note in that final commit.
 
 This note changes zero production lines (code-only and physical); before/after
 production totals will be measured on the implementation diff with the counting
-scope and method recorded. No Rust build has been run for the note stage. The docs duplicate check passed
-(49 files), CI's audit-event documentation check passed (45 names), and 44 Bash
-oracle scripts completed successfully.
+scope and method recorded. No Rust build has been run for the note stage. The docs
+duplicate check passed (49 files), and CI's audit-event documentation check passed
+(45 names). The initial 44 Bash oracle scripts completed successfully; this note
+fix adds 20 observed quoted-empty and control probes, including repeated and nested
+modifier fragments; all exited 0 with empty stderr.
 
 After the note review, run: git diff --check; cargo fmt --all --check;
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings;
@@ -196,11 +245,11 @@ check and the Mac chat check; this branch does not merge, release, or deploy.
 ## Choices I made
 
 - Use a private interp/case.rs module and hand-written dynamic programming over tagged characters.
-- Represent each expanded character as Literal or Unquoted, preserving quote origin until tokenization.
+- Preserve Literal/Unquoted characters plus QuotedNull fragments; normalize the whole pattern before tokenization.
 - Reuse parameter modifier dispatch with a case output destination so other expansion behavior stays fixed.
 - Refuse POSIX character classes, collating symbols, and equivalence classes by their construct names.
 - Remove all three CasePattern variants and use Word directly; bare * needs no separate AST form.
 - Keep shared non-case refusal helpers and remove only the case refusal paths.
 - Read “each fails at the base” as applying to new-behavior rows; keep already-supported rows as controls.
-- Remove the stale README case paragraph and qualify inert globbing as filesystem pathname expansion.
+- Remove stale case comparisons from all three README paragraphs and qualify inert globbing as filesystem pathname expansion.
 - Use Bash 5.2 under C.UTF-8 for deterministic Unicode and range examples.
