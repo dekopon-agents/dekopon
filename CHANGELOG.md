@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-10-28
+
+### Added
+
+- ambient.pullRequestLinks on Slack routes starts a review turn from a pull-request link
+
+### Changed
+
+- shell syntax errors inside $( ), ${ } and here-documents report the script's line
+
+## [dekopon-chart-0.54.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.54.0 targets core v0.67.0 and renders the `v0.67.0` image tag.
+
 ## [0.66.0] - 2026-10-28
 
 ### Changed
