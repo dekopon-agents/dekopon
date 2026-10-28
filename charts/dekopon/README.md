@@ -1,8 +1,8 @@
 # Dekopon Helm chart
 
-Chart `0.53.0` targets application `v0.66.0`.
+Chart `0.55.0` targets application `v0.68.0`.
 With empty `image.tag` and `image.digest`, the chart renders
-`ghcr.io/dekopon-agents/dekopon:v0.66.0`; a set `image.digest` wins over the tag.
+`ghcr.io/dekopon-agents/dekopon:v0.68.0`; a set `image.digest` wins over the tag.
 With `console.enabled: true` and empty `console.image.tag` and `console.image.digest`,
 the console uses the main image, including its tag, variant, or digest. An explicit console tag
 or digest uses `console.image.repository`, which defaults to `ghcr.io/dekopon-agents/dekopon`.
@@ -33,3 +33,29 @@ volumes retain their own sizing limits and must accommodate the configured budge
 `ci/test-assets.py` checks render-time refusals and mounts. `ci/verify-init-permissions.sh` also
 runs the rendered init command and writes to the mounted asset subtree as the gateway UID on a
 Docker local filesystem volume, modelling the claim's `local-path` backing.
+
+## Runtime thread flags
+
+Every value below is optional and unset by default; an unset or null value renders no flag.
+Set deployment-specific sizes here rather than in daemon configuration. Flags override the
+matching `DEKOPON_*` environment variables. The console can use those variables through its
+existing environment settings.
+
+| Value | Flag |
+|---|---|
+| `gateway.runtime.workerThreads` | `--worker-threads` |
+| `gateway.runtime.blockingThreads` | `--blocking-threads` |
+| `gateway.runtime.blockingKeepAlive` | `--blocking-keep-alive` |
+| `gateway.runtime.shellThreads` | `--shell-threads` |
+| `broker.runtime.workerThreads` | `--worker-threads` |
+| `broker.runtime.blockingThreads` | `--blocking-threads` |
+| `broker.runtime.blockingKeepAlive` | `--blocking-keep-alive` |
+| `broker.runtime.cpuThreads` | `--cpu-threads` |
+
+Counts must be positive; `workerThreads`, `blockingThreads` and `broker.runtime.cpuThreads`
+must each be at most 4096.
+The binaries reject larger counts before constructing any pool. `blockingKeepAlive` uses
+humantime syntax such as `10s`.
+Broker settings also reach precompile, provider sync, configuration checks and probes;
+gateway settings reach serving and configuration checks. The Pi values are set separately
+by the homelab deployment; the chart does not select them.

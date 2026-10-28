@@ -342,6 +342,36 @@ jobs:
       tag: ${{ needs.github-release.outputs.tag }}
       variant: wasmtime-optimization
 
+  release-digests:
+    name: record published image digests
+    needs: [github-release, container-image, optimized-container-image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      digest: ${{ needs.container-image.outputs.digest }}
+      optimized-digest: ${{ needs.optimized-container-image.outputs.digest }}
+    steps:
+      - name: Append image digests to release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.github-release.outputs.tag }}
+          DIGEST: ${{ needs.container-image.outputs.digest }}
+          OPTIMIZED_DIGEST: ${{ needs.optimized-container-image.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          trap 'rm -f "$notes"' EXIT
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' > "$notes"
+          {
+            printf '\n## Container images\n\n'
+            printf 'ghcr.io/dekopon-agents/dekopon:%s %s\n' "$TAG" "$DIGEST"
+            printf 'ghcr.io/dekopon-agents/dekopon:%s-wasmtime-optimization %s\n' "$TAG" "$OPTIMIZED_DIGEST"
+          } | tee -a "$notes" >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+
   homebrew-tap:
     name: update Homebrew tap
     needs: github-release
