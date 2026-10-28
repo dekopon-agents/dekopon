@@ -8,6 +8,24 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## awk is a builtin and case patterns match globs (0.70.0)
+
+No configuration change is required.
+
+`awk` joins the reserved command words. A provider that declares an `awk` command word
+is now refused at load by `dekopon_core::command_word_conflicts`; if you run such a
+provider, rename its command word before upgrading.
+
+Scripts gain an `awk` builtin with a POSIX subset. Unsupported program constructs are
+refused at exit 2 before input is read; formats and field separators built at run time
+are checked when used. Unquoted `case` patterns now match globs (`*`, `?` and bracket
+expressions); quoted or escaped characters remain literal. The model-facing shell tool
+description advertises unquoted case globs.
+
+Downgrading to 0.69.0 is revert-safe: these changes migrate no state and require no
+configuration rollback. Scripts using `awk` or the newly supported `case` globs fail
+again on 0.69.0.
+
 ## Ambient pull-request links and improvement notes (0.69.0)
 
 No configuration change or provider re-pin is required.
