@@ -1136,19 +1136,19 @@ impl<'a> Unescaped<'a> {
     }
 }
 
-impl Read for Unescaped<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+impl BufRead for Unescaped<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
         let invalid = |_corrupt: JournalError| io::Error::from(io::ErrorKind::InvalidData);
         while self.served == self.out.len() {
             let Some(state) = self.state.as_mut() else {
-                return Ok(0);
+                return Ok(&[]);
             };
             if self.len == 0 {
                 self.state
                     .take()
                     .map_or(Ok(()), Unescaper::finish)
                     .map_err(invalid)?;
-                return Ok(0);
+                return Ok(&[]);
             }
             let count =
                 usize::try_from(self.len.min(self.raw.len() as u64)).unwrap_or(self.raw.len());
@@ -1165,9 +1165,20 @@ impl Read for Unescaped<'_> {
                 })
                 .map_err(invalid)?;
         }
-        let count = buf.len().min(self.out.len() - self.served);
-        buf[..count].copy_from_slice(&self.out[self.served..self.served + count]);
-        self.served += count;
+        Ok(&self.out[self.served..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.served = (self.served + amount).min(self.out.len());
+    }
+}
+
+impl Read for Unescaped<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let count = buf.len().min(available.len());
+        buf[..count].copy_from_slice(&available[..count]);
+        self.consume(count);
         Ok(count)
     }
 }
