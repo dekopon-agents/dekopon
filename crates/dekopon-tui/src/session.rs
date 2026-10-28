@@ -40,7 +40,7 @@ use dekopon_model::{
     openai::OpenAiClient,
 };
 use dekopon_process::CancelHandle;
-use dekopon_process::{CallBudget, Limits as ShellLimits};
+use dekopon_process::{CallBudget, Limits as ShellLimits, ShellThreads};
 use dekopon_protocol::Agent;
 use dekopon_shell::{
     CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandProposal, JobControl,
@@ -204,6 +204,7 @@ pub struct ConsoleOptions {
     pub prompt_limits: PromptLimits,
     /// Per-script interpreter bounds.
     pub shell_limits: ShellLimits,
+    pub shell_threads: ShellThreads,
     /// Replay window handed to the model.
     pub history_limits: HistoryLimits,
 }
@@ -211,7 +212,7 @@ pub struct ConsoleOptions {
 impl ConsoleOptions {
     /// The options `dekopon-console` runs with when only a subject and a model are named.
     #[must_use]
-    pub fn new(subject: ExternalSubject, model: String) -> Self {
+    pub fn new(subject: ExternalSubject, model: String, shell_threads: ShellThreads) -> Self {
         Self {
             catalog: None,
             socket: None,
@@ -236,6 +237,7 @@ impl ConsoleOptions {
                 max_capability_calls: 16,
             },
             shell_limits: ShellLimits::default(),
+            shell_threads,
             history_limits: HistoryLimits::default(),
         }
     }
@@ -674,6 +676,7 @@ pub async fn run_turn(
                 ),
                 limits: options.shell_limits,
                 calls,
+                threads: options.shell_threads.clone(),
             },
             events.clone(),
             sequence,

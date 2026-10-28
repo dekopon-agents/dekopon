@@ -406,7 +406,8 @@ pub(crate) mod test_support {
         use dekopon_process::{CallBudget, CancelSignal, Limits, TreeContext};
         let (handle, signal) = CancelSignal::pair();
         let limits = Limits::default();
-        let tree = TreeContext::new(limits, CallBudget::new(32)).with_cancel(vec![signal]);
+        let tree = TreeContext::new(limits, CallBudget::new(32), crate::test_threads())
+            .with_cancel(vec![signal]);
         let (mut writer, mut reader) = dekopon_process::pipe::pipe(
             None,
             None,
@@ -417,14 +418,21 @@ pub(crate) mod test_support {
             writer.write(b"x\n"),
             dekopon_process::pipe::WriteOutcome::Accepted
         );
+        let [permit] = tree.shell_threads().reserve().unwrap();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while tree.steps() == 0 {
-                    std::thread::yield_now();
-                }
-                handle.cancel();
-                let _outcome = writer.write(b"x\n");
-            });
+            permit
+                .spawn(
+                    scope,
+                    dekopon_process::ThreadName::new("sh-cancel-test"),
+                    || {
+                        while tree.steps() == 0 {
+                            std::thread::yield_now();
+                        }
+                        handle.cancel();
+                        let _outcome = writer.write(b"x\n");
+                    },
+                )
+                .unwrap();
             let mut budget = crate::limits::Budget::start_tree(limits, tree.clone());
             run(&mut reader, &mut budget)
         })
@@ -549,8 +557,8 @@ mod tests {
     #[test]
     fn every_builtin_answers_help_at_exit_zero_before_its_own_usage_rules_apply() {
         for name in names() {
-            let outcome =
-                Interpreter::new(Limits::default()).run(&format!("{name} --help"), &NoCapabilities);
+            let outcome = Interpreter::new(Limits::default(), crate::test_threads())
+                .run(&format!("{name} --help"), &NoCapabilities);
             assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{name}: {outcome:?}");
             assert!(
                 outcome.output.starts_with(&format!("{name}: ")),
@@ -562,7 +570,9 @@ mod tests {
 
     #[test]
     fn help_names_the_exact_flags_a_few_representative_builtins_accept() {
-        let run = |script: &str| Interpreter::new(Limits::default()).run(script, &NoCapabilities);
+        let run = |script: &str| {
+            Interpreter::new(Limits::default(), crate::test_threads()).run(script, &NoCapabilities)
+        };
 
         assert_eq!(
             run("grep --help").output,
@@ -583,8 +593,8 @@ mod tests {
 
     #[test]
     fn unsupported_flag_names_the_accepted_subset() {
-        let result =
-            Interpreter::new(Limits::default()).run("grep -o a <<EOF\na\nEOF", &NoCapabilities);
+        let result = Interpreter::new(Limits::default(), crate::test_threads())
+            .run("grep -o a <<EOF\na\nEOF", &NoCapabilities);
         assert_eq!(result.exit_code, ExitCode::SYNTAX);
         assert!(
             result.output.contains(
@@ -620,7 +630,8 @@ mod tests {
     #[test]
     fn curl_is_not_a_builtin_and_exits_127_even_with_an_http_capability_granted() {
         assert!(lookup("curl").is_none());
-        let outcome = Interpreter::new(Limits::default()).run("curl https://x", &HttpGranted);
+        let outcome = Interpreter::new(Limits::default(), crate::test_threads())
+            .run("curl https://x", &HttpGranted);
         assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{}", outcome.output);
         assert_eq!(outcome.output, "dekopon-shell: curl: command not found");
         assert_eq!(outcome.capability_calls, 0);

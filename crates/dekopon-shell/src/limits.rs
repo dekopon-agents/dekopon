@@ -3,7 +3,7 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use dekopon_process::{CallBudget, LimitExceeded, Limits, RetainedBytes, TreeContext};
+use dekopon_process::{LimitExceeded, Limits, RetainedBytes, TreeContext};
 
 #[derive(Debug)]
 pub struct Budget {
@@ -12,11 +12,16 @@ pub struct Budget {
 }
 
 impl Budget {
+    #[cfg(test)]
     #[must_use]
-    pub fn start(limits: Limits) -> Self {
+    pub(crate) fn start(limits: Limits) -> Self {
         Self::start_tree(
             limits,
-            TreeContext::new(limits, CallBudget::new(limits.max_capability_calls)),
+            TreeContext::new(
+                limits,
+                dekopon_process::CallBudget::new(limits.max_capability_calls),
+                crate::test_threads(),
+            ),
         )
     }
 

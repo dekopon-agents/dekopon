@@ -461,7 +461,8 @@ mod tests {
     #[test]
     fn progress_adds_no_script_output() {
         let notes = Notes::default();
-        let result = Interpreter::new(Limits::default()).run("progress \"x\"; echo done", &notes);
+        let result = Interpreter::new(Limits::default(), crate::test_threads())
+            .run("progress \"x\"; echo done", &notes);
         assert_eq!(result.exit_code, ExitCode::SUCCESS);
         assert_eq!(result.output, "done");
         assert_eq!(result.capability_calls, 0);

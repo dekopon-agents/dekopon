@@ -150,6 +150,11 @@ pub(crate) enum TransportEvent {
     Message(Box<InboundMessage>),
     Delivery(Box<InboundMessage>, github::AdmissionTicket),
     CancelRequested(CancelRequest),
+    FollowLeave {
+        transport: String,
+        conversation: Conversation,
+        received: tracing::Span,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,5 +1,5 @@
 #![cfg(unix)]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use dekopon_broker::{
     Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,

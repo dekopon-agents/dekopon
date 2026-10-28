@@ -1,6 +1,6 @@
 use crate::interp::telemetry::StageObservation;
 use dekopon_process::pipe::{PipeReader, ReadOutcome};
-use dekopon_process::{ExitCode, LimitExceeded};
+use dekopon_process::{ExitCode, LimitExceeded, ThreadName};
 use std::{
     io::{self, BufRead as _, Read as _, Write as _},
     process::{Command, Stdio},
@@ -228,6 +228,10 @@ fn worker_status(status: std::process::ExitStatus, stderr: &str) -> CommandFailu
 
 const STDERR_BYTES: u64 = 4096;
 
+const WRITER_THREAD: ThreadName = ThreadName::new("jq-write");
+const ERRORS_THREAD: ThreadName = ThreadName::new("jq-err");
+const READER_THREAD: ThreadName = ThreadName::new("jq-read");
+
 fn evaluate(
     mut opts: Options,
     input: &mut PipeReader<StageObservation>,
@@ -235,6 +239,7 @@ fn evaluate(
 
     emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
 ) -> Result<(), CommandFailure> {
+    let [writer_permit, errors_permit, reader_permit] = budget.tree().shell_threads().reserve()?;
     let (header, _header_charge) = request_header(&mut opts, budget)?;
     let path =
         executable().ok_or_else(|| CommandFailure::failed("jq: no worker executable supplied"))?;
@@ -262,83 +267,95 @@ fn evaluate(
         .stderr
         .take()
         .ok_or_else(|| CommandFailure::failed("jq: worker stderr missing"))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: evaluate, which joins the worker's writer, stderr and reader threads; bound: their three ShellThreads permits"
+    )]
     std::thread::scope(|scope| {
         let mut input_budget = budget.fork();
-        let writer = scope.spawn(
-            move || -> Result<Vec<dekopon_process::RetainedBytes>, CommandFailure> {
-                let mut stdin = io::BufWriter::new(stdin);
-                stdin.write_all(&header).map_err(input_error)?;
-                stdin.write_all(b"\n").map_err(input_error)?;
-                if opts.null_input {
-                    stdin.write_all(b"null\n").map_err(input_error)?;
-                    stdin.flush().map_err(input_error)?;
-                    return Ok(Vec::new());
-                }
-                if opts.slurp {
-                    let mut values = Vec::new();
-                    let mut charges = Vec::new();
-                    let retention = input_budget.fork();
-                    let mut source = PipeSource::new(input, &mut input_budget);
-                    loop {
-                        let item = serde_json::Deserializer::from_reader(&mut source)
-                            .into_iter::<Value>()
-                            .next();
-                        let value = match item {
-                            Some(Ok(value)) => value,
-                            Some(Err(error)) => {
-                                if let Some(failure) = source.failure {
-                                    return Err(failure.into());
-                                }
-                                return Err(CommandFailure::Status {
-                                    message: format!("jq: invalid JSON input: {error}"),
-                                    status: ExitCode::SYNTAX,
-                                });
-                            }
-                            None => break,
-                        };
-                        drop(source.charged.take());
-                        charges.push(retention.charge_value_bytes(weigh(&value))?);
-                        values.push(value);
-                    }
-                    if let Some(error) = source.failure {
-                        return Err(error.into());
-                    }
-                    serde_json::to_writer(&mut stdin, &values).map_err(|error| {
-                        CommandFailure::failed(format!("jq: worker input: {error}"))
-                    })?;
+        let writer = writer_permit
+            .spawn(
+                scope,
+                WRITER_THREAD,
+                move || -> Result<Vec<dekopon_process::RetainedBytes>, CommandFailure> {
+                    let mut stdin = io::BufWriter::new(stdin);
+                    stdin.write_all(&header).map_err(input_error)?;
                     stdin.write_all(b"\n").map_err(input_error)?;
-                    stdin.flush().map_err(input_error)?;
-                    return Ok(charges);
-                } else {
-                    while let ReadOutcome::Bytes(chunk) = input.read(input_budget.tree())? {
-                        stdin.write_all(&chunk).map_err(input_error)?;
+                    if opts.null_input {
+                        stdin.write_all(b"null\n").map_err(input_error)?;
                         stdin.flush().map_err(input_error)?;
-                        input_budget.charge_step()?;
+                        return Ok(Vec::new());
                     }
-                }
-                stdin.flush().map_err(input_error)?;
-                Ok(Vec::new())
-            },
-        );
-        let errors = scope.spawn(move || {
-            let mut stderr = stderr;
-            let mut excerpt = String::new();
-            let _excerpt_result = stderr
-                .by_ref()
-                .take(STDERR_BYTES)
-                .read_to_string(&mut excerpt);
-            let _drain_result = io::copy(&mut stderr, &mut io::sink());
-            excerpt
-        });
+                    if opts.slurp {
+                        let mut values = Vec::new();
+                        let mut charges = Vec::new();
+                        let retention = input_budget.fork();
+                        let mut source = PipeSource::new(input, &mut input_budget);
+                        loop {
+                            let item = serde_json::Deserializer::from_reader(&mut source)
+                                .into_iter::<Value>()
+                                .next();
+                            let value = match item {
+                                Some(Ok(value)) => value,
+                                Some(Err(error)) => {
+                                    if let Some(failure) = source.failure {
+                                        return Err(failure.into());
+                                    }
+                                    return Err(CommandFailure::Status {
+                                        message: format!("jq: invalid JSON input: {error}"),
+                                        status: ExitCode::SYNTAX,
+                                    });
+                                }
+                                None => break,
+                            };
+                            drop(source.charged.take());
+                            charges.push(retention.charge_value_bytes(weigh(&value))?);
+                            values.push(value);
+                        }
+                        if let Some(error) = source.failure {
+                            return Err(error.into());
+                        }
+                        serde_json::to_writer(&mut stdin, &values).map_err(|error| {
+                            CommandFailure::failed(format!("jq: worker input: {error}"))
+                        })?;
+                        stdin.write_all(b"\n").map_err(input_error)?;
+                        stdin.flush().map_err(input_error)?;
+                        return Ok(charges);
+                    } else {
+                        while let ReadOutcome::Bytes(chunk) = input.read(input_budget.tree())? {
+                            stdin.write_all(&chunk).map_err(input_error)?;
+                            stdin.flush().map_err(input_error)?;
+                            input_budget.charge_step()?;
+                        }
+                    }
+                    stdin.flush().map_err(input_error)?;
+                    Ok(Vec::new())
+                },
+            )
+            .map_err(unstarted)?;
+        let errors = errors_permit
+            .spawn(scope, ERRORS_THREAD, move || {
+                let mut stderr = stderr;
+                let mut excerpt = String::new();
+                let _excerpt_result = stderr
+                    .by_ref()
+                    .take(STDERR_BYTES)
+                    .read_to_string(&mut excerpt);
+                let _drain_result = io::copy(&mut stderr, &mut io::sink());
+                excerpt
+            })
+            .map_err(unstarted)?;
         let (sender, receiver) = sync_channel(0);
         let maximum = budget.max_value_bytes();
-        let reader = scope.spawn(move || {
-            if let Err(error) = read_outputs(stdout, maximum, opts.raw, &sender) {
-                let _sent = sender.send(ReadOutput::Invalid(format!(
-                    "jq: could not read worker output: {error}"
-                )));
-            }
-        });
+        let reader = reader_permit
+            .spawn(scope, READER_THREAD, move || {
+                if let Err(error) = read_outputs(stdout, maximum, opts.raw, &sender) {
+                    let _sent = sender.send(ReadOutput::Invalid(format!(
+                        "jq: could not read worker output: {error}"
+                    )));
+                }
+            })
+            .map_err(unstarted)?;
         let result = collect(&receiver, budget, opts.raw, emit);
         drop(receiver);
         if !matches!(result, Ok(true)) {
@@ -369,6 +386,10 @@ fn evaluate(
         };
         result.map(|_| ())
     })
+}
+
+fn unstarted(error: io::Error) -> CommandFailure {
+    CommandFailure::failed(format!("jq: could not start a worker thread: {error}"))
 }
 
 fn input_error(error: io::Error) -> CommandFailure {

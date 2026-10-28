@@ -16,25 +16,27 @@ pub struct ObservedRequest {
 
 #[derive(Debug)]
 struct State {
-    api_consumed: bool,
+    api_next: usize,
     guest: Option<Request>,
     requests: Vec<ObservedRequest>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Transport {
-    scripts: Arc<[(String, Response); 2]>,
+    api: Arc<(String, Box<[Response]>)>,
+    storage: Arc<(String, Response)>,
     maximum: u32,
     state: Arc<Mutex<State>>,
 }
 
 impl Transport {
-    pub fn new(api: (String, Response), storage: (String, Response), maximum: u32) -> Self {
+    pub fn new(api: (String, Vec<Response>), storage: (String, Response), maximum: u32) -> Self {
         Self {
-            scripts: Arc::new([api, storage]),
+            api: Arc::new((api.0, api.1.into_boxed_slice())),
+            storage: Arc::new(storage),
             maximum,
             state: Arc::new(Mutex::new(State {
-                api_consumed: false,
+                api_next: 0,
                 guest: None,
                 requests: Vec::new(),
             })),
@@ -48,10 +50,8 @@ impl Transport {
     pub(super) fn admit(&self, url: &Url) -> Result<(), HttpError> {
         if url.scheme() != "https"
             || url.port_or_known_default() != Some(443)
-            || !self
-                .scripts
-                .iter()
-                .any(|(host, _)| Some(host.as_str()) == url.host_str())
+            || ![self.api.0.as_str(), self.storage.0.as_str()]
+                .contains(&url.host_str().unwrap_or_default())
         {
             return Err(http_error(
                 ErrorCode::Denied,
@@ -73,25 +73,23 @@ impl Transport {
         body: &[u8],
     ) -> Result<reqwest::Response, HttpError> {
         self.admit(url)?;
-        let (index, (_, script)) = self
-            .scripts
-            .iter()
-            .enumerate()
-            .find(|(_, (host, _))| Some(host.as_str()) == url.host_str())
-            .ok_or_else(|| http_error(ErrorCode::Denied, "destination has no test script"))?;
         let mut state = self.state.lock();
-        if index == 0 && std::mem::replace(&mut state.api_consumed, true) {
-            return Err(http_error(
-                ErrorCode::Denied,
-                "test API script already consumed",
-            ));
-        }
         if state.requests.len() >= self.maximum as usize {
             return Err(http_error(
                 ErrorCode::HostCallLimit,
                 "test request limit exhausted",
             ));
         }
+        let script = if Some(self.api.0.as_str()) == url.host_str() {
+            let script =
+                self.api.1.get(state.api_next).ok_or_else(|| {
+                    http_error(ErrorCode::Denied, "test API script already consumed")
+                })?;
+            state.api_next += 1;
+            script
+        } else {
+            &self.storage.1
+        };
         let guest = state
             .guest
             .take()
@@ -154,20 +152,21 @@ mod tests {
     use super::*;
     use crate::{BufferedHttpClient, HttpHostCeilings};
 
-    fn script(host: &str, status: u16) -> (String, Response) {
-        (
-            host.to_owned(),
-            Response {
-                status,
-                headers: Vec::new(),
-                body: b"body".to_vec(),
-            },
-        )
+    fn response(status: u16) -> Response {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: b"body".to_vec(),
+        }
     }
 
     #[tokio::test]
-    async fn the_api_script_answers_once_per_transport() {
-        let transport = Transport::new(script("api.test", 302), script("storage.test", 200), 6);
+    async fn api_steps_answer_in_order_and_each_only_once() {
+        let transport = Transport::new(
+            ("api.test".to_owned(), vec![response(200), response(302)]),
+            ("storage.test".to_owned(), response(200)),
+            6,
+        );
         let mut client = BufferedHttpClient::authorized(
             HttpConstraints {
                 allowed_hosts: vec!["api.test".to_owned()],
@@ -191,9 +190,10 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
+        assert_eq!(client.send(get()).await.unwrap().status, 200);
         assert_eq!(client.send(get()).await.unwrap().status, 302);
         let error = client.send(get()).await.expect_err("api script is spent");
         assert_eq!(error.code, ErrorCode::Denied);
-        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(transport.requests().len(), 2);
     }
 }

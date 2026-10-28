@@ -22,6 +22,12 @@ disallowed-methods = [
     { path = "std::thread::Builder::spawn", reason = "a native thread needs an owner and a join; use spawn_blocking", allow-invalid = true },
     { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded mpsc::channel(N) and name the full-queue policy", allow-invalid = true },
     { path = "std::sync::mpsc::channel", reason = "use a bounded channel and name the full-queue policy", allow-invalid = true },
+    { path = "std::thread::scope", reason = "a scope's threads are admitted by ShellThreads; name the scope's owner and what bounds its threads", allow-invalid = true },
+    { path = "std::thread::Scope::spawn", reason = "an unnamed, unadmitted thread; spawn through a ShellThreads ThreadPermit", allow-invalid = true },
+    { path = "std::thread::Builder::spawn_scoped", reason = "a scoped thread skips ShellThreads admission; spawn through a ThreadPermit", allow-invalid = true },
+    { path = "tokio::runtime::Builder::new_multi_thread", reason = "a runtime is a thread pool; name its owner, its worker bound and its shutdown", allow-invalid = true },
+    { path = "tokio::runtime::Builder::new_current_thread", reason = "a runtime is a thread pool; name its owner, its worker bound and its shutdown", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::new", reason = "an unsized runtime spawns a worker per core; build one with a named worker bound", allow-invalid = true },
 ]
 allow-expect-in-tests = true
 
@@ -29,5 +35,7 @@ disallowed-types = [
     { path = "std::sync::Mutex", reason = "parking_lot is the workspace mutex: no poisoning (owner, 2026-09-30)" },
     { path = "std::sync::RwLock", reason = "parking_lot is the workspace mutex: no poisoning (owner, 2026-09-30)" },
     { path = "std::sync::Condvar", reason = "parking_lot is the workspace mutex: no poisoning (owner, 2026-09-30)" },
+    { path = "parking_lot::Condvar", reason = "a condvar wait has no deadline owner; prefer a bounded channel, watch or oneshot", allow-invalid = true },
+    { path = "reqwest::blocking::Client", reason = "the blocking client runs its own runtime thread; name its owner and bound", allow-invalid = true },
 
 ]

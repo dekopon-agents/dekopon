@@ -8,6 +8,56 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Slack routes can follow threads (0.64.0)
+
+No configuration change or provider re-pin is required for existing deployments.
+`follow: true` is a new opt-in on Slack channel and thread routes; omitted, `null`
+and `false` leave it disabled. It requires `sessions.journal` and the out-of-tree
+`dekopon-provider-follow` provider with reviewed grants. An authorized `follow stay`
+opens a shared ticket for the exact thread: unmentioned replies are batched, retaining
+each speaker's text, and each turn uses the newest speaker's fresh broker authorization.
+Other threads and unmentioned top-level messages remain inactive.
+
+Upgrade gatewayd to 0.64.0 before enabling Slack follow. Version 0.63.0 refuses
+`follow: true` on Slack routes at configuration validation; its existing Discord
+follow support is unchanged. Slack must deliver `message.channels`/`message.groups`
+with `channels:history`/`groups:history`; install or reinstall the app with the
+example manifest's scopes and events before opting in. Reaction-based leave also
+needs `reaction_added`, `reactions:read` and `users:read`.
+
+Shell threads now have short names visible in `ps`. A script needing more threads
+than the process allows is refused with a limit error before those threads start.
+The SDK lets providers declare up to 64 capabilities instead of 32; this is an SDK-only
+change and adds no wire, WIT or configuration change. Existing provider components
+continue to work without rebuilding.
+
+Reverting 0.64.0 to 0.63.0 is revert-safe for these changes only if no Slack route
+sets `follow: true`: disable or remove that opt-in before downgrading. Existing
+Discord follow routes may retain it. These changes do not change the follow ticket
+marker format or the provider wire and WIT contracts.
+
+## OTLP export is HTTP only (0.63.0)
+
+Before or with the upgrade, change `telemetry.transport: grpc` to `http` in brokerd,
+gatewayd and console configurations, or leave transport unset to use the new HTTP default.
+All three refuse `grpc` at configuration load. An endpoint that pointed at a gRPC receiver
+(typically port 4317) must move to that receiver's OTLP/HTTP endpoint (typically port 4318).
+HTTP export uses protobuf; use the receiver's configured endpoint rather than
+assuming its port.
+
+Existing production providers require no re-pin: these changes add no provider WIT, wire
+format or grant change. The shell builtin consolidation in #797 preserves operator-visible
+shell behavior, including command resolution and refusal messages. #801 changes only the
+testkit and its test transport: provider test suites that re-pin the testkit can pass ordered
+API responses to `signed_download`, with exactly one redirect; existing single-`HttpScript`
+calls remain accepted. Production provider components do not need rebuilding for it.
+
+Upgrade the binaries after preparing the telemetry configuration. Reverting 0.63.0 to
+0.62.0 is revert-safe for these changes when `transport: http` is explicit: that configuration
+loads on both versions, and no persisted-state or production wire format changed. Keep the
+OTLP/HTTP endpoint on downgrade. An omitted console transport defaults to gRPC in 0.62.0,
+so set `http` explicitly before reverting the console.
+
 ## Shell IFS handling in the bash tool (0.62.0)
 
 No configuration change or provider re-pin is required for existing deployments. Unquoted
