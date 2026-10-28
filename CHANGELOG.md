@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-10-28
+
+### Changed
+
+- an ambient PR link from an unmapped or denied poster is ignored without a thread reply
+- suggest_improvement has no three-per-session cap; its receipt is unnumbered and its description guides how many notes to send
+
+### Fixed
+
+- the memory notice tells the model that a tool call missing from replayed history is not evidence it did not run
+
+## [dekopon-chart-0.56.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.56.0 targets core v0.69.0 and renders the `v0.69.0` image tag.
+
 ## [0.68.0] - 2026-10-28
 
 ### Added

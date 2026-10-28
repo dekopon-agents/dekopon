@@ -8,6 +8,25 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Ambient pull-request links and improvement notes (0.69.0)
+
+No configuration change or provider re-pin is required.
+
+With `ambient.pullRequestLinks` enabled on a Slack route, a link from an unmapped or
+agent-denied poster gets no thread reply or reaction. The rejection is still recorded as
+`gateway_session_rejected` with message `gateway.session.rejected`, reason `unmapped-subject`
+or `agent-denied`, and `admission.trigger = "pull-request-link"`; the unmapped case retains
+its `audit.event = "gateway.session.rejected"` owner-notice selector. With no route enabling
+`ambient.pullRequestLinks`, this change is inert.
+
+`suggest_improvement` has no per-session cap and returns an unnumbered receipt. A private
+runaway stop still limits accepted notes to ten per message execution, and the existing
+text-field bounds remain. No persisted or per-conversation counter is introduced.
+
+Downgrading to 0.68.0 is revert-safe: these changes migrate no state and require no
+configuration rollback. The earlier ambient refusal replies and three-per-session
+suggestion cap return.
+
 ## Daemon thread pools can be sized (0.68.0)
 
 No configuration change or provider re-pin is required. Every new flag and chart value is
