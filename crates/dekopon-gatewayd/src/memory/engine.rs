@@ -84,24 +84,68 @@ impl Drop for CancelOnDrop {
     }
 }
 
+pub(crate) struct Dispatcher {
+    receiver: mpsc::Receiver<Queued>,
+    sender: Sender,
+    concurrency: NonZeroUsize,
+}
+
+pub(crate) fn channel(
+    journal: Arc<Journal>,
+    counts: Arc<Counts>,
+    queue: NonZeroUsize,
+    concurrency: NonZeroUsize,
+) -> (Sender, Dispatcher) {
+    let (tx, receiver) = mpsc::channel(queue.get());
+    let sender = Sender {
+        queue: tx,
+        journal,
+        counts,
+    };
+    let dispatcher = Dispatcher {
+        receiver,
+        sender: sender.clone(),
+        concurrency,
+    };
+    (sender, dispatcher)
+}
+
+impl Dispatcher {
+    pub(crate) fn start(
+        self,
+        current: CurrentGeneration,
+        models: Arc<ModelCache>,
+        owned_tasks: &mut JoinSet<()>,
+    ) {
+        let resources = Resources {
+            journal: Arc::clone(&self.sender.journal),
+            current,
+            models,
+            counts: Arc::clone(&self.sender.counts),
+        };
+        owned_tasks.spawn(dispatch(
+            Arc::new(resources),
+            self.receiver,
+            self.sender,
+            self.concurrency,
+        ));
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn spawn(
     resources: Resources,
     queue: NonZeroUsize,
     concurrency: NonZeroUsize,
     owned_tasks: &mut JoinSet<()>,
 ) -> Sender {
-    let (tx, rx) = mpsc::channel(queue.get());
-    let sender = Sender {
-        queue: tx,
-        journal: Arc::clone(&resources.journal),
-        counts: Arc::clone(&resources.counts),
-    };
-    owned_tasks.spawn(dispatch(
-        Arc::new(resources),
-        rx,
-        sender.clone(),
+    let (sender, dispatcher) = channel(
+        Arc::clone(&resources.journal),
+        Arc::clone(&resources.counts),
+        queue,
         concurrency,
-    ));
+    );
+    dispatcher.start(resources.current, resources.models, owned_tasks);
     sender
 }
 
