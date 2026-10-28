@@ -28,6 +28,10 @@ re-pin and no broker wire change. Before upgrading:
   under the pre-0.58.0 conversation stems, so conversation memory starts empty once and memory
   `session_id`s change once. Follow markers, seals and the prompt-cache secret are kept.
 - Journal-recall routes default `maxBytes` to 524288 instead of 65536.
+- `agent.model.prompt` is split into records of at most 16 KiB carrying `transcript.segment` and
+  `transcript.segments`; a query that read one prompt per model turn concatenates the segments of
+  a turn in order. `gateway_memory_selection` and `gateway_memory_deviation` are gone; the
+  [memory records](observability.md) replace them.
 - Reverting to 0.62.0 needs the configuration reverted too, and resets the new-format journals
   the same way. The drop is not revert-safe.
 

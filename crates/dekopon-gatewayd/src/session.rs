@@ -2830,8 +2830,12 @@ async fn session_turn(
                                 "memory.record.ids",
                                 &ids,
                                 || {
+                                    let slices =
+                                        crate::memory::project::file_slices(&projected.messages);
                                     tracing::info!(
                                         event = "gateway_memory_projection",
+                                        memory.generation =
+                                            snapshot.records.last().map(|head| head.header.turn.0),
                                         memory.rung.native = projected.rungs.native,
                                         memory.rung.summary = projected.rungs.summary,
                                         memory.rung.metadata = projected.rungs.metadata,
@@ -2839,6 +2843,8 @@ async fn session_turn(
                                         memory.opaque.dropped = projected.opaque_dropped,
                                         memory.repacked = projected.repacked,
                                         memory.bytes = projected.bytes,
+                                        memory.body.chunks = slices.count,
+                                        memory.body.file_bytes = slices.bytes,
                                         "gateway.memory.projection"
                                     );
                                 },

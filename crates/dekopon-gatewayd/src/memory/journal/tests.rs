@@ -895,3 +895,56 @@ fn the_directory_and_its_files_are_private_to_the_daemon() {
     assert_eq!(mode(&dir.join("reviewer")), 0o700);
     assert_eq!(mode(&journal.path(STEM)), 0o600);
 }
+
+#[test]
+fn published_and_expired_records_name_their_ids_and_reason() {
+    let (capture, _guard) = crate::tests::capture_spans();
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(dir.path());
+    let now = SystemTime::now();
+    let swept = append_turn(
+        &journal,
+        STEM,
+        now - 2 * RETENTION,
+        &captured("swept", Some("answer")),
+        Some(plan(2)),
+    );
+    let capped = append_user(&journal, STEM, now - Duration::from_secs(1), "capped");
+    let kept = append_user(&journal, STEM, now, "kept");
+    journal.maintain(STEM, now, 1);
+    let len = fs::metadata(journal.path(STEM)).unwrap().len();
+    journal.agent_bytes.insert("reviewer".to_owned(), len - 1);
+    journal.maintain(STEM, now, 1);
+    assert_eq!(header_ids(&journal.path(STEM)), [kept.0.get()]);
+
+    let records = capture.records();
+    let published: Vec<_> = records
+        .iter()
+        .filter(|record| record.field("event") == Some("gateway_memory_published"))
+        .collect();
+    assert_eq!(published.len(), 3);
+    assert_eq!(
+        published[0].field("memory.record.id"),
+        Some(swept.0.to_string().as_str())
+    );
+    assert_eq!(published[0].field("memory.record.items"), Some("2"));
+    assert_eq!(published[0].field("memory.slots.queued"), Some("2"));
+    let expired: Vec<_> = records
+        .iter()
+        .filter(|record| record.field("event") == Some("gateway_journal_expired"))
+        .map(|record| {
+            (
+                record.field("memory.expiry.reason").unwrap().to_owned(),
+                record.field("memory.records.evicted").unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        expired,
+        [
+            ("record-age".to_owned(), "1".to_owned()),
+            ("agent-cap".to_owned(), "1".to_owned())
+        ]
+    );
+    let _ = capped;
+}

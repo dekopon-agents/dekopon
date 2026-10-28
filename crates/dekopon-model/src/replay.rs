@@ -6,6 +6,12 @@ use crate::{
     text::Text,
 };
 
+#[derive(Clone, Copy)]
+enum Reasoning<'a> {
+    Admit(Option<&'a ModelKey>),
+    Mark,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayCall {
     pub id: ToolCallId,
@@ -199,6 +205,19 @@ impl ReplayMessage {
         model: Option<&ModelKey>,
         cache: Option<&crate::openai::CacheControl>,
     ) -> Result<(), serde_json::Error> {
+        self.encode_chat(body, Reasoning::Admit(model), cache)
+    }
+
+    pub(crate) fn transcript(&self, body: &mut JsonBody) -> Result<(), serde_json::Error> {
+        self.encode_chat(body, Reasoning::Mark, None)
+    }
+
+    fn encode_chat(
+        &self,
+        body: &mut JsonBody,
+        reasoning_for: Reasoning<'_>,
+        cache: Option<&crate::openai::CacheControl>,
+    ) -> Result<(), serde_json::Error> {
         body.raw(b"{\"role\":");
         body.value(self.role())?;
         match self {
@@ -239,14 +258,22 @@ impl ReplayMessage {
                     body.raw(b"]");
                 }
                 let mut first = true;
-                for item in reasoning.iter().filter(|item| model == Some(&item.model)) {
+                for item in reasoning.iter().filter(|item| match reasoning_for {
+                    Reasoning::Admit(model) => model == Some(&item.model),
+                    Reasoning::Mark => true,
+                }) {
                     if first {
                         body.raw(b",\"reasoning_details\":[");
                         first = false;
                     } else {
                         body.raw(b",");
                     }
-                    body.source(&item.value);
+                    match reasoning_for {
+                        Reasoning::Admit(_) => body.source(&item.value),
+                        Reasoning::Mark => {
+                            body.value(&format!("[opaque {} B]", item.value.len()))?;
+                        }
+                    }
                 }
                 if !first {
                     body.raw(b"]");

@@ -530,3 +530,36 @@ pub(crate) fn decider_labels(head: &Head) -> Vec<Rung> {
     labels.push(Rung::Metadata);
     labels
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FileSlices {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+pub(crate) fn file_slices(messages: &[ModelMessage]) -> FileSlices {
+    let mut slices = FileSlices::default();
+    let mut add = |text: &Text| match text {
+        Text::File { len, .. } => {
+            slices.count += 1;
+            slices.bytes += len;
+        }
+        Text::Owned(_) | Text::Opaque(_) => {}
+    };
+    for message in messages {
+        match message {
+            ModelMessage::Journal { message } => match message {
+                ReplayMessage::User(texts) => texts.iter().for_each(&mut add),
+                ReplayMessage::Assistant { content, calls, .. } => {
+                    content.iter().for_each(&mut add);
+                    calls.iter().for_each(|call| add(&call.arguments));
+                }
+                ReplayMessage::Tool { text, .. } => add(text),
+            },
+            ModelMessage::System { .. }
+            | ModelMessage::User { .. }
+            | ModelMessage::Assistant { .. }
+            | ModelMessage::ToolResults { .. } => {}
+        }
+    }
+    slices
+}

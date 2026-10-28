@@ -434,7 +434,7 @@ impl ModelKey {
         self
     }
 
-    pub(crate) fn reported(&self) -> Option<&str> {
+    pub fn reported(&self) -> Option<&str> {
         self.reported.as_ref().map(|model| model.0.as_str())
     }
 

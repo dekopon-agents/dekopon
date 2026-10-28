@@ -12,7 +12,7 @@ use dekopon_model::model::{
     ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool, ModelToolCall,
     assistant_message,
 };
-use dekopon_model::{ModelText, TurnEvent};
+use dekopon_model::{ModelText, TurnEvent, transcript::TranscriptSegments};
 use dekopon_model_token_governor::ModelUsage;
 use dekopon_shell::ScriptOutcome;
 use serde::{Deserialize, de::IgnoredAny};
@@ -824,11 +824,10 @@ where
             model.complete(&request_messages, &model_tools, options, &mut on_event)
         };
         drop(asset_request);
-        let prepared = request_messages
+        let prepared: Vec<ModelMessage> = request_messages
             .iter()
-            .map(|message| serde_json::to_value(message.prepared_for_trace()))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap_or_else(|_| vec![json!("<unserializable>")]);
+            .map(|message| message.prepared_for_trace().into_owned())
+            .collect();
         let start = if prepared.get(..transcribed.len()) == Some(transcribed.as_slice()) {
             transcribed.len()
         } else {
@@ -836,18 +835,33 @@ where
         };
         let scope = if start == 0 { "full" } else { "delta" };
         let definitions = (start == 0).then_some(tool_definitions.as_str());
-        tracing::info!(
-            target: "dekopon_agent::audit",
-            {
-                audit.event = "agent.model.prompt",
-                model.turn = model_turns,
-                transcript.scope = scope,
-                message.count = messages.len(),
-                gen_ai.tool.definitions = definitions,
-                messages = %transcript(&prepared[start..]),
-            },
-            "agent.model.prompt"
-        );
+        let transcript = ModelMessage::transcript_segments(&prepared[start..]);
+        let segments = transcript.as_ref().map_or(1, TranscriptSegments::count);
+        let messages_len = messages.len();
+        let mut prompt_segment = |segment: u64, text: &str| {
+            tracing::info!(
+                target: "dekopon_agent::audit",
+                {
+                    audit.event = "agent.model.prompt",
+                    model.turn = model_turns,
+                    transcript.scope = scope,
+                    transcript.segment = segment,
+                    transcript.segments = segments,
+                    message.count = messages_len,
+                    gen_ai.tool.definitions = definitions.filter(|_| segment == 1),
+                    messages = text,
+                },
+                "agent.model.prompt"
+            );
+        };
+        match transcript {
+            Ok(transcript) => {
+                if let Err(error) = transcript.emit(&mut prompt_segment) {
+                    tracing::warn!(io.kind = %error.kind(), "agent.model.prompt.incomplete");
+                }
+            }
+            Err(_unserializable) => prompt_segment(1, "<unserializable>"),
+        }
         transcribed = prepared;
         stream.record_on(&model_span);
         let turn = match completion {
@@ -1973,10 +1987,6 @@ fn record_usage(span: &tracing::Span, usage: &ModelUsage) {
     if let Some(tokens) = usage.total_tokens {
         span.record("usage.total_tokens", tokens);
     }
-}
-
-fn transcript(messages: &[Value]) -> String {
-    serde_json::to_string(messages).unwrap_or_else(|_| "<unserializable>".to_owned())
 }
 
 fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
