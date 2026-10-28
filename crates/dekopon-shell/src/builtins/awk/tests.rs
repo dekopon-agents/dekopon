@@ -1,6 +1,6 @@
 use super::{
     AwkError, ChargedRegex, RuntimeError, compile, lex,
-    parse::{self, Binary, ExprKind, Refusal, StmtKind, Unary},
+    parse::{self, Binary, ExprKind, GawkSyntax, GawkVariable, Refusal, StmtKind, Unary},
 };
 use crate::{
     builtins::{CommandFailure, FatalError},
@@ -11,13 +11,14 @@ use dekopon_process::{ExitCode, LimitExceeded, Limits};
 fn refused(source: &str) -> Refusal {
     match compile(source, &Budget::start(Limits::default())).unwrap_err() {
         AwkError::Refused(refusal) => refusal,
-        other => panic!("expected a refusal for {source:?}, got {other:?}"),
+        other @ (AwkError::Syntax { .. } | AwkError::Runtime(_) | AwkError::Limit(_)) => {
+            panic!("expected a refusal for {source:?}, got {other:?}")
+        }
     }
 }
 
-#[test]
-fn every_refusal_class_has_its_exact_message() {
-    let cases = [
+fn language_refusals() -> Vec<(Refusal, &'static str)> {
+    vec![
         (
             Refusal::Getline,
             "awk: `getline` is not supported: awk reads only its one input, one record per rule pass; write a rule per record, or join inputs with the shell before the pipe",
@@ -67,11 +68,11 @@ fn every_refusal_class_has_its_exact_message() {
             "awk: `ENVIRON` is not supported: awk sees only its input and its -v assignments; pass values with `-v name=value`",
         ),
         (
-            Refusal::GawkVariable("IGNORECASE".into()),
+            Refusal::GawkVariable(GawkVariable::IgnoreCase),
             "awk: `IGNORECASE` is a gawk variable and is not supported; for case-insensitive matching compare `tolower($0) ~ /re/`",
         ),
         (
-            Refusal::GawkVariable("FPAT".into()),
+            Refusal::GawkVariable(GawkVariable::Fpat),
             "awk: `FPAT` is a gawk variable and is not supported; use FS, split() or substr()",
         ),
         (
@@ -87,11 +88,11 @@ fn every_refusal_class_has_its_exact_message() {
             "awk: `nextfile` is not supported: awk has one input; use `exit` to stop reading",
         ),
         (
-            Refusal::GawkSyntax("switch".into()),
+            Refusal::GawkSyntax(GawkSyntax::Switch),
             "awk: `switch` is a gawk extension and is not supported; use if/else",
         ),
         (
-            Refusal::GawkSyntax("BEGINFILE".into()),
+            Refusal::GawkSyntax(GawkSyntax::BeginFile),
             "awk: `BEGINFILE` is a gawk extension and is not supported; awk has one input",
         ),
         (
@@ -106,6 +107,11 @@ fn every_refusal_class_has_its_exact_message() {
             Refusal::ScalarArray("x".into()),
             "awk: `x` is used both as an array and as a scalar",
         ),
+    ]
+}
+
+fn boundary_refusals() -> Vec<(Refusal, &'static str)> {
+    vec![
         (
             Refusal::Option("-f".into()),
             "awk: option not yet supported: -f (supported: -F SEP -v NAME=VALUE)",
@@ -173,8 +179,12 @@ fn every_refusal_class_has_its_exact_message() {
             },
             "awk: `printf` width 4097 is more than 4096; use a width of at most 4096",
         ),
-    ];
-    for (refusal, expected) in cases {
+    ]
+}
+
+#[test]
+fn every_refusal_class_has_its_exact_message() {
+    for (refusal, expected) in language_refusals().into_iter().chain(boundary_refusals()) {
         assert_eq!(
             CommandFailure::from(AwkError::Refused(refusal)),
             CommandFailure::Status {
@@ -183,7 +193,9 @@ fn every_refusal_class_has_its_exact_message() {
             }
         );
     }
-    let dynamic = lex::validate_format("sprintf", "%.4097f").unwrap_err();
+    let AwkError::Refused(dynamic) = lex::validate_format("sprintf", "%.4097f").unwrap_err() else {
+        panic!("format bound refusal");
+    };
     assert_eq!(CommandFailure::from(AwkError::Runtime(RuntimeError { refusal: dynamic, record: 7.0 })), CommandFailure::Status {
         message: "awk: `sprintf` precision 4097 is more than 4096; use a precision of at most 4096 (record 7)".into(), status: ExitCode::SYNTAX,
     });
@@ -206,14 +218,17 @@ fn program_constructs_select_their_refusal_variants() {
         ("{RS=1}", Refusal::RecordSeparator),
         ("{OFMT}", Refusal::NumberFormat("OFMT".into())),
         ("{ENVIRON[1]}", Refusal::Environment("ENVIRON".into())),
-        ("{IGNORECASE=1}", Refusal::GawkVariable("IGNORECASE".into())),
+        (
+            "{IGNORECASE=1}",
+            Refusal::GawkVariable(GawkVariable::IgnoreCase),
+        ),
         ("{a[i,j]}", Refusal::MultiSubscript),
         ("{(i,j) in a}", Refusal::MultiSubscript),
         ("{SUBSEP}", Refusal::MultiSubscript),
         ("{x**=2}", Refusal::PowerSpelling),
         ("{nextfile}", Refusal::Nextfile),
-        ("BEGINFILE{}", Refusal::GawkSyntax("BEGINFILE".into())),
-        ("@include \"x\"", Refusal::GawkSyntax("@include".into())),
+        ("BEGINFILE{}", Refusal::GawkSyntax(GawkSyntax::BeginFile)),
+        ("@include \"x\"", Refusal::GawkSyntax(GawkSyntax::Include)),
         ("BEGIN{next}", Refusal::NextOutsideRule),
         ("END{next}", Refusal::NextOutsideRule),
         ("{x; x[1]}", Refusal::ScalarArray("x".into())),
@@ -383,7 +398,10 @@ fn groups_compile_non_capturing() {
         assert_eq!(lex::rewrite_regex(source).unwrap(), source);
         let regex = ChargedRegex::compile(source, &budget).unwrap();
         assert_eq!(regex.regex.captures_len(), 1);
-        if source != "[^(]" {
+        if source == "[^(]" {
+            assert!(!regex.regex.is_match("("));
+            assert!(regex.regex.is_match("a"));
+        } else {
             assert!(regex.regex.is_match("("));
         }
         if source == r"[\](]" {
@@ -447,4 +465,120 @@ fn syntax_errors_and_static_array_checks_are_typed() {
         program.program.rules[0].action.as_ref().unwrap().kind,
         StmtKind::Block(_)
     ));
+}
+
+#[test]
+fn action_boundaries_and_do_while_newlines_keep_following_statements() {
+    let program = compile(
+        "BEGIN{do x++;while(x<2)\nprint x} {print $1} END{print NR}",
+        &Budget::start(Limits::default()),
+    )
+    .unwrap()
+    .program;
+    assert_eq!(program.rules.len(), 3);
+    let StmtKind::Block(statements) = &program.rules[0].action.as_ref().unwrap().kind else {
+        panic!("block");
+    };
+    assert_eq!(statements.len(), 2);
+    assert!(matches!(statements[0].kind, StmtKind::Do(_, _)));
+    assert!(matches!(statements[1].kind, StmtKind::Print(_)));
+    assert_eq!(refused("BEGIN{} BEGIN{system (1)}"), Refusal::Process);
+    assert_eq!(
+        refused("{close (1)}"),
+        Refusal::StreamFunction("close".into())
+    );
+    assert!(matches!(
+        compile("BEGIN{\n split(x, 1)\n}", &Budget::start(Limits::default())),
+        Err(AwkError::Syntax {
+            line: 2,
+            column: 11,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn literal_format_bounds_apply_through_the_program_parser() {
+    for (function, dimension, format, source) in [
+        ("printf", "width", "%4097s", "BEGIN{printf \"%4097s\", x}"),
+        (
+            "sprintf",
+            "precision",
+            "%.4097f",
+            "BEGIN{x=sprintf(\"%.4097f\", 1)}",
+        ),
+    ] {
+        assert_eq!(
+            refused(source),
+            Refusal::FormatBound {
+                function: function.into(),
+                dimension: dimension.into(),
+                value: "4097".into()
+            }
+        );
+        assert!(matches!(
+            lex::validate_format(function, format),
+            Err(AwkError::Refused(Refusal::FormatBound { .. }))
+        ));
+    }
+    assert_eq!(lex::validate_format("printf", "%4096.4096f"), Ok(()));
+    assert_eq!(
+        lex::validate_format("printf", "%999999999999999999999999s"),
+        Err(AwkError::Refused(Refusal::FormatBound {
+            function: "printf".into(),
+            dimension: "width".into(),
+            value: "999999999999999999999999".into()
+        }))
+    );
+}
+
+#[test]
+fn malformed_formats_are_syntax_errors_at_the_literal() {
+    for format in ["%", "%5", "%.3", "%+"] {
+        let program = format!("BEGIN{{\n printf \"{format}\"\n}}");
+        assert!(matches!(
+            compile(&program, &Budget::start(Limits::default())),
+            Err(AwkError::Syntax {
+                line: 2,
+                column: 9,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn block_nodes_and_empty_statements_count_toward_height() {
+    let source = format!("{};{}", "{".repeat(31), "}".repeat(31));
+    let program = compile(&source, &Budget::start(Limits::default())).unwrap();
+    assert_eq!(program.program.rules[0].action.as_ref().unwrap().height, 32);
+    assert_eq!(refused(&format!("{{{source}}}")), Refusal::AstHeight);
+}
+
+#[test]
+fn literal_regex_source_and_nesting_are_bounded() {
+    assert!(matches!(
+        refused(&format!("/{}/", "x".repeat(1025))),
+        Refusal::Regex(_)
+    ));
+    assert!(matches!(
+        refused(&format!("/{}x{}/", "(".repeat(17), ")".repeat(17))),
+        Refusal::Regex(_)
+    ));
+}
+
+#[test]
+fn parser_thread_admission_is_a_fatal_limit_and_refunds_the_stack() {
+    let limits = Limits::default();
+    let tree = dekopon_process::TreeContext::new(
+        limits,
+        dekopon_process::CallBudget::new(1),
+        crate::test_threads_up_to(0),
+    );
+    let budget = Budget::start_tree(limits, tree);
+    assert!(matches!(
+        compile("1", &budget),
+        Err(AwkError::Limit(LimitExceeded::ShellThreads { maximum: 0 }))
+    ));
+    assert_eq!(budget.value_bytes(), 0);
 }

@@ -1,4 +1,7 @@
-use super::{AwkError, parse::Refusal};
+use super::{
+    AwkError,
+    parse::{GawkSyntax, Refusal},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Symbol {
@@ -187,8 +190,11 @@ impl<'a> Lexer<'a> {
                     self.take();
                 }
                 let name = &self.source[start..self.offset];
-                if name == "@include" || name == "@load" {
-                    return Err(Refusal::GawkSyntax(name.to_owned()).into());
+                if name == "@include" {
+                    return Err(Refusal::GawkSyntax(GawkSyntax::Include).into());
+                }
+                if name == "@load" {
+                    return Err(Refusal::GawkSyntax(GawkSyntax::Load).into());
                 }
                 return Err(self
                     .token(Kind::End, start, line, column)
@@ -460,7 +466,7 @@ pub(super) fn rewrite_regex(source: &str) -> Result<String, Refusal> {
     Ok(output)
 }
 
-pub(super) fn validate_format(function: &str, format: &str) -> Result<(), Refusal> {
+pub(super) fn validate_format(function: &str, format: &str) -> Result<(), AwkError> {
     let mut chars = format.char_indices().peekable();
     while let Some((_, c)) = chars.next() {
         if c != '%' {
@@ -481,7 +487,7 @@ pub(super) fn validate_format(function: &str, format: &str) -> Result<(), Refusa
                 chars.next();
             }
             if chars.peek().is_some_and(|(_, c)| *c == '*') {
-                return Err(Refusal::FormatStar);
+                return Err(Refusal::FormatStar.into());
             }
             let start = chars.peek().map_or(format.len(), |(at, _)| *at);
             let mut value = 0_u32;
@@ -498,16 +504,23 @@ pub(super) fn validate_format(function: &str, format: &str) -> Result<(), Refusa
                     function: function.into(),
                     dimension: dimension.into(),
                     value: format[start..end].into(),
-                });
+                }
+                .into());
             }
         }
         if let Some((_, c)) = chars.next() {
             if c == '*' {
-                return Err(Refusal::FormatStar);
+                return Err(Refusal::FormatStar.into());
             }
             if !"cdiouxXeEfFgGs%".contains(c) {
-                return Err(Refusal::FormatConversion(c));
+                return Err(Refusal::FormatConversion(c).into());
             }
+        } else {
+            return Err(AwkError::Syntax {
+                line: 1,
+                column: format.chars().count() + 1,
+                expected: "a conversion after `%`".into(),
+            });
         }
     }
     Ok(())
