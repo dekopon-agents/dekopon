@@ -951,7 +951,6 @@ dependencies = [
 name = "dekopon-agent"
 version = "0.62.0"
 dependencies = [
- "arc-swap",
  "base64 0.23.1",
  "dekopon-broker-protocol",
  "dekopon-capability",
