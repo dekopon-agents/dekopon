@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-10-28
+
+### Added
+
+- release notes list the published container image digests
+- --worker-threads, --blocking-threads, --blocking-keep-alive, --cpu-threads and --shell-threads, with chart values
+
+## [dekopon-chart-0.55.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.55.0 targets core v0.68.0 and renders the `v0.68.0` image tag.
+
+### Added
+
+- Optional `gateway.runtime` and `broker.runtime` values size worker threads, blocking threads and blocking keep-alive, plus gateway shell threads and broker CPU threads; unset or null values render no daemon flags.
+
 ## [0.67.0] - 2026-10-28
 
 ### Added
