@@ -1974,8 +1974,13 @@ fn case_posix_bracket_constructs_are_refused_by_name() {
             "[[.a.]]",
             "`case` POSIX collating symbols are not supported",
         ),
+        ("[[.a]", "`case` POSIX collating symbols are not supported"),
         (
             "[[=a=]]",
+            "`case` POSIX equivalence classes are not supported",
+        ),
+        (
+            "[[=a]",
             "`case` POSIX equivalence classes are not supported",
         ),
     ] {

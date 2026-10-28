@@ -114,7 +114,9 @@ pub(super) fn matches(
         tokens.push(token);
         index += 1;
     }
-    let subject = subject.chars().collect::<Vec<_>>();
+    let mut characters = Vec::with_capacity(subject.len());
+    characters.extend(subject.chars());
+    let subject = characters;
     let mut previous = vec![false; subject.len() + 1];
     let mut next = vec![false; subject.len() + 1];
     previous[0] = true;
@@ -140,20 +142,19 @@ pub(super) fn matches(
 
 fn reject_posix(contents: &[PatternChar]) -> Result<(), UnsupportedBracket> {
     for (index, pair) in contents.windows(2).enumerate() {
-        if index + 2 >= contents.len() {
-            continue;
-        }
         let opener = pair[0];
         let marker = pair[1];
-        if !opener.is_unquoted('[')
-            || !contents
-                .last()
-                .is_some_and(|last| last.is_unquoted(marker.character()))
-        {
+        if !opener.is_unquoted('[') {
             continue;
         }
         match marker {
-            PatternChar::Unquoted(':') => return Err(UnsupportedBracket::Class),
+            PatternChar::Unquoted(':') => {
+                if index + 2 < contents.len()
+                    && contents.last().is_some_and(|last| last.is_unquoted(':'))
+                {
+                    return Err(UnsupportedBracket::Class);
+                }
+            }
             PatternChar::Unquoted('.') => return Err(UnsupportedBracket::Collating),
             PatternChar::Unquoted('=') => return Err(UnsupportedBracket::Equivalence),
             PatternChar::Unquoted(_) | PatternChar::Literal(_) => {}
