@@ -15,6 +15,7 @@ use ureq::{Agent, config::ConfigBuilder, typestate::AgentScope};
 pub mod asset;
 
 pub mod blocking;
+pub mod body;
 pub mod chatgpt;
 pub mod codex;
 pub mod control;
@@ -28,10 +29,13 @@ mod mock;
 pub mod model;
 pub mod openai;
 pub mod openrouter;
+pub mod replay;
 mod sse;
 pub mod stream;
+pub mod text;
 #[cfg(test)]
 mod trace_capture;
+pub mod transcript;
 pub mod wire;
 
 pub use stream::{ModelText, TranscriptDialect, TurnEvent, events_from_transcript};

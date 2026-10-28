@@ -938,7 +938,6 @@ dependencies = [
 name = "dekopon-agent"
 version = "0.64.0"
 dependencies = [
- "arc-swap",
  "base64 0.23.1",
  "dekopon-broker-protocol",
  "dekopon-capability",
@@ -1238,10 +1237,12 @@ name = "dekopon-model"
 version = "0.64.0"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
  "dekopon-core",
  "dekopon-model-token-governor",
  "futures-util",
  "http",
+ "http-body",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
