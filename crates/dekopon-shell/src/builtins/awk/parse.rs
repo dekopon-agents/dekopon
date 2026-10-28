@@ -648,7 +648,6 @@ impl Parser<'_> {
             || self.token.kind == TokenKind::Newline
             || self.at(Punct::Semi)
             || self.at(Punct::RBrace)
-            || self.name() == Some("else")
     }
     fn statement(&mut self, depth: u8) -> Result<Stmt, AwkError> {
         let depth = deeper(depth)?;
@@ -704,7 +703,9 @@ impl Parser<'_> {
                         return self.error("while after a do body");
                     }
                     self.advance()?;
-                    let condition = self.condition(depth)?;
+                    self.require(Punct::LParen)?;
+                    let condition = self.expression(0, depth, ExprContext::Normal)?;
+                    self.require(Punct::RParen)?;
                     StmtKind::Do(Box::new(body), condition)
                 }
                 "for" => return self.for_statement(depth),
@@ -769,10 +770,10 @@ impl Parser<'_> {
             | StmtKind::Block(_)
             | StmtKind::If(_, _, _)
             | StmtKind::While(_, _)
-            | StmtKind::Do(_, _)
             | StmtKind::For(_, _, _, _)
             | StmtKind::ForIn(_, _, _) => {}
             StmtKind::Expr(_)
+            | StmtKind::Do(_, _)
             | StmtKind::Print(_, _)
             | StmtKind::Break
             | StmtKind::Continue
@@ -893,6 +894,8 @@ impl Parser<'_> {
                     let h = first.height;
                     let group = Expr::new(ExprKind::Group(Box::new(first)), h)?;
                     list.push(self.tail(group, 0, deeper(depth)?, ExprContext::Print)?);
+                } else if self.at(Punct::Comma) {
+                    return self.error("the end of a parenthesized print list");
                 }
             } else {
                 list.push(self.expression(0, depth, ExprContext::Print)?);

@@ -294,6 +294,9 @@ fn the_program_shape_preserves_source_order_and_ranges() {
         "/[/]/",
         "/[[:alpha:]/]/",
         "0 ? 1 : x=2",
+        "BEGIN{do{}while(0)}",
+        "BEGIN{if(1){}else{}}",
+        "BEGIN{print(1),2}",
         "\"x\" ++b",
         "\"x\" --b",
         "{x = 8 / 2; x /= 2}",
@@ -401,6 +404,11 @@ fn syntax_errors_preserve_line_and_column() {
         "{sub(/x/,1,2)}",
         "{(1)++}",
         "{break}",
+        "{do{}while(0) print 2}",
+        "{if(1) print 1 else print 2}",
+        "{if(1) exit else print 2}",
+        "{print(1,2),3}",
+        "{printf(\"%s\",1),2}",
     ] {
         assert!(
             matches!(
