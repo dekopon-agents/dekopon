@@ -3,7 +3,10 @@ use std::ops::Range;
 use dekopon_process::{LimitExceeded, RetainedBytes};
 use serde_json::Value;
 
-use super::{Evaluator, ExpansionOutput, ParameterExpansion, quoted_text, render_number};
+use super::{
+    Evaluator, ExpansionOutput, ParameterExpansion, PreservedFieldContext, quoted_text,
+    render_number,
+};
 use crate::{
     ast::{Parameter, Word, WordPart},
     builtins::CommandFailure,
@@ -350,7 +353,7 @@ impl Evaluator<'_> {
                     had_quoted_null |= text.is_empty();
                 }
                 WordPart::DoubleQuoted(parts) => {
-                    let expanded = self.expand_quoted(parts)?;
+                    let expanded = self.expand_quoted(parts, PreservedFieldContext::CasePattern)?;
                     let text = expanded.fields.first().map_or("", String::as_str);
                     pattern.append_quoted(text, context)?;
                     had_quoted_null |= text.is_empty() || expanded.quoted_at;

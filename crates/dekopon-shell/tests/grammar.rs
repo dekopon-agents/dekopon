@@ -1844,6 +1844,78 @@ fn a_case_pattern_assembled_at_run_time_matches_as_a_glob() {
 
 const CASE_GLOB_ROWS: &[(&str, &str)] = &[
     (
+        "unset p q; f() { case 'xa' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f ''",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xva' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v",
+        "no",
+    ),
+    (
+        "unset p q; f() { case 'xv' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v w",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'x' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f '' w",
+        "yes",
+    ),
+    (
+        "unset p; q=z; f() { case 'xza' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "no",
+    ),
+    (
+        "unset p; q=z; f() { case 'xz\u{7f}a' in \"x${q:-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v",
+        "yes",
+    ),
+    (
+        "unset p; q=z; f() { case 'xa' in \"x${q:+$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p; q=z; f() { case 'xa' in \"x${q:+$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f ''",
+        "yes",
+    ),
+    (
+        "unset p; q=z; f() { case 'xva' in \"x${q:+$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v",
+        "yes",
+    ),
+    (
+        "unset p; q=z; f() { case 'xv' in \"x${q:+$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v w",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'x\u{7f}a' in \"x${q:+$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v",
+        "yes",
+    ),
+    (
+        "unset p; q=''; f() { case 'x\u{7f}a' in \"x${q-$@}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v",
+        "yes",
+    ),
+    (
+        "unset p q r; f() { case 'xa' in \"x${q:-${r:-$@}}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p q r; f() { case 'xv' in \"x${q:-${r:-$@}}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v w",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xv' in \"x${q:-\"$@\"}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v w",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xprev' in \"x${q:-pre$@post}\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f v w",
+        "yes",
+    ),
+    (
         "unset p; f() { case a in ''${p:-\"$@\"}a) echo yes ;; *) echo no ;; esac; }; f '' q",
         "no",
     ),
