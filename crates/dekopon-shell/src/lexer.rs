@@ -139,16 +139,10 @@ impl std::fmt::Display for LexError {
             Self::ExpectedHereDelimiter => formatter.write_str("expected a here-document delimiter after `<<`, as in `cat <<EOF`"),
             Self::PositionalOutOfRange { digits } => write!(formatter, "positional parameter ${digits} is out of range"),
             Self::EmptyParameter => formatter.write_str("empty ${} parameter reference"),
-            Self::IndexAfterAll { name } => write!(formatter,
-                        "${{{name}[@]}} selects every element, so it cannot be indexed further"
-                    ),
+            Self::IndexAfterAll { name } => write!(formatter, "${{{name}[@]}} selects every element, so it cannot be indexed further"),
             Self::UnterminatedParameter => formatter.write_str("unterminated ${} parameter reference"),
-            Self::LengthWithTransformation { name, first } => write!(formatter,
-                    "${{#{name}{first}...}} combines a length with a transformation; ask for one or the other"
-                ),
-            Self::ColonInPattern { name, operator } => write!(formatter,
-                        "`${{{name}:{operator}...}}` is not a parameter expansion; drop the colon"
-                    ),
+            Self::LengthWithTransformation { name, first } => write!(formatter, "${{#{name}{first}...}} combines a length with a transformation; ask for one or the other"),
+            Self::ColonInPattern { name, operator } => write!(formatter, "`${{{name}:{operator}...}}` is not a parameter expansion; drop the colon"),
             Self::UnsupportedParameter { name, colon, other } => write!(formatter,
                         "unsupported ${{{name}{}{other}...}} parameter expansion; this shell keeps \
                          ${{NAME}}, ${{NAME[index]}}, ${{#NAME}}, `:-`, `:=`, `:?`, `:+`, `#`, `%`, \
@@ -172,8 +166,6 @@ impl std::fmt::Display for LexError {
     }
 }
 
-/// A here-document's body begins on the line after its operator, so the token is left as a
-/// placeholder filled in once the scanner reaches that line.
 struct PendingHereDoc {
     delimiter: String,
     strip_tabs: bool,

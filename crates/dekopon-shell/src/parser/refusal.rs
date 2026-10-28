@@ -54,6 +54,7 @@ pub(crate) enum Refusal {
     UnexpectedToken {
         kind: TokenKind,
     },
+    UnexpectedRightParen,
     UnterminatedSubstitution,
     UnterminatedHereDocument,
     DuplicationOrder {
@@ -170,6 +171,7 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnexpectedToken { kind } => write!(formatter, "unexpected {kind}"),
+            Self::UnexpectedRightParen => formatter.write_str("unexpected `)`"),
             Self::UnterminatedSubstitution => formatter.write_str("unterminated $( ... )"),
             Self::UnterminatedHereDocument => formatter.write_str("unterminated here-document"),
             Self::DuplicationOrder { source, copied } => write!(formatter, "`{}>&{}` must come after the redirection of stream {}, not before it: write `> name {}>&{}` rather than `{}>&{} > name`", source.descriptor(), copied.descriptor(), copied.descriptor(), source.descriptor(), copied.descriptor(), source.descriptor(), copied.descriptor()),
@@ -192,15 +194,11 @@ impl std::fmt::Display for Refusal {
             Self::ExpectedCaseSubject => formatter.write_str("expected a word to match after `case`"),
             Self::ExpectedCasePatternClose => formatter.write_str("expected `)` to close a `case` pattern list"),
             Self::ExpectedCasePattern { found } => write!(formatter, "expected a `case` pattern, found {found}"),
-            Self::CasePattern { character } => write!(formatter,
-        "`case` patterns are literal: `{character}` is not supported; quote it as `'{character}'`, list alternatives with `|`, or use `*)` for the default"
-    ),
+            Self::CasePattern { character } => write!(formatter, "`case` patterns are literal: `{character}` is not supported; quote it as `'{character}'`, list alternatives with `|`, or use `*)` for the default"),
             Self::ExpectedCondition { found } => write!(formatter, "expected a condition inside `[[ ... ]]`, found {found}"),
             Self::TooManyConditionOperands => formatter.write_str("a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses"),
             Self::RegexCondition => formatter.write_str("`=~` regex matching is not supported: every pattern in this shell is literal text; compare with `==`, or match structurally with `jq`"),
-            Self::ConditionalPattern { character } => write!(formatter,
-        "`[[ == ]]` patterns are literal: `{character}` is not supported; quote it as `'{character}'` or use `jq`"
-    ),
+            Self::ConditionalPattern { character } => write!(formatter, "`[[ == ]]` patterns are literal: `{character}` is not supported; quote it as `'{character}'` or use `jq`"),
             Self::ExpectedRedirectBuffer => formatter.write_str("expected an in-memory buffer name after a redirection operator"),
             Self::SelfDuplication { source, target } => write!(formatter, "`{}>&{}` redirects a stream onto itself and would do nothing", source.descriptor(), target.descriptor()),
             Self::ArrayLiteral => formatter.write_str("bash array literals `name=(a b c)` are not supported: arrays here are real JSON, so write `name='[\"a\",\"b\",\"c\"]'` or `name=$(... | jq ...)` and index it with `${name[0]}`"),
@@ -211,9 +209,7 @@ impl std::fmt::Display for Refusal {
             Self::InputRedirect => formatter.write_str("input redirection `<` is not supported: there are no files; pipe a value or `cat` a named buffer instead"),
             Self::ExpectedCommand { found } => write!(formatter, "expected a command, found {found}"),
             Self::ParameterPattern { character } => write!(formatter, "`${{NAME}}` patterns are literal: `{character}` is not supported; slice with `jq`"),
-            Self::ArithmeticTokenLimit => write!(formatter,
-                    "an arithmetic expansion may hold at most {MAX_ARITHMETIC_TOKENS} tokens; split the calculation across assignments"
-                ),
+            Self::ArithmeticTokenLimit => write!(formatter, "an arithmetic expansion may hold at most {MAX_ARITHMETIC_TOKENS} tokens; split the calculation across assignments"),
             Self::InvalidArithmeticLiteral { literal } => write!(formatter, "invalid arithmetic literal {literal:?}"),
             Self::ArithmeticLiteralOutOfRange { literal } => write!(formatter, "arithmetic literal {literal:?} is out of range"),
             Self::ExpectedArithmeticVariable => formatter.write_str("expected a variable name after `$` in an arithmetic expansion"),

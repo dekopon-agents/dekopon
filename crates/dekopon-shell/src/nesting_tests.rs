@@ -162,6 +162,11 @@ fn cases() -> Vec<Case> {
         ceiling: 31,
         refusal: TooDeep::Parameter,
     });
+    expression_cases(&mut cases);
+    cases
+}
+
+fn expression_cases(cases: &mut Vec<Case>) {
     for (name, prefix, open, close, suffix, ceiling, refusal) in [
         (
             "conditional not",
@@ -226,7 +231,6 @@ fn cases() -> Vec<Case> {
             refusal,
         });
     }
-    cases
 }
 
 #[test]
@@ -296,7 +300,7 @@ fn generated_scripts_parse_and_drop_without_panicking_on_a_two_mib_stack() {
         let cases = cases();
         for case in 0_u32..1_024 {
             let mut bytes = [0_u8; 512];
-            for (index, chunk) in bytes.chunks_exact_mut(8).enumerate() {
+            for (index, chunk) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 let mut hash = DefaultHasher::new();
                 (case, index).hash(&mut hash);
                 chunk.copy_from_slice(&hash.finish().to_le_bytes());

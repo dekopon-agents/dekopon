@@ -800,12 +800,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     let line = self.line();
-                    return Err(ParseError::refused(
-                        line,
-                        Refusal::UnexpectedToken {
-                            kind: TokenKind::RightParen,
-                        },
-                    ));
+                    return Err(ParseError::refused(line, Refusal::UnexpectedRightParen));
                 }
                 Some(TokenKind::HereDoc(word)) => {
                     let line = self.line();
@@ -1596,6 +1591,18 @@ mod tests {
     }
 
     #[test]
+    fn constant_expansion_patterns_return_typed_refusals() {
+        assert_refusal(
+            "echo ${name#*}",
+            Refusal::ParameterPattern { character: '*' },
+        );
+        assert_refusal(
+            "[[ x == * ]]",
+            Refusal::ConditionalPattern { character: '*' },
+        );
+    }
+
+    #[test]
     fn arithmetic_refusals_keep_their_typed_causes() {
         for (body, refusal) in [
             ("", Refusal::EmptyArithmetic),
@@ -1678,6 +1685,11 @@ mod tests {
                 name: "f".to_owned(),
             },
         );
+    }
+
+    #[test]
+    fn a_stray_closing_parenthesis_has_its_typed_refusal() {
+        assert_refusal(")", Refusal::UnexpectedRightParen);
     }
 
     #[test]
