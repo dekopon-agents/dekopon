@@ -5880,6 +5880,26 @@ async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         ));
         model.wait_until_entered().await;
+        let indicator_expected = reaction_expected
+            || (status && !status_off)
+            || (typing && !typing_off && (status_off || !status));
+        // The progress task opens indicators on `Started`, and a reply that beats it never shows one.
+        if indicator_expected {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !driver.calls().iter().any(|call| {
+                    matches!(
+                        call,
+                        DriverCall::Reaction { .. }
+                            | DriverCall::Status { .. }
+                            | DriverCall::Typing { .. }
+                    )
+                }) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("an indicator opens before the reply");
+        }
         model.release();
         session.await.expect("session completes");
         if reaction_expected {

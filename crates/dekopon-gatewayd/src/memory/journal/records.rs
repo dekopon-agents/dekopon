@@ -1230,6 +1230,11 @@ impl Journal {
                     if path.exists() {
                         fs::remove_file(path)?;
                         boot.reset = boot.reset.saturating_add(1);
+                        tracing::warn!(
+                            event = "gateway_journal_reset",
+                            reason = "crashed",
+                            "gateway.journal.reset"
+                        );
                     }
                     boot.crashed_files = boot.crashed_files.saturating_add(1);
                 }
@@ -1285,6 +1290,11 @@ impl Journal {
                     Err(_unloadable) => {
                         fs::remove_file(&path)?;
                         boot.reset = boot.reset.saturating_add(1);
+                        tracing::warn!(
+                            event = "gateway_journal_reset",
+                            reason = "corrupt",
+                            "gateway.journal.reset"
+                        );
                     }
                 }
                 fs::remove_file(&marker)?;
