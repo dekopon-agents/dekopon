@@ -942,7 +942,11 @@ impl ResponsesRequest<'_> {
         let mut body = crate::body::JsonBody::default();
         body.raw(b"{\"model\":");
         body.value(self.model)?;
-        body.raw(b",\"store\":false,\"stream\":true,\"instructions\":");
+        body.raw(b",\"store\":");
+        body.value(&self.store)?;
+        body.raw(b",\"stream\":");
+        body.value(&self.stream)?;
+        body.raw(b",\"instructions\":");
         body.value(&self.instructions)?;
         body.raw(b",\"input\":[");
         for (index, item) in self.input.iter().enumerate() {

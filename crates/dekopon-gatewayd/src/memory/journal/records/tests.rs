@@ -1278,3 +1278,79 @@ fn an_asset_number_zero_is_refused_at_decode() {
         ));
     }
 }
+
+#[test]
+fn an_unmatched_body_below_a_completed_record_is_corrupt_but_a_trailing_one_is_not() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    let orphan = |journal: &Journal| {
+        OpenOptions::new()
+            .append(true)
+            .open(journal.path("agent/hash"))
+            .unwrap()
+            .write_all(b"{\"b\":[]}\n")
+            .unwrap();
+    };
+    journal
+        .append_record("agent/hash", &record, Vec::new())
+        .unwrap();
+    orphan(&journal);
+    let trailing = journal
+        .record_window("agent/hash", 4.try_into().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(trailing.records.len(), 1);
+    record.id = RecordId(NonZeroU64::new(2).unwrap());
+    journal
+        .append_record("agent/hash", &record, Vec::new())
+        .unwrap();
+    assert!(matches!(
+        journal.record_window("agent/hash", 4.try_into().unwrap()),
+        Err(JournalError::Corrupt)
+    ));
+}
+
+#[test]
+fn a_side_line_backlog_for_records_outside_the_window_is_streamed_not_retained() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    for id in 1..=3 {
+        record.id = RecordId(NonZeroU64::new(id).unwrap());
+        journal
+            .append_record("agent/hash", &record, Vec::new())
+            .unwrap();
+    }
+    for asset in 1..=5_000u64 {
+        journal
+            .write_slot(
+                "agent/hash",
+                SlotLine {
+                    at_ms: 1,
+                    record: RecordId(NonZeroU64::new(1).unwrap()),
+                    part: NonZeroU8::new(1).unwrap(),
+                    slot: Slot::Running,
+                    subject: Subject::Asset(asset.try_into().unwrap()),
+                },
+            )
+            .unwrap();
+    }
+    journal
+        .write_slot(
+            "agent/hash",
+            SlotLine {
+                at_ms: 1,
+                record: record.id,
+                part: NonZeroU8::new(1).unwrap(),
+                slot: Slot::Running,
+                subject: Subject::Asset(1.try_into().unwrap()),
+            },
+        )
+        .unwrap();
+    let snapshot = journal
+        .record_window("agent/hash", 1.try_into().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].header.id, record.id);
+    assert_eq!(snapshot.records[0].raw_asset_lines.len(), 1);
+}
