@@ -968,6 +968,129 @@ fn an_unknown_tag_is_refused_before_reading_its_large_payload() {
 }
 
 #[test]
+fn the_backward_window_skips_bodies_and_joins_side_lines_in_file_order() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    record.original = vec![Item::User(Kept::new(
+        &"x".repeat(2 * 1024 * 1024),
+        usize::MAX,
+    ))];
+    for id in 1..=4 {
+        record.id = RecordId(NonZeroU64::new(id).unwrap());
+        journal
+            .append_record("agent/hash", &record, Vec::new())
+            .unwrap();
+    }
+    for slot in [Slot::Running, Slot::Generated("latest".to_owned())] {
+        journal
+            .write_slot(
+                "agent/hash",
+                SlotLine {
+                    at_ms: 1,
+                    record: record.id,
+                    part: NonZeroU8::new(1).unwrap(),
+                    slot,
+                    subject: Subject::Record,
+                },
+            )
+            .unwrap();
+    }
+    for subject in [
+        Subject::Asset(1.try_into().unwrap()),
+        Subject::Asset(2.try_into().unwrap()),
+    ] {
+        journal
+            .write_slot(
+                "agent/hash",
+                SlotLine {
+                    at_ms: 1,
+                    record: record.id,
+                    part: NonZeroU8::new(1).unwrap(),
+                    slot: Slot::Running,
+                    subject,
+                },
+            )
+            .unwrap();
+    }
+    let _writer = journal.lock.lock();
+    DECODED_BYTES.set(0);
+    let snapshot = journal
+        .record_window("agent/hash", 2.try_into().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .records
+            .iter()
+            .map(|head| head.header.id.0.get())
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert_eq!(
+        snapshot.records[1].header.summaries[0],
+        Slot::Generated("latest".to_owned())
+    );
+    assert_eq!(snapshot.records[1].asset_lines.len(), 2);
+    for (line, expected) in snapshot.records[1].asset_lines.iter().zip([1, 2]) {
+        let AssetSideLine::Slot(line) = line else {
+            panic!("slot line")
+        };
+        assert_eq!(line.subject, Subject::Asset(expected.try_into().unwrap()));
+    }
+    assert!(DECODED_BYTES.get() < 64 * 1024);
+}
+
+#[test]
+fn a_backward_window_skips_a_torn_last_header_or_body_without_decoding_it() {
+    let (_dir, journal) = journal();
+    let record = fixture();
+    journal
+        .append_record("agent/hash", &record, Vec::new())
+        .unwrap();
+    for tail in [b"{\"b\":[\"torn".as_slice(), b"{\"h\":{\"torn"] {
+        let original = std::fs::metadata(journal.path("agent/hash")).unwrap().len();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(journal.path("agent/hash"))
+            .unwrap();
+        file.write_all(tail).unwrap();
+        let snapshot = journal
+            .record_window("agent/hash", 2.try_into().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        file.set_len(original).unwrap();
+    }
+}
+
+#[test]
+fn seal_readers_keep_a_whole_inode_and_never_wait_on_the_writer() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let (_dir, journal) = journal();
+    let stem = "agent/hash";
+    journal
+        .seal(stem, UNIX_EPOCH + Duration::from_millis(1))
+        .unwrap();
+    let mut original = File::open(journal.seal_path(stem)).unwrap();
+    journal.seal(stem, SystemTime::now()).unwrap();
+    let mut bytes = Vec::new();
+    original.read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<super::super::Seal>(&bytes)
+            .unwrap()
+            .at_ms,
+        1
+    );
+    let _writer = journal.lock.lock();
+    assert!(
+        journal
+            .sealed(stem, Duration::from_secs(3600))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn unknown_nested_span_slot_and_asset_source_fields_are_corrupt() {
     let (_dir, journal) = journal();
     let mut record = fixture();
@@ -1116,4 +1239,119 @@ fn indexed_side_lines_join_the_first_kept_record_after_later_appends_and_a_rewri
             .pin
             .is_none()
     );
+}
+
+#[test]
+fn an_unmatched_body_below_a_completed_record_is_corrupt_but_a_trailing_one_is_not() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    let orphan = |journal: &Journal| {
+        OpenOptions::new()
+            .append(true)
+            .open(journal.path("agent/hash"))
+            .unwrap()
+            .write_all(b"{\"b\":[]}\n")
+            .unwrap();
+    };
+    journal
+        .append_record("agent/hash", &record, Vec::new())
+        .unwrap();
+    orphan(&journal);
+    let trailing = journal
+        .record_window("agent/hash", 4.try_into().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(trailing.records.len(), 1);
+    record.id = RecordId(NonZeroU64::new(2).unwrap());
+    journal
+        .append_record("agent/hash", &record, Vec::new())
+        .unwrap();
+    assert!(matches!(
+        journal.record_window("agent/hash", 4.try_into().unwrap()),
+        Err(JournalError::Corrupt)
+    ));
+}
+
+#[test]
+fn a_side_line_backlog_for_records_outside_the_window_is_streamed_not_retained() {
+    let (_dir, journal) = journal();
+    let mut record = fixture();
+    for id in 1..=3 {
+        record.id = RecordId(NonZeroU64::new(id).unwrap());
+        journal
+            .append_record("agent/hash", &record, Vec::new())
+            .unwrap();
+    }
+    let outside = |asset: u64| SlotLine {
+        at_ms: 1,
+        record: RecordId(NonZeroU64::new(1).unwrap()),
+        part: NonZeroU8::new(1).unwrap(),
+        slot: Slot::Running,
+        subject: Subject::Asset(asset.try_into().unwrap()),
+    };
+    journal.write_slot("agent/hash", outside(1)).unwrap();
+    let path = journal.path("agent/hash");
+    let bytes = std::fs::read(&path).unwrap();
+    let start = bytes[..bytes.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .unwrap()
+        + 1;
+    let line = bytes[start..].to_vec();
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    for _ in 0..5_000 {
+        file.write_all(&line).unwrap();
+    }
+    journal
+        .write_slot(
+            "agent/hash",
+            SlotLine {
+                record: record.id,
+                ..outside(1)
+            },
+        )
+        .unwrap();
+    DECODED_HEADERS.with_borrow_mut(Vec::clear);
+    let snapshot = journal
+        .record_window("agent/hash", 1.try_into().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].header.id, record.id);
+    assert_eq!(snapshot.records[0].raw_asset_lines.len(), 1);
+    DECODED_HEADERS.with_borrow(|kinds| {
+        let last_header = kinds.iter().rposition(|header| *header).unwrap();
+        let first_side = kinds.iter().position(|header| !header).unwrap();
+        assert!(
+            last_header < first_side,
+            "a side line was held before its window was known"
+        );
+        assert_eq!(kinds.len() - first_side, 5_002);
+    });
+}
+
+#[test]
+fn only_one_trailing_body_is_an_append_in_flight() {
+    let (_dir, journal) = journal();
+    journal
+        .append_record("agent/hash", &fixture(), Vec::new())
+        .unwrap();
+    let path = journal.path("agent/hash");
+    let original = std::fs::metadata(&path).unwrap().len();
+    for tail in [
+        b"{\"b\":[]}\n".as_slice(),
+        b"{\"b\":[]}\n{\"h\":{\"torn",
+        b"{\"b\":[]}\n{\"b\":[]}\n",
+        b"{\"b\":[]}\n{\"b\":[]}\n{\"h\":{\"torn",
+    ] {
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(tail).unwrap();
+        let window = journal.record_window("agent/hash", 4.try_into().unwrap());
+        if tail.starts_with(b"{\"b\":[]}\n{\"b\":") {
+            assert!(matches!(window, Err(JournalError::Corrupt)));
+        } else {
+            assert_eq!(window.unwrap().unwrap().records.len(), 1);
+        }
+        file.set_len(original).unwrap();
+    }
 }
