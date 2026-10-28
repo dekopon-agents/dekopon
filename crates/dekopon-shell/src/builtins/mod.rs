@@ -4,6 +4,9 @@ use std::collections::BTreeSet;
 
 use crate::{CapabilityInvoker, limits::Budget};
 
+#[cfg(test)]
+mod awk;
+
 pub(crate) mod cap;
 pub(crate) mod encode;
 pub(crate) mod jobs;
