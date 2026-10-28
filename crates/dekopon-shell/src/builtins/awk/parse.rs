@@ -321,30 +321,35 @@ pub(super) enum Function {
     Atan2,
 }
 impl Function {
-    fn from_name(name: &str) -> Result<Self, Refusal> {
+    fn lookup(name: &str) -> Option<Self> {
         match name {
-            "length" => Ok(Self::Length),
-            "substr" => Ok(Self::Substr),
-            "index" => Ok(Self::Index),
-            "split" => Ok(Self::Split),
-            "sub" => Ok(Self::Sub),
-            "gsub" => Ok(Self::Gsub),
-            "match" => Ok(Self::Match),
-            "sprintf" => Ok(Self::Sprintf),
-            "tolower" => Ok(Self::Tolower),
-            "toupper" => Ok(Self::Toupper),
-            "int" => Ok(Self::Int),
-            "sqrt" => Ok(Self::Sqrt),
-            "exp" => Ok(Self::Exp),
-            "log" => Ok(Self::Log),
-            "sin" => Ok(Self::Sin),
-            "cos" => Ok(Self::Cos),
-            "atan2" => Ok(Self::Atan2),
-            "system" => Err(Refusal::Process),
-            "close" | "fflush" => Err(Refusal::StreamFunction(name.into())),
-            "rand" | "srand" => Err(Refusal::Randomness(name.into())),
-            _ => Err(Refusal::UnknownFunction(name.into())),
+            "length" => Some(Self::Length),
+            "substr" => Some(Self::Substr),
+            "index" => Some(Self::Index),
+            "split" => Some(Self::Split),
+            "sub" => Some(Self::Sub),
+            "gsub" => Some(Self::Gsub),
+            "match" => Some(Self::Match),
+            "sprintf" => Some(Self::Sprintf),
+            "tolower" => Some(Self::Tolower),
+            "toupper" => Some(Self::Toupper),
+            "int" => Some(Self::Int),
+            "sqrt" => Some(Self::Sqrt),
+            "exp" => Some(Self::Exp),
+            "log" => Some(Self::Log),
+            "sin" => Some(Self::Sin),
+            "cos" => Some(Self::Cos),
+            "atan2" => Some(Self::Atan2),
+            _ => None,
         }
+    }
+    fn from_name(name: &str) -> Result<Self, Refusal> {
+        Self::lookup(name).ok_or_else(|| match name {
+            "system" => Refusal::Process,
+            "close" | "fflush" => Refusal::StreamFunction(name.into()),
+            "rand" | "srand" => Refusal::Randomness(name.into()),
+            _ => Refusal::UnknownFunction(name.into()),
+        })
     }
     fn accepts(self, count: usize) -> bool {
         match self {
@@ -408,6 +413,21 @@ pub(super) enum Binary {
 pub(super) struct Expr {
     pub kind: ExprKind,
     pub height: u8,
+    position: SourcePosition,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SourcePosition {
+    line: usize,
+    column: usize,
+}
+impl SourcePosition {
+    fn syntax(self, expected: impl Into<String>) -> AwkError {
+        AwkError::Syntax {
+            line: self.line,
+            column: self.column,
+            expected: expected.into(),
+        }
+    }
 }
 #[derive(Debug, PartialEq)]
 pub(super) enum ExprKind {
@@ -473,10 +493,11 @@ pub(super) struct Program {
 }
 
 impl Expr {
-    fn new(kind: ExprKind, children: u8) -> Result<Self, AwkError> {
+    fn new(kind: ExprKind, children: u8, position: SourcePosition) -> Result<Self, AwkError> {
         Ok(Self {
             kind,
             height: height(children)?,
+            position,
         })
     }
     fn lvalue(&self) -> bool {
@@ -616,12 +637,14 @@ impl Parser<'_> {
             self.error(format!("{punct:?}"))
         }
     }
-    fn error<T>(&self, expected: impl Into<String>) -> Result<T, AwkError> {
-        Err(AwkError::Syntax {
+    fn position(&self) -> SourcePosition {
+        SourcePosition {
             line: self.token.line,
             column: self.token.column,
-            expected: expected.into(),
-        })
+        }
+    }
+    fn error<T>(&self, expected: impl Into<String>) -> Result<T, AwkError> {
+        Err(self.position().syntax(expected))
     }
     fn name(&self) -> Option<&str> {
         match &self.token.kind {
@@ -636,6 +659,7 @@ impl Parser<'_> {
     fn take_name(&mut self) -> Result<String, AwkError> {
         let name = self
             .name()
+            .filter(|name| identifier(name))
             .ok_or_else(|| AwkError::Syntax {
                 line: self.token.line,
                 column: self.token.column,
@@ -686,7 +710,6 @@ impl Parser<'_> {
                     self.advance()?;
                     let condition = self.condition(depth)?;
                     let then = self.statement(depth)?;
-                    self.eat(Punct::Semi)?;
                     self.newlines()?;
                     let otherwise = if self.name() == Some("else") {
                         self.advance()?;
@@ -711,7 +734,6 @@ impl Parser<'_> {
                     self.loops += 1;
                     let body = self.statement(depth)?;
                     self.loops -= 1;
-                    self.eat(Punct::Semi)?;
                     self.newlines()?;
                     if self.name() != Some("while") {
                         return self.error("while after a do body");
@@ -797,6 +819,8 @@ impl Parser<'_> {
                 if !self.terminated() {
                     return self.error("a statement separator");
                 }
+                self.eat(Punct::Semi)?;
+                self.newlines()?;
             }
         }
         Ok(Stmt {
@@ -861,8 +885,10 @@ impl Parser<'_> {
             StmtKind::ForIn(key, array, Box::new(body))
         } else {
             self.require(Punct::Semi)?;
+            self.newlines()?;
             let condition = self.optional_expression(Punct::Semi, depth)?;
             self.require(Punct::Semi)?;
+            self.newlines()?;
             let step = self.optional_expression(Punct::RParen, depth)?;
             self.require(Punct::RParen)?;
             self.newlines()?;
@@ -890,6 +916,7 @@ impl Parser<'_> {
             .any(|punct| self.at(punct))
     }
     fn print_list(&mut self, kind: PrintKind, depth: u8) -> Result<Vec<Expr>, AwkError> {
+        let position = self.position();
         if self.print_redirection() {
             return Err(Refusal::OutputRedirection.into());
         }
@@ -906,7 +933,7 @@ impl Parser<'_> {
                 if list.len() == 1 {
                     let first = list.remove(0);
                     let h = first.height;
-                    let group = Expr::new(ExprKind::Group(Box::new(first)), h)?;
+                    let group = Expr::new(ExprKind::Group(Box::new(first)), h, position)?;
                     list.push(self.tail(group, 0, deeper(depth)?, ExprContext::Print)?);
                 } else if self.at(Punct::Comma) {
                     return self.error("the end of a parenthesized print list");
@@ -926,9 +953,7 @@ impl Parser<'_> {
             let Some(format) = list.first() else {
                 return self.error("a printf format");
             };
-            if let Some(format) = literal_string(format) {
-                check_format(format, FormatCall::Printf)?;
-            }
+            check_literal_format(format, FormatCall::Printf)?;
         }
         Ok(list)
     }
@@ -944,19 +969,15 @@ impl Parser<'_> {
     }
     fn named_expression(&mut self, name: String, depth: u8) -> Result<Expr, AwkError> {
         let depth = deeper(depth)?;
-        if [
-            "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "break",
-            "continue", "next", "exit", "delete", "in",
-        ]
-        .contains(&name.as_str())
-        {
+        let position = self.position();
+        if keyword(&name) {
             return self.error("an expression");
         }
         let line = self.token.line;
         let column = self.token.column + name.chars().count();
         self.advance()?;
         if self.at(Punct::LParen)
-            && (Function::from_name(&name).is_ok()
+            && (Function::lookup(&name).is_some()
                 || ["system", "close", "fflush", "rand", "srand"].contains(&name.as_str())
                 || (line == self.token.line && column == self.token.column))
         {
@@ -977,37 +998,43 @@ impl Parser<'_> {
                 return self.error(format!("the arguments required by {name}()"));
             }
             if function == Function::Sprintf
-                && let Some(format) = arguments.first().and_then(literal_string)
+                && let Some(format) = arguments.first()
             {
-                check_format(format, FormatCall::Sprintf)?;
+                check_literal_format(format, FormatCall::Sprintf)?;
             }
             let h = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
-            Expr::new(ExprKind::Call(function, arguments), h)
-        } else if self.eat(Punct::LBracket)? {
-            let key = self.expression(0, depth, ExprContext::Normal)?;
-            if self.at(Punct::Comma) {
-                return Err(Refusal::MultiSubscript.into());
-            }
-            self.require(Punct::RBracket)?;
-            let h = key.height;
-            Expr::new(ExprKind::Array(name, Box::new(key)), h)
-        } else if name == "length" {
-            Expr::new(ExprKind::Call(Function::Length, Vec::new()), 0)
+            Expr::new(ExprKind::Call(function, arguments), h, position)
+        } else if name == "length" && !self.at(Punct::LBracket) {
+            Expr::new(ExprKind::Call(Function::Length, Vec::new()), 0, position)
         } else {
-            Expr::new(ExprKind::Variable(name), 0)
+            if !identifier(&name) {
+                return Err(position.syntax("an identifier"));
+            }
+            if self.eat(Punct::LBracket)? {
+                let key = self.expression(0, depth, ExprContext::Normal)?;
+                if self.at(Punct::Comma) {
+                    return Err(Refusal::MultiSubscript.into());
+                }
+                self.require(Punct::RBracket)?;
+                let h = key.height;
+                Expr::new(ExprKind::Array(name, Box::new(key)), h, position)
+            } else {
+                Expr::new(ExprKind::Variable(name), 0, position)
+            }
         }
     }
     fn prefix(&mut self, depth: u8) -> Result<Expr, AwkError> {
         let depth = deeper(depth)?;
+        let position = self.position();
         let token = std::mem::replace(&mut self.token.kind, TokenKind::Eof);
         match token {
             TokenKind::Number(value) => {
                 self.advance()?;
-                Expr::new(ExprKind::Number(value), 0)
+                Expr::new(ExprKind::Number(value), 0, position)
             }
             TokenKind::String(value) => {
                 self.advance()?;
-                Expr::new(ExprKind::String(value), 0)
+                Expr::new(ExprKind::String(value), 0, position)
             }
             TokenKind::Name(name) => self.named_expression(name, depth),
             TokenKind::Punct(Punct::LParen) => {
@@ -1018,7 +1045,7 @@ impl Parser<'_> {
                 }
                 self.require(Punct::RParen)?;
                 let h = inner.height;
-                Expr::new(ExprKind::Group(Box::new(inner)), h)
+                Expr::new(ExprKind::Group(Box::new(inner)), h, position)
             }
             TokenKind::Punct(Punct::Div | Punct::DivAssign) => {
                 let prefix = if token == TokenKind::Punct(Punct::DivAssign) {
@@ -1030,7 +1057,7 @@ impl Parser<'_> {
                 self.advance()?;
                 let index = self.regexes.len();
                 self.regexes.push(source);
-                Expr::new(ExprKind::Regex(index), 0)
+                Expr::new(ExprKind::Regex(index), 0, position)
             }
             TokenKind::Punct(
                 Punct::Not | Punct::Add | Punct::Sub | Punct::Dollar | Punct::Inc | Punct::Dec,
@@ -1074,7 +1101,7 @@ impl Parser<'_> {
                     };
                     ExprKind::Unary(unary, Box::new(operand))
                 };
-                Expr::new(kind, h)
+                Expr::new(kind, h, position)
             }
             TokenKind::Punct(
                 Punct::LBrace
@@ -1121,6 +1148,7 @@ impl Parser<'_> {
     ) -> Result<Expr, AwkError> {
         let depth = deeper(depth)?;
         loop {
+            let position = left.position;
             if minimum <= 13 && left.lvalue() && (self.at(Punct::Inc) || self.at(Punct::Dec)) {
                 let op = if self.at(Punct::Inc) {
                     Increment::PostAdd
@@ -1129,7 +1157,7 @@ impl Parser<'_> {
                 };
                 self.advance()?;
                 let h = left.height;
-                left = Expr::new(ExprKind::Increment(op, Box::new(left)), h)?;
+                left = Expr::new(ExprKind::Increment(op, Box::new(left)), h, position)?;
                 continue;
             }
             if minimum <= 2 && self.eat(Punct::Question)? {
@@ -1140,6 +1168,7 @@ impl Parser<'_> {
                 left = Expr::new(
                     ExprKind::Conditional(Box::new(left), Box::new(yes), Box::new(no)),
                     h,
+                    position,
                 )?;
                 continue;
             }
@@ -1147,7 +1176,7 @@ impl Parser<'_> {
                 self.advance()?;
                 let array = self.take_name()?;
                 let h = left.height;
-                left = Expr::new(ExprKind::In(Box::new(left), array), h)?;
+                left = Expr::new(ExprKind::In(Box::new(left), array), h, position)?;
                 continue;
             }
             if context == ExprContext::Normal && self.at(Punct::Pipe) {
@@ -1202,9 +1231,8 @@ impl Parser<'_> {
                 context,
             )?;
             if op == Binary::Assign
-                && let ExprKind::Variable(name) = &left.kind
-                && name == "FS"
-                && literal_string(&right) == Some("")
+                && variable(&left) == Some("FS")
+                && literal_string(&right).map(|(text, _)| text) == Some("")
             {
                 return Err(Refusal::EmptySeparator.into());
             }
@@ -1229,10 +1257,18 @@ impl Parser<'_> {
                     left.height = left.height.max(height(right.height)?);
                     rest.push((op, right));
                 } else {
-                    left = Expr::new(ExprKind::Chain(Box::new(left), vec![(op, right)]), h)?;
+                    left = Expr::new(
+                        ExprKind::Chain(Box::new(left), vec![(op, right)]),
+                        h,
+                        position,
+                    )?;
                 }
             } else {
-                left = Expr::new(ExprKind::Binary(op, Box::new(left), Box::new(right)), h)?;
+                left = Expr::new(
+                    ExprKind::Binary(op, Box::new(left), Box::new(right)),
+                    h,
+                    position,
+                )?;
             }
         }
         Ok(left)
@@ -1307,14 +1343,20 @@ fn non_associative(expr: &Expr, binding: u8) -> bool {
         | ExprKind::In(_, _) => false,
     }
 }
+fn keyword(name: &str) -> bool {
+    [
+        "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "break", "continue",
+        "next", "exit", "delete", "in",
+    ]
+    .contains(&name)
+}
+fn identifier(name: &str) -> bool {
+    !keyword(name) && Function::lookup(name).is_none()
+}
 fn starts_concat(token: &TokenKind) -> bool {
     match token {
         TokenKind::Number(_) | TokenKind::String(_) => true,
-        TokenKind::Name(name) => ![
-            "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "break",
-            "continue", "next", "exit", "delete", "in",
-        ]
-        .contains(&name.as_str()),
+        TokenKind::Name(name) => !keyword(name),
         TokenKind::Punct(punct) => [
             Punct::LParen,
             Punct::Dollar,
@@ -1326,9 +1368,9 @@ fn starts_concat(token: &TokenKind) -> bool {
         TokenKind::Newline | TokenKind::Eof => false,
     }
 }
-fn literal_string(expr: &Expr) -> Option<&str> {
+fn literal_string(expr: &Expr) -> Option<(&str, SourcePosition)> {
     match &expr.kind {
-        ExprKind::String(text) => Some(text),
+        ExprKind::String(text) => Some((text, expr.position)),
         ExprKind::Group(inner) => literal_string(inner),
         ExprKind::Number(_)
         | ExprKind::Regex(_)
@@ -1368,6 +1410,16 @@ fn statement_height(stmt: &StmtKind) -> u8 {
         StmtKind::ForIn(_, _, body) => body.height,
         StmtKind::Exit(expr) | StmtKind::Delete(_, expr) => expr.as_ref().map_or(0, |e| e.height),
     }
+}
+
+fn check_literal_format(expr: &Expr, call: FormatCall) -> Result<(), AwkError> {
+    if let Some((format, position)) = literal_string(expr) {
+        check_format(format, call).map_err(|error| match error {
+            AwkError::Syntax { expected, .. } => position.syntax(expected),
+            error @ (AwkError::Refused(_) | AwkError::Runtime { .. } | AwkError::Limit(_)) => error,
+        })?;
+    }
+    Ok(())
 }
 
 pub(super) fn check_format(format: &str, call: FormatCall) -> Result<(), AwkError> {
@@ -1489,10 +1541,9 @@ impl Names {
                 continue;
             }
             if function == Function::Split && index == 1 {
-                let name = variable(expr).ok_or_else(|| AwkError::Syntax {
-                    line: 1,
-                    column: 1,
-                    expected: "an array name as split's second argument".into(),
+                let name = variable(expr).ok_or_else(|| {
+                    expr.position
+                        .syntax("an array name as split's second argument")
                 })?;
                 self.name(name, Use::Array)?;
             } else {
@@ -1500,11 +1551,7 @@ impl Names {
                     && index == 2
                     && !expr.lvalue()
                 {
-                    return Err(AwkError::Syntax {
-                        line: 1,
-                        column: 1,
-                        expected: "an assignable sub/gsub target".into(),
-                    });
+                    return Err(expr.position.syntax("an assignable sub/gsub target"));
                 }
                 self.expr(expr)?;
             }

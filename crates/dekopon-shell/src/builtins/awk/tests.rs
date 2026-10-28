@@ -674,3 +674,106 @@ fn error_mapping_keeps_limits_fatal_and_runtime_errors_at_exit_two() {
     let p = parsed("{print 1}");
     assert!(matches!(p.program.rules[0].action.kind, StmtKind::Block(_)));
 }
+
+#[test]
+fn grouped_fs_assignments_refuse_an_empty_literal_separator() {
+    for source in [r#"BEGIN{(FS)=""}"#, r#"BEGIN{((FS))=("")}"#] {
+        assert_eq!(refused(source), Refusal::EmptySeparator);
+    }
+}
+
+#[test]
+fn for_headers_allow_newlines_after_both_semicolons() {
+    parsed("BEGIN{for(i=0;\ni<1;\ni++) print i}");
+    parsed("BEGIN{for(;\n;\n)break}");
+}
+
+#[test]
+fn identifiers_exclude_statement_keywords_and_kept_function_names() {
+    for name in [
+        "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "break", "continue",
+        "next", "exit", "delete", "in", "length", "substr", "index", "split", "sub", "gsub",
+        "match", "sprintf", "tolower", "toupper", "int", "sqrt", "exp", "log", "sin", "cos",
+        "atan2",
+    ] {
+        for source in [
+            format!("BEGIN{{delete {name}}}"),
+            format!("BEGIN{{for(k in {name}) print k}}"),
+        ] {
+            assert!(
+                matches!(
+                    compile(&source, &Budget::start(Limits::default())),
+                    Err(AwkError::Syntax { .. })
+                ),
+                "{source}"
+            );
+        }
+    }
+    for name in [
+        "length", "substr", "index", "split", "sub", "gsub", "match", "sprintf", "tolower",
+        "toupper", "int", "sqrt", "exp", "log", "sin", "cos", "atan2",
+    ] {
+        for source in [
+            format!("BEGIN{{{name}=1}}"),
+            format!("BEGIN{{{name}[1]=2}}"),
+        ] {
+            assert!(
+                matches!(
+                    compile(&source, &Budget::start(Limits::default())),
+                    Err(AwkError::Syntax { .. })
+                ),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn else_and_do_while_do_not_swallow_extra_semicolons() {
+    for source in [
+        "BEGIN{if(0){};else print 1}",
+        "BEGIN{if(0);;else print 1}",
+        "BEGIN{do{};while(0)}",
+        "BEGIN{do;;while(0)}",
+    ] {
+        assert!(
+            matches!(
+                compile(source, &Budget::start(Limits::default())),
+                Err(AwkError::Syntax { .. })
+            ),
+            "{source}"
+        );
+    }
+    for source in [
+        "BEGIN{if(0){}\nelse print 1}",
+        "BEGIN{if(0)print 1;else print 2}",
+        "BEGIN{if(0);else print 1}",
+        "BEGIN{do print 1;while(0)}",
+        "BEGIN{do;while(0)}",
+        "BEGIN{do{}\nwhile(0)}",
+    ] {
+        parsed(source);
+    }
+}
+
+#[test]
+fn invalid_arguments_and_literal_formats_keep_program_source_locations() {
+    for (source, expected_line, expected_column) in [
+        ("BEGIN{\n split(\"x\",1)\n}", 2, 12),
+        ("BEGIN{\n sub(/x/,\"y\",\n  1)\n}", 3, 3),
+        ("BEGIN{\n gsub(/x/,\"y\",(1+2))\n}", 2, 15),
+        ("BEGIN{\n printf \"%\"\n}", 2, 9),
+        ("BEGIN{\n x=sprintf((\"%\"))\n}", 2, 13),
+        ("BEGIN{\n printf \"ok\\n%\"\n}", 2, 9),
+        ("BEGIN{\n printf \"ok\\\n%\"\n}", 2, 9),
+    ] {
+        match compile(source, &Budget::start(Limits::default())).expect_err(source) {
+            AwkError::Syntax { line, column, .. } => {
+                assert_eq!((line, column), (expected_line, expected_column), "{source}");
+            }
+            error @ (AwkError::Refused(_) | AwkError::Runtime { .. } | AwkError::Limit(_)) => {
+                panic!("{source}: {error:?}");
+            }
+        }
+    }
+}
