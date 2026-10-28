@@ -21,6 +21,24 @@ pub(crate) struct TurnId(pub u64);
 #[serde(transparent)]
 pub(crate) struct GrantDigest(pub [u8; 8]);
 
+impl GrantDigest {
+    pub(crate) fn of(granted: &[String]) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for capability in granted {
+            digest.update((capability.len() as u64).to_be_bytes());
+            digest.update(capability.as_bytes());
+        }
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(&digest.finalize()[..8]);
+        Self(bytes)
+    }
+
+    pub(crate) fn hex(&self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
 pub(crate) struct TurnRecord {
     pub id: RecordId,
     pub turn: TurnId,
@@ -224,6 +242,13 @@ pub(crate) struct ChoiceLine {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "07 reads asset lines; this build only carries them"
+    )
+)]
 pub(crate) enum AssetSideLine {
     Slot(SlotLine),
     Pin(PinLine),

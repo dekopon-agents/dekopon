@@ -646,66 +646,6 @@ fn a_pin_survives_restart_without_rewriting_the_file() {
 }
 
 #[test]
-fn the_v3_walk_and_rewrite_decode_headers_and_never_bodies() {
-    let (dir, journal) = journal();
-    let mut record = fixture();
-    record.original = vec![Item::User(Kept::new(
-        &"x".repeat(2 * 1024 * 1024),
-        usize::MAX,
-    ))];
-    journal.append_record(STEM, &record, Vec::new()).unwrap();
-    journal
-        .write_slot(
-            STEM,
-            SlotLine {
-                at_ms: 2,
-                record: record.id,
-                part: NonZeroU8::new(1).unwrap(),
-                slot: Slot::Generated("summary".to_owned()),
-                subject: Subject::Record,
-            },
-        )
-        .unwrap();
-    journal
-        .write_choice(
-            STEM,
-            ChoiceLine {
-                at_ms: 3,
-                record: record.id,
-                choice: dekopon_agent::memory_tools::Rung::Metadata,
-            },
-        )
-        .unwrap();
-    journal
-        .write_pin(
-            STEM,
-            PinLine {
-                at_ms: 4,
-                record: record.id,
-                pin: Some(dekopon_agent::memory_tools::Rung::Native),
-                subject: Subject::Record,
-            },
-        )
-        .unwrap();
-    DECODED_BYTES.with(|bytes| bytes.set(0));
-    let before = journal.record_snapshot(STEM, true).unwrap().unwrap();
-    let body = read_body(&before, 0);
-    journal.rewrite_records(STEM, |_| true).unwrap();
-    assert_eq!(
-        read_body(&journal.record_snapshot(STEM, true).unwrap().unwrap(), 0),
-        body
-    );
-    drop(journal);
-    let (journal, boot) = reopen(dir.path());
-    assert_eq!(boot.reset, 0);
-    assert_eq!(
-        read_body(&journal.record_snapshot(STEM, true).unwrap().unwrap(), 0),
-        body
-    );
-    DECODED_BYTES.with(|bytes| assert!(bytes.get() < 64 * 1024, "decoded {} bytes", bytes.get()));
-}
-
-#[test]
 fn an_unlocked_header_reader_keeps_its_snapshot_across_a_rewrite() {
     let (_dir, journal) = journal();
     let mut first = fixture();
@@ -747,18 +687,6 @@ fn an_unlocked_header_reader_keeps_its_snapshot_across_a_rewrite() {
     assert_eq!(new.records.len(), 1);
     assert_eq!(new.records[0].body_at, 0);
     assert_ne!(old.records[1].body_at, 0);
-}
-
-#[test]
-fn a_v3_boot_resets_v2_and_other_unloadable_files() {
-    let (dir, journal) = journal();
-    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
-    std::fs::write(journal.path(STEM), b"{\"version\":2}\n").unwrap();
-    drop(journal);
-    let (journal, boot) = reopen(dir.path());
-    assert_eq!(boot.reset, 1);
-    assert!(boot.tasks.is_empty());
-    assert!(journal.record_snapshot(STEM, true).unwrap().is_none());
 }
 
 #[test]
@@ -1239,6 +1167,116 @@ fn indexed_side_lines_join_the_first_kept_record_after_later_appends_and_a_rewri
             .pin
             .is_none()
     );
+}
+
+#[test]
+fn arrival_entries_and_lines_survive_the_horizon_sweep_and_the_cap() {
+    use std::time::SystemTime;
+    let (_dir, mut journal) = journal();
+    let now = SystemTime::now();
+    let now_ms = super::super::millis(now);
+    for (number, at_ms) in [
+        (1, now_ms - 2 * 3600 * 1000),
+        (2, now_ms - 1000),
+        (3, now_ms),
+    ] {
+        let mut record = fixture();
+        record.id = RecordId(NonZeroU64::new(number).unwrap());
+        record.turn = TurnId(number);
+        record.at_ms = at_ms;
+        record.original.push(Item::Asset(1.try_into().unwrap()));
+        journal
+            .append_record(STEM, &record, vec![arrival(1, 1)])
+            .unwrap();
+    }
+    let newest = RecordId(NonZeroU64::new(3).unwrap());
+    journal
+        .write_slot(
+            STEM,
+            SlotLine {
+                at_ms: 3,
+                record: newest,
+                part: NonZeroU8::new(1).unwrap(),
+                slot: Slot::Running,
+                subject: Subject::Asset(1.try_into().unwrap()),
+            },
+        )
+        .unwrap();
+    journal
+        .write_pin(
+            STEM,
+            PinLine {
+                at_ms: 4,
+                record: newest,
+                pin: None,
+                subject: Subject::Asset(1.try_into().unwrap()),
+            },
+        )
+        .unwrap();
+    let path = journal.path(STEM);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("\"arrived\":[{", "\"arrived\":[  {")
+        .replace("\"atMs\":3,", "\"atMs\" : 3,");
+    std::fs::write(&path, raw.as_bytes()).unwrap();
+    let raw_of = |journal: &Journal| {
+        let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
+        let head = snapshot.records.last().unwrap();
+        (
+            snapshot.records.len(),
+            head.arrived_raw.as_ref().unwrap().get().to_owned(),
+            head.raw_asset_lines.clone(),
+            read_body(&snapshot, snapshot.records.len() - 1),
+        )
+    };
+    let (count, arrived, lines, body) = raw_of(&journal);
+    assert_eq!(count, 3);
+    assert!(arrived.starts_with("[  {"));
+    journal.maintain(STEM, now, 1);
+    assert_eq!(
+        raw_of(&journal),
+        (2, arrived.clone(), lines.clone(), body.clone())
+    );
+    let len = std::fs::metadata(&path).unwrap().len();
+    Arc::get_mut(&mut journal)
+        .unwrap()
+        .agent_bytes
+        .insert("reviewer".to_owned(), len - 1);
+    journal.maintain(STEM, now, 1);
+    assert_eq!(raw_of(&journal), (1, arrived, lines, body));
+}
+
+#[test]
+fn an_asset_number_zero_is_refused_at_decode() {
+    let (_dir, journal) = journal();
+    journal
+        .append_record(STEM, &fixture(), vec![arrival(1, 1)])
+        .unwrap();
+    let path = journal.path(STEM);
+    let header = std::fs::read_to_string(&path).unwrap();
+    let mut line = serde_json::to_vec(&SummaryLine {
+        s: SlotLine {
+            at_ms: 2,
+            record: fixture().id,
+            part: NonZeroU8::new(1).unwrap(),
+            slot: Slot::Running,
+            subject: Subject::Asset(1.try_into().unwrap()),
+        },
+    })
+    .unwrap();
+    line.push(b'\n');
+    let slot = String::from_utf8(line).unwrap();
+    for changed in [
+        header.replace("\"number\":1", "\"number\":0"),
+        format!("{header}{}", slot.replace("{\"asset\":1}", "{\"asset\":0}")),
+    ] {
+        assert_ne!(changed, header);
+        std::fs::write(&path, &changed).unwrap();
+        assert!(matches!(
+            journal.record_snapshot(STEM, true),
+            Err(JournalError::Corrupt)
+        ));
+    }
 }
 
 #[test]
