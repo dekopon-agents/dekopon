@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OutputMode {
     Value,
     Copy,
@@ -9,6 +9,7 @@ pub(super) enum OutputMode {
     Base64,
 }
 
+#[derive(Debug)]
 enum Destination {
     Discard,
     Diagnostics,
@@ -18,25 +19,19 @@ enum Destination {
     Terminal,
 }
 
-pub(super) struct StageOut {
+#[derive(Debug)]
+pub(crate) struct StageOut {
     destination: Destination,
     mode: OutputMode,
     deferred: bool,
-    collect: bool,
     bytes: Vec<u8>,
     charges: Vec<dekopon_process::RetainedBytes>,
-    collected: Vec<CommandResult>,
     pending: Vec<u8>,
     truncated: bool,
 }
 
 impl StageOut {
-    pub(super) fn new(
-        evaluator: &Evaluator<'_>,
-        sink: &Sink,
-        mode: OutputMode,
-        capture_output: bool,
-    ) -> Self {
+    pub(super) fn new(evaluator: &Evaluator<'_>, sink: &Sink, mode: OutputMode) -> Self {
         let active = evaluator.active_buffer_name();
         let discarded = evaluator.output_discarded();
         let diagnostics = evaluator.diagnostics_redirected();
@@ -58,7 +53,7 @@ impl StageOut {
                     Destination::Diagnostics
                 } else if evaluator.stdout.is_some() && (!captured || mode == OutputMode::Named) {
                     Destination::Pipe
-                } else if captured || capture_output {
+                } else if captured {
                     Destination::Capture
                 } else {
                     Destination::Terminal
@@ -88,10 +83,8 @@ impl StageOut {
             destination,
             mode,
             deferred,
-            collect: capture_output && !captured,
             bytes: Vec::new(),
             charges: Vec::new(),
-            collected: Vec::new(),
             pending: Vec::new(),
             truncated: false,
         }
@@ -102,9 +95,6 @@ impl StageOut {
         evaluator: &mut Evaluator<'_>,
         mut result: CommandResult,
     ) -> Result<(), LimitExceeded> {
-        if result.value.is_null() {
-            return Ok(());
-        }
         match &self.destination {
             Destination::Discard => {}
             Destination::Diagnostics => evaluator.write_redirected_diagnostics(&result),
@@ -171,11 +161,11 @@ impl StageOut {
                 return Ok(true);
             }
             Destination::Pipe => {
-                if let Some(writer) = evaluator.stdout.as_mut() {
-                    if writer.write(bytes) == WriteOutcome::ReaderGone {
-                        evaluator.reader_gone = true;
-                        return Ok(false);
-                    }
+                if let Some(writer) = evaluator.stdout.as_mut()
+                    && writer.write(bytes) == WriteOutcome::ReaderGone
+                {
+                    evaluator.reader_gone = true;
+                    return Ok(false);
                 }
                 return Ok(true);
             }
@@ -221,9 +211,7 @@ impl StageOut {
             let charge = evaluator.budget.charge_value_bytes(complete as u64)?;
             let mut result = CommandResult::value(Value::String(text.to_owned())).without_newline();
             result.retained.push(charge);
-            if self.collect {
-                self.collected.push(result);
-            } else if let Some(capture) = evaluator.captures.last_mut() {
+            if let Some(capture) = evaluator.captures.last_mut() {
                 capture.push(result);
             }
         } else if !captured {
@@ -256,11 +244,11 @@ impl StageOut {
                 push_diagnostic_bytes(bytes, &mut evaluator.stderr_capture, &mut evaluator.output)
             }
             Destination::Pipe => {
-                if let Some(writer) = evaluator.stdout.as_mut() {
-                    if writer.write(bytes) == WriteOutcome::ReaderGone {
-                        evaluator.reader_gone = true;
-                        return Ok(false);
-                    }
+                if let Some(writer) = evaluator.stdout.as_mut()
+                    && writer.write(bytes) == WriteOutcome::ReaderGone
+                {
+                    evaluator.reader_gone = true;
+                    return Ok(false);
                 }
             }
             Destination::Capture => {
@@ -324,19 +312,9 @@ impl StageOut {
             }
         }
         if self.mode == OutputMode::Copy {
-            let mut retained = capture_charges(&mut self.collected);
-            let value = if self.collected.is_empty() {
-                Value::Null
-            } else {
-                reduce_charged(&evaluator.budget, self.collected, &mut retained)?
-            };
-            retain_value(&evaluator.budget, &value, &mut retained)?;
-            return Ok(CommandResult {
-                value,
-                status,
-                suppress_newline: true,
-                retained,
-            });
+            let mut result = CommandResult::status(status).without_newline();
+            retain_value(&evaluator.budget, &result.value, &mut result.retained)?;
+            return Ok(result);
         }
         if self.bytes.is_empty() || (self.mode == OutputMode::Base64 && status != ExitCode::SUCCESS)
         {
@@ -348,20 +326,24 @@ impl StageOut {
                 Ok(CommandResult::status(status))
             }
             Destination::Diagnostics | Destination::Capture => {
-                let text = String::from_utf8(self.bytes).map_err(|_invalid_utf8| {
-                    if self.mode == OutputMode::Lines {
-                        CommandFailure::Fatal(FatalError::Unsupported(
-                            "standard input is not valid UTF-8 text".to_owned(),
-                        ))
-                    } else {
-                        invalid_utf8()
-                    }
-                })?;
+                let text = String::from_utf8(std::mem::take(&mut self.bytes)).map_err(
+                    |_invalid_utf8| {
+                        if self.mode == OutputMode::Lines {
+                            CommandFailure::Fatal(FatalError::Unsupported(
+                                "standard input is not valid UTF-8 text".to_owned(),
+                            ))
+                        } else {
+                            invalid_utf8()
+                        }
+                    },
+                )?;
+                let retained = std::mem::take(&mut self.charges);
                 Ok(CommandResult {
                     value: Value::String(text),
                     status,
                     suppress_newline: true,
-                    retained: self.charges,
+                    retained,
+                    output: Some(self),
                 })
             }
             Destination::Discard | Destination::Pipe | Destination::Terminal => {

@@ -375,15 +375,6 @@ pub(crate) fn cat_stream(
 }
 
 #[cfg(test)]
-pub(crate) fn cat(
-    _context: &mut BuiltinContext<'_>,
-    _arguments: &[String],
-    input: Option<Value>,
-) -> Result<CommandResult, CommandFailure> {
-    Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline())
-}
-
-#[cfg(test)]
 mod tests {
     use dekopon_process::ExitCode;
     use parking_lot::Mutex;
@@ -395,14 +386,14 @@ mod tests {
         CapabilityCallResult, CapabilityInvoker, Interpreter,
         builtins::{
             CommandFailure,
-            test_support::{run_builtin, run_builtin_with, run_builtin_with_invoker},
+            test_support::{cat as Cat, run_builtin, run_builtin_with, run_builtin_with_invoker},
         },
     };
     use dekopon_process::Limits;
 
     use super::{
-        cat as Cat, echo as Echo, fail as False, printf as Printf, progress as Progress,
-        sleep as Sleep, succeed as True, test as Test, test_bracket as TestBracket,
+        echo as Echo, fail as False, printf as Printf, progress as Progress, sleep as Sleep,
+        succeed as True, test as Test, test_bracket as TestBracket,
     };
 
     #[derive(Default)]
