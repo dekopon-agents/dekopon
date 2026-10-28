@@ -1877,7 +1877,7 @@ refusal is a fact to report: nothing escalates past the grants.
 `asset cat chat-asset:3 | head`. Quoted, or inside a larger word, it is plain text. Builtins never \
 read files.
 - Not bash: no processes, files, environment variables or network; `ls` and `cd` do not exist; \
-patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
+`case` supports unquoted globs (`*`, `?`, brackets); other patterns are literal unless `grep -E`/`sed -E`; values are JSON. Everything unsupported fails \
 loudly and by name: `eval`, backticks, subshells, and `<<<` are errors.
 - The output is your only evidence: never guess what a command returned, accepts, or whether it \
 exists. Exit codes: 0 success; 1 ran and failed; 2 parse, usage, refused construct or exhausted \

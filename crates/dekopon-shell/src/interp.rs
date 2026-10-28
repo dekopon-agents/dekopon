@@ -627,10 +627,12 @@ enum PreservedExpansion {
 enum FieldContext {
     Fields,
     CasePattern,
+    QuotedCasePattern,
 }
 
 struct FieldExpansion<'a> {
     context: FieldContext,
+    quoted_elements: bool,
     spans: &'a mut Vec<ExpansionSpan>,
 }
 
@@ -3210,7 +3212,7 @@ impl<'a> Evaluator<'a> {
                 SpanContent::Elements(items, _) => {
                     (quoted_text(&Value::Array(items)), Protection::Unquoted)
                 }
-                SpanContent::Boundary(_) => (" ".to_owned(), Protection::Quoted),
+                SpanContent::Boundary(_) => break,
                 SpanContent::SplitSpace => continue,
             };
             self.expansion_charges.push(
@@ -3237,6 +3239,9 @@ impl<'a> Evaluator<'a> {
             FieldContext::Fields => self.record_value(spans, value),
             FieldContext::CasePattern => {
                 self.record_text(spans, &quoted_text(value), Protection::Unquoted)
+            }
+            FieldContext::QuotedCasePattern => {
+                self.record_text(spans, &quoted_text(value), Protection::Quoted)
             }
         }
     }
@@ -3322,6 +3327,9 @@ impl<'a> Evaluator<'a> {
                     FieldContext::CasePattern => {
                         self.record_text(spans, text, Protection::Unquoted)?
                     }
+                    FieldContext::QuotedCasePattern => {
+                        self.record_text(spans, text, Protection::Quoted)?
+                    }
                 }
                 self.expansion_text(text, output)
             }
@@ -3336,17 +3344,17 @@ impl<'a> Evaluator<'a> {
             }
             WordPart::Arithmetic(expression) => {
                 let text = render_number(self.evaluate_arithmetic(expression)?);
-                self.record_text(spans, &text, Protection::Unquoted)?;
+                let protection = if context == FieldContext::QuotedCasePattern {
+                    Protection::Quoted
+                } else {
+                    Protection::Unquoted
+                };
+                self.record_text(spans, &text, protection)?;
                 Ok(Value::String(text))
             }
             WordPart::DoubleQuoted(parts) => {
-                if context == FieldContext::CasePattern {
-                    let text = self.expand_quoted(parts)?;
-                    self.record_text(spans, &text, Protection::Quoted)?;
-                    return self.expansion_text(&text, output);
-                }
                 let start = spans.len();
-                self.collect_quoted_parts(parts, spans)?;
+                self.collect_quoted_parts(parts, spans, context)?;
                 match output {
                     ExpansionOutput::Value => {
                         let bytes = spans[start..]
@@ -3409,6 +3417,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         parts: &[WordPart],
         spans: &mut Vec<ExpansionSpan>,
+        context: FieldContext,
     ) -> Result<(), CommandFailure> {
         if parts.is_empty() {
             self.record_text(spans, "", Protection::Quoted)?;
@@ -3421,22 +3430,24 @@ impl<'a> Evaluator<'a> {
                 WordPart::Asset(number) => {
                     self.record_text(spans, &number.to_string(), Protection::Quoted)?
                 }
-                WordPart::DoubleQuoted(inner) => self.collect_quoted_parts(inner, spans)?,
+                WordPart::DoubleQuoted(inner) => {
+                    self.collect_quoted_parts(inner, spans, context)?
+                }
                 WordPart::Arithmetic(expression) => {
                     let text = render_number(self.evaluate_arithmetic(expression)?);
                     self.record_text(spans, &text, Protection::Quoted)?;
                 }
                 WordPart::Parameter(parameter) => {
+                    if context != FieldContext::Fields {
+                        self.expand_parameter_fields(
+                            parameter,
+                            spans,
+                            FieldContext::QuotedCasePattern,
+                        )?;
+                        continue;
+                    }
                     let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
                     if splits_inside_quotes(parameter) {
-                        let elements = match value {
-                            Value::Array(items) => items,
-                            Value::Null => Vec::new(),
-                            scalar @ (Value::Bool(_)
-                            | Value::Number(_)
-                            | Value::String(_)
-                            | Value::Object(_)) => vec![scalar],
-                        };
                         let protection = match parameter {
                             Parameter::Named { .. } => Protection::Checked,
                             Parameter::Positional(_)
@@ -3446,23 +3457,7 @@ impl<'a> Evaluator<'a> {
                             | Parameter::LastStatus
                             | Parameter::LastJob => Protection::Quoted,
                         };
-                        for (index, element) in elements.iter().enumerate() {
-                            if index > 0 {
-                                let mut separator = self.ifs_separator();
-                                if separator.is_empty() {
-                                    separator.push(' ');
-                                }
-                                let charge = self.budget.charge_value_bytes(
-                                    (size_of::<ExpansionSpan>() + separator.len()) as u64,
-                                )?;
-                                spans.push(ExpansionSpan {
-                                    content: SpanContent::Boundary(separator),
-                                    charge,
-                                    retained: Vec::new(),
-                                });
-                            }
-                            self.record_text(spans, &display(element), protection)?;
-                        }
+                        self.record_quoted_elements(spans, &value, protection)?;
                     } else {
                         self.record_text(spans, &quoted_text(&value), Protection::Quoted)?;
                     }
@@ -3472,6 +3467,39 @@ impl<'a> Evaluator<'a> {
                     self.record_capture(spans, result, Protection::Quoted)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn record_quoted_elements(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        value: &Value,
+        protection: Protection,
+    ) -> Result<(), CommandFailure> {
+        let elements = match value {
+            Value::Array(items) => items.as_slice(),
+            Value::Null => &[],
+            scalar @ (Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_)) => {
+                std::slice::from_ref(scalar)
+            }
+        };
+        for (index, element) in elements.iter().enumerate() {
+            if index > 0 {
+                let mut separator = self.ifs_separator();
+                if separator.is_empty() {
+                    separator.push(' ');
+                }
+                let charge = self
+                    .budget
+                    .charge_value_bytes((size_of::<ExpansionSpan>() + separator.len()) as u64)?;
+                spans.push(ExpansionSpan {
+                    content: SpanContent::Boundary(separator),
+                    charge,
+                    retained: Vec::new(),
+                });
+            }
+            self.record_text(spans, &display(element), protection)?;
         }
         Ok(())
     }
@@ -3628,14 +3656,24 @@ impl<'a> Evaluator<'a> {
                     name,
                     indices,
                     modifier,
-                    Some(FieldExpansion { spans, context }),
+                    Some(FieldExpansion {
+                        spans,
+                        context,
+                        quoted_elements: context == FieldContext::QuotedCasePattern
+                            && splits_inside_quotes(parameter),
+                    }),
                     ExpansionOutput::Unsplit,
                 )
             }),
             Parameter::AllPositional | Parameter::AllPositionalJoined => {
-                if context == FieldContext::CasePattern {
+                if context != FieldContext::Fields {
                     let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
-                    self.record_expanded_value(spans, &value, context)?;
+                    if context == FieldContext::QuotedCasePattern && splits_inside_quotes(parameter)
+                    {
+                        self.record_quoted_elements(spans, &value, Protection::Quoted)?;
+                    } else {
+                        self.record_expanded_value(spans, &value, context)?;
+                    }
                     return Ok(value);
                 }
                 let values = self.positional().to_vec();
@@ -3672,7 +3710,11 @@ impl<'a> Evaluator<'a> {
         split: Option<FieldExpansion<'_>>,
     ) -> Result<Value, CommandFailure> {
         if let Some(split) = split {
-            self.record_expanded_value(split.spans, &value, split.context)?;
+            if split.quoted_elements {
+                self.record_quoted_elements(split.spans, &value, Protection::Quoted)?;
+            } else {
+                self.record_expanded_value(split.spans, &value, split.context)?;
+            }
         }
         Ok(value)
     }
@@ -3694,7 +3736,14 @@ impl<'a> Evaluator<'a> {
             let start = spans.len();
             let value = match part {
                 WordPart::Literal(literal) => {
-                    self.record_split_text(spans, literal)?;
+                    match context {
+                        FieldContext::Fields | FieldContext::CasePattern => {
+                            self.record_split_text(spans, literal)?
+                        }
+                        FieldContext::QuotedCasePattern => {
+                            self.record_text(spans, literal, Protection::Quoted)?
+                        }
+                    }
                     self.expansion_text(literal, ExpansionOutput::Value)?
                 }
                 WordPart::Asset(_)

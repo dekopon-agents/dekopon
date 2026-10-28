@@ -1996,6 +1996,121 @@ fn case_posix_bracket_constructs_are_refused_by_name() {
 }
 
 #[test]
+fn case_backslashes_preserve_mixed_quote_boundaries() {
+    for (script, expected) in [
+        (
+            r"p='\'; case '\a' in $p'a') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case a in $p'a') echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r"p='\'; case '\abc' in $p'*') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case abc in $p'*') echo yes ;; *) echo no ;; esac",
+            "no",
+        ),
+        (
+            r"p='\'; case '\?' in $p'?') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case '\[' in $p'[') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+        (
+            r"p='\'; case '\\' in $p'\') echo yes ;; *) echo no ;; esac",
+            "yes",
+        ),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
+
+#[test]
+fn case_matching_checks_the_deadline_inside_stars_and_brackets() {
+    for (subject, pattern) in [
+        ("a".repeat(8192), format!("{}b", "*a".repeat(4096))),
+        ("b".repeat(8192), format!("*[{}]", "a".repeat(65536))),
+    ] {
+        let script = format!("case '{subject}' in {pattern}) : ;; esac");
+        let outcome = run_with(
+            &script,
+            Limits {
+                timeout: Duration::from_millis(100),
+                max_value_bytes: 64 * 1024 * 1024,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(outcome.exit_code, ExitCode::TIMEOUT);
+    }
+}
+
+#[test]
+fn case_incomplete_posix_classes_are_refused_directly_and_after_expansion() {
+    for script in [
+        "case '[' in [a[:b]) echo yes ;; *) echo no ;; esac",
+        "p='[a[:b]'; case '[' in $p) echo yes ;; *) echo no ;; esac",
+    ] {
+        let outcome = run(script);
+        assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
+        assert_eq!(
+            outcome.output, "`case` POSIX bracket classes are not supported",
+            "{script}"
+        );
+    }
+}
+
+#[test]
+fn case_quoted_positionals_select_the_first_expanded_field() {
+    for (script, expected) in [
+        (
+            r#"f() { IFS=:; case 'a b' in "$@") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "no",
+        ),
+        (
+            r#"f() { IFS=:; case a in "$@") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case xa in x"$@"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case 'xa by' in x"$@"y) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "no",
+        ),
+        (
+            r#"f() { IFS=:; case a in ${p:-"$@"}) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case a in "${p:-$@}") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case 'a b' in $@) echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { IFS=:; case a:b in "$*") echo yes ;; *) echo no ;; esac; }; f a b"#,
+            "yes",
+        ),
+        (
+            r#"f() { case a in "$@"${p:=x}) echo "$p" ;; esac; }; f a b"#,
+            "x",
+        ),
+        (r#"f() { case '' in "$@") echo yes ;; esac; }; f"#, "yes"),
+    ] {
+        assert_eq!(output(script), expected, "{script}");
+    }
+}
+
+#[test]
 fn case_charges_the_step_budget_like_every_other_construct() {
     let outcome = run_with(
         "while true; do case x in a) : ;; b) : ;; *) : ;; esac; done",
