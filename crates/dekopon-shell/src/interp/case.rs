@@ -270,7 +270,7 @@ fn check_bracket(members: &[PatternFragment]) -> Result<(), BracketRefusal> {
         }
         let refusal = match pair[1] {
             PatternFragment::Unquoted(':') => BracketRefusal::CharacterClass,
-            PatternFragment::Unquoted('.') => BracketRefusal::CollatingSymbol,
+            PatternFragment::Unquoted('.') => return Err(BracketRefusal::CollatingSymbol),
             PatternFragment::Unquoted('=') => BracketRefusal::EquivalenceClass,
             PatternFragment::Literal(_)
             | PatternFragment::Unquoted(_)
@@ -328,13 +328,18 @@ impl Evaluator<'_> {
         pattern: &mut CaseExpansion,
         context: Context,
     ) -> Result<(), CommandFailure> {
+        let mut had_quoted_null = false;
         for part in &word.parts {
             match part {
                 WordPart::Literal(text) => pattern.append(text, Quote::Unquoted)?,
-                WordPart::SingleQuoted(text) => pattern.append_quoted(text, context)?,
+                WordPart::SingleQuoted(text) => {
+                    pattern.append_quoted(text, context)?;
+                    had_quoted_null |= text.is_empty();
+                }
                 WordPart::DoubleQuoted(parts) => {
                     let text = self.expand_quoted(parts)?;
                     pattern.append_quoted(&text, context)?;
+                    had_quoted_null |= text.is_empty();
                 }
                 WordPart::Asset(number) => pattern.append(&number.to_string(), Quote::Unquoted)?,
                 WordPart::Arithmetic(expression) => {
@@ -346,35 +351,43 @@ impl Evaluator<'_> {
                     pattern.append_value(&result.value)?;
                     self.expansion_charges.extend(result.retained);
                 }
-                WordPart::Parameter(parameter) => match parameter {
-                    Parameter::Named {
-                        name,
-                        indices,
-                        modifier,
-                        length: false,
-                    } => {
-                        self.nested(|this| {
-                            this.named_parameter_value(
-                                name,
-                                indices,
-                                modifier,
-                                Some(ParameterExpansion::Case(pattern)),
-                                ExpansionOutput::Unsplit,
-                            )
-                        })?;
+                WordPart::Parameter(parameter) => {
+                    let start = pattern.fragments.len();
+                    match parameter {
+                        Parameter::Named {
+                            name,
+                            indices,
+                            modifier,
+                            length: false,
+                        } => {
+                            self.nested(|this| {
+                                this.named_parameter_value(
+                                    name,
+                                    indices,
+                                    modifier,
+                                    Some(ParameterExpansion::Case(pattern)),
+                                    ExpansionOutput::Unsplit,
+                                )
+                            })?;
+                        }
+                        Parameter::Named { length: true, .. }
+                        | Parameter::Positional(_)
+                        | Parameter::AllPositional
+                        | Parameter::AllPositionalJoined
+                        | Parameter::PositionalCount
+                        | Parameter::LastStatus
+                        | Parameter::LastJob => {
+                            let value =
+                                self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
+                            pattern.append_value(&value)?;
+                        }
                     }
-                    Parameter::Named { length: true, .. }
-                    | Parameter::Positional(_)
-                    | Parameter::AllPositional
-                    | Parameter::AllPositionalJoined
-                    | Parameter::PositionalCount
-                    | Parameter::LastStatus
-                    | Parameter::LastJob => {
-                        let value =
-                            self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
-                        pattern.append_value(&value)?;
+                    if had_quoted_null
+                        && pattern.fragments[start..] == [PatternFragment::QuotedNull]
+                    {
+                        pattern.fragments.truncate(start);
                     }
-                },
+                }
             }
         }
         Ok(())
@@ -390,6 +403,7 @@ mod tests {
         for (source, expected) in [
             ("[[:alpha:]]", BracketRefusal::CharacterClass),
             ("[[.a.]]", BracketRefusal::CollatingSymbol),
+            ("[[.a]", BracketRefusal::CollatingSymbol),
             ("[[=a=]]", BracketRefusal::EquivalenceClass),
         ] {
             let pattern: Vec<_> = source.chars().map(PatternFragment::Unquoted).collect();

@@ -1844,6 +1844,49 @@ fn a_case_pattern_assembled_at_run_time_matches_as_a_glob() {
 
 const CASE_GLOB_ROWS: &[(&str, &str)] = &[
     (
+        "unset p; case a in ''${p:-''}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case a in ${p:-''}''a) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p; case a in \"\"${p:-''}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p q; case a in \"$q\"${p:-''}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p=x; case a in ''${p:+''}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "p=x; case a in ${p:+''}''a) echo yes ;; *) echo no ;; esac",
+        "no",
+    ),
+    (
+        "unset p q; case a in ''${p:-''}${q:-''}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p q; case '\u{7f}a' in ${p:-''${q:-''}}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '\u{7f}xa' in ''${p:-''x}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    (
+        "unset p; case '\u{7f}\u{7f}a' in ''${p:-''''}a) echo yes ;; *) echo no ;; esac",
+        "yes",
+    ),
+    ("case a in ['[.'a]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case a in [[:a]) echo yes ;; *) echo no ;; esac", "yes"),
+    ("case a in [[=a]) echo yes ;; *) echo no ;; esac", "yes"),
+    (
         "case 'report.json' in *.json) echo yes ;; *) echo no ;; esac",
         "yes",
     ),
