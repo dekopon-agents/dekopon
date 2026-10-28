@@ -357,12 +357,21 @@ pub(crate) fn sleep(
     Ok(CommandResult::status(ExitCode::SUCCESS))
 }
 
-pub(crate) fn cat(
-    _context: &mut BuiltinContext<'_>,
-    _arguments: &[String],
-    input: Option<Value>,
-) -> Result<CommandResult, CommandFailure> {
-    Ok(CommandResult::value(input.unwrap_or(Value::Null)).without_newline())
+pub(crate) fn cat_stream(
+    arguments: &[String],
+    mut emit: impl FnMut(&str) -> Result<bool, CommandFailure>,
+) -> Result<(), CommandFailure> {
+    for name in arguments {
+        if name.starts_with('-') && name.len() > 1 {
+            return Err(CommandFailure::usage(format!(
+                "cat: unsupported flag {name}"
+            )));
+        }
+        if !emit(name)? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -377,14 +386,14 @@ mod tests {
         CapabilityCallResult, CapabilityInvoker, Interpreter,
         builtins::{
             CommandFailure,
-            test_support::{run_builtin, run_builtin_with, run_builtin_with_invoker},
+            test_support::{cat as Cat, run_builtin, run_builtin_with, run_builtin_with_invoker},
         },
     };
     use dekopon_process::Limits;
 
     use super::{
-        cat as Cat, echo as Echo, fail as False, printf as Printf, progress as Progress,
-        sleep as Sleep, succeed as True, test as Test, test_bracket as TestBracket,
+        echo as Echo, fail as False, printf as Printf, progress as Progress, sleep as Sleep,
+        succeed as True, test as Test, test_bracket as TestBracket,
     };
 
     #[derive(Default)]
