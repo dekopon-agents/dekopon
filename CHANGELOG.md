@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-10-28
+
+### Changed
+
+- Shell builtins write their output through one internal writer; no behaviour change.
+
+## [dekopon-chart-0.53.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.53.0 targets core v0.66.0 and renders the `v0.66.0` image tag.
+
 ## [0.65.0] - 2026-10-28
 
 ### Added
