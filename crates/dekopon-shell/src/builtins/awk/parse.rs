@@ -536,6 +536,7 @@ pub(super) struct Rule {
 pub(super) struct Program {
     pub rules: Vec<Rule>,
     pub regex_sources: Vec<String>,
+    pub arrays: std::collections::BTreeSet<String>,
 }
 
 struct Parser<'a> {
@@ -570,11 +571,12 @@ pub(super) fn program(source: &str) -> Result<Program, AwkError> {
         }
         parser.separators()?;
     }
-    let program = Program {
+    let mut program = Program {
         rules,
         regex_sources: parser.regex_sources,
+        arrays: std::collections::BTreeSet::new(),
     };
-    check_uses(&program)?;
+    program.arrays = check_uses(&program)?;
     Ok(program)
 }
 
@@ -1448,7 +1450,7 @@ fn use_name(uses: &mut BTreeMap<String, Use>, name: &str, usage: Use) -> Result<
     Ok(())
 }
 
-fn check_uses(program: &Program) -> Result<(), AwkError> {
+fn check_uses(program: &Program) -> Result<std::collections::BTreeSet<String>, AwkError> {
     let mut uses = BTreeMap::new();
     for rule in &program.rules {
         for expression in [&rule.pattern, &rule.range_end].into_iter().flatten() {
@@ -1458,7 +1460,13 @@ fn check_uses(program: &Program) -> Result<(), AwkError> {
             check_statement(action, &mut uses)?;
         }
     }
-    Ok(())
+    Ok(uses
+        .into_iter()
+        .filter_map(|(name, usage)| match usage {
+            Use::Array => Some(name),
+            Use::Scalar => None,
+        })
+        .collect())
 }
 
 fn array_argument(expression: &Expr, uses: &mut BTreeMap<String, Use>) -> Result<(), AwkError> {
