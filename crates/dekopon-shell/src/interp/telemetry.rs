@@ -196,7 +196,7 @@ pub(crate) fn stage_write(bytes: usize, accepted: bool, owner: &StageObservation
     });
 }
 
-use crate::{builtins::FatalError, dispatch::Resolution, value::display};
+use crate::{builtins::FatalError, builtins::Resolution, value::display};
 use dekopon_process::{ExitCode, LimitExceeded};
 
 pub(crate) const SCRIPT_SPAN: &str = "shell.script";
@@ -294,14 +294,6 @@ pub(crate) fn script_span() -> tracing::Span {
         shell.script.failed_commands = tracing::field::Empty,
         outcome = tracing::field::Empty,
     )
-}
-
-pub(crate) const CONTROL_WORDS: &[&str] = &[
-    "break", "continue", "exit", "local", "read", "return", "set", "shift", "unset", ":",
-];
-
-pub(crate) fn is_control_word(word: &str) -> bool {
-    CONTROL_WORDS.contains(&word)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -79,7 +79,7 @@ broker:
         shutdownGraceMs: 120000
       telemetry:
         endpoint: http://rpi.localdomain
-        transport: grpc
+        transport: http
         serviceName: dekopon-brokerd
         exportTimeoutMs: 5000
 

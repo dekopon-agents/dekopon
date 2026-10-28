@@ -312,8 +312,9 @@ commands, failed commands — which cost the same whether a script ran three com
 thousand.
 
 Instrumentation lives at the single seam every command word passes through, so a builtin added
-later is traced without another edit, and none of the twenty builtin implementations carries
-telemetry code.
+later is traced without another edit. The closed `Builtin` enum owns names, help and execution
+dispatch; `ControlWord` and `RejectedCommand` own control and refusal vocabulary. Builtin
+implementations carry no telemetry code.
 
 `tracing` is this crate's only dependency for that. There is no exporter here, no collector, and no
 telemetry protocol — the embedding binary's subscriber decides where spans go. Spans must therefore

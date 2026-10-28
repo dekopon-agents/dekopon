@@ -1,4 +1,4 @@
-use super::extra::ExtraStream;
+use crate::builtins::Builtin;
 use crate::{
     builtins::{CommandFailure, FatalError},
     limits::Budget,
@@ -6,21 +6,36 @@ use crate::{
 use dekopon_process::pipe::{self, PipeReader, WriteOutcome};
 use dekopon_process::{ExitCode, LimitExceeded, Limits};
 
-fn arguments(command: ExtraStream) -> Vec<String> {
+fn arguments(command: Builtin) -> Vec<String> {
     match command {
-        ExtraStream::Cut => vec!["-c".into(), "1".into()],
-        ExtraStream::Uniq | ExtraStream::Wc | ExtraStream::Sort => Vec::new(),
+        Builtin::Cut => vec!["-c".into(), "1".into()],
+        Builtin::Uniq | Builtin::Wc | Builtin::Sort => Vec::new(),
+        Builtin::Echo
+        | Builtin::Printf
+        | Builtin::Test
+        | Builtin::TestBracket
+        | Builtin::True
+        | Builtin::False
+        | Builtin::Progress
+        | Builtin::Sleep
+        | Builtin::Cat
+        | Builtin::Jobs
+        | Builtin::Wait
+        | Builtin::Kill
+        | Builtin::Cap
+        | Builtin::Head
+        | Builtin::Tail
+        | Builtin::Grep
+        | Builtin::Sed
+        | Builtin::Jq
+        | Builtin::Base64
+        | Builtin::Xargs => panic!("not an extra text test"),
     }
 }
 
 #[test]
 fn four_text_commands_charge_each_small_pipe_chunk() {
-    for command in [
-        ExtraStream::Cut,
-        ExtraStream::Uniq,
-        ExtraStream::Wc,
-        ExtraStream::Sort,
-    ] {
+    for command in [Builtin::Cut, Builtin::Uniq, Builtin::Wc, Builtin::Sort] {
         let (mut writer, mut reader) = pipe::pipe(
             None,
             None,
@@ -36,7 +51,7 @@ fn four_text_commands_charge_each_small_pipe_chunk() {
             ..Limits::default()
         });
         let failure = command
-            .run(&arguments(command), &mut reader, &mut budget, |_| Ok(true))
+            .run_text(&arguments(command), &mut reader, &mut budget, |_| Ok(true))
             .expect_err("the third small chunk exhausts the step budget");
         assert!(matches!(
             failure,
@@ -47,14 +62,9 @@ fn four_text_commands_charge_each_small_pipe_chunk() {
 
 #[test]
 fn four_text_commands_notice_cancellation_between_chunks() {
-    for command in [
-        ExtraStream::Cut,
-        ExtraStream::Uniq,
-        ExtraStream::Wc,
-        ExtraStream::Sort,
-    ] {
+    for command in [Builtin::Cut, Builtin::Uniq, Builtin::Wc, Builtin::Sort] {
         let failure = crate::builtins::test_support::cancel_after_first_step(|reader, budget| {
-            command.run(&arguments(command), reader, budget, |_| Ok(true))
+            command.run_text(&arguments(command), reader, budget, |_| Ok(true))
         })
         .expect_err("a later chunk notices cancellation");
         assert!(matches!(
@@ -77,7 +87,7 @@ fn cut_selects_characters_from_a_near_limit_line_without_retaining_copies() {
         ..Limits::default()
     });
     let mut output = Vec::new();
-    let result = ExtraStream::Cut.run(
+    let result = Builtin::Cut.run_text(
         &["-c".into(), "2-3".into()],
         &mut reader,
         &mut budget,
@@ -107,8 +117,8 @@ fn streaming_cut_selects_unsorted_overlapping_fields_and_characters() {
         );
         let mut budget = Budget::start(Limits::default());
         let mut output = Vec::new();
-        ExtraStream::Cut
-            .run(
+        Builtin::Cut
+            .run_text(
                 &arguments
                     .iter()
                     .map(|arg| (*arg).to_owned())
@@ -133,7 +143,7 @@ fn sorted(arguments: &[&str], input: &str) -> Result<String, CommandFailure> {
     );
     let mut budget = Budget::start(Limits::default());
     let mut output = Vec::new();
-    ExtraStream::Sort.run(
+    Builtin::Sort.run_text(
         &arguments
             .iter()
             .map(|arg| (*arg).to_owned())
@@ -201,8 +211,8 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
         None,
         crate::interp::telemetry::stage_read,
     );
-    let failure = ExtraStream::Sort
-        .run(&[], &mut reader, &mut budget, |_| Ok(true))
+    let failure = Builtin::Sort
+        .run_text(&[], &mut reader, &mut budget, |_| Ok(true))
         .expect_err("two retained two-byte lines do not fit in three bytes");
     assert!(matches!(
         failure,
@@ -219,8 +229,8 @@ fn sorted_lines_hold_their_charges_until_the_command_finishes() {
     });
     for _ in 0..2 {
         assert_eq!(
-            ExtraStream::Sort
-                .run(&[], &mut reader, &mut budget, |_| Ok(true))
+            Builtin::Sort
+                .run_text(&[], &mut reader, &mut budget, |_| Ok(true))
                 .expect("retained bytes are refunded"),
             ExitCode::SUCCESS
         );

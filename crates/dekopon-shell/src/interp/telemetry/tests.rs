@@ -146,7 +146,8 @@ impl CapabilityInvoker for Fixture {
     }
 }
 
-use super::{CONTROL_WORDS, SCRIPT_SPAN};
+use super::SCRIPT_SPAN;
+use crate::builtins::ControlWord;
 
 #[derive(Clone, Debug)]
 struct Captured {
@@ -728,7 +729,8 @@ fn a_loop_heavy_script_still_spans_every_command_it_ran() {
 
 #[test]
 fn control_words_and_their_dispatcher_agree() {
-    for word in CONTROL_WORDS {
+    for word in ControlWord::ALL {
+        let word = word.name();
         let outcome = capture(word).outcome;
         assert!(
             !outcome.output.contains("command not found"),

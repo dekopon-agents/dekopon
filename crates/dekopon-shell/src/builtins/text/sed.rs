@@ -309,15 +309,12 @@ fn split_unescaped(body: &str, delimiter: char) -> Vec<String> {
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::builtins::{
-        CommandResult,
-        text::stream::{TextStream, run_test},
-    };
+    use crate::builtins::{Builtin, CommandResult, text::stream::run_test};
 
     use super::Substitution;
 
     fn sed(arguments: &[&str], input: Value) -> CommandResult {
-        run_test(TextStream::Sed, arguments, input).expect("sed runs")
+        run_test(Builtin::Sed, arguments, input).expect("sed runs")
     }
 
     #[test]
@@ -403,8 +400,8 @@ mod tests {
 
     #[test]
     fn unsupported_flags_are_rejected_by_name() {
-        let failure = run_test(TextStream::Sed, &["-n", "s/a/b/"], json!("a"))
-            .expect_err("-n is not supported");
+        let failure =
+            run_test(Builtin::Sed, &["-n", "s/a/b/"], json!("a")).expect_err("-n is not supported");
         assert!(format!("{failure:?}").contains("-n"), "{failure:?}");
     }
 
@@ -448,13 +445,13 @@ mod tests {
     #[test]
     fn without_the_e_flag_a_regex_is_still_refused_by_name() {
         let failure =
-            run_test(TextStream::Sed, &["s/^ *//"], json!("  x")).expect_err("literal by default");
+            run_test(Builtin::Sed, &["s/^ *//"], json!("  x")).expect_err("literal by default");
         assert!(format!("{failure:?}").contains("anchors"), "{failure:?}");
     }
 
     #[test]
     fn an_uncompilable_e_pattern_fails_rather_than_matching_nothing() {
-        let failure = run_test(TextStream::Sed, &["-E", "s/a(/x/"], json!("a("))
+        let failure = run_test(Builtin::Sed, &["-E", "s/a(/x/"], json!("a("))
             .expect_err("an unclosed group is not a literal");
         assert!(
             format!("{failure:?}").contains("closing ')'"),

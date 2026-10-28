@@ -52,7 +52,15 @@ pub(crate) async fn observed<E: std::error::Error>(
         .as_ref()
         .and_then(dekopon_brokerd::ShutdownDeadline::get)
     {
-        None => telemetry.shutdown(),
+        None => match tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+            Ok(flushed) => flushed,
+            Err(error) => {
+                return diagnostic(
+                    &format!("dekopon-brokerd: telemetry flush failed: {error}\n"),
+                    code,
+                );
+            }
+        },
         Some(deadline) if tokio::time::Instant::now() >= deadline => {
             return diagnostic(
                 "dekopon-brokerd: telemetry flush abandoned at the shutdown deadline\n",
