@@ -153,6 +153,10 @@ const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,deko
 const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: main, which drops it after the broker returns; bound: the daemon's one runtime, one worker per core"
+)]
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

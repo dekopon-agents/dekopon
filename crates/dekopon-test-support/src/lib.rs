@@ -38,6 +38,18 @@ pub use transcripts::{
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[must_use]
+pub fn shell_threads() -> dekopon_process::ShellThreads {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("the test runtime starts")
+    });
+    dekopon_process::ShellThreads::new(16, RUNTIME.handle().clone())
+}
+
 const POOLED_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[must_use]

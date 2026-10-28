@@ -64,7 +64,7 @@
 //! use dekopon_shell::{
 //!     CapabilityCallResult, CapabilityInvoker, Interpreter, Streams,
 //! };
-//! use dekopon_process::Limits;
+//! use dekopon_process::{Limits, ShellThreads};
 //! use serde_json::json;
 //!
 //! /// One provider word, `probe`, whose `upper --text <s>` proposes `cli-probe.upper`.
@@ -115,7 +115,9 @@
 //!     }
 //! }
 //!
-//! let outcome = Interpreter::new(Limits::default())
+//! let runtime = tokio::runtime::Runtime::new().unwrap();
+//! let threads = ShellThreads::new(16, runtime.handle().clone());
+//! let outcome = Interpreter::new(Limits::default(), threads)
 //!     .run("probe upper --text hi | cat", &Fixture);
 //! assert_eq!(outcome.exit_code.get(), 0);
 //! assert_eq!(outcome.output, "HI");
@@ -132,7 +134,7 @@
     )
 )]
 use crate::interp::telemetry::StageObservation;
-use dekopon_process::{CallBudget, ExitCode, Limits, TreeContext, pipe};
+use dekopon_process::{CallBudget, ExitCode, Limits, ShellThreads, TreeContext, pipe};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde_json::Value;
@@ -458,6 +460,20 @@ pub struct ScriptOutcome {
     pub steps: u64,
 }
 
+impl ScriptOutcome {
+    #[must_use]
+    pub fn refused(limit: dekopon_process::LimitExceeded) -> Self {
+        let fatal = builtins::FatalError::Limit(limit);
+        Self {
+            output: interp::fatal_message(&fatal),
+            exit_code: interp::telemetry::fatal_exit_code(&fatal),
+            truncated: false,
+            capability_calls: 0,
+            steps: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ChildStdin(pipe::PipeReader<StageObservation>);
 
@@ -469,15 +485,16 @@ impl ChildStdin {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Interpreter {
     limits: Limits,
+    threads: ShellThreads,
 }
 
 impl Interpreter {
     #[must_use]
-    pub fn new(limits: Limits) -> Self {
-        Self { limits }
+    pub fn new(limits: Limits, threads: ShellThreads) -> Self {
+        Self { limits, threads }
     }
 
     #[must_use]
@@ -492,6 +509,7 @@ impl Interpreter {
             &TreeContext::new(
                 self.limits,
                 CallBudget::new(self.limits.max_capability_calls),
+                self.threads.clone(),
             )
             .with_cancel(invoker.cancel_signals()),
         )
@@ -532,12 +550,25 @@ impl Interpreter {
         prev: &str,
         invoker: &dyn CapabilityInvoker,
     ) -> ScriptOutcome {
-        interp::run(script, Some(prev), invoker, self.limits)
+        interp::run(script, Some(prev), invoker, self.limits, &self.threads)
     }
 }
 
-pub fn run(script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
-    Interpreter::new(Limits::default()).run(script, invoker)
+#[cfg(test)]
+pub(crate) fn test_threads() -> ShellThreads {
+    test_threads_up_to(16)
+}
+
+#[cfg(test)]
+pub(crate) fn test_threads_up_to(maximum: u32) -> ShellThreads {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    ShellThreads::new(maximum, RUNTIME.handle().clone())
 }
 
 #[cfg(test)]
@@ -710,8 +741,8 @@ mod tests {
             max_steps: 100_000,
             ..Limits::default()
         };
-        let outcome =
-            Interpreter::new(limits).run("while true; do :; done", &Cancellation(cancelled));
+        let outcome = Interpreter::new(limits, crate::test_threads())
+            .run("while true; do :; done", &Cancellation(cancelled));
         assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
         assert_eq!(
             super::interp::telemetry::fatal_outcome(&super::builtins::FatalError::Limit(
@@ -726,8 +757,11 @@ mod tests {
     fn run_with_prev_refuses_an_already_cancelled_invoker() {
         let (handle, signal) = dekopon_process::CancelSignal::pair();
         handle.cancel();
-        let outcome =
-            Interpreter::new(Limits::default()).run_with_prev("echo ok", "", &Cancellation(signal));
+        let outcome = Interpreter::new(Limits::default(), crate::test_threads()).run_with_prev(
+            "echo ok",
+            "",
+            &Cancellation(signal),
+        );
         assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
     }
 
@@ -739,10 +773,13 @@ mod tests {
             flip.cancel();
         });
         let start = Instant::now();
-        let outcome = Interpreter::new(Limits {
-            timeout: Duration::from_secs(310),
-            ..Limits::default()
-        })
+        let outcome = Interpreter::new(
+            Limits {
+                timeout: Duration::from_secs(310),
+                ..Limits::default()
+            },
+            crate::test_threads(),
+        )
         .run("sleep 300", &Cancellation(cancelled));
         worker.join().expect("cancel worker");
         assert_eq!(outcome.exit_code, ExitCode::CANCELLED);
@@ -756,16 +793,16 @@ mod tests {
             max_capability_calls: 1,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
         let invoker = RecordingInvoker::default();
-        let interpreter = Interpreter::new(limits);
+        let interpreter = Interpreter::new(limits, crate::test_threads());
         assert_eq!(
             interpreter
                 .run_with_tree("gh-extra one", &invoker, &tree)
                 .capability_calls,
             1
         );
-        let second_interpreter = Interpreter::new(limits);
+        let second_interpreter = Interpreter::new(limits, crate::test_threads());
         let second = second_interpreter.run_with_tree("gh-extra two", &invoker, &tree);
         assert_eq!(second.exit_code, ExitCode::SYNTAX);
         assert_eq!(tree.calls().used(), 1);
@@ -784,11 +821,14 @@ mod tests {
             max_value_bytes: 128,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
         let script = "f() { local y=abcdefgh; }; x=abcdefgh; ".to_owned()
             + &"x=ijklmnop; f; echo abcdefgh > buf; ".repeat(20);
-        let outcome =
-            Interpreter::new(limits).run_with_tree(&script, &RecordingInvoker::default(), &tree);
+        let outcome = Interpreter::new(limits, crate::test_threads()).run_with_tree(
+            &script,
+            &RecordingInvoker::default(),
+            &tree,
+        );
         assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
         assert_eq!(tree.value_bytes(), 0);
     }
@@ -800,9 +840,9 @@ mod tests {
             max_value_bytes: 512,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(4));
+        let tree = TreeContext::new(limits, CallBudget::new(4), crate::test_threads());
         let word = format!("\"$(printf {})\"", "x".repeat(256));
-        let interpreter = Interpreter::new(limits);
+        let interpreter = Interpreter::new(limits, crate::test_threads());
         let failed = interpreter.run_with_tree(&format!("gh-extra {word} {word}"), &invoker, &tree);
         assert_eq!(failed.exit_code, ExitCode::SYNTAX, "{}", failed.output);
         assert!(invoker.secret_uses.lock().is_empty());
@@ -820,12 +860,12 @@ mod tests {
             max_value_bytes: 256,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
         let invoker = RecordingInvoker {
             tree: Some(tree.clone()),
             ..RecordingInvoker::default()
         };
-        let outcome = Interpreter::new(limits).run_with_tree(
+        let outcome = Interpreter::new(limits, crate::test_threads()).run_with_tree(
             "v=$(printf 'x\\n\\n'); retained; w=$(printf 12345678); retained",
             &invoker,
             &tree,
@@ -841,13 +881,16 @@ mod tests {
             max_value_bytes: 2 * 1024 * 1024 + 96 * 1024,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
         let script = format!(
             "big={}; f() {{ local n=0; n=1 sleep 1 | cat; }}; f",
             "x".repeat(64 * 1024)
         );
-        let outcome =
-            Interpreter::new(limits).run_with_tree(&script, &RecordingInvoker::default(), &tree);
+        let outcome = Interpreter::new(limits, crate::test_threads()).run_with_tree(
+            &script,
+            &RecordingInvoker::default(),
+            &tree,
+        );
         assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
         assert_eq!(tree.value_bytes(), 0);
     }
@@ -858,8 +901,8 @@ mod tests {
             max_value_bytes: 2 * 1024 * 1024 + 4096,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(1));
-        let interpreter = Interpreter::new(limits);
+        let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
+        let interpreter = Interpreter::new(limits, crate::test_threads());
         let invoker = RecordingInvoker::default();
         for script in [
             "v=$(while true; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | cat)",
@@ -882,10 +925,14 @@ mod tests {
             max_value_bytes: 2 * 2 * 1024 * 1024 + 4096,
             ..limits
         };
-        let streaming_tree = TreeContext::new(streaming_limits, CallBudget::new(1));
+        let streaming_tree =
+            TreeContext::new(streaming_limits, CallBudget::new(1), crate::test_threads());
         let script = format!("printf '{}' | cat | wc -c", "x".repeat(1024 * 1024));
-        let streamed =
-            Interpreter::new(streaming_limits).run_with_tree(&script, &invoker, &streaming_tree);
+        let streamed = Interpreter::new(streaming_limits, crate::test_threads()).run_with_tree(
+            &script,
+            &invoker,
+            &streaming_tree,
+        );
         assert_eq!(streamed.exit_code, ExitCode::SUCCESS, "{streamed:?}");
         assert_eq!(streamed.output, "1048576");
         assert_eq!(streaming_tree.value_bytes(), 0);
@@ -897,12 +944,16 @@ mod tests {
             max_value_bytes: 15,
             ..Limits::default()
         };
-        let tree = TreeContext::new(limits, CallBudget::new(1));
+        let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
         let invoker = RecordingInvoker {
             tree: Some(tree.clone()),
             ..RecordingInvoker::default()
         };
-        let outcome = Interpreter::new(limits).run_with_tree("render > buf", &invoker, &tree);
+        let outcome = Interpreter::new(limits, crate::test_threads()).run_with_tree(
+            "render > buf",
+            &invoker,
+            &tree,
+        );
         assert_ne!(outcome.exit_code, ExitCode::SUCCESS, "{outcome:?}");
         assert!(outcome.output.contains("bytes of values"), "{outcome:?}");
         assert_eq!(tree.value_bytes(), 0);
@@ -936,12 +987,13 @@ mod tests {
                 max_value_bytes: maximum,
                 ..Limits::default()
             };
-            let tree = TreeContext::new(limits, CallBudget::new(1));
+            let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
             let invoker = RecordingInvoker {
                 tree: Some(tree.clone()),
                 ..RecordingInvoker::default()
             };
-            let outcome = Interpreter::new(limits).run_with_tree(script, &invoker, &tree);
+            let outcome = Interpreter::new(limits, crate::test_threads())
+                .run_with_tree(script, &invoker, &tree);
             assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
             assert_eq!(*invoker.retained.lock(), expected, "{script}");
             assert_eq!(tree.value_bytes(), 0);
@@ -976,7 +1028,8 @@ mod tests {
                 streams().0,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    crate::test_threads()
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -987,7 +1040,8 @@ mod tests {
                 streams().0,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    crate::test_threads()
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1123,7 +1177,7 @@ mod tests {
     fn a_provider_proposal_hands_its_secret_use_to_invoke() {
         for secret_use in [Some(proposal()), None] {
             let invoker = ProposingInvoker::proposing(secret_use.clone());
-            let outcome = Interpreter::new(Limits::default())
+            let outcome = Interpreter::new(Limits::default(), crate::test_threads())
                 .run("httpprobe fetch --url https://x", &invoker);
             assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
             assert_eq!(outcome.output, r#"{"status":200}"#);
@@ -1243,11 +1297,11 @@ mod tests {
         write.write_all(input).expect("input bytes");
         drop(write);
         let limits = Limits::default();
-        Interpreter::new(limits).run_child(
+        Interpreter::new(limits, crate::test_threads()).run_child(
             script,
             Some(stdin),
             invoker,
-            &TreeContext::new(limits, CallBudget::new(16)),
+            &TreeContext::new(limits, CallBudget::new(16), crate::test_threads()),
         )
     }
 
@@ -1286,11 +1340,11 @@ mod tests {
         let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("idle stdin");
         let limits = Limits::default();
         let start = std::time::Instant::now();
-        let outcome = Interpreter::new(limits).run_child(
+        let outcome = Interpreter::new(limits, crate::test_threads()).run_child(
             "httpprobe",
             Some(super::ChildStdin::adopt(reader).expect("child adopts stdin")),
             &invoker,
-            &TreeContext::new(limits, CallBudget::new(16)),
+            &TreeContext::new(limits, CallBudget::new(16), crate::test_threads()),
         );
         assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
         assert!(start.elapsed() < std::time::Duration::from_millis(1500));
@@ -1395,11 +1449,11 @@ mod tests {
                 stop: stop_for_worker,
             };
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Interpreter::new(limits).run_child(
+                Interpreter::new(limits, crate::test_threads()).run_child(
                     "httpprobe",
                     Some(stdin),
                     &invoker,
-                    &TreeContext::new(limits, CallBudget::new(16))
+                    &TreeContext::new(limits, CallBudget::new(16), crate::test_threads())
                         .with_cancel(invoker.cancel_signals()),
                 )
             }))

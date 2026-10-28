@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use std::collections::BTreeMap;
 
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
@@ -85,7 +86,7 @@ fn the_shell_serves_the_released_gh_root_help_whole() {
     assert_eq!(status, 0);
     assert!(stderr.is_empty());
     let host = HelpHost { registry, runtime };
-    let shell = Interpreter::new(Limits::default());
+    let shell = Interpreter::new(Limits::default(), dekopon_test_support::shell_threads());
     let help = shell.run("gh --help", &host);
     assert_eq!(help.exit_code.get(), 0, "{}", help.output);
     assert_eq!(help.output, root.strip_suffix('\n').unwrap_or(&root));

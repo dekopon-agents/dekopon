@@ -166,7 +166,8 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
     };
     let context = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor, broker, limits);
     tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(limits).run("probe upper &", &ProbeInvoker(context))
+        dekopon_shell::Interpreter::new(limits, dekopon_test_support::shell_threads())
+            .run("probe upper &", &ProbeInvoker(context))
     })
     .await
     .expect("job launched");
@@ -213,7 +214,12 @@ async fn a_probe_tick_ends_its_nested_invoke_at_tree_deadline() {
         ..dekopon_process::Limits::default()
     };
     let probe = crate::wake::Probe::scripted_for_test("probe upper");
-    let tick = tokio::task::spawn_blocking(move || probe.tick(&leg, limits));
+    let tick = tokio::task::spawn_blocking(move || {
+        probe.tick(
+            &leg,
+            &dekopon_shell::Interpreter::new(limits, dekopon_test_support::shell_threads()),
+        )
+    });
     parked
         .await
         .expect("probe tick reached its nested child Invoke");
@@ -1232,8 +1238,11 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
     )
     .for_probe();
     let outcome = tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
-            .run("true &", &ProbeInvoker(context))
+        dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("true &", &ProbeInvoker(context))
     })
     .await
     .expect("the probe script joins");
@@ -1986,8 +1995,11 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
     )
     .for_probe();
     let probed = tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
-            .run("true & echo status=$?", &ProbeInvoker(probe))
+        dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("true & echo status=$?", &ProbeInvoker(probe))
     })
     .await
     .expect("the probe script joins");
@@ -2113,8 +2125,9 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
     let turn = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor(), broker, limits(3));
     tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
-            dekopon_shell::Interpreter::new(limits(1)).run("true &", &ProbeInvoker(probe));
-            dekopon_shell::Interpreter::new(limits(30))
+            dekopon_shell::Interpreter::new(limits(1), dekopon_test_support::shell_threads())
+                .run("true &", &ProbeInvoker(probe));
+            dekopon_shell::Interpreter::new(limits(30), dekopon_test_support::shell_threads())
                 .run("{ sleep 1; true & } &", &ProbeInvoker(turn));
         });
     })
