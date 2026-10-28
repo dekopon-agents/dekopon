@@ -1,7 +1,7 @@
 use super::{CompiledProgram, compile, compile_regex, compile_separator, failure, lex, parse};
 use crate::{builtins::CommandFailure, limits::Budget};
 use dekopon_process::{ExitCode, LimitExceeded, Limits};
-use parse::{AwkError, Binary, ExprKind, Pattern, Refusal, RuntimeError, StmtKind};
+use parse::{AwkError, Binary, ExprKind, FormatCall, Pattern, Refusal, RuntimeError, StmtKind};
 
 fn parsed(source: &str) -> CompiledProgram {
     compile(source, &Budget::start(Limits::default())).expect(source)
@@ -20,6 +20,11 @@ enum Case<'a> {
     Refusal(fn() -> Refusal),
     Separator(&'a str),
     LongRegex(usize),
+    RuntimeFormat {
+        format: &'a str,
+        call: FormatCall,
+        record: f64,
+    },
 }
 const REFUSAL_CASES: &[(Case<'static>, &str)] = &[
     (
@@ -151,12 +156,16 @@ const REFUSAL_CASES: &[(Case<'static>, &str)] = &[
         "awk: program nests deeper than 32 levels; split it across statements",
     ),
     (
-        Case::Refusal(|| Refusal::PrintfWidth(4097)),
-        "awk: printf width is 4097; the limit is 4096",
+        Case::Program("{printf \"%4097s\"}"),
+        "awk: `printf` width 4097 is more than 4096; use a width of at most 4096",
     ),
     (
-        Case::Refusal(|| Refusal::PrintfPrecision(4097)),
-        "awk: printf precision is 4097; the limit is 4096",
+        Case::RuntimeFormat {
+            format: "%.4097s",
+            call: FormatCall::Sprintf,
+            record: 7.0,
+        },
+        "awk: `sprintf` precision 4097 is more than 4096; use a precision of at most 4096 (record 7)",
     ),
     (
         Case::Program("/(?i)a/"),
@@ -180,6 +189,23 @@ fn every_refusal_class_has_its_exact_message() {
                 compile(source, &Budget::start(Limits::default())).expect_err(source)
             }
             Case::Refusal(refusal) => AwkError::Refused(refusal()),
+            Case::RuntimeFormat {
+                format,
+                call,
+                record,
+            } => {
+                let error = parse::check_format(format, *call)
+                    .expect_err("dynamic format exceeds its bound");
+                match error {
+                    AwkError::Refused(refusal) => AwkError::Runtime {
+                        error: RuntimeError::Format(refusal),
+                        record: *record,
+                    },
+                    error @ (AwkError::Syntax { .. }
+                    | AwkError::Runtime { .. }
+                    | AwkError::Limit(_)) => panic!("{error:?}"),
+                }
+            }
             Case::LongRegex(size) => compile(
                 &format!("/{}/", "a".repeat(*size)),
                 &Budget::start(Limits::default()),
@@ -483,12 +509,43 @@ fn parse_bounds_cover_source_depth_height_and_flat_chains() {
 
 #[test]
 fn literal_formats_are_checked_without_a_formatter() {
-    for source in ["{printf \"%4097s\"}", "{sprintf(\"%4097s\")}"] {
-        assert_eq!(refused(source), Refusal::PrintfWidth(4097));
+    for (call, source) in [
+        (FormatCall::Printf, "{printf \"%4097s\"}"),
+        (FormatCall::Sprintf, "{sprintf(\"%4097s\")}"),
+    ] {
+        assert_eq!(
+            refused(source),
+            Refusal::PrintfWidth {
+                call,
+                written: "4097".into()
+            }
+        );
+    }
+    for (call, source) in [
+        (FormatCall::Printf, "{printf \"%.4097f\"}"),
+        (FormatCall::Sprintf, "{sprintf(\"%.4097f\")}"),
+    ] {
+        assert_eq!(
+            refused(source),
+            Refusal::PrintfPrecision {
+                call,
+                written: "4097".into()
+            }
+        );
     }
     assert_eq!(
-        refused("{printf \"%.4097f\"}"),
-        Refusal::PrintfPrecision(4097)
+        refused("{printf \"%184467440737095516160s\"}"),
+        Refusal::PrintfWidth {
+            call: FormatCall::Printf,
+            written: "184467440737095516160".into()
+        }
+    );
+    assert_eq!(
+        refused("{sprintf(\"%.00004097s\")}"),
+        Refusal::PrintfPrecision {
+            call: FormatCall::Sprintf,
+            written: "00004097".into()
+        }
     );
     assert_eq!(refused("{sprintf(\"%.*s\",1)}"), Refusal::PrintfStar);
     parsed(

@@ -104,6 +104,20 @@ impl GawkSyntax {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum FormatCall {
+    Printf,
+    Sprintf,
+}
+impl fmt::Display for FormatCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Printf => f.write_str("printf"),
+            Self::Sprintf => f.write_str("sprintf"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) enum Refusal {
     Getline,
@@ -136,8 +150,8 @@ pub(super) enum Refusal {
     ProgramBytes(usize),
     ParseDepth,
     AstHeight,
-    PrintfWidth(usize),
-    PrintfPrecision(usize),
+    PrintfWidth { call: FormatCall, written: String },
+    PrintfPrecision { call: FormatCall, written: String },
     RegexExtension,
     Regex(String),
     InternalCaptures(usize),
@@ -184,8 +198,8 @@ impl fmt::Display for Refusal {
             Self::ProgramBytes(bytes) => write!(f, "awk: program is {bytes} bytes; the limit is 8192"),
             Self::ParseDepth => f.write_str("awk: program nests too deeply (more than 96 parser levels); split it across statements"),
             Self::AstHeight => f.write_str("awk: program nests deeper than 32 levels; split it across statements"),
-            Self::PrintfWidth(width) => write!(f, "awk: printf width is {width}; the limit is 4096"),
-            Self::PrintfPrecision(precision) => write!(f, "awk: printf precision is {precision}; the limit is 4096"),
+            Self::PrintfWidth { call, written } => write!(f, "awk: `{call}` width {written} is more than 4096; use a width of at most 4096"),
+            Self::PrintfPrecision { call, written } => write!(f, "awk: `{call}` precision {written} is more than 4096; use a precision of at most 4096"),
             Self::RegexExtension => f.write_str("awk: `(?` is not ERE syntax; awk regexes are POSIX extended regular expressions"),
             Self::InternalCaptures(count) => write!(f, "awk: internal refusal: a compiled regex has {count} capture groups instead of one"),
             Self::ParserStart(cause) => write!(f, "awk: could not start the parser: {cause}"),
@@ -913,7 +927,7 @@ impl Parser<'_> {
                 return self.error("a printf format");
             };
             if let Some(format) = literal_string(format) {
-                check_format(format)?;
+                check_format(format, FormatCall::Printf)?;
             }
         }
         Ok(list)
@@ -965,7 +979,7 @@ impl Parser<'_> {
             if function == Function::Sprintf
                 && let Some(format) = arguments.first().and_then(literal_string)
             {
-                check_format(format)?;
+                check_format(format, FormatCall::Sprintf)?;
             }
             let h = arguments.iter().map(|arg| arg.height).max().unwrap_or(0);
             Expr::new(ExprKind::Call(function, arguments), h)
@@ -1356,7 +1370,7 @@ fn statement_height(stmt: &StmtKind) -> u8 {
     }
 }
 
-pub(super) fn check_format(format: &str) -> Result<(), AwkError> {
+pub(super) fn check_format(format: &str, call: FormatCall) -> Result<(), AwkError> {
     let mut chars = format.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '%' {
@@ -1369,8 +1383,12 @@ pub(super) fn check_format(format: &str) -> Result<(), AwkError> {
             return Err(Refusal::PrintfStar.into());
         }
         let width = format_number(&mut chars);
-        if width > 4096 {
-            return Err(Refusal::PrintfWidth(width).into());
+        if format_count_exceeds_limit(&width) {
+            return Err(Refusal::PrintfWidth {
+                call,
+                written: width,
+            }
+            .into());
         }
         if chars.peek() == Some(&'.') {
             chars.next();
@@ -1378,8 +1396,12 @@ pub(super) fn check_format(format: &str) -> Result<(), AwkError> {
                 return Err(Refusal::PrintfStar.into());
             }
             let precision = format_number(&mut chars);
-            if precision > 4096 {
-                return Err(Refusal::PrintfPrecision(precision).into());
+            if format_count_exceeds_limit(&precision) {
+                return Err(Refusal::PrintfPrecision {
+                    call,
+                    written: precision,
+                }
+                .into());
             }
         }
         let Some(conversion) = chars.next() else {
@@ -1395,15 +1417,17 @@ pub(super) fn check_format(format: &str) -> Result<(), AwkError> {
     }
     Ok(())
 }
-fn format_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> usize {
-    let mut number = 0usize;
+fn format_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut written = String::new();
     while let Some(ch @ '0'..='9') = chars.peek().copied() {
         chars.next();
-        number = number
-            .saturating_mul(10)
-            .saturating_add(ch as usize - '0' as usize);
+        written.push(ch);
     }
-    number
+    written
+}
+fn format_count_exceeds_limit(written: &str) -> bool {
+    let significant = written.trim_start_matches('0');
+    significant.len() > 4 || (significant.len() == 4 && significant > "4096")
 }
 
 #[derive(Clone, Copy, PartialEq)]
