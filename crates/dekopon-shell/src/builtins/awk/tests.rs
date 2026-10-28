@@ -233,6 +233,7 @@ fn program_constructs_select_their_refusal_variants() {
         ("END{next}", Refusal::NextOutsideRule),
         ("{x; x[1]}", Refusal::ScalarArray("x".into())),
         ("{FS=\"\"}", Refusal::EmptySeparator),
+        ("{(FS)=(\"\")}", Refusal::EmptySeparator),
         ("{printf \"%*s\", 3, x}", Refusal::FormatStar),
         ("{sprintf(\"%n\",x)}", Refusal::FormatConversion('n')),
         ("/(?i)a/", Refusal::RegexExtension),
@@ -581,4 +582,33 @@ fn parser_thread_admission_is_a_fatal_limit_and_refunds_the_stack() {
         Err(AwkError::Limit(LimitExceeded::ShellThreads { maximum: 0 }))
     ));
     assert_eq!(budget.value_bytes(), 0);
+}
+
+#[test]
+fn control_flow_requires_statement_separators_and_array_identifiers() {
+    for source in [
+        "BEGIN{if(1)print 1 else print 2}",
+        "BEGIN{while(1){if(1)break print 2}}",
+        "BEGIN{while(1)break print 2}",
+        "BEGIN{do print 1 while(0)}",
+        "BEGIN{delete if}",
+        "BEGIN{delete length}",
+        "BEGIN{1 in while}",
+    ] {
+        assert!(
+            matches!(
+                compile(source, &Budget::start(Limits::default())),
+                Err(AwkError::Syntax { .. })
+            ),
+            "{source}"
+        );
+    }
+    for source in [
+        "BEGIN{if(1){print 1}else{print 2}print 3}",
+        "BEGIN{if(1);else;print 3}",
+        "BEGIN{while(1)break;print 2}",
+        "BEGIN{do{}while(0);do;while(0)}",
+    ] {
+        compile(source, &Budget::start(Limits::default())).unwrap();
+    }
 }

@@ -357,6 +357,25 @@ pub(super) enum ExprKind {
 }
 
 impl Expr {
+    fn ungrouped(&self) -> &Self {
+        match &self.kind {
+            ExprKind::Group(inner) => inner.ungrouped(),
+            ExprKind::Number(_)
+            | ExprKind::String(_)
+            | ExprKind::Regex(_)
+            | ExprKind::Variable(_)
+            | ExprKind::Array(_, _)
+            | ExprKind::Field(_)
+            | ExprKind::Unary(_, _)
+            | ExprKind::Increment { .. }
+            | ExprKind::Binary(_, _, _)
+            | ExprKind::Chain { .. }
+            | ExprKind::Assign(_, _, _)
+            | ExprKind::Conditional(_, _, _)
+            | ExprKind::In(_, _)
+            | ExprKind::Call(_, _) => self,
+        }
+    }
     fn new(kind: ExprKind, height: u8) -> Result<Self, AwkError> {
         if height > 32 {
             return Err(Refusal::AstHeight.into());
@@ -471,6 +490,24 @@ pub(super) enum StmtKind {
 }
 
 impl Stmt {
+    fn needs_separator(&self) -> bool {
+        match &self.kind {
+            StmtKind::Block(_) | StmtKind::Empty => false,
+            StmtKind::If { yes, no, .. } => no.as_ref().unwrap_or(yes).needs_separator(),
+            StmtKind::While(_, body)
+            | StmtKind::For { body, .. }
+            | StmtKind::ForIn { body, .. } => body.needs_separator(),
+            StmtKind::Expression(_)
+            | StmtKind::Print(_)
+            | StmtKind::Printf(_)
+            | StmtKind::Do(_, _)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Next
+            | StmtKind::Exit(_)
+            | StmtKind::Delete(_, _) => true,
+        }
+    }
     fn new(kind: StmtKind, child_height: u8) -> Result<Self, AwkError> {
         let height = child_height + 1;
         if height > 32 {
@@ -593,6 +630,9 @@ impl Parser<'_> {
         match &token.kind {
             Kind::Name(name) => {
                 check_name(name)?;
+                if keyword(name) || Function::lookup(name).is_ok() {
+                    return Err(token.error("an array identifier"));
+                }
                 Ok(name.clone())
             }
             Kind::Number(_) | Kind::String(_) | Kind::Symbol(_) | Kind::Newline | Kind::End => {
@@ -673,12 +713,7 @@ impl Parser<'_> {
     fn primary_name(&mut self, name: &str, token: &Token, depth: u8) -> Result<Expr, AwkError> {
         let depth = Self::depth(depth)?;
         check_name(name)?;
-        if [
-            "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "in", "break",
-            "continue", "next", "exit", "delete",
-        ]
-        .contains(&name)
-        {
+        if keyword(name) {
             return Err(token.error("an expression"));
         }
         let function = Function::lookup(name);
@@ -856,7 +891,7 @@ impl Parser<'_> {
                     }
                     let right = self.expression(1, depth, print_list)?;
                     if operation.is_none()
-                        && left.kind == ExprKind::Variable("FS".into())
+                        && left.ungrouped().variable() == Some("FS")
                         && right.literal_string() == Some("")
                     {
                         return Err(Refusal::EmptySeparator.into());
@@ -1095,6 +1130,14 @@ fn infix(kind: &Kind) -> Option<Infix> {
     })
 }
 
+fn keyword(name: &str) -> bool {
+    [
+        "BEGIN", "END", "print", "printf", "if", "else", "while", "do", "for", "in", "break",
+        "continue", "next", "exit", "delete",
+    ]
+    .contains(&name)
+}
+
 impl Parser<'_> {
     fn statement(&mut self, depth: u8) -> Result<Stmt, AwkError> {
         let depth = Self::depth(depth)?;
@@ -1107,26 +1150,10 @@ impl Parser<'_> {
                     return Err(self.peek()?.error("a closing `}`"));
                 }
                 let statement = self.statement(depth)?;
-                let compound = match &statement.kind {
-                    StmtKind::Block(_)
-                    | StmtKind::If { .. }
-                    | StmtKind::While(_, _)
-                    | StmtKind::For { .. }
-                    | StmtKind::ForIn { .. } => true,
-                    StmtKind::Empty => true,
-                    StmtKind::Expression(_)
-                    | StmtKind::Print(_)
-                    | StmtKind::Printf(_)
-                    | StmtKind::Do(_, _)
-                    | StmtKind::Break
-                    | StmtKind::Continue
-                    | StmtKind::Next
-                    | StmtKind::Exit(_)
-                    | StmtKind::Delete(_, _) => false,
-                };
+                let needs_separator = statement.needs_separator();
                 let empty = statement.kind == StmtKind::Empty;
                 body.push(statement);
-                if !compound && !self.terminated()? {
+                if needs_separator && !self.terminated()? {
                     return Err(self.peek()?.error("a newline or `;` between statements"));
                 }
                 if !empty {
@@ -1272,8 +1299,12 @@ impl Parser<'_> {
         self.newlines()?;
         let yes = Box::new(self.statement(depth)?);
         let saved = (self.lexer.clone(), self.look.clone());
+        let separated = self.at(Symbol::Semi)? || self.peek()?.kind == Kind::Newline;
         self.separators()?;
         let no = if self.named("else")? {
+            if yes.needs_separator() && !separated {
+                return Err(self.peek()?.error("a newline or `;` before else"));
+            }
             self.take()?;
             self.newlines()?;
             Some(Box::new(self.statement(depth)?))
@@ -1309,6 +1340,12 @@ impl Parser<'_> {
         if name == "do" {
             self.newlines()?;
             let body = self.loop_body(depth)?;
+            if body.needs_separator()
+                && !self.at(Symbol::Semi)?
+                && self.peek()?.kind != Kind::Newline
+            {
+                return Err(self.peek()?.error("a newline or `;` before while"));
+            }
             self.separators()?;
             if !self.named("while")? {
                 return Err(self.peek()?.error("`while` after a do body"));
