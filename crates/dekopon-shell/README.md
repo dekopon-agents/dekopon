@@ -197,6 +197,8 @@ named-buffer redirects there do not change the parent. `exit`, `return`, and `br
 stage end only that stage. Inside a compound, `read`, `cat`, and stdin-reading builtins share its
 one-shot input stream; provider commands do not inherit that stream.
 
+The private `StageOut` writer selects each command’s output destination: discard, diagnostics, named buffer, pipe, capture, or terminal. Value builtins and stream builtins, including `cat` and `base64`, share that routing.
+
 Pipeline stages exchange bytes; `xargs` runs one input line at a time and emits each command's
 output before reading the next line. Named redirection buffers append exact bytes, including invalid
 UTF-8, and `cat` copies those bytes to another pipe or buffer. `grep`, `sort`, `uniq`, `wc`,
