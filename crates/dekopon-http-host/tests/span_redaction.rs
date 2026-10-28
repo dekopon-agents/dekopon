@@ -1,7 +1,7 @@
 //! This must stay a separate test binary: tracing caches per-callsite interest against the global
 //! dispatcher, so a sibling test calling send without a subscriber would permanently disable this
 //! callsite process-wide.
-
+#![allow(clippy::disallowed_methods)]
 #![allow(clippy::unwrap_used)]
 
 use std::time::Duration;

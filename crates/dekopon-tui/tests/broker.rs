@@ -241,7 +241,11 @@ async fn console_shell_runs_provider_child_through_real_broker() {
         .await
         .expect("broker executable supplied");
     let subject = "slack.t0123abc.u9xyz".parse().unwrap();
-    let mut options = ConsoleOptions::new(subject, "unused".into());
+    let mut options = ConsoleOptions::new(
+        subject,
+        "unused".into(),
+        dekopon_test_support::shell_threads(),
+    );
     options.socket = Some(fixture.socket.clone());
     options.server_uid = Some(rustix::process::geteuid().as_raw());
     let (client, _) = connect(&options).await.expect("real broker connection");
@@ -253,6 +257,7 @@ async fn console_shell_runs_provider_child_through_real_broker() {
             invoker: LegHandle(Arc::new(leg)),
             limits: Limits::default(),
             calls: CallBudget::new(4),
+            threads: dekopon_test_support::shell_threads(),
         }
         .run_script("probe upper --text parent", None)
     })
@@ -283,7 +288,11 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
     };
     let uid = rustix::process::geteuid().as_raw();
     let subject: ExternalSubject = "slack.t0123abc.u9xyz".parse().expect("canonical subject");
-    let mut options = ConsoleOptions::new(subject.clone(), "unused".into());
+    let mut options = ConsoleOptions::new(
+        subject.clone(),
+        "unused".into(),
+        dekopon_test_support::shell_threads(),
+    );
     options.socket = Some(fixture.socket.clone());
     options.server_uid = Some(uid);
     let (client, _) = connect(&options).await.expect("authenticated peer");
@@ -357,7 +366,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
     tokio::task::spawn_blocking(move || {
         let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let recorded = RecordingInvoker::new(allowed, events, Sequence::default());
-        let help = Interpreter::new(Limits::default()).run("probe --help", &recorded);
+        let help = Interpreter::new(Limits::default(), dekopon_test_support::shell_threads()).run("probe --help", &recorded);
         assert_eq!(
             help.exit_code.get(),
             0,
@@ -365,7 +374,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
             help.output
         );
         assert!(help.output.contains("Usage: probe"));
-        let read = Interpreter::new(Limits::default()).run("probe upper --text hello", &recorded);
+        let read = Interpreter::new(Limits::default(), dekopon_test_support::shell_threads()).run("probe upper --text hello", &recorded);
         assert_eq!(
             read.exit_code.get(),
             0,
@@ -374,7 +383,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
         );
         assert!(read.output.contains("HELLO"), "{}", read.output);
         let refused =
-            Interpreter::new(Limits::default()).run("probe reverse --text hello", &recorded);
+            Interpreter::new(Limits::default(), dekopon_test_support::shell_threads()).run("probe reverse --text hello", &recorded);
         assert_ne!(
             refused.exit_code.get(),
             0,
@@ -385,7 +394,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
                 .parse::<SecretDrn>()
                 .unwrap(),
         };
-        let denied = recorded.invoke(CommandProposal::new("cli-probe.upper", json!({"text":"hi"}), Some(drn)), sink(), &TreeContext::new(Limits::default(), CallBudget::new(4)));
+        let denied = recorded.invoke(CommandProposal::new("cli-probe.upper", json!({"text":"hi"}), Some(drn)), sink(), &TreeContext::new(Limits::default(), CallBudget::new(4), dekopon_test_support::shell_threads()));
         assert!(
             matches!(denied, CapabilityCallResult::Denied { .. }),
             "secret.use cannot be dropped by a wrapper: {denied:?}"
@@ -491,7 +500,11 @@ async fn executed_asset_effect_registers_descriptor_through_real_broker() {
     };
     let assets_root = fixture._dir.path().join("assets");
     let subject = "slack.t0123abc.u9xyz".parse().unwrap();
-    let mut options = ConsoleOptions::new(subject, "unused".into());
+    let mut options = ConsoleOptions::new(
+        subject,
+        "unused".into(),
+        dekopon_test_support::shell_threads(),
+    );
     options.socket = Some(fixture.socket.clone());
     options.server_uid = Some(rustix::process::geteuid().as_raw());
     let (client, _) = connect(&options).await.unwrap();
@@ -503,7 +516,11 @@ async fn executed_asset_effect_registers_descriptor_through_real_broker() {
         LegHandle(Arc::new(leg)).invoke(
             CommandProposal::new("http-probe.purge", json!({"assetMode": "attach"}), None),
             sink(),
-            &TreeContext::new(Limits::default(), CallBudget::new(4)),
+            &TreeContext::new(
+                Limits::default(),
+                CallBudget::new(4),
+                dekopon_test_support::shell_threads(),
+            ),
         )
     })
     .await
@@ -617,7 +634,11 @@ async fn console_shell_and_model_script_register_real_broker_asset_with_zero_exi
         return;
     };
     let subject = "slack.t0123abc.u9xyz".parse().unwrap();
-    let mut options = ConsoleOptions::new(subject, "unused".into());
+    let mut options = ConsoleOptions::new(
+        subject,
+        "unused".into(),
+        dekopon_test_support::shell_threads(),
+    );
     options.socket = Some(fixture.socket.clone());
     options.server_uid = Some(rustix::process::geteuid().as_raw());
     let (client, _) = connect(&options).await.unwrap();
@@ -642,6 +663,7 @@ async fn console_shell_and_model_script_register_real_broker_asset_with_zero_exi
                     },
                     limits: Limits::default(),
                     calls: CallBudget::new(4),
+                    threads: dekopon_test_support::shell_threads(),
                 }
                 .run_script("asset-fixture", None)
             } else {
@@ -649,6 +671,7 @@ async fn console_shell_and_model_script_register_real_broker_asset_with_zero_exi
                     invoker: broker,
                     limits: Limits::default(),
                     calls: CallBudget::new(4),
+                    threads: dekopon_test_support::shell_threads(),
                 }
                 .run_script("asset-fixture", None)
             }
@@ -696,7 +719,11 @@ async fn real_broker_rejects_unmapped_peer_uid() {
         eprintln!("broker fixture env absent; integration not exercised");
         return;
     };
-    let mut options = ConsoleOptions::new("slack.t0123abc.u9xyz".parse().unwrap(), "unused".into());
+    let mut options = ConsoleOptions::new(
+        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "unused".into(),
+        dekopon_test_support::shell_threads(),
+    );
     options.socket = Some(fixture.socket.clone());
     options.server_uid = Some(rustix::process::geteuid().as_raw());
     assert!(

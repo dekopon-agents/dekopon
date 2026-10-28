@@ -144,7 +144,8 @@ mod tests {
     #[test]
     fn a_capability_identifier_is_a_usage_error_rather_than_an_invocation() {
         let fixture = Fixture::default();
-        let outcome = Interpreter::new(Limits::default()).run("cap wikipedia_page '{}'", &fixture);
+        let outcome = Interpreter::new(Limits::default(), crate::test_threads())
+            .run("cap wikipedia_page '{}'", &fixture);
         assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{}", outcome.output);
         assert!(
             outcome

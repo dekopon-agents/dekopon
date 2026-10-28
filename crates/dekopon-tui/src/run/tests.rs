@@ -112,8 +112,11 @@ fn cancelled_running_event_loop_restores_pty_after_join() {
             let mut app = console();
             app.busy = true;
             app.transcript.open("in flight".into());
-            let mut options =
-                ConsoleOptions::new("slack.t0123abc.u9xyz".parse().unwrap(), "unused".into());
+            let mut options = ConsoleOptions::new(
+                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "unused".into(),
+                dekopon_test_support::shell_threads(),
+            );
             let mut history = History::new(options.history_limits);
             let stop = StopFlag::default();
             let mut keys = crossterm::event::EventStream::new();
@@ -465,7 +468,8 @@ fn esc_during_an_accepted_command_prevents_the_next_broker_effect() {
     };
     let task = std::thread::spawn(move || {
         let invoker = RecordingInvoker::new(commands, events_tx, Sequence::default());
-        Interpreter::new(Limits::default()).run("probe first; probe second", &invoker)
+        Interpreter::new(Limits::default(), dekopon_test_support::shell_threads())
+            .run("probe first; probe second", &invoker)
     });
     started_rx
         .recv_timeout(Duration::from_secs(10))
@@ -541,7 +545,11 @@ fn cancellation_does_not_erase_an_effect_the_broker_already_accepted() {
 async fn switching_profiles_clears_the_model_replay_and_visible_history() {
     let first = "slack.t0123abc.u9xyz".parse().unwrap();
     let second = "slack.t0123abc.u8xyz".parse().unwrap();
-    let mut options = ConsoleOptions::new(first, "test-model".into());
+    let mut options = ConsoleOptions::new(
+        first,
+        "test-model".into(),
+        dekopon_test_support::shell_threads(),
+    );
     options.profiles.push(OperatorProfile {
         name: "second".into(),
         agent: "other".parse().unwrap(),
@@ -653,6 +661,7 @@ async fn profile_switches_preserve_cli_override_and_update_model_provenance() {
     let mut options = ConsoleOptions::new(
         "slack.t0123abc.u9xyz".parse().unwrap(),
         DEFAULT_MODEL.into(),
+        dekopon_test_support::shell_threads(),
     );
     options.profiles.push(OperatorProfile {
         name: "authored".into(),
@@ -807,7 +816,11 @@ fn empty_surface_frame() -> Value {
 }
 
 async fn hop(app: &mut App, client: &BrokerClient) {
-    let mut options = ConsoleOptions::new(app.subject.parse().unwrap(), "test-model".into());
+    let mut options = ConsoleOptions::new(
+        app.subject.parse().unwrap(),
+        "test-model".into(),
+        dekopon_test_support::shell_threads(),
+    );
     let mut history = History::new(options.history_limits);
     dispatch(
         app,
@@ -1036,7 +1049,11 @@ async fn smoke_record_without_flag_is_local_refusal() {
         leg,
         dekopon_agent::prompt::HistoryLimits::default(),
     ));
-    let mut options = ConsoleOptions::new(app.subject.parse().unwrap(), "test-model".into());
+    let mut options = ConsoleOptions::new(
+        app.subject.parse().unwrap(),
+        "test-model".into(),
+        dekopon_test_support::shell_threads(),
+    );
     let mut history = History::new(options.history_limits);
     dispatch(
         &mut app,
@@ -1078,7 +1095,11 @@ async fn a_refused_shell_command_is_written_in_full_into_the_transcript() {
     app.assets = Some(std::sync::Arc::new(
         crate::session::assets::ConsoleAssets::default(),
     ));
-    let mut options = ConsoleOptions::new(app.subject.parse().unwrap(), "test-model".into());
+    let mut options = ConsoleOptions::new(
+        app.subject.parse().unwrap(),
+        "test-model".into(),
+        dekopon_test_support::shell_threads(),
+    );
     let mut history = History::new(options.history_limits);
     dispatch(
         &mut app,

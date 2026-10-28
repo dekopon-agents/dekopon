@@ -37,7 +37,9 @@ use dekopon_model::{
     model::{ChatModel, CompletionOptions},
     openai::OpenAiClient,
 };
-use dekopon_process::{CallBudget, CancelHandle, CancelSignal, Limits as ShellLimits};
+use dekopon_process::{
+    CallBudget, CancelHandle, CancelSignal, Limits as ShellLimits, ShellThreads,
+};
 use dekopon_shell::CapabilityInvoker as _;
 use futures_util::StreamExt as _;
 use thiserror::Error;
@@ -1199,6 +1201,7 @@ pub(crate) struct SessionRunner {
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
     pub jobs: Arc<crate::jobs::Jobs>,
     pub metering: Arc<dekopon_model_token_governor::Metering>,
+    pub shell_threads: ShellThreads,
 }
 
 struct RecalledWindow {
@@ -2675,7 +2678,7 @@ async fn session_turn(
                 Arc::clone(store),
                 runner.broker.clone(),
                 tokio::runtime::Handle::current(),
-                shell,
+                dekopon_shell::Interpreter::new(shell, runner.shell_threads.clone()),
                 route.job_timeout.map(|timeout| {
                     (
                         Arc::clone(&runner.jobs),
@@ -2783,6 +2786,7 @@ async fn session_turn(
                 MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => false,
             });
     let model_runtime = tokio::runtime::Handle::current();
+    let threads = runner.shell_threads.clone();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let result = tokio::task::spawn_blocking(move || {
@@ -2797,6 +2801,7 @@ async fn session_turn(
                     invoker,
                     limits: shell,
                     calls,
+                    threads,
                 },
                 table: participant_table,
             };
@@ -3166,13 +3171,16 @@ async fn session_turn(
                 &message.conversation.key(),
             );
             let index = route.route_index;
+            let transitioned = table.suspend(&follow_key);
             match tokio::task::spawn_blocking(move || table.leave(&follow_key)).await {
-                Ok(Ok(())) => tracing::info!(
+                Ok(Ok(())) if transitioned => tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "self-left",
+                    cause = "leave",
                     route = index,
                     "gateway.follow"
                 ),
+                Ok(Ok(())) => {}
                 _ => tracing::warn!(
                     audit.event = "gateway.follow",
                     operation = "refused",

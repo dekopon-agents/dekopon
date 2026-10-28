@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{CancelSignal, LimitExceeded, Limits};
+use crate::{CancelSignal, LimitExceeded, Limits, ShellThreads};
 use tokio::time::Sleep;
 
 #[derive(Clone, Debug)]
@@ -60,6 +60,7 @@ pub struct TreeContext {
     steps: Arc<AtomicU64>,
     retained: Arc<AtomicU64>,
     limits: Limits,
+    threads: ShellThreads,
 }
 
 #[derive(Debug)]
@@ -102,7 +103,7 @@ impl Drop for RetainedBytes {
 
 impl TreeContext {
     #[must_use]
-    pub fn new(limits: Limits, calls: CallBudget) -> Self {
+    pub fn new(limits: Limits, calls: CallBudget, threads: ShellThreads) -> Self {
         let started = Instant::now();
         Self {
             cancel: Vec::new(),
@@ -112,6 +113,7 @@ impl TreeContext {
             steps: Arc::new(AtomicU64::new(0)),
             retained: Arc::new(AtomicU64::new(0)),
             limits,
+            threads,
         }
     }
 
@@ -212,6 +214,11 @@ impl TreeContext {
     #[must_use]
     pub fn calls(&self) -> &CallBudget {
         &self.calls
+    }
+
+    #[must_use]
+    pub const fn shell_threads(&self) -> &ShellThreads {
+        &self.threads
     }
 }
 

@@ -156,6 +156,7 @@ pub(crate) fn decide<I: CapabilityInvoker>(
         },
         limits: runtime.limits,
         calls: runtime.calls.clone(),
+        threads: runtime.threads.clone(),
     };
     let result = decider.run_script("memory_decide", None);
     if result.exit_code != ExitCode::SUCCESS {
@@ -756,6 +757,7 @@ mod tests {
                 &TreeContext::new(
                     dekopon_process::Limits::default(),
                     dekopon_process::CallBudget::new(1),
+                    dekopon_test_support::shell_threads(),
                 ),
             );
             assert!(matches!(result, dekopon_shell::RunResult::Invoked { .. }));

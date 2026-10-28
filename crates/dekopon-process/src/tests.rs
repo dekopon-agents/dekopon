@@ -1,4 +1,97 @@
 use super::*;
+use std::{sync::LazyLock, time::Duration as StdDuration};
+
+pub(crate) fn threads() -> ShellThreads {
+    static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    ShellThreads::new(4, RUNTIME.handle().clone())
+}
+
+const PROBE: ThreadName = ThreadName::new("sh-thread-probe");
+
+#[test]
+fn a_shell_thread_carries_its_full_name_and_blocks_on_a_runtime_timer() {
+    let threads = threads();
+    let [permit] = threads.reserve().unwrap();
+    let (name, slept) = std::thread::scope(|scope| {
+        permit
+            .spawn(scope, PROBE, || {
+                let name = std::thread::current().name().map(str::to_owned);
+                let slept = tokio::runtime::Handle::current().block_on(async {
+                    tokio::time::sleep(StdDuration::from_millis(1)).await;
+                    true
+                });
+                (name, slept)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    });
+    assert_eq!(name.as_deref(), Some("sh-thread-probe"));
+    assert!(slept);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_kernel_reports_a_shell_thread_name_untruncated() {
+    let threads = threads();
+    let [permit] = threads.reserve().unwrap();
+    let comm = std::thread::scope(|scope| {
+        permit
+            .spawn(scope, PROBE, || {
+                std::fs::read_to_string("/proc/thread-self/comm")
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(comm.trim_end(), "sh-thread-probe");
+}
+
+#[test]
+fn a_group_past_the_cap_is_refused_whole_and_takes_no_permit() {
+    let threads = threads();
+    let held = threads.reserve_many(3).unwrap();
+    assert_eq!(
+        threads.reserve::<2>().map(|_| ()),
+        Err(LimitExceeded::ShellThreads { maximum: 4 })
+    );
+    let [last] = threads.reserve().unwrap();
+    drop((held, last));
+    assert_eq!(threads.reserve_many(4).map(|permits| permits.len()), Ok(4));
+}
+
+#[test]
+fn a_panicking_shell_thread_returns_its_permit() {
+    let threads = threads();
+    let permits = threads.reserve_many(4).unwrap();
+    let panicked = std::thread::scope(|scope| {
+        let handles = permits
+            .into_iter()
+            .map(|permit| {
+                permit
+                    .spawn(scope, PROBE, || panic!("stage panicked"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        handles.into_iter().all(|handle| handle.join().is_err())
+    });
+    assert!(panicked);
+    assert_eq!(threads.reserve_many(4).map(|permits| permits.len()), Ok(4));
+}
+
+#[test]
+fn an_unspawned_permit_returns_to_the_budget() {
+    let threads = threads();
+    drop(threads.reserve::<4>().unwrap());
+    assert_eq!(threads.reserve_many(4).map(|permits| permits.len()), Ok(4));
+}
 
 #[tokio::test]
 async fn a_request_completes_current_and_future_waits() {
@@ -58,7 +151,8 @@ fn a_synchronous_boundary_reads_the_request_without_awaiting_it() {
 #[test]
 fn a_cancelled_tree_makes_the_next_step_charge_return_cancelled_without_an_invoker() {
     let (handle, signal) = CancelSignal::pair();
-    let tree = TreeContext::new(Limits::default(), CallBudget::new(32)).with_cancel(vec![signal]);
+    let tree = TreeContext::new(Limits::default(), CallBudget::new(32), threads())
+        .with_cancel(vec![signal]);
     handle.cancel();
     assert_eq!(tree.charge_step(), Err(LimitExceeded::Cancelled));
     assert_eq!(tree.steps(), 0);
@@ -78,7 +172,8 @@ async fn script_deadline_cancellation_does_not_change_a_jobs_deadline_error() {
         )
         .is_pending()
     );
-    let script = TreeContext::new(limits, CallBudget::new(32)).with_script_timer(Some(timer));
+    let script =
+        TreeContext::new(limits, CallBudget::new(32), threads()).with_script_timer(Some(timer));
     let job = script
         .clone()
         .with_cancel(vec![CancelSignal::never()])
@@ -93,6 +188,7 @@ async fn script_deadline_cancellation_does_not_change_a_jobs_deadline_error() {
             ..limits
         },
         CallBudget::new(32),
+        threads(),
     );
     assert_eq!(
         expired_job.check_deadline(),
@@ -105,7 +201,7 @@ fn a_child_tree_keeps_both_its_starter_and_broker_cancellation_sources() {
     for cancel_parent in [false, true] {
         let (starter, starter_signal) = CancelSignal::pair();
         let (parent, parent_signal) = CancelSignal::pair();
-        let tree = TreeContext::new(Limits::default(), CallBudget::new(32))
+        let tree = TreeContext::new(Limits::default(), CallBudget::new(32), threads())
             .with_cancel(vec![starter_signal])
             .with_parent_cancel(parent_signal);
         if cancel_parent {

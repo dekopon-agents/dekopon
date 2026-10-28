@@ -59,6 +59,20 @@ pub(crate) struct RoutingTable {
 }
 
 impl RoutingTable {
+    pub(crate) fn follow_routes<'a>(
+        &'a self,
+        transport: &'a str,
+        conversation: &'a Conversation,
+    ) -> impl Iterator<Item = &'a BoundRoute> {
+        self.routes
+            .iter()
+            .filter(move |route| {
+                route.transport == transport && route.conversation.matches(conversation)
+            })
+            .take(1)
+            .filter(|route| route.follow)
+    }
+
     pub(crate) fn has_persistent_memory(&self) -> bool {
         self.routes
             .iter()

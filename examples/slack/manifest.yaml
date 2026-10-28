@@ -10,12 +10,11 @@
 #   needs no public HTTP endpoint.
 # - `message.im` events (requires `im:history`), so direct messages reach DM routes.
 # - `app_mention` events (requires `app_mentions:read`), so channel routes fire only
-#   when the bot is explicitly addressed — dekopon-gatewayd ignores unaddressed channel
-#   traffic by design.
+#   when the bot is explicitly addressed. Channel-history events also feed opted-in follow routes.
 # - `channels:read`, `groups:read`, `im:read`, `mpim:read`, so `conversations.info` can say what
 #   kind of conversation a mention arrived in. Slack sends no `channel_type` on `app_mention`, and
-#   this profile receives channel traffic only as one, so without the lookup a mention in a direct
-#   message or a multi-person DM would be minted as a channel and match no `directMessage` or
+#   without the lookup a mention in a direct message or a multi-person DM would be minted as a
+#   channel and match no `directMessage` or
 #   `groupDirectMessage` route. The result is remembered per conversation, so it costs one call
 #   per conversation the bot is addressed in, and a lookup that fails drops that one message.
 # - `chat:write`, so the gateway can reply.
@@ -38,9 +37,8 @@
 # 2. Bot token (`xoxb-...`): "Install App" → install to the workspace. This token
 #    sends the configured reaction, the progress message, and replies.
 #
-# To extend later: seeing every message in a public channel (not just mentions) needs
-# the `channels:history` scope plus the `message.channels` event; private channels
-# need `groups:history` plus `message.groups`. Add them here and reinstall the app.
+# `message.channels`/`channels:history` and `message.groups`/`groups:history` deliver replies
+# for `follow: true`; unmentioned messages outside followed threads are ignored.
 #
 # `files:read` is what lets the gateway open an attachment. An attachment is part of
 # the message that carried it — Slack just delivers it by reference rather than by
@@ -84,12 +82,19 @@ oauth_config:
       - im:read
       - mpim:history
       - mpim:read
+      # Follow leaves on human thumbs-down; user lookup distinguishes bot reactors.
+      - reactions:read
+      - users:read
       - reactions:write
 settings:
   event_subscriptions:
     bot_events:
       - app_mention
+      # History events feed only explicitly enabled follow routes.
+      - message.channels
+      - message.groups
       - message.im
+      - reaction_added
   interactivity:
     # Socket Mode delivers `block_actions`, so the gateway's Stop button (`indicators.cancelButton`)
     # reaches it without a request URL. Off, Slack never sends the press and the button is inert.

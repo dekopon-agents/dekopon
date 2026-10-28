@@ -4707,6 +4707,7 @@ fn runner_tracking(
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
+        shell_threads: dekopon_test_support::shell_threads(),
     })
 }
 
@@ -7158,7 +7159,7 @@ fn a_fired_follow_from_the_running_speaker_queues_without_interruption() {
 }
 
 #[test]
-fn follow_debounce_keeps_the_newest_speaker_and_both_time_bounds() {
+fn a_follow_batch_keeps_every_speakers_text_and_runs_as_the_newest_with_both_time_bounds() {
     let mut pending = crate::follow::Debounce::default();
     let first = tokio::time::Instant::now();
     let mut earlier = message("first");
@@ -7172,7 +7173,10 @@ fn follow_debounce_keeps_the_newest_speaker_and_both_time_bounds() {
         .try_into()
         .unwrap();
     assert_eq!(fired.subject, later.subject);
-    assert_eq!(fired.text, "newest");
+    assert_eq!(
+        fired.text,
+        "[follow speaker 1]\nfirst\n\n[follow speaker 2]\nnewest"
+    );
     assert!(pending.offer("key".into(), later.clone(), first));
     for second in [29, 58, 87, 116] {
         assert!(pending.offer(
@@ -17968,14 +17972,17 @@ fn journaled_runner(
         wakes: None,
         jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
         metering: unmetered(),
+        shell_threads: dekopon_test_support::shell_threads(),
     })
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
+async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
     use dekopon_shell::CapabilityInvoker as _;
-    let directory = temporary();
-    let journal_dir = temporary();
+    let fixture = SlackFollowFixture::new().await;
+    fixture.table.stay(&fixture.key, SystemTime::now()).unwrap();
+    fixture.table.leave(&fixture.key).unwrap();
+    let directory = &fixture.directory;
     let mut broker = dekopon_test_support::BrokerFixture::answering(
         directory.path(),
         [
@@ -17989,8 +17996,21 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
             ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
         ],
     );
-    let message = message("invite");
-    let route = route(model_config());
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "resume",
+        app_mention(
+            "u8other",
+            "1700000000.000002",
+            Some("1700000000.000001"),
+            "<@u0botbot> follow again",
+        ),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base).with_generation(fixture.generation.clone());
+    transport.connect().await.unwrap();
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.addressed, Some(true));
+    let route = fixture.routes.route(&message).unwrap();
     let claim = Attestation::for_chat(
         message.subject.clone(),
         route.agent.clone(),
@@ -18014,13 +18034,13 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
         .unwrap();
     let journal = Arc::new(
         crate::journal::Journal::open(
-            journal_dir.path(),
+            &fixture.directory.path().join("journal"),
             Duration::from_secs(7 * 86400),
             Duration::from_secs(7 * 86400),
         )
         .unwrap(),
     );
-    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let table = Arc::clone(&fixture.table);
     let key = crate::follow::follow_key(
         &route.transport,
         route.agent.as_str(),
@@ -18038,7 +18058,11 @@ async fn a_successful_stay_on_the_speakers_broker_leg_survives_restart() {
                 stdin: None,
                 stdout: std::os::fd::OwnedFd::from(stdout),
             },
-            &dekopon_process::TreeContext::new(dekopon_process::Limits::default(), calls),
+            &dekopon_process::TreeContext::new(
+                dekopon_process::Limits::default(),
+                calls,
+                dekopon_test_support::shell_threads(),
+            ),
         )
     })
     .await
@@ -23002,4 +23026,594 @@ async fn fauxlack_config_parses_but_check_refuses_it_without_a_service_in_every_
         serde_json::from_value(json!({"kind": "fauxlack", "server": "acme", "file": "f1"}))
             .unwrap();
     assert_eq!(serde_json::to_value(asset).unwrap()["kind"], "fauxlack");
+}
+
+struct SlackFollowFixture {
+    directory: tempfile::TempDir,
+    journal: Arc<crate::journal::Journal>,
+    routes: Arc<RoutingTable>,
+    generation: crate::gateway::CurrentGeneration,
+    table: Arc<crate::follow::FollowTable>,
+    key: String,
+}
+
+impl SlackFollowFixture {
+    async fn new() -> Self {
+        let directory = temporary();
+        let mut doc = document(directory.path());
+        doc["routes"][0]["transport"] = json!("scientist-slack");
+        doc["routes"][0]["conversation"] = json!({"kind": ["channel", "thread"]});
+        doc["routes"][0]["follow"] = json!(true);
+        doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+        doc["transports"][0] = json!({"name": "scientist-slack", "kind": "slackSocketMode", "appTokenEnv": "APP", "botTokenEnv": "BOT"});
+        doc["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});
+        let config = resolved(directory.path(), &doc).await;
+        let routes =
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+        let journal = Arc::new(
+            crate::journal::Journal::open(
+                &directory.path().join("journal"),
+                Duration::from_secs(604800),
+                Duration::from_secs(604800),
+            )
+            .unwrap(),
+        );
+        let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+        let route = &config.routes[0];
+        let key = crate::follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
+            "c0123abc:1700000000.000001",
+        );
+        let generation =
+            crate::gateway::CurrentGeneration::boot(Arc::clone(&routes), Arc::default());
+        generation.set_follow(Some(Arc::clone(&table)));
+        Self {
+            directory,
+            journal,
+            routes,
+            generation,
+            table,
+            key,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest() {
+    for experience in [SlackExperience::Classic, SlackExperience::Agent] {
+        let fixture = SlackFollowFixture::new().await;
+        fixture.table.stay(&fixture.key, SystemTime::now()).unwrap();
+        let socket = spawn_socket_mock(vec![
+            events_envelope(
+                "first",
+                channel_message(
+                    "u9xyz",
+                    "1700000000.000002",
+                    Some("1700000000.000001"),
+                    "first text",
+                ),
+            ),
+            events_envelope(
+                "second",
+                channel_message(
+                    "u8other",
+                    "1700000000.000003",
+                    Some("1700000000.000001"),
+                    "second text",
+                ),
+            ),
+        ]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut transport = slack_with(&http.base, experience, LivenessConfig::default())
+            .with_generation(fixture.generation.clone());
+        transport.connect().await.unwrap();
+        if let Some(ownership) = transport.thread_ownership() {
+            ownership.claim(ThreadClaim::Slack {
+                team_id: TEAM.to_owned(),
+                channel_id: "c0123abc".to_owned(),
+                thread_ts: "1700000000.000001".to_owned(),
+                user_id: "u9xyz".to_owned(),
+            });
+        }
+        let first = next_message(&mut transport).await;
+        let second = next_message(&mut transport).await;
+        assert_eq!(
+            second.subject,
+            ExternalSubject::slack(TEAM, "u8other").unwrap()
+        );
+        let (broker, mut observed) = stub_broker(
+            fixture.directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                vec![],
+                BTreeMap::new(),
+            )],
+        )
+        .await;
+        let models = ModelScript::new([decline_reply()]);
+        let mut running = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+        running.follow = Some(Arc::clone(&fixture.table));
+        let running = Arc::new(running);
+        let gateway = crate::gateway::Gateway::new(
+            Arc::clone(&running),
+            Arc::clone(&fixture.routes),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        );
+        let mut pending = crate::follow::Debounce::default();
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut collector = crate::collection::Collector::new(&[], 4);
+        gateway.dispatch(&mut sessions, &mut collector, &mut pending, first);
+        gateway.dispatch(&mut sessions, &mut collector, &mut pending, second.clone());
+        assert!(sessions.is_empty(), "follow text waits instead of steering");
+        let [batch] = pending
+            .due(tokio::time::Instant::now() + Duration::from_secs(31))
+            .try_into()
+            .unwrap();
+        assert_eq!(batch.subject, second.subject);
+        assert_eq!(
+            batch.text,
+            "[follow speaker 1]\nfirst text\n\n[follow speaker 2]\nsecond text"
+        );
+        let driver = Arc::new(RecordingDriver::default());
+        let route = fixture.routes.route(&batch).unwrap().clone();
+        run_session(
+            running,
+            route,
+            batch,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        assert!(driver.replies().is_empty());
+        assert_eq!(models.requests(), 1);
+        let request = observed.recv().await.unwrap();
+        assert!(
+            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(Attestation { subject, .. }) } if subject == second.subject)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
+    for (text, age, cause) in [("mute", 0, "mute"), ("later", 86400, "lapse")] {
+        let fixture = SlackFollowFixture::new().await;
+        fixture
+            .table
+            .stay(&fixture.key, SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
+        let socket = spawn_socket_mock(vec![events_envelope(
+            "signal",
+            channel_message(
+                "u8other",
+                "1700000000.000002",
+                Some("1700000000.000001"),
+                text,
+            ),
+        )]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut transport = slack(&http.base).with_generation(fixture.generation.clone());
+        let identity = transport.connect().await.unwrap();
+        let inbound = next_message(&mut transport).await;
+        let (broker, _observed) = stub_broker(fixture.directory.path(), vec![]).await;
+        let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+        running.follow = Some(Arc::clone(&fixture.table));
+        let gateway = crate::gateway::Gateway::new(
+            Arc::new(running),
+            Arc::clone(&fixture.routes),
+            Arc::new(BTreeMap::from([("scientist-slack".into(), identity)])),
+            Arc::default(),
+            Arc::default(),
+        );
+        let mut sessions = tokio::task::JoinSet::new();
+        let (capture, _guard) = capture_spans();
+        gateway.dispatch(
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            inbound,
+        );
+        while let Some(result) = sessions.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(
+            fixture.table.ticket(&fixture.key, SystemTime::now()),
+            crate::follow::FollowTicket::Absent
+        );
+        assert!(
+            !fixture
+                .directory
+                .path()
+                .join("journal")
+                .join(format!("{}.followed", fixture.key))
+                .exists()
+        );
+        let events = capture.events_where(
+            "dekopon_gatewayd",
+            &[("audit.event", "gateway.follow"), ("cause", cause)],
+        );
+        assert_eq!(events.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_authors() {
+    let fixture = SlackFollowFixture::new().await;
+    fixture.table.stay(&fixture.key, SystemTime::now()).unwrap();
+    let reaction = |user: &str, author: &str, name: &str| {
+        json!({
+            "type": "reaction_added", "user": user, "item_user": author, "reaction": name,
+            "item": {"type": "message", "channel": "c0123abc", "ts": "1700000000.000100"}
+        })
+    };
+    let socket = spawn_socket_mock(vec![
+        events_envelope("other-author", reaction("u8other", "u9xyz", "-1")),
+        events_envelope("bot", reaction("uotherbot", BOT_USER, "-1")),
+        events_envelope("human", reaction("u8other", BOT_USER, "thumbsdown")),
+        events_envelope("duplicate", reaction("u8other", BOT_USER, "-1")),
+        events_envelope(
+            "mention",
+            app_mention(
+                "u8other",
+                "1700000000.000004",
+                Some("1700000000.000001"),
+                "<@u0botbot> return",
+            ),
+        ),
+    ]);
+    let standard = slack_handler(vec![socket.url.clone()]);
+    let http = spawn_http_mock(move |path, body| {
+        let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        match path {
+            "/api/reactions.get" => {
+                assert_eq!(
+                    request,
+                    json!({"channel": "c0123abc", "timestamp": "1700000000.000100"})
+                );
+                json!({"ok": true, "type": "message", "channel": "c0123abc", "message": {
+                    "user": BOT_USER, "ts": "1700000000.000100", "thread_ts": "1700000000.000001"
+                }})
+            }
+            "/api/users.info" => {
+                json!({"ok": true, "user": {"id": request["user"], "is_bot": request["user"] == "uotherbot"}})
+            }
+            _ => standard(path, body),
+        }
+    });
+    let mut transport = slack(&http.base).with_generation(fixture.generation.clone());
+    transport.connect().await.unwrap();
+    let first = transport.next().await.unwrap();
+    let second = transport.next().await.unwrap();
+    for event in [&first, &second] {
+        assert!(
+            matches!(event, TransportEvent::FollowLeave { transport, conversation, .. }
+            if transport == "scientist-slack" && conversation.key() == "c0123abc:1700000000.000001")
+        );
+    }
+    let lookups: Vec<_> = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/users.info")
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).unwrap()["user"].clone())
+        .collect();
+    assert_eq!(
+        lookups,
+        [json!("uotherbot"), json!("u8other"), json!("u8other")]
+    );
+    let (broker, _observed) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let (sender, receiver) = mpsc::channel(4);
+    sender.send(first).await.unwrap();
+    sender.send(second).await.unwrap();
+    drop(sender);
+    let (capture, _guard) = capture_spans();
+    serve(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+        receiver,
+        std::future::pending(),
+        Duration::from_secs(2),
+        crate::collection::Collector::new(&[], 4),
+    )
+    .await;
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "reaction")]
+            )
+            .len(),
+        1
+    );
+    let mention = next_message(&mut transport).await;
+    assert_eq!(mention.addressed, Some(true));
+    assert_eq!(
+        mention.subject,
+        ExternalSubject::slack(TEAM, "u8other").unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_racing_an_expiry_sweep_records_exactly_one_follow_leave() {
+    let fixture = SlackFollowFixture::new().await;
+    fixture
+        .table
+        .stay(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+        .unwrap();
+    let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let gateway = crate::gateway::Gateway::new(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+    );
+    let (capture, _guard) = capture_spans();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held = Arc::clone(&fixture.journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _lock = held.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(8))
+            .expect("release journal I/O");
+    });
+    ready.await.unwrap();
+    let sweeping = Arc::clone(&fixture.table);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let sweep = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            sweeping.stay(&"f".repeat(64), SystemTime::now())
+        })
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !fixture.table.sweeping_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the sweep collected the expired key and reached journal removal");
+    let mut incoming = owned_slack_message("later", true);
+    incoming.transport = "scientist-slack".to_owned();
+    let mut sessions = tokio::task::JoinSet::new();
+    gateway.dispatch(
+        &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
+        incoming,
+    );
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    sweep.await.unwrap().unwrap();
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recall_then_dispatch_records_exactly_one_follow_leave() {
+    let fixture = SlackFollowFixture::new().await;
+    fixture
+        .table
+        .stay(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+        .unwrap();
+    let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let gateway = crate::gateway::Gateway::new(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+    );
+    let (capture, _guard) = capture_spans();
+    fixture
+        .journal
+        .recall(&"e".repeat(64), "other-grant", window(), SystemTime::now())
+        .unwrap();
+    assert!(fixture.journal.load_follow(1024).unwrap().is_empty());
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Lapsed
+    );
+    let mut incoming = owned_slack_message("later", true);
+    incoming.transport = "scientist-slack".to_owned();
+    let mut sessions = tokio::task::JoinSet::new();
+    gateway.dispatch(
+        &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
+        &mut crate::follow::Debounce::default(),
+        incoming,
+    );
+    assert_eq!(
+        fixture.table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() {
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().extend(batch);
+            Ok(())
+        }
+    }
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("follow-expiry-test")))
+        .set_default();
+    let fixture = SlackFollowFixture::new().await;
+    fixture.table.stay(&fixture.key, SystemTime::now()).unwrap();
+    let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
+    let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    let received =
+        crate::transport::receive_span(dekopon_broker_protocol::ChatTransportKind::Slack);
+    let expected = received.context().span().span_context().clone();
+    assert!(expected.is_valid());
+    let mut incoming = owned_slack_message("later", true);
+    incoming.transport = "scientist-slack".to_owned();
+    incoming.receive_span = received.clone();
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(TransportEvent::Message(Box::new(incoming)))
+        .await
+        .unwrap();
+    let shutdown = async {
+        while sender.capacity() != 1 {
+            tokio::task::yield_now().await;
+        }
+        fixture
+            .table
+            .stay(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(
+            fixture.table.ticket(&fixture.key, SystemTime::now()),
+            crate::follow::FollowTicket::Absent
+        );
+    };
+    serve(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::default(),
+        Arc::default(),
+        receiver,
+        shutdown,
+        Duration::from_secs(2),
+        crate::collection::Collector::new(&[], 4),
+    )
+    .await;
+    drop(received);
+    provider.force_flush().unwrap();
+    {
+        let spans = exported.0.lock();
+        let leaves: Vec<_> = spans
+            .iter()
+            .flat_map(|span| {
+                span.events
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.attributes.iter().any(|item| {
+                            item.key.as_str() == "audit.event"
+                                && item.value.to_string() == "gateway.follow"
+                        })
+                    })
+                    .map(move |_| span.span_context.clone())
+            })
+            .collect();
+        assert_eq!(leaves, [expected]);
+    }
+    provider.shutdown().unwrap();
+}
+
+#[test]
+fn startup_expiry_records_a_follow_lapse_once() {
+    let directory = temporary();
+    let now = SystemTime::now();
+    let journal = crate::journal::Journal::open(
+        directory.path(),
+        Duration::from_secs(604800),
+        Duration::from_secs(604800),
+    )
+    .unwrap();
+    let key = "f".repeat(64);
+    journal
+        .write_follow(
+            &key,
+            crate::journal::FollowMarker {
+                at_ms: 1,
+                until_ms: 2,
+            },
+        )
+        .unwrap();
+    drop(journal);
+    let (capture, _guard) = capture_spans();
+    for _ in 0..2 {
+        let journal = crate::journal::Journal::open_at(
+            directory.path(),
+            Duration::from_secs(604800),
+            Duration::from_secs(604800),
+            now,
+        )
+        .unwrap();
+        assert!(journal.load_follow(1024).unwrap().is_empty());
+    }
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
+            )
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() {
+    let fixture = SlackFollowFixture::new().await;
+    let table = crate::load_follow_table(&Some(Arc::clone(&fixture.journal)), false)
+        .await
+        .unwrap()
+        .expect("journal-backed gateways retain follow state even when all routes start disabled");
+    table.stay(&fixture.key, SystemTime::now()).unwrap();
+    assert!(matches!(
+        table.ticket(&fixture.key, SystemTime::now()),
+        crate::follow::FollowTicket::Active { .. }
+    ));
 }

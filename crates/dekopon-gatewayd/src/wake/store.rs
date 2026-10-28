@@ -10,8 +10,7 @@ use std::{
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
 use dekopon_core::{AgentId, ExternalSubject};
-use dekopon_process::Limits as ShellLimits;
-use dekopon_shell::CapabilityInvoker;
+use dekopon_shell::{CapabilityInvoker, Interpreter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -155,8 +154,8 @@ impl Tick {
         &self.anchor
     }
 
-    pub(crate) fn run(&self, leg: &dyn CapabilityInvoker, limits: ShellLimits) -> Verdict {
-        self.probe.tick(leg, limits)
+    pub(crate) fn run(&self, leg: &dyn CapabilityInvoker, shell: &Interpreter) -> Verdict {
+        self.probe.tick(leg, shell)
     }
 
     pub(crate) fn resolve(

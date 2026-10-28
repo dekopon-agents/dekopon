@@ -58,8 +58,8 @@ const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
 /// context-length rejection instead of an answer.
-const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. If you can \
-help, give a specific, useful reply. For thanks, side talk, or when you cannot help, call \
+const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. Default to silence. Only if you can \
+help with a specific, useful contribution, reply. For thanks, side talk, or when you cannot help, call \
 `decline_chat_reply` before doing any capability work. After capability work, report what happened \
 instead of declining, even if you requested to leave the conversation.";
 
@@ -4210,7 +4210,11 @@ mod tests {
         );
 
         for (name, script, expected) in refused {
-            let outcome = dekopon_shell::run(script, &NoCapabilities);
+            let outcome = dekopon_shell::Interpreter::new(
+                dekopon_process::Limits::default(),
+                dekopon_test_support::shell_threads(),
+            )
+            .run(script, &NoCapabilities);
             assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{name}: {outcome:?}");
             assert!(
                 outcome.output.contains(expected),
@@ -4229,14 +4233,22 @@ mod tests {
             "{listed:?}"
         );
 
-        let conditional = dekopon_shell::run(
+        let conditional = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run(
             "if [[ \"a\" == \"a\" ]]; then echo yes; fi",
             &NoCapabilities,
         );
         assert_eq!(conditional.exit_code, ExitCode::SUCCESS, "{conditional:?}");
         assert_eq!(conditional.output, "yes");
 
-        let errexit = dekopon_shell::run("set -e\nnosuchcmd.here\necho after", &NoCapabilities);
+        let errexit = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("set -e\nnosuchcmd.here\necho after", &NoCapabilities);
         assert_eq!(errexit.exit_code, ExitCode::NOT_FOUND, "{errexit:?}");
         assert!(errexit.output.contains("`set -e` is on"), "{errexit:?}");
         assert!(!errexit.output.contains("after"), "{errexit:?}");
@@ -4389,21 +4401,37 @@ mod tests {
             );
         }
 
-        let not_found = dekopon_shell::run("wikipedia_page --title x", &OutcomeCapabilities);
+        let not_found = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("wikipedia_page --title x", &OutcomeCapabilities);
         assert_eq!(not_found.exit_code, ExitCode::NOT_FOUND, "{not_found:?}");
         assert!(
             not_found.output.contains("command not found"),
             "{not_found:?}"
         );
 
-        let ungranted = dekopon_shell::run("probe vault", &OutcomeCapabilities);
+        let ungranted = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("probe vault", &OutcomeCapabilities);
         assert_eq!(ungranted.exit_code, ExitCode::NOT_FOUND, "{ungranted:?}");
         assert!(ungranted.output.contains("vault.open"), "{ungranted:?}");
 
-        let denied = dekopon_shell::run("probe door", &OutcomeCapabilities);
+        let denied = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("probe door", &OutcomeCapabilities);
         assert_eq!(denied.exit_code, ExitCode::DENIED, "{denied:?}");
 
-        let failed = dekopon_shell::run("probe broken", &OutcomeCapabilities);
+        let failed = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("probe broken", &OutcomeCapabilities);
         assert_eq!(failed.exit_code, ExitCode::FAILURE, "{failed:?}");
         assert!(
             failed
@@ -4412,33 +4440,56 @@ mod tests {
             "{failed:?}"
         );
 
-        let usage = dekopon_shell::run("echo abc | grep '[0-9]'", &OutcomeCapabilities);
+        let usage = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("echo abc | grep '[0-9]'", &OutcomeCapabilities);
         assert_eq!(usage.exit_code, ExitCode::SYNTAX, "{usage:?}");
-        let declined = dekopon_shell::run("probe bogus", &OutcomeCapabilities);
+        let declined = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("probe bogus", &OutcomeCapabilities);
         assert_eq!(declined.exit_code, ExitCode::SYNTAX, "{declined:?}");
         assert!(declined.output.contains("probe: usage:"), "{declined:?}");
 
-        let help = dekopon_shell::run("probe --help", &OutcomeCapabilities);
+        let help = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("probe --help", &OutcomeCapabilities);
         assert_eq!(help.exit_code, ExitCode::SUCCESS, "{help:?}");
         assert!(help.output.contains("Usage: probe"), "{help:?}");
-        let proposed = dekopon_shell::run("probe get --post-id 7", &OutcomeCapabilities);
+        let proposed = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("probe get --post-id 7", &OutcomeCapabilities);
         assert_eq!(proposed.exit_code, ExitCode::SUCCESS, "{proposed:?}");
         assert_eq!(
             serde_json::from_str::<Value>(&proposed.output)
                 .expect("the proposal's input is echoed as JSON"),
             json!({"postId": "7"})
         );
-        let listed = dekopon_shell::run("cap --list", &OutcomeCapabilities);
+        let listed = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("cap --list", &OutcomeCapabilities);
         assert_eq!(listed.exit_code, ExitCode::SUCCESS, "{listed:?}");
         assert_eq!(
             serde_json::from_str::<Value>(&listed.output).expect("cap --list prints a JSON array"),
             json!(["broken.thing", "locked.door", "posts.get"])
         );
 
-        let truncated = dekopon_shell::Interpreter::new(dekopon_process::Limits {
-            max_output_lines: 4,
-            ..dekopon_process::Limits::default()
-        })
+        let truncated = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits {
+                max_output_lines: 4,
+                ..dekopon_process::Limits::default()
+            },
+            dekopon_test_support::shell_threads(),
+        )
         .run(
             "for i in 1 2 3 4 5 6 7 8 9 10; do echo $i; done",
             &OutcomeCapabilities,
