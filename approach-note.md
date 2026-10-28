@@ -57,8 +57,16 @@ markers and existing separator behavior, without field splitting.
 
 Extend the existing expansion collector with a case-pattern context, reusing parameter,
 arithmetic and command-substitution evaluation. This context records lexical quote protection
-rather than IFS-derived protection and emits the marked characters directly. Thread that context
-through selected modifier words, so `${p:-'*'}.json` preserves its inner quoted star as well.
+rather than IFS-derived protection and emits the marked characters directly. Preserve inner
+quote markers through selected default/alternate words (`:-`, `-`, `:+`, `+`), so
+`${p:-'*'}.json` preserves its inner quoted star.
+
+Assignment modifiers (`:=` and `=`) follow the existing `Modifier::Assign` evaluation in
+`interp.rs:3938`: evaluate the selected word without collecting its inner quote markers, assign
+the resulting value, then emit that value with protection determined by the enclosing expansion.
+Thus, with `p` unset, `${p:='*'}.json` and `${p='*'}.json` produce an active star, whereas
+`"${p:='*'}".json` and `"${p='*'}".json` produce literal characters. Inner quote protection
+from the assignment word does not survive assignment into an unquoted expansion.
 The ordinary expansion contexts and their output remain unchanged; if an oracle row requires
 changing their behavior, stop and report the contract conflict.
 
@@ -108,7 +116,7 @@ separate pathological-pattern result test; add no fixture or timing assertion.
 
 Observed oracle: GNU Bash `5.2.37(1)-release (x86_64-pc-linux-gnu)`, run with
 `bash --noprofile --norc`, `LC_ALL=C.UTF-8`, and `shopt -u extglob nocasematch`.
-All 34 rows below were executed successfully before this note. `yes`/`no` are the selected
+All 39 rows below were executed successfully before this revision. `yes`/`no` are the selected
 branch's output. The extra alternatives make protected-literal and bare-star rows fail at base.
 
 | Subject / setup | Pattern | Output |
@@ -141,6 +149,11 @@ branch's output. The extra alternatives make protected-literal and bare-star row
 | `b` | `[a'-'c]` | no |
 | unset `p`, literal `*.json` | `${p:-'*'}.json` or `*.csv` | yes |
 | unset `p`, `report.json` | `${p:-'*'}.json` or `*.csv` | no |
+| `p=set`, `report.json` | `${p:+'*'}.json` or `*.csv` | no |
+| unset `p`, `report.json` | `${p:='*'}.json` | yes |
+| unset `p`, `report.json` | `${p='*'}.json` | yes |
+| unset `p`, `report.json` | `"${p:='*'}".json` or `*.csv` | no |
+| unset `p`, `report.json` | `"${p='*'}".json` or `*.csv` | no |
 | `report.json` | `$(printf '*.json')` | yes |
 | `report.json` | `"$(printf '*.json')"` or `*.csv` | no |
 | `p='\*'`, literal `*` | `$p` | yes |
@@ -174,6 +187,7 @@ owner's post-deploy work. This branch authorizes no merge, tag, release, deploy 
 - Use a private hand-written glob matcher in `interp/case_pattern.rs`, with rolling dynamic-programming rows and no new dependency.
 - Carry per-character quote origin in private `PatternChar::Unquoted` / `PatternChar::Literal` variants emitted by case-pattern expansion.
 - Extend the existing expansion collector with a case-only context, including selected modifier words, without changing other expansion contexts.
+- Preserve inner quote markers for default/alternate words; evaluate assignment words through the existing assignment path and emit the assigned value under the enclosing quote context.
 - Refuse POSIX bracket classes, collating symbols and equivalence classes by name rather than approximating them.
 - Remove all three internal `CasePattern` variants and store pattern `Word`s directly; bare `*` earns no special case.
 - Add active glob alternatives to table rows whose isolated literal or bare-star behavior already passes at base, to meet the each-row-fails-at-base requirement.
