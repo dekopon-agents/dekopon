@@ -3171,13 +3171,16 @@ async fn session_turn(
                 &message.conversation.key(),
             );
             let index = route.route_index;
+            let transitioned = table.suspend(&follow_key);
             match tokio::task::spawn_blocking(move || table.leave(&follow_key)).await {
-                Ok(Ok(())) => tracing::info!(
+                Ok(Ok(())) if transitioned => tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "self-left",
+                    cause = "leave",
                     route = index,
                     "gateway.follow"
                 ),
+                Ok(Ok(())) => {}
                 _ => tracing::warn!(
                     audit.event = "gateway.follow",
                     operation = "refused",

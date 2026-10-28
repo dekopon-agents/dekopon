@@ -215,6 +215,10 @@ where
         capability.count = capabilities.len(),
         "gateway.broker.ready"
     );
+    let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    let follow =
+        load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?;
+    generation.set_follow(follow.clone());
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
@@ -230,7 +234,6 @@ where
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
-    let journal = open_journal(config.journal.clone(), &config.memory).await?;
     let journal_dir = config.journal.as_ref().map(|journal| journal.dir.clone());
     let cache_keys = tokio::task::spawn_blocking(move || match journal_dir {
         Some(dir) => cache_key::CacheKeySecret::load_or_create(&dir),
@@ -303,7 +306,7 @@ where
             config.memory.arena.max_transient_bytes.get() as usize,
             cache_keys,
         ),
-        follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
+        follow,
         journal,
         assets: Arc::clone(&assets),
         asset_fetchers,
@@ -451,7 +454,7 @@ async fn load_follow_table(
     journal: &Option<Arc<journal::Journal>>,
     enabled: bool,
 ) -> Result<Option<Arc<follow::FollowTable>>, GatewaydError> {
-    if !enabled {
+    if !enabled && journal.is_none() {
         return Ok(None);
     }
     let journal = Arc::clone(journal.as_ref().ok_or(GatewaydError::Journal {
@@ -1165,15 +1168,18 @@ fn build_transport(
             experience,
             endpoint,
             ..
-        } => Box::new(SlackTransport::new(
-            name.clone(),
-            endpoint
-                .clone()
-                .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
-            transport::read_credential(app_token_env)?,
-            transport::read_credential(bot_token_env)?,
-            *experience,
-        )?),
+        } => Box::new(
+            SlackTransport::new(
+                name.clone(),
+                endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
+                transport::read_credential(app_token_env)?,
+                transport::read_credential(bot_token_env)?,
+                *experience,
+            )?
+            .with_generation(generation.clone()),
+        ),
         TransportConfig::DiscordGateway {
             name,
             bot_token_env,

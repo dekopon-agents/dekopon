@@ -58,8 +58,8 @@ const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
 /// Capped at the shell's own output limit so a larger asset would end the session with a provider
 /// context-length rejection instead of an answer.
-const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. If you can \
-help, give a specific, useful reply. For thanks, side talk, or when you cannot help, call \
+const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. Default to silence. Only if you can \
+help with a specific, useful contribution, reply. For thanks, side talk, or when you cannot help, call \
 `decline_chat_reply` before doing any capability work. After capability work, report what happened \
 instead of declining, even if you requested to leave the conversation.";
 
