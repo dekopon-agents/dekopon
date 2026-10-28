@@ -45,7 +45,7 @@ struct Cli {
     /// Retire idle blocking threads after this duration (default: 10s).
     #[arg(long, env = "DEKOPON_BLOCKING_KEEP_ALIVE", value_name = "DURATION")]
     blocking_keep_alive: Option<humantime::Duration>,
-    /// Rayon CPU threads; otherwise RAYON_NUM_THREADS or the available CPU count.
+    /// Rayon CPU threads (1 to 4096); otherwise RAYON_NUM_THREADS or the available CPU count.
     #[arg(long, env = "DEKOPON_CPU_THREADS", value_name = "COUNT")]
     cpu_threads: Option<std::num::NonZeroUsize>,
     /// Strict owner-controlled broker YAML/JSON configuration.
@@ -225,13 +225,36 @@ fn runtime_builder(cli: &Cli) -> Result<tokio::runtime::Builder, clap::Error> {
 }
 
 #[cfg(unix)]
-fn cpu_pool(cli: &Cli) -> Result<(), rayon::ThreadPoolBuildError> {
-    let mut builder = rayon::ThreadPoolBuilder::new()
-        .thread_name(|index| format!("bk-cpu-{}", index % 100_000_000));
-    if let Some(threads) = cli.cpu_threads {
-        builder = builder.num_threads(threads.get());
+fn cpu_pool_builder(cli: &Cli) -> Result<rayon::ThreadPoolBuilder, clap::Error> {
+    let threads = match cli.cpu_threads {
+        Some(threads) => threads.get(),
+        None => match std::env::var("RAYON_NUM_THREADS") {
+            Ok(value) => value
+                .parse::<std::num::NonZeroUsize>()
+                .map_err(|error| {
+                    Cli::command().error(
+                        ErrorKind::ValueValidation,
+                        format!("invalid RAYON_NUM_THREADS: {error}"),
+                    )
+                })?
+                .get(),
+            Err(std::env::VarError::NotPresent) => {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            }
+            Err(error) => {
+                return Err(Cli::command().error(ErrorKind::ValueValidation, error));
+            }
+        },
+    };
+    if threads > MAX_RUNTIME_THREADS {
+        return Err(Cli::command().error(
+            ErrorKind::ValueValidation,
+            format!("CPU thread count must be at most {MAX_RUNTIME_THREADS}"),
+        ));
     }
-    builder.build_global()
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("bk-cpu-{}", index % 100_000_000)))
 }
 
 #[cfg(unix)]
@@ -244,7 +267,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let mut builder = runtime_builder(&cli).unwrap_or_else(|error| error.exit());
-    if let Err(error) = cpu_pool(&cli) {
+    let cpu_builder = cpu_pool_builder(&cli).unwrap_or_else(|error| error.exit());
+    if let Err(error) = cpu_builder.build_global() {
         eprintln!("dekopon-brokerd: could not start the CPU pool: {error}");
         return ExitCode::FAILURE;
     }
@@ -1029,6 +1053,51 @@ mod runtime_sizing_tests {
     }
 
     #[test]
+    fn cpu_thread_limits_are_cli_errors() {
+        const CHILD: &str = "DEKOPON_CPU_LIMIT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let error = Cli::try_parse_from(["daemon"])
+                .and_then(|cli| cpu_pool_builder(&cli))
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+            return;
+        }
+        let invalid_counts = [usize::MAX, usize::MAX - 512, MAX_RUNTIME_THREADS + 1];
+        for count in invalid_counts {
+            let cli = Cli::try_parse_from(["daemon".to_owned(), format!("--cpu-threads={count}")])
+                .unwrap();
+            let error = cpu_pool_builder(&cli).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert_eq!(error.exit_code(), 2);
+        }
+        for variable in ["DEKOPON_CPU_THREADS", "RAYON_NUM_THREADS"] {
+            let mut values: Vec<_> = invalid_counts.into_iter().map(|n| n.to_string()).collect();
+            if variable == "RAYON_NUM_THREADS" {
+                values.extend(["0".to_owned(), "invalid".to_owned()]);
+            }
+            for value in values {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "runtime_sizing_tests::cpu_thread_limits_are_cli_errors",
+                    ])
+                    .env_remove("DEKOPON_CPU_THREADS")
+                    .env_remove("RAYON_NUM_THREADS")
+                    .env(CHILD, "1")
+                    .env(variable, &value)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{variable}={value}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn configured_runtime_names_workers_and_blocking_threads() {
         let cli = Cli::parse_from(["daemon", "--worker-threads=2", "--blocking-threads=1"]);
         let runtime = runtime_builder(&cli).unwrap().build().unwrap();
@@ -1066,33 +1135,60 @@ mod runtime_sizing_tests {
     #[test]
     fn global_cpu_pool_has_the_selected_size_and_names() {
         const CHILD: &str = "DEKOPON_CPU_POOL_TEST";
-        if std::env::var_os(CHILD).is_none() {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "runtime_sizing_tests::global_cpu_pool_has_the_selected_size_and_names",
-                ])
-                .env(CHILD, "1")
-                .env("DEKOPON_CPU_THREADS", "3")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        let mode = std::env::var(CHILD).ok();
+        let Some(mode) = mode else {
+            for (mode, dekopon, rayon) in [
+                ("flag", Some("3"), Some("1000000")),
+                ("environment", Some("2"), Some("1000000")),
+                ("legacy", None, Some("2")),
+                ("default", None, None),
+            ] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "runtime_sizing_tests::global_cpu_pool_has_the_selected_size_and_names",
+                    ])
+                    .env(CHILD, mode);
+                for (variable, value) in [
+                    ("DEKOPON_CPU_THREADS", dekopon),
+                    ("RAYON_NUM_THREADS", rayon),
+                ] {
+                    if let Some(value) = value {
+                        child.env(variable, value);
+                    } else {
+                        child.env_remove(variable);
+                    }
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             return;
-        }
-        let cli = Cli::parse_from(["broker", "--cpu-threads=2"]);
-        cpu_pool(&cli).unwrap();
-        assert_eq!(rayon::current_num_threads(), 2);
+        };
+        let arguments = if mode == "flag" {
+            vec!["broker", "--cpu-threads=2"]
+        } else {
+            vec!["broker"]
+        };
+        let expected = if mode == "default" {
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        } else {
+            2
+        };
+        let cli = Cli::parse_from(arguments);
+        cpu_pool_builder(&cli).unwrap().build_global().unwrap();
+        assert_eq!(rayon::current_num_threads(), expected);
         let names: BTreeSet<_> =
             rayon::broadcast(|_| std::thread::current().name().unwrap().to_owned())
                 .into_iter()
                 .collect();
         assert_eq!(
             names,
-            BTreeSet::from(["bk-cpu-0".to_owned(), "bk-cpu-1".to_owned()])
+            (0..expected).map(|n| format!("bk-cpu-{n}")).collect()
         );
     }
 }

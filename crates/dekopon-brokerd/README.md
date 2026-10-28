@@ -48,6 +48,10 @@ CPUs; larger counts are command-line validation errors (exit 2) before any pool 
 | `--cpu-threads` | `DEKOPON_CPU_THREADS` | `RAYON_NUM_THREADS`, otherwise available CPUs |
 
 The process builds its Rayon global pool at startup; it owns that pool until process exit.
+Its effective CPU count must be from 1 to 4096, using `--cpu-threads`, then
+`DEKOPON_CPU_THREADS`, then `RAYON_NUM_THREADS`, then available CPUs. Invalid or excessive
+counts are command-line validation errors (exit 2) before the pool is built; the deprecated
+`RAYON_RS_NUM_CPUS` fallback is not used.
 Runtime flags precede a subcommand, for example `dekopon-brokerd --cpu-threads=2 provider precompile`.
 
 With both OTel exporters enabled and idle blocking threads retired, brokerd has `W + C + 4` idle threads (main, `W` workers named `bk-rt-N`, `C` CPU threads named `bk-cpu-N`, `bk-stdout`, and two SDK-owned export threads) and a process ceiling of `W + C + 4 + B`, where `B` is the blocking cap (512 by default); the Pi settings `W=2, C=2, B=8` give 8 idle and at most 16 threads.

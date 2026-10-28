@@ -40,11 +40,12 @@ CPUs; larger counts are command-line validation errors (exit 2) before any pool 
 | `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
 | `--shell-threads` | `DEKOPON_SHELL_THREADS` | 32 |
 
-With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (512 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=8, S=32` give 6 idle and at most 46 threads.
+With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (512 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=16, S=32` give 6 idle and at most 54 threads.
 Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
 `gw-rt-N` namespace and retire after the keep-alive. The stdout worker and OTel providers drain
-before runtime shutdown. The Pi settings are deployment values, not binary defaults; moving
-turns off the blocking pool is a separate change.
+before runtime shutdown. The Pi settings are deployment values, not binary defaults.
+Until turns move to `ShellThreads`, the Pi must use `B=16` with a startup arithmetic check;
+`threads/homelab` must not set `B=8` before that move. Afterward, `B=8` gives a ceiling of 46 threads.
 
 ## Check a configuration
 
