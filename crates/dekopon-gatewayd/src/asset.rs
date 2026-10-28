@@ -1055,7 +1055,8 @@ impl AssetSource for SessionAssets {
                 }
                 | dekopon_model::model::ModelMessage::System { .. }
                 | dekopon_model::model::ModelMessage::Assistant { .. }
-                | dekopon_model::model::ModelMessage::ToolResults { .. } => continue,
+                | dekopon_model::model::ModelMessage::ToolResults { .. }
+                | dekopon_model::model::ModelMessage::Journal { .. } => continue,
             };
             for part in parts {
                 let data = match part {
