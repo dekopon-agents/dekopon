@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    reason = "tests spawn, join and build runtimes freely; production sites carry their own expectation"
+)]
 use std::{
     io::{BufRead, BufReader, Write},
     num::NonZeroU8,
@@ -11,6 +16,17 @@ use dekopon_process::Limits;
 use dekopon_shell::{
     CapabilityCallResult, CapabilityInvoker, CommandProposal, CommandRun, Interpreter, Streams,
 };
+
+fn shell_threads() -> dekopon_process::ShellThreads {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    dekopon_process::ShellThreads::new(16, RUNTIME.handle().clone())
+}
 
 const BROKEN_PIPE: NonZeroU8 = NonZeroU8::new(141).expect("nonzero");
 
@@ -133,14 +149,15 @@ impl CapabilityInvoker for Processes {
 #[test]
 fn an_asset_note_is_stage_stderr_not_piped_stdout() {
     let processes = Processes::default();
-    let outcome = Interpreter::new(Limits::default()).run("note | cat", &processes);
+    let outcome =
+        Interpreter::new(Limits::default(), shell_threads()).run("note | cat", &processes);
     assert_eq!(outcome.output, "provider bytes\nasset note", "{outcome:?}");
 }
 
 #[test]
 fn head_closing_a_provider_pipeline_exits_141_upstream_and_eof_reaches_every_stage() {
     let processes = Processes::default();
-    let outcome = Interpreter::new(Limits::default())
+    let outcome = Interpreter::new(Limits::default(), shell_threads())
         .run("flood | relay | head -1\necho ${PIPESTATUS[@]}", &processes);
     assert_eq!(outcome.output, "line 0\n141 141 0", "{outcome:?}");
     let mut seen = processes.seen.lock().clone();
@@ -156,7 +173,7 @@ fn head_closing_a_provider_pipeline_exits_141_upstream_and_eof_reaches_every_sta
 
 #[test]
 fn named_operand_leaves_provider_pipe_unread() {
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "printf 'one\\ntwo\\n' > buf; flood | wc -l buf; echo ${PIPESTATUS[@]}",
         &Processes::default(),
     );
@@ -165,7 +182,7 @@ fn named_operand_leaves_provider_pipe_unread() {
 
 #[test]
 fn quiet_grep_drops_the_flood_reader_after_the_first_match() {
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "flood | grep -q 'line 0'; echo ${PIPESTATUS[@]}",
         &Processes::default(),
     );
@@ -174,12 +191,12 @@ fn quiet_grep_drops_the_flood_reader_after_the_first_match() {
 
 #[test]
 fn head_bytes_closes_a_flood_after_the_exact_prefix() {
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "flood | head -c 2 | base64; echo ${PIPESTATUS[@]}",
         &Processes::default(),
     );
     assert_eq!(outcome.output, "bGk=141 0 0", "{outcome:?}");
-    let zero = Interpreter::new(Limits::default()).run(
+    let zero = Interpreter::new(Limits::default(), shell_threads()).run(
         "flood | head -c 0; echo ${PIPESTATUS[@]}",
         &Processes::default(),
     );
@@ -189,7 +206,7 @@ fn head_bytes_closes_a_flood_after_the_exact_prefix() {
 #[test]
 fn a_provider_with_nothing_piped_sees_no_stdin_and_its_exit_status_is_the_stage_s() {
     let processes = Processes::default();
-    let outcome = Interpreter::new(Limits::default()).run(
+    let outcome = Interpreter::new(Limits::default(), shell_threads()).run(
         "probe | relay\necho ${PIPESTATUS[@]}\nrelay\necho $?",
         &processes,
     );

@@ -279,7 +279,7 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
     let outcome = tracing::subscriber::with_default(subscriber, || {
         let enclosing = enclose.then(|| tracing::info_span!("caller.enclosing"));
         let _entered = enclosing.as_ref().map(tracing::Span::enter);
-        Interpreter::new(limits).run(script, &Fixture)
+        Interpreter::new(limits, crate::test_threads()).run(script, &Fixture)
     });
 
     let spans = spans.lock().clone();

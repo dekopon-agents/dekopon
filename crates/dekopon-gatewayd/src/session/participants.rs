@@ -80,7 +80,7 @@ impl<I: dekopon_shell::CapabilityInvoker> dekopon_agent::prompt::ScriptRuntime f
         };
         match selected {
             Some((Handle::ASKER, _)) => self.asker.run_script(script, None),
-            Some((_, leg)) => ShellRuntime { invoker: leg, limits: self.asker.limits, calls: self.asker.calls.clone() }.run_script(script, None),
+            Some((_, leg)) => ShellRuntime { invoker: leg, limits: self.asker.limits, calls: self.asker.calls.clone(), threads: self.asker.threads.clone() }.run_script(script, None),
             None => dekopon_shell::ScriptOutcome {
                 output: "Unknown participant handle: use a handle in this turn's authenticated attribution lines.".to_owned(),
                 exit_code: dekopon_process::ExitCode::from(2),

@@ -28,7 +28,10 @@ use dekopon_broker_protocol::{
 };
 #[cfg(unix)]
 use dekopon_core::{CapabilityId, InvocationId, PrincipalId, TraceId};
-use dekopon_process::{CallBudget, CancelSignal, ExitCode, Limits as ShellLimits, TreeContext};
+use dekopon_process::{
+    CallBudget, CancelSignal, ExitCode, Limits as ShellLimits, ShellThreads, ThreadName,
+    TreeContext,
+};
 #[cfg(unix)]
 use dekopon_shell::CapabilityDescription;
 use dekopon_shell::{
@@ -65,6 +68,7 @@ pub struct ShellRuntime<I> {
     pub invoker: I,
     pub limits: ShellLimits,
     pub calls: CallBudget,
+    pub threads: ShellThreads,
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
@@ -79,10 +83,14 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
                 steps: 0,
             };
         }
-        let mut tree = TreeContext::new(self.limits, self.calls.clone())
+        let mut tree = TreeContext::new(self.limits, self.calls.clone(), self.threads.clone())
             .with_cancel(self.invoker.cancel_signals());
         self.invoker.script_started(&mut tree);
-        let outcome = Interpreter::new(self.limits).run_with_tree(script, &self.invoker, &tree);
+        let outcome = Interpreter::new(self.limits, self.threads.clone()).run_with_tree(
+            script,
+            &self.invoker,
+            &tree,
+        );
         // Call script_finished before returning the outcome, or the next turn's progress event
         // reports out of order.
         self.invoker.script_finished();
@@ -801,7 +809,7 @@ impl BrokerLeg {
             stdin: streams.stdin,
             stdout: streams.stdout,
         });
-        let submitted = std::thread::scope(|scope| {
+        let submitted = upcall_scope(|scope| {
             self.runtime.block_on(async {
                 tokio::select! {
                     biased;
@@ -981,7 +989,7 @@ impl BrokerLeg {
         // re-enter `Handle::block_on`, which panics on a thread already inside one. Cancel drops this
         // future and its connection first; the scope then joins a child that sees the same cancel.
         let cancel = &self.cancel;
-        let submitted = std::thread::scope(|scope| {
+        let submitted = upcall_scope(|scope| {
             self.runtime.block_on(async {
                 tokio::select! {
                     result = async {
@@ -1107,25 +1115,38 @@ impl BrokerLeg {
         let (finished, outcome) = tokio::sync::oneshot::channel();
         let dispatcher = dispatcher.clone();
         let tree = tree.clone().with_parent_cancel(self.cancel.clone());
-        scope.spawn(move || {
-            let outcome = tracing::dispatcher::with_default(&dispatcher, || {
-                span.in_scope(|| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Interpreter::new(*tree.limits()).run_child(
-                            &script,
-                            script_stdin,
-                            self,
-                            &tree,
-                        )
-                    }))
-                })
-            });
+        let [permit] = match tree.shell_threads().reserve() {
+            Ok(permit) => permit,
+            Err(limit) => return deliver_child(stdout, ScriptOutcome::refused(limit)).await,
+        };
+        let spawned = permit.spawn(scope, UPCALL_THREAD, move || {
+            let outcome =
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    span.in_scope(|| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            Interpreter::new(*tree.limits(), tree.shell_threads().clone())
+                                .run_child(&script, script_stdin, self, &tree)
+                        }))
+                    })
+                });
             #[allow(
                 clippy::let_underscore_must_use,
                 reason = "a closed receiver means the invocation was cancelled and nobody waits"
             )]
             let _ = finished.send(outcome.ok());
         });
+        if let Err(error) = spawned {
+            tracing::warn!(
+                event = "gateway_child_thread_unstarted",
+                parent = %parent,
+                error = %error,
+                "gateway.child.thread.unstarted"
+            );
+            return UpcallExit {
+                status: ExitCode::FAILURE.get(),
+                stderr: "dekopon-shell: the child script's thread could not start".to_owned(),
+            };
+        }
         let pumped = async {
             if let Some((source, sink)) = feed {
                 pump_child_stdin(source, sink).await;
@@ -1147,21 +1168,40 @@ impl BrokerLeg {
                 stderr: "dekopon-shell: the child script panicked".to_owned(),
             };
         };
-        let mut text = outcome.output;
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        if let Err(error) = write_child_stdout(stdout, text.as_bytes()).await {
-            tracing::debug!(
-                event = "gateway_child_stdout_unread",
-                error = %error,
-                "gateway.child.stdout.unread"
-            );
-        }
-        UpcallExit {
-            status: outcome.exit_code.get(),
-            stderr: String::new(),
-        }
+        deliver_child(stdout, outcome).await
+    }
+}
+
+#[cfg(unix)]
+const UPCALL_THREAD: ThreadName = ThreadName::new("sh-upcall");
+
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: the broker call, whose scope joins every child-script upcall before returning; bound: each upcall's ShellThreads permit"
+)]
+fn upcall_scope<'env, T>(
+    run: impl for<'scope> FnOnce(&'scope std::thread::Scope<'scope, 'env>) -> T,
+) -> T {
+    std::thread::scope(run)
+}
+
+#[cfg(unix)]
+async fn deliver_child(stdout: OwnedFd, outcome: ScriptOutcome) -> UpcallExit {
+    let mut text = outcome.output;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if let Err(error) = write_child_stdout(stdout, text.as_bytes()).await {
+        tracing::debug!(
+            event = "gateway_child_stdout_unread",
+            error = %error,
+            "gateway.child.stdout.unread"
+        );
+    }
+    UpcallExit {
+        status: outcome.exit_code.get(),
+        stderr: String::new(),
     }
 }
 
@@ -1358,7 +1398,8 @@ mod tests {
                 streams,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    dekopon_test_support::shell_threads()
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1380,7 +1421,8 @@ mod tests {
                 streams,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    dekopon_test_support::shell_threads()
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1414,7 +1456,8 @@ mod tests {
                 streams().0,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    dekopon_test_support::shell_threads()
                 )
             ),
             CapabilityCallResult::NotFound
@@ -1440,7 +1483,8 @@ mod tests {
                 streams().0,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    dekopon_test_support::shell_threads()
                 )
             ),
             CapabilityCallResult::Succeeded
@@ -1452,7 +1496,8 @@ mod tests {
                 streams().0,
                 &dekopon_process::TreeContext::new(
                     dekopon_process::Limits::default(),
-                    dekopon_process::CallBudget::new(64)
+                    dekopon_process::CallBudget::new(64),
+                    dekopon_test_support::shell_threads()
                 )
             ),
             dekopon_shell::secret_use_unsupported()
@@ -1527,8 +1572,11 @@ mod tests {
             direct: FakeLeg::new("cli-probe.upper", "direct"),
             broker: Some(Box::new(std::sync::Arc::clone(&leg))),
         };
-        let outcome = dekopon_shell::Interpreter::new(dekopon_process::Limits::default())
-            .run("echo a &", &invoker);
+        let outcome = dekopon_shell::Interpreter::new(
+            dekopon_process::Limits::default(),
+            dekopon_test_support::shell_threads(),
+        )
+        .run("echo a &", &invoker);
         assert_eq!(outcome.output, "[7]");
         let jobs = invoker.job_control().expect("the broker leg's job control");
         let id = dekopon_process::JobId::new(7);
@@ -1768,13 +1816,17 @@ mod tests {
             .await;
             leg.command_words.insert("probe".to_owned());
             let calls = dekopon_process::CallBudget::new(1);
-            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let tree = dekopon_process::TreeContext::new(
+                Limits::default(),
+                calls.clone(),
+                dekopon_test_support::shell_threads(),
+            );
             let outcome = tokio::task::spawn_blocking(move || {
-                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
-                    "probe upper",
-                    &leg,
-                    &tree,
+                dekopon_shell::Interpreter::new(
+                    Limits::default(),
+                    dekopon_test_support::shell_threads(),
                 )
+                .run_with_tree("probe upper", &leg, &tree)
             })
             .await
             .unwrap();
@@ -1814,13 +1866,17 @@ mod tests {
                 )))));
             leg.command_words.insert("probe".to_owned());
             let calls = dekopon_process::CallBudget::new(1);
-            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let tree = dekopon_process::TreeContext::new(
+                Limits::default(),
+                calls.clone(),
+                dekopon_test_support::shell_threads(),
+            );
             let run = tokio::task::spawn_blocking(move || {
-                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
-                    "probe chat-asset:1",
-                    &leg,
-                    &tree,
+                dekopon_shell::Interpreter::new(
+                    Limits::default(),
+                    dekopon_test_support::shell_threads(),
                 )
+                .run_with_tree("probe chat-asset:1", &leg, &tree)
             });
             resolving.await.unwrap();
             assert_eq!(calls.used(), 1);
@@ -1841,13 +1897,17 @@ mod tests {
             let (handle, signal) = CancelSignal::pair();
             let leg = leg.with_cancel_signal(signal);
             let calls = dekopon_process::CallBudget::new(1);
-            let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+            let tree = dekopon_process::TreeContext::new(
+                Limits::default(),
+                calls.clone(),
+                dekopon_test_support::shell_threads(),
+            );
             let run = tokio::task::spawn_blocking(move || {
-                dekopon_shell::Interpreter::new(Limits::default()).run_with_tree(
-                    "probe upper",
-                    &leg,
-                    &tree,
+                dekopon_shell::Interpreter::new(
+                    Limits::default(),
+                    dekopon_test_support::shell_threads(),
                 )
+                .run_with_tree("probe upper", &leg, &tree)
             });
             assert!(matches!(
                 observed.recv().await.unwrap().request,
@@ -1894,11 +1954,18 @@ mod tests {
                 let capture = dekopon_test_support::CaptureLayer::new();
                 let subscriber = tracing_subscriber::registry().with(capture.clone());
                 let calls = dekopon_process::CallBudget::new(1);
-                let tree = dekopon_process::TreeContext::new(Limits::default(), calls.clone());
+                let tree = dekopon_process::TreeContext::new(
+                    Limits::default(),
+                    calls.clone(),
+                    dekopon_test_support::shell_threads(),
+                );
                 let outcome = tokio::task::spawn_blocking(move || {
                     tracing::subscriber::with_default(subscriber, || {
-                        dekopon_shell::Interpreter::new(Limits::default())
-                            .run_with_tree(script, &leg, &tree)
+                        dekopon_shell::Interpreter::new(
+                            Limits::default(),
+                            dekopon_test_support::shell_threads(),
+                        )
+                        .run_with_tree(script, &leg, &tree)
                     })
                 })
                 .await
@@ -1993,6 +2060,7 @@ mod tests {
                     &dekopon_process::TreeContext::new(
                         dekopon_process::Limits::default(),
                         dekopon_process::CallBudget::new(64),
+                        dekopon_test_support::shell_threads(),
                     ),
                 );
                 (result, output(reader))
@@ -2009,6 +2077,7 @@ mod tests {
                     &dekopon_process::TreeContext::new(
                         dekopon_process::Limits::default(),
                         dekopon_process::CallBudget::new(64),
+                        dekopon_test_support::shell_threads(),
                     ),
                 )
             })
@@ -2254,7 +2323,11 @@ mod tests {
             }
 
             fn tree(calls: &CallBudget) -> TreeContext {
-                TreeContext::new(Limits::default(), calls.clone())
+                TreeContext::new(
+                    Limits::default(),
+                    calls.clone(),
+                    dekopon_test_support::shell_threads(),
+                )
             }
 
             fn call(leg: &BrokerLeg, tree: &TreeContext) -> CapabilityCallResult {
@@ -2343,7 +2416,14 @@ mod tests {
                         timeout: Duration::from_secs(300),
                         ..Limits::default()
                     };
-                    call(&leg, &TreeContext::new(limits, CallBudget::new(64)))
+                    call(
+                        &leg,
+                        &TreeContext::new(
+                            limits,
+                            CallBudget::new(64),
+                            dekopon_test_support::shell_threads(),
+                        ),
+                    )
                 });
                 child_parked.await.expect("the child call is parked");
                 for _ in 0..280 {
@@ -2401,7 +2481,14 @@ mod tests {
                             timeout: Duration::from_secs(30),
                             ..Limits::default()
                         };
-                        call(&leg, &TreeContext::new(limits, CallBudget::new(64)))
+                        call(
+                            &leg,
+                            &TreeContext::new(
+                                limits,
+                                CallBudget::new(64),
+                                dekopon_test_support::shell_threads(),
+                            ),
+                        )
                     });
                     child_parked.await.expect("child invocation parked");
                     let start = tokio::time::Instant::now();
@@ -3014,6 +3101,7 @@ mod tests {
                         &dekopon_process::TreeContext::new(
                             dekopon_process::Limits::default(),
                             dekopon_process::CallBudget::new(64),
+                            dekopon_test_support::shell_threads(),
                         ),
                     )
                 })
@@ -3215,6 +3303,7 @@ mod tests {
                 },
                 limits: Limits::default(),
                 calls,
+                threads: dekopon_test_support::shell_threads(),
             };
             let script = (1..=9)
                 .map(|index| format!("progress note-{index}"))
@@ -3314,6 +3403,7 @@ mod tests {
                 invoker: leg,
                 limits,
                 calls: dekopon_process::CallBudget::new(4),
+                threads: dekopon_test_support::shell_threads(),
             };
             let running = tokio::task::spawn_blocking(move || {
                 runtime.run_script("while true; do :; done", None)
@@ -3341,6 +3431,7 @@ mod tests {
                 invoker: leg,
                 limits,
                 calls: dekopon_process::CallBudget::new(4),
+                threads: dekopon_test_support::shell_threads(),
             };
             let running =
                 tokio::task::spawn_blocking(move || runtime.run_script("sleep 300", None));
@@ -3400,6 +3491,7 @@ mod tests {
                 invoker: leg,
                 limits: Limits::default(),
                 calls: calls.clone(),
+                threads: dekopon_test_support::shell_threads(),
             };
             let (first, second) = tokio::task::spawn_blocking(move || {
                 (
@@ -3441,6 +3533,7 @@ mod tests {
                 },
                 limits: Limits::default(),
                 calls,
+                threads: dekopon_test_support::shell_threads(),
             };
 
             let outcome =
@@ -3476,6 +3569,7 @@ mod tests {
                     &dekopon_process::TreeContext::new(
                         dekopon_process::Limits::default(),
                         dekopon_process::CallBudget::new(64),
+                        dekopon_test_support::shell_threads(),
                     ),
                 )
             })

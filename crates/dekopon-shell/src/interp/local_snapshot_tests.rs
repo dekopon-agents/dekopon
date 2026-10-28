@@ -38,7 +38,10 @@ fn local_assignment_and_restore_keep_snapshot_globals_shared() {
     let mut parent = Evaluator {
         nesting: super::nesting::Nesting::root(),
         invoker: &invoker,
-        budget: Budget::start_tree(limits, TreeContext::new(limits, CallBudget::new(1))),
+        budget: Budget::start_tree(
+            limits,
+            TreeContext::new(limits, CallBudget::new(1), crate::test_threads()),
+        ),
         limits,
         output: OutputBuffer::new(&limits),
         globals: Arc::new(BTreeMap::from([(
@@ -100,7 +103,7 @@ fn structured_capture_counts_escaped_bytes_before_reduction() {
         max_value_bytes: 200,
         ..Limits::default()
     };
-    let tree = TreeContext::new(limits, CallBudget::new(1));
+    let tree = TreeContext::new(limits, CallBudget::new(1), crate::test_threads());
     let budget = Budget::start_tree(limits, tree.clone());
     let value = serde_json::json!({"payload": "\n".repeat(40)});
     assert_eq!(
@@ -131,6 +134,7 @@ fn capture_reduction_is_bounded_by_the_tree_value_limit() {
             ..Limits::default()
         },
         CallBudget::new(1),
+        crate::test_threads(),
     );
     let budget = Budget::start_tree(
         Limits {

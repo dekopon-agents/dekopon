@@ -17,6 +17,7 @@ include = ["src/**", "tests/**", "Cargo.toml"]
 clap.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
+dekopon-process.workspace = true
 dekopon-tui.workspace = true
 dekopon-telemetry = { workspace = true, features = ["exporter"] }
 opentelemetry_sdk.workspace = true

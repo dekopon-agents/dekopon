@@ -655,25 +655,29 @@ async fn telemetry_section_is_optional_and_strict() {
     let mut enabled = base.clone();
     enabled["telemetry"] = json!({
         "endpoint": "http://rpi.localdomain",
-        "transport": "grpc",
         "serviceName": "dekopon-brokerd",
         "exportTimeoutMs": 5000
     });
     write(&enabled);
     let resolved = config::load(&path, uid)
         .await
-        .expect("config with telemetry loads");
+        .expect("config with telemetry and the default transport loads");
     let settings = resolved.telemetry.expect("telemetry resolved");
-    assert_eq!(
-        settings.settings.transport(),
-        dekopon_telemetry::Transport::Grpc
-    );
     assert_eq!(
         settings.settings.timeout(),
         std::time::Duration::from_millis(5_000)
     );
+    let mut grpc = enabled.clone();
+    grpc["telemetry"]["transport"] = json!("grpc");
+    write(&grpc);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::Telemetry {
+            source: dekopon_telemetry::TelemetryError::GrpcTransport
+        })
+    ));
     for broken in [
-        json!({"endpoint": "http://rpi.localdomain", "transport": "grpc"}),
+        json!({"endpoint": "http://rpi.localdomain", "transport": "http"}),
         json!({
             "endpoint": "http://rpi.localdomain",
             "transport": "thrift",
@@ -694,7 +698,7 @@ async fn telemetry_section_is_optional_and_strict() {
         }),
         json!({
             "endpoint": "http://rpi.localdomain",
-            "transport": "grpc",
+            "transport": "http",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000,
             "telemetryPayloads": false

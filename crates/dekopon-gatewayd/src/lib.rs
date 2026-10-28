@@ -47,6 +47,7 @@ use std::{
 
 use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
+use dekopon_process::ShellThreads;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet};
 
@@ -89,6 +90,8 @@ pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,
 
 const INBOUND_BUFFER: usize = 64;
 const ONE_SHOT_ASSET_IDLE: Duration = Duration::from_secs(60 * 60);
+
+const SHELL_THREADS: u32 = 32;
 
 #[must_use]
 pub fn current_uid() -> u32 {
@@ -212,6 +215,13 @@ where
         capability.count = capabilities.len(),
         "gateway.broker.ready"
     );
+    let (journal, boot) = match open_journal(config.journal.clone(), &config.memory).await? {
+        Some((journal, boot)) => (Some(journal), Some(boot)),
+        None => (None, None),
+    };
+    let follow =
+        load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?;
+    generation.set_follow(follow.clone());
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
@@ -227,10 +237,6 @@ where
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
-    let (journal, boot) = match open_journal(config.journal.clone(), &config.memory).await? {
-        Some((journal, boot)) => (Some(journal), Some(boot)),
-        None => (None, None),
-    };
     let journal_dir = config.journal.as_ref().map(|journal| journal.dir.clone());
     let cache_keys = tokio::task::spawn_blocking(move || match journal_dir {
         Some(dir) => cache_key::CacheKeySecret::load_or_create(&dir),
@@ -308,7 +314,7 @@ where
             config.sessions.max_conversations,
             cache_keys,
         ),
-        follow: load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?,
+        follow,
         journal,
         assets: Arc::clone(&assets),
         asset_fetchers,
@@ -316,6 +322,7 @@ where
         wakes,
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
+        shell_threads: ShellThreads::new(SHELL_THREADS, tokio::runtime::Handle::current()),
     });
     let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
     if let Some((sender, dispatcher)) = engine {
@@ -480,7 +487,7 @@ async fn load_follow_table(
     journal: &Option<Arc<journal::Journal>>,
     enabled: bool,
 ) -> Result<Option<Arc<follow::FollowTable>>, GatewaydError> {
-    if !enabled {
+    if !enabled && journal.is_none() {
         return Ok(None);
     }
     let journal = Arc::clone(journal.as_ref().ok_or(GatewaydError::Journal {
@@ -884,13 +891,16 @@ fn spawn_tick(
         );
         return;
     };
-    let limits = routes
-        .route_for_anchor(tick.anchor())
-        .map(|route| dekopon_process::Limits {
-            max_capability_calls: route.limits.max_capability_calls,
-            timeout: route.script_timeout,
-            ..dekopon_process::Limits::default()
-        });
+    let shell = routes.route_for_anchor(tick.anchor()).map(|route| {
+        dekopon_shell::Interpreter::new(
+            dekopon_process::Limits {
+                max_capability_calls: route.limits.max_capability_calls,
+                timeout: route.script_timeout,
+                ..dekopon_process::Limits::default()
+            },
+            runner.shell_threads.clone(),
+        )
+    });
     let job_limits = routes.route_for_anchor(tick.anchor()).and_then(|route| {
         route.job_timeout.map(|timeout| dekopon_process::Limits {
             max_capability_calls: route.limits.max_capability_calls,
@@ -908,7 +918,7 @@ fn spawn_tick(
             &store,
             &broker,
             &runtime,
-            limits,
+            shell,
             job_limits.map(|limits| (jobs, limits)),
         )
     });
@@ -1191,15 +1201,18 @@ fn build_transport(
             experience,
             endpoint,
             ..
-        } => Box::new(SlackTransport::new(
-            name.clone(),
-            endpoint
-                .clone()
-                .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
-            transport::read_credential(app_token_env)?,
-            transport::read_credential(bot_token_env)?,
-            *experience,
-        )?),
+        } => Box::new(
+            SlackTransport::new(
+                name.clone(),
+                endpoint
+                    .clone()
+                    .unwrap_or_else(|| config::SLACK_ENDPOINT.to_owned()),
+                transport::read_credential(app_token_env)?,
+                transport::read_credential(bot_token_env)?,
+                *experience,
+            )?
+            .with_generation(generation.clone()),
+        ),
         TransportConfig::DiscordGateway {
             name,
             bot_token_env,

@@ -28,6 +28,7 @@ use std::{
 use clap::Parser;
 use dekopon_config::load_discovered;
 use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_process::ShellThreads;
 use dekopon_tui::OperatorProfile;
 use dekopon_tui::{
     App, ConsoleOptions, ModelChoice,
@@ -187,6 +188,8 @@ enum ConsoleError {
     StructuredAgent,
 }
 
+const SHELL_THREADS: u32 = 16;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match if cli.idle { idle() } else { run_console(&cli) } {
@@ -297,7 +300,11 @@ fn execute(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<(), ConsoleEr
         cli.model.as_deref(),
         initial.and_then(|p| p.model.as_deref()),
     );
-    let mut options = ConsoleOptions::new(subject.clone(), model);
+    let mut options = ConsoleOptions::new(
+        subject.clone(),
+        model,
+        ShellThreads::new(SHELL_THREADS, runtime.handle().clone()),
+    );
     options.model_source = model_source;
     options.scope = cli
         .smoke_conversation
@@ -512,6 +519,10 @@ fn read_profiles(path: &Path) -> Result<ProfilesDocument, ConsoleError> {
     Ok(document)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: idle, which drops it when a signal arrives; bound: one current-thread runtime with no workers"
+)]
 fn idle() -> Result<(), ConsoleError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -527,6 +538,10 @@ fn idle() -> Result<(), ConsoleError> {
 }
 
 /// Exporters are created and drained while their runtime is alive, including startup refusals.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: run_console, which shuts it down with a timeout; bound: the console's one runtime, one worker per core"
+)]
 fn run_console(cli: &Cli) -> Result<(), ConsoleError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

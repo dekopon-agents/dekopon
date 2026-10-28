@@ -158,7 +158,8 @@ fn the_empty_local_leg_claims_nothing() {
             sink(),
             &dekopon_process::TreeContext::new(
                 dekopon_process::Limits::default(),
-                dekopon_process::CallBudget::new(4)
+                dekopon_process::CallBudget::new(4),
+                dekopon_test_support::shell_threads()
             )
         ),
         dekopon_shell::CapabilityCallResult::NotFound
@@ -172,7 +173,8 @@ fn the_empty_local_leg_claims_nothing() {
             sink(),
             &dekopon_process::TreeContext::new(
                 dekopon_process::Limits::default(),
-                dekopon_process::CallBudget::new(4)
+                dekopon_process::CallBudget::new(4),
+                dekopon_test_support::shell_threads()
             )
         ),
         dekopon_shell::CapabilityCallResult::Denied { .. }
@@ -228,6 +230,7 @@ async fn a_stopped_broker_is_refused_by_the_exact_path_that_was_tried() {
             .parse()
             .expect("valid subject fixture"),
         "test-model".to_owned(),
+        dekopon_test_support::shell_threads(),
     );
     options.socket = Some(absent.clone());
 

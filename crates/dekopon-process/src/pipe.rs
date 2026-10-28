@@ -257,7 +257,11 @@ mod tests {
 
     #[test]
     fn a_line_read_leaves_the_rest_of_the_chunk_for_the_next_reader() {
-        let budget = TreeContext::new(Limits::default(), CallBudget::new(32));
+        let budget = TreeContext::new(
+            Limits::default(),
+            CallBudget::new(32),
+            crate::tests::threads(),
+        );
         let (mut writer, mut reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         assert_eq!(writer.write(b"a\nbc"), WriteOutcome::Accepted);
         drop(writer);
@@ -283,6 +287,7 @@ mod tests {
                 ..Limits::default()
             },
             CallBudget::new(32),
+            crate::tests::threads(),
         );
         let (mut writer, mut reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         assert_eq!(writer.write(b"1234567890123456"), WriteOutcome::Accepted);
@@ -302,6 +307,7 @@ mod tests {
                 ..Limits::default()
             },
             CallBudget::new(32),
+            crate::tests::threads(),
         );
         let (_writer, mut reader) = pipe((), (), |_, _| {}, |_, _, _| {});
         assert!(matches!(

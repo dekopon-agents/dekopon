@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "tests spawn, join and build runtimes freely; production sites carry their own expectation"
+)]
 mod audit_stdout;
 mod examples;
 mod ipc_process;

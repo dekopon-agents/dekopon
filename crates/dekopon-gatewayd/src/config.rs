@@ -1030,6 +1030,7 @@ const fn default_reply_on_busy() -> bool {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TelemetryConfig {
     pub endpoint: String,
+    #[serde(default)]
     pub transport: Transport,
     pub service_name: String,
     pub export_timeout_ms: u64,
@@ -2491,7 +2492,7 @@ fn resolve_with_service(
                 problems.push(ConfigProblem::FollowWithoutJournal { route: index });
             }
             let supported = transports.iter().any(|transport| {
-                matches!(transport, TransportConfig::DiscordGateway { name, message_content: true, .. } if name == &route.transport)
+                matches!(transport, TransportConfig::DiscordGateway { name, message_content: true, .. } | TransportConfig::SlackSocketMode { name, .. } if name == &route.transport)
             });
             if !supported
                 || !matches!(&conversation.kind, ConversationKindMatch::Kinds(kinds) if !kinds.is_empty() && kinds.iter().all(|kind| matches!(kind, ConversationKind::Channel | ConversationKind::Thread)))
@@ -3331,7 +3332,7 @@ pub enum ConfigProblem {
     #[error("routes[{route}]: follow needs sessions.journal")]
     FollowWithoutJournal { route: usize },
     #[error(
-        "routes[{route}]: follow requires a Discord channel/thread route with messageContent enabled"
+        "routes[{route}]: follow requires a Slack channel/thread route or a Discord channel/thread route with messageContent enabled"
     )]
     UnsupportedFollowRoute { route: usize },
     #[error(
@@ -4093,6 +4094,37 @@ routes:
                 ))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn slack_follow_loads_only_for_durable_channel_and_thread_routes() {
+        let journal = "sessions:\n  journal: { path: journal }\n  assets: { path: assets }\n";
+        let slack = "transports:\n  - name: chat\n    kind: slackSocketMode\n    appTokenEnv: APP\n    botTokenEnv: BOT\n";
+        let route = "routes:\n  - transport: chat\n    conversation: { kind: [channel, thread] }\n    agent: reviewer\n    follow: true\n";
+        assert!(
+            resolved(&format!("{journal}{slack}{route}"))
+                .unwrap()
+                .routes[0]
+                .follow
+        );
+        let error = resolved(&format!(
+            "{slack}{}",
+            route.replace("channel, thread", "directMessage")
+        ))
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid { problems, .. }
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::FollowWithoutJournal { route: 0 }))
+            && problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedFollowRoute { route: 0 }))));
+        let local = "transports:\n  - name: chat\n    kind: local\n    socketPath: dev.sock\n";
+        assert!(
+            matches!(resolved(&format!("{journal}{local}{route}")), Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedFollowRoute { route: 0 })))
+        );
+        let discord = "transports:\n  - name: chat\n    kind: discordGateway\n    botTokenEnv: BOT\n    messageContent: false\n";
+        assert!(
+            matches!(resolved(&format!("{journal}{discord}{route}")), Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedFollowRoute { route: 0 })))
         );
     }
 

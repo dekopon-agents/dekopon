@@ -124,7 +124,8 @@ fn a_capability_shaped_word_exits_127_with_the_ordinary_not_found_message() {
         ("wikipedia_page --title x", "wikipedia_page"),
         ("cli-probe.upper --text x", "cli-probe.upper"),
     ] {
-        let outcome = Interpreter::new(Limits::default()).run(script, &session);
+        let outcome =
+            Interpreter::new(Limits::default(), crate::test_threads()).run(script, &session);
         assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{script}");
         assert_eq!(
             outcome.output,

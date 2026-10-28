@@ -351,7 +351,11 @@ mod tests {
         };
         let socket = fixture.dir.path().join("broker.sock");
         let subject = "slack.t0123abc.u9xyz".parse().unwrap();
-        let mut options = ConsoleOptions::new(subject, "unused".into());
+        let mut options = ConsoleOptions::new(
+            subject,
+            "unused".into(),
+            dekopon_test_support::shell_threads(),
+        );
         options.initial_agent = Some("reviewer".parse().unwrap());
         let agent = Agent {
             api_version: ApiVersion::V1Alpha1,
@@ -423,7 +427,11 @@ mod tests {
             };
             let socket = fixture.dir.path().join("broker.sock");
             let subject = "slack.t0123abc.u9xyz".parse().unwrap();
-            let mut options = ConsoleOptions::new(subject, "unused".into());
+            let mut options = ConsoleOptions::new(
+                subject,
+                "unused".into(),
+                dekopon_test_support::shell_threads(),
+            );
             options.initial_agent = Some("reviewer".parse().unwrap());
             let agent = Agent {
                 api_version: ApiVersion::V1Alpha1,

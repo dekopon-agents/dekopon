@@ -7,6 +7,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.63.0] - 2026-10-27
+
+### Changed
+
+- OTLP export uses HTTP (protobuf) only; `telemetry.transport: grpc` is refused at config load, and `http` is now the default everywhere, including the console.
+- dekopon-provider-sdk-testkit `signed_download` takes ordered API responses with exactly one redirect, so buffered metadata requests can precede a signed download in one invocation
+
+## [dekopon-chart-0.50.0] - 2026-10-27
+
+### Changed
+
+- Chart 0.50.0 targets core v0.63.0 and renders the `v0.63.0` image tag.
+
 ## [0.62.0] - 2026-10-27
 
 ### Added

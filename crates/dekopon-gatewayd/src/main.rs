@@ -98,6 +98,10 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "owner: bounded_runtime, which shuts it down within exit_timeout; bound: the daemon's one runtime, one worker per core"
+)]
 fn bounded_runtime<T>(
     exit_timeout: Duration,
     body: impl Future<Output = T>,
@@ -213,12 +217,14 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         }
     };
 
-    if let Err(error) = telemetry.shutdown() {
-        tracing::error!(
+    match tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
             event = "gateway_telemetry_shutdown_failed",
             error = %error,
             "gateway.telemetry.shutdown.failed"
-        );
+        ),
+        Err(error) => eprintln!("dekopon-gatewayd: telemetry flush failed: {error}"),
     }
     code
 }

@@ -350,6 +350,7 @@ pub(crate) fn fatal_exit_code(fatal: &FatalError) -> ExitCode {
         | FatalError::Limit(LimitExceeded::RecursionDepth { .. })
         | FatalError::Limit(LimitExceeded::CapabilityCalls { .. })
         | FatalError::Limit(LimitExceeded::ValueBytes { .. })
+        | FatalError::Limit(LimitExceeded::ShellThreads { .. })
         | FatalError::Unsupported(_) => ExitCode::SYNTAX,
         FatalError::Assertion(_) => ExitCode::FAILURE,
     }
@@ -362,7 +363,8 @@ pub(crate) fn fatal_outcome(fatal: &FatalError) -> &'static str {
         FatalError::Limit(LimitExceeded::Steps { .. })
         | FatalError::Limit(LimitExceeded::RecursionDepth { .. })
         | FatalError::Limit(LimitExceeded::CapabilityCalls { .. })
-        | FatalError::Limit(LimitExceeded::ValueBytes { .. }) => "limit-exceeded",
+        | FatalError::Limit(LimitExceeded::ValueBytes { .. })
+        | FatalError::Limit(LimitExceeded::ShellThreads { .. }) => "limit-exceeded",
         FatalError::Unsupported(_) => "rejected",
         FatalError::Assertion(_) => "assertion-failed",
     }

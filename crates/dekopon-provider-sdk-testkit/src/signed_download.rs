@@ -16,20 +16,31 @@ use crate::{
 pub(crate) struct Scenario {
     pub origin: String,
     pub transport: Transport,
-    api: HttpScript,
+    hostname: String,
+    api: Vec<HttpScript>,
     storage: HttpScript,
     maximum: u32,
 }
 
 impl Scenario {
-    pub fn new(api: HttpScript, storage: HttpScript, maximum: u32) -> Self {
+    pub fn new(api: Vec<HttpScript>, storage: HttpScript, maximum: u32) -> Self {
+        let hostname = api
+            .first()
+            .map(|step| step.hostname.clone())
+            .unwrap_or_default();
         let transport = Transport::new(
-            (api.hostname.clone(), native_response(&api.response)),
+            (
+                hostname.clone(),
+                api.iter()
+                    .map(|step| native_response(&step.response))
+                    .collect(),
+            ),
             (storage.hostname.clone(), native_response(&storage.response)),
             maximum,
         );
         Self {
-            origin: format!("https://{}", api.hostname),
+            origin: format!("https://{hostname}"),
+            hostname,
             api,
             storage,
             maximum,
@@ -42,7 +53,7 @@ impl Scenario {
     }
 
     pub fn validate(&self) -> Result<(), HarnessError> {
-        for script in [&self.api, &self.storage] {
+        for script in self.api.iter().chain([&self.storage]) {
             crate::typed::validate_response(&script.response)?;
             if script.method != "GET" || script.response.body.len() > HTTP_BYTES {
                 return Err(HarnessError::Fixture(
@@ -50,9 +61,17 @@ impl Scenario {
                 ));
             }
         }
-        if self.api.response.status != 302 || self.api.hostname == self.storage.hostname {
+        if self.api.iter().any(|step| step.hostname != self.hostname)
+            || self
+                .api
+                .iter()
+                .filter(|step| step.response.status == 302)
+                .count()
+                != 1
+            || self.hostname == self.storage.hostname
+        {
             return Err(HarnessError::Fixture(
-                "signed script requires an API redirect to a separate host",
+                "signed script requires one API host with exactly one redirect to a separate host",
             ));
         }
         Ok(())
@@ -60,7 +79,7 @@ impl Scenario {
 
     pub fn constraints(&self, templates: Vec<RequestTemplate>) -> HttpConstraints {
         HttpConstraints {
-            allowed_hosts: vec![self.api.hostname.clone()],
+            allowed_hosts: vec![self.hostname.clone()],
             allowed_methods: vec!["GET".to_owned()],
             max_requests: self.maximum,
             max_request_bytes: HTTP_BYTES as u64,
@@ -76,7 +95,7 @@ impl Scenario {
         BoundCredential::bearer(
             "Bearer",
             Redacted::new("testkit-synthetic-credential".to_owned()),
-            vec![self.api.hostname.clone()],
+            vec![self.hostname.clone()],
         )
         .map_err(|_error| HarnessError::Fixture("invalid synthetic credential binding"))
     }
@@ -108,6 +127,66 @@ fn native_response(
             })
             .collect(),
         body: response.body.clone(),
+    }
+}
+
+pub(crate) fn host_request(
+    request: dekopon_provider_sdk::provider::Request,
+) -> dekopon_http_host::Request {
+    dekopon_http_host::Request {
+        method: request.method,
+        uri: request.uri,
+        headers: request
+            .headers
+            .into_iter()
+            .map(|header| dekopon_http_host::Header {
+                name: header.name,
+                value: header.value,
+            })
+            .collect(),
+        body: request.body,
+    }
+}
+
+pub(crate) fn guest_response(
+    response: dekopon_http_host::Response,
+) -> dekopon_provider_sdk::provider::Response {
+    dekopon_provider_sdk::provider::Response {
+        status: response.status,
+        headers: response
+            .headers
+            .into_iter()
+            .map(|header| dekopon_provider_sdk::provider::Header {
+                name: header.name,
+                value: header.value,
+            })
+            .collect(),
+        body: response.body,
+    }
+}
+
+pub(crate) fn http_error(
+    error: dekopon_http_host::HttpError,
+) -> dekopon_provider_sdk::provider::HttpError {
+    use dekopon_http_host::ErrorCode as E;
+    use dekopon_provider_sdk::provider::HttpErrorCode as G;
+    dekopon_provider_sdk::provider::HttpError {
+        code: match error.code {
+            E::InvalidMethod => G::InvalidMethod,
+            E::InvalidUri => G::InvalidUri,
+            E::InvalidHeader => G::InvalidHeader,
+            E::RequestTooLarge => G::RequestTooLarge,
+            E::Denied => G::Denied,
+            E::HostCallLimit => G::HostCallLimit,
+            E::Dns => G::Dns,
+            E::Connect => G::Connect,
+            E::Tls => G::Tls,
+            E::Timeout => G::Timeout,
+            E::Protocol => G::Protocol,
+            E::ResponseTooLarge => G::ResponseTooLarge,
+            E::Internal => G::Internal,
+        },
+        message: error.message,
     }
 }
 

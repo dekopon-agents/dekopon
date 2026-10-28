@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use dekopon_agent::prompt::{
     AssetSource, ConversationTurn, FetchedAsset, History, PromptLimits, ScriptRuntime,
