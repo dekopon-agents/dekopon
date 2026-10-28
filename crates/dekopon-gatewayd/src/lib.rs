@@ -92,8 +92,6 @@ pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,
 const INBOUND_BUFFER: usize = 64;
 const ONE_SHOT_ASSET_IDLE: Duration = Duration::from_secs(60 * 60);
 
-const SHELL_THREADS: u32 = 32;
-
 #[must_use]
 pub fn current_uid() -> u32 {
     rustix::process::geteuid().as_raw()
@@ -142,7 +140,11 @@ async fn boot_candidate_with_service(
     Ok((candidate, prepared))
 }
 
-pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
+pub async fn run<F>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    shell_threads: u32,
+) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -150,6 +152,7 @@ where
         config_path.as_ref(),
         shutdown,
         &config::InProcess::default(),
+        shell_threads,
     )
     .await
 }
@@ -159,6 +162,7 @@ pub async fn run_fauxlack<F>(
     config_path: impl AsRef<Path>,
     shutdown: F,
     fauxlack: fauxlack::Fauxlack,
+    shell_threads: u32,
 ) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
@@ -169,6 +173,7 @@ where
         &config::InProcess {
             fauxlack: Some(fauxlack),
         },
+        shell_threads,
     )
     .await
 }
@@ -181,6 +186,7 @@ async fn run_with_service<F>(
     config_path: &Path,
     shutdown: F,
     service: &config::InProcess,
+    shell_threads: u32,
 ) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
@@ -323,7 +329,7 @@ where
         wakes,
         jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
         metering: Arc::clone(&metering),
-        shell_threads: ShellThreads::new(SHELL_THREADS, tokio::runtime::Handle::current()),
+        shell_threads: ShellThreads::new(shell_threads, tokio::runtime::Handle::current()),
     });
     let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
     if let Some((sender, dispatcher)) = engine {

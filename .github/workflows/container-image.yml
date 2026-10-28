@@ -40,6 +40,10 @@ name: Container image
 
 on:
   workflow_call:
+    outputs:
+      digest:
+        description: Published multi-platform image digest verified against the registry
+        value: ${{ jobs.image.outputs.digest }}
     inputs:
       tag:
         description: Published release tag to package (for example v0.4.0)
@@ -85,6 +89,8 @@ concurrency:
 
 jobs:
   image:
+    outputs:
+      digest: ${{ steps.published.outputs.digest }}
     name: container image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
