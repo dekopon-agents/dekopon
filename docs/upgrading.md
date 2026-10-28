@@ -8,6 +8,33 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Conversation memory records, summaries and removed memory keys (0.65.0)
+
+One configuration change on gateways that set the removed memory keys; no provider WIT or SDK
+re-pin and no broker wire change. Before upgrading:
+
+- `sessions.memory.arena`, `sessions.memory.agents.<id>.routine` and `.policy`, and
+  `routes[].memory.policy` are removed, and unknown names refuse at load. Delete them and, where
+  a route used a decider, set `selection: {decider: {capability, backend, model,
+  requireProbabilities}}` on the route or agent instead. A 0.64.0 gateway refuses the new
+  `hotTurns`, `summaries`, `capture`, `selection` and `sessions.memory.summaries` keys, so the
+  configuration change and the image roll out, and revert, together; expect the gateway to refuse
+  its configuration between the two.
+- Summaries are on by default on journal-recall routes and use the route's own model after each
+  reply. Their calls are metered with `via = "summary"` but never refused by a budget. Set
+  `summaries: off` to opt out.
+- The journal moves to a new record format. At startup every journal file in an earlier format
+  resets (counted in `gateway_memory_startup`'s `memory.journals.reset`), including files left
+  under the pre-0.58.0 conversation stems, so conversation memory starts empty once and memory
+  `session_id`s change once. Follow markers, seals and the prompt-cache secret are kept.
+- Journal-recall routes default `maxBytes` to 524288 instead of 65536.
+- `agent.model.prompt` is split into records of at most 16 KiB carrying `transcript.segment` and
+  `transcript.segments`; a query that read one prompt per model turn concatenates the segments of
+  a turn in order. `gateway_memory_selection` and `gateway_memory_deviation` are gone; the
+  [memory records](observability.md) replace them.
+- Reverting to 0.64.0 needs the configuration reverted too, and resets the new-format journals
+  the same way. The drop is not revert-safe.
+
 ## Slack routes can follow threads (0.64.0)
 
 No configuration change or provider re-pin is required for existing deployments.

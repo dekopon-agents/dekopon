@@ -61,9 +61,10 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Conversations** — `persistent` is the route default, with per-subject history under
   `privateConversation`; explicit `sharedConversation` shares one exact agent/transport/conversation
   window. `memory: { mode: oneShot }` starts each session without prior history.
-  `sessions.memory` resolves retention/arena bounds and per-agent representation policies;
-  journal-backed routes may override the agent policy with `routes[].memory.policy`. A `decider`
-  selection also names the decision provider's `backend`, `model` and `requireProbabilities`.
+  `sessions.memory` resolves retention bounds, the summary engine's concurrency and queue, and
+  per-agent `hotTurns`, `summaries`, `capture` and `selection`, which a route may override under
+  `routes[].memory`. A `decider` selection names the decision provider's `capability`, `backend`,
+  `model` and `requireProbabilities`.
   Without a journal, persistent routes remain window-only and config-check warns once.
   `githubWebhook` configuration requires `name`, `bind` and `secretEnv` (the name of a nonblank
   environment credential); its path is fixed at `/webhooks/github`. A GitHub route must set

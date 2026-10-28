@@ -137,6 +137,15 @@ pub(crate) enum FollowTicket {
     Absent,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MarkerSeq(u64);
+
+#[derive(Clone, Copy)]
+struct Marked {
+    marker: FollowMarker,
+    seq: MarkerSeq,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum LeaveCause {
     Reaction,
@@ -158,17 +167,91 @@ impl LeaveCause {
 
 pub(crate) struct FollowTable {
     journal: Arc<Journal>,
-    resident: Mutex<HashMap<String, FollowMarker>>,
+    resident: Mutex<HashMap<String, Marked>>,
+    written: Mutex<HashMap<String, MarkerSeq>>,
     writer: Mutex<HashSet<String>>,
     disk: Mutex<()>,
+    next_seq: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     sweeping: AtomicBool,
 }
 
+/// An invite accepted in memory during a turn; its marker is written after delivery, and only
+/// while it is still the key's newest marker.
+#[must_use]
+pub(crate) struct PendingFollow {
+    table: Arc<FollowTable>,
+    key: String,
+    marked: Marked,
+    lapsed: Vec<String>,
+    route: usize,
+}
+
+impl PendingFollow {
+    pub(crate) fn write(self) {
+        let table = &self.table;
+        let _disk = table.disk.lock();
+        for old in &self.lapsed {
+            if table.resident.lock().contains_key(old) {
+                continue;
+            }
+            #[cfg(test)]
+            table.sweeping.store(true, Ordering::Release);
+            let removed = table.journal.remove_follow(old);
+            #[cfg(test)]
+            table.sweeping.store(false, Ordering::Release);
+            if removed.is_ok() {
+                table.written.lock().remove(old);
+            }
+        }
+        let current = table
+            .resident
+            .lock()
+            .get(&self.key)
+            .is_some_and(|marked| marked.seq == self.marked.seq);
+        if !current || table.writer.lock().contains(&self.key) {
+            return;
+        }
+        match table.journal.write_follow(&self.key, self.marked.marker) {
+            Ok(()) => {
+                table
+                    .written
+                    .lock()
+                    .insert(self.key.clone(), self.marked.seq);
+            }
+            Err(error) => {
+                let mut resident = table.resident.lock();
+                if resident
+                    .get(&self.key)
+                    .is_some_and(|marked| marked.seq == self.marked.seq)
+                {
+                    resident.remove(&self.key);
+                }
+                tracing::warn!(
+                    audit.event = "gateway.follow",
+                    operation = "refused",
+                    route = self.route,
+                    reason = error.label(),
+                    "gateway.follow"
+                );
+            }
+        }
+    }
+}
+
 impl FollowTable {
     pub(crate) fn load(journal: Arc<Journal>) -> Result<Self, JournalError> {
+        let mut resident = HashMap::new();
+        let mut written = HashMap::new();
+        for (index, (key, marker)) in journal.load_follow(MAX_TICKETS)?.into_iter().enumerate() {
+            let seq = MarkerSeq(index as u64);
+            resident.insert(key.clone(), Marked { marker, seq });
+            written.insert(key, seq);
+        }
         Ok(Self {
-            resident: Mutex::new(journal.load_follow(MAX_TICKETS)?.into_iter().collect()),
+            next_seq: std::sync::atomic::AtomicU64::new(resident.len() as u64),
+            resident: Mutex::new(resident),
+            written: Mutex::new(written),
             writer: Mutex::new(HashSet::new()),
             disk: Mutex::new(()),
             #[cfg(test)]
@@ -177,47 +260,52 @@ impl FollowTable {
         })
     }
 
-    pub(crate) fn ticket(&self, key: &str, now: SystemTime) -> FollowTicket {
-        match self.resident.lock().get(key) {
-            Some(marker) if millis(now) < marker.until_ms => FollowTicket::Active {
-                until_ms: marker.until_ms,
-            },
-            Some(_) => FollowTicket::Lapsed,
-            None => FollowTicket::Absent,
-        }
-    }
-
-    pub(crate) fn stay(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
-        let _disk = self.disk.lock();
-        if self.writer.lock().contains(key) {
-            return Err(JournalError::Io {
-                kind: io::ErrorKind::PermissionDenied,
-            });
-        }
-        self.persist(key, now)
-    }
-
-    fn persist(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
+    fn mark(&self, now: SystemTime) -> Result<Marked, JournalError> {
         let at_ms = millis(now);
         let until_ms = at_ms
             .checked_add(LAPSE.as_millis() as u64)
             .ok_or(JournalError::Io {
                 kind: io::ErrorKind::InvalidInput,
             })?;
-        let lapsed = self
-            .resident
-            .lock()
+        Ok(Marked {
+            marker: FollowMarker { at_ms, until_ms },
+            seq: MarkerSeq(self.next_seq.fetch_add(1, Ordering::Relaxed)),
+        })
+    }
+
+    pub(crate) fn ticket(&self, key: &str, now: SystemTime) -> FollowTicket {
+        match self.resident.lock().get(key) {
+            Some(marked) if millis(now) < marked.marker.until_ms => FollowTicket::Active {
+                until_ms: marked.marker.until_ms,
+            },
+            Some(_) => FollowTicket::Lapsed,
+            None => FollowTicket::Absent,
+        }
+    }
+
+    /// Never takes `disk`: `refresh` and `leave` hold it across the journal lock, so a `stay`
+    /// that took it could wait behind another conversation's maintenance.
+    pub(crate) fn stay(
+        self: &Arc<Self>,
+        key: &str,
+        now: SystemTime,
+        route: usize,
+    ) -> Result<PendingFollow, JournalError> {
+        let marked = self.mark(now)?;
+        let writer = self.writer.lock();
+        if writer.contains(key) {
+            return Err(JournalError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+            });
+        }
+        let mut resident = self.resident.lock();
+        let lapsed: Vec<String> = resident
             .iter()
-            .filter(|(_, marker)| marker.until_ms <= at_ms)
+            .filter(|(_, marked)| marked.marker.until_ms <= millis(now))
             .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for old in lapsed {
-            #[cfg(test)]
-            self.sweeping.store(true, Ordering::Release);
-            self.journal.remove_follow(&old)?;
-            #[cfg(test)]
-            self.sweeping.store(false, Ordering::Release);
-            if self.resident.lock().remove(&old).is_some() {
+            .collect();
+        for old in &lapsed {
+            if resident.remove(old).is_some() {
                 tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "banished",
@@ -226,28 +314,19 @@ impl FollowTable {
                 );
             }
         }
-        {
-            let writer = self.writer.lock();
-            let resident = self.resident.lock();
-            if !resident.contains_key(key) && resident.len() + writer.len() >= MAX_TICKETS {
-                return Err(JournalError::Io {
-                    kind: io::ErrorKind::OutOfMemory,
-                });
-            }
-        }
-        let marker = FollowMarker { at_ms, until_ms };
-        if let Err(error) = self.journal.write_follow(key, marker) {
-            self.resident.lock().remove(key);
-            return Err(error);
-        }
-        let writer = self.writer.lock();
-        if writer.contains(key) {
+        if !resident.contains_key(key) && resident.len() + writer.len() >= MAX_TICKETS {
             return Err(JournalError::Io {
-                kind: io::ErrorKind::PermissionDenied,
+                kind: io::ErrorKind::OutOfMemory,
             });
         }
-        self.resident.lock().insert(key.to_owned(), marker);
-        Ok(())
+        resident.insert(key.to_owned(), marked);
+        Ok(PendingFollow {
+            table: Arc::clone(self),
+            key: key.to_owned(),
+            marked,
+            lapsed,
+            route,
+        })
     }
 
     pub(crate) fn refresh(&self, key: &str, now: SystemTime) -> Result<(), JournalError> {
@@ -259,13 +338,36 @@ impl FollowTable {
                 kind: io::ErrorKind::NotFound,
             });
         }
-        self.persist(key, now)
+        let marked = self.mark(now)?;
+        match self.journal.write_follow(key, marked.marker) {
+            Ok(()) => {
+                if self.writer.lock().contains(key) {
+                    return Err(JournalError::Io {
+                        kind: io::ErrorKind::PermissionDenied,
+                    });
+                }
+                self.resident.lock().insert(key.to_owned(), marked);
+                self.written.lock().insert(key.to_owned(), marked.seq);
+                Ok(())
+            }
+            Err(error) => {
+                let last = self.written.lock().get(key).copied();
+                let mut resident = self.resident.lock();
+                if last
+                    .is_some_and(|last| resident.get(key).is_some_and(|marked| marked.seq == last))
+                {
+                    resident.remove(key);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn leave(&self, key: &str) -> Result<(), JournalError> {
         self.suspend(key);
         let _disk = self.disk.lock();
         self.journal.remove_follow(key)?;
+        self.written.lock().remove(key);
         let mut writer = self.writer.lock();
         writer.remove(key);
         self.resident.lock().remove(key);
@@ -336,10 +438,13 @@ pub(crate) fn follow_key(
         .collect()
 }
 
+pub(crate) type PendingFollows = Arc<Mutex<Vec<PendingFollow>>>;
+
 pub(crate) struct FollowInvoker<I> {
     inner: I,
     ticket: Option<(Arc<FollowTable>, String, usize)>,
     leave: Arc<AtomicBool>,
+    pending: PendingFollows,
 }
 
 impl<I> FollowInvoker<I> {
@@ -348,11 +453,16 @@ impl<I> FollowInvoker<I> {
             inner,
             ticket,
             leave: Arc::new(AtomicBool::new(false)),
+            pending: PendingFollows::default(),
         }
     }
 
     pub(crate) fn leave_request(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.leave)
+    }
+
+    pub(crate) fn pending_follows(&self) -> PendingFollows {
+        Arc::clone(&self.pending)
     }
 }
 
@@ -478,8 +588,9 @@ impl<I: CapabilityInvoker> FollowInvoker<I> {
             )
             && let Some((table, key, route)) = &self.ticket
         {
-            match table.stay(key, SystemTime::now()) {
-                Ok(()) => {
+            match table.stay(key, SystemTime::now(), *route) {
+                Ok(pending) => {
+                    self.pending.lock().push(pending);
                     tracing::info!(
                         audit.event = "gateway.follow",
                         operation = "invited",
@@ -510,6 +621,15 @@ impl<I: CapabilityInvoker> FollowInvoker<I> {
 impl FollowTable {
     pub(crate) fn sweeping_for_test(&self) -> bool {
         self.sweeping.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stay_and_write(
+        self: &Arc<Self>,
+        key: &str,
+        now: SystemTime,
+    ) -> Result<(), JournalError> {
+        self.stay(key, now, 0)?.write();
+        Ok(())
     }
 
     pub(crate) fn writing_for_test(&self) -> bool {
@@ -848,6 +968,9 @@ mod tests {
         assert_eq!(events[0].field("route"), Some("0"));
         assert!(events[0].field("subject").is_none());
         assert!(events[0].field("conversation").is_none());
+        for pending in std::mem::take(&mut *success.pending_follows().lock()) {
+            pending.write();
+        }
         assert!(matches!(
             FollowTable::load(journal)
                 .unwrap()
@@ -869,7 +992,7 @@ mod tests {
         );
         let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let key = "c".repeat(64);
-        table.stay(&key, SystemTime::now()).unwrap();
+        table.stay_and_write(&key, SystemTime::now()).unwrap();
         let (locked, ready) = tokio::sync::oneshot::channel();
         let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
         let held = Arc::clone(&journal);
@@ -929,20 +1052,20 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let now = SystemTime::now();
         let key = "c".repeat(64);
-        table.stay(&key, now).unwrap();
+        table.stay_and_write(&key, now).unwrap();
         table.suspend(&key);
         assert_eq!(table.ticket(&key, now), FollowTicket::Absent);
         assert!(matches!(
-            table.stay(&key, now),
+            table.stay_and_write(&key, now),
             Err(JournalError::Io {
                 kind: io::ErrorKind::PermissionDenied
             })
         ));
         table.leave(&key).unwrap();
-        assert!(table.stay(&key, now).is_ok());
+        assert!(table.stay_and_write(&key, now).is_ok());
     }
 
     #[test]
@@ -956,10 +1079,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let key = "d".repeat(64);
         let now = SystemTime::now();
-        table.stay(&key, now).unwrap();
+        table.stay_and_write(&key, now).unwrap();
         std::fs::remove_file(dir.path().join(format!("{key}.followed"))).unwrap();
         std::fs::create_dir(dir.path().join(format!("{key}.followed"))).unwrap();
         assert!(matches!(
@@ -983,8 +1106,8 @@ mod tests {
         let table = Arc::new(FollowTable::load(journal).unwrap());
         let key = "a".repeat(64);
         let other = "b".repeat(64);
-        table.stay(&key, SystemTime::now()).unwrap();
-        table.stay(&other, SystemTime::now()).unwrap();
+        table.stay_and_write(&key, SystemTime::now()).unwrap();
+        table.stay_and_write(&other, SystemTime::now()).unwrap();
         let success = FollowInvoker::new(
             ResultLeg(CapabilityCallResult::Succeeded),
             Some((Arc::clone(&table), key.clone(), 0)),
@@ -1036,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_marker_write_never_activates_a_ticket() {
+    fn a_failed_follow_write_leaves_the_ticket_absent() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1053,11 +1176,20 @@ mod tests {
             ResultLeg(CapabilityCallResult::Succeeded),
             Some((Arc::clone(&table), key.clone(), 0)),
         );
+        let (capture, _guard) = crate::tests::capture_spans();
         assert!(matches!(
             call(&success, "dekopon-provider-follow.stay", json!({})),
-            CapabilityCallResult::Failed { .. }
+            CapabilityCallResult::Succeeded
         ));
+        for pending in std::mem::take(&mut *success.pending_follows().lock()) {
+            pending.write();
+        }
         assert_eq!(table.ticket(&key, SystemTime::now()), FollowTicket::Absent);
+        let refused = capture.events_where(
+            "dekopon_gatewayd",
+            &[("audit.event", "gateway.follow"), ("operation", "refused")],
+        );
+        assert_eq!(refused.len(), 1);
     }
 
     #[test]
@@ -1146,8 +1278,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn elapsed_resident_tickets_release_capacity_for_a_new_invitation() {
+    fn follow_table() -> (tempfile::TempDir, Arc<Journal>, Arc<FollowTable>) {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(
             Journal::open(
@@ -1157,34 +1288,173 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(Arc::clone(&journal)).unwrap();
+        let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
+        (dir, journal, table)
+    }
+
+    fn lapse(table: &FollowTable, dir: &std::path::Path, key: &str, now: SystemTime) {
+        let marker = FollowMarker {
+            at_ms: millis(now) - 2,
+            until_ms: millis(now) - 1,
+        };
+        std::fs::write(
+            dir.join(format!("{key}.followed")),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let seq = MarkerSeq(table.next_seq.fetch_add(1, Ordering::Relaxed));
+        table
+            .resident
+            .lock()
+            .insert(key.to_owned(), Marked { marker, seq });
+        table.written.lock().insert(key.to_owned(), seq);
+    }
+
+    fn reloaded(journal: &Arc<Journal>, key: &str, now: SystemTime) -> FollowTicket {
+        FollowTable::load(Arc::clone(journal))
+            .unwrap()
+            .ticket(key, now)
+    }
+
+    #[test]
+    fn lapsed_tickets_never_block_a_new_invite() {
+        let (dir, journal, table) = follow_table();
         let now = SystemTime::now();
-        for index in 0..MAX_TICKETS {
-            table.resident.lock().insert(
-                format!("{index:064x}"),
-                FollowMarker {
-                    at_ms: millis(now) - 2,
-                    until_ms: millis(now) - 1,
-                },
-            );
+        let lapsed: Vec<String> = (0..MAX_TICKETS)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        for key in &lapsed {
+            lapse(&table, dir.path(), key, now);
         }
-        let first = format!("{:064x}", 0);
-        journal
-            .write_follow(
-                &first,
-                FollowMarker {
-                    at_ms: millis(now) - 2,
-                    until_ms: millis(now) - 1,
-                },
-            )
-            .unwrap();
         let fresh = "f".repeat(64);
-        table.stay(&fresh, now).unwrap();
+        let pending = table.stay(&fresh, now, 0).unwrap();
         assert!(matches!(
             table.ticket(&fresh, now),
             FollowTicket::Active { .. }
         ));
-        assert!(!dir.path().join(format!("{first}.followed")).exists());
+        assert!(dir.path().join(format!("{}.followed", lapsed[0])).exists());
+        assert!(!dir.path().join(format!("{fresh}.followed")).exists());
+        pending.write();
+        for key in &lapsed {
+            assert!(!dir.path().join(format!("{key}.followed")).exists());
+        }
+        assert!(matches!(
+            reloaded(&journal, &fresh, now),
+            FollowTicket::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn a_lapsed_unlink_never_drops_a_rewritten_marker() {
+        let (dir, journal, table) = follow_table();
+        let now = SystemTime::now();
+        let key = "a".repeat(64);
+        lapse(&table, dir.path(), &key, now);
+        let first = table.stay(&"b".repeat(64), now, 0).unwrap();
+        let second = table.stay(&key, now, 1).unwrap();
+        second.write();
+        first.write();
+        assert!(matches!(
+            reloaded(&journal, &key, now),
+            FollowTicket::Active { .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_refresh_never_drops_a_new_invite() {
+        for held in [true, false] {
+            let (dir, journal, table) = follow_table();
+            let now = SystemTime::now();
+            let key = "c".repeat(64);
+            table.stay_and_write(&key, now).unwrap();
+            let marker = dir.path().join(format!("{key}.followed"));
+            std::fs::remove_file(&marker).unwrap();
+            std::fs::create_dir(&marker).unwrap();
+            let pending = if held {
+                std::thread::scope(|scope| {
+                    let (locked, ready) = std::sync::mpsc::sync_channel(1);
+                    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+                    let held = &journal;
+                    let holder = scope.spawn(move || {
+                        let _lock = held.hold_io_for_test();
+                        locked.send(()).unwrap();
+                        unblock.recv_timeout(Duration::from_secs(8)).unwrap();
+                    });
+                    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let refresh = scope.spawn(|| table.refresh(&key, now));
+                    while !table.writing_for_test() {
+                        std::thread::yield_now();
+                    }
+                    let pending = table.stay(&key, now, 1).unwrap();
+                    release.send(()).unwrap();
+                    holder.join().unwrap();
+                    assert!(matches!(
+                        refresh.join().unwrap(),
+                        Err(JournalError::Io { .. })
+                    ));
+                    pending
+                })
+            } else {
+                let pending = table.stay(&key, now, 1).unwrap();
+                assert!(matches!(
+                    table.refresh(&key, now),
+                    Err(JournalError::Io { .. })
+                ));
+                pending
+            };
+            assert!(matches!(
+                table.ticket(&key, now),
+                FollowTicket::Active { .. }
+            ));
+            std::fs::remove_dir(&marker).unwrap();
+            pending.write();
+            assert!(matches!(
+                reloaded(&journal, &key, now),
+                FollowTicket::Active { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn stay_never_waits_on_disk() {
+        let (dir, journal, table) = follow_table();
+        let now = SystemTime::now();
+        let other = "d".repeat(64);
+        let key = "e".repeat(64);
+        table.stay_and_write(&other, now).unwrap();
+        let pending = std::thread::scope(|scope| {
+            let (locked, ready) = std::sync::mpsc::sync_channel(1);
+            let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+            let held = &journal;
+            let holder = scope.spawn(move || {
+                let _lock = held.hold_io_for_test();
+                locked.send(()).unwrap();
+                unblock.recv_timeout(Duration::from_secs(8)).unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let refresh = scope.spawn(|| table.refresh(&other, now));
+            while !table.writing_for_test() {
+                std::thread::yield_now();
+            }
+            let (sent, stayed) = std::sync::mpsc::sync_channel(1);
+            let (staying, staying_key) = (&table, &key);
+            let staying =
+                scope.spawn(move || sent.send(staying.stay(staying_key, now, 0)).unwrap());
+            let pending = stayed.recv_timeout(Duration::from_secs(2));
+            assert!(table.writing_for_test());
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            staying.join().unwrap();
+            refresh.join().unwrap().unwrap();
+            pending.expect("stay never waits on disk").unwrap()
+        });
+        assert!(!dir.path().join(format!("{key}.followed")).exists());
+        pending.write();
+        assert!(dir.path().join(format!("{key}.followed")).exists());
+        assert!(matches!(
+            reloaded(&journal, &key, now),
+            FollowTicket::Active { .. }
+        ));
     }
 
     #[test]
@@ -1201,7 +1471,7 @@ mod tests {
         let key = "b".repeat(64);
         std::fs::write(dir.path().join(format!("{key}.followed")), b"{broken").unwrap();
         let (capture, _guard) = crate::tests::capture_spans();
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let events = capture.events_where("dekopon_gatewayd", &[("event", "gateway_follow")]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].field("reason"), Some("corrupt"));
@@ -1257,7 +1527,8 @@ mod tests {
                 .unwrap();
         }
         let (capture, _guard) = crate::tests::capture_spans();
-        let table = FollowTable::load(journal).expect("valid overflow must not refuse boot");
+        let table =
+            Arc::new(FollowTable::load(journal).expect("valid overflow must not refuse boot"));
         assert_eq!(table.resident.lock().len(), MAX_TICKETS);
         let earliest = format!("{:064x}", MAX_TICKETS / 2);
         let latest = format!("{:064x}", MAX_TICKETS);
@@ -1294,19 +1565,22 @@ mod tests {
             Err(JournalError::Io { .. })
         ));
         std::fs::remove_dir(dir.path().join(format!("{key}.followed"))).unwrap();
-        let table = FollowTable::load(journal).unwrap();
+        let table = Arc::new(FollowTable::load(journal).unwrap());
         let at = SystemTime::now();
         for index in 0..MAX_TICKETS {
             table.resident.lock().insert(
                 format!("{index:064x}"),
-                FollowMarker {
-                    at_ms: millis(at),
-                    until_ms: millis(at) + 86_400_000,
+                Marked {
+                    marker: FollowMarker {
+                        at_ms: millis(at),
+                        until_ms: millis(at) + 86_400_000,
+                    },
+                    seq: MarkerSeq(u64::MAX - index as u64),
                 },
             );
         }
         assert!(matches!(
-            table.stay(&key, at),
+            table.stay_and_write(&key, at),
             Err(JournalError::Io {
                 kind: io::ErrorKind::OutOfMemory
             })
@@ -1325,11 +1599,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let table = FollowTable::load(Arc::clone(&journal)).unwrap();
+        let table = Arc::new(FollowTable::load(Arc::clone(&journal)).unwrap());
         let at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         assert_eq!(table.ticket("test", at), FollowTicket::Absent);
         let key = "a".repeat(64);
-        table.stay(&key, at).unwrap();
+        table.stay_and_write(&key, at).unwrap();
         let restarted = FollowTable::load(Arc::clone(&journal)).unwrap();
         std::fs::remove_file(dir.path().join(format!("{key}.followed"))).unwrap();
         assert!(matches!(

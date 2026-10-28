@@ -30,6 +30,11 @@ items only and rebuilds assistant text and function calls from their parsed part
 receives the portable text and calls without the opaque reasoning. A reported-model drift retries once with reasoning omitted. Opaque capture uses compact JSON,
 and its debug representation exposes only a byte count.
 
+Journal replay messages carry `Text::File` slices of already escaped strings. All three backend
+encoders produce shared literal, file and opaque chunks; `SliceBody` reads files off the runtime
+worker with one 64 KiB read in flight and an exact remaining size. Retries rebuild a body from the
+same chunks and held descriptors. Opaque chunks stay unquoted and out of literal chunks.
+
 A message is text unless it is built with `ModelMessage::user_with_parts`. A text-only message
 serializes as a bare string on the chat-completions wire and as one `input_text` part on
 Responses. Attachment bytes are encoded only while a request is being built: `ModelMessage`'s own
