@@ -62,6 +62,18 @@ No deployed transport produces them.
 
 A chat scope also states what started the turn: `trigger` is `message` for a person's message or a verified repository delivery, `wake` for a session a scheduled wake started, `job` for a detached job or its notice turn, and `probe` for a watch's unattended check. Policy sees it as `context.trigger`. A wake reuses the subject and conversation of the authenticated message that scheduled it, so it can never speak as anyone else or anywhere else, and every wake session is authorized afresh. A job under trigger `job` may write only when the broker explicitly authorizes its narrow write capability. A job started by a probe retains trigger `probe`: its leg is refused every capability whose effect is not read-only (`probe-write`) before policy is consulted. A probe's job may look, never act.
 
+## Typed GitHub facts
+
+A verified GitHub message carries bounded facts on `ChatScopeClaim.github`; the broker binds every event to the attested repository, conversation thread and first delivery ID. Only GitHub message claims carry this field. The gateway and broker ship and roll back together because the claim rejects unknown fields; other clients omit `github` on non-GitHub claims.
+
+Cedar sees one delivery at a time as optional `context.github`. Repository-set facts may support permits. Author-set facts live only in `context.github.authorSet` and can only deny: every event must allow both with `authorSet` omitted and with it present. The same checks cover capability, prompt, secret and HTTP decisions, including both principals in a mapped space. An error denies. A coalesced turn can do only what every delivery could do alone.
+
+The six classifications cover actor login versus stable numeric ID; PR draft and issue/PR state; run/check status, conclusion and path; deployment details; discussion category/answered; and review state. Author-only detail that is not a policy fact is dropped. Trust an actor by `actor.id`, never by its chosen login. Policies must not permit on a label an issue template can apply: an outsider selecting a template can receive its labels and assignees.
+
+Facts keep GitHub's case. Cedar `==` is case-sensitive, so a forbid on `"none"` never matches `NONE`. Actions and other words admit `[A-Za-z0-9_.:-]{1,64}`. Out-of-bound discussion categories and repository-dispatch actions are absent, including CJK category slugs and dispatch names with spaces. Optional malformed facts disappear, invalid set elements are dropped, and unknown payload fields are ignored; only missing or malformed required facts refuse the delivery.
+
+Titles, bodies, comment/review text, commit messages and lists, dispatch inputs, URLs, secret values and location text, and run/job/check names never reach Cedar, the GitHub note or `wake_reason`. Facts do not change policy digests. The agent must still read current checks, reviews and head through broker-granted capabilities before acting.
+
 ## Current local process boundary
 
 The chart runs the broker as UID/GID **65532:65532** and the gateway as

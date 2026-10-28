@@ -183,6 +183,7 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
     AuditEvent::Decision {
         authority: Box::new(super::DecisionAuthority {
+            github_denial: None,
             principal_kind: dekopon_core::PrincipalKind::Service,
             started_by: None,
             chat: None,
@@ -1484,6 +1485,7 @@ fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
         |kind, conversation_kind, container: Option<&str>, id: &str, thread: Option<&str>| {
             ChatScopeClaim {
                 participant: None,
+                github: None,
                 transport: "family-chat".parse().expect("transport"),
                 kind,
                 conversation: Conversation {

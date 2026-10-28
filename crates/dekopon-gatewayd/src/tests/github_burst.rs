@@ -125,12 +125,13 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
 }
 
 fn body(event: &str, number: u64, actor: u64) -> Value {
-    let mut body = crate::transport::github::tests::pr();
+    let mut body = crate::transport::github::tests::sample(event);
     body["sender"]["id"] = json!(actor);
     body["number"] = json!(number);
     body["pull_request"]["number"] = json!(number);
-    body["issue"] = json!({"number":number,"pull_request":{}});
-    body["check_run"] = json!({"pull_requests":[{"number":number,"base":{"repo":{"id":10}}}]});
+    body["issue"]["number"] = json!(number);
+    body["issue"]["pull_request"] = json!({});
+    body["check_run"]["pull_requests"] = json!([{"number":number,"base":{"repo":{"id":10}}}]);
     body["action"] = json!(if event == "pull_request" {
         "opened"
     } else {

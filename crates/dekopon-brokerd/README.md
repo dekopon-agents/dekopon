@@ -809,6 +809,7 @@ that can never match.
 | `Dekopon::Agent::"…"` | any agent name; the catalog belongs to the gateway, not the broker |
 | `Dekopon::Secret::"drn:…"` | a public DRN declared by the owner-only secret map |
 | `Dekopon::Action::"secret.use"` | fixed separate permission to consume one exact DRN |
+| `context.github` | optional typed GitHub message facts, evaluated per delivery; `authorSet` can only deny |
 
 The context each action carries is `dekopon-policy`'s
 [context](../dekopon-policy/README.md#context). Every value is derived by the broker from

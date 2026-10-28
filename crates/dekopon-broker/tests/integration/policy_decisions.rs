@@ -155,6 +155,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         agent("some-agent"),
         ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
             conversation: Conversation {
@@ -282,6 +283,7 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
         agent("some-agent"),
         ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "elote-logs".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Discord,
             conversation: Conversation {
@@ -368,6 +370,7 @@ fn channel_claim(
         agent("some-agent"),
         ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "chat".parse().expect("transport"),
             kind,
             conversation: Conversation {
@@ -607,4 +610,109 @@ async fn allowed_space_decisions_commit_to_the_invocation_input() {
         .collect::<Vec<_>>();
     assert_eq!(digests.len(), 2);
     assert_ne!(digests[0], digests[1]);
+}
+
+#[path = "../common/github.rs"]
+mod github;
+
+#[tokio::test]
+async fn a_permit_on_an_author_set_fact_never_allows() {
+    for (policies, expected) in [
+        (
+            r#"@id("allow") permit(principal,action,resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
+            false,
+        ),
+        (
+            r#"@id("allow") permit(principal,action,resource); @id("deny") forbid(principal,action,resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
+            false,
+        ),
+        (
+            r#"@id("allow") permit(principal,action,resource); @id("deny") forbid(principal,action,resource) when { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "other" };"#,
+            true,
+        ),
+        (
+            r#"@id("allow") permit(principal,action,resource); @id("deny") forbid(principal,action,resource) unless { context has github && context.github has authorSet && context.github.authorSet has headRef && context.github.authorSet.headRef == "x" };"#,
+            false,
+        ),
+    ] {
+        let (broker, _) = github::broker(policies).await;
+        let (context, refusal) = broker.resolve_context(
+            &github::gateway(),
+            Some(&AttestorGrant { namespaces: None }),
+            &github::claim(vec![github::event("pull_request", "delivery-1")]),
+        );
+        assert!(refusal.is_none());
+        assert_eq!(
+            broker
+                .authorize_invocation(&context, &capability("cli-probe.reverse"))
+                .is_ok(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_coalesced_turn_is_allowed_only_if_every_event_is() {
+    let (broker,_) = github::broker(r#"@id("allow") permit(principal,action,resource) when { context has github && context.github.event == "issue_comment" };"#).await;
+    for (second, expected) in [("pull_request", false), ("issue_comment", true)] {
+        let (context, refusal) = broker.resolve_context(
+            &github::gateway(),
+            Some(&AttestorGrant { namespaces: None }),
+            &github::claim(vec![
+                github::event("issue_comment", "delivery-1"),
+                github::event(second, "delivery-2"),
+            ]),
+        );
+        assert!(refusal.is_none());
+        assert_eq!(
+            broker
+                .authorize_invocation(&context, &capability("cli-probe.reverse"))
+                .is_ok(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn github_facts_must_match_the_attested_scope() {
+    let (broker, _) = github::broker(r#"@id("allow") permit(principal,action,resource);"#).await;
+    let good = github::claim(vec![github::event("issue_comment", "delivery-1")]);
+    let mut foreign = github::event("issue_comment", "delivery-1");
+    foreign["repository"]["fullName"] = json!("owner/foreign");
+    let mut wrong_thread = github::event("issue_comment", "delivery-1");
+    wrong_thread["number"] = json!(8);
+    let mut slack = good.clone();
+    slack.subject = "slack.team.user".parse().unwrap();
+    let scope = slack.scope.as_mut().unwrap();
+    scope.kind = ChatTransportKind::Slack;
+    scope.conversation.id = "channel".into();
+    scope.conversation.container = Some("team".into());
+    scope.conversation.thread = Some("1712345678.000100".into());
+    scope.delivery = None;
+    let mut wake = good.clone();
+    wake.scope.as_mut().unwrap().trigger = dekopon_broker::Trigger::Wake;
+    for bad in [
+        github::claim(vec![foreign]),
+        github::claim(vec![wrong_thread]),
+        slack,
+        wake,
+        github::claim(vec![github::event("issue_comment", "other-delivery")]),
+    ] {
+        let (_, refusal) = broker.resolve_context(
+            &github::gateway(),
+            Some(&AttestorGrant { namespaces: None }),
+            &bad,
+        );
+        assert_eq!(refusal.expect("refused scope").reason, "attestation-denied");
+    }
+    assert!(
+        broker
+            .resolve_context(
+                &github::gateway(),
+                Some(&AttestorGrant { namespaces: None }),
+                &good
+            )
+            .1
+            .is_none()
+    );
 }

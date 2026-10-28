@@ -26,82 +26,15 @@ use super::{
     whatsapp::WhatsappTransport,
 };
 use crate::{config::GithubEvent, gateway::CurrentGeneration};
-use dekopon_core::github::{GithubId, GithubThread, thread};
 
 const CALLBACK: &str = "/webhooks/github";
 const RECENT_DELIVERIES: usize = 1024;
 const QUEUE: usize = 64;
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GithubEntry {
-    pub delivery: String,
-    pub event: GithubEvent,
-    pub action: Option<String>,
-    pub actor: GithubId,
-    pub thread: GithubThread,
-    pub head_sha: Option<String>,
-    pub run: Option<GithubId>,
-    pub conclusion: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GithubBatch(Vec<GithubEntry>);
-
-impl GithubBatch {
-    pub(crate) fn new(entry: GithubEntry) -> Self {
-        Self(vec![entry])
-    }
-    pub(crate) fn lead(&self) -> &GithubEntry {
-        &self.0[0]
-    }
-    pub(crate) fn deliveries(&self) -> Vec<&str> {
-        self.0.iter().map(|e| e.delivery.as_str()).collect()
-    }
-    pub(crate) fn append(&mut self, other: &mut Self) -> bool {
-        if self.0.len() + other.0.len() > 16 || self.lead().actor != other.lead().actor {
-            return false;
-        }
-        self.0.append(&mut other.0);
-        true
-    }
-    pub(crate) fn note(&self, subject: &ExternalSubject) -> String {
-        let mut lines = Vec::with_capacity(self.0.len() + 1);
-        for entry in &self.0 {
-            let event = serde_json::to_value(entry.event)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let mut line = format!(
-                "[gateway: unverified GitHub {event} claim] repository {}/{}; action {}; {}; delivery {}.",
-                subject.tenant().unwrap_or_default(),
-                subject.subject(),
-                entry.action.as_deref().unwrap_or("none"),
-                match entry.thread {
-                    GithubThread::Number(number) => format!("#{number}"),
-                    GithubThread::Repository => "repository".to_owned(),
-                },
-                entry.delivery
-            );
-            if let Some(sha) = &entry.head_sha {
-                line.push_str(&format!(" head {sha};"));
-            }
-            if let Some(run) = entry.run {
-                let association = match entry.thread {
-                    GithubThread::Number(number) => format!("Some({number})"),
-                    GithubThread::Repository => "None".to_owned(),
-                };
-                line.push_str(&format!(" run {run}; associated PR {association};"));
-            }
-            if let Some(conclusion) = &entry.conclusion {
-                line.push_str(&format!(" conclusion {conclusion};"));
-            }
-            lines.push(line);
-        }
-        lines.push("Read current checks and head through a broker-granted capability before acting. No associated PR means report only.".to_owned());
-        lines.join("\n")
-    }
-}
+mod facts;
+use dekopon_core::github::{GithubBatch, GithubEvent as TypedGithubEvent, GithubWord};
+use facts::parse;
 
 pub(super) enum Reservation {
     New,
@@ -345,8 +278,20 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         ignored(state, &delivery, "no-repository");
         return webhook::content_free(StatusCode::OK);
     }
-    let Some((subject, conversation, entry)) = parse(&root, event_kind, &delivery) else {
+    let Some(entry) = parse(&root, event_kind, &delivery) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
+    };
+    let Some((owner, repo)) = entry.repository.full_name.as_str().split_once('/') else {
+        return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
+    };
+    let Ok(subject) = ExternalSubject::github(owner, repo) else {
+        return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
+    };
+    let conversation = Conversation {
+        kind: ConversationKind::Thread,
+        container: Some(owner.to_owned()),
+        id: format!("{owner}.{repo}"),
+        thread: Some(entry.thread().to_string()),
     };
     if !state
         .generation
@@ -427,141 +372,18 @@ fn ignored(state: &StateData, delivery: &str, reason: &str) {
     });
 }
 
-fn field<'a>(root: &'a Value, path: &str, max: usize) -> Option<&'a str> {
-    root.pointer(path)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= max)
-}
-
-fn parse(
-    root: &Value,
-    event: GithubEvent,
-    delivery: &str,
-) -> Option<(ExternalSubject, Conversation, GithubEntry)> {
-    let owner = field(root, "/repository/owner/login", 39)?;
-    let repo = field(root, "/repository/name", 100)?;
-    let subject = ExternalSubject::github(owner, repo).ok()?;
-    GithubId::new(root.pointer("/repository/id")?.as_u64()?).ok()?;
-    let thread = thread(event, root).ok()?;
-    let conversation = Conversation {
-        kind: ConversationKind::Thread,
-        container: Some(subject.tenant()?.to_owned()),
-        id: format!("{}.{}", subject.tenant()?, subject.subject()),
-        thread: Some(thread.to_string()),
-    };
-    let actor = GithubId::new(root.pointer("/sender/id")?.as_u64()?).ok()?;
-    let action = field(root, "/action", 64)
-        .filter(|v| {
-            v.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
-        })
-        .map(str::to_owned);
-    if matches!(event, GithubEvent::PullRequest | GithubEvent::WorkflowRun) && action.is_none() {
-        return None;
-    }
-    let sha = |path| {
-        field(root, path, 64)
-            .filter(|v| {
-                matches!(v.len(), 40 | 64)
-                    && v.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-            .map(str::to_owned)
-    };
-    let (head_sha, run, conclusion) = match event {
-        GithubEvent::PullRequest => (Some(sha("/pull_request/head/sha")?), None, None),
-        GithubEvent::WorkflowRun => (
-            Some(sha("/workflow_run/head_sha")?),
-            Some(GithubId::new(root.pointer("/workflow_run/id")?.as_u64()?).ok()?),
-            field(root, "/workflow_run/conclusion", 64)
-                .filter(|v| {
-                    v.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
-                })
-                .map(str::to_owned),
-        ),
-        GithubEvent::BranchProtectionConfiguration
-        | GithubEvent::BranchProtectionRule
-        | GithubEvent::CheckRun
-        | GithubEvent::CheckSuite
-        | GithubEvent::CodeScanningAlert
-        | GithubEvent::CommitComment
-        | GithubEvent::Create
-        | GithubEvent::CustomPropertyValues
-        | GithubEvent::Delete
-        | GithubEvent::DependabotAlert
-        | GithubEvent::DeployKey
-        | GithubEvent::Deployment
-        | GithubEvent::DeploymentProtectionRule
-        | GithubEvent::DeploymentReview
-        | GithubEvent::DeploymentStatus
-        | GithubEvent::Discussion
-        | GithubEvent::DiscussionComment
-        | GithubEvent::Fork
-        | GithubEvent::Gollum
-        | GithubEvent::IssueComment
-        | GithubEvent::IssueDependencies
-        | GithubEvent::Issues
-        | GithubEvent::Label
-        | GithubEvent::Member
-        | GithubEvent::MergeGroup
-        | GithubEvent::Meta
-        | GithubEvent::Milestone
-        | GithubEvent::Package
-        | GithubEvent::PageBuild
-        | GithubEvent::ProjectCard
-        | GithubEvent::ProjectColumn
-        | GithubEvent::Project
-        | GithubEvent::Public
-        | GithubEvent::PullRequestReview
-        | GithubEvent::PullRequestReviewComment
-        | GithubEvent::PullRequestReviewThread
-        | GithubEvent::Push
-        | GithubEvent::RegistryPackage
-        | GithubEvent::Release
-        | GithubEvent::Repository
-        | GithubEvent::RepositoryAdvisory
-        | GithubEvent::RepositoryDispatch
-        | GithubEvent::RepositoryImport
-        | GithubEvent::RepositoryRuleset
-        | GithubEvent::RepositoryVulnerabilityAlert
-        | GithubEvent::SecretScanningAlert
-        | GithubEvent::SecretScanningAlertLocation
-        | GithubEvent::SecretScanningScan
-        | GithubEvent::SecurityAndAnalysis
-        | GithubEvent::Star
-        | GithubEvent::Status
-        | GithubEvent::SubIssues
-        | GithubEvent::TeamAdd
-        | GithubEvent::Watch
-        | GithubEvent::WorkflowDispatch
-        | GithubEvent::WorkflowJob => (None, None, None),
-    };
-    Some((
-        subject,
-        conversation,
-        GithubEntry {
-            delivery: delivery.to_owned(),
-            event,
-            action,
-            actor,
-            thread,
-            head_sha,
-            run,
-            conclusion,
-        },
-    ))
-}
-
-fn eligible(entry: &GithubEntry) -> bool {
+fn eligible(entry: &TypedGithubEvent) -> bool {
     match entry.event {
         GithubEvent::PullRequest => matches!(
-            entry.action.as_deref(),
+            entry.action.as_ref().map(GithubWord::as_str),
             Some("opened" | "reopened" | "synchronize")
         ),
         GithubEvent::WorkflowRun => {
-            entry.action.as_deref() == Some("completed")
-                && matches!(entry.conclusion.as_deref(), Some("success" | "failure"))
+            entry.action.as_ref().map(GithubWord::as_str) == Some("completed")
+                && matches!(
+                    entry.author_set.conclusion.as_ref().map(GithubWord::as_str),
+                    Some("success" | "failure")
+                )
         }
         GithubEvent::BranchProtectionConfiguration
         | GithubEvent::BranchProtectionRule
@@ -772,7 +594,7 @@ pub(crate) mod tests {
     use axum::body::Body;
     use serde_json::json;
 
-    fn state() -> (StateData, mpsc::Receiver<TransportEvent>) {
+    pub(super) fn state() -> (StateData, mpsc::Receiver<TransportEvent>) {
         let (sender, receiver) = mpsc::channel(1);
         (
             StateData {
@@ -829,8 +651,57 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn pr() -> Value {
-        json!({ "repository": {"id": 10, "owner": {"login": "Owner"}, "name": "Repo"}, "sender": {"id": 1},
-            "action": "opened", "number": 7, "pull_request": { "head": {"sha": "a".repeat(40)} } })
+        json!({ "repository": {"id": 10, "owner": {"login": "Owner"}, "name": "Repo"}, "sender": {"id": 1,"login":"owner","type":"User"},
+            "action": "opened", "number": 7, "pull_request": {"number":7,"user":{"id":1},"author_association":"OWNER","labels":[],"merged":false,"draft":false,"state":"open","base":{"ref":"main","sha":"b".repeat(40),"repo":{"id":10}},"head":{"ref":"feature","sha":"a".repeat(40),"repo":{"id":10,"full_name":"owner/repo"}} } })
+    }
+
+    pub(crate) fn sample(event: &str) -> Value {
+        let mut body = pr();
+        body["action"] = json!(if event == "workflow_run" {
+            "completed"
+        } else {
+            "opened"
+        });
+        body["issue"] = json!({"number":7,"user":{"id":1},"author_association":"OWNER","labels":[],"assignees":[],"state":"open"});
+        body["parent_issue"] = body["issue"].clone();
+        body["blocked_issue"] = body["issue"].clone();
+        body["parent_issue_repo"] = json!({"id":10});
+        body["blocked_issue_repo"] = json!({"id":10});
+        body["comment"] = json!({"id":2,"author_association":"OWNER"});
+        body["review"] = json!({"id":2,"author_association":"OWNER","state":"approved","commit_id":"a".repeat(40)});
+        body["discussion"] = json!({"number":7,"author_association":"OWNER","state":"open","category":{"slug":"q-a"}});
+        body["ref"] = json!(if event == "push" {
+            "refs/heads/main"
+        } else {
+            "main"
+        });
+        body["ref_type"] = json!("branch");
+        body["before"] = json!("a".repeat(40));
+        body["after"] = json!("b".repeat(40));
+        body["created"] = json!(false);
+        body["deleted"] = json!(false);
+        body["forced"] = json!(false);
+        body["commits"] = json!([]);
+        body["workflow_run"] = json!({"id":3,"run_number":1,"run_attempt":1,"event":"push","status":"completed","head_sha":"a".repeat(40),"conclusion":"success","pull_requests":[]});
+        body["workflow_job"] = json!({"id":4,"run_id":3,"run_attempt":1,"status":"completed","head_sha":"a".repeat(40)});
+        body["check_run"] = json!({"id":3,"app":{"id":4},"check_suite":{"id":5},"status":"completed","head_sha":"a".repeat(40),"pull_requests":[]});
+        body["check_suite"] = json!({"id":5,"app":{"id":4},"status":"completed","head_sha":"a".repeat(40),"pull_requests":[]});
+        body["id"] = json!(3);
+        body["sha"] = json!("a".repeat(40));
+        body["state"] = json!("success");
+        body["release"] = json!({"id":3,"tag_name":"v1","draft":false,"prerelease":false});
+        body["deployment"] = json!({"id":3,"ref":"main","sha":"a".repeat(40)});
+        body["deployment_status"] = json!({"state":"success"});
+        body["alert"] = json!({"number":3,"state":"open","ghsa_id":"GHSA-1234"});
+        body["repository_advisory"] = body["alert"].clone();
+        body["label"] = json!({"id":3,"name":"ready"});
+        body["milestone"] = json!({"id":3,"number":1,"state":"open"});
+        body["merge_group"] =
+            json!({"head_sha":"a".repeat(40),"base_sha":"b".repeat(40),"base_ref":"main"});
+        body["package"] = json!({"id":3,"package_type":"CONTAINER"});
+        body["registry_package"] = body["package"].clone();
+        body["member"] = json!({"id":3});
+        body
     }
 
     #[tokio::test]
@@ -1039,20 +910,19 @@ pub(crate) mod tests {
 
     #[test]
     fn signed_repository_alone_selects_the_subject_and_eligible_action() {
-        let (subject, conversation, entry) =
-            parse(&pr(), GithubEvent::PullRequest, "guid").expect("claim");
-        assert_eq!(subject.canonical(), "github.owner.repo");
-        assert_eq!(conversation.key(), "owner.repo:7");
+        let entry = parse(&pr(), GithubEvent::PullRequest, "guid").expect("claim");
+        assert_eq!(entry.repository.full_name.as_str(), "owner/repo");
+        assert_eq!(entry.thread().to_string(), "7");
         assert!(eligible(&entry));
         assert!(
             GithubBatch::new(entry)
-                .note(&subject)
+                .note()
                 .starts_with("[gateway: unverified")
         );
         let mut ignored = pr();
         ignored["action"] = json!("closed");
         assert!(!eligible(
-            &parse(&ignored, GithubEvent::PullRequest, "guid").unwrap().2
+            &parse(&ignored, GithubEvent::PullRequest, "guid").unwrap()
         ));
         ignored["repository"]["name"] = json!("dotted.repo");
         assert!(parse(&ignored, GithubEvent::PullRequest, "guid").is_none());
@@ -1271,5 +1141,218 @@ pub(crate) mod tests {
             );
         }
         assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod typed_fact_tests {
+    use super::tests::{pr, signed};
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn an_unknown_field_is_ignored_and_only_a_required_fact_out_of_bound_is_malformed() {
+        let mut body = pr();
+        body["unknown"] = json!({"nested":"ignored"});
+        body["pull_request"]["unknown"] = json!(true);
+        body["pull_request"]["labels"] = json!([{"name":"x".repeat(51)},{"name":"🍋".repeat(50)}]);
+        let event = parse(&body, GithubEvent::PullRequest, "delivery-1").unwrap();
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["pullRequest"]["labels"], json!(["🍋".repeat(50)]));
+        body["pull_request"]["head"]["sha"] = json!("a".repeat(41));
+        assert!(parse(&body, GithubEvent::PullRequest, "delivery-1").is_none());
+        let (state, _receiver) = super::tests::state();
+        let malformed = signed(
+            &serde_json::to_vec(&body).unwrap(),
+            b"secret",
+            "delivery-1",
+            "pull_request",
+        );
+        assert_eq!(
+            process(&state, malformed, &receive_span(ChatTransportKind::Github))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        for (family, key) in [
+            (GithubEvent::Discussion, "discussion"),
+            (GithubEvent::DiscussionComment, "discussion_comment"),
+        ] {
+            let mut body = pr();
+            body["discussion"] = json!({"number":7,"author_association":"OWNER","state":"open","category":{"slug":"推荐项目"}});
+            body["comment"] = json!({"id":2,"author_association":"OWNER"});
+            let event = parse(&body, family, key).unwrap();
+            assert!(
+                serde_json::to_value(event).unwrap()["authorSet"]
+                    .get("category")
+                    .is_none()
+            );
+        }
+        for action in ["deploy staging".to_owned(), "x".repeat(65)] {
+            let mut body = pr();
+            body["action"] = json!(action);
+            assert!(
+                serde_json::to_value(
+                    parse(&body, GithubEvent::RepositoryDispatch, "dispatch").unwrap()
+                )
+                .unwrap()
+                .get("action")
+                .is_none()
+            );
+        }
+        let mut body = pr();
+        body["action"] = json!("deploy:migrations");
+        body["deployment"] = json!({"id":3,"ref":"main","sha":"a".repeat(40),"environment":"staging environment","task":"deploy:migrations"});
+        let event =
+            serde_json::to_value(parse(&body, GithubEvent::Deployment, "deployment").unwrap())
+                .unwrap();
+        assert!(event["authorSet"].get("environment").is_none());
+        assert_eq!(event["authorSet"]["task"], json!("deploy:migrations"));
+        body["discussion"] = json!({"number":7,"author_association":"OWNER","state":"open","category":{"slug":"q-a"}});
+        let event =
+            serde_json::to_value(parse(&body, GithubEvent::Discussion, "discussion").unwrap())
+                .unwrap();
+        assert_eq!(event["discussion"]["authorAssociation"], json!("OWNER"));
+        assert_eq!(event["authorSet"]["category"], json!("q-a"));
+    }
+
+    #[test]
+    fn every_typed_family_parses_its_synthetic_body() {
+        for (name, kind) in [
+            ("branch_protection_configuration", "none"),
+            ("branch_protection_rule", "none"),
+            ("check_run", "check"),
+            ("check_suite", "check"),
+            ("code_scanning_alert", "alert"),
+            ("commit_comment", "commitComment"),
+            ("create", "ref"),
+            ("custom_property_values", "none"),
+            ("delete", "ref"),
+            ("dependabot_alert", "alert"),
+            ("deploy_key", "none"),
+            ("deployment", "deployment"),
+            ("deployment_protection_rule", "deployment"),
+            ("deployment_review", "deployment"),
+            ("deployment_status", "deployment"),
+            ("discussion", "discussion"),
+            ("discussion_comment", "discussionComment"),
+            ("fork", "none"),
+            ("gollum", "none"),
+            ("issue_comment", "issueComment"),
+            ("issue_dependencies", "issue"),
+            ("issues", "issue"),
+            ("label", "label"),
+            ("member", "member"),
+            ("merge_group", "mergeGroup"),
+            ("meta", "none"),
+            ("milestone", "milestone"),
+            ("package", "package"),
+            ("page_build", "none"),
+            ("project_card", "none"),
+            ("project_column", "none"),
+            ("project", "none"),
+            ("public", "none"),
+            ("pull_request", "pullRequest"),
+            ("pull_request_review", "review"),
+            ("pull_request_review_comment", "reviewComment"),
+            ("pull_request_review_thread", "pullRequest"),
+            ("push", "push"),
+            ("registry_package", "package"),
+            ("release", "release"),
+            ("repository", "none"),
+            ("repository_advisory", "alert"),
+            ("repository_dispatch", "none"),
+            ("repository_import", "none"),
+            ("repository_ruleset", "none"),
+            ("repository_vulnerability_alert", "alert"),
+            ("secret_scanning_alert", "alert"),
+            ("secret_scanning_alert_location", "alert"),
+            ("secret_scanning_scan", "none"),
+            ("security_and_analysis", "none"),
+            ("star", "none"),
+            ("status", "check"),
+            ("sub_issues", "issue"),
+            ("team_add", "none"),
+            ("watch", "none"),
+            ("workflow_dispatch", "ref"),
+            ("workflow_job", "run"),
+            ("workflow_run", "run"),
+        ] {
+            let event: GithubEvent = serde_json::from_value(json!(name)).unwrap();
+            let body = super::tests::sample(name);
+            let facts = parse(&body, event, "synthetic").expect(name);
+            let value = serde_json::to_value(facts).unwrap();
+            assert_eq!(value["kind"], json!(kind), "{name}");
+            assert_eq!(value["event"], json!(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_redelivery_bodies_parse_to_their_facts() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/typed-events-deliveries");
+        let mut count = 0;
+        for file in std::fs::read_dir(dir).expect("pinned redeliveries") {
+            let path = file.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let delivery = path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap();
+            let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let family: GithubEvent = serde_json::from_value(fixture["event"].clone()).unwrap();
+            let body = &fixture["body"];
+            let request = signed(
+                &serde_json::to_vec(body).unwrap(),
+                b"test-secret",
+                delivery,
+                fixture["event"].as_str().unwrap(),
+            );
+            let verified = webhook::verified_body(request, b"test-secret")
+                .await
+                .expect("test-secret signature");
+            assert_eq!(serde_json::from_slice::<Value>(&verified).unwrap(), *body);
+            let event = parse(body, family, delivery).expect("real delivery parses");
+            let thread = event.thread().to_string();
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["event"], fixture["event"]);
+            if family == GithubEvent::PullRequest {
+                assert_eq!(thread, body["number"].to_string());
+                assert_eq!(
+                    value["pullRequest"]["baseSha"],
+                    body["pull_request"]["base"]["sha"]
+                );
+                assert_eq!(
+                    value["authorSet"]["headSha"],
+                    body["pull_request"]["head"]["sha"]
+                );
+            } else {
+                let expected = if body["workflow_run"]["pull_requests"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+                    == 1
+                {
+                    "780"
+                } else {
+                    "repository"
+                };
+                assert_eq!(thread, expected);
+                assert_eq!(value["run"]["id"], body["workflow_run"]["id"]);
+                assert_eq!(
+                    value["authorSet"]["runStatus"],
+                    body["workflow_run"]["status"]
+                );
+            }
+            count += 1;
+        }
+        assert_eq!(count, 13);
     }
 }

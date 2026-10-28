@@ -305,11 +305,23 @@ where
                 ids.span_id()
             )?;
         }
-        for array in arrays.into_iter().flat_map(|arrays| &arrays.0) {
+        for array in arrays.into_iter().flat_map(|arrays| arrays.iter()) {
             let name =
                 serde_json::to_string(array.name).map_err(|_invalid_json| std::fmt::Error)?;
-            let values =
-                serde_json::to_string(&array.values).map_err(|_invalid_json| std::fmt::Error)?;
+            let values = serde_json::to_string(
+                &array
+                    .values
+                    .iter()
+                    .map(|value| match value {
+                        opentelemetry::Value::String(value) => serde_json::json!(value.as_str()),
+                        opentelemetry::Value::I64(value) => serde_json::json!(value),
+                        opentelemetry::Value::Bool(value) => serde_json::json!(value),
+                        opentelemetry::Value::F64(value) => serde_json::json!(value),
+                        value => serde_json::json!(value.to_string()),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_invalid_json| std::fmt::Error)?;
             write!(writer, ",{name}:{values}")?;
         }
         writeln!(writer, "}}")
@@ -539,7 +551,7 @@ where
             metadata.is_event()
                 && metadata.fields().field("audit.event").is_some()
                 && opentelemetry::Context::current()
-                    .get::<crate::EventStringArray>()
+                    .get::<crate::EventStringArrays>()
                     .is_some()
         })
         .with_callsite_filter(|metadata| {

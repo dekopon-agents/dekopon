@@ -86,6 +86,7 @@ impl Anchor {
             self.agent.clone(),
             ChatScopeClaim {
                 participant: None,
+                github: None,
                 transport: self.transport.clone(),
                 kind: self.kind,
                 conversation: self.conversation.clone(),

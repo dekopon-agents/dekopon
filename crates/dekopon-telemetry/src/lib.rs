@@ -30,19 +30,21 @@ pub use install::{
 };
 
 #[derive(Clone, Debug)]
-pub struct EventStringArray {
+pub struct EventStringArray<V = String> {
     pub name: &'static str,
-    pub values: Vec<String>,
+    pub values: Vec<V>,
 }
 
-#[derive(Clone, Default)]
-struct EventStringArrays(Vec<EventStringArray>);
+type EventStringArrays = Vec<EventStringArray<opentelemetry::Value>>;
 
-pub fn with_event_string_array<T>(
+pub fn with_event_string_array<T, V: ToOwned + ?Sized>(
     name: &'static str,
-    values: &[&str],
+    values: &[&V],
     emit: impl FnOnce() -> T,
-) -> T {
+) -> T
+where
+    V::Owned: Clone + std::fmt::Debug + Into<opentelemetry::Value> + Send + Sync + 'static,
+{
     let current = Context::current();
     let mut arrays = current
         .get::<EventStringArrays>()
@@ -52,8 +54,11 @@ pub fn with_event_string_array<T>(
         name,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
     };
-    arrays.0.retain(|existing| existing.name != name);
-    arrays.0.push(array.clone());
+    arrays.retain(|existing| existing.name != name);
+    arrays.push(EventStringArray {
+        name,
+        values: array.values.iter().cloned().map(Into::into).collect(),
+    });
     let context = current.with_value(arrays).with_value(array);
     let _scope = context.attach();
     emit()

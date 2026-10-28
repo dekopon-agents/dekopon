@@ -285,6 +285,7 @@ fn chat_claim() -> Attestation {
         AGENT.parse::<AgentId>().expect("valid agent fixture"),
         ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "scientist-slack"
                 .parse::<TransportId>()
                 .expect("valid transport fixture"),

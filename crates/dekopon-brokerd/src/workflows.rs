@@ -311,6 +311,7 @@ pub(crate) async fn run(
             agent: file.agent.clone(),
             scope: Some(ChatScopeClaim {
                 participant: None,
+                github: None,
                 transport: file.scope.transport.clone(),
                 kind: file.scope.transport_kind,
                 conversation: conversation(

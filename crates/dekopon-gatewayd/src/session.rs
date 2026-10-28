@@ -1859,7 +1859,7 @@ async fn run_admitted(
     (admission, digest): (SessionAdmission, &str),
 ) -> SessionAdmission {
     if let MessageId::Github(batch) = &message.message_id {
-        message.text = batch.note(&message.subject);
+        message.text = batch.note();
     }
     if matches!(message.message_id, MessageId::Github(_)) || message.pull_request_links.is_some() {
         record_admission(&message, "started", 0, None);
@@ -3676,7 +3676,18 @@ fn chat_claim_for(
             transport,
             kind: message.transport_kind,
             conversation: message.conversation.clone(),
-            delivery: None,
+            delivery: match &message.message_id {
+                MessageId::Github(batch) => {
+                    Some(dekopon_broker_protocol::DeliveryIdentity::Github {
+                        delivery: batch.lead().delivery.to_string(),
+                    })
+                }
+                _ => None,
+            },
+            github: match &message.message_id {
+                MessageId::Github(batch) => Some((**batch).clone()),
+                _ => None,
+            },
             trigger: message.message_id.trigger(),
         },
     );
