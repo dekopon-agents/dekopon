@@ -188,6 +188,8 @@ Never edit `.wasm` files directly. Each in-tree source directory is a separate C
 
 ### Dependencies, crates, CI, or releases
 
+The dispatch-only `.github/workflows/burn-in.yml` appends a dated note to `docs/burn-in/TURNS.md` and pushes only `burn-in/webhook-turn` as the release App to trigger the standing draft PR’s webhook turn, recording the pushed commit SHA in its job summary.
+
 The root workspace temporarily patches `tracing-core` to commit
 `2b696a18454a04df9c9a60569b6fb73a22415296` from the
 [`dekopon-agents/tracing` fork](https://github.com/dekopon-agents/tracing), the source
