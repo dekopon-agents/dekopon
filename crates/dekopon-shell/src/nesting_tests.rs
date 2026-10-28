@@ -1,4 +1,4 @@
-use super::{ParseError, parse};
+use super::{Construct, ParseError, TooDeep, parse};
 
 struct Case {
     name: &'static str,
@@ -8,13 +8,7 @@ struct Case {
     close: &'static str,
     suffix: &'static str,
     ceiling: usize,
-    refusal: Refusal,
-}
-
-enum Refusal {
-    Nesting(&'static str),
-    Parameter,
-    Arithmetic,
+    refusal: TooDeep,
 }
 
 impl Case {
@@ -29,11 +23,10 @@ impl Case {
         )
     }
 
-    fn message(&self) -> String {
-        match self.refusal {
-            Refusal::Parameter => "parameter expansions nested deeper than 32".to_owned(),
-            Refusal::Arithmetic => "an arithmetic expansion may nest at most 64 operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments".to_owned(),
-            Refusal::Nesting(construct) => format!("{construct} nested more than 64 levels deep; this shell parses on a fixed stack and refuses rather than risking it"),
+    fn error(&self) -> ParseError {
+        ParseError::TooDeep {
+            line: 1,
+            refusal: self.refusal.clone(),
         }
     }
 }
@@ -46,48 +39,106 @@ fn cases() -> Vec<Case> {
             "if ",
             "; then :; fi",
             63,
-            "an `if` statement",
+            TooDeep::Grammar {
+                construct: Construct::If,
+            },
         ),
-        ("if body", "if :; then ", "; fi", 63, "an `if` statement"),
+        (
+            "if body",
+            "if :; then ",
+            "; fi",
+            63,
+            TooDeep::Grammar {
+                construct: Construct::If,
+            },
+        ),
         (
             "elif condition",
             "if :; then :; elif ",
             "; then :; fi",
             63,
-            "an `if` statement",
+            TooDeep::Grammar {
+                construct: Construct::If,
+            },
         ),
         (
             "while condition",
             "while ",
             "; do :; done",
             63,
-            "a `while` loop",
+            TooDeep::Grammar {
+                construct: Construct::While,
+            },
         ),
-        ("while body", "while :; do ", "; done", 63, "a `while` loop"),
+        (
+            "while body",
+            "while :; do ",
+            "; done",
+            63,
+            TooDeep::Grammar {
+                construct: Construct::While,
+            },
+        ),
         (
             "until condition",
             "until ",
             "; do :; done",
             63,
-            "an `until` loop",
+            TooDeep::Grammar {
+                construct: Construct::Until,
+            },
         ),
         (
             "until body",
             "until :; do ",
             "; done",
             63,
-            "an `until` loop",
+            TooDeep::Grammar {
+                construct: Construct::Until,
+            },
         ),
-        ("for", "for x in a; do ", "; done", 63, "a `for` loop"),
-        ("case", "case x in x) ", ";; esac", 63, "a `case` statement"),
-        ("group", "{ ", "; }", 31, "a `{ ...; }` group"),
-        ("function", "f() { ", "; }", 63, "a function body"),
+        (
+            "for",
+            "for x in a; do ",
+            "; done",
+            63,
+            TooDeep::Grammar {
+                construct: Construct::For,
+            },
+        ),
+        (
+            "case",
+            "case x in x) ",
+            ";; esac",
+            63,
+            TooDeep::Grammar {
+                construct: Construct::Case,
+            },
+        ),
+        (
+            "group",
+            "{ ",
+            "; }",
+            31,
+            TooDeep::Grammar {
+                construct: Construct::Group,
+            },
+        ),
+        (
+            "function",
+            "f() { ",
+            "; }",
+            63,
+            TooDeep::Grammar {
+                construct: Construct::Function,
+            },
+        ),
         (
             "substitution",
             "echo $(",
             ")",
             31,
-            "command substitution `$( ... )`",
+            TooDeep::CommandSubstitution,
         ),
     ] {
         cases.push(Case {
@@ -98,7 +149,7 @@ fn cases() -> Vec<Case> {
             close,
             suffix: "",
             ceiling,
-            refusal: Refusal::Nesting(construct),
+            refusal: construct,
         });
     }
     cases.push(Case {
@@ -109,7 +160,7 @@ fn cases() -> Vec<Case> {
         close: "}",
         suffix: "",
         ceiling: 31,
-        refusal: Refusal::Parameter,
+        refusal: TooDeep::Parameter,
     });
     for (name, prefix, open, close, suffix, ceiling, refusal) in [
         (
@@ -119,7 +170,9 @@ fn cases() -> Vec<Case> {
             "",
             " ]]",
             62,
-            Refusal::Nesting("a `!` inside `[[ ... ]]`"),
+            TooDeep::Grammar {
+                construct: Construct::TestNot,
+            },
         ),
         (
             "conditional group",
@@ -128,7 +181,9 @@ fn cases() -> Vec<Case> {
             " )",
             " ]]",
             62,
-            Refusal::Nesting("a group inside `[[ ... ]]`"),
+            TooDeep::Grammar {
+                construct: Construct::TestGroup,
+            },
         ),
         (
             "arithmetic group",
@@ -137,7 +192,9 @@ fn cases() -> Vec<Case> {
             " )",
             " ))",
             63,
-            Refusal::Nesting("an arithmetic expansion"),
+            TooDeep::Grammar {
+                construct: Construct::Arithmetic,
+            },
         ),
         (
             "arithmetic unary",
@@ -146,7 +203,7 @@ fn cases() -> Vec<Case> {
             "",
             " ))",
             64,
-            Refusal::Arithmetic,
+            TooDeep::ArithmeticOperators,
         ),
         (
             "arithmetic binary",
@@ -155,7 +212,7 @@ fn cases() -> Vec<Case> {
             "",
             " ))",
             64,
-            Refusal::Arithmetic,
+            TooDeep::ArithmeticOperators,
         ),
     ] {
         cases.push(Case {
@@ -172,26 +229,13 @@ fn cases() -> Vec<Case> {
     cases
 }
 
-fn refusal_message(error: ParseError) -> String {
-    match error {
-        ParseError::Syntax { line, message } => {
-            assert_eq!(line, 1);
-            message
-        }
-        ParseError::Lex(error) => {
-            assert_eq!(error.line, 1);
-            error.message
-        }
-    }
-}
-
 #[test]
 fn each_production_preserves_its_measured_ceiling_and_refusal() {
     for case in cases() {
         parse(&case.script(case.ceiling))
             .unwrap_or_else(|e| panic!("{} at {}: {e}", case.name, case.ceiling));
         let error = parse(&case.script(case.ceiling + 1)).expect_err(case.name);
-        assert_eq!(refusal_message(error), case.message(), "{}", case.name);
+        assert_eq!(error, case.error(), "{}", case.name);
     }
 }
 
@@ -215,16 +259,20 @@ fn every_production_refuses_two_thousand_levels_on_a_two_mib_stack() {
     for case in cases() {
         let script = case.script(2_000);
         let error = two_mib(|| parse(&script)).expect_err(case.name);
-        assert_eq!(refusal_message(error), case.message(), "{}", case.name);
+        assert_eq!(error, case.error(), "{}", case.name);
     }
     let mut script = ":".to_owned();
     for _ in 0..2_000 {
         script = format!("echo $(echo ${{x:-$( {{ if :; then {script}; fi; }} )}})");
     }
     let error = two_mib(|| parse(&script)).expect_err("alternating nesting");
-    match error {
-        ParseError::Lex(_) | ParseError::Syntax { .. } => {}
-    }
+    assert_eq!(
+        error,
+        ParseError::TooDeep {
+            line: 1,
+            refusal: TooDeep::Parameter
+        }
+    );
 }
 
 #[test]
@@ -236,5 +284,125 @@ fn for_words_case_subjects_and_each_pattern_lex_at_the_outer_depth() {
     ] {
         let script = format!("{}{inner}{}", "if :; then ".repeat(61), "; fi".repeat(61));
         parse(&script).expect("headers retain the outer depth");
+    }
+}
+
+#[test]
+fn generated_scripts_parse_and_drop_without_panicking_on_a_two_mib_stack() {
+    use arbitrary::Unstructured;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    two_mib(|| {
+        let cases = cases();
+        for case in 0_u32..1_024 {
+            let mut bytes = [0_u8; 512];
+            for (index, chunk) in bytes.chunks_exact_mut(8).enumerate() {
+                let mut hash = DefaultHasher::new();
+                (case, index).hash(&mut hash);
+                chunk.copy_from_slice(&hash.finish().to_le_bytes());
+            }
+            let mut input = Unstructured::new(&bytes);
+            let script = if (case as usize) < cases.len() {
+                cases[case as usize].script(2_000)
+            } else {
+                generated_script(&mut input, &cases).expect("bounded generator has enough bytes")
+            };
+            match parse(&script) {
+                Ok(program) => drop(program),
+                Err(
+                    ParseError::Lex { .. }
+                    | ParseError::Refused { .. }
+                    | ParseError::TooDeep { .. },
+                ) => {}
+            }
+        }
+    });
+}
+
+fn generated_script(
+    input: &mut arbitrary::Unstructured<'_>,
+    cases: &[Case],
+) -> arbitrary::Result<String> {
+    let fragments = [
+        "$(",
+        "${",
+        "$((",
+        "\"",
+        "'",
+        "cat <<E\n",
+        "\nE\n",
+        "case x in ",
+        "x) :;; esac",
+        "[[ ",
+        " ]]",
+        " >buf",
+        "2>&1",
+        "; ",
+        "\n",
+        "\\",
+        "💠",
+        "é",
+        "\0",
+        "echo ",
+        "}",
+        "))",
+        ")",
+        "${x:-",
+        "$(echo ",
+        "if :; then ",
+        "; fi",
+        "! ",
+        "1 + ",
+    ];
+    match input.int_in_range(0_u8..=3)? {
+        0 => {
+            let mut script = String::new();
+            for _ in 0..input.int_in_range(1..=64)? {
+                script.push_str(input.choose(&fragments)?);
+            }
+            Ok(script)
+        }
+        1 => {
+            let case = input.choose(cases)?;
+            let depth = *input.choose(&[0, 1, 4, 16, 31, 32, 63, 64, 128, 2_000])?;
+            Ok(case.script(depth))
+        }
+        2 => {
+            let wrappers = [
+                ("echo $(", ")"),
+                ("echo ${x:-", "}"),
+                ("if :; then ", "; fi"),
+                ("case x in x) ", ";; esac"),
+                ("{ ", "; }"),
+                ("cat <<E\n", "\nE\n"),
+                ("echo \"", "\""),
+            ];
+            let mut script = "echo é".to_owned();
+            for _ in 0..input.int_in_range(0..=64)? {
+                let (open, close) = input.choose(&wrappers)?;
+                script = format!("{open}{script}{close}");
+            }
+            if input.arbitrary()? {
+                let keep = input.int_in_range(0..=script.chars().count())?;
+                let end = script
+                    .char_indices()
+                    .nth(keep)
+                    .map_or(script.len(), |(index, _)| index);
+                script.truncate(end);
+            }
+            Ok(script)
+        }
+        3 => {
+            let mut script = "echo x".to_owned();
+            for level in 0..input.int_in_range(0..=64)? {
+                script = if input.arbitrary()? {
+                    format!("echo $(echo ${{x:-{script}}})")
+                } else {
+                    format!("echo $(cat <<E{level}\n${{x:-$({script})}}\nE{level}\n)")
+                };
+            }
+            Ok(script)
+        }
+        4..=u8::MAX => Err(arbitrary::Error::IncorrectFormat),
     }
 }

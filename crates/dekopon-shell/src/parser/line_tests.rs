@@ -1,10 +1,7 @@
-use super::{ParseError, parse};
+use super::parse;
 
 fn refusal_line(script: &str) -> usize {
-    match parse(script).expect_err("script is refused") {
-        ParseError::Syntax { line, .. } => line,
-        ParseError::Lex(error) => error.line,
-    }
+    parse(script).expect_err("script is refused").line()
 }
 
 #[test]
@@ -34,7 +31,10 @@ fn nested_arithmetic_refusal_has_absolute_line_three() {
 
 #[test]
 fn arithmetic_in_a_multiline_word_uses_its_absolute_line() {
-    assert_eq!(refusal_line("echo prefix\"first\nsecond\n$(( 1 & 2 ))\""), 3);
+    assert_eq!(
+        refusal_line("echo prefix\"first\nsecond\n$(( 1 & 2 ))\""),
+        3
+    );
 }
 
 #[test]
