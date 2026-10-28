@@ -3,8 +3,6 @@
 
 use std::{collections::VecDeque, fmt, iter::Peekable, str::CharIndices};
 
-use thiserror::Error;
-
 use crate::{
     ast::{Index, Modifier, Parameter, Stream, Word, WordPart},
     parser::{self, ParseError},
@@ -77,51 +75,103 @@ impl fmt::Display for TokenKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("line {line}: {message}")]
-pub struct LexError {
-    pub line: usize,
-    pub message: String,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LexError {
+    Backtick,
+    UnterminatedHereDocument {
+        delimiter: String,
+    },
+    TrailingBackslash,
+    UnterminatedSingleQuoted,
+    HereString,
+    UnterminatedHereDelimiter,
+    SplitHereDelimiter,
+    ExpectedHereDelimiter,
+    PositionalOutOfRange {
+        digits: String,
+    },
+    EmptyParameter,
+    IndexAfterAll {
+        name: String,
+    },
+    UnterminatedParameter,
+    LengthWithTransformation {
+        name: String,
+        first: char,
+    },
+    ColonInPattern {
+        name: String,
+        operator: char,
+    },
+    UnsupportedParameter {
+        name: String,
+        colon: bool,
+        other: char,
+    },
+    OperatorInParameter {
+        operator: Option<TokenKind>,
+        character: char,
+    },
+    UnterminatedIndex,
+    EmptyIndex,
+    MultipleIndexExpressions,
+    UnterminatedArithmetic,
+    ArithmeticClosingText,
+    DuplicationTarget,
+    UnknownDescriptor,
+    InputDuplication,
+    BothDuplication,
+    CaseFallthrough,
+    UnterminatedDoubleQuoted,
+    UnterminatedHereBody,
 }
 
-fn lex_error(error: ParseError) -> LexError {
-    match error {
-        ParseError::Lex(error) => error,
-        ParseError::Syntax { line, message } => LexError::new(line, message),
+impl std::fmt::Display for LexError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backtick => formatter.write_str("backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"),
+            Self::UnterminatedHereDocument { delimiter } => write!(formatter, "unterminated here-document: the script ended before a line containing exactly {:?}", delimiter),
+            Self::TrailingBackslash => formatter.write_str("script ends with a trailing backslash"),
+            Self::UnterminatedSingleQuoted => formatter.write_str("unterminated single-quoted string"),
+            Self::HereString => formatter.write_str("the here-string `<<<` is not supported; pipe the value instead, as in `echo \"$x\" | cmd`, or use a here-document `<<EOF ... EOF`"),
+            Self::UnterminatedHereDelimiter => formatter.write_str("unterminated quoted here-document delimiter"),
+            Self::SplitHereDelimiter => formatter.write_str("a here-document delimiter cannot be split across lines; write it on the same line as `<<`"),
+            Self::ExpectedHereDelimiter => formatter.write_str("expected a here-document delimiter after `<<`, as in `cat <<EOF`"),
+            Self::PositionalOutOfRange { digits } => write!(formatter, "positional parameter ${digits} is out of range"),
+            Self::EmptyParameter => formatter.write_str("empty ${} parameter reference"),
+            Self::IndexAfterAll { name } => write!(formatter, "${{{name}[@]}} selects every element, so it cannot be indexed further"),
+            Self::UnterminatedParameter => formatter.write_str("unterminated ${} parameter reference"),
+            Self::LengthWithTransformation { name, first } => write!(formatter, "${{#{name}{first}...}} combines a length with a transformation; ask for one or the other"),
+            Self::ColonInPattern { name, operator } => write!(formatter, "`${{{name}:{operator}...}}` is not a parameter expansion; drop the colon"),
+            Self::UnsupportedParameter { name, colon, other } => write!(formatter,
+                        "unsupported ${{{name}{}{other}...}} parameter expansion; this shell keeps \
+                         ${{NAME}}, ${{NAME[index]}}, ${{#NAME}}, `:-`, `:=`, `:?`, `:+`, `#`, `%`, \
+                         and `/`",
+                        if *colon { ":" } else { "" }
+                    ),
+            Self::OperatorInParameter { operator, character } => write!(formatter, "`{}` is not allowed inside a ${{}} parameter expansion", operator.as_ref().map_or_else(|| character.to_string(), ToString::to_string)),
+            Self::UnterminatedIndex => formatter.write_str("unterminated ${NAME[index]} reference"),
+            Self::EmptyIndex => formatter.write_str("empty ${NAME[index]} reference"),
+            Self::MultipleIndexExpressions => formatter.write_str("${NAME[index]} accepts exactly one index expression"),
+            Self::UnterminatedArithmetic => formatter.write_str("unterminated $(( ... ))"),
+            Self::ArithmeticClosingText => formatter.write_str("unexpected text between the closing parentheses of $(( ... ))"),
+            Self::DuplicationTarget => formatter.write_str("a duplication must name a stream: write `>&1` or `>&2`; to write a buffer use `> name`, `2> name`, or `&> name`"),
+            Self::UnknownDescriptor => formatter.write_str("only descriptors 1 (the value stream) and 2 (the diagnostic stream) exist in this shell; there is nothing else to redirect"),
+            Self::InputDuplication => formatter.write_str("input duplication (`<&`) is not supported: there is no input descriptor to duplicate; pipe a value or `cat` a named buffer instead"),
+            Self::BothDuplication => formatter.write_str("`&>&` is not a redirection: `&>` already sends both streams to one buffer, so there is no second stream left to duplicate"),
+            Self::CaseFallthrough => formatter.write_str("`;&` and `;;&` are not supported: a `case` clause here runs alone and never falls through to the next; end every clause with `;;`"),
+            Self::UnterminatedDoubleQuoted => formatter.write_str("unterminated double-quoted string"),
+            Self::UnterminatedHereBody => formatter.write_str("unterminated here-document"),
+        }
     }
 }
 
-const BACKTICK_REJECTION: &str = "backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly";
-
-const UNKNOWN_DESCRIPTOR_REJECTION: &str = "only descriptors 1 (the value stream) and 2 (the diagnostic stream) exist in this shell; there is nothing else to redirect";
-
-const INPUT_DUPLICATION_REJECTION: &str = "input duplication (`<&`) is not supported: there is no input descriptor to duplicate; pipe a value or `cat` a named buffer instead";
-
-const BOTH_DUPLICATION_REJECTION: &str = "`&>&` is not a redirection: `&>` already sends both streams to one buffer, so there is no second stream left to duplicate";
-
-const DUPLICATION_TARGET_REJECTION: &str = "a duplication must name a stream: write `>&1` or `>&2`; to write a buffer use `> name`, `2> name`, or `&> name`";
-
-const HERE_STRING_REJECTION: &str = "the here-string `<<<` is not supported; pipe the value instead, as in `echo \"$x\" | cmd`, or use a here-document `<<EOF ... EOF`";
-
-const CASE_FALLTHROUGH_REJECTION: &str = "`;&` and `;;&` are not supported: a `case` clause here runs alone and never falls through to the next; end every clause with `;;`";
-
-/// A here-document's body begins on the line after its operator, so the token is left as a
-/// placeholder filled in once the scanner reaches that line.
 struct PendingHereDoc {
     delimiter: String,
     strip_tabs: bool,
     expand: bool,
     line: usize,
     token: usize,
-}
-
-impl LexError {
-    fn new(line: usize, message: impl Into<String>) -> Self {
-        Self {
-            line,
-            message: message.into(),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -131,8 +181,8 @@ enum Enclosure {
 }
 
 #[cfg(test)]
-pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source, crate::parser::depth::test_depth()).run()
+pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
+    Lexer::new(source, crate::parser::depth::test_depth(), 1).run()
 }
 
 pub(crate) struct Lexer<'a> {
@@ -152,16 +202,16 @@ pub(crate) struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    pub(crate) fn new(source: &'a str, depth: parser::depth::Depth) -> Self {
+    pub(crate) fn new(source: &'a str, depth: parser::depth::Depth, start_line: usize) -> Self {
         Self {
             source,
             chars: source.char_indices().peekable(),
-            line: 1,
+            line: start_line,
             tokens: VecDeque::new(),
             parts: Vec::new(),
             literal: String::new(),
             word_started: false,
-            word_line: 1,
+            word_line: start_line,
             word_offset: 0,
             token_offset: 0,
             pending_here_docs: Vec::new(),
@@ -170,7 +220,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn run(mut self) -> Result<Vec<Token>, LexError> {
+    fn run(mut self) -> Result<Vec<Token>, ParseError> {
         let mut tokens = Vec::new();
         while let Some(token) = self.next_token()? {
             tokens.push(token);
@@ -192,7 +242,7 @@ impl<'a> Lexer<'a> {
             .map_or(self.source.len(), |(index, _)| *index)
     }
 
-    pub(crate) fn next_token(&mut self) -> Result<Option<Token>, LexError> {
+    pub(crate) fn next_token(&mut self) -> Result<Option<Token>, ParseError> {
         if !self.tokens.is_empty() && self.pending_here_docs.is_empty() {
             return Ok(self.tokens.pop_front());
         }
@@ -213,7 +263,7 @@ impl<'a> Lexer<'a> {
                 '$' => self.read_dollar(index, Enclosure::Bare)?,
                 // Backticks are rejected by name rather than falling through as literal text, since
                 // silently treating them as text would make a script look like its command had run.
-                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
+                '`' => return Err(ParseError::lexical(self.line, LexError::Backtick)),
                 '|' | '&' | ';' | '<' | '>' | '(' | ')' => self.read_operator(character)?,
                 '{' | '}' if self.brace_is_reserved_word() => {
                     self.finish_word();
@@ -231,12 +281,11 @@ impl<'a> Lexer<'a> {
         }
         self.finish_word();
         if let Some(pending) = self.pending_here_docs.first() {
-            return Err(LexError::new(
+            return Err(ParseError::lexical(
                 pending.line,
-                format!(
-                    "unterminated here-document: the script ended before a line containing exactly {:?}",
-                    pending.delimiter
-                ),
+                LexError::UnterminatedHereDocument {
+                    delimiter: pending.delimiter.clone(),
+                },
             ));
         }
         Ok(self.tokens.pop_front())
@@ -313,7 +362,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_escape(&mut self) -> Result<(), LexError> {
+    fn read_escape(&mut self) -> Result<(), ParseError> {
         match self.chars.next() {
             Some((_, '\n')) => {
                 self.line += 1;
@@ -326,14 +375,11 @@ impl<'a> Lexer<'a> {
                 self.push_part(WordPart::SingleQuoted(character.to_string()));
                 Ok(())
             }
-            None => Err(LexError::new(
-                self.line,
-                "script ends with a trailing backslash",
-            )),
+            None => Err(ParseError::lexical(self.line, LexError::TrailingBackslash)),
         }
     }
 
-    fn read_single_quoted(&mut self) -> Result<(), LexError> {
+    fn read_single_quoted(&mut self) -> Result<(), ParseError> {
         let opened = self.line;
         let mut text = String::new();
         loop {
@@ -346,7 +392,10 @@ impl<'a> Lexer<'a> {
                     text.push(character);
                 }
                 None => {
-                    return Err(LexError::new(opened, "unterminated single-quoted string"));
+                    return Err(ParseError::lexical(
+                        opened,
+                        LexError::UnterminatedSingleQuoted,
+                    ));
                 }
             }
         }
@@ -354,8 +403,8 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn read_double_quoted(&mut self) -> Result<(), LexError> {
-        let parts = self.read_interpolated(Some('"'), "unterminated double-quoted string")?;
+    fn read_double_quoted(&mut self) -> Result<(), ParseError> {
+        let parts = self.read_interpolated(Some('"'), LexError::UnterminatedDoubleQuoted)?;
         self.push_part(WordPart::DoubleQuoted(parts));
         Ok(())
     }
@@ -366,8 +415,8 @@ impl<'a> Lexer<'a> {
     fn read_interpolated(
         &mut self,
         terminator: Option<char>,
-        unterminated: &str,
-    ) -> Result<Vec<WordPart>, LexError> {
+        unterminated: LexError,
+    ) -> Result<Vec<WordPart>, ParseError> {
         let opened = self.line;
         let escapable: &[char] = if terminator == Some('"') {
             &['"', '\\', '$', '`']
@@ -381,7 +430,7 @@ impl<'a> Lexer<'a> {
                 if terminator.is_none() {
                     break;
                 }
-                return Err(LexError::new(opened, unterminated));
+                return Err(ParseError::lexical(opened, unterminated.clone()));
             };
             if Some(character) == terminator {
                 break;
@@ -399,7 +448,7 @@ impl<'a> Lexer<'a> {
                             literal.push('\\');
                             break;
                         }
-                        return Err(LexError::new(opened, unterminated));
+                        return Err(ParseError::lexical(opened, unterminated.clone()));
                     }
                 },
                 '$' => {
@@ -414,7 +463,7 @@ impl<'a> Lexer<'a> {
                         None => literal.push('$'),
                     }
                 }
-                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
+                '`' => return Err(ParseError::lexical(self.line, LexError::Backtick)),
                 other => {
                     if other == '\n' {
                         self.line += 1;
@@ -429,9 +478,9 @@ impl<'a> Lexer<'a> {
         Ok(parts)
     }
 
-    fn read_here_doc_header(&mut self) -> Result<(), LexError> {
+    fn read_here_doc_header(&mut self) -> Result<(), ParseError> {
         if self.chars.peek().map(|(_, character)| *character) == Some('<') {
-            return Err(LexError::new(self.line, HERE_STRING_REJECTION));
+            return Err(ParseError::lexical(self.line, LexError::HereString));
         }
         let strip_tabs = self.chars.peek().map(|(_, character)| *character) == Some('-');
         if strip_tabs {
@@ -462,7 +511,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn read_here_doc_delimiter(&mut self) -> Result<(String, bool), LexError> {
+    fn read_here_doc_delimiter(&mut self) -> Result<(String, bool), ParseError> {
         let line = self.line;
         let mut delimiter = String::new();
         let mut quoted = false;
@@ -475,9 +524,9 @@ impl<'a> Lexer<'a> {
                         match self.chars.next() {
                             Some((_, closing)) if closing == character => break,
                             Some((_, '\n')) | None => {
-                                return Err(LexError::new(
+                                return Err(ParseError::lexical(
                                     line,
-                                    "unterminated quoted here-document delimiter",
+                                    LexError::UnterminatedHereDelimiter,
                                 ));
                             }
                             Some((_, other)) => delimiter.push(other),
@@ -492,17 +541,11 @@ impl<'a> Lexer<'a> {
                         // would create a terminator no body line could match, swallowing the rest
                         // of the script and skewing later line numbers.
                         Some((_, '\n')) => {
-                            return Err(LexError::new(
-                                line,
-                                "a here-document delimiter cannot be split across lines; write it on the same line as `<<`",
-                            ));
+                            return Err(ParseError::lexical(line, LexError::SplitHereDelimiter));
                         }
                         Some((_, escaped)) => delimiter.push(escaped),
                         None => {
-                            return Err(LexError::new(
-                                line,
-                                "script ends with a trailing backslash",
-                            ));
+                            return Err(ParseError::lexical(line, LexError::TrailingBackslash));
                         }
                     }
                 }
@@ -514,25 +557,23 @@ impl<'a> Lexer<'a> {
             }
         }
         if delimiter.is_empty() {
-            return Err(LexError::new(
-                line,
-                "expected a here-document delimiter after `<<`, as in `cat <<EOF`",
-            ));
+            return Err(ParseError::lexical(line, LexError::ExpectedHereDelimiter));
         }
         Ok((delimiter, !quoted))
     }
 
-    fn read_pending_here_doc_bodies(&mut self) -> Result<(), LexError> {
+    fn read_pending_here_doc_bodies(&mut self) -> Result<(), ParseError> {
         let pending = std::mem::take(&mut self.pending_here_docs);
         self.pending_here_doc_close = None;
         for specification in pending {
+            let body_line = self.line;
             let mut body = self.read_here_doc_body(&specification)?;
             // Values in this shell are not newline-terminated, so the last body line's newline is
             // dropped; keeping it would print an extra trailing blank line bash's heredoc does not
             // produce.
             body.pop();
             let parts = if specification.expand {
-                Self::interpolate_here_doc_body(&body, specification.line, self.depth)?
+                Self::interpolate_here_doc_body(&body, body_line, self.depth)?
             } else if body.is_empty() {
                 Vec::new()
             } else {
@@ -543,7 +584,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn read_here_doc_body(&mut self, specification: &PendingHereDoc) -> Result<String, LexError> {
+    fn read_here_doc_body(&mut self, specification: &PendingHereDoc) -> Result<String, ParseError> {
         let mut body = String::new();
         loop {
             let mut line = String::new();
@@ -570,12 +611,11 @@ impl<'a> Lexer<'a> {
                 return Ok(body);
             }
             if !terminated {
-                return Err(LexError::new(
+                return Err(ParseError::lexical(
                     specification.line,
-                    format!(
-                        "unterminated here-document: the script ended before a line containing exactly {:?}",
-                        specification.delimiter
-                    ),
+                    LexError::UnterminatedHereDocument {
+                        delimiter: specification.delimiter.clone(),
+                    },
                 ));
             }
             body.push_str(content);
@@ -587,15 +627,12 @@ impl<'a> Lexer<'a> {
         body: &str,
         line: usize,
         depth: parser::depth::Depth,
-    ) -> Result<Vec<WordPart>, LexError> {
-        let mut lexer = Lexer::new(body, depth);
-        lexer.line = line + 1;
-        lexer
-            .read_interpolated(None, "unterminated here-document")
-            .map_err(|error| LexError::new(error.line, error.message))
+    ) -> Result<Vec<WordPart>, ParseError> {
+        let mut lexer = Lexer::new(body, depth, line);
+        lexer.read_interpolated(None, LexError::UnterminatedHereBody)
     }
 
-    fn read_dollar(&mut self, index: usize, enclosure: Enclosure) -> Result<(), LexError> {
+    fn read_dollar(&mut self, index: usize, enclosure: Enclosure) -> Result<(), ParseError> {
         match self.read_dollar_part(index, enclosure)? {
             Some(part) => self.push_part(part),
             None => self.push_literal('$'),
@@ -607,7 +644,7 @@ impl<'a> Lexer<'a> {
         &mut self,
         dollar_index: usize,
         enclosure: Enclosure,
-    ) -> Result<Option<WordPart>, LexError> {
+    ) -> Result<Option<WordPart>, ParseError> {
         let Some((_, next)) = self.chars.peek().copied() else {
             return Ok(None);
         };
@@ -616,20 +653,15 @@ impl<'a> Lexer<'a> {
                 self.chars.next();
                 if self.chars.peek().map(|(_, character)| *character) == Some('(') {
                     self.chars.next();
-                    let body = self.read_balanced(dollar_index, '(', ')', 2, "$(( ... ))")?;
-                    let line = if self.word_started {
-                        self.word_line
-                    } else {
-                        self.line
-                    };
-                    return Ok(Some(WordPart::Arithmetic(
-                        parser::parse_arithmetic(&body, line, self.depth).map_err(lex_error)?,
-                    )));
+                    let line = self.line;
+                    let body = self.read_balanced(dollar_index, '(', ')', 2)?;
+                    return Ok(Some(WordPart::Arithmetic(parser::parse_arithmetic(
+                        &body, line, self.depth,
+                    )?)));
                 }
                 let start = self.offset();
                 let (program, consumed) =
-                    parser::parse_substitution(&self.source[start..], self.depth, self.line)
-                        .map_err(lex_error)?;
+                    parser::parse_substitution(&self.source[start..], self.depth, self.line)?;
                 let end = start + consumed;
                 while self.chars.peek().is_some_and(|(index, _)| *index < end) {
                     if let Some((_, '\n')) = self.chars.next() {
@@ -698,7 +730,7 @@ impl<'a> Lexer<'a> {
         name
     }
 
-    fn read_braced_parameter(&mut self, enclosure: Enclosure) -> Result<WordPart, LexError> {
+    fn read_braced_parameter(&mut self, enclosure: Enclosure) -> Result<WordPart, ParseError> {
         let line = self.line;
         match self.chars.peek().map(|(_, character)| *character) {
             Some('?') => {
@@ -741,10 +773,7 @@ impl<'a> Lexer<'a> {
                               reachable ParseIntError and the message already says out of range"
                 )]
                 let position = digits.parse::<usize>().map_err(|_| {
-                    LexError::new(
-                        line,
-                        format!("positional parameter ${digits} is out of range"),
-                    )
+                    ParseError::lexical(line, LexError::PositionalOutOfRange { digits })
                 })?;
                 return Ok(WordPart::Parameter(Parameter::Positional(position)));
             }
@@ -759,21 +788,16 @@ impl<'a> Lexer<'a> {
         line: usize,
         length: bool,
         enclosure: Enclosure,
-    ) -> Result<WordPart, LexError> {
+    ) -> Result<WordPart, ParseError> {
         let name = self.read_name();
         if name.is_empty() {
-            return Err(LexError::new(line, "empty ${} parameter reference"));
+            return Err(ParseError::lexical(line, LexError::EmptyParameter));
         }
 
         let mut indices = Vec::new();
         while self.chars.peek().map(|(_, character)| *character) == Some('[') {
             if matches!(indices.last(), Some(Index::All | Index::AllJoined)) {
-                return Err(LexError::new(
-                    line,
-                    format!(
-                        "${{{name}[@]}} selects every element, so it cannot be indexed further"
-                    ),
-                ));
+                return Err(ParseError::lexical(line, LexError::IndexAfterAll { name }));
             }
             self.chars.next();
             indices.push(self.read_index(line)?);
@@ -794,21 +818,22 @@ impl<'a> Lexer<'a> {
         name: &str,
         length: bool,
         enclosure: Enclosure,
-    ) -> Result<Modifier, LexError> {
+    ) -> Result<Modifier, ParseError> {
         let first = match self.chars.peek().map(|(_, character)| *character) {
             Some('}') => {
                 self.chars.next();
                 return Ok(Modifier::None);
             }
             Some(character) => character,
-            None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
+            None => return Err(ParseError::lexical(line, LexError::UnterminatedParameter)),
         };
         if length {
-            return Err(LexError::new(
+            return Err(ParseError::lexical(
                 line,
-                format!(
-                    "${{#{name}{first}...}} combines a length with a transformation; ask for one or the other"
-                ),
+                LexError::LengthWithTransformation {
+                    name: name.to_owned(),
+                    first,
+                },
             ));
         }
         self.chars.next();
@@ -817,7 +842,7 @@ impl<'a> Lexer<'a> {
         let operator = if colon {
             match self.chars.next() {
                 Some((_, character)) => character,
-                None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
+                None => return Err(ParseError::lexical(line, LexError::UnterminatedParameter)),
             }
         } else {
             first
@@ -845,11 +870,12 @@ impl<'a> Lexer<'a> {
                 word: self.read_modifier_word(line, &['}'], enclosure)?.0,
             },
             '#' | '%' | '/' if colon => {
-                return Err(LexError::new(
+                return Err(ParseError::lexical(
                     line,
-                    format!(
-                        "`${{{name}:{operator}...}}` is not a parameter expansion; drop the colon"
-                    ),
+                    LexError::ColonInPattern {
+                        name: name.to_owned(),
+                        operator,
+                    },
                 ));
             }
             '#' | '%' => {
@@ -859,13 +885,9 @@ impl<'a> Lexer<'a> {
                 }
                 let pattern = self.read_modifier_word(line, &['}'], Enclosure::Bare)?.0;
                 if operator == '#' {
-                    Modifier::StripPrefix(
-                        parser::parameter_pattern(pattern, line).map_err(lex_error)?,
-                    )
+                    Modifier::StripPrefix(parser::parameter_pattern(pattern, line)?)
                 } else {
-                    Modifier::StripSuffix(
-                        parser::parameter_pattern(pattern, line).map_err(lex_error)?,
-                    )
+                    Modifier::StripSuffix(parser::parameter_pattern(pattern, line)?)
                 }
             }
             '/' => {
@@ -882,19 +904,18 @@ impl<'a> Lexer<'a> {
                 };
                 Modifier::Replace {
                     all,
-                    pattern: parser::parameter_pattern(pattern, line).map_err(lex_error)?,
+                    pattern: parser::parameter_pattern(pattern, line)?,
                     replacement,
                 }
             }
             other => {
-                return Err(LexError::new(
+                return Err(ParseError::lexical(
                     line,
-                    format!(
-                        "unsupported ${{{name}{}{other}...}} parameter expansion; this shell keeps \
-                         ${{NAME}}, ${{NAME[index]}}, ${{#NAME}}, `:-`, `:=`, `:?`, `:+`, `#`, `%`, \
-                         and `/`",
-                        if colon { ":" } else { "" }
-                    ),
+                    LexError::UnsupportedParameter {
+                        name: name.to_owned(),
+                        colon,
+                        other,
+                    },
                 ));
             }
         };
@@ -906,7 +927,7 @@ impl<'a> Lexer<'a> {
         line: usize,
         terminators: &[char],
         enclosure: Enclosure,
-    ) -> Result<(Word, char), LexError> {
+    ) -> Result<(Word, char), ParseError> {
         if let Some((_, character)) = self.chars.peek().copied()
             && terminators.contains(&character)
         {
@@ -922,8 +943,8 @@ impl<'a> Lexer<'a> {
         result
     }
 
-    fn parameter_lexer<'b>(&self, source: &'b str, line: usize) -> Result<Lexer<'b>, LexError> {
-        let lexer = Lexer::new(source, self.depth.parameter(line)?);
+    fn parameter_lexer<'b>(&self, source: &'b str, line: usize) -> Result<Lexer<'b>, ParseError> {
+        let lexer = Lexer::new(source, self.depth.parameter(line)?, self.line);
         Ok(lexer)
     }
 
@@ -932,11 +953,11 @@ impl<'a> Lexer<'a> {
         line: usize,
         terminators: &[char],
         enclosure: Enclosure,
-    ) -> Result<(Word, char), LexError> {
+    ) -> Result<(Word, char), ParseError> {
         let mut braces = 0_usize;
         loop {
             let Some((index, character)) = self.chars.next() else {
-                return Err(LexError::new(line, "unterminated ${} parameter reference"));
+                return Err(ParseError::lexical(line, LexError::UnterminatedParameter));
             };
             if braces == 0 && terminators.contains(&character) {
                 self.flush_literal();
@@ -958,16 +979,16 @@ impl<'a> Lexer<'a> {
                     Enclosure::DoubleQuoted => self.read_double_quoted_parameter_escape()?,
                 },
                 '$' => self.read_dollar(index, enclosure)?,
-                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
+                '`' => return Err(ParseError::lexical(self.line, LexError::Backtick)),
                 '|' | '&' | ';' | '<' | '>' | '(' | ')' => {
                     self.read_operator(character)?;
                     let operator = self.tokens.back().map(|token| &token.kind);
-                    return Err(LexError::new(
+                    return Err(ParseError::lexical(
                         line,
-                        format!(
-                            "`{}` is not allowed inside a ${{}} parameter expansion",
-                            operator.map_or_else(|| character.to_string(), ToString::to_string)
-                        ),
+                        LexError::OperatorInParameter {
+                            operator: operator.cloned(),
+                            character,
+                        },
                     ));
                 }
                 other => {
@@ -985,12 +1006,15 @@ impl<'a> Lexer<'a> {
 
     // bash keeps these quotes as text and expands between them, yet a `}` between them does not
     // close the expansion.
-    fn read_double_quoted_parameter_quote(&mut self) -> Result<(), LexError> {
+    fn read_double_quoted_parameter_quote(&mut self) -> Result<(), ParseError> {
         let opened = self.line;
         self.push_literal('\'');
         loop {
             let Some((index, character)) = self.chars.next() else {
-                return Err(LexError::new(opened, "unterminated single-quoted string"));
+                return Err(ParseError::lexical(
+                    opened,
+                    LexError::UnterminatedSingleQuoted,
+                ));
             };
             match character {
                 '\'' => {
@@ -1003,7 +1027,7 @@ impl<'a> Lexer<'a> {
                 '\\' => self.read_double_quoted_parameter_escape()?,
                 '"' => self.read_double_quoted()?,
                 '$' => self.read_dollar(index, Enclosure::DoubleQuoted)?,
-                '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
+                '`' => return Err(ParseError::lexical(self.line, LexError::Backtick)),
                 other => {
                     if other == '\n' {
                         self.line += 1;
@@ -1014,7 +1038,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_double_quoted_parameter_escape(&mut self) -> Result<(), LexError> {
+    fn read_double_quoted_parameter_escape(&mut self) -> Result<(), ParseError> {
         match self.chars.next() {
             Some((_, '\n')) => self.line += 1,
             Some((_, escaped @ ('"' | '\\' | '$' | '`' | '}'))) => self.push_literal(escaped),
@@ -1023,19 +1047,16 @@ impl<'a> Lexer<'a> {
                 self.push_literal(other);
             }
             None => {
-                return Err(LexError::new(
-                    self.line,
-                    "script ends with a trailing backslash",
-                ));
+                return Err(ParseError::lexical(self.line, LexError::TrailingBackslash));
             }
         }
         Ok(())
     }
 
-    fn expect_brace_close(&mut self, line: usize) -> Result<(), LexError> {
+    fn expect_brace_close(&mut self, line: usize) -> Result<(), ParseError> {
         match self.chars.next() {
             Some((_, '}')) => Ok(()),
-            _ => Err(LexError::new(line, "unterminated ${} parameter reference")),
+            _ => Err(ParseError::lexical(line, LexError::UnterminatedParameter)),
         }
     }
 
@@ -1043,14 +1064,14 @@ impl<'a> Lexer<'a> {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    fn read_index(&mut self, line: usize) -> Result<Index, LexError> {
+    fn read_index(&mut self, line: usize) -> Result<Index, ParseError> {
         let mut text = String::new();
         let mut depth = 0_usize;
         loop {
             match self.chars.next() {
                 Some((_, ']')) if depth == 0 => break,
                 Some((_, '\n')) => {
-                    return Err(LexError::new(line, "unterminated ${NAME[index]} reference"));
+                    return Err(ParseError::lexical(line, LexError::UnterminatedIndex));
                 }
                 Some((_, character)) => {
                     match character {
@@ -1060,7 +1081,7 @@ impl<'a> Lexer<'a> {
                     }
                     text.push(character);
                 }
-                None => return Err(LexError::new(line, "unterminated ${NAME[index]} reference")),
+                None => return Err(ParseError::lexical(line, LexError::UnterminatedIndex)),
             }
         }
         match text.as_str() {
@@ -1075,11 +1096,11 @@ impl<'a> Lexer<'a> {
         });
         let word = words
             .next()
-            .ok_or_else(|| LexError::new(line, "empty ${NAME[index]} reference"))?;
+            .ok_or_else(|| ParseError::lexical(line, LexError::EmptyIndex))?;
         if words.next().is_some() {
-            return Err(LexError::new(
+            return Err(ParseError::lexical(
                 line,
-                "${NAME[index]} accepts exactly one index expression",
+                LexError::MultipleIndexExpressions,
             ));
         }
         Ok(Index::At(word))
@@ -1091,15 +1112,17 @@ impl<'a> Lexer<'a> {
         open: char,
         close: char,
         mut depth: usize,
-        label: &str,
-    ) -> Result<String, LexError> {
+    ) -> Result<String, ParseError> {
         let opened = self.line;
         let initial = depth;
         let start = dollar_index + '$'.len_utf8() + open.len_utf8() * depth;
         let mut body_end = None;
         loop {
             let Some((index, character)) = self.chars.next() else {
-                return Err(LexError::new(opened, format!("unterminated {label}")));
+                return Err(ParseError::lexical(
+                    opened,
+                    LexError::UnterminatedArithmetic,
+                ));
             };
             match character {
                 '\n' => self.line += 1,
@@ -1151,11 +1174,9 @@ impl<'a> Lexer<'a> {
                     if depth == 0 {
                         let end = body_end.unwrap_or(index);
                         if index != end + close.len_utf8() {
-                            return Err(LexError::new(
+                            return Err(ParseError::lexical(
                                 opened,
-                                format!(
-                                    "unexpected text between the closing parentheses of {label}"
-                                ),
+                                LexError::ArithmeticClosingText,
                             ));
                         }
                         return Ok(self.source[start..end].to_owned());
@@ -1166,11 +1187,11 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_duplication(&mut self, source: Stream) -> Result<(), LexError> {
+    fn read_duplication(&mut self, source: Stream) -> Result<(), ParseError> {
         let target = match self.chars.peek().map(|(_, character)| *character) {
             Some('1') => Stream::Stdout,
             Some('2') => Stream::Stderr,
-            _ => return Err(LexError::new(self.line, DUPLICATION_TARGET_REJECTION)),
+            _ => return Err(ParseError::lexical(self.line, LexError::DuplicationTarget)),
         };
         self.chars.next();
         if self
@@ -1178,13 +1199,13 @@ impl<'a> Lexer<'a> {
             .peek()
             .is_some_and(|(_, character)| character.is_ascii_digit())
         {
-            return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION));
+            return Err(ParseError::lexical(self.line, LexError::UnknownDescriptor));
         }
         self.push(TokenKind::Duplicate { source, target });
         Ok(())
     }
 
-    fn read_operator(&mut self, character: char) -> Result<(), LexError> {
+    fn read_operator(&mut self, character: char) -> Result<(), ParseError> {
         // A leading descriptor digit, as in 2>, belongs to the redirection operator, not to argv;
         // treating it as an ordinary word would redirect the command's own output where the script
         // never asked.
@@ -1198,7 +1219,7 @@ impl<'a> Lexer<'a> {
             source = match self.literal.as_str() {
                 "1" => Stream::Stdout,
                 "2" => Stream::Stderr,
-                _ => return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION)),
+                _ => return Err(ParseError::lexical(self.line, LexError::UnknownDescriptor)),
             };
             self.literal.clear();
             self.word_started = false;
@@ -1208,12 +1229,12 @@ impl<'a> Lexer<'a> {
             && !self.literal.is_empty()
             && self.literal.chars().all(|digit| digit.is_ascii_digit())
         {
-            return Err(LexError::new(self.line, INPUT_DUPLICATION_REJECTION));
+            return Err(ParseError::lexical(self.line, LexError::InputDuplication));
         }
         self.finish_word();
         let next = self.chars.peek().map(|(_, character)| *character);
         if matches!((character, next), ('<', Some('&'))) {
-            return Err(LexError::new(self.line, INPUT_DUPLICATION_REJECTION));
+            return Err(ParseError::lexical(self.line, LexError::InputDuplication));
         }
         if character == '>' && next == Some('&') {
             self.chars.next();
@@ -1232,7 +1253,7 @@ impl<'a> Lexer<'a> {
             ('&', Some('>')) => {
                 self.chars.next();
                 if self.chars.peek().map(|(_, character)| *character) == Some('&') {
-                    return Err(LexError::new(self.line, BOTH_DUPLICATION_REJECTION));
+                    return Err(ParseError::lexical(self.line, LexError::BothDuplication));
                 }
                 let append = self.chars.peek().map(|(_, character)| *character) == Some('>');
                 if append {
@@ -1247,11 +1268,13 @@ impl<'a> Lexer<'a> {
             (';', Some(';')) => {
                 self.chars.next();
                 if self.chars.peek().map(|(_, character)| *character) == Some('&') {
-                    return Err(LexError::new(self.line, CASE_FALLTHROUGH_REJECTION));
+                    return Err(ParseError::lexical(self.line, LexError::CaseFallthrough));
                 }
                 TokenKind::DoubleSemicolon
             }
-            (';', Some('&')) => return Err(LexError::new(self.line, CASE_FALLTHROUGH_REJECTION)),
+            (';', Some('&')) => {
+                return Err(ParseError::lexical(self.line, LexError::CaseFallthrough));
+            }
             (';', _) => TokenKind::Semicolon,
             ('>', Some('>')) => {
                 self.chars.next();
@@ -1289,7 +1312,10 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Index, Modifier, Parameter, Stream, TokenKind, Word, WordPart, tokenize};
+    use super::{
+        Index, LexError, Modifier, Parameter, ParseError, Stream, TokenKind, Word, WordPart,
+        tokenize,
+    };
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         tokenize(source)
@@ -1402,7 +1428,7 @@ mod tests {
     #[test]
     fn a_pending_here_doc_records_a_case_pattern_close() {
         let source = "cat <<EOF; case a in a) `x`";
-        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth());
+        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth(), 1);
         let error = loop {
             match lexer.next_token() {
                 Ok(Some(_)) => {}
@@ -1410,17 +1436,14 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert_eq!(
-            error.to_string(),
-            "line 1: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
-        );
+        assert_eq!(error, ParseError::lexical(1, LexError::Backtick));
         assert_eq!(lexer.pending_here_doc_close(), source.find(')'));
     }
 
     #[test]
     fn a_pending_here_doc_records_a_function_close() {
         let source = "cat <<EOF; f() `x`";
-        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth());
+        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth(), 1);
         let error = loop {
             match lexer.next_token() {
                 Ok(Some(_)) => {}
@@ -1428,17 +1451,14 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert_eq!(
-            error.to_string(),
-            "line 1: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
-        );
+        assert_eq!(error, ParseError::lexical(1, LexError::Backtick));
         assert_eq!(lexer.pending_here_doc_close(), source.find(')'));
     }
 
     #[test]
     fn completed_here_docs_clear_a_pending_function_close() {
         let source = "cat <<EOF; cat <<'END'; f() { true; }\nhi\nEOF\nEND\n`x`";
-        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth());
+        let mut lexer = super::Lexer::new(source, crate::parser::depth::test_depth(), 1);
         let error = loop {
             match lexer.next_token() {
                 Ok(Some(_)) => {}
@@ -1446,18 +1466,25 @@ mod tests {
                 Err(error) => break error,
             }
         };
-        assert_eq!(
-            error.to_string(),
-            "line 5: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
-        );
+        assert_eq!(error, ParseError::lexical(5, LexError::Backtick));
         assert_eq!(lexer.pending_here_doc_close(), None);
     }
 
     #[test]
     fn parameter_word_newlines_preserve_following_diagnostic_lines() {
         let error = tokenize("echo \"${x:-a\nb}\"\n${y:^^}").expect_err("unsupported modifier");
-        assert!(error.message.contains("this shell keeps"), "{error}");
-        assert_eq!(error.line, 3);
+        assert_eq!(
+            error,
+            ParseError::lexical(
+                3,
+                LexError::UnsupportedParameter {
+                    name: "y".to_owned(),
+                    colon: true,
+                    other: '^'
+                }
+            )
+        );
+        assert_eq!(error.line(), 3);
     }
 
     #[test]
@@ -1596,28 +1623,101 @@ mod tests {
     #[test]
     fn every_dropped_parameter_expansion_is_rejected_by_name() {
         for (source, expected) in [
-            ("echo ${arr[@][0]}", "cannot be indexed further"),
+            (
+                "echo ${arr[@][0]}",
+                LexError::IndexAfterAll {
+                    name: "arr".to_owned(),
+                },
+            ),
             (
                 "echo ${#items:-x}",
-                "combines a length with a transformation",
+                LexError::LengthWithTransformation {
+                    name: "items".to_owned(),
+                    first: ':',
+                },
             ),
-            ("echo ${name:#a}", "drop the colon"),
-            ("echo ${name^^}", "this shell keeps"),
-            ("echo ${name@Q}", "this shell keeps"),
-            ("echo ${}", "empty ${} parameter reference"),
-            ("echo ${name", "unterminated"),
-            ("echo ${name:-a|b}", "is not allowed inside"),
-            ("echo ${name:-a;b}", "is not allowed inside"),
-            ("echo ${name:-a&b}", "is not allowed inside"),
-            ("echo ${name:-a<b}", "is not allowed inside"),
-            ("echo ${name:-a>b}", "is not allowed inside"),
-            ("echo ${name:-a(b)c}", "is not allowed inside"),
-            ("echo ${name:-a)b}", "is not allowed inside"),
+            (
+                "echo ${name:#a}",
+                LexError::ColonInPattern {
+                    name: "name".to_owned(),
+                    operator: '#',
+                },
+            ),
+            (
+                "echo ${name^^}",
+                LexError::UnsupportedParameter {
+                    name: "name".to_owned(),
+                    colon: false,
+                    other: '^',
+                },
+            ),
+            (
+                "echo ${name@Q}",
+                LexError::UnsupportedParameter {
+                    name: "name".to_owned(),
+                    colon: false,
+                    other: '@',
+                },
+            ),
+            ("echo ${}", LexError::EmptyParameter),
+            ("echo ${name", LexError::UnterminatedParameter),
+            (
+                "echo ${name:-a|b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::Pipe),
+                    character: '|',
+                },
+            ),
+            (
+                "echo ${name:-a;b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::Semicolon),
+                    character: ';',
+                },
+            ),
+            (
+                "echo ${name:-a&b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::Ampersand),
+                    character: '&',
+                },
+            ),
+            (
+                "echo ${name:-a<b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::Less),
+                    character: '<',
+                },
+            ),
+            (
+                "echo ${name:-a>b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::Redirect {
+                        source: Stream::Stdout,
+                        append: false,
+                    }),
+                    character: '>',
+                },
+            ),
+            (
+                "echo ${name:-a(b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::LeftParen),
+                    character: '(',
+                },
+            ),
+            (
+                "echo ${name:-a)b}",
+                LexError::OperatorInParameter {
+                    operator: Some(TokenKind::RightParen),
+                    character: ')',
+                },
+            ),
         ] {
             let error = tokenize(source)
                 .map(|tokens| format!("{tokens:?}"))
                 .expect_err(source);
-            assert!(error.message.contains(expected), "{source}: {error}");
+            assert_eq!(error, ParseError::lexical(1, expected), "{source}");
         }
     }
 
@@ -1645,8 +1745,7 @@ mod tests {
     fn backtick_substitution_is_rejected_by_name() {
         for source in ["echo `echo hi`", r#"echo "`echo hi`""#, "x=`date`"] {
             let error = tokenize(source).expect_err("backticks are dropped");
-            assert!(error.message.contains("backtick"), "{source}: {error}");
-            assert!(error.message.contains("$( ... )"), "{source}: {error}");
+            assert_eq!(error, ParseError::lexical(1, LexError::Backtick));
         }
         assert_eq!(
             single_word(r"\`"),
@@ -1708,16 +1807,16 @@ mod tests {
     #[test]
     fn descriptors_this_shell_does_not_have_are_rejected_by_name() {
         for (source, expected) in [
-            ("cmd 3> buf", "only descriptors 1"),
-            ("cmd 2>&3", "must name a stream"),
-            ("cmd >&12", "only descriptors 1"),
-            ("cmd 0< buf", "input duplication"),
-            ("cmd <& 1", "input duplication"),
-            ("cmd &>& buf", "`&>&` is not a redirection"),
-            ("cmd >& buf", "must name a stream"),
+            ("cmd 3> buf", LexError::UnknownDescriptor),
+            ("cmd 2>&3", LexError::DuplicationTarget),
+            ("cmd >&12", LexError::UnknownDescriptor),
+            ("cmd 0< buf", LexError::InputDuplication),
+            ("cmd <& 1", LexError::InputDuplication),
+            ("cmd &>& buf", LexError::BothDuplication),
+            ("cmd >& buf", LexError::DuplicationTarget),
         ] {
             let error = tokenize(source).expect_err("rejected");
-            assert!(error.message.contains(expected), "{source}: {error}");
+            assert_eq!(error, ParseError::lexical(1, expected), "{source}");
         }
     }
 
@@ -1726,7 +1825,7 @@ mod tests {
         assert!(kinds("a;;").contains(&TokenKind::DoubleSemicolon));
         for source in ["a;;&", "a;&"] {
             let error = tokenize(source).expect_err("fall-through is dropped");
-            assert!(error.message.contains("falls through"), "{source}: {error}");
+            assert_eq!(error, ParseError::lexical(1, LexError::CaseFallthrough));
         }
     }
 
@@ -1827,27 +1926,37 @@ mod tests {
     }
 
     #[test]
-    fn a_diagnostic_inside_a_here_document_body_counts_from_the_body() {
+    fn a_diagnostic_inside_a_here_document_body_has_an_absolute_line() {
         let error = tokenize("echo one\ncat <<EOF\nbad `sub`\nEOF\n").expect_err("backticks");
-        assert_eq!(error.line, 3, "{error}");
+        assert_eq!(error.line(), 3, "{error}");
     }
 
     #[test]
     fn a_here_document_delimiter_cannot_be_split_across_lines() {
         let error = tokenize("cat <<\\\nEOF\nbody\nEOF\n").expect_err("a split delimiter");
-        assert!(error.message.contains("cannot be split"), "{error}");
+        assert_eq!(error, ParseError::lexical(1, LexError::SplitHereDelimiter));
     }
 
     #[test]
     fn malformed_here_documents_are_rejected_by_name() {
         for (source, expected) in [
-            ("cat <<EOF\nbody\n", "unterminated here-document"),
-            ("cat <<EOF", "unterminated here-document"),
-            ("cat <<\n", "expected a here-document delimiter"),
-            ("cat <<<\"$x\"", "here-string"),
+            (
+                "cat <<EOF\nbody\n",
+                LexError::UnterminatedHereDocument {
+                    delimiter: "EOF".to_owned(),
+                },
+            ),
+            (
+                "cat <<EOF",
+                LexError::UnterminatedHereDocument {
+                    delimiter: "EOF".to_owned(),
+                },
+            ),
+            ("cat <<\n", LexError::ExpectedHereDelimiter),
+            ("cat <<<\"$x\"", LexError::HereString),
         ] {
             let error = tokenize(source).expect_err(source);
-            assert!(error.message.contains(expected), "{source}: {error}");
+            assert_eq!(error, ParseError::lexical(1, expected), "{source}");
         }
     }
 
@@ -1905,7 +2014,10 @@ mod tests {
     #[test]
     fn unterminated_quotes_are_reported_with_a_line() {
         let error = tokenize("echo 'open").expect_err("unterminated quote");
-        assert_eq!(error.line, 1);
-        assert!(error.message.contains("unterminated"), "{error}");
+        assert_eq!(error.line(), 1);
+        assert_eq!(
+            error,
+            ParseError::lexical(1, LexError::UnterminatedSingleQuoted)
+        );
     }
 }

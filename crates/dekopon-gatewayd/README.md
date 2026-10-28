@@ -25,7 +25,10 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   Declaration order is the precedence rule: a named channel written above a catch-all keeps
   its own traffic. Unmatched traffic is ignored, and a channel initially requires the bot to be
   @-mentioned. In Slack Agent mode, fresh authorization claims that exact sender/thread so later
-  unmentioned follow-ups can continue; every other ambient channel message remains ignored.
+  unmentioned follow-ups can continue. Slack routes may opt into `ambient.pullRequestLinks`
+  with existing follow and journal configuration: a PR link starts a threaded review turn using
+  only the poster’s broker leg, downscoped by a mapped channel. Other speakers wait for separate
+  turns. See [Slack pull-request links](../../docs/gatewayd.md#slack-pull-request-links).
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Feature-only fauxlack also reads manifest files from its world. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.

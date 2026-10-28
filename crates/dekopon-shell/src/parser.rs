@@ -5,7 +5,9 @@ mod nested;
 
 use depth::Depth;
 use nested::Construct;
-use thiserror::Error;
+mod refusal;
+pub(crate) use refusal::ParseError;
+use refusal::{Found, Refusal, TooDeep};
 
 use crate::{
     ast::{
@@ -14,7 +16,7 @@ use crate::{
         FunctionDefinition, IfStatement, Pattern, Pipeline, Program, Redirect, RedirectTarget,
         SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
     },
-    lexer::{LexError, Lexer, Token, TokenKind},
+    lexer::{Lexer, Token, TokenKind},
 };
 
 /// Without this ceiling, deeply nested command substitution overflows the native stack and aborts
@@ -28,38 +30,21 @@ pub(crate) const RESERVED_WORDS: &[&str] = &[
     "until", "select", "function", "[[", "]]",
 ];
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ParseError {
-    #[error(transparent)]
-    Lex(#[from] LexError),
-    #[error("line {line}: {message}")]
-    Syntax { line: usize, message: String },
-}
-
-impl ParseError {
-    fn syntax(line: usize, message: impl Into<String>) -> Self {
-        Self::Syntax {
-            line,
-            message: message.into(),
-        }
-    }
-}
-
 pub fn parse(source: &str) -> Result<Program, ParseError> {
     depth::parse(source)
 }
 
-fn parse_nested(source: &str, depth: Depth) -> Result<Program, ParseError> {
-    let mut parser = Parser::new(source, depth);
+fn parse_nested(source: &str, depth: Depth, start_line: usize) -> Result<Program, ParseError> {
+    let mut parser = Parser::new(source, depth, start_line);
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
-        return Err(error.into());
+        return Err(error);
     }
     let program = result?;
     if let Some(token) = parser.peek() {
         let line = token.line;
         let kind = token.kind.clone();
-        return Err(ParseError::syntax(line, format!("unexpected {kind}")));
+        return Err(ParseError::refused(line, Refusal::UnexpectedToken { kind }));
     }
     Ok(program)
 }
@@ -70,18 +55,18 @@ pub(crate) fn parse_substitution(
     line: usize,
 ) -> Result<(Program, usize), ParseError> {
     let depth = depth.substitution(line)?;
-    let mut parser = Parser::new(source, depth);
+    let mut parser = Parser::new(source, depth, line);
     parser.substitution = true;
     let result = parser.parse_program(&[]);
     if let Some(error) = parser.lex_error.take() {
         if let Some(close) = parser.lexer.pending_here_doc_close() {
-            parse_nested(&source[..close + 1], depth)?;
+            parse_nested(&source[..close + 1], depth, line)?;
         }
-        return Err(error.into());
+        return Err(error);
     }
     let program = result?;
     let Some(token) = parser.peek() else {
-        return Err(ParseError::syntax(line, "unterminated $( ... )"));
+        return Err(ParseError::refused(line, Refusal::UnterminatedSubstitution));
     };
     let token_line = token.line;
     let end = token.offset + 1;
@@ -89,9 +74,9 @@ pub(crate) fn parse_substitution(
         TokenKind::RightParen => {
             if parser.lexer.offset() != end {
                 // Reparse the bounded prefix to preserve the here-document's delimiter-specific refusal.
-                return parse_nested(&source[..end], depth).and(Err(ParseError::syntax(
+                return parse_nested(&source[..end], depth, line).and(Err(ParseError::refused(
                     token_line,
-                    "unterminated here-document",
+                    Refusal::UnterminatedHereDocument,
                 )));
             }
             Ok((program, end))
@@ -111,9 +96,10 @@ pub(crate) fn parse_substitution(
         | TokenKind::Duplicate { .. }
         | TokenKind::Less
         | TokenKind::HereDoc(_)
-        | TokenKind::LessParen) => {
-            Err(ParseError::syntax(token_line, format!("unexpected {kind}")))
-        }
+        | TokenKind::LessParen) => Err(ParseError::refused(
+            token_line,
+            Refusal::UnexpectedToken { kind: kind.clone() },
+        )),
     }
 }
 
@@ -127,52 +113,45 @@ fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), Pa
                 && (later.source == copied || later.source == Stream::Both)
         });
         if reassigned {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!(
-                    "`{}>&{}` must come after the redirection of stream {}, not before it: \
-                     write `> name {}>&{}` rather than `{}>&{} > name`",
-                    redirect.source.descriptor(),
-                    copied.descriptor(),
-                    copied.descriptor(),
-                    redirect.source.descriptor(),
-                    copied.descriptor(),
-                    redirect.source.descriptor(),
-                    copied.descriptor(),
-                ),
+                Refusal::DuplicationOrder {
+                    source: redirect.source,
+                    copied,
+                },
             ));
         }
     }
     Ok(())
 }
 
-fn too_deep(line: usize, construct: &str) -> ParseError {
-    ParseError::syntax(
+fn too_deep(line: usize, construct: Construct) -> ParseError {
+    ParseError::TooDeep {
         line,
-        format!(
-            "{construct} nested more than {MAX_NESTING_DEPTH} levels deep; this shell parses on a fixed stack and refuses rather than risking it"
-        ),
-    )
+        refusal: TooDeep::Grammar { construct },
+    }
 }
 
 struct Parser<'a> {
     source: &'a str,
+    start_line: usize,
     tokens: Vec<Token>,
     position: usize,
     depth: Depth,
     lexer: Lexer<'a>,
-    lex_error: Option<LexError>,
+    lex_error: Option<ParseError>,
     substitution: bool,
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, depth: Depth) -> Self {
+    fn new(source: &'a str, depth: Depth, start_line: usize) -> Self {
         Self {
             source,
+            start_line,
             tokens: Vec::new(),
             position: 0,
             depth,
-            lexer: Lexer::new(source, depth),
+            lexer: Lexer::new(source, depth, start_line),
             lex_error: None,
             substitution: false,
         }
@@ -201,7 +180,10 @@ impl<'a> Parser<'a> {
     fn line(&mut self) -> usize {
         match self.peek() {
             Some(token) => token.line,
-            None => self.tokens.last().map_or(1, |token| token.line),
+            None => self
+                .tokens
+                .last()
+                .map_or(self.start_line, |token| token.line),
         }
     }
 
@@ -245,14 +227,18 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn expect_reserved(&mut self, expected: &str, context: &str) -> Result<(), ParseError> {
+    fn expect_reserved(
+        &mut self,
+        expected: &'static str,
+        context: Construct,
+    ) -> Result<(), ParseError> {
         if self.eat_reserved(expected) {
             return Ok(());
         }
         let line = self.line();
-        Err(ParseError::syntax(
+        Err(ParseError::refused(
             line,
-            format!("expected `{expected}` in {context}"),
+            Refusal::ExpectedReserved { expected, context },
         ))
     }
 
@@ -300,9 +286,9 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::Word(_)) if reserved => {}
                 Some(other) => {
                     let other = other.clone();
-                    return Err(ParseError::syntax(
+                    return Err(ParseError::refused(
                         line,
-                        format!("unexpected {other} after a command"),
+                        Refusal::UnexpectedAfterCommand { other },
                     ));
                 }
             }
@@ -313,12 +299,11 @@ impl<'a> Parser<'a> {
     fn background(&mut self, statement: Statement, start: usize) -> Result<Statement, ParseError> {
         let line = self.line();
         if let Statement::Function(definition) = &statement {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!(
-                    "`&` cannot follow the function definition `{}() {{ ... }}`: define the function, then start it as a job with `{} &`",
-                    definition.name, definition.name
-                ),
+                Refusal::BackgroundFunction {
+                    name: definition.name.clone(),
+                },
             ));
         }
         let source_end = self.source.len();
@@ -338,25 +323,22 @@ impl<'a> Parser<'a> {
             }
             Some("esac") => {
                 let line = self.line();
-                return Err(ParseError::syntax(line, "`esac` without a matching `case`"));
+                return Err(ParseError::refused(line, Refusal::UnmatchedEsac));
             }
             Some("select") => {
                 let line = self.line();
-                return Err(ParseError::syntax(
-                    line,
-                    "`select` is not part of this shell: there is no interactive terminal to prompt",
-                ));
+                return Err(ParseError::refused(line, Refusal::Select));
             }
             Some("function") => {
                 let line = self.line();
-                return Err(ParseError::syntax(
-                    line,
-                    "the `function` keyword is not part of this shell; define functions as `name() { ... }`",
-                ));
+                return Err(ParseError::refused(line, Refusal::FunctionKeyword));
             }
             Some(other) => {
                 let line = self.line();
-                return Err(ParseError::syntax(line, format!("unexpected `{other}`")));
+                return Err(ParseError::refused(
+                    line,
+                    Refusal::UnexpectedReserved { other },
+                ));
             }
             None => {}
         }
@@ -387,22 +369,21 @@ impl<'a> Parser<'a> {
 
         let line = self.line();
         if !is_valid_name(&name) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("{name:?} is not a valid function name"),
+                Refusal::InvalidFunctionName { name },
             ));
         }
         if let Some(rejected) = crate::builtins::RejectedCommand::lookup(&name) {
-            let reason = rejected.reason();
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("cannot define a function named {name:?}: {reason}"),
+                Refusal::RejectedFunction { name, rejected },
             ));
         }
         if RESERVED_WORDS.contains(&name.as_str()) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("cannot define a function named {name:?}: it is a reserved word"),
+                Refusal::ReservedFunction { name },
             ));
         }
 
@@ -410,18 +391,18 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         if !matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) {
             let line = self.line();
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("expected `{{` to open the body of function {name:?}"),
+                Refusal::ExpectedFunctionOpen { name },
             ));
         }
         self.position += 1;
         let body = self.nest(Construct::Function)?.parse_function_body()?;
         if !matches!(self.peek_kind(), Some(TokenKind::RightBrace)) {
             let line = self.line();
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("expected `}}` to close the body of function {name:?}"),
+                Refusal::ExpectedFunctionClose { name },
             ));
         }
         self.position += 1;
@@ -429,31 +410,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_for(&mut self) -> Result<ForLoop, ParseError> {
-        self.expect_reserved("for", "a `for` loop")?;
+        self.expect_reserved("for", Construct::For)?;
         let line = self.line();
         if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
-            return Err(ParseError::syntax(
-                line,
-                "C-style `for (( ... ))` loops are not supported; use `for x in ...` over a list, or a `while` loop with `i=$(( i + 1 ))`",
-            ));
+            return Err(ParseError::refused(line, Refusal::CStyleFor));
         }
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
-            return Err(ParseError::syntax(line, "expected a `for` loop variable"));
+            return Err(ParseError::refused(line, Refusal::ExpectedForVariable));
         };
         let Some(variable) = word.as_literal().map(str::to_owned) else {
-            return Err(ParseError::syntax(
-                line,
-                "a `for` loop variable must be a plain name",
-            ));
+            return Err(ParseError::refused(line, Refusal::ForVariableNotPlain));
         };
         if !is_valid_name(&variable) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                format!("{variable:?} is not a valid `for` loop variable name"),
+                Refusal::InvalidForVariable { variable },
             ));
         }
         self.position += 1;
-        self.expect_reserved("in", "a `for` loop")?;
+        self.expect_reserved("in", Construct::For)?;
 
         let mut words = Vec::new();
         while let Some(TokenKind::Word(word)) = self.peek_kind().cloned() {
@@ -465,23 +440,20 @@ impl<'a> Parser<'a> {
         }
 
         self.skip_separators();
-        self.expect_reserved("do", "a `for` loop")?;
+        self.expect_reserved("do", Construct::For)?;
         self.nest(Construct::For)?.parse_for_body(variable, words)
     }
 
     fn parse_case(&mut self) -> Result<CaseStatement, ParseError> {
-        self.expect_reserved("case", "a `case` statement")?;
+        self.expect_reserved("case", Construct::Case)?;
         let line = self.line();
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
-            return Err(ParseError::syntax(
-                line,
-                "expected a word to match after `case`",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedCaseSubject));
         };
         let subject = word.clone();
         self.position += 1;
         self.skip_newlines();
-        self.expect_reserved("in", "a `case` statement")?;
+        self.expect_reserved("in", Construct::Case)?;
 
         let mut clauses = Vec::new();
         loop {
@@ -491,14 +463,17 @@ impl<'a> Parser<'a> {
             }
             if self.peek().is_none() {
                 let line = self.line();
-                return Err(ParseError::syntax(
+                return Err(ParseError::refused(
                     line,
-                    "expected `esac` in a `case` statement",
+                    Refusal::ExpectedReserved {
+                        expected: "esac",
+                        context: Construct::Case,
+                    },
                 ));
             }
             clauses.push(self.parse_case_clause()?);
         }
-        self.expect_reserved("esac", "a `case` statement")?;
+        self.expect_reserved("esac", Construct::Case)?;
         Ok(CaseStatement { subject, clauses })
     }
 
@@ -515,10 +490,7 @@ impl<'a> Parser<'a> {
         }
         if !matches!(self.peek_kind(), Some(TokenKind::RightParen)) {
             let line = self.line();
-            return Err(ParseError::syntax(
-                line,
-                "expected `)` to close a `case` pattern list",
-            ));
+            return Err(ParseError::refused(line, Refusal::ExpectedCasePatternClose));
         }
         self.position += 1;
 
@@ -528,12 +500,12 @@ impl<'a> Parser<'a> {
     fn parse_case_pattern(&mut self) -> Result<CasePattern, ParseError> {
         let line = self.line();
         let Some(TokenKind::Word(word)) = self.peek_kind() else {
-            let found = self
-                .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
+            let found = self.peek_kind().cloned();
+            return Err(ParseError::refused(
                 line,
-                format!("expected a `case` pattern, found {found}"),
+                Refusal::ExpectedCasePattern {
+                    found: Found(found),
+                },
             ));
         };
         let word = word.clone();
@@ -546,9 +518,9 @@ impl<'a> Parser<'a> {
 
         if word_is_constant(&word) {
             if let Some(character) = literal_pattern_metacharacter(&word) {
-                return Err(ParseError::syntax(
+                return Err(ParseError::refused(
                     line,
-                    unsupported_case_pattern(character),
+                    Refusal::CasePattern { character },
                 ));
             }
             return Ok(CasePattern::Literal(word));
@@ -688,36 +660,30 @@ impl<'a> Parser<'a> {
         }
 
         if words.is_empty() {
-            let found = self
-                .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
+            let found = self.peek_kind().cloned();
+            return Err(ParseError::refused(
                 line,
-                format!("expected a condition inside `[[ ... ]]`, found {found}"),
+                Refusal::ExpectedCondition {
+                    found: Found(found),
+                },
             ));
         }
         if words.len() > 3 {
-            return Err(ParseError::syntax(
-                line,
-                "a `[[ ... ]]` condition takes at most three operands; join conditions with `&&`,                  `||`, or parentheses",
-            ));
+            return Err(ParseError::refused(line, Refusal::TooManyConditionOperands));
         }
 
         let mut check_right_pattern = false;
         if let [_, operator, right] = words.as_slice() {
             let operator = operator.as_literal().unwrap_or_default().to_owned();
             if operator == "=~" {
-                return Err(ParseError::syntax(
-                    line,
-                    "`=~` regex matching is not supported: every pattern in this shell is literal text; compare with `==`, or match structurally with `jq`",
-                ));
+                return Err(ParseError::refused(line, Refusal::RegexCondition));
             }
             if matches!(operator.as_str(), "=" | "==" | "!=") {
                 if word_is_constant(right) {
                     if let Some(character) = literal_pattern_metacharacter(right) {
-                        return Err(ParseError::syntax(
+                        return Err(ParseError::refused(
                             line,
-                            unsupported_conditional_pattern(character),
+                            Refusal::ConditionalPattern { character },
                         ));
                     }
                 } else {
@@ -741,10 +707,7 @@ impl<'a> Parser<'a> {
                     let line = self.line();
                     self.position += 1;
                     let Some(TokenKind::Word(word)) = self.peek_kind() else {
-                        return Err(ParseError::syntax(
-                            line,
-                            "expected an in-memory buffer name after a redirection operator",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::ExpectedRedirectBuffer));
                     };
                     let word = word.clone();
                     self.position += 1;
@@ -761,13 +724,9 @@ impl<'a> Parser<'a> {
                     let line = self.line();
                     self.position += 1;
                     if source == target {
-                        return Err(ParseError::syntax(
+                        return Err(ParseError::refused(
                             line,
-                            format!(
-                                "`{}>&{}` redirects a stream onto itself and would do nothing",
-                                source.descriptor(),
-                                target.descriptor()
-                            ),
+                            Refusal::SelfDuplication { source, target },
                         ));
                     }
                     redirects.push(Redirect {
@@ -826,57 +785,39 @@ impl<'a> Parser<'a> {
                 Some(TokenKind::LeftParen) => {
                     let line = self.line();
                     if after_empty_assignment {
-                        return Err(ParseError::syntax(
-                            line,
-                            "bash array literals `name=(a b c)` are not supported: arrays here are real JSON, so write `name='[\"a\",\"b\",\"c\"]'` or `name=$(... | jq ...)` and index it with `${name[0]}`",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::ArrayLiteral));
                     }
                     if matches!(
                         self.token_at(self.position + 1).map(|token| &token.kind),
                         Some(TokenKind::LeftParen)
                     ) {
-                        return Err(ParseError::syntax(
-                            line,
-                            "the arithmetic command `(( ... ))` is not supported; use the arithmetic expansion `x=$(( ... ))`, or `[ ... ]` to test a value",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::ArithmeticCommand));
                     }
-                    return Err(ParseError::syntax(
-                        line,
-                        "subshells `( ... )` are not supported: this shell forks no processes; use a function instead",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::Subshell));
                 }
                 Some(TokenKind::RightParen) => {
                     if self.substitution {
                         break;
                     }
                     let line = self.line();
-                    return Err(ParseError::syntax(line, "unexpected `)`"));
+                    return Err(ParseError::refused(line, Refusal::UnexpectedRightParen));
                 }
                 Some(TokenKind::HereDoc(word)) => {
                     let line = self.line();
                     self.position += 1;
                     if here_doc.is_some() {
-                        return Err(ParseError::syntax(
-                            line,
-                            "a command accepts at most one here-document",
-                        ));
+                        return Err(ParseError::refused(line, Refusal::MultipleHereDocuments));
                     }
                     after_empty_assignment = false;
                     here_doc = Some(word);
                 }
                 Some(TokenKind::LessParen) => {
                     let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "process substitution `<( ... )` is not supported: this shell forks no processes and has no file descriptors",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::ProcessSubstitution));
                 }
                 Some(TokenKind::Less) => {
                     let line = self.line();
-                    return Err(ParseError::syntax(
-                        line,
-                        "input redirection `<` is not supported: there are no files; pipe a value or `cat` a named buffer instead",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::InputRedirect));
                 }
                 _ => break,
             }
@@ -884,12 +825,12 @@ impl<'a> Parser<'a> {
 
         if words.is_empty() && assignments.is_empty() {
             let line = self.line();
-            let found = self
-                .peek_kind()
-                .map_or_else(|| "end of script".to_owned(), TokenKind::to_string);
-            return Err(ParseError::syntax(
+            let found = self.peek_kind().cloned();
+            return Err(ParseError::refused(
                 line,
-                format!("expected a command, found {found}"),
+                Refusal::ExpectedCommand {
+                    found: Found(found),
+                },
             ));
         }
 
@@ -910,22 +851,6 @@ const CASE_METACHARACTERS: &[char] = &['*', '?', '['];
 pub(crate) fn pattern_metacharacter(text: &str) -> Option<char> {
     text.chars()
         .find(|character| CASE_METACHARACTERS.contains(character))
-}
-
-pub(crate) fn unsupported_case_pattern(character: char) -> String {
-    format!(
-        "`case` patterns are literal: `{character}` is not supported; quote it as `'{character}'`, list alternatives with `|`, or use `*)` for the default"
-    )
-}
-
-pub(crate) fn unsupported_parameter_pattern(character: char) -> String {
-    format!("`${{NAME}}` patterns are literal: `{character}` is not supported; slice with `jq`")
-}
-
-pub(crate) fn unsupported_conditional_pattern(character: char) -> String {
-    format!(
-        "`[[ == ]]` patterns are literal: `{character}` is not supported; quote it as `'{character}'` or use `jq`"
-    )
 }
 
 pub(crate) fn expanded_pattern(character: char) -> String {
@@ -990,9 +915,9 @@ fn split_assignment(word: &Word) -> Option<(String, Word)> {
 pub(crate) fn parameter_pattern(word: Word, line: usize) -> Result<Pattern, ParseError> {
     if word_is_constant(&word) {
         if let Some(character) = literal_pattern_metacharacter(&word) {
-            return Err(ParseError::syntax(
+            return Err(ParseError::refused(
                 line,
-                unsupported_parameter_pattern(character),
+                Refusal::ParameterPattern { character },
             ));
         }
         return Ok(Pattern::Literal(word));
@@ -1010,30 +935,36 @@ enum ArithToken {
 
 enum ArithSymbol {
     Kept,
-    Rejected(&'static str),
+    Rejected(Refusal),
 }
 
 /// Operator spellings, longest first so `&&` is never mistaken for a rejected bitwise `&`.
 const ARITH_SYMBOLS: &[(&str, ArithSymbol)] = &[
+    ("**", ArithSymbol::Rejected(Refusal::ArithmeticPower)),
+    ("++", ArithSymbol::Rejected(Refusal::ArithmeticIncrement)),
+    ("--", ArithSymbol::Rejected(Refusal::ArithmeticDecrement)),
     (
-        "**",
-        ArithSymbol::Rejected("`**` is not supported; multiply repeatedly, or use `jq pow`"),
+        "+=",
+        ArithSymbol::Rejected(Refusal::ArithmeticCompoundAssignment),
     ),
     (
-        "++",
-        ArithSymbol::Rejected("`++` is not supported; write `i=$(( i + 1 ))`"),
+        "-=",
+        ArithSymbol::Rejected(Refusal::ArithmeticCompoundAssignment),
     ),
     (
-        "--",
-        ArithSymbol::Rejected("`--` is not supported; write `i=$(( i - 1 ))`"),
+        "*=",
+        ArithSymbol::Rejected(Refusal::ArithmeticCompoundAssignment),
     ),
-    ("+=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("-=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("*=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("/=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("%=", ArithSymbol::Rejected(COMPOUND_ASSIGNMENT)),
-    ("<<", ArithSymbol::Rejected(BITWISE)),
-    (">>", ArithSymbol::Rejected(BITWISE)),
+    (
+        "/=",
+        ArithSymbol::Rejected(Refusal::ArithmeticCompoundAssignment),
+    ),
+    (
+        "%=",
+        ArithSymbol::Rejected(Refusal::ArithmeticCompoundAssignment),
+    ),
+    ("<<", ArithSymbol::Rejected(Refusal::ArithmeticBitwise)),
+    (">>", ArithSymbol::Rejected(Refusal::ArithmeticBitwise)),
     ("&&", ArithSymbol::Kept),
     ("||", ArithSymbol::Kept),
     ("<=", ArithSymbol::Kept),
@@ -1050,28 +981,15 @@ const ARITH_SYMBOLS: &[(&str, ArithSymbol)] = &[
     ("<", ArithSymbol::Kept),
     (">", ArithSymbol::Kept),
     ("!", ArithSymbol::Kept),
-    (
-        "=",
-        ArithSymbol::Rejected(
-            "assignment inside `$(( ... ))` is not supported; assign the expansion instead, as `name=$(( ... ))`",
-        ),
-    ),
-    ("?", ArithSymbol::Rejected(TERNARY)),
-    (":", ArithSymbol::Rejected(TERNARY)),
-    ("&", ArithSymbol::Rejected(BITWISE)),
-    ("|", ArithSymbol::Rejected(BITWISE)),
-    ("^", ArithSymbol::Rejected(BITWISE)),
-    ("~", ArithSymbol::Rejected(BITWISE)),
-    (
-        ",",
-        ArithSymbol::Rejected("the comma operator is not supported; write one expansion per value"),
-    ),
+    ("=", ArithSymbol::Rejected(Refusal::ArithmeticAssignment)),
+    ("?", ArithSymbol::Rejected(Refusal::ArithmeticTernary)),
+    (":", ArithSymbol::Rejected(Refusal::ArithmeticTernary)),
+    ("&", ArithSymbol::Rejected(Refusal::ArithmeticBitwise)),
+    ("|", ArithSymbol::Rejected(Refusal::ArithmeticBitwise)),
+    ("^", ArithSymbol::Rejected(Refusal::ArithmeticBitwise)),
+    ("~", ArithSymbol::Rejected(Refusal::ArithmeticBitwise)),
+    (",", ArithSymbol::Rejected(Refusal::ArithmeticComma)),
 ];
-
-const COMPOUND_ASSIGNMENT: &str =
-    "compound assignment is not supported inside `$(( ... ))`; write `name=$(( name + 1 ))`";
-const BITWISE: &str = "bitwise operators are not supported; this arithmetic is numeric only, so use `jq` for bit manipulation";
-const TERNARY: &str = "the ternary `? :` is not supported; use `if`/`else`";
 
 #[allow(
     clippy::map_err_ignore,
@@ -1079,21 +997,22 @@ const TERNARY: &str = "the ternary `? :` is not supported; use `if`/`else`";
               ASCII digit run with at most one interior dot: ParseFloatError is unreachable and \
               ParseIntError can only be overflow, which the message it is replaced by states"
 )]
-fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, ParseError> {
+fn tokenize_arithmetic(
+    source: &str,
+    mut line: usize,
+) -> Result<Vec<(ArithToken, usize)>, ParseError> {
     let mut tokens = Vec::new();
     let bytes = source.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
         if tokens.len() >= MAX_ARITHMETIC_TOKENS {
-            return Err(ParseError::syntax(
-                line,
-                format!(
-                    "an arithmetic expansion may hold at most {MAX_ARITHMETIC_TOKENS} tokens; split the calculation across assignments"
-                ),
-            ));
+            return Err(ParseError::refused(line, Refusal::ArithmeticTokenLimit));
         }
         let character = source[index..].chars().next().unwrap_or('\0');
         if character.is_ascii_whitespace() {
+            if character == '\n' {
+                line += 1;
+            }
             index += 1;
             continue;
         }
@@ -1109,18 +1028,25 @@ fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, Par
                 }
                 let literal = &source[start..index];
                 let value = literal.parse::<f64>().map_err(|_| {
-                    ParseError::syntax(line, format!("invalid arithmetic literal {literal:?}"))
+                    ParseError::refused(
+                        line,
+                        Refusal::InvalidArithmeticLiteral {
+                            literal: literal.to_owned(),
+                        },
+                    )
                 })?;
-                tokens.push(ArithToken::Float(value));
+                tokens.push((ArithToken::Float(value), line));
             } else {
                 let literal = &source[start..index];
                 let value = literal.parse::<i64>().map_err(|_| {
-                    ParseError::syntax(
+                    ParseError::refused(
                         line,
-                        format!("arithmetic literal {literal:?} is out of range"),
+                        Refusal::ArithmeticLiteralOutOfRange {
+                            literal: literal.to_owned(),
+                        },
                     )
                 })?;
-                tokens.push(ArithToken::Integer(value));
+                tokens.push((ArithToken::Integer(value), line));
             }
             continue;
         }
@@ -1135,35 +1061,30 @@ fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, Par
                 index += 1;
             }
             if start == index {
-                return Err(ParseError::syntax(
+                return Err(ParseError::refused(
                     line,
-                    "expected a variable name after `$` in an arithmetic expansion",
+                    Refusal::ExpectedArithmeticVariable,
                 ));
             }
-            tokens.push(ArithToken::Name(source[start..index].to_owned()));
+            tokens.push((ArithToken::Name(source[start..index].to_owned()), line));
             continue;
         }
         let (matched, symbol) = ARITH_SYMBOLS
             .iter()
             .find(|(symbol, _)| source[index..].starts_with(*symbol))
-            .ok_or_else(|| {
-                ParseError::syntax(
-                    line,
-                    format!("unsupported character {character:?} in an arithmetic expansion"),
-                )
-            })?;
+            .ok_or_else(|| ParseError::refused(line, Refusal::ArithmeticCharacter { character }))?;
         match symbol {
             ArithSymbol::Kept => {}
-            ArithSymbol::Rejected(reason) => return Err(ParseError::syntax(line, *reason)),
+            ArithSymbol::Rejected(reason) => return Err(ParseError::refused(line, reason.clone())),
         }
         index += matched.len();
-        tokens.push(ArithToken::Symbol(matched));
+        tokens.push((ArithToken::Symbol(matched), line));
     }
     Ok(tokens)
 }
 
 struct ArithParser {
-    tokens: Vec<ArithToken>,
+    tokens: Vec<(ArithToken, usize)>,
     position: usize,
     line: usize,
     depth: Depth,
@@ -1176,7 +1097,7 @@ pub(crate) fn parse_arithmetic(
 ) -> Result<ArithExpr, ParseError> {
     let tokens = tokenize_arithmetic(source, line)?;
     if tokens.is_empty() {
-        return Err(ParseError::syntax(line, "empty arithmetic expansion"));
+        return Err(ParseError::refused(line, Refusal::EmptyArithmetic));
     }
     let mut parser = ArithParser {
         tokens,
@@ -1186,9 +1107,9 @@ pub(crate) fn parse_arithmetic(
     };
     let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
-        return Err(ParseError::syntax(
-            line,
-            "trailing tokens in an arithmetic expansion",
+        return Err(ParseError::refused(
+            parser.tokens[parser.position].1,
+            Refusal::TrailingArithmeticTokens,
         ));
     }
     Ok(expression)
@@ -1197,7 +1118,7 @@ pub(crate) fn parse_arithmetic(
 impl ArithParser {
     fn peek_symbol(&self) -> Option<&'static str> {
         match self.tokens.get(self.position) {
-            Some(ArithToken::Symbol(symbol)) => Some(symbol),
+            Some((ArithToken::Symbol(symbol), _)) => Some(symbol),
             _ => None,
         }
     }
@@ -1211,12 +1132,10 @@ impl ArithParser {
     }
 
     fn arithmetic_too_deep(&self, _error: crate::ast::ArithTooDeep) -> ParseError {
-        ParseError::syntax(
-            self.line,
-            format!(
-                "an arithmetic expansion may nest at most {MAX_NESTING_DEPTH} operators deep, counting each `!`, unary `-` and operator in a chain like `a + b + c`; split the calculation across assignments"
-            ),
-        )
+        ParseError::TooDeep {
+            line: self.line,
+            refusal: TooDeep::ArithmeticOperators,
+        }
     }
 
     fn parse_binary_level(
@@ -1306,8 +1225,17 @@ impl ArithParser {
     }
 
     fn parse_primary(&mut self) -> Result<ArithExpr, ParseError> {
-        let line = self.line;
-        match self.tokens.get(self.position).cloned() {
+        let line = self
+            .tokens
+            .get(self.position)
+            .map_or(self.line, |(_, line)| *line);
+        self.line = line;
+        match self
+            .tokens
+            .get(self.position)
+            .map(|(token, _)| token)
+            .cloned()
+        {
             Some(ArithToken::Integer(value)) => {
                 self.position += 1;
                 Ok(ArithExpr::integer(value))
@@ -1324,21 +1252,15 @@ impl ArithParser {
                 self.position += 1;
                 let inner = self.group()?.parse_or()?;
                 if !self.eat_symbol(")") {
-                    return Err(ParseError::syntax(
-                        line,
-                        "unbalanced parentheses in an arithmetic expansion",
-                    ));
+                    return Err(ParseError::refused(line, Refusal::UnbalancedArithmetic));
                 }
                 Ok(inner)
             }
-            Some(ArithToken::Symbol(symbol)) => Err(ParseError::syntax(
+            Some(ArithToken::Symbol(symbol)) => Err(ParseError::refused(
                 line,
-                format!("unexpected `{symbol}` in an arithmetic expansion"),
+                Refusal::UnexpectedArithmeticSymbol { symbol },
             )),
-            None => Err(ParseError::syntax(
-                line,
-                "arithmetic expansion ended unexpectedly",
-            )),
+            None => Err(ParseError::refused(line, Refusal::ArithmeticEnded)),
         }
     }
 }
@@ -1350,32 +1272,37 @@ mod tests {
         Statement, Stream, Word, WordPart,
     };
 
-    use super::{ParseError, parse};
+    use super::{Construct, ParseError, Refusal, TokenKind, parse};
+    use crate::{builtins::RejectedCommand, lexer::LexError};
 
-    fn syntax_error(source: &str) -> String {
-        match parse(source).expect_err("must be rejected") {
-            ParseError::Syntax { message, .. } => message,
-            ParseError::Lex(error) => error.message,
-        }
+    fn assert_refusal(source: &str, refusal: Refusal) {
+        assert_eq!(
+            parse(source).expect_err(source),
+            ParseError::refused(1, refusal)
+        );
     }
 
     #[test]
-    fn substitution_reports_unexpected_tokens_at_their_body_lines() {
-        let cases = [
-            ("$(echo })", "line 1: unexpected }"),
-            ("$(echo a ;; )", "line 1: unexpected ;;"),
-        ];
-        let actual = cases.map(|(source, _)| parse(source).expect_err(source).to_string());
-        let expected = cases.map(|(_, expected)| expected.to_owned());
-        assert_eq!(actual, expected);
+    fn substitution_reports_unexpected_token_variants() {
+        for (source, kind) in [
+            ("$(echo })", TokenKind::RightBrace),
+            ("$(echo a ;; )", TokenKind::DoubleSemicolon),
+        ] {
+            assert_refusal(source, Refusal::UnexpectedToken { kind });
+        }
     }
 
     #[test]
     fn pending_substitution_close_keeps_the_here_doc_refusal() {
         let source = "echo \"$(cat <<EOF)\"\nhi\nEOF\n";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 1: unterminated here-document: the script ended before a line containing exactly \"EOF\""
+            parse(source).expect_err(source),
+            ParseError::lexical(
+                1,
+                LexError::UnterminatedHereDocument {
+                    delimiter: "EOF".to_owned()
+                }
+            )
         );
     }
 
@@ -1383,8 +1310,8 @@ mod tests {
     fn a_here_doc_interpolation_failure_keeps_its_own_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\n`x`\nEOF\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 2: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+            parse(source).expect_err(source),
+            ParseError::lexical(2, LexError::Backtick)
         );
     }
 
@@ -1392,8 +1319,8 @@ mod tests {
     fn completed_here_doc_keeps_a_later_backtick_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\n`x`\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 4: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+            parse(source).expect_err(source),
+            ParseError::lexical(4, LexError::Backtick)
         );
     }
 
@@ -1401,8 +1328,8 @@ mod tests {
     fn completed_here_doc_keeps_a_later_quote_refusal() {
         let source = "echo $(cat <<EOF; case a in a) true;; esac\nhi\nEOF\necho \"oops\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 4: unterminated double-quoted string"
+            parse(source).expect_err(source),
+            ParseError::lexical(4, LexError::UnterminatedDoubleQuoted)
         );
     }
 
@@ -1410,8 +1337,8 @@ mod tests {
     fn completed_empty_quoted_here_doc_keeps_a_later_backtick_refusal() {
         let source = "echo $(cat <<'EOF'; case a in a) true;; esac\nEOF\n`x`\n)";
         assert_eq!(
-            parse(source).expect_err(source).to_string(),
-            "line 3: backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly"
+            parse(source).expect_err(source),
+            ParseError::lexical(3, LexError::Backtick)
         );
     }
 
@@ -1644,13 +1571,64 @@ mod tests {
 
     #[test]
     fn redirections_that_would_do_nothing_or_mislead_are_refused() {
-        for source in ["cmd >&1", "cmd 2>&2"] {
-            let error = parse(source).expect_err("self-duplication is refused");
-            assert!(format!("{error}").contains("onto itself"), "{source}");
+        for (source, stream) in [("cmd >&1", Stream::Stdout), ("cmd 2>&2", Stream::Stderr)] {
+            assert_refusal(
+                source,
+                Refusal::SelfDuplication {
+                    source: stream,
+                    target: stream,
+                },
+            );
         }
-        let error = parse("cmd 2>&1 > buf").expect_err("reversed duplication is refused");
-        assert!(format!("{error}").contains("before"), "{error}");
+        assert_refusal(
+            "cmd 2>&1 > buf",
+            Refusal::DuplicationOrder {
+                source: Stream::Stderr,
+                copied: Stream::Stdout,
+            },
+        );
         assert_eq!(redirects_of("cmd > buf 2>&1").len(), 2);
+    }
+
+    #[test]
+    fn constant_expansion_patterns_return_typed_refusals() {
+        assert_refusal(
+            "echo ${name#*}",
+            Refusal::ParameterPattern { character: '*' },
+        );
+        assert_refusal(
+            "[[ x == * ]]",
+            Refusal::ConditionalPattern { character: '*' },
+        );
+    }
+
+    #[test]
+    fn arithmetic_refusals_keep_their_typed_causes() {
+        for (body, refusal) in [
+            ("", Refusal::EmptyArithmetic),
+            ("1 & 2", Refusal::ArithmeticBitwise),
+            ("1 ** 2", Refusal::ArithmeticPower),
+            ("1 ? 2 : 3", Refusal::ArithmeticTernary),
+            ("x += 1", Refusal::ArithmeticCompoundAssignment),
+            ("x = 1", Refusal::ArithmeticAssignment),
+            ("1,2", Refusal::ArithmeticComma),
+            (
+                "9223372036854775808",
+                Refusal::ArithmeticLiteralOutOfRange {
+                    literal: "9223372036854775808".to_owned(),
+                },
+            ),
+            ("$", Refusal::ExpectedArithmeticVariable),
+            ("é", Refusal::ArithmeticCharacter { character: 'é' }),
+            ("1 2", Refusal::TrailingArithmeticTokens),
+            ("1 +", Refusal::ArithmeticEnded),
+        ] {
+            assert_refusal(&format!("echo $(( {body} ))"), refusal);
+        }
+        assert_refusal(
+            &format!("echo $(( {} ))", "1 ".repeat(4_097)),
+            Refusal::ArithmeticTokenLimit,
+        );
     }
 
     #[test]
@@ -1701,19 +1679,31 @@ mod tests {
 
     #[test]
     fn a_function_definition_cannot_be_started_as_a_job() {
-        let message = syntax_error("f() { echo x; } &");
-        assert!(message.contains("function definition `f()"), "{message}");
+        assert_refusal(
+            "f() { echo x; } &",
+            Refusal::BackgroundFunction {
+                name: "f".to_owned(),
+            },
+        );
+    }
+
+    #[test]
+    fn a_stray_closing_parenthesis_has_its_typed_refusal() {
+        assert_refusal(")", Refusal::UnexpectedRightParen);
     }
 
     #[test]
     fn dropped_grammar_is_rejected_by_name() {
-        assert!(syntax_error("(echo hi)").contains("subshells"));
-        assert!(syntax_error("cat <<<\"$x\"").contains("here-string"));
-        assert!(syntax_error("diff <(a) b").contains("process substitution"));
-        assert!(syntax_error("cat < file").contains("input redirection"));
-        assert!(syntax_error("select x in a; do echo $x; done").contains("select"));
-        assert!(syntax_error("function f { echo hi; }").contains("`function` keyword"));
-        assert!(syntax_error("esac").contains("without a matching `case`"));
+        assert_refusal("(echo hi)", Refusal::Subshell);
+        assert_eq!(
+            parse("cat <<<\"$x\"").expect_err("here-string"),
+            ParseError::lexical(1, LexError::HereString)
+        );
+        assert_refusal("diff <(a) b", Refusal::ProcessSubstitution);
+        assert_refusal("cat < file", Refusal::InputRedirect);
+        assert_refusal("select x in a; do echo $x; done", Refusal::Select);
+        assert_refusal("function f { echo hi; }", Refusal::FunctionKeyword);
+        assert_refusal("esac", Refusal::UnmatchedEsac);
     }
 
     #[test]
@@ -1744,15 +1734,15 @@ mod tests {
     #[test]
     fn case_patterns_that_would_glob_are_rejected_by_name() {
         for (source, expected) in [
-            ("case $f in *.json) echo j ;; esac", "`*`"),
-            ("case $f in a?c) echo q ;; esac", "`?`"),
-            ("case $f in [ab]) echo c ;; esac", "`[`"),
+            ("case $f in *.json) echo j ;; esac", '*'),
+            ("case $f in a?c) echo q ;; esac", '?'),
+            ("case $f in [ab]) echo c ;; esac", '['),
         ] {
-            let message = syntax_error(source);
-            assert!(message.contains(expected), "{source}: {message}");
-            assert!(
-                message.contains("patterns are literal"),
-                "{source}: {message}"
+            assert_refusal(
+                source,
+                Refusal::CasePattern {
+                    character: expected,
+                },
             );
         }
 
@@ -1771,9 +1761,24 @@ mod tests {
 
     #[test]
     fn malformed_case_statements_are_reported() {
-        assert!(syntax_error("case $x in a) echo a ;;").contains("expected `esac`"));
-        assert!(syntax_error("case $x in a echo a ;; esac").contains("expected `)`"));
-        assert!(syntax_error("case in a) echo a ;; esac").contains("expected `in`"));
+        assert_refusal(
+            "case $x in a) echo a ;;",
+            Refusal::ExpectedReserved {
+                expected: "esac",
+                context: Construct::Case,
+            },
+        );
+        assert_refusal(
+            "case $x in a echo a ;; esac",
+            Refusal::ExpectedCasePatternClose,
+        );
+        assert_refusal(
+            "case in a) echo a ;; esac",
+            Refusal::ExpectedReserved {
+                expected: "in",
+                context: Construct::Case,
+            },
+        );
     }
 
     #[test]
@@ -1786,7 +1791,7 @@ mod tests {
 
     #[test]
     fn a_command_accepts_at_most_one_here_document() {
-        assert!(syntax_error("cat <<A <<B\na\nA\nb\nB\n").contains("at most one here-document"));
+        assert_refusal("cat <<A <<B\na\nA\nb\nB\n", Refusal::MultipleHereDocuments);
     }
 
     #[test]
@@ -1814,10 +1819,12 @@ mod tests {
 
     #[test]
     fn functions_cannot_shadow_rejected_commands() {
-        let message = syntax_error("eval() { echo hi; }");
-        assert!(
-            message.contains("cannot define a function named"),
-            "{message}"
+        assert_refusal(
+            "eval() { echo hi; }",
+            Refusal::RejectedFunction {
+                name: "eval".to_owned(),
+                rejected: RejectedCommand::Eval,
+            },
         );
     }
 
@@ -1840,12 +1847,33 @@ mod tests {
 
     #[test]
     fn unterminated_blocks_are_reported() {
-        assert!(syntax_error("if true; then echo hi").contains("expected `fi`"));
-        assert!(syntax_error("for x in a; do echo $x").contains("expected `done`"));
-        assert!(syntax_error("f() { echo hi").contains("expected `}`"));
+        assert_refusal(
+            "if true; then echo hi",
+            Refusal::ExpectedReserved {
+                expected: "fi",
+                context: Construct::If,
+            },
+        );
+        assert_refusal(
+            "for x in a; do echo $x",
+            Refusal::ExpectedReserved {
+                expected: "done",
+                context: Construct::For,
+            },
+        );
+        assert_refusal(
+            "f() { echo hi",
+            Refusal::ExpectedFunctionClose {
+                name: "f".to_owned(),
+            },
+        );
     }
 }
 
 #[cfg(test)]
 #[path = "nesting_tests.rs"]
 mod nesting_tests;
+
+#[cfg(test)]
+#[path = "parser/line_tests.rs"]
+mod line_tests;

@@ -30,6 +30,7 @@ mod metering;
 mod probe;
 mod progress;
 mod proxy;
+mod pull_request_links;
 mod routes;
 mod session;
 mod transport;

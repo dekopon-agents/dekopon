@@ -1,7 +1,7 @@
+use super::{Construct, TooDeep};
 use super::{MAX_NESTING_DEPTH, ParseError, Program, too_deep};
-use crate::lexer::LexError;
 
-const MAX_PARAMETER_NESTING: u32 = 32;
+pub(super) const MAX_PARAMETER_NESTING: u32 = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Depth {
@@ -10,7 +10,7 @@ pub(crate) struct Depth {
 }
 
 pub(super) fn parse(source: &str) -> Result<Program, ParseError> {
-    super::parse_nested(source, Depth { lexer: 0, block: 1 })
+    super::parse_nested(source, Depth { lexer: 0, block: 1 }, 1)
 }
 
 #[cfg(test)]
@@ -19,7 +19,12 @@ pub(crate) fn test_depth() -> Depth {
 }
 
 impl Depth {
-    pub(super) fn nest(self, units: u32, line: usize, construct: &str) -> Result<Self, ParseError> {
+    pub(super) fn nest(
+        self,
+        units: u32,
+        line: usize,
+        construct: Construct,
+    ) -> Result<Self, ParseError> {
         if self.lexer + self.block + units > MAX_NESTING_DEPTH {
             return Err(too_deep(line, construct));
         }
@@ -32,7 +37,10 @@ impl Depth {
     pub(super) fn substitution(self, line: usize) -> Result<Self, ParseError> {
         let sum = self.lexer + self.block;
         if sum >= MAX_NESTING_DEPTH - 1 {
-            return Err(too_deep(line, "command substitution `$( ... )`"));
+            return Err(ParseError::TooDeep {
+                line,
+                refusal: TooDeep::CommandSubstitution,
+            });
         }
         Ok(Self {
             lexer: sum + 1,
@@ -40,11 +48,11 @@ impl Depth {
         })
     }
 
-    pub(crate) fn parameter(self, line: usize) -> Result<Self, LexError> {
+    pub(crate) fn parameter(self, line: usize) -> Result<Self, ParseError> {
         if self.lexer + 1 >= MAX_PARAMETER_NESTING {
-            return Err(LexError {
+            return Err(ParseError::TooDeep {
                 line,
-                message: format!("parameter expansions nested deeper than {MAX_PARAMETER_NESTING}"),
+                refusal: TooDeep::Parameter,
             });
         }
         Ok(Self {
@@ -54,6 +62,6 @@ impl Depth {
     }
 
     pub(super) fn arithmetic_group(self, line: usize) -> Result<Self, ParseError> {
-        self.nest(1, line, "an arithmetic expansion")
+        self.nest(1, line, Construct::Arithmetic)
     }
 }

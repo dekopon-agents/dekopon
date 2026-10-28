@@ -1383,6 +1383,7 @@ dependencies = [
 name = "dekopon-shell"
 version = "0.66.0"
 dependencies = [
+ "arbitrary",
  "base64 0.23.1",
  "clap",
  "dekopon-core",

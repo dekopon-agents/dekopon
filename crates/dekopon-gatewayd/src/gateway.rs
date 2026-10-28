@@ -729,6 +729,7 @@ impl Gateway {
         }
         if message.conversation.kind != ConversationKind::DirectMessage
             && !addressed
+            && !(route.ambient.pull_request_links && message.pull_request_links.is_some())
             && ((route.follow
                 && message.transport_kind == dekopon_broker_protocol::ChatTransportKind::Slack)
                 || (!inherited_thread
