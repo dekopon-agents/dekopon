@@ -517,3 +517,143 @@ pub(crate) fn decider_labels(head: &Head) -> Vec<Rung> {
     labels.push(Rung::Metadata);
     labels
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FileSlices {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+impl FileSlices {
+    fn text(&mut self, text: &Text) {
+        match text {
+            Text::File { len, .. } => self.add(*len),
+            Text::Opaque(source) => self.source(source),
+            Text::Owned(_) => {}
+        }
+    }
+
+    fn source(&mut self, source: &OpaqueSource) {
+        match source {
+            OpaqueSource::File { len, .. } => self.add(*len),
+            OpaqueSource::Owned(_) => {}
+        }
+    }
+
+    fn add(&mut self, len: u64) {
+        self.count += 1;
+        self.bytes += len;
+    }
+}
+
+pub(crate) fn file_slices(messages: &[ModelMessage]) -> FileSlices {
+    let mut slices = FileSlices::default();
+    for message in messages {
+        match message {
+            ModelMessage::Journal { message } => match message {
+                ReplayMessage::User(texts) => texts.iter().for_each(|text| slices.text(text)),
+                ReplayMessage::Assistant {
+                    content,
+                    calls,
+                    reasoning,
+                } => {
+                    content.iter().for_each(|text| slices.text(text));
+                    calls.iter().for_each(|call| slices.text(&call.arguments));
+                    reasoning.iter().for_each(|item| slices.source(&item.value));
+                }
+                ReplayMessage::Tool { text, .. } => slices.text(text),
+            },
+            ModelMessage::System { .. }
+            | ModelMessage::User { .. }
+            | ModelMessage::Assistant { .. }
+            | ModelMessage::ToolResults { .. } => {}
+        }
+    }
+    slices
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write as _, sync::Arc};
+
+    use dekopon_model::{
+        body::OpaqueSource,
+        model::{Backend, ModelKey, ModelMessage},
+        replay::{ReplayCall, ReplayMessage, ReplayReasoning},
+        text::Text,
+    };
+
+    use super::{FileSlices, file_slices};
+
+    fn file(len: u64) -> Arc<std::fs::File> {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![b'x'; usize::try_from(len).unwrap()])
+            .unwrap();
+        Arc::new(file)
+    }
+
+    fn reasoning(value: OpaqueSource) -> ReplayReasoning {
+        ReplayReasoning {
+            model: ModelKey::new(Backend::OpenRouter, "alias"),
+            value,
+        }
+    }
+
+    #[test]
+    fn opaque_file_slices_count_in_the_body_metrics_and_owned_sources_do_not() {
+        let opaque = OpaqueSource::File {
+            file: file(47),
+            offset: 0,
+            len: 47,
+        };
+        let owned = OpaqueSource::owned(b"{\"owned\":1}");
+        let reasoning_only = [ModelMessage::Journal {
+            message: ReplayMessage::Assistant {
+                content: None,
+                calls: Vec::new(),
+                reasoning: vec![reasoning(opaque.clone()), reasoning(owned.clone())],
+            },
+        }];
+        assert_eq!(
+            file_slices(&reasoning_only),
+            FileSlices {
+                count: 1,
+                bytes: 47
+            }
+        );
+        let text = |len: u64| Text::File {
+            file: file(len),
+            offset: 0,
+            len,
+        };
+        let mixed = [
+            ModelMessage::user("owned question"),
+            ModelMessage::Journal {
+                message: ReplayMessage::User(vec![text(10), Text::Owned("owned".to_owned())]),
+            },
+            ModelMessage::Journal {
+                message: ReplayMessage::Assistant {
+                    content: Some(text(5)),
+                    calls: vec![ReplayCall {
+                        id: "call".into(),
+                        name: "bash".to_owned(),
+                        arguments: text(7),
+                    }],
+                    reasoning: vec![reasoning(opaque), reasoning(owned)],
+                },
+            },
+            ModelMessage::Journal {
+                message: ReplayMessage::Tool {
+                    id: "call".into(),
+                    text: text(3),
+                },
+            },
+        ];
+        assert_eq!(
+            file_slices(&mixed),
+            FileSlices {
+                count: 5,
+                bytes: 72
+            }
+        );
+    }
+}

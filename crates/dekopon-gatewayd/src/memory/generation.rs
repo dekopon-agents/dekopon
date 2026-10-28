@@ -61,6 +61,7 @@ pub(crate) fn report_policy(route: &BoundRoute) {
     let (Some(window), Some(knobs)) = (route.memory.window(), route.memory_knobs.as_ref()) else {
         return;
     };
+    let summaries = plan(route);
     tracing::info!(
         event = "gateway_memory_policy",
         recall = match window.recall {
@@ -70,6 +71,9 @@ pub(crate) fn report_policy(route: &BoundRoute) {
         },
         memory.hot_turns = knobs.hot_turns.get(),
         memory.summaries.parts = knobs.summaries.as_ref().map_or(0, |plan| plan.parts.len()),
+        memory.summaries.model = summaries.as_ref().map(|plan| plan.model.as_str()),
+        memory.summaries.max_input_bytes =
+            summaries.as_ref().map(|plan| plan.max_input_bytes.get()),
         memory.capture.max_item_bytes = knobs.capture_max_item_bytes.get(),
         memory.selection = match knobs.selection {
             crate::config::memory::Selection::Ladder => "ladder",
