@@ -1844,6 +1844,66 @@ fn a_case_pattern_assembled_at_run_time_matches_as_a_glob() {
 
 const CASE_GLOB_ROWS: &[(&str, &str)] = &[
     (
+        "unset p; f() { case a in ''${p:-\"$@\"}a) echo yes ;; *) echo no ;; esac; }; f '' q",
+        "no",
+    ),
+    (
+        "unset p; f() { case xq in \"x$@\"${p:=tail}) echo \"$p\" ;; *) echo no ;; esac; }; f q r",
+        "tail",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f ''",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xqa' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f q",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f q",
+        "no",
+    ),
+    (
+        "unset p q; f() { case 'xa' in ${p:-''}\"x$@\"a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xza' in \"x$@\"${p:-''z}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x$@\"${p:-''''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xq' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f q r",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'x' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f '' q",
+        "yes",
+    ),
+    (
+        "unset p q; f() { case 'xqa' in \"x$*\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f q",
+        "no",
+    ),
+    (
+        "unset p q; f() { case 'xa' in \"x$1\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f ''",
+        "no",
+    ),
+    (
+        "unset p q; f() { case 'x\u{7f}a' in \"x$@\"${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "no",
+    ),
+    (
+        "unset p; q='\u{7f}'; f() { case 'x\u{7f}a' in \"x$@\"$q${p:-''}a) echo yes ;; *) echo no ;; esac; }; f",
+        "yes",
+    ),
+    (
         "unset p; case a in ''${p:-''}a) echo yes ;; *) echo no ;; esac",
         "yes",
     ),

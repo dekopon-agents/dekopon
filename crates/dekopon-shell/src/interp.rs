@@ -623,6 +623,11 @@ enum PreservedExpansion {
     Unsplit,
 }
 
+struct PreservedFields {
+    fields: Vec<String>,
+    quoted_at: bool,
+}
+
 enum ParameterExpansion<'a> {
     Fields(&'a mut Vec<ExpansionSpan>),
     Case(&'a mut CaseExpansion),
@@ -1009,7 +1014,7 @@ impl<'a> Evaluator<'a> {
         let subject = match self
             .expand_preserved_fields(&statement.subject.parts, ExpansionOutput::Unsplit)
         {
-            Ok(expanded) => expanded.join(" "),
+            Ok(expanded) => expanded.fields.join(" "),
             Err(failure) => {
                 let status = self.absorb(failure)?;
                 self.last_status = status;
@@ -1972,7 +1977,7 @@ impl<'a> Evaluator<'a> {
             Some(body) => match self.expand_preserved_fields(&body.parts, ExpansionOutput::Unsplit)
             {
                 Ok(fields) => {
-                    let text = fields.join(" ");
+                    let text = fields.fields.join(" ");
                     here_doc_charges = self.expansion_charges.split_off(start);
                     match self.budget.charge_value_bytes(text.len() as u64) {
                         Ok(charge) => here_doc_charges.push(charge),
@@ -2986,6 +2991,7 @@ impl<'a> Evaluator<'a> {
             }
             _ => Value::String(
                 self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)?
+                    .fields
                     .join(" "),
             ),
         };
@@ -3086,7 +3092,7 @@ impl<'a> Evaluator<'a> {
                     append_field(&mut fields, &mut separated, &text);
                 }
                 WordPart::DoubleQuoted(parts) => {
-                    let mut expanded = self.expand_quoted_fields(parts)?.into_iter();
+                    let mut expanded = self.expand_quoted(parts)?.fields.into_iter();
                     if let Some(first) = expanded.next() {
                         append_field(&mut fields, &mut separated, &first);
                     }
@@ -3761,11 +3767,7 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn expand_quoted(&mut self, parts: &[WordPart]) -> Result<String, CommandFailure> {
-        Ok(self.expand_quoted_fields(parts)?.join(" "))
-    }
-
-    fn expand_quoted_fields(&mut self, parts: &[WordPart]) -> Result<Vec<String>, CommandFailure> {
+    fn expand_quoted(&mut self, parts: &[WordPart]) -> Result<PreservedFields, CommandFailure> {
         self.expand_preserved_fields(parts, ExpansionOutput::Unsplit)
     }
 
@@ -3777,8 +3779,9 @@ impl<'a> Evaluator<'a> {
         &mut self,
         parts: &[WordPart],
         output: ExpansionOutput,
-    ) -> Result<Vec<String>, CommandFailure> {
+    ) -> Result<PreservedFields, CommandFailure> {
         let mut fields = vec![String::new()];
+        let mut quoted_at = false;
         for part in parts {
             match part {
                 WordPart::Asset(number) => append(&mut fields, &number.to_string()),
@@ -3787,13 +3790,15 @@ impl<'a> Evaluator<'a> {
                 }
                 WordPart::DoubleQuoted(inner) => {
                     let inner = self.expand_quoted(inner)?;
-                    append(&mut fields, &inner);
+                    quoted_at |= inner.quoted_at;
+                    append(&mut fields, &inner.fields.join(" "));
                 }
                 WordPart::Arithmetic(expression) => {
                     let number = self.evaluate_arithmetic(expression)?;
                     append(&mut fields, &render_number(number));
                 }
                 WordPart::Parameter(parameter) if splits_inside_quotes(parameter) => {
+                    quoted_at = true;
                     let value = self.parameter_value_with(parameter, output)?;
                     let elements = match value {
                         Value::Array(items) => items,
@@ -3803,7 +3808,10 @@ impl<'a> Evaluator<'a> {
                     let mut elements = elements.iter().map(display);
                     let Some(first) = elements.next() else {
                         if parts.len() == 1 {
-                            return Ok(Vec::new());
+                            return Ok(PreservedFields {
+                                fields: Vec::new(),
+                                quoted_at,
+                            });
                         }
                         continue;
                     };
@@ -3821,7 +3829,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        Ok(fields)
+        Ok(PreservedFields { fields, quoted_at })
     }
 
     fn parameter_value(&mut self, parameter: &Parameter) -> Result<Value, CommandFailure> {
@@ -3932,7 +3940,7 @@ impl<'a> Evaluator<'a> {
                     return self.finish_parameter(value, split);
                 }
                 let message = match word {
-                    Some(word) => self.expand_quoted(&word.parts)?,
+                    Some(word) => self.expand_quoted(&word.parts)?.fields.join(" "),
                     None => "parameter is not set".to_owned(),
                 };
                 return Err(CommandFailure::Fatal(FatalError::Assertion(format!(
@@ -3970,6 +3978,7 @@ impl<'a> Evaluator<'a> {
                 let pattern = self.literal_pattern(pattern, output)?;
                 let replacement = self
                     .expand_preserved_fields(&replacement.parts, output)?
+                    .fields
                     .join(" ");
                 let text = display(&value);
                 if pattern.is_empty() {
@@ -4028,11 +4037,15 @@ impl<'a> Evaluator<'a> {
         output: ExpansionOutput,
     ) -> Result<String, CommandFailure> {
         match pattern {
-            Pattern::Literal(word) => {
-                Ok(self.expand_preserved_fields(&word.parts, output)?.join(" "))
-            }
+            Pattern::Literal(word) => Ok(self
+                .expand_preserved_fields(&word.parts, output)?
+                .fields
+                .join(" ")),
             Pattern::Expanded(word) => {
-                let text = self.expand_preserved_fields(&word.parts, output)?.join(" ");
+                let text = self
+                    .expand_preserved_fields(&word.parts, output)?
+                    .fields
+                    .join(" ");
                 if let Some(character) = pattern_metacharacter(&text) {
                     return Err(CommandFailure::usage(expanded_pattern(character)));
                 }
@@ -4085,6 +4098,7 @@ impl<'a> Evaluator<'a> {
         for word in &test.words {
             operands.push(
                 self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)?
+                    .fields
                     .join(" "),
             );
         }

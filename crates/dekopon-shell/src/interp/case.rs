@@ -32,6 +32,8 @@ enum Context {
 pub(super) struct CaseExpansion {
     fragments: Vec<PatternFragment>,
     charge: RetainedBytes,
+    quoted_at: bool,
+    first_field_end: Option<usize>,
 }
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
@@ -76,6 +78,8 @@ impl CaseExpansion {
         Ok(Self {
             fragments: Vec::new(),
             charge: budget.charge_value_bytes(0)?,
+            quoted_at: false,
+            first_field_end: None,
         })
     }
 
@@ -119,6 +123,15 @@ impl CaseExpansion {
     }
 
     fn normalize(&mut self) {
+        if let Some(end) = self.first_field_end {
+            self.fragments.truncate(end);
+        }
+        if self.quoted_at {
+            self.fragments.retain(|fragment| match fragment {
+                PatternFragment::QuotedNull => false,
+                PatternFragment::Literal(_) | PatternFragment::Unquoted(_) => true,
+            });
+        }
         if self.fragments == [PatternFragment::QuotedNull] {
             self.fragments.clear();
             return;
@@ -337,9 +350,16 @@ impl Evaluator<'_> {
                     had_quoted_null |= text.is_empty();
                 }
                 WordPart::DoubleQuoted(parts) => {
-                    let text = self.expand_quoted(parts)?;
-                    pattern.append_quoted(&text, context)?;
-                    had_quoted_null |= text.is_empty();
+                    let expanded = self.expand_quoted(parts)?;
+                    let text = expanded.fields.first().map_or("", String::as_str);
+                    pattern.append_quoted(text, context)?;
+                    had_quoted_null |= text.is_empty() || expanded.quoted_at;
+                    pattern.quoted_at |= expanded.quoted_at;
+                    if expanded.fields.len() > 1 {
+                        pattern
+                            .first_field_end
+                            .get_or_insert(pattern.fragments.len());
+                    }
                 }
                 WordPart::Asset(number) => pattern.append(&number.to_string(), Quote::Unquoted)?,
                 WordPart::Arithmetic(expression) => {
@@ -383,6 +403,7 @@ impl Evaluator<'_> {
                         }
                     }
                     if had_quoted_null
+                        && !pattern.quoted_at
                         && pattern.fragments[start..] == [PatternFragment::QuotedNull]
                     {
                         pattern.fragments.truncate(start);
