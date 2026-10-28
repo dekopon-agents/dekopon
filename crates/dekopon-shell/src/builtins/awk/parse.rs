@@ -1249,7 +1249,11 @@ impl Parser<'_> {
 
     fn print(&mut self, formatted: bool, depth: u8) -> Result<Stmt, AwkError> {
         let depth = Self::depth(depth)?;
+        if self.at(Symbol::Gt)? || self.at(Symbol::Append)? || self.at(Symbol::Pipe)? {
+            return Err(Refusal::Redirection.into());
+        }
         let mut args = Vec::new();
+        let mut closed_list = false;
         if self.eat(Symbol::Open)? {
             args = self.expression_list(Symbol::Close, depth, false)?;
             if args.is_empty() {
@@ -1260,11 +1264,13 @@ impl Parser<'_> {
                 let height = first.height + 1;
                 let group = Expr::new(ExprKind::Group(Box::new(first)), height)?;
                 args.push(self.expression_tail(group, 1, depth, true)?);
+            } else {
+                closed_list = true;
             }
         } else if !self.terminated()? {
             args.push(self.expression(1, depth, true)?);
         }
-        while self.eat(Symbol::Comma)? {
+        while !closed_list && self.eat(Symbol::Comma)? {
             self.newlines()?;
             args.push(self.expression(1, depth, true)?);
         }
@@ -1293,16 +1299,23 @@ impl Parser<'_> {
         Ok(condition)
     }
 
+    fn body_terminator(&mut self, body: &Stmt) -> Result<bool, AwkError> {
+        let terminated = !body.needs_separator()
+            || self.eat(Symbol::Semi)?
+            || self.peek()?.kind == Kind::Newline;
+        self.newlines()?;
+        Ok(terminated)
+    }
+
     fn if_statement(&mut self, depth: u8) -> Result<Stmt, AwkError> {
         let depth = Self::depth(depth)?;
         let condition = self.condition(depth)?;
         self.newlines()?;
         let yes = Box::new(self.statement(depth)?);
         let saved = (self.lexer.clone(), self.look.clone());
-        let separated = self.at(Symbol::Semi)? || self.peek()?.kind == Kind::Newline;
-        self.separators()?;
+        let terminated = self.body_terminator(&yes)?;
         let no = if self.named("else")? {
-            if yes.needs_separator() && !separated {
+            if !terminated {
                 return Err(self.peek()?.error("a newline or `;` before else"));
             }
             self.take()?;
@@ -1340,13 +1353,9 @@ impl Parser<'_> {
         if name == "do" {
             self.newlines()?;
             let body = self.loop_body(depth)?;
-            if body.needs_separator()
-                && !self.at(Symbol::Semi)?
-                && self.peek()?.kind != Kind::Newline
-            {
+            if !self.body_terminator(&body)? {
                 return Err(self.peek()?.error("a newline or `;` before while"));
             }
-            self.separators()?;
             if !self.named("while")? {
                 return Err(self.peek()?.error("`while` after a do body"));
             }
@@ -1370,12 +1379,14 @@ impl Parser<'_> {
             return Stmt::new(StmtKind::ForIn { key, array, body }, height);
         }
         self.expect(Symbol::Semi)?;
+        self.newlines()?;
         let condition = if self.at(Symbol::Semi)? {
             None
         } else {
             Some(self.expression(1, depth, false)?)
         };
         self.expect(Symbol::Semi)?;
+        self.newlines()?;
         let step = if self.at(Symbol::Close)? {
             None
         } else {

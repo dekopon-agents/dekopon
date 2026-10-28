@@ -612,3 +612,111 @@ fn control_flow_requires_statement_separators_and_array_identifiers() {
         compile(source, &Budget::start(Limits::default())).unwrap();
     }
 }
+
+#[test]
+fn an_empty_print_list_refuses_redirection() {
+    for operator in [">", ">>", "|"] {
+        assert_eq!(
+            refused(&format!("{{print {operator} \"target\"}}")),
+            Refusal::Redirection
+        );
+    }
+}
+
+#[test]
+fn for_headers_allow_newlines_after_both_semicolons() {
+    for (header, expected) in [
+        ("i=0;\ni<2;i++", (true, true, true)),
+        ("i=0;i<2;\ni++", (true, true, true)),
+        ("i=0;\n\ni<2;\n\ni++", (true, true, true)),
+        (";\n;\n", (false, false, false)),
+        ("i=0;\n;\n", (true, false, false)),
+        (";\n1;\n", (false, true, false)),
+        (";\n;\ni++", (false, false, true)),
+    ] {
+        let compiled = compile(
+            &format!("BEGIN{{for({header});}}"),
+            &Budget::start(Limits::default()),
+        )
+        .unwrap();
+        let StmtKind::Block(body) = &compiled.program.rules[0].action.as_ref().unwrap().kind else {
+            panic!("BEGIN block");
+        };
+        let StmtKind::For {
+            init,
+            condition,
+            step,
+            ..
+        } = &body[0].kind
+        else {
+            panic!("for loop");
+        };
+        assert_eq!(
+            (init.is_some(), condition.is_some(), step.is_some()),
+            expected
+        );
+    }
+}
+
+#[test]
+fn control_flow_consumes_only_its_body_terminator() {
+    for source in [
+        "BEGIN{if(1){};else print 2}",
+        "BEGIN{if(1){};;else print 2}",
+        "BEGIN{if(1);;else print 2}",
+        "BEGIN{if(1)print 1;;else print 2}",
+        "BEGIN{if(1)print 1\n;else print 2}",
+        "BEGIN{do{};while(0)}",
+        "BEGIN{do{};;while(0)}",
+        "BEGIN{do;;while(0)}",
+        "BEGIN{do print 1;;while(0)}",
+        "BEGIN{do print 1\n;while(0)}",
+    ] {
+        assert!(
+            matches!(
+                compile(source, &Budget::start(Limits::default())),
+                Err(AwkError::Syntax { .. })
+            ),
+            "{source}"
+        );
+    }
+    for source in [
+        "BEGIN{if(1){}\n\nelse print 2}",
+        "BEGIN{if(1);\nelse print 2}",
+        "BEGIN{if(1)print 1;\n\nelse print 2}",
+        "BEGIN{if(1)print 1\n\nelse print 2}",
+        "BEGIN{if(1)if(0)print 1;else print 2;else print 3}",
+        "BEGIN{do{}\n\nwhile(0)}",
+        "BEGIN{do;\nwhile(0)}",
+        "BEGIN{do print 1;\n\nwhile(0)}",
+        "BEGIN{do print 1\n\nwhile(0)}",
+    ] {
+        compile(source, &Budget::start(Limits::default()))
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    }
+}
+
+#[test]
+fn parenthesized_print_lists_close_after_multiple_arguments() {
+    for source in ["BEGIN{print(1,2),3}", "BEGIN{printf(\"%d\",1),2}"] {
+        assert!(matches!(
+            compile(source, &Budget::start(Limits::default())),
+            Err(AwkError::Syntax { .. })
+        ));
+    }
+    for source in [
+        "BEGIN{print(1),2}",
+        "BEGIN{printf(\"%d\"),1}",
+        "BEGIN{print(1,2)}",
+        "BEGIN{printf(\"%d\",1)}",
+    ] {
+        let compiled = compile(source, &Budget::start(Limits::default())).unwrap();
+        let StmtKind::Block(body) = &compiled.program.rules[0].action.as_ref().unwrap().kind else {
+            panic!("BEGIN block");
+        };
+        let (StmtKind::Print(args) | StmtKind::Printf(args)) = &body[0].kind else {
+            panic!("print statement");
+        };
+        assert_eq!(args.len(), 2);
+    }
+}
