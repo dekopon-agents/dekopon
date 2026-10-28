@@ -663,7 +663,11 @@ impl logs::LogProcessor for EventArrayProcessor {
     fn emit(&self, record: &mut logs::SdkLogRecord, _: &opentelemetry::InstrumentationScope) {
         use opentelemetry::logs::LogRecord as _;
         let context = opentelemetry::Context::current();
-        if let Some(array) = context.get::<crate::EventStringArray>() {
+        for array in context
+            .get::<crate::EventStringArrays>()
+            .into_iter()
+            .flat_map(|arrays| &arrays.0)
+        {
             record.add_attribute(
                 array.name,
                 opentelemetry::logs::AnyValue::ListAny(Box::new(

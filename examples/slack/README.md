@@ -49,7 +49,9 @@ if the classic deployment wants final replies only. The Agent profile additional
 `agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
 requires for Agent View. Both profiles include `channels:history`/`message.channels` and
 `groups:history`/`message.groups` for thread follow; Agent also uses them for owned-thread continuation. Opening App Home is not
-itself routed as a prompt, and ambient channel-history events are discarded inside the transport.
+itself routed as a prompt. To admit top-level PR links, enable
+[`ambient.pullRequestLinks`](../../docs/gatewayd.md#slack-pull-request-links) on a channel route
+with `follow: true` and a journal; other ambient channel-history events retain their existing gates.
 
 ### Generate the app-level token (`xapp-…`)
 

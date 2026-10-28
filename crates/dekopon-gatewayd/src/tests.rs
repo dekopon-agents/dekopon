@@ -4433,6 +4433,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         indicators: fixture_liveness(),
         wakes: false,
         follow: false,
+        ambient: crate::config::AmbientConfig::default(),
     }
 }
 
@@ -4486,6 +4487,7 @@ fn model_config() -> ModelConfig {
 
 fn message(text: &str) -> InboundMessage {
     InboundMessage {
+        pull_request_links: None,
         transport: "dev".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
         subject: subject(),
@@ -4566,6 +4568,7 @@ fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
 
 fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
     InboundMessage {
+        pull_request_links: None,
         transport: "scientist-slack".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
         subject: "slack.t0123abc.u9xyz"
@@ -17927,6 +17930,7 @@ mod jobs_e2e;
 #[path = "tests/memory_notice.rs"]
 mod memory_notice;
 mod participants;
+mod pull_request_links;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
 #[path = "tests/sealed_handoff.rs"]
@@ -23039,11 +23043,18 @@ struct SlackFollowFixture {
 
 impl SlackFollowFixture {
     async fn new() -> Self {
+        Self::with_pull_request_links(false).await
+    }
+
+    async fn with_pull_request_links(enabled: bool) -> Self {
         let directory = temporary();
         let mut doc = document(directory.path());
         doc["routes"][0]["transport"] = json!("scientist-slack");
         doc["routes"][0]["conversation"] = json!({"kind": ["channel", "thread"]});
         doc["routes"][0]["follow"] = json!(true);
+        if enabled {
+            doc["routes"][0]["ambient"] = json!({"pullRequestLinks": true});
+        }
         doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
         doc["transports"][0] = json!({"name": "scientist-slack", "kind": "slackSocketMode", "appTokenEnv": "APP", "botTokenEnv": "BOT"});
         doc["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});

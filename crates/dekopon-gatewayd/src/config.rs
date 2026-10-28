@@ -787,6 +787,13 @@ const fn default_conversation_max_bytes() -> usize {
 // One week matches how long WhatsApp keeps an inbound media id, so recalled photos stay fetchable.
 pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AmbientConfig {
+    #[serde(default)]
+    pub(crate) pull_request_links: bool,
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent authored route switches are optional and retain their wire booleans"
@@ -794,6 +801,8 @@ pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteConfig {
+    #[serde(default)]
+    pub(crate) ambient: AmbientConfig,
     pub transport: String,
     pub conversation: ConversationMatchConfig,
     #[serde(default, deserialize_with = "github_events_present")]
@@ -880,6 +889,7 @@ impl MemoryPolicy {
 )]
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
+    pub(crate) ambient: AmbientConfig,
     pub transport: String,
     pub github_events: Option<Vec<GithubEvent>>,
     pub conversation: ConversationMatch,
@@ -2479,6 +2489,19 @@ fn resolve_with_service(
                 indicators.insert(kind, Arc::new(resolved));
             }
         }
+        if route.ambient.pull_request_links {
+            let slack = transports.iter().any(|transport| {
+                matches!(transport, TransportConfig::SlackSocketMode { name, .. } if name == &route.transport)
+            });
+            if !slack
+                || !matches!(&conversation.kind, ConversationKindMatch::Kinds(kinds) if !kinds.is_empty() && kinds.iter().all(|kind| matches!(kind, ConversationKind::Channel | ConversationKind::Thread)))
+            {
+                problems.push(ConfigProblem::UnsupportedPullRequestLinksRoute { route: index });
+            }
+            if !route.follow {
+                problems.push(ConfigProblem::PullRequestLinksWithoutFollow { route: index });
+            }
+        }
         if route.follow {
             if config.sessions.journal.is_none() {
                 problems.push(ConfigProblem::FollowWithoutJournal { route: index });
@@ -2708,6 +2731,7 @@ fn resolve_with_service(
             indicators,
             wakes: route.wakes,
             follow: route.follow,
+            ambient: route.ambient,
         });
     }
 
@@ -3334,6 +3358,10 @@ pub enum ConfigProblem {
         "routes[{route}]: follow requires a Slack channel/thread route or a Discord channel/thread route with messageContent enabled"
     )]
     UnsupportedFollowRoute { route: usize },
+    #[error("routes[{route}]: ambient.pullRequestLinks requires a Slack channel/thread route")]
+    UnsupportedPullRequestLinksRoute { route: usize },
+    #[error("routes[{route}]: ambient.pullRequestLinks requires follow: true and its journal")]
+    PullRequestLinksWithoutFollow { route: usize },
     #[error(
         "stopWords must not be empty and no word may be blank; omit the key to keep the default list"
     )]
@@ -4094,6 +4122,59 @@ routes:
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn pull_request_links_require_slack_channel_kinds_and_existing_follow() {
+        let slack = "transports:\n  - name: chat\n    kind: slackSocketMode\n    appTokenEnv: APP\n    botTokenEnv: BOT\n";
+        let local = "transports:\n  - name: chat\n    kind: local\n    socketPath: dev.sock\n";
+        let route = "routes:\n  - transport: chat\n    conversation: { kind: [channel, thread] }\n    agent: reviewer\n    follow: true\n    ambient: { pullRequestLinks: true }\n";
+        let journal = "sessions:\n  journal: { path: journal }\n  assets: { path: assets }\n";
+        assert!(
+            resolved(&format!("{journal}{slack}{route}"))
+                .unwrap()
+                .routes[0]
+                .ambient
+                .pull_request_links
+        );
+        for (transport, route) in [
+            (local, route.to_owned()),
+            (slack, route.replace("channel, thread", "directMessage")),
+            (
+                slack,
+                route.replace("channel, thread", "groupDirectMessage"),
+            ),
+        ] {
+            assert!(
+                matches!(resolved(&format!("{journal}{transport}{route}")), Err(ConfigError::Invalid { problems, .. })
+                if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedPullRequestLinksRoute { route: 0 })))
+            );
+        }
+        assert!(
+            matches!(resolved(&format!("{slack}{}", route.replace("follow: true", "follow: false"))), Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::PullRequestLinksWithoutFollow { route: 0 })))
+        );
+        assert!(
+            matches!(resolved(&format!("{slack}{route}")), Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::FollowWithoutJournal { route: 0 })))
+        );
+        assert!(
+            !resolved(&format!(
+                "{journal}{slack}{}",
+                route.replace("    ambient: { pullRequestLinks: true }\n", "")
+            ))
+            .unwrap()
+            .routes[0]
+                .ambient
+                .pull_request_links
+        );
+        assert!(matches!(
+            resolved(&format!(
+                "{journal}{slack}{}",
+                route.replace("pullRequestLinks: true", "pullRequestLinks: yes")
+            )),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]
