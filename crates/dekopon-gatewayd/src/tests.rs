@@ -1798,13 +1798,9 @@ async fn signed_reload_delivery(
     repo: &str,
 ) -> reqwest::StatusCode {
     use crate::transport::webhook::hmac_sha256;
-    let claim = if event == "pull_request" {
-        json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":repo},"sender":{"id":1},
-            "action":"opened","number":7,"pull_request":{"head":{"sha":"a".repeat(40)}}})
-    } else {
-        json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":repo},"sender":{"id":1},
-            "action":"completed","workflow_run":{"id":5,"head_sha":"a".repeat(40),"conclusion":"success"}})
-    };
+    let mut claim = crate::transport::github::tests::sample(event);
+    claim["repository"]["owner"]["login"] = json!("OWNER");
+    claim["repository"]["name"] = json!(repo);
     let body = serde_json::to_vec(&claim).unwrap();
     let signature: String = hmac_sha256(b"secret", &body)
         .iter()
@@ -1972,6 +1968,7 @@ async fn authorize_github_fixture(
         "reviewer".parse().unwrap(),
         ChatScopeClaim {
             participant: None,
+            github: None,
             transport: inbound.transport.parse().unwrap(),
             kind: inbound.transport_kind,
             conversation: inbound.conversation,
@@ -2032,11 +2029,8 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         dekopon_config::LocalCatalog::load(directory.path().join("dekopon.yaml")).unwrap();
     let routes =
         std::sync::Arc::new(crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap());
-    let body = serde_json::to_vec(
-        &json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":"REPO"},"sender":{"id":1},
-        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"a".repeat(40)}}}),
-    )
-    .unwrap();
+    let body =
+        serde_json::to_vec(&crate::transport::github::tests::sample("pull_request")).unwrap();
     let signature: String = hmac_sha256(b"secret", &body)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -2090,11 +2084,10 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
             .is_err(),
         "a duplicate must not enqueue a second turn"
     );
-    let other_body = serde_json::to_vec(
-        &json!({"repository":{"id":20,"owner":{"login":"OTHER"},"name":"REPO"},"sender":{"id":1},
-        "action":"opened", "number": 7, "pull_request":{"head":{"sha":"a".repeat(40)}}}),
-    )
-    .unwrap();
+    let mut other = crate::transport::github::tests::sample("pull_request");
+    other["repository"]["id"] = json!(20);
+    other["repository"]["owner"]["login"] = json!("OTHER");
+    let other_body = serde_json::to_vec(&other).unwrap();
     let other_signature: String = hmac_sha256(b"secret", &other_body)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -2116,11 +2109,8 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
             .is_err(),
         "another signed repo cannot use the first repo's route"
     );
-    let run_body = serde_json::to_vec(
-        &json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":"REPO"},"sender":{"id":1},
-        "action":"completed", "workflow_run":{"id":5,"head_sha":"a".repeat(40),"conclusion":"success"}}),
-    )
-    .unwrap();
+    let run_body =
+        serde_json::to_vec(&crate::transport::github::tests::sample("workflow_run")).unwrap();
     let run_signature: String = hmac_sha256(b"secret", &run_body)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -2135,11 +2125,10 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         .await
         .unwrap();
     assert_eq!(run_status.status(), reqwest::StatusCode::OK);
-    let pending_run = serde_json::to_vec(
-        &json!({"repository":{"id":10,"owner":{"login":"OWNER"},"name":"REPO"},"sender":{"id":1},
-        "action":"requested", "workflow_run":{"id":6,"head_sha":"a".repeat(40),"conclusion":null}}),
-    )
-    .unwrap();
+    let mut pending = crate::transport::github::tests::sample("workflow_run");
+    pending["action"] = json!("requested");
+    pending["workflow_run"]["conclusion"] = Value::Null;
+    let pending_run = serde_json::to_vec(&pending).unwrap();
     let pending_signature: String = hmac_sha256(b"secret", &pending_run)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -4608,6 +4597,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
         "reviewer".parse().expect("agent"),
         dekopon_broker_protocol::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "support-whatsapp".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
             conversation: inbound.conversation.clone(),
@@ -18405,6 +18395,7 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
         route.agent.clone(),
         dekopon_broker_protocol::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: message.transport.parse().unwrap(),
             kind: message.transport_kind,
             conversation: message.conversation.clone(),

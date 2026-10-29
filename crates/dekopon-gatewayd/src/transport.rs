@@ -82,7 +82,7 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
-    Github(Box<github::GithubBatch>),
+    Github(Box<dekopon_core::github::GithubBatch>),
     Follow(String),
     Wake {
         id: WakeId,
@@ -108,7 +108,7 @@ impl fmt::Display for MessageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Native(id) | Self::Follow(id) => formatter.write_str(id),
-            Self::Github(batch) => formatter.write_str(&batch.lead().delivery),
+            Self::Github(batch) => formatter.write_str(batch.lead().delivery.as_str()),
             Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
             Self::Job { id, .. } => write!(formatter, "job-{id}"),
         }

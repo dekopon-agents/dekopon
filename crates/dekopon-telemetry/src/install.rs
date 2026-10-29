@@ -305,11 +305,24 @@ where
                 ids.span_id()
             )?;
         }
-        for array in arrays.into_iter().flat_map(|arrays| &arrays.0) {
+        for array in arrays.into_iter().flat_map(|arrays| arrays.iter()) {
             let name =
                 serde_json::to_string(array.name).map_err(|_invalid_json| std::fmt::Error)?;
-            let values =
-                serde_json::to_string(&array.values).map_err(|_invalid_json| std::fmt::Error)?;
+            let values = serde_json::to_string(
+                &array
+                    .values
+                    .iter()
+                    .map(|value| match value {
+                        opentelemetry::Value::String(value) => serde_json::json!(value.as_str()),
+                        opentelemetry::Value::I64(value) => serde_json::json!(value),
+                        opentelemetry::Value::Bool(value) => serde_json::json!(value),
+                        opentelemetry::Value::F64(value) => serde_json::json!(value),
+                        opentelemetry::Value::Array(value) => serde_json::json!(value.to_string()),
+                        value => serde_json::json!(value.to_string()),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_invalid_json| std::fmt::Error)?;
             write!(writer, ",{name}:{values}")?;
         }
         writeln!(writer, "}}")
@@ -539,7 +552,7 @@ where
             metadata.is_event()
                 && metadata.fields().field("audit.event").is_some()
                 && opentelemetry::Context::current()
-                    .get::<crate::EventStringArray>()
+                    .get::<crate::EventStringArrays>()
                     .is_some()
         })
         .with_callsite_filter(|metadata| {
@@ -859,7 +872,9 @@ mod tests {
         tracing::subscriber::with_default(registry().with(console), || {
             crate::with_event_string_array("github.deliveries", &["first", "second"], || {
                 crate::with_event_string_array("github.repository.names", &["one", "two"], || {
-                    tracing::info!(outcome = "queued", "admission");
+                    crate::with_event_string_array("github.actor.id", &[&1_i64, &2_i64], || {
+                        tracing::info!(outcome = "queued", "admission")
+                    });
                 });
             });
             tracing::info!(outcome = "ignored", "next");
@@ -873,6 +888,8 @@ mod tests {
             lines[0]["github.repository.names"],
             serde_json::json!(["one", "two"])
         );
+        assert_eq!(lines[0]["github.actor.id"], serde_json::json!([1, 2]));
+        assert!(lines[1].get("github.actor.id").is_none());
         assert!(lines[1].get("github.repository.names").is_none());
         assert!(lines[1].get("github.deliveries").is_none());
     }

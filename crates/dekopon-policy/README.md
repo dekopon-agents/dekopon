@@ -68,7 +68,7 @@ public DRN was proposed for. A request missing a required field is refused befor
 even if a policy would otherwise permit it.
 
 All three action types optionally carry `subject`, `transportKind`, `transport`, `trigger`, `startedBy`, and
-`conversation`. When present, `conversation` requires `kind` and `id`; its `container` and `thread`
+`conversation`, and `github`. When present, `conversation` requires `kind` and `id`; its `container` and `thread`
 fields are optional. Policies must guard optional fields with `has` before reading them. Ordinary
 policies' strict validation also prevents a field from being read on an action that never carries it.
 
@@ -84,6 +84,8 @@ configuration:
   matched byte for byte against the loaded manifest at startup.
 
 Invocation context excludes message content and arbitrary provider input; at the per-request Cedar point, `context.request` exposes bounded outgoing HTTP facts, including a buffered JSON object body of at most 16 KiB as a record (`null` members omitted, fractions as Cedar `decimal`); any other body is the string `"opaque"`, so a forbid that reads its attributes errors and denies. A public DRN remains a separate strongly validated resource on a separate action, inert without an owner binding.
+
+For a GitHub message, `context.github` is one typed delivery record: delivery, event, optional action/time/number, repository and actor, its `kind`-tagged family facts, and `authorSet`. Each decision evaluates every delivery separately with `authorSet` omitted and then present; all evaluations must allow. An author-set permit cannot grant authority, while an author-set forbid can deny. GitHub facts are request context and do not change the policy digest. Non-GitHub claims and wake claims omit them.
 
 ## Determinism and bounds
 

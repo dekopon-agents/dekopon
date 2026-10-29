@@ -87,6 +87,7 @@ fn agent() -> dekopon_core::AgentId {
 fn scope() -> ChatScopeClaim {
     ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "scientist-slack".parse().expect("valid transport fixture"),
         kind: ChatTransportKind::Slack,
         conversation: conversation(
@@ -902,6 +903,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
 
     let oversized = ChatScopeClaim {
         participant: None,
+        github: None,
         conversation: conversation(
             ConversationKind::Channel,
             Some("t0123abc"),
@@ -1597,6 +1599,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     );
     let fauxlack = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "chat".parse().unwrap(),
         kind: ChatTransportKind::Fauxlack,
         conversation: conversation(ConversationKind::Channel, Some("acme"), "cteam", Some("m1")),
@@ -1642,6 +1645,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }));
     let slack = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "scientist-slack".parse().expect("transport"),
         kind: ChatTransportKind::Slack,
         conversation: conversation(
@@ -1679,6 +1683,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
 
     let discord = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Channel, Some("999"), "123", None),
@@ -1687,6 +1692,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     };
     let discord_thread = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Thread, Some("999"), "123", Some("456")),
@@ -1719,6 +1725,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
 
     let telegram = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
         conversation: conversation(ConversationKind::Thread, None, "-1001", Some("42")),
@@ -1760,6 +1767,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
 
     let telegram_max = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
         conversation: conversation(
@@ -1783,6 +1791,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
 
     let whatsapp = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "support-whatsapp".parse().expect("transport"),
         kind: ChatTransportKind::Whatsapp,
         conversation: conversation(
@@ -1824,6 +1833,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
 
     let local = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "dev".parse().expect("transport"),
         kind: ChatTransportKind::Local,
         conversation: conversation(ConversationKind::DirectMessage, None, "conversation", None),
@@ -2130,6 +2140,7 @@ fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
             agent(),
             ChatScopeClaim {
                 participant: None,
+                github: None,
                 conversation: conversation(
                     ConversationKind::Channel,
                     Some("t0123abc"),
@@ -2986,4 +2997,66 @@ fn chat_participant_is_optional_and_only_canonical_ordinals_are_bounded() {
         claim.participant = Some(handle.to_owned());
         assert!(!claim.is_bounded());
     }
+}
+
+#[test]
+fn a_frame_with_an_unknown_key_is_refused() {
+    let base = json!({"delivery":"delivery-1","event":"repository","repository":{"id":10,"fullName":"owner/repo"},"actor":{"id":1},"authorSet":{"actorLogin":"owner"}});
+    let pr = json!({"baseRef":"main","baseSha":"a".repeat(40),"merged":false,"crossRepository":false,"authorId":1,"authorAssociation":"OWNER","labels":[]});
+    let issue = json!({"authorId":1,"authorAssociation":"OWNER","labels":[],"assignees":[],"isPullRequest":false});
+    let comment = json!({"id":2,"authorAssociation":"OWNER"});
+    for shape in [
+        json!({"kind":"none"}),
+        json!({"kind":"pullRequest","pullRequest":pr}),
+        json!({"kind":"review","pullRequest":pr,"review":comment}),
+        json!({"kind":"reviewComment","pullRequest":pr,"comment":comment}),
+        json!({"kind":"issue","issue":issue}),
+        json!({"kind":"issueComment","issue":issue,"comment":comment}),
+        json!({"kind":"discussion","discussion":{"authorAssociation":"OWNER"}}),
+        json!({"kind":"discussionComment","discussion":{"authorAssociation":"OWNER"},"comment":comment}),
+        json!({"kind":"commitComment","comment":comment}),
+        json!({"kind":"push","push":{"ref":"main","refType":"branch","before":"a".repeat(40),"after":"b".repeat(40),"created":false,"deleted":false,"forced":false,"commits":0}}),
+        json!({"kind":"ref","gitRef":{}}),
+        json!({"kind":"run","run":{}}),
+        json!({"kind":"check","check":{}}),
+        json!({"kind":"release","release":{"id":2,"tag":"v1","draft":false,"prerelease":false}}),
+        json!({"kind":"deployment","deployment":{}}),
+        json!({"kind":"alert","alert":{}}),
+        json!({"kind":"label","label":{"id":2,"name":"ready"}}),
+        json!({"kind":"milestone","milestone":{"id":2,"number":1,"state":"open"}}),
+        json!({"kind":"mergeGroup","mergeGroup":{"baseSha":"a".repeat(40),"headSha":"b".repeat(40),"baseRef":"main"}}),
+        json!({"kind":"package","package":{"id":2,"ecosystem":"CONTAINER"}}),
+        json!({"kind":"member","member":2}),
+    ] {
+        let mut event = base.clone();
+        event
+            .as_object_mut()
+            .unwrap()
+            .extend(shape.as_object().unwrap().clone());
+        let mut claim = serde_json::to_value(scope()).unwrap();
+        claim["github"] = json!([event]);
+        let decoded: ChatScopeClaim = serde_json::from_value(claim.clone()).expect("known fields");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), claim);
+        let mut extra = claim.clone();
+        extra["github"][0]["surprise"] = json!(true);
+        assert!(serde_json::from_value::<ChatScopeClaim>(extra).is_err());
+        for key in event
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| event[*k].is_object())
+        {
+            let mut extra = claim.clone();
+            extra["github"][0][key]["surprise"] = json!(true);
+            assert!(
+                serde_json::from_value::<ChatScopeClaim>(extra).is_err(),
+                "{key}"
+            );
+        }
+    }
+    let original=br#"{"transport":"scientist-slack","kind":"slack","conversation":{"kind":"channel","container":"t0123abc","id":"c0123abc","thread":"1712345678.000100"},"trigger":"message"}"#.to_vec();
+    assert_eq!(serde_json::to_vec(&scope()).unwrap(), original);
+    let absent: ChatScopeClaim = serde_json::from_slice(&original).unwrap();
+    assert!(absent.github.is_none());
+    assert_eq!(serde_json::to_vec(&absent).unwrap(), original);
 }

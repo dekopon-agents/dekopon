@@ -1299,6 +1299,7 @@ fn mapped_slack_channel_claim() -> dekopon_broker_protocol::Attestation {
             .expect("agent"),
         dekopon_broker_protocol::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "scientist-slack".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Slack,
             conversation: dekopon_broker_protocol::Conversation {
