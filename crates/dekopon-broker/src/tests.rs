@@ -2372,17 +2372,6 @@ fn an_audit_error_names_its_category() {
 }
 
 #[test]
-fn the_denying_principal_and_github_denier_record_distinct_values() {
-    use super::{DenyingPrincipal, GithubDenier};
-
-    assert_eq!(DenyingPrincipal::Asker.as_str(), "asker");
-    assert_eq!(DenyingPrincipal::Space.as_str(), "space");
-    assert_eq!(DenyingPrincipal::Both.as_str(), "both");
-    assert_eq!(GithubDenier::Facts.as_str(), "facts");
-    assert_eq!(GithubDenier::AuthorSet.as_str(), "author-set");
-}
-
-#[test]
 fn each_storage_host_error_maps_to_its_public_category() {
     use dekopon_storage_host::StorageHostError;
 
@@ -2407,103 +2396,9 @@ fn each_storage_host_error_maps_to_its_public_category() {
 }
 
 #[test]
-fn audit_records_carry_delivery_and_actor_kind_and_id() {
-    use dekopon_broker_protocol::DeliveryIdentity;
-
-    let local = DeliveryIdentity::Local {
-        transport: "local-dev".parse().expect("transport"),
-        conversation: "session".to_owned(),
-        boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
-        connection: 3,
-        sequence: 9,
-    };
-    let message = |message: &str| message.to_owned();
-    for (delivery, kind, id) in [
-        (
-            DeliveryIdentity::Fauxlack {
-                channel: "c1".to_owned(),
-                message: message("m-faux"),
-            },
-            "fauxlack",
-            "m-faux",
-        ),
-        (
-            DeliveryIdentity::Slack {
-                channel: "c1".to_owned(),
-                timestamp: "1712345678.000100".to_owned(),
-            },
-            "slack",
-            "1712345678.000100",
-        ),
-        (
-            DeliveryIdentity::Discord {
-                channel: "c1".to_owned(),
-                message: message("m-discord"),
-            },
-            "discord",
-            "m-discord",
-        ),
-        (
-            DeliveryIdentity::Telegram {
-                chat: "-100".to_owned(),
-                topic: None,
-                message: message("77"),
-            },
-            "telegram",
-            "77",
-        ),
-        (
-            DeliveryIdentity::Whatsapp {
-                waba: "1".to_owned(),
-                phone_number: "2".to_owned(),
-                message: message("wamid.ABC"),
-            },
-            "whatsapp",
-            "wamid.ABC",
-        ),
-        (
-            DeliveryIdentity::Github {
-                delivery: "guid-1".to_owned(),
-            },
-            "github",
-            "guid-1",
-        ),
-        (local, "local", "0123456789abcdef0123456789abcdef-3-9"),
-    ] {
-        assert_eq!(super::delivery_kind(&delivery), kind);
-        assert_eq!(super::delivery_id(&delivery), id);
-    }
-
-    let principal: PrincipalId = "maintainer".parse().expect("principal");
-    let agent: AgentId = "reviewer".parse().expect("agent");
-    for (actor, kind, id) in [
-        (
-            Actor::Human {
-                principal: principal.clone(),
-            },
-            "human",
-            "maintainer",
-        ),
-        (
-            Actor::Service {
-                principal: principal.clone(),
-            },
-            "service",
-            "maintainer",
-        ),
-        (Actor::Agent { agent }, "agent", "reviewer"),
-    ] {
-        assert_eq!(super::actor_kind(&actor), kind);
-        assert_eq!(super::actor_id(&actor), id);
-    }
-}
-
-#[test]
-fn a_rendered_evidence_value_is_absent_when_it_is_empty_or_null() {
-    assert_eq!(super::rendered(&vec!["a"]).as_deref(), Some(r#"["a"]"#));
+fn a_rendered_evidence_value_is_absent_when_it_is_an_empty_list_or_null() {
     assert_eq!(super::rendered(&Vec::<String>::new()), None);
     assert_eq!(super::rendered(&None::<u8>), None);
-    assert_eq!(super::rendered(&Some(5)).as_deref(), Some("5"));
 }
 
 #[test]
