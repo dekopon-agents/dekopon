@@ -1575,8 +1575,9 @@ personal. Legacy once/watch rows without `run_as` retain their personal ownershi
 
 Every probe run opens its own broker leg attested with `trigger: probe`. The broker neither lists
 nor authorizes a capability that is not read-only on that leg (`probe-write`), whatever policy
-says. The woken session attests `trigger: wake` and is authorized afresh, like any message, so
-a personal wake can do only what its scheduling person could do by typing. Every wake newly
+says. A daily digest's woken session also attests `trigger: probe` and stays read-only; other
+woken sessions attest `trigger: wake`. Each is authorized afresh, so a personal wake can do only
+what its scheduling person could do by typing. Every wake newly
 created in a mapped space, whether schedule, watch, digest or PR subscription, runs as the space
 alone and can do only what that space may do, without a participant leg or the original person's
 grants. Space-watch probes also run as the space alone under the read-only ceiling.

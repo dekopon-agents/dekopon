@@ -10,6 +10,8 @@ const DAY: u64 = 86_400;
 pub(super) fn configure_broker(config: &mut Value, policies: &mut String, api: Option<&str>) {
     config["principals"]["random-space"] = json!({"subjects":["fauxlack.acme.crandom"]});
     policies.push_str(&format!(r#"
+@id("digest-space-write")
+permit(principal == Dekopon::Principal::"team", action == Dekopon::Action::"http-probe.purge", resource == Dekopon::Provider::"http-probe") when {{ context.via == "{GATEWAY_PRINCIPAL}" && context.agent == "{AGENT}" }};
 @id("digest-other-space-prompt")
 permit(principal == Dekopon::Principal::"random-space", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"{AGENT}") when {{ context.via == "{GATEWAY_PRINCIPAL}" }};
 @id("digest-other-space-read")
@@ -214,7 +216,6 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
         "Unowned issue #17 waits for an owner; octocat can help."
     );
     assert_space_read(&audit, "gh.issue.list", "probe", root.id());
-    assert_space_read(&audit, "gh.issue.list", "wake", root.id());
     let reason: Value = serde_json::from_str(&fixture.tool_result("reason")).unwrap();
     assert!(reason["scheduledBy"].is_null());
     assert_eq!(reason["trigger"], "wake");
@@ -588,7 +589,7 @@ async fn a_digest_can_decline_after_real_read_work_without_any_chat_post() {
     )
     .await;
     wait_event(&audit, "agent.reply.declined").await;
-    assert_space_read(&audit, "cli-probe.upper", "wake", root.id());
+    assert_space_read(&audit, "cli-probe.upper", "probe", root.id());
     assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
@@ -776,4 +777,116 @@ async fn a_queued_digest_is_dropped_when_a_reload_disables_wakes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_digest_is_dropped_when_a_reload_changes_its_agent() {
     assert_a_queued_digest_is_dropped_after_reload(QueuedDigestReload::AgentChanged).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fired_digest_cannot_write_and_can_decline_after_reads() {
+    use dekopon_broker_protocol::{
+        Attestation, BrokerClient, ChatScopeClaim, InvocationOutcome, InvocationRequest,
+        TraceParent, Trigger,
+    };
+
+    let audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let script = "probe upper --text waiting | jq -r .text";
+    let fixture = boot_digests(
+        &chat,
+        temporary(),
+        vec![
+            meta("create", "wake", request("digest", script)),
+            final_answer("Set."),
+        ],
+        vec![],
+        None,
+    )
+    .await;
+    let root = chat
+        .server("acme")
+        .user("ualice")
+        .post("cteam", "<@udekopon> daily digest")
+        .await
+        .unwrap();
+    assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
+    let mut rows = stored(&fixture);
+    let directory = fixture.shutdown().await;
+    due(&mut rows[0]);
+    let row = rows[0].clone();
+    let fixture = boot_digests(
+        &chat,
+        directory,
+        vec![
+            bash_tool_call("read", script),
+            meta("quiet", "decline_chat_reply", json!({})),
+        ],
+        rows,
+        None,
+    )
+    .await;
+    wait_event(&audit, "agent.reply.declined").await;
+    let reads = audit.capture.events_where(
+        "dekopon_broker",
+        &[
+            ("capability.id", "cli-probe.upper"),
+            ("decision.point", "invocation"),
+            ("principal", "team"),
+            ("decision.allowed", "true"),
+        ],
+    );
+    assert_eq!(
+        reads.len(),
+        2,
+        "the scheduled probe and fired digest each read"
+    );
+    let fired_read = reads.last().expect("the fired digest read succeeded");
+    let trigger: Trigger =
+        serde_json::from_value(json!(fired_read.field("turn.started_by").unwrap())).unwrap();
+    let claim = Attestation::for_chat(
+        serde_json::from_value(row["subject"].clone()).unwrap(),
+        serde_json::from_value(row["agent"].clone()).unwrap(),
+        ChatScopeClaim {
+            transport: serde_json::from_value(row["transport"].clone()).unwrap(),
+            kind: serde_json::from_value(row["kind"].clone()).unwrap(),
+            conversation: serde_json::from_value(row["conversation"].clone()).unwrap(),
+            trigger,
+            delivery: None,
+            participant: None,
+            github: None,
+        },
+    );
+    let client = BrokerClient::new(
+        fixture.directory.path().join("broker.sock"),
+        dekopon_brokerd::current_uid(),
+        Default::default(),
+    )
+    .unwrap();
+    let mut ordinary = claim.clone();
+    ordinary.scope.as_mut().unwrap().trigger = Trigger::Wake;
+    let surface = client.session_surface(Some(ordinary)).await.unwrap();
+    assert!(
+        surface
+            .capabilities
+            .iter()
+            .any(|entry| entry.capability.id.as_str() == "http-probe.purge")
+    );
+    // Invoke the fired scope directly so surface filtering cannot substitute for the broker ceiling.
+    let refused = client
+        .invoke(
+            Some(claim),
+            InvocationRequest {
+                id: "digest-write-ceiling".parse().unwrap(),
+                capability: "http-probe.purge".parse().unwrap(),
+                trace_parent: TraceParent::new([1; 16], [2; 8], 1).unwrap(),
+                input: json!({}),
+                secret_use: None,
+            },
+            Default::default(),
+            async |_| panic!("a refused write cannot run a provider upcall"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(refused.result.error.as_deref(), Some("probe-write"));
+    assert_eq!(trigger, Trigger::Probe);
+    assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
+    fixture.shutdown().await;
 }
