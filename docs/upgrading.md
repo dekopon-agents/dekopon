@@ -8,6 +8,35 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Gateway and broker upgrade together; turns share the shell thread budget (0.71.0)
+
+No configuration change is required.
+
+**Upgrade and roll back gatewayd and brokerd together.** A 0.71.0 gateway adds the
+optional `github` field to GitHub message claims; a 0.70.0 broker refuses it because
+`ChatScopeClaim` denies unknown fields. Non-GitHub claims are byte-identical. The
+chart runs both daemons from one image in one pod.
+
+Cedar policies may read `context.github`, guarded with `has`. Author-set facts
+(`context.github.authorSet`) can only deny; trust an actor by `actor.id`.
+Existing policies need no change, and their policy digests do not change.
+
+Gatewayd's `--blocking-threads` default is 8, down from 512. An explicit flag or
+`DEKOPON_BLOCKING_THREADS` keeps its configured value.
+
+Turns, jobs, wake ticks and memory summaries now take permits from
+`--shell-threads` (default 32): one per turn plus one per non-final pipeline stage.
+At the cap, work is refused at once with `LimitExceeded::ShellThreads` rather than
+queued. If you run many concurrent sessions with long pipelines, raise
+`--shell-threads`.
+
+Awk `%d` and `%i` format nan and inf as `nan` and `inf`, without zero padding.
+
+Downgrading to 0.70.0 is revert-safe and migrates no state; revert gatewayd and
+brokerd together. Remove policies that rely on `context.github` before downgrading.
+On 0.70.0, unguarded reads fail validation; `has`-guarded GitHub conditions validate
+but cannot match because the field is absent.
+
 ## awk is a builtin and case patterns match globs (0.70.0)
 
 No configuration change is required.
