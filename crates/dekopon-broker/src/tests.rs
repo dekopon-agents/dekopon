@@ -2089,10 +2089,12 @@ fn a_constraint_catalog_reports_its_length() {
 async fn a_catalog_over_the_constraint_set_ceiling_is_refused() {
     use super::{BrokerBuildError, CredentialStore};
 
-    let registry =
-        dekopon_broker_host::BrokerProviderRegistry::load([], BrokerHostLimits::default())
-            .await
-            .expect("an empty registry loads");
+    let registry = dekopon_broker_host::BrokerProviderRegistry::load(
+        Vec::<std::path::PathBuf>::new(),
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("an empty registry loads");
     let error = two_probe_sets()
         .validate(&registry, &CredentialStore::empty(), 1)
         .expect_err("two sets exceed a ceiling of one");
