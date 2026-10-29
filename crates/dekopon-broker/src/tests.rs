@@ -2364,6 +2364,14 @@ fn an_attestor_grant_needs_each_field_valid() {
             "{grant:?}"
         );
     }
+
+    for namespace in ["slack.t0123abc.u9xyz", "tel.16034700182"] {
+        AttestorGrant {
+            namespaces: Some(vec![namespace.to_owned()]),
+        }
+        .validate()
+        .unwrap_or_else(|error| panic!("{namespace}: {error}"));
+    }
 }
 
 #[test]
