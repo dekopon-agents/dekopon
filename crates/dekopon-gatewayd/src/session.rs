@@ -15,7 +15,10 @@ use dekopon_agent::{
     BrokerLeg, BrokerLegError, BudgetLimit, CancelSource, IdSequence, ProgressEvent, ProgressSink,
     ShellRuntime,
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
-    meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
+    meta::{
+        Admission as TurnAdmission, AgentConfigView, MemoryConfigView, MemoryScopeView,
+        SessionConfigView, SkillView, WakeReasonView, WebhookSource,
+    },
     prompt::{
         CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
         OmissionReason, PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer,
@@ -705,6 +708,7 @@ impl SessionGate {
         entries.insert(key.clone(), Holder::Session(Box::new(running)));
         Admit::Admitted(
             SessionAdmission {
+                kind: TurnAdmission::New,
                 _permit: permit,
                 key,
                 in_flight: Arc::clone(&self.in_flight),
@@ -844,6 +848,7 @@ impl SessionGate {
 }
 
 pub(crate) struct SessionAdmission {
+    kind: TurnAdmission,
     _permit: OwnedSemaphorePermit,
     key: AdmissionKey,
     in_flight: Arc<Mutex<BTreeMap<AdmissionKey, Holder>>>,
@@ -941,6 +946,7 @@ impl SessionAdmission {
                 running.participation = TurnParticipation::of(&next.message);
                 running.authorizing = 0;
                 running.received_at = next.message.received_at;
+                self.kind = TurnAdmission::FollowUp;
                 self.cancellation = running.cancellation.clone();
                 *self.route = next.route.clone();
                 found = Some((next, evidence));
@@ -1872,6 +1878,7 @@ async fn run_admitted(
         &message,
         driver,
         cancellation.clone(),
+        admission.kind,
     )
     .instrument(tracing::info_span!(
         "gateway.session",
@@ -2074,6 +2081,7 @@ async fn session(
     message: &InboundMessage,
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
+    admission: TurnAdmission,
 ) -> Ended {
     runner.assets.finish_publications().await;
     let mut publication = None;
@@ -2084,6 +2092,7 @@ async fn session(
         driver,
         cancellation.clone(),
         &mut publication,
+        admission,
     )
     .await;
     runner.gate.resolve_mapping(
@@ -2108,6 +2117,7 @@ async fn session_turn(
     driver: &Arc<dyn ChatDriver>,
     cancellation: SessionCancellation,
     publication: &mut Option<asset::Publication>,
+    admission: TurnAdmission,
 ) -> Ended {
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
@@ -2352,6 +2362,23 @@ async fn session_turn(
     let window = route.memory.window();
     let mut memory_facts = Vec::new();
     let principal = leg.principal().cloned();
+    let wake_reason = match &message.message_id {
+        MessageId::Native(_) | MessageId::Follow(_) => WakeReasonView::Chat {
+            transport_kind: message.transport_kind,
+            principal: principal.clone(),
+            admission,
+            steers: 0,
+        },
+        MessageId::Github(batch) => WakeReasonView::Webhook {
+            source: WebhookSource::Github,
+            events: batch.events().to_vec(),
+        },
+        MessageId::Wake { id, .. } => WakeReasonView::Wake {
+            wake: *id,
+            scheduled_by: principal.clone(),
+        },
+        MessageId::Job { id, .. } => WakeReasonView::Job { job: *id },
+    };
     let recall = Recall {
         runner,
         route,
@@ -2971,6 +2998,7 @@ async fn session_turn(
                 .with_system(Some(&instructions))
                 .with_skills(&skills)
                 .with_agent(&agent)
+                .wake_reason(&wake_reason)
                 .with_options(&options)
                 .with_assets(assets.as_ref())
                 .with_reply_assets(&session_attachments)
@@ -3267,6 +3295,8 @@ async fn session_turn(
                     | PromptError::InvalidArguments { .. }
                     | PromptError::ArgumentsNotObject { .. }
                     | PromptError::AgentConfigArgumentsNotEmpty { .. }
+                    | PromptError::WakeReasonArgumentsNotEmpty { .. }
+                    | PromptError::WakeReasonSerialization(_)
                     | PromptError::DeclineReplyArgumentsNotEmpty { .. }
                     | PromptError::MissingCommand { .. }
                     | PromptError::MissingAssetId { .. }

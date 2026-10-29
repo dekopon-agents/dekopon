@@ -6750,6 +6750,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
             "bash".to_owned(),
             IMPROVEMENT_TOOL_NAME.to_owned(),
             AGENT_CONFIG_TOOL_NAME.to_owned(),
+            "wake_reason".to_owned(),
             "fetch_chat_asset".to_owned()
         ]
     );
@@ -18324,6 +18325,7 @@ mod sealed_handoff;
 mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
+mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;
 
