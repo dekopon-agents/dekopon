@@ -4759,6 +4759,13 @@ fn metered_runner(
     Arc::new(runner)
 }
 
+fn serving_threads() -> dekopon_process::ShellThreads {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => dekopon_process::ShellThreads::new(16, runtime),
+        Err(_outside_runtime) => dekopon_test_support::shell_threads(),
+    }
+}
+
 fn runner_tracking(
     broker: ResolvedBroker,
     models: Arc<dyn ModelFactory>,
@@ -4789,7 +4796,7 @@ fn runner_tracking(
             Arc::clone(&thread_owner),
         )),
         metering: unmetered(),
-        shell_threads: dekopon_test_support::shell_threads(),
+        shell_threads: serving_threads(),
         thread_owner,
     })
 }
@@ -18367,7 +18374,7 @@ fn journaled_runner(
             Arc::clone(&thread_owner),
         )),
         metering: unmetered(),
-        shell_threads: dekopon_test_support::shell_threads(),
+        shell_threads: serving_threads(),
         thread_owner,
     })
 }
@@ -23972,6 +23979,11 @@ pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
         tokio::runtime::Handle::current().runtime_flavor(),
         tokio::runtime::RuntimeFlavor::CurrentThread
     ) {
+        return join.await;
+    }
+    let clock = tokio::time::Instant::now();
+    std::thread::yield_now();
+    if tokio::time::Instant::now() != clock {
         return join.await;
     }
     tokio::pin!(join);

@@ -2090,10 +2090,15 @@ fn a_multi_job_wait_holds_every_target_against_notices_and_eviction() {
         });
         on_park.recv().expect("the wait parks");
         drop(second);
+        let threads = dekopon_test_support::shell_threads();
+        let held_threads = (0..16)
+            .map(|_| jobs.thread_owner.reserve(&threads).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
             admitted(&jobs, "b", "evictor").err(),
             Some(dekopon_shell::JobRefusal::Full { maximum: 2 })
         );
+        drop(held_threads);
         drop(first);
         assert_eq!(
             waiter.join().expect("the waiter"),

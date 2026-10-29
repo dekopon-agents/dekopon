@@ -120,17 +120,6 @@ impl Table {
             .find(|row| row.id == id && row.owner == *owner)
             .ok_or(JobRefusal::NotYours)
     }
-
-    fn evict_finished(&mut self) -> bool {
-        let Some(index) = self.rows.iter().position(|row| match row.state {
-            RowState::Running => false,
-            RowState::Finished { .. } => row.waiters == 0,
-        }) else {
-            return false;
-        };
-        self.rows.remove(index);
-        true
-    }
 }
 
 #[expect(
@@ -195,14 +184,28 @@ impl Jobs {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => return Err(full),
         };
+        let evict = if table.rows.len() >= self.maximum {
+            Some(
+                table
+                    .rows
+                    .iter()
+                    .position(|row| match row.state {
+                        RowState::Running => false,
+                        RowState::Finished { .. } => row.waiters == 0,
+                    })
+                    .ok_or(full)?,
+            )
+        } else {
+            None
+        };
         let thread = self
             .thread_owner
             .reserve(threads)
             .map_err(JobRefusal::Limit)?;
-        let (handle, signal) = CancelSignal::pair();
-        if table.rows.len() >= self.maximum && !table.evict_finished() {
-            return Err(full);
+        if let Some(index) = evict {
+            table.rows.remove(index);
         }
+        let (handle, signal) = CancelSignal::pair();
         let id = JobId::new(table.next);
         table.next += 1;
         table.rows.push_back(Row {
