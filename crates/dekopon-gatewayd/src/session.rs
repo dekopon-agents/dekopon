@@ -21,8 +21,8 @@ use dekopon_agent::{
     },
     prompt::{
         CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
-        OmissionReason, PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer,
-        SteerSource, run_prompt_session,
+        OmissionReason, PromptError, ReplaySource, ReplyDisposition, ReviewProgress, Seal,
+        SessionInputs, Steer, SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -573,7 +573,7 @@ pub(crate) fn record_admission(
             { audit.event = "gateway.admission", outcome, busy.cause = cause,
               transport = %message.transport, conversation.id = %message.conversation.key(),
               queue.depth = depth,
-              admission.trigger = message.pull_request_links.as_ref().map(|_| "pull-request-link") },
+              admission.trigger = message.message_id.wake_origin().and_then(crate::wake::WakeOrigin::admission_trigger).or_else(|| if crate::wake::space_wake(message) { Some("space-wake") } else { message.pull_request_links.as_ref().map(|_| "pull-request-link") }) },
             "gateway.admission"
         )
     };
@@ -925,6 +925,12 @@ impl SessionAdmission {
                     next.receipts.finish(MessageOutcome::RouteLost);
                     continue;
                 };
+                if crate::wake::space_wake(&next.message)
+                    && (!route.wakes || route.agent != next.route.agent)
+                {
+                    next.receipts.finish(MessageOutcome::RouteLost);
+                    continue;
+                }
                 if folds_in(&next.message) {
                     let mut grouped = Vec::new();
                     while let Some(mut same) = running.follow_ups.pop_front_if(|queued| {
@@ -1821,7 +1827,8 @@ async fn execute(
             );
             let can_reply = match &message.message_id {
                 MessageId::Github(_) | MessageId::Follow(_) => false,
-                MessageId::Native(_) | MessageId::Wake { .. } | MessageId::Job { .. } => true,
+                MessageId::Wake { .. } => !crate::wake::space_wake(&message),
+                MessageId::Native(_) | MessageId::Job { .. } => true,
             };
             if can_reply
                 && notice.is_none()
@@ -1868,7 +1875,10 @@ async fn run_admitted(
     if let MessageId::Github(batch) = &message.message_id {
         message.text = batch.note();
     }
-    if matches!(message.message_id, MessageId::Github(_)) || message.pull_request_links.is_some() {
+    if matches!(message.message_id, MessageId::Github(_))
+        || message.pull_request_links.is_some()
+        || crate::wake::space_wake(&message)
+    {
         record_admission(&message, "started", 0, None);
     }
     let cancellation = admission.cancellation();
@@ -2121,6 +2131,11 @@ async fn session_turn(
     // message text, transport presentation, and model output never influence that choice.
     let mut key = conversation_key(route, message);
     let is_follow = matches!(message.message_id, MessageId::Follow(_));
+    let is_space_wake = crate::wake::space_wake(message);
+    let is_digest = message
+        .message_id
+        .wake_origin()
+        .is_some_and(crate::wake::WakeOrigin::is_digest);
     if is_follow {
         let ticket = runner.follow.as_ref().map(|table| {
             let follow_key = crate::follow::follow_key(
@@ -2223,7 +2238,7 @@ async fn session_turn(
                     UNAUTHORIZED_REPLY.to_owned()
                 }
             };
-            if !is_follow && !quiet && answer(driver, message, &reply).await {
+            if !is_follow && !is_space_wake && !quiet && answer(driver, message, &reply).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2237,7 +2252,7 @@ async fn session_turn(
                 reason = "attestation-refused",
                 "gateway.session.rejected"
             );
-            if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
+            if !is_follow && !is_space_wake && answer(driver, message, UNAUTHORIZED_REPLY).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2249,7 +2264,7 @@ async fn session_turn(
                 error = %error,
                 "gateway.session.failed"
             );
-            if !is_follow && answer(driver, message, FAILURE_REPLY).await {
+            if !is_follow && !is_space_wake && answer(driver, message, FAILURE_REPLY).await {
                 reply_delivered(MessageOutcome::Failed);
             }
             return MessageOutcome::Failed.into();
@@ -2324,14 +2339,15 @@ async fn session_turn(
         let reply = leg
             .principal()
             .map_or_else(|| UNAUTHORIZED_REPLY.to_owned(), permission_reply);
-        if !is_follow && answer(driver, message, &reply).await {
+        if !is_follow && !is_space_wake && answer(driver, message, &reply).await {
             reply_delivered(MessageOutcome::Unauthorized);
         }
         return MessageOutcome::Unauthorized.into();
     }
     let mapped_participants = participants::Mapping::for_turn(route, message)
         == participants::Mapping::Pending
-        && leg.space_grants().is_some();
+        && leg.space_grants().is_some()
+        && !is_space_wake;
     runner.gate.resolve_mapping(
         &(message.transport.clone(), message.conversation.key()),
         &cancellation,
@@ -2373,7 +2389,11 @@ async fn session_turn(
         },
         MessageId::Wake { id, .. } => WakeReasonView::Wake {
             wake: *id,
-            scheduled_by: principal.clone(),
+            scheduled_by: if is_space_wake {
+                None
+            } else {
+                principal.clone()
+            },
         },
         MessageId::Job { id, .. } => WakeReasonView::Job { job: *id },
     };
@@ -2660,7 +2680,7 @@ async fn session_turn(
             Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
     let (mut settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
-    if is_follow {
+    if is_follow || is_space_wake {
         settings.mode = crate::config::LivenessMode::Off;
     }
     // Keep this declared before progress and sink: Rust drops them first, so cancellation can't
@@ -2677,7 +2697,7 @@ async fn session_turn(
         keep_alive,
         cancellation: cancellation.clone(),
         max_duration: route.max_duration,
-        silent_until_success: is_follow,
+        silent_until_success: is_follow || is_space_wake,
     });
     sink.emit(ProgressEvent::Started {
         agent: route.agent.to_string(),
@@ -2725,6 +2745,43 @@ async fn session_turn(
         ));
     }
     drop(sink);
+    let space_access = leg.space_grants().is_some() && !is_space_wake;
+    let review_progress = message
+        .message_id
+        .wake_origin()
+        .is_some_and(|origin| match origin {
+            crate::wake::WakeOrigin::Subscription(_) => true,
+            crate::wake::WakeOrigin::Scheduled | crate::wake::WakeOrigin::Digest => false,
+        })
+        .then(|| Arc::new(ReviewProgress::default()));
+    let subscriptions = if let (
+        Some(progress),
+        MessageId::Wake {
+            origin: crate::wake::WakeOrigin::Subscription(target),
+            ..
+        },
+    ) = (&review_progress, &message.message_id)
+    {
+        Some(crate::wake::ReviewSubscriptions::Refresh {
+            target: target.clone(),
+            progress: Arc::clone(progress),
+        })
+    } else if route.wakes && space_access && !is_space_wake {
+        message
+            .pull_request_links
+            .as_ref()
+            .zip(runner.wakes.as_ref())
+            .zip(Anchor::from_inbound(message, &route.agent).and_then(|anchor| anchor.as_space()))
+            .map(
+                |((links, store), anchor)| crate::wake::ReviewSubscriptions::Subscribe {
+                    anchor: Box::new(anchor),
+                    store: Arc::clone(store),
+                    links: links.clone(),
+                },
+            )
+    } else {
+        None
+    };
     let wakes = route
         .wakes
         .then_some(runner.wakes.as_ref())
@@ -2748,6 +2805,7 @@ async fn session_turn(
                     )
                 }),
             )
+            .with_space_access(space_access)
         });
     let follow_ticket = route
         .follow
@@ -2807,7 +2865,8 @@ async fn session_turn(
         } else {
             None
         },
-    );
+    )
+    .with_subscriptions(subscriptions);
     let leave_request = invoker.leave_request();
     let pending_follows = invoker.pending_follows();
     let knobs = route.memory_knobs.clone();
@@ -3037,7 +3096,11 @@ async fn session_turn(
             if progress_notes {
                 inputs = inputs.with_progress_notes();
             }
-            if reply_optional {
+            if let Some(progress) = review_progress.as_deref() {
+                inputs = inputs.with_quiet_review(progress);
+            } else if is_digest {
+                inputs = inputs.with_quiet_digest();
+            } else if reply_optional {
                 inputs = inputs.with_optional_reply();
             }
             if let Some(wakes) = wakes.as_ref() {
@@ -3194,6 +3257,9 @@ async fn session_turn(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
+        if is_digest && let MessageId::Wake { id, .. } = &message.message_id {
+            crate::wake::record_digest(*id, crate::wake::WakeOperation::Declined, Some("model"));
+        }
         progress.terminal(Terminal::Silent).await;
         return Ended {
             outcome: MessageOutcome::Declined,
@@ -3208,7 +3274,12 @@ async fn session_turn(
             } else {
                 outcome.answer.as_str()
             });
-            let reply = if images.is_empty() {
+            let text = if is_digest {
+                crate::wake::digest_reply(&text)
+            } else {
+                text
+            };
+            let reply = if is_digest || images.is_empty() {
                 OutboundReply::text(text.clone())
             } else {
                 OutboundReply::with_images(text.clone(), images)
@@ -3238,7 +3309,7 @@ async fn session_turn(
                 "gateway.session.failed"
             );
             (
-                if is_follow {
+                if is_follow || is_space_wake {
                     Terminal::Answered(OutboundReply::text(UNREPORTED_WORK_REPLY.to_owned()))
                 } else {
                     Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned())
@@ -3436,6 +3507,7 @@ async fn reject_sealed_thread(
                 "gateway.session.rejected"
             );
             if !matches!(message.message_id, MessageId::Follow(_))
+                && !crate::wake::space_wake(message)
                 && !message
                     .thread_continuation
                     .as_ref()
@@ -3680,7 +3752,7 @@ fn agent_config_view(
     )
 }
 
-async fn connect(
+pub(crate) async fn connect(
     runner: &SessionRunner,
     route: &BoundRoute,
     message: &InboundMessage,

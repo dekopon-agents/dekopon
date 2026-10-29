@@ -5,6 +5,7 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, current_trace_parent,
+    prompt::ReviewProgress,
     wake::{WakeId, WakeRefusal, WakeRegistrar, WakeRequest, WakeSummary},
 };
 use dekopon_broker_protocol::{
@@ -30,6 +31,170 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 8 * 1024;
 // Meta refuses free-form business-initiated text outside the 24-hour customer-service window.
 const WHATSAPP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
+pub(crate) fn space_wake(message: &InboundMessage) -> bool {
+    message.subject.kind() == dekopon_core::PrincipalKind::Space
+        && match message.message_id {
+            MessageId::Wake { .. } => true,
+            MessageId::Native(_)
+            | MessageId::Github(_)
+            | MessageId::Follow(_)
+            | MessageId::Job { .. } => false,
+        }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WakeOrigin {
+    Scheduled,
+    Subscription(crate::pull_request_links::PullRequestLinkTarget),
+    Digest,
+}
+
+impl WakeOrigin {
+    pub(crate) const fn is_digest(&self) -> bool {
+        match self {
+            Self::Digest => true,
+            Self::Scheduled | Self::Subscription(_) => false,
+        }
+    }
+
+    pub(crate) const fn admission_trigger(&self) -> Option<&'static str> {
+        match self {
+            Self::Scheduled => None,
+            Self::Subscription(_) => Some("pr-subscription"),
+            Self::Digest => Some("digest"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WakeOperation {
+    Created,
+    Fired,
+    Declined,
+    Expired,
+    Failed,
+    Closed,
+    Cancelled,
+}
+
+impl WakeOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Fired => "fired",
+            Self::Declined => "declined",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+            Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+pub(crate) fn record_digest(id: WakeId, operation: WakeOperation, cause: Option<&str>) {
+    tracing::info!(
+        audit.event = "gateway.admission", admission.trigger = "digest",
+        digest.operation = operation.as_str(), wake.id = %id, wake.run_as = "space",
+        reason = cause, "gateway.admission"
+    );
+}
+
+pub(crate) enum ReviewSubscriptions {
+    Subscribe {
+        anchor: Box<Anchor>,
+        store: Arc<WakeStore>,
+        links: crate::pull_request_links::PullRequestLinkContext,
+    },
+    Refresh {
+        target: crate::pull_request_links::PullRequestLinkTarget,
+        progress: Arc<ReviewProgress>,
+    },
+}
+
+impl ReviewSubscriptions {
+    pub(crate) fn reviewed(
+        &self,
+        capability: &str,
+        input: &serde_json::Value,
+        result: dekopon_shell::CapabilityCallResult,
+    ) -> dekopon_shell::CapabilityCallResult {
+        use dekopon_shell::CapabilityCallResult;
+        if capability != "gh.pull-request.comment"
+            || !match result {
+                CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_) => {
+                    true
+                }
+                CapabilityCallResult::Failed { .. }
+                | CapabilityCallResult::Denied { .. }
+                | CapabilityCallResult::Exited { .. }
+                | CapabilityCallResult::NotFound => false,
+            }
+        {
+            if let Self::Refresh { progress, .. } = self {
+                progress.record_other_invocation();
+            }
+            return result;
+        }
+        let targets = match self {
+            Self::Subscribe { links, .. } => links.targets.as_slice(),
+            Self::Refresh { target, .. } => std::slice::from_ref(target),
+        };
+        for target in targets {
+            let (owner, repo) = target.coordinates();
+            if input
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(owner))
+                && input
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(repo))
+                && input.get("number").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(target.number))
+            {
+                let (anchor, store) = match self {
+                    Self::Refresh { progress, .. } => {
+                        progress.record_refresh();
+                        return result;
+                    }
+                    Self::Subscribe { anchor, store, .. } => (anchor, store),
+                };
+                let Err(error) =
+                    store.subscribe(anchor.as_ref().clone(), target.clone(), SystemTime::now())
+                else {
+                    continue;
+                };
+                tracing::info!(
+                    audit.event = "gateway.admission",
+                    admission.trigger = "pr-subscription",
+                    subscription.operation = "ignored",
+                    reason = error.telemetry_kind(),
+                    "gateway.admission"
+                );
+                let note = format!(
+                    "The GitHub review succeeded, but its PR subscription was not saved: {error}"
+                );
+                return match result {
+                    CapabilityCallResult::Succeeded => {
+                        CapabilityCallResult::SucceededWithStderr(note)
+                    }
+                    CapabilityCallResult::SucceededWithStderr(stderr) => {
+                        CapabilityCallResult::SucceededWithStderr(format!("{stderr}\n{note}"))
+                    }
+                    CapabilityCallResult::Failed { .. }
+                    | CapabilityCallResult::Denied { .. }
+                    | CapabilityCallResult::Exited { .. }
+                    | CapabilityCallResult::NotFound => result,
+                };
+            }
+        }
+        if let Self::Refresh { progress, .. } = self {
+            progress.record_other_invocation();
+        }
+        result
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Anchor {
     transport: TransportId,
@@ -42,6 +207,43 @@ pub(crate) struct Anchor {
 }
 
 impl Anchor {
+    pub(crate) fn as_space(&self) -> Option<Self> {
+        use dekopon_broker_protocol::ConversationKind;
+        match self.conversation.kind {
+            ConversationKind::Channel | ConversationKind::Thread => {}
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => return None,
+        }
+        let service = match self.kind {
+            ChatTransportKind::Slack => "slack",
+            ChatTransportKind::Fauxlack => "fauxlack",
+            ChatTransportKind::Discord => "discord",
+            ChatTransportKind::Telegram
+            | ChatTransportKind::Whatsapp
+            | ChatTransportKind::Github
+            | ChatTransportKind::Local => return None,
+        };
+        let mut anchor = self.clone();
+        anchor.subject = format!(
+            "{service}.{}.{}",
+            self.conversation.container.as_deref()?,
+            self.conversation.id
+        )
+        .parse()
+        .ok()?;
+        (anchor.subject.kind() == dekopon_core::PrincipalKind::Space).then_some(anchor)
+    }
+
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        self.agent == other.agent
+            && self.transport == other.transport
+            && self.subject == other.subject
+            && self.conversation.container == other.conversation.container
+            && self.conversation.id == other.conversation.id
+    }
+
+    pub(crate) fn same_thread(&self, other: &Self) -> bool {
+        self.same_channel(other) && self.conversation.thread == other.conversation.thread
+    }
     /// A local reply target is a connection number that a restart hands to another client.
     pub(crate) fn from_inbound(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
         if matches!(message.reply, ReplyTarget::Local { .. }) {
@@ -112,8 +314,18 @@ impl Anchor {
         )
     }
 
-    pub(crate) fn inbound(&self, id: WakeId, text: String, notice: String) -> InboundMessage {
-        self.inbound_message(MessageId::Wake { id, notice }, text, self.scheduled_in)
+    pub(crate) fn inbound(
+        &self,
+        id: WakeId,
+        text: String,
+        notice: String,
+        origin: WakeOrigin,
+    ) -> InboundMessage {
+        self.inbound_message(
+            MessageId::Wake { id, notice, origin },
+            text,
+            self.scheduled_in,
+        )
     }
 
     fn inbound_message(
@@ -187,14 +399,59 @@ impl Anchor {
 pub(crate) struct Probe {
     script: String,
     prev: String,
+    purpose: WatchPurpose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchPurpose {
+    Ordinary,
+    Digest,
 }
 
 impl Probe {
+    const DIGEST_HEADER: &str = "# dekopon: daily-digest\n";
+    const DIGEST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+    pub(crate) fn into_digest(mut self) -> Self {
+        self.purpose = WatchPurpose::Digest;
+        self
+    }
+
+    fn minimum_interval(&self, configured: Duration) -> Duration {
+        match self.purpose {
+            WatchPurpose::Ordinary => configured,
+            WatchPurpose::Digest => configured.max(Self::DIGEST_INTERVAL),
+        }
+    }
+
+    fn encoded_script(&self) -> String {
+        match self.purpose {
+            WatchPurpose::Ordinary => self.script.clone(),
+            WatchPurpose::Digest => format!("{}{}", Self::DIGEST_HEADER, self.script),
+        }
+    }
+
+    fn decode(script: String, prev: String, space: bool) -> Self {
+        if space && let Some(script) = script.strip_prefix(Self::DIGEST_HEADER) {
+            return Self {
+                script: script.to_owned(),
+                prev,
+                purpose: WatchPurpose::Digest,
+            };
+        }
+        Self {
+            script,
+            prev,
+            purpose: WatchPurpose::Ordinary,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn scripted_for_test(script: &str) -> Self {
         Self {
             script: script.to_owned(),
             prev: String::new(),
+            purpose: WatchPurpose::Ordinary,
         }
     }
 
@@ -203,10 +460,16 @@ impl Probe {
         leg: &dyn CapabilityInvoker,
         shell: &Interpreter,
     ) -> Result<Self, WakeRefusal> {
+        let script = if script.starts_with(Self::DIGEST_HEADER) {
+            format!("\n{script}")
+        } else {
+            script
+        };
         match Verdict::from(shell.run(&script, leg)) {
             Verdict::Fire { output } | Verdict::Wait { output } => Ok(Self {
                 script,
                 prev: output,
+                purpose: WatchPurpose::Ordinary,
             }),
             Verdict::Failed { exit, output } => Err(WakeRefusal::Broken {
                 exit: exit.get(),
@@ -260,6 +523,7 @@ pub(crate) struct SessionWakes {
     runtime: tokio::runtime::Handle,
     shell: Interpreter,
     started: SystemTime,
+    space_access: bool,
     job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
 }
 
@@ -281,7 +545,20 @@ impl SessionWakes {
             runtime,
             shell,
             started: SystemTime::now(),
+            space_access: false,
         }
+    }
+
+    pub(crate) fn with_space_access(mut self, allowed: bool) -> Self {
+        self.space_access = allowed;
+        self
+    }
+
+    fn space_anchor(&self) -> Result<Anchor, WakeRefusal> {
+        self.space_access
+            .then(|| self.anchor.as_space())
+            .flatten()
+            .ok_or(WakeRefusal::MappedChannelRequired)
     }
 
     #[expect(
@@ -309,29 +586,58 @@ impl SessionWakes {
 }
 
 impl WakeRegistrar for SessionWakes {
+    fn list_subscriptions(&self) -> Result<Vec<WakeSummary>, WakeRefusal> {
+        self.store
+            .list_subscriptions(&self.space_anchor()?, SystemTime::now())
+    }
+
+    fn cancel_subscription(&self, id: WakeId) -> Result<(), WakeRefusal> {
+        self.store.cancel_subscription(&self.space_anchor()?, id)
+    }
     fn schedule(&self, request: WakeRequest) -> Result<WakeSummary, WakeRefusal> {
+        if !self.space_access && self.anchor.subject().kind() == dekopon_core::PrincipalKind::Space
+        {
+            return Err(WakeRefusal::MappedChannelRequired);
+        }
         let now = SystemTime::now();
+        let anchor = if self.space_access {
+            self.space_anchor()?
+        } else {
+            self.anchor.clone()
+        };
+        let digest = match &request {
+            WakeRequest::Digest { .. } => true,
+            WakeRequest::Once { .. } | WakeRequest::Watch { .. } => false,
+        };
         let summary = match request {
             WakeRequest::Once { note, after } => {
                 self.check(&note, after)?;
-                self.store.register(
-                    self.anchor.clone(),
-                    note,
-                    now,
-                    store::Schedule::Once { after },
-                )?
+                self.store
+                    .register(anchor, note, now, store::Schedule::Once { after })?
             }
             WakeRequest::Watch {
                 note,
                 script,
                 every,
                 until,
+            }
+            | WakeRequest::Digest {
+                note,
+                script,
+                every,
+                until,
             } => {
+                if digest {
+                    self.space_anchor()?;
+                }
                 self.check(&note, until)?;
-                if every < self.bounds.min_interval || every > until {
-                    return Err(WakeRefusal::Interval {
-                        minimum: self.bounds.min_interval,
-                    });
+                let minimum = if digest {
+                    self.bounds.min_interval.max(Probe::DIGEST_INTERVAL)
+                } else {
+                    self.bounds.min_interval
+                };
+                if every < minimum || every > until {
+                    return Err(WakeRefusal::Interval { minimum });
                 }
                 let mut leg = self
                     .anchor
@@ -347,8 +653,9 @@ impl WakeRegistrar for SessionWakes {
                     )));
                 }
                 let probe = Probe::baseline(script, &leg, &self.shell)?;
+                let probe = if digest { probe.into_digest() } else { probe };
                 self.store.register(
-                    self.anchor.clone(),
+                    anchor,
                     note,
                     now,
                     store::Schedule::Watch {
@@ -373,11 +680,25 @@ impl WakeRegistrar for SessionWakes {
     }
 
     fn list(&self) -> Vec<WakeSummary> {
-        self.store.list(&self.anchor.subject, SystemTime::now())
+        self.store.list_for(
+            &self.anchor,
+            self.space_access
+                .then(|| self.anchor.as_space())
+                .flatten()
+                .as_ref(),
+            SystemTime::now(),
+        )
     }
 
     fn cancel(&self, id: WakeId) -> Result<(), WakeRefusal> {
-        self.store.cancel(&self.anchor.subject, id)?;
+        self.store.cancel_for(
+            &self.anchor,
+            self.space_access
+                .then(|| self.anchor.as_space())
+                .flatten()
+                .as_ref(),
+            id,
+        )?;
         tracing::info!(event = "gateway_wake_cancelled", wake.id = %id, "gateway.wake.cancelled");
         Ok(())
     }
@@ -438,6 +759,20 @@ pub(crate) fn run_tick(
             None
         }
     }
+}
+
+pub(crate) fn digest_reply(text: &str) -> String {
+    const MAXIMUM: usize = 1_900;
+    const MARKER: &str = "\n[truncated]";
+    let escaped = text.replace('<', "&lt;").replace('>', "&gt;");
+    if escaped.len() <= MAXIMUM {
+        return escaped;
+    }
+    let mut end = MAXIMUM - MARKER.len();
+    while !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &escaped[..end])
 }
 
 pub(crate) fn fired_text(id: WakeId, note: &str, reason: &str, output: Option<&str>) -> String {

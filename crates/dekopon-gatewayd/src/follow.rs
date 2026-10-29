@@ -445,6 +445,7 @@ pub(crate) struct FollowInvoker<I> {
     ticket: Option<(Arc<FollowTable>, String, usize)>,
     leave: Arc<AtomicBool>,
     pending: PendingFollows,
+    subscriptions: Option<crate::wake::ReviewSubscriptions>,
 }
 
 impl<I> FollowInvoker<I> {
@@ -454,7 +455,16 @@ impl<I> FollowInvoker<I> {
             ticket,
             leave: Arc::new(AtomicBool::new(false)),
             pending: PendingFollows::default(),
+            subscriptions: None,
         }
+    }
+
+    pub(crate) fn with_subscriptions(
+        mut self,
+        subscriptions: Option<crate::wake::ReviewSubscriptions>,
+    ) -> Self {
+        self.subscriptions = subscriptions;
+        self
     }
 
     pub(crate) fn leave_request(&self) -> Arc<AtomicBool> {
@@ -566,6 +576,10 @@ impl<I: CapabilityInvoker> FollowInvoker<I> {
         secret_use: Option<&dekopon_core::SecretUseProposal>,
         result: CapabilityCallResult,
     ) -> CapabilityCallResult {
+        let result = match &self.subscriptions {
+            Some(subscriptions) => subscriptions.reviewed(capability, input, result),
+            None => result,
+        };
         let stay = capability == "dekopon-provider-follow.stay"
             && secret_use.is_none()
             && input.as_object().is_some_and(serde_json::Map::is_empty);

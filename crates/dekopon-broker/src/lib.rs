@@ -1285,6 +1285,26 @@ impl Default for BrokerLimits {
     }
 }
 
+fn space_subject(scope: &ChatScopeClaim) -> Option<ExternalSubject> {
+    match scope.conversation.kind {
+        ConversationKind::Channel | ConversationKind::Thread => {}
+        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => return None,
+    }
+    let service = match scope.kind {
+        ChatTransportKind::Fauxlack => "fauxlack",
+        ChatTransportKind::Slack => "slack",
+        ChatTransportKind::Discord => "discord",
+        ChatTransportKind::Telegram
+        | ChatTransportKind::Whatsapp
+        | ChatTransportKind::Github
+        | ChatTransportKind::Local => return None,
+    };
+    let container = scope.conversation.container.as_deref()?;
+    format!("{service}.{container}.{}", scope.conversation.id)
+        .parse()
+        .ok()
+}
+
 /// Every value here comes from the broker's own authenticated-context view; caller-supplied
 /// proposal input is deliberately excluded so no policy can be made to depend on it.
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
@@ -2261,7 +2281,15 @@ where
                 space: None,
                 github_denial: None,
             };
-            if let Some(id) = space {
+            if let Some(id) = space.filter(|id| **id == request.principal) {
+                pass.space = Some(SpaceDecision {
+                    id: id.clone(),
+                    asker_allowed: None,
+                    allowed: Some(pass.policy.allowed),
+                    policy_ids: pass.policy.determining_policy_ids.clone(),
+                    denied_by: None,
+                });
+            } else if let Some(id) = space {
                 let mut verdict = evaluate(
                     PolicyRequest {
                         principal: id.clone(),
@@ -2825,7 +2853,17 @@ where
             }
             return (refused(), Some(refusal));
         };
-        if self.identities.principal_kind(principal) == PrincipalKind::Space {
+        if self.identities.principal_kind(principal) == PrincipalKind::Space
+            && !claim.scope.as_ref().is_some_and(|scope| {
+                (match scope.trigger {
+                    Trigger::Wake | Trigger::Probe => true,
+                    Trigger::Message | Trigger::Job => false,
+                }) && scope.participant.is_none()
+                    && scope.github.is_none()
+                    && scope.delivery.is_none()
+                    && space_subject(scope).as_ref() == Some(&claim.subject)
+            })
+        {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         }
         let actor = Actor::Agent {
@@ -2896,32 +2934,15 @@ where
         let Ok(mut context) = derived else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
-        context.space = context.chat_scope().and_then(|scope| {
-            let in_space = match scope.conversation.kind {
-                ConversationKind::Channel | ConversationKind::Thread => true,
-                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => false,
-            };
-            if !in_space {
-                return None;
-            }
-            let service = match scope.kind {
-                ChatTransportKind::Fauxlack => "fauxlack",
-                ChatTransportKind::Slack => "slack",
-                ChatTransportKind::Discord => "discord",
-                ChatTransportKind::Telegram
-                | ChatTransportKind::Whatsapp
-                | ChatTransportKind::Github
-                | ChatTransportKind::Local => return None,
-            };
-            let container = scope.conversation.container.as_deref()?;
-            let subject = format!("{service}.{container}.{}", scope.conversation.id)
-                .parse()
-                .ok()?;
-            self.identities
-                .resolve(&subject)
-                .filter(|mapped| self.identities.principal_kind(mapped) == PrincipalKind::Space)
-                .cloned()
-        });
+        context.space = context
+            .chat_scope()
+            .and_then(space_subject)
+            .and_then(|subject| {
+                self.identities
+                    .resolve(&subject)
+                    .filter(|mapped| self.identities.principal_kind(mapped) == PrincipalKind::Space)
+                    .cloned()
+            });
         let decision = self.authorize_agent_prompt(&context, &claim.agent);
         if decision.allowed {
             (context, None)

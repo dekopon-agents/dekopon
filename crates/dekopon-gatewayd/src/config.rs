@@ -926,6 +926,18 @@ pub struct WakesConfig {
     pub min_interval_ms: u64,
     #[serde(default = "default_wake_max_horizon_ms")]
     pub max_horizon_ms: u64,
+    #[serde(default = "default_max_subscriptions_per_agent")]
+    pub max_subscriptions_per_agent: usize,
+    #[serde(default = "default_subscription_expiry_ms")]
+    pub subscription_expiry_ms: u64,
+}
+
+const fn default_max_subscriptions_per_agent() -> usize {
+    64
+}
+
+const fn default_subscription_expiry_ms() -> u64 {
+    14 * 24 * 60 * 60 * 1_000
 }
 
 const fn default_wake_max_per_subject() -> usize {
@@ -945,6 +957,8 @@ pub struct WakeBounds {
     pub max_per_subject: usize,
     pub min_interval: Duration,
     pub max_horizon: Duration,
+    pub max_subscriptions_per_agent: usize,
+    pub subscription_expiry: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -2761,7 +2775,12 @@ fn resolve_with_service(
         problems.push(ConfigProblem::InvalidMaxJobs);
     }
     let wakes = config.sessions.wakes.as_ref().map(|wakes| {
-        if wakes.max_per_subject == 0 || wakes.min_interval_ms == 0 || wakes.max_horizon_ms == 0 {
+        if wakes.max_per_subject == 0
+            || wakes.min_interval_ms == 0
+            || wakes.max_horizon_ms == 0
+            || wakes.max_subscriptions_per_agent == 0
+            || wakes.subscription_expiry_ms == 0
+        {
             problems.push(ConfigProblem::InvalidWakeBounds);
         }
         ResolvedWakes {
@@ -2770,6 +2789,8 @@ fn resolve_with_service(
                 max_per_subject: wakes.max_per_subject,
                 min_interval: Duration::from_millis(wakes.min_interval_ms),
                 max_horizon: Duration::from_millis(wakes.max_horizon_ms),
+                max_subscriptions_per_agent: wakes.max_subscriptions_per_agent,
+                subscription_expiry: Duration::from_millis(wakes.subscription_expiry_ms),
             },
         }
     });
@@ -3475,7 +3496,7 @@ pub enum ConfigProblem {
     #[error("routes[{route}]: `wakes: true` needs `sessions.wakes`")]
     WakesWithoutStore { route: usize },
     #[error(
-        "sessions.wakes.maxPerSubject, minIntervalMs and maxHorizonMs must be greater than zero; omit sessions.wakes to turn wakes off"
+        "sessions.wakes.maxPerSubject, minIntervalMs, maxHorizonMs, maxSubscriptionsPerAgent and subscriptionExpiryMs must be greater than zero; omit sessions.wakes to turn wakes off"
     )]
     InvalidWakeBounds,
     #[error(

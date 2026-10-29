@@ -11,7 +11,7 @@ use crate::{
     wake::{Anchor, Probe, Resolved, Verdict, WakeStore, run_tick, store::Schedule},
 };
 
-struct NoProviders;
+pub(super) struct NoProviders;
 
 impl dekopon_shell::CapabilityInvoker for NoProviders {
     fn granted(&self) -> Vec<String> {
@@ -29,13 +29,19 @@ impl dekopon_shell::CapabilityInvoker for NoProviders {
 }
 
 pub(super) fn wake_store(directory: &Path) -> Arc<WakeStore> {
+    wake_store_with_horizon(directory, Duration::from_secs(3600))
+}
+
+pub(super) fn wake_store_with_horizon(directory: &Path, horizon: Duration) -> Arc<WakeStore> {
     Arc::new(
         WakeStore::open(&ResolvedWakes {
             path: directory.join("wakes").join("wakes.jsonl"),
             bounds: WakeBounds {
                 max_per_subject: 4,
+                max_subscriptions_per_agent: 64,
+                subscription_expiry: Duration::from_secs(14 * 24 * 60 * 60),
                 min_interval: Duration::from_secs(1),
-                max_horizon: Duration::from_secs(3600),
+                max_horizon: horizon,
             },
         })
         .expect("the wake store opens"),

@@ -885,6 +885,109 @@ impl Gateway {
             ticket.answer(crate::transport::github::Acked::Ignored);
             return;
         }
+        if let (Some(store), MessageId::Github(batch)) = (&self.runner.wakes, &message.message_id)
+            && let Some(route) = generation.routes.route(&message)
+            && matches!(
+                batch.lead().action.as_ref().map(|action| action.as_str()),
+                Some("synchronize" | "closed")
+            )
+            && store.matches_subscription(&route.agent, batch.lead())
+        {
+            let Some(permit) = self
+                .runner
+                .gate
+                .admit_probe((message.transport.clone(), message.conversation.key()))
+            else {
+                session::record_admission(&message, "busy", 0, Some("subscription-admission"));
+                ticket.answer(transport::github::Acked::Busy);
+                return;
+            };
+            let runner = Arc::clone(&self.runner);
+            let active = Arc::clone(&self.active);
+            let drivers = Arc::clone(&self.drivers);
+            let store = Arc::clone(store);
+            let route = route.clone();
+            let event = batch.lead().clone();
+            let receipt = message.receive_span.clone();
+            let span = receipt.clone();
+            sessions.spawn(async move {
+                match session::connect(&runner, &route, &message).await {
+                    Ok(leg) => drop(leg),
+                    Err(error) => {
+                        tracing::info!(audit.event = "gateway.admission", admission.trigger = "pr-subscription", subscription.operation = "ignored", reason = "repository-admission", error = %error, "gateway.admission");
+                        ticket.answer(transport::github::Acked::Ignored);
+                        return;
+                    }
+                }
+                let generation = active.load_full();
+                if !generation.routes.github_route(&message.transport, &message.conversation, &message.subject, event.event).is_some_and(|current| current.agent == route.agent) {
+                    session::record_admission(&message, "ignored", 0, Some("subscription-route-lost"));
+                    ticket.answer(transport::github::Acked::Ignored);
+                    return;
+                }
+                let agent = route.agent.clone();
+                let closed = event.action.as_ref().is_some_and(|action| action.as_str() == "closed");
+                let store_span = tracing::Span::current();
+                let delivery = tokio::task::spawn_blocking(move || store_span.in_scope(|| store.deliver_subscriptions(&agent, &event, SystemTime::now()))).await;
+                let delivery = match delivery {
+                    Ok(Ok(delivery)) => delivery,
+                    Ok(Err(error)) => {
+                        tracing::error!(event = "gateway_wake_store_failed", error = %error, "gateway.wake.store.failed");
+                        ticket.answer(transport::github::Acked::Busy);
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(event = "gateway_wake_store_failed", error = %error, "gateway.wake.store.failed");
+                        ticket.answer(transport::github::Acked::Busy);
+                        return;
+                    }
+                };
+                drop(permit);
+                if !delivery.matched && closed
+                {
+                    session::record_admission(&message, "ignored", 0, None);
+                    ticket.answer(transport::github::Acked::Ignored);
+                    return;
+                }
+                if !delivery.matched {
+                    run_routed_delivery(runner, active, drivers, message, Some(ticket)).await;
+                    return;
+                }
+                let (tickets, answer) = ticket.split(delivery.fired.len());
+                let wakes = delivery.fired.into_iter().zip(tickets).map(|(fired, ticket)| {
+                    let runner = Arc::clone(&runner);
+                    let active = Arc::clone(&active);
+                    let drivers = Arc::clone(&drivers);
+                    let receipt = &receipt;
+                    async move {
+                        let agent = fired.agent().clone();
+                        let wake = fired.into_inbound();
+                        dekopon_telemetry::link_span(&wake.receive_span, receipt);
+                        let generation = active.load_full();
+                        if !generation.routes.route(&wake).is_some_and(|route| route.wakes && route.agent == agent) {
+                            session::record_admission(&wake, "ignored", 0, Some("subscription-route-lost"));
+                            ticket.answer(transport::github::Acked::Ignored);
+                            return;
+                        }
+                        run_routed_delivery(runner, active, drivers, wake, Some(ticket)).await;
+                    }
+                });
+                tokio::join!(answer, futures_util::future::join_all(wakes));
+            }.instrument(span));
+            return;
+        }
+        if let MessageId::Github(batch) = &message.message_id
+            && batch.lead().event == GithubEvent::PullRequest
+            && batch
+                .lead()
+                .action
+                .as_ref()
+                .is_some_and(|action| action.as_str() == "closed")
+        {
+            session::record_admission(&message, "ignored", 0, None);
+            ticket.answer(transport::github::Acked::Ignored);
+            return;
+        }
         self.start_session_with_ticket(sessions, &generation, message, Some(ticket));
     }
 
@@ -936,9 +1039,8 @@ impl Gateway {
         ));
     }
 
-    /// A wake whose route no longer answers as its agent is delivered as its note, so the person still
-    /// hears what they asked to be reminded of.
     fn start_wake(&self, sessions: &mut JoinSet<()>, fired: wake::Fired) {
+        let space = fired.is_space();
         let agent = fired.agent().clone();
         let id = fired.id();
         let message = fired.into_inbound();
@@ -961,7 +1063,8 @@ impl Gateway {
             wake.id = %id,
             "gateway.wake.orphaned")
         });
-        if let Some(driver) = self.drivers.get(&message.transport).cloned()
+        if !space
+            && let Some(driver) = self.drivers.get(&message.transport).cloned()
             && let MessageId::Wake { notice, .. } = &message.message_id
         {
             let notice = notice.clone();
@@ -973,6 +1076,47 @@ impl Gateway {
             );
         }
     }
+}
+
+async fn run_routed_delivery(
+    runner: Arc<SessionRunner>,
+    active: Arc<ArcSwap<ServingGeneration>>,
+    drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+    message: InboundMessage,
+    ticket: Option<transport::github::AdmissionTicket>,
+) {
+    let generation = active.load_full();
+    let Some(route) = generation.routes.route(&message).cloned() else {
+        session::record_admission(&message, "ignored", 0, Some("route-lost"));
+        if let Some(ticket) = ticket {
+            ticket.answer(transport::github::Acked::Ignored);
+        }
+        return;
+    };
+    let Some(driver) = drivers.get(&message.transport).cloned() else {
+        session::record_admission(&message, "ignored", 0, Some("no-driver"));
+        if let Some(ticket) = ticket {
+            ticket.answer(transport::github::Acked::Ignored);
+        }
+        return;
+    };
+    let agent = route.agent.clone();
+    session::run_session_resolving(
+        runner,
+        route,
+        message,
+        driver,
+        (generation._digest.clone(), ticket),
+        move |message, queued| {
+            let generation = active.load();
+            let route = generation.routes.route(message)?;
+            (!wake::space_wake(message) || route.wakes && route.agent == agent).then_some(())?;
+            (message.constituents.is_empty()
+                || RouteIdentity::of(route, message) == RouteIdentity::of(queued, message))
+            .then(|| (route.clone(), generation._digest.clone()))
+        },
+    )
+    .await;
 }
 
 fn reload_reason(problem: &GatewaydError) -> &'static str {

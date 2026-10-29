@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fmt,
     ops::ControlFlow,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -366,6 +369,52 @@ where
     )
 }
 
+#[derive(Default)]
+pub struct ReviewProgress {
+    confirmed_refreshes: AtomicU64,
+    other_invocations: AtomicU64,
+}
+
+impl ReviewProgress {
+    pub fn record_refresh(&self) {
+        self.confirmed_refreshes.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_other_invocation(&self) {
+        self.other_invocations.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn permits_decline(&self, capability_invocations: u32) -> bool {
+        self.other_invocations.load(Ordering::Acquire) == 0
+            && self.confirmed_refreshes.load(Ordering::Acquire) == u64::from(capability_invocations)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReplyMode<'a> {
+    Required,
+    Optional,
+    QuietReview(&'a ReviewProgress),
+    QuietDigest,
+}
+
+impl ReplyMode<'_> {
+    fn permits_decline(self, capability_invocations: u32) -> bool {
+        match self {
+            Self::Required | Self::Optional => capability_invocations == 0,
+            Self::QuietReview(progress) => progress.permits_decline(capability_invocations),
+            Self::QuietDigest => true,
+        }
+    }
+
+    const fn offered(self) -> bool {
+        match self {
+            Self::Required => false,
+            Self::Optional | Self::QuietReview(_) | Self::QuietDigest => true,
+        }
+    }
+}
+
 pub struct SessionInputs<'a> {
     prompt: &'a str,
     recorded: Option<&'a str>,
@@ -381,7 +430,7 @@ pub struct SessionInputs<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
     progress: Option<Arc<dyn ProgressSink>>,
-    optional_reply: bool,
+    reply_mode: ReplyMode<'a>,
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
@@ -408,7 +457,7 @@ impl<'a> SessionInputs<'a> {
             cancellation: None,
             steering: None,
             progress: None,
-            optional_reply: false,
+            reply_mode: ReplyMode::Required,
             skills: &[],
             progress_notes: false,
             wakes: None,
@@ -533,8 +582,20 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn with_quiet_review(mut self, progress: &'a ReviewProgress) -> Self {
+        self.reply_mode = ReplyMode::QuietReview(progress);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_quiet_digest(mut self) -> Self {
+        self.reply_mode = ReplyMode::QuietDigest;
+        self
+    }
+
+    #[must_use]
     pub const fn with_optional_reply(mut self) -> Self {
-        self.optional_reply = true;
+        self.reply_mode = ReplyMode::Optional;
         self
     }
 }
@@ -551,7 +612,7 @@ struct SessionExtensions<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
     progress: Option<&'a dyn ProgressSink>,
-    optional_reply: bool,
+    reply_mode: ReplyMode<'a>,
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
@@ -583,7 +644,7 @@ where
         cancellation,
         steering,
         progress,
-        optional_reply,
+        reply_mode,
         skills,
         progress_notes,
         wakes,
@@ -607,8 +668,15 @@ where
     if let Some(listing) = skills::prompt_block(skills) {
         messages.push(ModelMessage::system(listing));
     }
-    if optional_reply {
-        messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
+    match reply_mode {
+        ReplyMode::Required => {}
+        ReplyMode::Optional => messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION)),
+        ReplyMode::QuietDigest => messages.push(ModelMessage::system(
+            "This is a daily space digest. Verify the waiting items through granted reads. Post one concise threaded summary only for changed, nonempty items; otherwise call decline_chat_reply, including after read work. Name GitHub logins as plain text, never Slack mentions."
+        )),
+        ReplyMode::QuietReview(_) => messages.push(ModelMessage::system(
+            "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."
+        )),
     }
     if let Some(notice) = memory_notice {
         messages.push(ModelMessage::system(notice.text()));
@@ -636,7 +704,7 @@ where
             cancellation,
             steering,
             progress,
-            optional_reply,
+            reply_mode,
             skills,
             progress_notes,
             wakes,
@@ -740,7 +808,7 @@ where
         cancellation,
         steering: _,
         progress,
-        optional_reply,
+        reply_mode,
         skills,
         progress_notes,
         wakes,
@@ -760,7 +828,7 @@ where
     if !skills.is_empty() {
         model_tools.push(skills::skill_tool());
     }
-    if optional_reply {
+    if reply_mode.offered() {
         model_tools.push(decline_reply_tool());
     }
     if wakes.is_some() {
@@ -1082,7 +1150,7 @@ where
             });
         }
 
-        let decline_requested = optional_reply
+        let decline_requested = reply_mode.offered()
             && turn
                 .tool_calls
                 .iter()
@@ -1097,7 +1165,7 @@ where
                     decline_reply_argument(&call.function.name, &call.function.arguments)?;
                 }
             }
-            if capability_invocations == 0 {
+            if reply_mode.permits_decline(capability_invocations) {
                 check_cancelled(cancellation)?;
                 match lease.seal() {
                     Seal::Stopped => return Err(PromptError::Cancelled),
@@ -2106,11 +2174,11 @@ mod tests {
         DECLINE_AFTER_WORK_RESULT, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS,
         FetchedAsset, Handoff, History, HistoryLimits, IMPROVEMENT_TOOL_NAME, Item,
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
-        PromptLimits, PromptOutcome, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME,
-        SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource, agent_config_tool,
-        asset_argument, format_script_outcome, reject_tool_call, run_prompt, run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_argument, script_tool,
-        unknown_tool_feedback,
+        PromptLimits, PromptOutcome, ReplyDisposition, ReviewProgress, SCRIPT_TOOL_DESCRIPTION,
+        SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource,
+        agent_config_tool, asset_argument, format_script_outcome, reject_tool_call, run_prompt,
+        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
+        script_argument, script_tool, unknown_tool_feedback,
     };
 
     struct ScriptedModel {
@@ -5482,6 +5550,80 @@ mod tests {
                 .iter()
                 .any(|message| message == DECLINE_AFTER_WORK_RESULT)
         );
+    }
+
+    #[test]
+    fn quiet_review_declines_only_when_all_invocations_are_confirmed_refreshes() {
+        for (refreshes, other, total, can_decline) in [
+            (0, 0, 1, false),
+            (1, 0, 1, true),
+            (1, 1, 2, false),
+            (1, 1, 1, false),
+            (0, 1, 0, false),
+            (2, 0, 2, true),
+        ] {
+            let progress = ReviewProgress::default();
+            for _ in 0..refreshes {
+                progress.record_refresh();
+            }
+            for _ in 0..other {
+                progress.record_other_invocation();
+            }
+            let model = ScriptedModel::new([
+                script_call("work", "echo did-work"),
+                decline(json!({})),
+                answer("The work needs a visible report."),
+            ]);
+            let runtime = RecordingRuntime::new(total);
+            let outcome = run_prompt_session(
+                &model,
+                &runtime,
+                SessionInputs::new("re-review", limits(3, 4)).with_quiet_review(&progress),
+                &[],
+            )
+            .0
+            .expect("the review or chat reports the work");
+            assert_eq!(outcome.capability_invocations, total);
+            assert_eq!(
+                outcome.disposition,
+                if can_decline {
+                    ReplyDisposition::Suppress
+                } else {
+                    ReplyDisposition::Send
+                }
+            );
+            if !can_decline {
+                assert_eq!(outcome.answer, "The work needs a visible report.");
+                assert!(
+                    model
+                        .tool_messages()
+                        .iter()
+                        .any(|message| message == DECLINE_AFTER_WORK_RESULT)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_final_quiet_decline_with_unreported_work_keeps_the_work_warning() {
+        for has_refresh in [false, true] {
+            let progress = ReviewProgress::default();
+            if has_refresh {
+                progress.record_refresh();
+                progress.record_other_invocation();
+            }
+            let model =
+                ScriptedModel::new([script_call("work", "echo did-work"), decline(json!({}))]);
+            let runtime = RecordingRuntime::new(if has_refresh { 2 } else { 1 });
+            let (result, captured) = run_prompt_session(
+                &model,
+                &runtime,
+                SessionInputs::new("re-review", limits(2, 4)).with_quiet_review(&progress),
+                &[],
+            );
+            assert!(matches!(result, Err(PromptError::UnreportedCapabilityWork)));
+            assert_unanswered(&captured.expect("unreported work is captured"), "re-review");
+        }
     }
 
     #[test]
