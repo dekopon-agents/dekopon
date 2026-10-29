@@ -12,7 +12,7 @@ use axum::{
     routing::post,
 };
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_core::{ExternalSubject, Redacted, SubjectSegment, SubjectService};
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -267,6 +267,13 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     };
     if !root.get("repository").is_some_and(Value::is_object) {
         ignored(state, &delivery, "no-repository");
+        return webhook::content_free(StatusCode::OK);
+    }
+    if let Some(name) = root.pointer("/repository/name").and_then(Value::as_str)
+        && !SubjectService::Github
+            .admits_segment(SubjectSegment::Subject, &name.to_ascii_lowercase())
+    {
+        ignored(state, &delivery, "not-listed");
         return webhook::content_free(StatusCode::OK);
     }
     let Some(entry) = parse(&root, event_kind, &delivery) else {
@@ -615,7 +622,7 @@ pub(crate) mod tests {
         doc["routes"][0]["memory"] = json!({"mode":"oneShot"});
         doc["routes"][0]["conversation"] = json!({"kind":["thread"],
             "container":"owner", "ids":["owner.repo"]});
-        doc["routes"][0]["githubEvents"] = json!(["pull_request"]);
+        doc["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
         let resolved = crate::tests::load(directory.path(), &doc)
             .await
             .expect("config");
@@ -693,6 +700,174 @@ pub(crate) mod tests {
         body["registry_package"] = body["package"].clone();
         body["member"] = json!({"id":3});
         body
+    }
+
+    fn review_payload(family: GithubEvent) -> Value {
+        let fixture = match family {
+            GithubEvent::PullRequestReview => {
+                include_str!("../../tests/fixtures/github-reviews/pull_request_review.json")
+            }
+            GithubEvent::PullRequestReviewComment => {
+                include_str!("../../tests/fixtures/github-reviews/pull_request_review_comment.json")
+            }
+            GithubEvent::PullRequestReviewThread => {
+                include_str!("../../tests/fixtures/github-reviews/pull_request_review_thread.json")
+            }
+            _ => panic!("review family"),
+        };
+        serde_json::from_str(fixture).expect("documented webhook payload")
+    }
+
+    #[test]
+    fn ingress_review_families_derive_merged_from_the_simple_pull_request() {
+        let mut observed = Vec::new();
+        for family in [
+            GithubEvent::PullRequestReview,
+            GithubEvent::PullRequestReviewComment,
+            GithubEvent::PullRequestReviewThread,
+        ] {
+            let mut body = review_payload(family);
+            assert!(body["pull_request"].get("merged").is_none());
+            for (merged_at, merged) in [(Value::Null, false), (json!("2026-10-29T04:15:00Z"), true)]
+            {
+                body["pull_request"]["merged_at"] = merged_at;
+                observed.push((
+                    family,
+                    merged,
+                    parse(&body, family, "review").map(|event| {
+                        let value = serde_json::to_value(event).unwrap();
+                        value["pullRequest"]["merged"].clone()
+                    }),
+                ));
+            }
+            body["pull_request"]["merged"] = json!(false);
+            assert_eq!(
+                serde_json::to_value(parse(&body, family, "explicit").unwrap()).unwrap()["pullRequest"]
+                    ["merged"],
+                json!(false)
+            );
+            body["pull_request"]["merged"] = Value::Null;
+            assert!(parse(&body, family, "invalid").is_none());
+            body["pull_request"]
+                .as_object_mut()
+                .unwrap()
+                .remove("merged");
+            body["pull_request"]
+                .as_object_mut()
+                .unwrap()
+                .remove("merged_at");
+            assert!(parse(&body, family, "missing").is_none());
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|(_, expected, actual)| actual.as_ref() == Some(&json!(expected))),
+            "{observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_unlisted_review_is_acknowledged_without_queueing() {
+        let (state, mut receiver) = routed_state().await;
+        let (capture, _guard) = crate::tests::capture_spans();
+        let mut body = review_payload(GithubEvent::PullRequestReview);
+        body["repository"]["owner"]["login"] = json!("owner");
+        body["repository"]["name"] = json!("repo");
+        let body = serde_json::to_vec(&body).unwrap();
+        assert_eq!(
+            process(
+                &state,
+                signed(&body, b"secret", "review", "pull_request_review"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[
+                        ("event", "gateway_github_ignored"),
+                        ("reason", "not-listed")
+                    ]
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_out_of_grammar_repository_is_ignored_without_refusal() {
+        let (state, mut receiver) = routed_state().await;
+        let (capture, _guard) = crate::tests::capture_spans();
+        let mut body = pr();
+        body["repository"]["name"] = json!("x.github.io");
+        let body = serde_json::to_vec(&body).unwrap();
+        assert_eq!(
+            process(
+                &state,
+                signed(&body, b"secret", "dotted", "pull_request"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[("event", "gateway_github_webhook_refused")]
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[
+                        ("event", "gateway_github_ignored"),
+                        ("reason", "not-listed")
+                    ]
+                )
+                .len(),
+            1
+        );
+        for name in [Value::Null, json!(7)] {
+            let mut missing = pr();
+            missing["repository"]["name"] = name;
+            let body = serde_json::to_vec(&missing).unwrap();
+            assert_eq!(
+                process(
+                    &state,
+                    signed(&body, b"secret", "missing-name", "pull_request"),
+                    &receive_span(ChatTransportKind::Github)
+                )
+                .await
+                .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut missing = pr();
+        missing["repository"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        let body = serde_json::to_vec(&missing).unwrap();
+        assert_eq!(
+            process(
+                &state,
+                signed(&body, b"secret", "absent-name", "pull_request"),
+                &receive_span(ChatTransportKind::Github)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

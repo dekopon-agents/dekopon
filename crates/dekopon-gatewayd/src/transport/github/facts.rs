@@ -93,7 +93,10 @@ fn pr(root: &Value, a: &mut AuthorSetFacts) -> Option<PullRequestFacts> {
     Some(PullRequestFacts {
         base_ref: reference(root, "/base/ref")?,
         base_sha: sha(root, "/base/sha")?,
-        merged: boolean(root, "/merged")?,
+        merged: match root.get("merged") {
+            Some(value) => value.as_bool()?,
+            None => !root.get("merged_at")?.is_null(),
+        },
         cross_repository: id(root, "/head/repo/id") != Some(base),
         author_id: id(root, "/user/id")?,
         author_association: word(root, "/author_association")?,
