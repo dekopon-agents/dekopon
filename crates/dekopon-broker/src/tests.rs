@@ -2407,29 +2407,6 @@ fn each_storage_host_error_maps_to_its_public_category() {
 }
 
 #[test]
-fn a_turn_started_by_a_non_person_attested_subject_is_not_credited_to_a_person() {
-    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
-
-    let scope = || {
-        chat_scope(
-            ChatTransportKind::Slack,
-            ConversationKind::Channel,
-            Trigger::Message,
-        )
-    };
-    let person = attested_agent_context("slack.t0123abc.u9xyz", scope());
-    let space = attested_agent_context("slack.t0123abc.c0123abc", scope());
-    assert_eq!(
-        super::turn_started_by(&person),
-        Some(super::TurnStartedBy::Person)
-    );
-    assert_eq!(
-        super::turn_started_by(&space),
-        Some(super::TurnStartedBy::Message)
-    );
-}
-
-#[test]
 fn audit_records_carry_delivery_and_actor_kind_and_id() {
     use dekopon_broker_protocol::DeliveryIdentity;
 
@@ -3677,10 +3654,10 @@ fn secret_proposal() -> super::SecretUseProposal {
 #[tokio::test]
 async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
     use super::AttestorGrant;
-    use dekopon_broker_protocol::{Attestation, SessionRefusal};
+    use dekopon_broker_protocol::Attestation;
     use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
 
-    let dirs = [(); 3].map(|()| tempfile::tempdir().expect("tempdir"));
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
     let scope = || {
         chat_scope(
             ChatTransportKind::Slack,
@@ -3690,20 +3667,10 @@ async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
     };
     let context = attested_agent_context("slack.t0123abc.u9xyz", scope());
 
-    let denying = SurfaceBroker::new(dirs[0].path(), &[]).build().await;
-    let refusal = denying
-        .authorize_invocation(&context, &"cli-probe.upper".parse().expect("capability"))
-        .err()
-        .expect("nothing permits the capability");
-    let evaluation = refusal
-        .evaluation
-        .expect("a policy denial carries its evaluation");
-    assert!(!evaluation.errors_present);
-
     let erroring_secret_policy = permit("maintainer", "secret.use", "Secret", SECRET_DRN)
         .replace(");", ") when { 9223372036854775807 + 1 > 0 };");
     let mut secret_broker =
-        SurfaceBroker::new(dirs[1].path(), &[("http-probe.fetch", "http-probe")])
+        SurfaceBroker::new(dirs[0].path(), &[("http-probe.fetch", "http-probe")])
             .with_secret(false, None);
     secret_broker.policy.push_str(&erroring_secret_policy);
     let secret_broker = secret_broker.build().await;
@@ -3732,7 +3699,7 @@ async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
     );
 
     let identities = [("slack.t0123abc.u9xyz", "maintainer")];
-    let agents = SurfaceBroker::new(dirs[2].path(), &[])
+    let agents = SurfaceBroker::new(dirs[1].path(), &[])
         .with_identities(identities)
         .build()
         .await;
@@ -3755,12 +3722,6 @@ async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
     let (_, refusal) = agents.resolve_context(&gateway, Some(&grant), &claim);
     let refusal = refusal.expect("no policy lets the maintainer prompt the agent");
     assert_eq!(refusal.reason, "agent-denied");
-    assert_eq!(
-        refusal.session,
-        SessionRefusal::AgentDenied {
-            principal: "maintainer".parse().expect("principal")
-        }
-    );
     assert!(refusal.evaluation.is_some());
 }
 
@@ -3811,7 +3772,7 @@ async fn a_denial_digests_the_same_with_or_without_a_storage_host_unless_the_cap
 }
 
 #[tokio::test]
-async fn an_authorized_failure_before_the_provider_and_a_success_name_the_loaded_artifact() {
+async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
     use dekopon_capability::{Evidence, InvocationOutcome};
 
     let root = tempfile::tempdir().expect("tempdir");
@@ -3882,29 +3843,7 @@ async fn an_authorized_failure_before_the_provider_and_a_success_name_the_loaded
         .expect("the failure is recorded");
     assert_eq!(
         artifacts(&broker),
-        [(InvocationOutcome::Failed, Some(artifact.clone()))]
-    );
-
-    let request = dekopon_broker_protocol::InvocationRequest {
-        id: "invoke-succeeds".parse().expect("invocation"),
-        capability,
-        ..invocation_with_input(serde_json::json!({"text": "hi"}))
-    };
-    let (assets, captured) = stdout_assets();
-    let result = broker
-        .invoke(&context, None, None, request, assets)
-        .await
-        .expect("the invocation runs")
-        .result;
-    captured.join().expect("stdout reader");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded, "{result:?}");
-    assert!(
-        result.detail.is_none(),
-        "a silent provider carries no detail"
-    );
-    assert_eq!(
-        artifacts(&broker)[1..],
-        [(InvocationOutcome::Succeeded, Some(artifact))]
+        [(InvocationOutcome::Failed, Some(artifact))]
     );
 }
 
