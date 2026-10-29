@@ -2032,8 +2032,8 @@ fn a_default_secret_use_field_deserializes_to_some() {
     let set = |extra: serde_json::Value| {
         let mut value = serde_json::json!({
             "provider": "storage-probe",
-            "effect": "readOnly",
-            "risk": "low",
+            "effect": "read-only",
+            "risk": "Low",
             "constraints": {},
         });
         value
@@ -2090,11 +2090,13 @@ async fn a_catalog_over_the_constraint_set_ceiling_is_refused() {
     use super::{BrokerBuildError, CredentialStore};
 
     let registry = dekopon_broker_host::BrokerProviderRegistry::load(
-        Vec::<std::path::PathBuf>::new(),
+        [dekopon_test_support::provider_fixture(
+            "cli-probe-provider.wasm",
+        )],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("an empty registry loads");
+    .expect("a real component loads");
     let error = two_probe_sets()
         .validate(&registry, &CredentialStore::empty(), 1)
         .expect_err("two sets exceed a ceiling of one");
