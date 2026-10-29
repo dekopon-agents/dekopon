@@ -1,13 +1,11 @@
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use dekopon_agent::{
     BrokerLeg, current_trace_parent,
+    prompt::ReviewProgress,
     wake::{WakeId, WakeRefusal, WakeRegistrar, WakeRequest, WakeSummary},
 };
 use dekopon_broker_protocol::{
@@ -52,7 +50,7 @@ pub(crate) enum ReviewSubscriptions {
     },
     Refresh {
         target: crate::pull_request_links::PullRequestLinkTarget,
-        refreshed: Arc<AtomicBool>,
+        progress: Arc<ReviewProgress>,
     },
 }
 
@@ -75,6 +73,9 @@ impl ReviewSubscriptions {
                 | CapabilityCallResult::NotFound => false,
             }
         {
+            if let Self::Refresh { progress, .. } = self {
+                progress.record_other_invocation();
+            }
             return result;
         }
         let targets = match self {
@@ -95,9 +96,9 @@ impl ReviewSubscriptions {
                     == Some(u64::from(target.number))
             {
                 let (anchor, store) = match self {
-                    Self::Refresh { refreshed, .. } => {
-                        refreshed.store(true, Ordering::Release);
-                        continue;
+                    Self::Refresh { progress, .. } => {
+                        progress.record_refresh();
+                        return result;
                     }
                     Self::Subscribe { anchor, store, .. } => (anchor, store),
                 };
@@ -129,6 +130,9 @@ impl ReviewSubscriptions {
                     | CapabilityCallResult::NotFound => result,
                 };
             }
+        }
+        if let Self::Refresh { progress, .. } = self {
+            progress.record_other_invocation();
         }
         result
     }

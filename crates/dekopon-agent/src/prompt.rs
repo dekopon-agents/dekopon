@@ -4,7 +4,7 @@ use std::{
     ops::ControlFlow,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -369,18 +369,39 @@ where
     )
 }
 
+#[derive(Default)]
+pub struct ReviewProgress {
+    confirmed_refreshes: AtomicU64,
+    other_invocations: AtomicU64,
+}
+
+impl ReviewProgress {
+    pub fn record_refresh(&self) {
+        self.confirmed_refreshes.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn record_other_invocation(&self) {
+        self.other_invocations.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn permits_decline(&self, capability_invocations: u32) -> bool {
+        self.other_invocations.load(Ordering::Acquire) == 0
+            && self.confirmed_refreshes.load(Ordering::Acquire) == u64::from(capability_invocations)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReplyMode<'a> {
     Required,
     Optional,
-    QuietReview(&'a AtomicBool),
+    QuietReview(&'a ReviewProgress),
 }
 
 impl ReplyMode<'_> {
-    fn review_refreshed(self) -> bool {
+    fn permits_decline(self, capability_invocations: u32) -> bool {
         match self {
-            Self::Required | Self::Optional => false,
-            Self::QuietReview(refreshed) => refreshed.load(Ordering::Acquire),
+            Self::Required | Self::Optional => capability_invocations == 0,
+            Self::QuietReview(progress) => progress.permits_decline(capability_invocations),
         }
     }
 
@@ -559,8 +580,8 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
-    pub const fn with_quiet_review(mut self, refreshed: &'a AtomicBool) -> Self {
-        self.reply_mode = ReplyMode::QuietReview(refreshed);
+    pub const fn with_quiet_review(mut self, progress: &'a ReviewProgress) -> Self {
+        self.reply_mode = ReplyMode::QuietReview(progress);
         self
     }
 
@@ -643,7 +664,7 @@ where
         ReplyMode::Required => {}
         ReplyMode::Optional => messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION)),
         ReplyMode::QuietReview(_) => messages.push(ModelMessage::system(
-            "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. A successful refresh is your visible report: if blocking findings are unchanged, call decline_chat_reply; if they changed, reply to chat. Capability work without that successful refresh requires a chat report."
+            "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."
         )),
     }
     if let Some(notice) = memory_notice {
@@ -1133,7 +1154,7 @@ where
                     decline_reply_argument(&call.function.name, &call.function.arguments)?;
                 }
             }
-            if capability_invocations == 0 || reply_mode.review_refreshed() {
+            if reply_mode.permits_decline(capability_invocations) {
                 check_cancelled(cancellation)?;
                 match lease.seal() {
                     Seal::Stopped => return Err(PromptError::Cancelled),
@@ -2112,7 +2133,7 @@ mod tests {
         ops::ControlFlow,
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
     };
 
@@ -2142,11 +2163,11 @@ mod tests {
         DECLINE_AFTER_WORK_RESULT, DECLINE_REPLY_TOOL_NAME, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS,
         FetchedAsset, Handoff, History, HistoryLimits, IMPROVEMENT_TOOL_NAME, Item,
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
-        PromptLimits, PromptOutcome, ReplyDisposition, SCRIPT_TOOL_DESCRIPTION, SCRIPT_TOOL_NAME,
-        SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource, agent_config_tool,
-        asset_argument, format_script_outcome, reject_tool_call, run_prompt, run_prompt_session,
-        run_prompt_with_history, run_prompt_with_history_and_options, script_argument, script_tool,
-        unknown_tool_feedback,
+        PromptLimits, PromptOutcome, ReplyDisposition, ReviewProgress, SCRIPT_TOOL_DESCRIPTION,
+        SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource,
+        agent_config_tool, asset_argument, format_script_outcome, reject_tool_call, run_prompt,
+        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
+        script_argument, script_tool, unknown_tool_feedback,
     };
 
     struct ScriptedModel {
@@ -5521,33 +5542,46 @@ mod tests {
     }
 
     #[test]
-    fn quiet_review_capability_work_requires_a_confirmed_refresh_before_declining() {
-        for confirmed in [false, true] {
-            let refreshed = AtomicBool::new(confirmed);
+    fn quiet_review_declines_only_when_all_invocations_are_confirmed_refreshes() {
+        for (refreshes, other, total, can_decline) in [
+            (0, 0, 1, false),
+            (1, 0, 1, true),
+            (1, 1, 2, false),
+            (1, 1, 1, false),
+            (0, 1, 0, false),
+            (2, 0, 2, true),
+        ] {
+            let progress = ReviewProgress::default();
+            for _ in 0..refreshes {
+                progress.record_refresh();
+            }
+            for _ in 0..other {
+                progress.record_other_invocation();
+            }
             let model = ScriptedModel::new([
                 script_call("work", "echo did-work"),
                 decline(json!({})),
                 answer("The work needs a visible report."),
             ]);
-            let runtime = RecordingRuntime::new(1);
+            let runtime = RecordingRuntime::new(total);
             let outcome = run_prompt_session(
                 &model,
                 &runtime,
-                SessionInputs::new("re-review", limits(3, 4)).with_quiet_review(&refreshed),
+                SessionInputs::new("re-review", limits(3, 4)).with_quiet_review(&progress),
                 &[],
             )
             .0
             .expect("the review or chat reports the work");
-            assert_eq!(outcome.capability_invocations, 1);
+            assert_eq!(outcome.capability_invocations, total);
             assert_eq!(
                 outcome.disposition,
-                if confirmed {
+                if can_decline {
                     ReplyDisposition::Suppress
                 } else {
                     ReplyDisposition::Send
                 }
             );
-            if !confirmed {
+            if !can_decline {
                 assert_eq!(outcome.answer, "The work needs a visible report.");
                 assert!(
                     model
@@ -5560,18 +5594,25 @@ mod tests {
     }
 
     #[test]
-    fn a_final_quiet_decline_without_a_refreshed_review_keeps_the_work_warning() {
-        let refreshed = AtomicBool::new(false);
-        let model = ScriptedModel::new([script_call("work", "echo did-work"), decline(json!({}))]);
-        let runtime = RecordingRuntime::new(1);
-        let (result, captured) = run_prompt_session(
-            &model,
-            &runtime,
-            SessionInputs::new("re-review", limits(2, 4)).with_quiet_review(&refreshed),
-            &[],
-        );
-        assert!(matches!(result, Err(PromptError::UnreportedCapabilityWork)));
-        assert_unanswered(&captured.expect("unreported work is captured"), "re-review");
+    fn a_final_quiet_decline_with_unreported_work_keeps_the_work_warning() {
+        for has_refresh in [false, true] {
+            let progress = ReviewProgress::default();
+            if has_refresh {
+                progress.record_refresh();
+                progress.record_other_invocation();
+            }
+            let model =
+                ScriptedModel::new([script_call("work", "echo did-work"), decline(json!({}))]);
+            let runtime = RecordingRuntime::new(if has_refresh { 2 } else { 1 });
+            let (result, captured) = run_prompt_session(
+                &model,
+                &runtime,
+                SessionInputs::new("re-review", limits(2, 4)).with_quiet_review(&progress),
+                &[],
+            );
+            assert!(matches!(result, Err(PromptError::UnreportedCapabilityWork)));
+            assert_unanswered(&captured.expect("unreported work is captured"), "re-review");
+        }
     }
 
     #[test]

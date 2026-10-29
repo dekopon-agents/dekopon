@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -21,8 +21,8 @@ use dekopon_agent::{
     },
     prompt::{
         CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
-        OmissionReason, PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer,
-        SteerSource, run_prompt_session,
+        OmissionReason, PromptError, ReplaySource, ReplyDisposition, ReviewProgress, Seal,
+        SessionInputs, Steer, SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -2736,18 +2736,18 @@ async fn session_turn(
     }
     drop(sink);
     let space_access = leg.space_grants().is_some() && !is_subscription;
-    let review_refreshed = is_subscription.then(|| Arc::new(AtomicBool::new(false)));
+    let review_progress = is_subscription.then(|| Arc::new(ReviewProgress::default()));
     let subscriptions = if let (
-        Some(refreshed),
+        Some(progress),
         MessageId::Wake {
             subscription: Some(target),
             ..
         },
-    ) = (&review_refreshed, &message.message_id)
+    ) = (&review_progress, &message.message_id)
     {
         Some(crate::wake::ReviewSubscriptions::Refresh {
             target: target.clone(),
-            refreshed: Arc::clone(refreshed),
+            progress: Arc::clone(progress),
         })
     } else if route.wakes && space_access {
         message
@@ -3079,8 +3079,8 @@ async fn session_turn(
             if progress_notes {
                 inputs = inputs.with_progress_notes();
             }
-            if let Some(refreshed) = review_refreshed.as_deref() {
-                inputs = inputs.with_quiet_review(refreshed);
+            if let Some(progress) = review_progress.as_deref() {
+                inputs = inputs.with_quiet_review(progress);
             } else if reply_optional {
                 inputs = inputs.with_optional_reply();
             }
