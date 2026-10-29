@@ -888,3 +888,58 @@ async fn a_full_anchored_mailbox_returns_503_and_leaves_the_subscription_guid_re
     );
     assert!(fixture.transport.try_delivery_for_test().is_err());
 }
+
+#[tokio::test]
+async fn a_subscription_without_an_anchor_driver_is_ignored_and_commits_its_guid() {
+    let models = ModelScript::new([]);
+    let mut fixture = fixture_with_subscriptions(
+        Arc::new(Arc::clone(&models)),
+        4,
+        &[owned_slack_message("anchor", false)],
+    )
+    .await;
+    fixture.gateway = Gateway::serving(
+        Arc::clone(fixture.gateway.runner_for_test()),
+        CurrentGeneration::boot(
+            Arc::clone(&fixture.gateway.generation_for_test().routes),
+            Arc::default(),
+        ),
+        Arc::default(),
+        Arc::new(BTreeMap::from([(
+            "github".into(),
+            fixture.transport.driver(),
+        )])),
+    );
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut push = body("pull_request", 7, 1);
+    push["action"] = json!("synchronize");
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "no-anchor-driver",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    assert_eq!(
+        fixture
+            .transport
+            .request_for_test(signed(
+                &serde_json::to_vec(&push).unwrap(),
+                b"secret",
+                "no-anchor-driver",
+                "pull_request"
+            ))
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert!(fixture.transport.try_delivery_for_test().is_err());
+}

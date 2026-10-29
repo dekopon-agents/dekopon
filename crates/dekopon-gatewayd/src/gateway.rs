@@ -1090,10 +1090,16 @@ async fn run_routed_delivery(
     let generation = active.load_full();
     let Some(route) = generation.routes.route(&message).cloned() else {
         session::record_admission(&message, "ignored", 0, Some("route-lost"));
+        if let Some(ticket) = ticket {
+            ticket.answer(transport::github::Acked::Ignored);
+        }
         return;
     };
     let Some(driver) = drivers.get(&message.transport).cloned() else {
         session::record_admission(&message, "ignored", 0, Some("no-driver"));
+        if let Some(ticket) = ticket {
+            ticket.answer(transport::github::Acked::Ignored);
+        }
         return;
     };
     let agent = route.agent.clone();

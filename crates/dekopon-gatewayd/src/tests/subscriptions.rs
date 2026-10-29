@@ -521,3 +521,50 @@ fn only_a_successful_review_of_the_subscribed_target_confirms_a_refresh() {
         assert!(refreshed.load(Ordering::Acquire));
     }
 }
+
+#[test]
+fn a_subscription_close_is_recorded_separately_from_deadline_expiry() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let store = wakes::wake_store(directory.path());
+    let now = std::time::SystemTime::now();
+    for (number, created) in [
+        (17, now),
+        (18, now - Duration::from_secs(14 * 24 * 60 * 60)),
+    ] {
+        let target =
+            PullRequestLinkContext::parse(&format!("https://github.com/acme/widget/pull/{number}"))
+                .unwrap()
+                .unwrap()
+                .targets
+                .remove(0);
+        store
+            .subscribe(subscription_anchor(), target, created)
+            .unwrap();
+    }
+    let event = serde_json::from_value(json!({
+        "delivery":"closed", "event":"pull_request", "action":"closed", "number":17,
+        "repository":{"id":10,"fullName":"acme/widget"}, "actor":{"id":1},
+        "kind":"none", "authorSet":{"actorLogin":"alice"},
+    }))
+    .unwrap();
+    let delivery = store
+        .deliver_subscriptions(subscription_anchor().agent(), &event, now)
+        .unwrap();
+    assert!(delivery.matched);
+    assert!(delivery.fired.is_empty());
+    assert!(
+        store
+            .list_subscriptions(&subscription_anchor(), now)
+            .unwrap()
+            .is_empty()
+    );
+    for (operation, number) in [("closed", "17"), ("expired", "18")] {
+        let records = capture.events_where(
+            "dekopon_gatewayd::wake::store",
+            &[("subscription.operation", operation)],
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].field("github.number"), Some(number));
+    }
+}
