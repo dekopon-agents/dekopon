@@ -8,6 +8,28 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## The wake_reason tool and GitHub review deliveries (0.72.0)
+
+No configuration change is required.
+
+Every gateway session offers the no-argument `wake_reason` tool, which returns why
+its turn started: chat, webhook, wake or job. It grants no authority and calls no
+broker capability. Embedders that supply no view, including the console and
+`dekopon-tui`, do not offer it. Each route's tool definitions change, so its
+prompt cache goes cold once after the upgrade.
+
+The GitHub prompt note ends "Call wake_reason for every fact." Run notes name
+the associated pull request as `#N` or `none`.
+
+GitHub `pull_request_review`, `pull_request_review_comment` and
+`pull_request_review_thread` deliveries no longer answer 400 malformed. A route
+that does not list the family answers 200 not-listed. A delivery from a repository
+whose name contains a dot is acknowledged and ignored rather than refused.
+
+Downgrading to 0.71.0 is revert-safe and migrates no state. Its gateway again
+refuses those review-family deliveries without a `merged` field and dotted-repository
+deliveries with 400 malformed.
+
 ## Gateway and broker upgrade together; turns share the shell thread budget (0.71.0)
 
 No configuration change is required.

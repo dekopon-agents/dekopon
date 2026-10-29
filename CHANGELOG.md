@@ -7,6 +7,24 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-10-29
+
+### Added
+
+- the wake_reason tool returns why a turn started.
+
+### Fixed
+
+- GitHub pull_request_review, _comment and _thread deliveries no longer answer 400 malformed.
+- a GitHub delivery from a repository with a dot in its name is ignored instead of refused.
+- the GitHub run note names its associated pull request as #N or none.
+
+## [dekopon-chart-0.59.0] - 2026-10-29
+
+### Changed
+
+- Chart 0.59.0 targets core v0.72.0 and renders the `v0.72.0` image tag.
+
 ## [0.71.0] - 2026-10-29
 
 ### Added
