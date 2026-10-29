@@ -3512,3 +3512,66 @@ async fn an_invoke_with_more_asset_descriptors_than_the_limit_is_refused_before_
         "{error:?}"
     );
 }
+
+#[test]
+fn a_run_with_more_asset_rows_than_the_limit_is_refused() {
+    let row = super::AssetRow {
+        id: 1,
+        content_type: "image/png".into(),
+        encoding: super::AssetEncoding::Identity,
+        bytes: Some(0),
+        origin: "chat".into(),
+        sent: false,
+    };
+    let run = BrokerRequest::Run {
+        attestation: None,
+        trace_parent: sample_trace_parent(),
+        invocation: "run-test".parse().expect("valid invocation fixture"),
+        word: "probe".to_owned(),
+        argv: Vec::new(),
+        assets: vec![row; super::MAX_ASSET_DESCRIPTORS + 1],
+        sends_remaining: 0,
+        streams: super::StreamDescriptors { stdin: false },
+    };
+    assert!(matches!(
+        run.validate(),
+        Err(ProtocolError::TooManyAssetRows)
+    ));
+}
+
+#[test]
+fn a_trailing_colon_is_not_a_thread_form() {
+    let selector = ConversationMatch {
+        kind: ConversationKindMatch::Any,
+        container: None,
+        ids: Some(vec!["cteam:".to_owned()]),
+    };
+    assert_eq!(
+        selector.validate(ChatTransportKind::Slack),
+        vec![ConversationMatchProblem::NonCanonicalId {
+            id: "cteam:".to_owned()
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refusing_broker_is_retried_until_the_connect_window_ends() {
+    use super::{BrokerClient, ClientError};
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
+    private_socket(&socket);
+    let window = Duration::from_millis(300);
+    let client = BrokerClient::new(&socket, owner(directory.path()), RETRY_LIMITS)
+        .expect("valid client limits")
+        .with_connect_window(window);
+    let started = tokio::time::Instant::now();
+    let error = client
+        .capabilities()
+        .await
+        .expect_err("nothing ever accepts");
+    assert!(started.elapsed() >= window);
+    assert!(matches!(error, ClientError::Connect { .. }), "{error:?}");
+}

@@ -1905,6 +1905,11 @@ fn chat_memory_config_refuses_each_invalid_limit() {
     let storage = StorageLimits::default();
     let valid = valid_memory_config();
     valid.validate(&storage).expect("the baseline is valid");
+    let mut wide_query = valid.clone();
+    wide_query.max_query_bytes = 100_000;
+    wide_query
+        .validate(&storage)
+        .expect("a query below the ceiling is valid");
 
     type Break = fn(&mut ChatMemoryConfig, &mut StorageLimits);
     let breaks: &[(&str, Break)] = &[
