@@ -1811,3 +1811,92 @@ fn every_family_sample_validates_strictly_against_the_schema() {
         }
     }
 }
+
+#[test]
+fn a_world_lists_what_it_registers() {
+    let world = world_with_secret();
+    fn names(mut items: Vec<&str>) -> Vec<&str> {
+        items.sort_unstable();
+        items
+    }
+    assert_eq!(
+        names(world.principals().map(|id| id.as_str()).collect()),
+        ["cpetersen", "direct-caller"]
+    );
+    assert_eq!(
+        names(world.providers().map(|id| id.as_str()).collect()),
+        ["cli-probe"]
+    );
+    assert_eq!(
+        names(
+            world
+                .capabilities()
+                .map(|(capability, provider)| {
+                    assert_eq!(provider.as_str(), "cli-probe");
+                    capability.as_str()
+                })
+                .collect()
+        ),
+        ["cli-probe.reverse", "cli-probe.upper"]
+    );
+    assert_eq!(
+        world
+            .secrets()
+            .map(|secret| secret.as_str())
+            .collect::<Vec<_>>(),
+        ["drn:com.xrl:secret:prod:api/token"]
+    );
+}
+
+#[test]
+fn unresolved_kinds_have_distinct_labels() {
+    let labels: std::collections::BTreeSet<_> = [
+        UnresolvedKind::Capability,
+        UnresolvedKind::Provider,
+        UnresolvedKind::ActionGroup,
+    ]
+    .map(UnresolvedKind::label)
+    .into();
+    assert_eq!(labels.len(), 3);
+    assert!(!labels.contains(""));
+    assert!(!labels.contains("xyzzy"));
+}
+
+#[test]
+fn opaque_body_reasons_have_distinct_labels() {
+    let labels: std::collections::BTreeSet<_> = [
+        OpaqueBody::Streamed,
+        OpaqueBody::MediaType,
+        OpaqueBody::TooLarge,
+        OpaqueBody::Malformed,
+        OpaqueBody::Unrepresentable,
+    ]
+    .map(OpaqueBody::label)
+    .into();
+    assert_eq!(labels.len(), 5);
+    assert!(!labels.contains(""));
+    assert!(!labels.contains("xyzzy"));
+}
+
+#[test]
+fn a_policy_set_over_the_policy_count_ceiling_is_refused() {
+    let policies = "permit(principal, action, resource);\n".repeat(super::MAX_POLICIES + 1);
+    let error = PolicyEngine::new(&policies, &world()).expect_err("too many policies");
+    assert!(matches!(error, PolicyBuildError::TooManyPolicies { .. }));
+}
+
+#[test]
+fn a_policy_id_annotation_that_is_empty_or_overlong_is_refused() {
+    for id in [String::new(), "a".repeat(super::MAX_POLICY_ID_BYTES + 1)] {
+        let error = PolicyEngine::new(
+            &format!(r#"@id("{id}") permit(principal, action, resource);"#),
+            &world(),
+        )
+        .expect_err("an unusable policy name");
+        assert!(
+            matches!(error, PolicyBuildError::InvalidPolicyId { .. }),
+            "{} bytes",
+            id.len()
+        );
+    }
+}
