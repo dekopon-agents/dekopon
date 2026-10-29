@@ -47,3 +47,37 @@ crates/dekopon-broker/src/lib.rs:1452:9: replace || with && in validate_set_cons
 crates/dekopon-broker/src/lib.rs:1463:26: replace || with && in validate_set_constraints
 crates/dekopon-broker/src/lib.rs:1469:31: replace || with && in validate_set_constraints
 crates/dekopon-broker/src/lib.rs:1515:9: replace <impl fmt::Display for NamespaceConflict>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:1850:9: replace AuditError::category -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:1850:9: replace AuditError::category -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:2041:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2040:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2039:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2071:9: replace Broker<A>::capability_uses_storage -> bool with true
+crates/dekopon-broker/src/lib.rs:2071:9: replace Broker<A>::capability_uses_storage -> bool with false
+crates/dekopon-broker/src/lib.rs:2073:66: replace || with && in Broker<A>::capability_uses_storage
+crates/dekopon-broker/src/lib.rs:2104:17: delete field evaluation from struct Refusal expression in Broker<A>::authorize_invocation
+crates/dekopon-broker/src/lib.rs:2163:33: replace |= with &= in Broker<A>::bind_secret_use
+crates/dekopon-broker/src/lib.rs:2172:17: delete field evaluation from struct Refusal expression in Broker<A>::bind_secret_use
+crates/dekopon-broker/src/lib.rs:2231:33: delete field errors_present from struct PolicyDecision expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2232:33: delete field refusal from struct PolicyDecision expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2309:37: replace && with || in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2309:16: delete ! in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2430:21: replace && with || in Broker<A>::reachable_providers
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::new())
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::from_iter([(String::new(), String::new())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::from_iter([(String::new(), "xyzzy".into())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::from_iter([("xyzzy".into(), String::new())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::from_iter([("xyzzy".into(), "xyzzy".into())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![String::new()], BTreeMap::new())
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![String::new()], BTreeMap::from_iter([(String::new(), String::new())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![String::new()], BTreeMap::from_iter([(String::new(), "xyzzy".into())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![String::new()], BTreeMap::from_iter([("xyzzy".into(), String::new())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![String::new()], BTreeMap::from_iter([("xyzzy".into(), "xyzzy".into())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec!["xyzzy".into()], BTreeMap::new())
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec!["xyzzy".into()], BTreeMap::from_iter([(String::new(), String::new())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec!["xyzzy".into()], BTreeMap::from_iter([(String::new(), "xyzzy".into())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec!["xyzzy".into()], BTreeMap::from_iter([("xyzzy".into(), String::new())]))
+crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec!["xyzzy".into()], BTreeMap::from_iter([("xyzzy".into(), "xyzzy".into())]))
+crates/dekopon-broker/src/lib.rs:2586:9: replace Broker<A>::display_principal -> Option<PrincipalId> with None
+crates/dekopon-broker/src/lib.rs:2591:9: replace Broker<A>::principal_ceiling -> Option<PrincipalId> with None
+crates/dekopon-broker/src/lib.rs:2599:9: replace Broker<A>::chat_memory_ceiling -> Option<ChatMemorySurface> with None
