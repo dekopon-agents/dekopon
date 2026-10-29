@@ -21,6 +21,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 dekopon-policy.workspace = true
+dekopon-telemetry.workspace = true
 dekopon-storage-host.workspace = true
 getrandom.workspace = true
 serde.workspace = true
@@ -32,6 +33,7 @@ tracing.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+opentelemetry.workspace = true
 dekopon-test-support = { path = "../dekopon-test-support" }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

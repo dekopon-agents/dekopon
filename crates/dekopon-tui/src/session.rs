@@ -320,6 +320,7 @@ pub async fn connect(
 pub fn smoke_claim() -> ChatScopeClaim {
     ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "console-smoke".parse().unwrap_or_else(|_| unreachable!()),
         kind: ChatTransportKind::Local,
         conversation: Conversation {

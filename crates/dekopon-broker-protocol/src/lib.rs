@@ -321,6 +321,8 @@ pub struct ChatScopeClaim {
     pub delivery: Option<DeliveryIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub participant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<dekopon_core::github::GithubBatch>,
 }
 
 impl fmt::Debug for ChatScopeClaim {

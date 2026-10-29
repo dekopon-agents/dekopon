@@ -113,6 +113,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+mod github;
 mod request;
 pub use request::{HttpRequestFacts, OpaqueBody, RequestBody};
 
@@ -344,6 +345,7 @@ impl PolicyWorld {
                 },
             }),
         );
+        routing_attributes.insert("github".to_owned(), github::schema());
         // Fields added here must be schema-required only if the broker always stamps them on the
         // request, or Cedar evaluation can fail.
         let context = |required: &[&str]| {
@@ -481,6 +483,7 @@ pub struct PolicyContext {
     pub trigger: Option<String>,
     pub started_by: Option<String>,
     pub conversation: Option<PolicyConversation>,
+    pub github: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -773,7 +776,7 @@ impl PolicyEngine {
         let has_request = request_facts.is_some();
         let action = entity_uid(&self.entity_types.action, target.action());
         let principal = entity_uid(&self.entity_types.principal, principal.as_str());
-        let (resource, mut pairs) = match target {
+        let (resource, mut attributes) = match target {
             PolicyTarget::Capability {
                 provider,
                 effect,
@@ -781,20 +784,14 @@ impl PolicyEngine {
                 ..
             } => (
                 entity_uid(&self.entity_types.provider, provider.as_str()),
-                vec![
-                    (
-                        "effect".to_owned(),
-                        RestrictedExpression::new_string(effect.to_string()),
-                    ),
-                    (
-                        "risk".to_owned(),
-                        RestrictedExpression::new_string(risk.to_string()),
-                    ),
-                ],
+                serde_json::Map::from_iter([
+                    ("effect".to_owned(), json!(effect.to_string())),
+                    ("risk".to_owned(), json!(risk.to_string())),
+                ]),
             ),
             PolicyTarget::AgentPrompt { agent } => (
                 entity_uid(&self.entity_types.agent, agent.as_str()),
-                Vec::new(),
+                serde_json::Map::new(),
             ),
             PolicyTarget::SecretUse {
                 secret,
@@ -803,20 +800,11 @@ impl PolicyEngine {
                 sink,
             } => (
                 entity_uid(&self.entity_types.secret, secret.as_str()),
-                vec![
-                    (
-                        "capability".to_owned(),
-                        RestrictedExpression::new_string(capability.to_string()),
-                    ),
-                    (
-                        "provider".to_owned(),
-                        RestrictedExpression::new_string(provider.to_string()),
-                    ),
-                    (
-                        "sink".to_owned(),
-                        RestrictedExpression::new_string(sink.to_string()),
-                    ),
-                ],
+                serde_json::Map::from_iter([
+                    ("capability".to_owned(), json!(capability.to_string())),
+                    ("provider".to_owned(), json!(provider.to_string())),
+                    ("sink".to_owned(), json!(sink.to_string())),
+                ]),
             ),
         };
         for (name, value) in [
@@ -829,33 +817,34 @@ impl PolicyEngine {
             ("startedBy", context.started_by),
         ] {
             if let Some(value) = value {
-                pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));
+                attributes.insert(name.to_owned(), json!(value));
             }
         }
-        // Absent conversation fields like container must stay truly absent, not defaulted to an
-        // empty string, or has-guarded policies could match unintentionally.
         if let Some(conversation) = context.conversation {
-            let fields = [
-                Some(("kind", conversation.kind)),
-                conversation.container.map(|value| ("container", value)),
-                Some(("id", conversation.id)),
-                conversation.thread.map(|value| ("thread", value)),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|(name, value)| (name.to_owned(), RestrictedExpression::new_string(value)));
-            pairs.push((
-                "conversation".to_owned(),
-                RestrictedExpression::new_record(fields).map_err(|source| {
-                    RequestError::Context {
-                        message: source.to_string(),
-                    }
-                })?,
-            ));
+            let mut fields = serde_json::Map::from_iter([
+                ("kind".to_owned(), json!(conversation.kind)),
+                ("id".to_owned(), json!(conversation.id)),
+            ]);
+            if let Some(container) = conversation.container {
+                fields.insert("container".to_owned(), json!(container));
+            }
+            if let Some(thread) = conversation.thread {
+                fields.insert("thread".to_owned(), json!(thread));
+            }
+            attributes.insert("conversation".to_owned(), fields.into());
         }
-        let context = Context::from_pairs(pairs).map_err(|source| RequestError::Context {
-            message: source.to_string(),
-        })?;
+        let github_schema = if let Some(github) = context.github {
+            attributes.insert("github".to_owned(), github);
+            Some((&self.schema, &action))
+        } else {
+            None
+        };
+        let context =
+            Context::from_json_value(attributes.into(), github_schema).map_err(|source| {
+                RequestError::Context {
+                    message: source.to_string(),
+                }
+            })?;
         let (context, opaque_body) = if let Some(facts) = request_facts {
             let (request, opaque_body) = facts.context()?;
             let context = context

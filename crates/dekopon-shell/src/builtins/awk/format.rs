@@ -445,6 +445,16 @@ fn conversion<E: From<AwkError>>(
             out.write_str("%").expect("percent");
             (0, false)
         }
+        Conversion::Signed
+            if !value.number().is_finite() || value.number().abs() >= 9223372036854775808.0 =>
+        {
+            let n = value.number();
+            floating(&mut out, n, Conversion::Fixed(false), 0, spec.flags);
+            (
+                spec.flags.sign(n.is_sign_negative()).len(),
+                spec.flags.zero && n.is_finite(),
+            )
+        }
         Conversion::Signed | Conversion::Unsigned | Conversion::Octal | Conversion::Hex(_) => {
             let prefix = integer(&mut out, value.number(), spec);
             (prefix, spec.flags.zero && spec.precision.is_none())

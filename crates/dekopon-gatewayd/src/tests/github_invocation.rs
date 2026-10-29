@@ -17,18 +17,7 @@ fn github_message(owner: &str, repo: &str, guid: &str, number: u64) -> InboundMe
         id: format!("{owner}.{repo}"),
         thread: Some(number.to_string()),
     };
-    inbound.message_id = MessageId::Github(Box::new(crate::transport::github::GithubBatch::new(
-        crate::transport::github::GithubEntry {
-            delivery: guid.into(),
-            event: crate::config::GithubEvent::WorkflowRun,
-            action: Some("completed".into()),
-            actor: dekopon_core::github::GithubId::new(1).unwrap(),
-            thread: number.to_string().parse().unwrap(),
-            head_sha: Some("a".repeat(40)),
-            run: Some(dekopon_core::github::GithubId::new(5).unwrap()),
-            conclusion: Some("success".into()),
-        },
-    )));
+    inbound.message_id=MessageId::Github(Box::new(dekopon_core::github::GithubBatch::new(serde_json::from_value(json!({"delivery":guid,"event":"workflow_run","action":"completed","repository":{"id":10,"fullName":format!("{owner}/{repo}")},"actor":{"id":1},"kind":"run","run":{"id":5,"pullRequests":[number]},"authorSet":{"actorLogin":"owner","headSha":"a".repeat(40),"conclusion":"success"}})).unwrap())));
     inbound.addressed = Some(true);
     inbound.reply = ReplyTarget::GithubTrace;
     inbound

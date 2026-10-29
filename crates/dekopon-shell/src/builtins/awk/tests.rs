@@ -1,5 +1,7 @@
 use super::{
-    AwkError, ChargedRegex, RuntimeError, RuntimeKind, compile, lex,
+    AwkError, ChargedRegex, RuntimeError, RuntimeKind, compile,
+    eval::Value,
+    format, lex,
     parse::{self, Binary, ExprKind, GawkSyntax, GawkVariable, Refusal, StmtKind, Unary},
 };
 use crate::{
@@ -790,5 +792,36 @@ fn parenthesized_print_lists_close_after_multiple_arguments() {
             panic!("print statement");
         };
         assert_eq!(args.len(), 2);
+    }
+}
+
+#[test]
+fn signed_nonfinite_conversions_keep_lowercase_signs_and_space_padding() {
+    for (number, expected) in [
+        (
+            f64::NAN.copysign(1.0),
+            "nan|   nan|  +nan|   nan|nan   |   nan",
+        ),
+        (
+            f64::NAN.copysign(-1.0),
+            "-nan|  -nan|  -nan|  -nan|-nan  |  -nan",
+        ),
+        (f64::INFINITY, "inf|   inf|  +inf|   inf|inf   |   inf"),
+        (f64::NEG_INFINITY, "-inf|  -inf|  -inf|  -inf|-inf  |  -inf"),
+    ] {
+        for conversion in ['d', 'i'] {
+            let source = format!(
+                "%{conversion}|%06{conversion}|%+06{conversion}|% 06{conversion}|%-06{conversion}|%06.9{conversion}"
+            );
+            let args: [Value; 6] = std::array::from_fn(|_| Value::Num(number));
+            let mut budget = Budget::start(Limits::default());
+            let mut output = String::new();
+            format::write::<AwkError>("printf", &source, &args, &mut budget, |text, _| {
+                output.push_str(text);
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(output, expected, "{source} of {number:?}");
+        }
     }
 }
