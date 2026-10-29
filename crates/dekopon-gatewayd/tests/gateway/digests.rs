@@ -98,6 +98,12 @@ fn assert_space_read(audit: &Audit, capability: &str, trigger: &str, root: &str)
             ("turn.started_by", trigger),
         ],
     );
+    let decisions = decisions
+        .into_iter()
+        .filter(|decision| {
+            trigger != "probe" || decision.field("subject") == Some("fauxlack.acme.cteam")
+        })
+        .collect::<Vec<_>>();
     assert!(!decisions.is_empty(), "space {trigger} read observed");
     for decision in decisions {
         assert_eq!(decision.field("principal"), Some("team"));
@@ -166,6 +172,19 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
         root.thread().next_from("udekopon", WAIT).await.text,
         "Digest set."
     );
+    let baseline = audit.capture.events_where(
+        "dekopon_broker",
+        &[
+            ("capability.id", "gh.issue.list"),
+            ("decision.point", "invocation"),
+            ("turn.started_by", "probe"),
+            ("principal", "alice"),
+        ],
+    );
+    assert_eq!(baseline.len(), 1);
+    assert_eq!(baseline[0].field("space.id"), Some("team"));
+    assert_eq!(baseline[0].field("asker.allowed"), Some("true"));
+    assert_eq!(baseline[0].field("space.allowed"), Some("true"));
     let mut rows = stored(&fixture);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["run_as"], "space");
