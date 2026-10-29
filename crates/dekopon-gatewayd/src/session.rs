@@ -2090,9 +2090,8 @@ async fn session(
         route,
         message,
         driver,
-        cancellation.clone(),
+        (cancellation.clone(), admission),
         &mut publication,
-        admission,
     )
     .await;
     runner.gate.resolve_mapping(
@@ -2115,9 +2114,8 @@ async fn session_turn(
     route: &BoundRoute,
     message: &InboundMessage,
     driver: &Arc<dyn ChatDriver>,
-    cancellation: SessionCancellation,
+    (cancellation, admission): (SessionCancellation, TurnAdmission),
     publication: &mut Option<asset::Publication>,
-    admission: TurnAdmission,
 ) -> Ended {
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.

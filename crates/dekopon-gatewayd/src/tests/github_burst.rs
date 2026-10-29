@@ -720,7 +720,15 @@ async fn wake_reason_returns_the_batch_the_claim_carries() {
             BrokerRequest::Capabilities {
                 attestation: Some(claim),
             } => claim.scope.and_then(|scope| scope.github),
-            _ => None,
+            BrokerRequest::Capabilities { attestation: None }
+            | BrokerRequest::Run { .. }
+            | BrokerRequest::Invoke { .. }
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::UpcallResult { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => None,
         })
         .collect();
     assert_eq!(claims.len(), 2, "inspection opens no extra broker leg");
