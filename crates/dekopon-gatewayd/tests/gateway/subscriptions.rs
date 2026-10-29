@@ -83,7 +83,8 @@ fn subscription(root: &str, repository: &str, id: u32) -> Value {
 }
 
 async fn boot_subscriptions(chat: &Fauxlack, responses: Vec<Value>, settings: Settings) -> Fixture {
-    boot_with(
+    let address = settings.address;
+    let fixture = boot_with(
         temporary(),
         responses,
         None,
@@ -96,7 +97,24 @@ async fn boot_subscriptions(chat: &Fauxlack, responses: Vec<Value>, settings: Se
             ..Timing::default()
         },
     )
+    .await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(socket) => {
+                    drop(socket);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("webhook readiness: {error}"),
+            }
+        }
+    })
     .await
+    .expect("subscription webhook listener starts");
+    fixture
 }
 
 fn stored(fixture: &Fixture) -> Vec<Value> {
