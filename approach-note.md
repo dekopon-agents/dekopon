@@ -1,6 +1,7 @@
 # Approach: quiet re-review on push through PR subscriptions
 
-Status: proposal for the coordinator's Astra note review. No implementation has started.
+Status: revised for Astra note r1 under the coordinator's ruling; awaiting note review.
+No implementation has started.
 Base: `9089a6e1808cbac4d5ab4fb9969765c0394b2fa3` (typed-events-pr3, #837).
 Branch: `codex/s5-rereview-1`.
 Stamped steering: `xrl/agents@7a5ceaf641b3516be8cfe7b2ff0769ad6690f598:steering/GPT.md`.
@@ -8,11 +9,15 @@ Its first line is **# Steering for GPT executors**.
 
 ## Inputs and conflicts before implementation
 
-The dispatch supplies the design's required behavior and stop conditions. The promised
-full DESIGN.md §1, §4, §7, contract table and D4, PLAN.md lines 233–234, and
-HELPER-RULES.md excerpts have not arrived in this thread. I requested them without
-reading campaign-trail. This note is reviewable against the supplied brief; a complete
-design-versus-base reconciliation remains pending those excerpts, before implementation.
+Astra note r1 reviewed this proposal against the binding design excerpts and found one
+contract issue: dotted repository names accepted by PR-link parsing cannot become typed
+subscriptions. The coordinator resolved that issue on 2026-10-29 at 07:05Z in
+`08-team-agent/team/s5-rereview/evidence/coordinator-scope.md`. The ruling preserves
+DECISIONS-r4 §3.1's owner-frozen GitHub subject and RepoFullName grammar: s5 refuses
+dotted repository names at PR-link parse time with the existing subject grammar's typed
+refusal. The owner decision to admit dots is tracked separately as OWNER-QUEUE item 5.
+The reviewer had the binding excerpts and reported no other finding; their absence from
+this thread is no longer recorded as an unresolved input.
 
 These are the conflicts found at the stamped base and the readings proposed:
 
@@ -25,20 +30,22 @@ These are the conflicts found at the stamped base and the readings proposed:
 | `gateway.rs:858` dispatches GitHub deliveries only into repository sessions; `docs/security-model.md:243` says they cannot resume watched chats. | Add the approved subscription branch after the existing GitHub route/ids and broker repository-admission gates. An unmatched delivery keeps current handling. Update only the affected security/gateway descriptions. |
 | `wake/store.rs:69` and `:357` support only once/watch records with strict authored fields. | Add a subscription line kind while continuing to read today's exact once/watch shapes. Old binaries rejecting the new shape makes the carrying release `revert-safe: no`. |
 | `config.rs:921` already carries `maxPerSubject`. | Per the brief's conditional rule, add sibling subscription bound/expiry configuration, with defaults of 64 per agent and 14 days, rather than independent enforcing constants. |
-| `pull_request_links.rs` accepts repository names containing dots; `dekopon_core::github::RepoFullName` in `github.rs:205` excludes dots. | Use the existing typed repository/event/thread vocabulary for subscriptions and matching; do not silently invent a second grammar or broaden typed GitHub facts. This inherited mismatch needs disposition in the note review before claiming all parsed link targets are subscribable. |
+| `pull_request_links.rs` accepts repository names containing dots; `dekopon_core::github::RepoFullName` in `github.rs:205` and the GitHub subject grammar in `subject.rs:67` exclude dots. | Follow the coordinator's 2026-10-29 07:05Z ruling: refuse dotted repositories at PR-link parse time using the same typed refusal as the subject grammar. Accept no review target that cannot become a subscription. Keep both frozen grammars unchanged; admitting dots belongs to OWNER-QUEUE item 5, outside s5. |
 | `gateway.rs:935` sends an orphaned timed wake's note directly to chat; subject-filtered routing can also differ between a person and the canonical space subject. | Revalidate a subscription's anchored transport/channel/thread and agent against current routing for the space turn. If it no longer answers, refuse/retire as appropriate with a structured cause; do not apply the personal reminder's direct-post fallback to a quiet subscription. Resolve the route before starting a turn. |
 | Generic steering asks for a PR and full report; this dispatch explicitly requires a pushed note and end of turn first. | Push only this approach note, report its head, and stop for the coordinator-launched note review. Open the single implementation PR after that gate passes. The dispatch's 300-word parent report takes precedence over the generic full-diff report. |
 | Repository instructions allow releases inside some approved contracts. | This dispatch authorizes only the named feature branches and one PR; no merge, tag, release, deploy, main push or live-system change. |
 
 No change is proposed to `ChatScopeClaim`, `context.github`, or `WakeReasonView`.
-The typed-events-pr3 dispatch gate is present at the base. Full design excerpts and the
-inherited repository-name mismatch remain unresolved inputs, not implied approvals.
+The typed-events-pr3 dispatch gate is present at the base. The coordinator's ruling
+resolves the repository-name mismatch by narrowing PR-link admission to the frozen grammar.
 
 ## Store and lifecycle
 
 Extend the existing store, mutex, atomic rewrite and ID allocator. Add
 `WakeKind::Subscription` with a typed repository identity, `GithubNumber`, and fixed
-expiry. Keep the common persisted anchor and use its canonical space subject, agent,
+expiry. Construct that repository identity during PR-link parsing, before accepting
+the target for review; persist only targets representable by the canonical subject and
+RepoFullName types. Keep the common persisted anchor and use its canonical space subject, agent,
 transport, conversation and reply target. A subscription is unique per
 (agent, repository, number, anchored thread); successful repeat reviews in that same
 thread reuse it rather than consuming another slot. Distinct anchored threads may
@@ -70,6 +77,18 @@ persistent subscription fire internally rather than accidentally deleting the
 subscription or pretending it is an already-consumed timed row.
 
 ## First successful review signal
+
+Before a link becomes an accepted structured review target, use the existing
+`ExternalSubject::github(owner, repo)` constructor and typed repository identity. A
+repository such as `other/repo.name` must return the constructor's existing
+`SubjectError::InvalidSegment` refusal at PR-link parse time, before review or
+persistence. Preserve that typed cause through the PR-link parse; do not replace it
+with a new dotted-name error or accept the link and discard its subscription later.
+The pinned gh provider's broader repository grammar does not widen this ingress path.
+
+If the owner later admits dots, change RepoFullName and the subject grammar together
+once in ingress-fixes or its successor, and delete this refusal there. That contract
+change is outside s5.
 
 Use the gateway's existing invocation-observer seam in `FollowInvoker::mark`, which
 already observes the broker-selected capability, actual proposal input and terminal
@@ -166,6 +185,14 @@ Slack writes after real review work; legacy store-line readability and strict sh
 refusal; mismatched space-subject refusal. Drive time using existing explicit store
 timestamps and paused Tokio time where applicable, without a wall-clock expiry wait.
 
+Add one regression, `a_dotted_repository_is_refused_at_pr_link_parse_and_persists_nothing`:
+pass `https://github.com/other/repo.name/pull/18` through PR-link parsing, assert the
+same typed `SubjectError::InvalidSegment` refusal as the GitHub subject constructor,
+and assert that the real wake store persists nothing. Replace the existing permissive
+parser fixture's dotted target with a representable repository so it no longer requires
+the behavior the coordinator ruled out. This regression is an implementation obligation;
+it is not added or run during the note-only revision.
+
 For this note only, the documented duplicate-entry gate passed (49 Markdown files),
 and the exact CI audit-event step passed (45 event names). Run staged
 `git diff --check` before commit; the unstaged check also passed. Implementation gates deferred until the note passes:
@@ -199,6 +226,7 @@ rows, fires from an unmapped/out-of-ids repository, or retains a person's grants
 
 ## Choices I made
 
+- Apply the coordinator's ruling at PR-link parsing through the existing typed subject constructor, keeping the frozen grammars and requiring one refusal/no-persistence regression.
 - Preserve old common JSONL rows; identify a subscription by a strict, optional, mutually exclusive subscription object.
 - Make the subscription key include the anchor thread; repeated successful reviews in that thread reuse the subscription.
 - Set expiry from creation; pushes and re-reviews do not refresh it.
