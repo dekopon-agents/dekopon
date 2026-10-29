@@ -1,0 +1,1264 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 273.635162406,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 89.350964094,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:83:37: replace * with +",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": null,
+          "span": {
+            "start": {
+              "line": 83,
+              "column": 37
+            },
+            "end": {
+              "line": 83,
+              "column": 38
+            }
+          },
+          "replacement": "+",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_83_col_37.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_83_col_37.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.346458369,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.062181715,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:142:38: replace < with <= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 142,
+              "column": 38
+            },
+            "end": {
+              "line": 142,
+              "column": 39
+            }
+          },
+          "replacement": "<=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_142_col_38.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_142_col_38.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 62.894039841,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.054022896,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:168:36: replace > with == in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 36
+            },
+            "end": {
+              "line": 168,
+              "column": 37
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_168_col_36.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_168_col_36.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 49.32482801,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.040708545,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:168:36: replace > with >= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 168,
+              "column": 36
+            },
+            "end": {
+              "line": 168,
+              "column": 37
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_168_col_36_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_168_col_36_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 51.95232411,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.064632399,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:140:48: replace > with == in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 140,
+              "column": 48
+            },
+            "end": {
+              "line": 140,
+              "column": 49
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_140_col_48.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_140_col_48.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 662.998447813,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.033643939,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:171:28: replace > with >= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 171,
+              "column": 28
+            },
+            "end": {
+              "line": 171,
+              "column": 29
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_171_col_28.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_171_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 66.229116089,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.110827449,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:140:48: replace > with >= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 140,
+              "column": 48
+            },
+            "end": {
+              "line": 140,
+              "column": 49
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_140_col_48_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_140_col_48_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 900.094154086,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:172:29: replace > with >= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 172,
+              "column": 29
+            },
+            "end": {
+              "line": 172,
+              "column": 30
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_172_col_29.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_172_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 39.206827776,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.022135759,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:176:37: replace > with >= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 176,
+              "column": 37
+            },
+            "end": {
+              "line": 176,
+              "column": 38
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_176_col_37.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_176_col_37.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 23.583063806,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.071017692,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:231:49: replace > with >= in ChatMemoryConfig::validate_host_limits",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate_host_limits",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 225,
+                "column": 5
+              },
+              "end": {
+                "line": 238,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 231,
+              "column": 49
+            },
+            "end": {
+              "line": 231,
+              "column": 50
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_231_col_49.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_231_col_49.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 39.720195288,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.050707535,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:232:59: replace > with >= in ChatMemoryConfig::validate_host_limits",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate_host_limits",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 225,
+                "column": 5
+              },
+              "end": {
+                "line": 238,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 232,
+              "column": 59
+            },
+            "end": {
+              "line": 232,
+              "column": 60
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_232_col_59.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_232_col_59.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 41.469747002,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.046994309,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:233:46: replace > with >= in ChatMemoryConfig::validate_host_limits",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate_host_limits",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 225,
+                "column": 5
+              },
+              "end": {
+                "line": 238,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 233,
+              "column": 46
+            },
+            "end": {
+              "line": 233,
+              "column": 47
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_233_col_46.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_233_col_46.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 42.213072852,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.086540258,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:177:38: replace > with >= in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 177,
+              "column": 38
+            },
+            "end": {
+              "line": 177,
+              "column": 39
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_177_col_38.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_177_col_38.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 301.68501275,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.087623166,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:535:9: replace <impl fmt::Display for StartupWarning>::fmt -> fmt::Result with Ok(Default::default())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "<impl fmt::Display for StartupWarning>::fmt",
+            "return_type": "-> fmt::Result",
+            "span": {
+              "start": {
+                "line": 534,
+                "column": 5
+              },
+              "end": {
+                "line": 546,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 535,
+              "column": 9
+            },
+            "end": {
+              "line": 545,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_535_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_535_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 83.464796446,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.074973052,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:558:9: replace ConstraintCatalog::empty -> Self with Default::default()",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::empty",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 556,
+                "column": 5
+              },
+              "end": {
+                "line": 559,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 558,
+              "column": 9
+            },
+            "end": {
+              "line": 558,
+              "column": 24
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_558_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_558_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 65.249063713,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.064052425,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:667:28: replace > with >= in ConstraintCatalog::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 667,
+              "column": 28
+            },
+            "end": {
+              "line": 667,
+              "column": 29
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_28.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 53.849157532,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.051731167,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with >= in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 61
+            },
+            "end": {
+              "line": 705,
+              "column": 62
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 86.140190992,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.07581624,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:904:9: replace CredentialStore::empty -> Self with Default::default()",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "CredentialStore::empty",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 902,
+                "column": 5
+              },
+              "end": {
+                "line": 905,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 904,
+              "column": 9
+            },
+            "end": {
+              "line": 904,
+              "column": 24
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Timeout",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_904_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_904_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 47.893169569,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 120.052479594,
+          "process_status": "Timeout",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.72.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--tests"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 18,
+  "missed": 0,
+  "caught": 0,
+  "timeout": 18,
+  "unviable": 0,
+  "success": 0,
+  "start_time": "2026-10-29T19:11:45.001401474Z",
+  "end_time": null,
+  "cargo_mutants_version": "27.1.0"
+}

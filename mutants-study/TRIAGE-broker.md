@@ -1,0 +1,176 @@
+# Mutation baseline: dekopon-broker remainder (study, no source change)
+
+Base `95d9e2e2b679adf9d5f4bc615d7ca744d528c8a9` (main, #841). cargo-mutants 27.1.0, rustc 1.98.1, `-j3`, `--timeout 120`, `CARGO_PROFILE_DEV_DEBUG=0`, `-p dekopon-broker-host` as a cargo arg. Unmutated baseline passed under both test sets (reduced `--lib --test integration`; full `--lib --tests`).
+
+**Selection.** 834 mutants at base; 672 tested = all minus the 162 that measure caught (142) or found unviable (20) at the identical `file:line:col` and name. No retest was needed on that basis for function edits: #839-#841 changed `lib.rs` only from line 1287 on, beyond everything measure tested, so measure's 209 are untouched and the whole changed region is inside the 672. Selection included measure's 47 misses (retested against #841's tests) and its 616 untested.
+
+| Phase | Test set | Mutants | Caught | Missed | Timeout | Unviable | Wall |
+|---|---|---:|---:|---:|---:|---:|---|
+| 1 | `--lib --test integration` | 672 | 345 | 142 | 0 | 185 | 2h54m |
+| 2 (capped) | `--lib --tests` (all 8 targets + lib) | 145 selected, 18 run | 0 | 0 | 18 | 0 | 33m, killed at the 4 h study cap |
+
+Phase 2 selection was the 142 phase 1 misses; the regex matched 3 extra mutants (`lib.rs:2267`, `2275`, `2295`), also untested. **127 of 145 were not tested**; the 124 phase 1 misses among them are in `dekopon-broker-remainder/phase2/untested.txt`. Every phase 2 mutant that ran hung to the 120 s timeout (the first 18 in source order: `lib.rs:83` and the `ChatMemoryConfig::validate*` group through `lib.rs:904`), as measure's 15 did. A timeout under the full set may partly be `-j3` contention (the full unmutated suite takes ~110 s alone with warm build), so these 18 are flagged as hangs, not confirmed catches.
+
+**Combined dekopon-broker (834 mutants):** caught 487 (142 measure + 345), missed 142, unviable 205. Score 487/(487+142) = **77.4%**, vs measure's 142/189 = 75.1% on its 209. Of measure's 47 misses, 30 are now caught (by #841) and 17 still miss. (The brief says 55 broker misses; measure's `missed.txt` and TRIAGE table have 47, the 55 is the rerun's count of its rerun set.) All 142 misses are measured against the reduced set only; none is confirmed against the full set, since phase 2 reached 18 mutants and all hung.
+
+**Triage (142 phase 1 misses):** kill 118, equivalent 4, covered-elsewhere 0, skip 20. Covered-elsewhere is 0 because phase 2 could not run to show a full-set kill; the 15 `ConstraintCatalog`/`validate` timeouts say nothing about assertions.
+
+**P1 candidates:** none. No miss is a panic or process-killing input on peer bytes; all are lost-assertion mutants. The highest-risk group is the authority generation digest (`canonical_authority_surface`, `effect_tag`, `risk_tag`, secret bindings): a digest that ignores a capability, effect, risk or secret binding lets authority change without rotating the generation.
+
+## Ten highest-value kills, in order
+
+1. `lib.rs:3059-3139` `canonical_authority_surface` (10 mutants): `the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied`.
+2. `lib.rs:4367,4375` `effect_tag`/`risk_tag` (4): `the_authority_generation_differs_for_each_effect_and_risk_level`.
+3. `lib.rs:1102,1124,1128` secret bindings and map revision absent from the digest (5): `the_authority_generation_changes_with_the_secret_bindings_and_map_revision`.
+4. `lib.rs:2309,4826,4827` space decisions (#840 area, 3): `a_space_principal_decision_is_recorded_only_when_the_space_matches_the_requester`, `merge_space_decision_ands_each_verdict_and_unions_policy_ids`.
+5. `lib.rs:2950` `resolve_context` (#840): a DM scope resolves no space, a channel scope resolves the mapped space.
+6. `lib.rs:3262-3288` `curate_memory_input` (6, model-supplied input): `memory_inputs_outside_their_limits_or_with_extra_keys_are_refused`.
+7. `lib.rs:1361` `turn_started_by` guard: `a_turn_started_by_a_non_person_attested_subject_is_not_credited_to_a_person`.
+8. `lib.rs:940,1134-1151,1106-1109` `SecretUseBinding`/`SecretCatalog` validation (12): build refuses each invalid binding and revision text.
+9. `lib.rs:2572` `capability_ceiling` (20 mutants, one test): `the_capability_ceiling_lists_each_available_capability_with_its_words_and_help`.
+10. `lib.rs:5509-5512` `public_host_error` (4) and `lib.rs:1850` `AuditError::category`: one exhaustive category table each.
+
+## Missed mutants (phase 1; "phase2" says what the capped phase 2 observed)
+
+- `lib.rs:83:37` replace * with + — **skip** — ceiling constant arithmetic [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:140:48` replace > with == in ChatMemoryConfig::validate — **kill** — chat_memory_config_refuses_each_invalid_limit: a limit above its bound is InvalidChatMemory (table over validate) [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:140:48` replace > with >= in ChatMemoryConfig::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:142:38` replace < with <= in ChatMemoryConfig::validate — **kill** — chat_memory_config_refuses_each_invalid_limit: a turn-byte limit below its minimum is InvalidChatMemory [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:168:36` replace > with == in ChatMemoryConfig::validate — **kill** — chat_memory_config_refuses_each_invalid_limit: a limit above its bound is InvalidChatMemory (table over validate) [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:168:36` replace > with >= in ChatMemoryConfig::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:171:28` replace > with >= in ChatMemoryConfig::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:172:29` replace > with >= in ChatMemoryConfig::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:176:37` replace > with >= in ChatMemoryConfig::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:177:38` replace > with >= in ChatMemoryConfig::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:231:49` replace > with >= in ChatMemoryConfig::validate_host_limits — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:232:59` replace > with >= in ChatMemoryConfig::validate_host_limits — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:233:46` replace > with >= in ChatMemoryConfig::validate_host_limits — **skip** — boundary at exactly the ceiling; ceiling twin banned by AGENTS Tests [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:535:9` replace <impl fmt::Display for StartupWarning>::fmt -> fmt::Result with Ok(Default::default()) — **skip** — Display/Debug text only; asserting it asserts formatting [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:558:9` replace ConstraintCatalog::empty -> Self with Default::default() — **equivalent** — empty() is Self::default(); the mutant is the same body [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:667:28` replace > with >= in ConstraintCatalog::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:705:61` replace > with >= in ConstraintCatalog::retention_policies — **skip** — boundary at exactly the ceiling; ceiling twin banned [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:904:9` replace CredentialStore::empty -> Self with Default::default() — **equivalent** — empty() is Self::default(); the mutant is the same body [phase2 TIMEOUT (hang, no assertion)]
+- `lib.rs:940:9` replace SecretUseBinding::validate -> Result<(), dekopon_capability::SecretUseGrantError> with Ok(()) — **kill** — a_secret_binding_with_an_invalid_grant_is_refused_at_build [phase2 not run]
+- `lib.rs:997:9` replace <impl fmt::Debug for SecretMaterial>::fmt -> fmt::Result with Ok(Default::default()) — **skip** — Display/Debug text only; asserting it asserts formatting [phase2 not run]
+- `lib.rs:1032:9` replace <impl fmt::Debug for SecretCatalog>::fmt -> fmt::Result with Ok(Default::default()) — **skip** — Display/Debug text only; asserting it asserts formatting [phase2 not run]
+- `lib.rs:1054:9` replace SecretCatalog::empty -> Self with Default::default() — **equivalent** — empty() is Self::default(); the mutant is the same body [phase2 not run]
+- `lib.rs:1102:9` replace SecretCatalog::drns -> impl Iterator<Item =&SecretDrn> with ::std::iter::empty() — **kill** — the_authority_generation_changes_with_the_secret_bindings_and_map_revision [phase2 not run]
+- `lib.rs:1106:9` replace SecretCatalog::with_authority_revision -> Result<Self, BrokerBuildError> with Ok(Default::default()) — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1109:13` replace || with && in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1108:13` replace || with && in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1107:13` replace || with && in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1107:31` replace > with == in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1107:31` replace > with < in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1107:31` replace > with >= in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1108:32` replace != with == in SecretCatalog::with_authority_revision — **kill** — secret_authority_revision_refuses_empty_overlong_padded_and_control_text (one table) [phase2 not run]
+- `lib.rs:1124:9` replace SecretCatalog::authority_revision -> Option<&str> with None — **kill** — the_authority_generation_changes_with_the_secret_bindings_and_map_revision [phase2 not run]
+- `lib.rs:1124:9` replace SecretCatalog::authority_revision -> Option<&str> with Some("") — **kill** — the_authority_generation_changes_with_the_secret_bindings_and_map_revision [phase2 not run]
+- `lib.rs:1124:9` replace SecretCatalog::authority_revision -> Option<&str> with Some("xyzzy") — **kill** — the_authority_generation_changes_with_the_secret_bindings_and_map_revision [phase2 not run]
+- `lib.rs:1128:9` replace SecretCatalog::authority_bindings -> Vec<&SecretUseBinding> with vec![] — **kill** — the_authority_generation_changes_with_the_secret_bindings_and_map_revision [phase2 not run]
+- `lib.rs:1134:9` replace SecretCatalog::validate -> Result<(), BrokerBuildError> with Ok(()) — **kill** — secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constraint [phase2 not run]
+- `lib.rs:1151:17` replace || with && in SecretCatalog::validate — **kill** — secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constraint [phase2 not run]
+- `lib.rs:1147:17` replace || with && in SecretCatalog::validate — **kill** — secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constraint [phase2 not run]
+- `lib.rs:1146:39` replace > with < in SecretCatalog::validate — **kill** — secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constraint [phase2 not run]
+- `lib.rs:1187:54` replace > with == in AttestorGrant::validate — **kill** — an_attestor_grant_needs_each_field_valid: refused when each field is invalid [phase2 not run]
+- `lib.rs:1187:54` replace > with >= in AttestorGrant::validate — **skip** — boundary at exactly the ceiling; ceiling twin banned [phase2 not run]
+- `lib.rs:1201:58` replace && with || in AttestorGrant::validate — **kill** — an_attestor_grant_needs_each_field_valid: refused when each field is invalid [phase2 not run]
+- `lib.rs:1238:9` replace IdentityDirectory::empty -> Self with Default::default() — **equivalent** — empty() is Self::default(); the mutant is the same body [phase2 not run]
+- `lib.rs:1270:9` replace IdentityDirectory::principals -> impl Iterator<Item =&PrincipalId> with ::std::iter::empty() — **kill** — principal_ceiling_is_the_longest_registered_principal (needs IdentityDirectory::principals to list them) [phase2 not run]
+- `lib.rs:1361:16` replace match guard context .attested_subject() .is_some_and(|subject| subject.kind() == PrincipalKind::Person — **kill** — a_turn_started_by_a_non_person_attested_subject_is_not_credited_to_a_person [phase2 not run]
+- `lib.rs:1452:9` replace || with && in validate_set_constraints — **kill** — validate_set_constraints_refuses_each_inconsistent_constraint_set [phase2 not run]
+- `lib.rs:1463:26` replace || with && in validate_set_constraints — **kill** — validate_set_constraints_refuses_each_inconsistent_constraint_set [phase2 not run]
+- `lib.rs:1469:31` replace || with && in validate_set_constraints — **kill** — validate_set_constraints_refuses_each_inconsistent_constraint_set [phase2 not run]
+- `lib.rs:1515:9` replace <impl fmt::Display for NamespaceConflict>::fmt -> fmt::Result with Ok(Default::default()) — **skip** — Display/Debug text only; asserting it asserts formatting [phase2 not run]
+- `lib.rs:1850:9` replace AuditError::category -> &'static str with "" — **kill** — each_audit_error_variant_has_a_distinct_category (exhaustive match, as credential_refresh_errors_have_distinct_categories) [phase2 not run]
+- `lib.rs:1850:9` replace AuditError::category -> &'static str with "xyzzy" — **kill** — each_audit_error_variant_has_a_distinct_category (exhaustive match, as credential_refresh_errors_have_distinct_categories) [phase2 not run]
+- `lib.rs:2041:17` replace || with && in Broker<A>::with_chat_memory — **kill** — with_chat_memory_refuses_a_route_whose_effect_risk_credential_or_http_differs [phase2 not run]
+- `lib.rs:2040:17` replace || with && in Broker<A>::with_chat_memory — **kill** — with_chat_memory_refuses_a_route_whose_effect_risk_credential_or_http_differs [phase2 not run]
+- `lib.rs:2039:17` replace || with && in Broker<A>::with_chat_memory — **kill** — with_chat_memory_refuses_a_route_whose_effect_risk_credential_or_http_differs [phase2 not run]
+- `lib.rs:2071:9` replace Broker<A>::capability_uses_storage -> bool with true — **kill** — a_chat_memory_route_and_a_storage_constrained_capability_each_use_storage [phase2 not run]
+- `lib.rs:2071:9` replace Broker<A>::capability_uses_storage -> bool with false — **kill** — a_chat_memory_route_and_a_storage_constrained_capability_each_use_storage [phase2 not run]
+- `lib.rs:2073:66` replace || with && in Broker<A>::capability_uses_storage — **kill** — a_chat_memory_route_and_a_storage_constrained_capability_each_use_storage [phase2 not run]
+- `lib.rs:2104:17` delete field evaluation from struct Refusal expression in Broker<A>::authorize_invocation — **kill** — a_refusal_from_authorization_carries_its_policy_evaluation (assert the structured field) [phase2 not run]
+- `lib.rs:2163:33` replace |= with &= in Broker<A>::bind_secret_use — **kill** — a_secret_use_refused_for_any_one_reason_is_refused_overall [phase2 not run]
+- `lib.rs:2172:17` delete field evaluation from struct Refusal expression in Broker<A>::bind_secret_use — **kill** — a_refusal_from_authorization_carries_its_policy_evaluation (assert the structured field) [phase2 not run]
+- `lib.rs:2231:33` delete field errors_present from struct PolicyDecision expression in Broker<A>::evaluate — **kill** — a_policy_decision_records_errors_present_and_its_refusal [phase2 not run]
+- `lib.rs:2232:33` delete field refusal from struct PolicyDecision expression in Broker<A>::evaluate — **kill** — a_policy_decision_records_errors_present_and_its_refusal [phase2 not run]
+- `lib.rs:2309:37` replace && with || in Broker<A>::evaluate — **kill** — a_space_principal_decision_is_recorded_only_when_the_space_matches_the_requester (changed by #840) [phase2 not run]
+- `lib.rs:2309:16` delete ! in Broker<A>::evaluate — **kill** — a_space_principal_decision_is_recorded_only_when_the_space_matches_the_requester (changed by #840) [phase2 not run]
+- `lib.rs:2430:21` replace && with || in Broker<A>::reachable_providers — **kill** — reachable_providers_hides_storage_providers_outside_a_chat_scope [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2572:9` replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) wi — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2586:9` replace Broker<A>::display_principal -> Option<PrincipalId> with None — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2591:9` replace Broker<A>::principal_ceiling -> Option<PrincipalId> with None — **kill** — principal_ceiling_is_the_longest_registered_principal (needs IdentityDirectory::principals to list them) [phase2 not run]
+- `lib.rs:2599:9` replace Broker<A>::chat_memory_ceiling -> Option<ChatMemorySurface> with None — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:2950:32` delete ! in Broker<A>::resolve_context — **kill** — a_dm_scope_resolves_no_space_and_a_channel_scope_resolves_the_mapped_space (changed by #840) [phase2 not run]
+- `lib.rs:3023:39` replace || with && in Broker<A>::memory_surface — **kill** — memory_surface_requires_each_of_its_conditions [phase2 not run]
+- `lib.rs:3042:9` replace Broker<A>::available_capability -> Option<AvailableCapability> with None — **kill** — the_capability_ceiling_lists_each_available_capability_with_its_words_and_help (one test pins the tuple, 20 mutants) [phase2 not run]
+- `lib.rs:3059:9` replace Broker<A>::canonical_authority_surface -> Result<Vec<u8>, BrokerError> with Ok(vec![]) — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3059:9` replace Broker<A>::canonical_authority_surface -> Result<Vec<u8>, BrokerError> with Ok(vec![0]) — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3059:9` replace Broker<A>::canonical_authority_surface -> Result<Vec<u8>, BrokerError> with Ok(vec![1]) — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3086:13` replace && with || in Broker<A>::canonical_authority_surface — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3096:21` replace && with || in Broker<A>::canonical_authority_surface — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3095:21` replace && with || in Broker<A>::canonical_authority_surface — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3094:41` replace || with && in Broker<A>::canonical_authority_surface — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3125:21` replace && with || in Broker<A>::canonical_authority_surface — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3139:12` delete ! in Broker<A>::canonical_authority_surface — **kill** — the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied [phase2 not run]
+- `lib.rs:3243:37` replace == with != in Broker<A>::prepare_storage_grant — **kill** — a_storage_grant_binds_only_the_matching_scope [phase2 not run]
+- `lib.rs:3262:9` replace Broker<A>::curate_memory_input -> Result<(), &'static str> with Ok(()) — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3271:46` replace && with || in Broker<A>::curate_memory_input — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3271:42` replace > with >= in Broker<A>::curate_memory_input — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3284:51` replace == with != in Broker<A>::curate_memory_input — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3288:43` replace && with || in Broker<A>::curate_memory_input — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3288:25` delete ! in Broker<A>::curate_memory_input — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3288:65` replace <= with > in Broker<A>::curate_memory_input — **kill** — memory_inputs_outside_their_limits_or_with_extra_keys_are_refused (model-supplied input; table over recent/search) [phase2 not run]
+- `lib.rs:3503:36` replace && with || in Broker<A>::deny — **kill** — a_denial_records_each_deciding_party / authorized_failure_before_provider_records_its_stage [phase2 not run]
+- `lib.rs:3587:51` replace == with != in Broker<A>::fail_authorized_before_provider — **kill** — a_denial_records_each_deciding_party / authorized_failure_before_provider_records_its_stage [phase2 not run]
+- `lib.rs:3802:30` delete ! in Broker<A>::execute — **kill** — execute_records_the_outcome_for_each_branch (assert the structured audit field per branch) [phase2 not run]
+- `lib.rs:4130:51` replace == with != in Broker<A>::execute — **kill** — execute_records_the_outcome_for_each_branch (assert the structured audit field per branch) [phase2 not run]
+- `lib.rs:4199:34` delete ! in Broker<A>::execute — **kill** — execute_records_the_outcome_for_each_branch (assert the structured audit field per branch) [phase2 not run]
+- `lib.rs:4367:5` replace effect_tag -> u8 with 0 — **kill** — the_authority_generation_differs_for_each_effect_and_risk_level [phase2 not run]
+- `lib.rs:4367:5` replace effect_tag -> u8 with 1 — **kill** — the_authority_generation_differs_for_each_effect_and_risk_level [phase2 not run]
+- `lib.rs:4375:5` replace risk_tag -> u8 with 0 — **kill** — the_authority_generation_differs_for_each_effect_and_risk_level [phase2 not run]
+- `lib.rs:4375:5` replace risk_tag -> u8 with 1 — **kill** — the_authority_generation_differs_for_each_effect_and_risk_level [phase2 not run]
+- `lib.rs:4740:9` replace DenyingPrincipal::as_str -> &'static str with "" — **kill** — the_denying_principal_and_github_denier_record_distinct_values [phase2 not run]
+- `lib.rs:4740:9` replace DenyingPrincipal::as_str -> &'static str with "xyzzy" — **kill** — the_denying_principal_and_github_denier_record_distinct_values [phase2 not run]
+- `lib.rs:4770:9` replace GithubDenier::as_str -> &'static str with "" — **kill** — the_denying_principal_and_github_denier_record_distinct_values [phase2 not run]
+- `lib.rs:4770:9` replace GithubDenier::as_str -> &'static str with "xyzzy" — **kill** — the_denying_principal_and_github_denier_record_distinct_values [phase2 not run]
+- `lib.rs:4826:33` replace && with || in merge_space_decision — **kill** — merge_space_decision_ands_each_verdict_and_unions_policy_ids [phase2 not run]
+- `lib.rs:4827:78` replace && with || in merge_space_decision — **kill** — merge_space_decision_ands_each_verdict_and_unions_policy_ids [phase2 not run]
+- `lib.rs:4936:9` delete field evaluation from struct Refusal expression in decided_refusal — **kill** — a_refusal_from_authorization_carries_its_policy_evaluation (assert the structured field) [phase2 not run]
+- `lib.rs:4960:5` replace report_inspection_refusal with () — **skip** — log-only helper; no state a test should pin [phase2 not run]
+- `lib.rs:5144:5` replace delivery_kind -> &'static str with "" — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5144:5` replace delivery_kind -> &'static str with "xyzzy" — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5156:5` replace delivery_id -> String with String::new() — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5156:5` replace delivery_id -> String with "xyzzy".into() — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5173:5` replace actor_kind -> &'static str with "" — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5173:5` replace actor_kind -> &'static str with "xyzzy" — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5181:5` replace actor_id -> String with String::new() — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5181:5` replace actor_id -> String with "xyzzy".into() — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5188:5` replace rendered -> Option<String> with None — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5188:5` replace rendered -> Option<String> with Some(String::new()) — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5188:5` replace rendered -> Option<String> with Some("xyzzy".into()) — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5189:19` replace && with || in rendered — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5189:11` replace != with == in rendered — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5189:27` replace != with == in rendered — **kill** — audit_records_carry_delivery_and_actor_kind_and_id (structured field per variant) [phase2 not run]
+- `lib.rs:5407:5` replace outcome_evidence_digest -> Result<String, BrokerError> with Ok(String::new()) — **kill** — the_outcome_evidence_digest_is_the_digest_of_the_outcome [phase2 not run]
+- `lib.rs:5407:5` replace outcome_evidence_digest -> Result<String, BrokerError> with Ok("xyzzy".into()) — **kill** — the_outcome_evidence_digest_is_the_digest_of_the_outcome [phase2 not run]
+- `lib.rs:5440:5` replace duration_millis -> u64 with 0 — **skip** — wall-clock duration; a test would need a clock seam [phase2 not run]
+- `lib.rs:5440:5` replace duration_millis -> u64 with 1 — **skip** — wall-clock duration; a test would need a clock seam [phase2 not run]
+- `lib.rs:5509:13` delete match arm dekopon_storage_host::StorageHostError::QuotaExceeded in public_host_error — **kill** — each_storage_host_error_maps_to_its_public_category [phase2 not run]
+- `lib.rs:5510:13` delete match arm dekopon_storage_host::StorageHostError::Busy in public_host_error — **kill** — each_storage_host_error_maps_to_its_public_category [phase2 not run]
+- `lib.rs:5511:13` delete match arm dekopon_storage_host::StorageHostError::Timeout in public_host_error — **kill** — each_storage_host_error_maps_to_its_public_category [phase2 not run]
+- `lib.rs:5512:13` delete match arm dekopon_storage_host::StorageHostError::Corrupt{..} | dekopon_storage_host::StorageHostError: — **kill** — each_storage_host_error_maps_to_its_public_category [phase2 not run]
