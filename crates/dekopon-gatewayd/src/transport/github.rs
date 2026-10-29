@@ -367,7 +367,7 @@ fn eligible(entry: &TypedGithubEvent) -> bool {
     match entry.event {
         GithubEvent::PullRequest => matches!(
             entry.action.as_ref().map(GithubWord::as_str),
-            Some("opened" | "reopened" | "synchronize")
+            Some("opened" | "reopened" | "synchronize" | "closed")
         ),
         GithubEvent::WorkflowRun => {
             entry.action.as_ref().map(GithubWord::as_str) == Some("completed")
@@ -911,7 +911,7 @@ pub(crate) mod tests {
                 .starts_with("[gateway: unverified")
         );
         let mut ignored = pr();
-        ignored["action"] = json!("closed");
+        ignored["action"] = json!("edited");
         assert!(!eligible(
             &parse(&ignored, GithubEvent::PullRequest, "guid").unwrap()
         ));

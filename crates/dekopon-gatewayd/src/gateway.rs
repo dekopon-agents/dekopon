@@ -926,7 +926,9 @@ impl Gateway {
                     return;
                 }
                 let agent = route.agent.clone();
-                let delivery = tokio::task::spawn_blocking(move || store.deliver_subscriptions(&agent, &event, SystemTime::now())).await;
+                let closed = event.action.as_ref().is_some_and(|action| action.as_str() == "closed");
+                let store_span = tracing::Span::current();
+                let delivery = tokio::task::spawn_blocking(move || store_span.in_scope(|| store.deliver_subscriptions(&agent, &event, SystemTime::now()))).await;
                 let delivery = match delivery {
                     Ok(Ok(delivery)) => delivery,
                     Ok(Err(error)) => {
@@ -941,6 +943,12 @@ impl Gateway {
                     }
                 };
                 drop(permit);
+                if !delivery.matched && closed
+                {
+                    session::record_admission(&message, "ignored", 0, None);
+                    ticket.answer(transport::github::Acked::Ignored);
+                    return;
+                }
                 if !delivery.matched {
                     run_routed_delivery(runner, active, drivers, message, Some(ticket)).await;
                     return;
@@ -958,6 +966,18 @@ impl Gateway {
                     run_routed_delivery(Arc::clone(&runner), Arc::clone(&active), Arc::clone(&drivers), wake, None).await;
                 }
             }.instrument(span));
+            return;
+        }
+        if let MessageId::Github(batch) = &message.message_id
+            && batch.lead().event == GithubEvent::PullRequest
+            && batch
+                .lead()
+                .action
+                .as_ref()
+                .is_some_and(|action| action.as_str() == "closed")
+        {
+            session::record_admission(&message, "ignored", 0, None);
+            ticket.answer(transport::github::Acked::Ignored);
             return;
         }
         self.start_session_with_ticket(sessions, &generation, message, Some(ticket));
@@ -1078,7 +1098,7 @@ async fn run_routed_delivery(
         move |message, queued| {
             let generation = active.load();
             let route = generation.routes.route(message)?;
-            (!wake::space_wake(message) || route.wakes && route.agent == agent).then(|| ())?;
+            (!wake::space_wake(message) || route.wakes && route.agent == agent).then_some(())?;
             (message.constituents.is_empty()
                 || RouteIdentity::of(route, message) == RouteIdentity::of(queued, message))
             .then(|| (route.clone(), generation._digest.clone()))

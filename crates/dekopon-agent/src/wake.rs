@@ -66,7 +66,7 @@ pub enum WakeRefusal {
     Full { maximum: usize },
     #[error("the probe script exited {exit} on its first run, so it was not stored:\n{output}")]
     Broken { exit: u8, output: String },
-    #[error("no pending wake of this person has that id")]
+    #[error("no pending wake has that id in this scope")]
     NotFound,
     #[error("the gateway could not reach the broker to run the probe")]
     Unavailable,

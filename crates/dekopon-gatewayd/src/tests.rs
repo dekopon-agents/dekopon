@@ -2472,6 +2472,10 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |problem| matches!(problem, ConfigProblem::InvalidWakeBounds),
         ),
         (
+            json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "maxSubscriptionsPerAgent": 0, "subscriptionExpiryMs": 0}}}),
+            |problem| matches!(problem, ConfigProblem::InvalidWakeBounds),
+        ),
+        (
             json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}},
             "/routes/0/wakes": true}),
             |problem| {
@@ -18325,6 +18329,7 @@ mod sealed_handoff;
 mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
+mod subscriptions;
 mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;

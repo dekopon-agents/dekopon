@@ -152,7 +152,7 @@ impl PullRequestLinkTarget {
             subject.tenant().unwrap_or_default(),
             subject.subject()
         ))
-        .map_err(|_| SubjectError::InvalidSegment {
+        .map_err(|_invalid_repository| SubjectError::InvalidSegment {
             segment: "subject",
             value: repo.to_owned(),
         })?;

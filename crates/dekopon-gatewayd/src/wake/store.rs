@@ -67,6 +67,25 @@ struct Wake {
     kind: WakeKind,
 }
 
+#[derive(Clone, Copy)]
+enum SubscriptionOperation {
+    Created,
+    Fired,
+    Expired,
+    Cancelled,
+}
+
+impl SubscriptionOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Fired => "fired",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum WakeKind {
     Once,
@@ -118,15 +137,9 @@ impl Wake {
         }
     }
 
-    fn record_subscription(&self, operation: &str) {
+    fn record_subscription(&self, operation: SubscriptionOperation) {
         if let WakeKind::Subscription { target } = &self.kind {
-            tracing::info!(
-                audit.event = "gateway.admission", admission.trigger = "pr-subscription",
-                subscription.operation = operation, wake.id = %self.id,
-                github.repository = target.repository.as_str(), github.number = %target.number,
-                agent = %self.anchor.agent(), conversation.id = %self.anchor.conversation().key(),
-                "gateway.admission"
-            );
+            record_subscription(self.id, &self.anchor, target, operation);
         }
     }
 }
@@ -195,7 +208,7 @@ impl Tick {
         verdict: Verdict,
         now: SystemTime,
     ) -> Result<Resolved, WakeStoreError> {
-        store.mutate(|wakes| {
+        store.mutate(SubscriptionOperation::Expired, |wakes| {
             let Some(index) = wakes.iter().position(|wake| wake.id == self.id) else {
                 return Ok(Resolved::Gone);
             };
@@ -250,6 +263,12 @@ impl WakeStore {
         target: PullRequestLinkTarget,
         now: SystemTime,
     ) -> Result<WakeSummary, WakeRefusal> {
+        if anchor
+            .as_space()
+            .is_none_or(|space| space.subject() != anchor.subject())
+        {
+            return Err(WakeRefusal::MappedChannelRequired);
+        }
         let mut state = self.state.lock();
         let mut wakes = state.wakes.clone();
         expire_subscriptions(&mut wakes, now);
@@ -286,8 +305,14 @@ impl WakeStore {
         let summary = wake.summary(now);
         wakes.push(wake);
         write(&self.path, &wakes)?;
+        let retained: std::collections::BTreeSet<_> = wakes.iter().map(|wake| wake.id).collect();
+        for removed in &state.wakes {
+            if !retained.contains(&removed.id) {
+                removed.record_subscription(SubscriptionOperation::Expired);
+            }
+        }
         if let Some(wake) = wakes.last() {
-            wake.record_subscription("created");
+            wake.record_subscription(SubscriptionOperation::Created);
         }
         state.wakes = wakes;
         state.next_id = state.next_id.wrapping_add(1);
@@ -299,7 +324,7 @@ impl WakeStore {
         anchor: &Anchor,
         now: SystemTime,
     ) -> Result<Vec<WakeSummary>, WakeRefusal> {
-        Ok(self.mutate(|wakes| {
+        Ok(self.mutate(SubscriptionOperation::Expired, |wakes| {
             expire_subscriptions(wakes, now);
             Ok(wakes
                 .iter()
@@ -320,7 +345,7 @@ impl WakeStore {
         anchor: &Anchor,
         id: WakeId,
     ) -> Result<(), WakeRefusal> {
-        let found = self.mutate(|wakes| {
+        let found = self.mutate(SubscriptionOperation::Cancelled, |wakes| {
             let before = wakes.len();
             wakes.retain(|wake| {
                 let remove = wake.id == id
@@ -329,9 +354,6 @@ impl WakeStore {
                         WakeKind::Subscription { .. } => true,
                         WakeKind::Once | WakeKind::Watch { .. } => false,
                     };
-                if remove {
-                    wake.record_subscription("cancelled");
-                }
                 !remove
             });
             Ok(before != wakes.len())
@@ -357,7 +379,7 @@ impl WakeStore {
         event: &GithubEvent,
         now: SystemTime,
     ) -> Result<SubscriptionDelivery, WakeStoreError> {
-        self.mutate(|wakes| {
+        let delivery = self.mutate(SubscriptionOperation::Expired, |wakes| {
             expire_subscriptions(wakes, now);
             let mut delivery = SubscriptionDelivery::default();
             wakes.retain(|wake| {
@@ -366,12 +388,8 @@ impl WakeStore {
                 }
                 delivery.matched = true;
                 match event.action.as_ref().map(|action| action.as_str()) {
-                    Some("closed") => {
-                        wake.record_subscription("expired");
-                        false
-                    }
+                    Some("closed") => false,
                     Some("synchronize") => {
-                        wake.record_subscription("fired");
                         delivery.fired.push(wake.fired("fired", None));
                         true
                     }
@@ -379,7 +397,18 @@ impl WakeStore {
                 }
             });
             Ok(delivery)
-        })
+        })?;
+        for fired in &delivery.fired {
+            if let Some(target) = &fired.subscription {
+                record_subscription(
+                    fired.id,
+                    &fired.anchor,
+                    target,
+                    SubscriptionOperation::Fired,
+                );
+            }
+        }
+        Ok(delivery)
     }
     pub(crate) fn open(config: &ResolvedWakes) -> Result<Self, WakeStoreError> {
         if let Some(parent) = config.path.parent() {
@@ -436,7 +465,13 @@ impl WakeStore {
         let pending = state
             .wakes
             .iter()
-            .filter(|wake| wake.anchor.subject() == anchor.subject())
+            .filter(|wake| {
+                wake.anchor.subject() == anchor.subject()
+                    && match wake.kind {
+                        WakeKind::Subscription { .. } => false,
+                        WakeKind::Once | WakeKind::Watch { .. } => true,
+                    }
+            })
             .count();
         if pending >= maximum {
             return Err(WakeRefusal::Full { maximum });
@@ -458,9 +493,16 @@ impl WakeStore {
     }
 
     pub(crate) fn cancel(&self, subject: &ExternalSubject, id: WakeId) -> Result<(), WakeRefusal> {
-        let found = self.mutate(|wakes| {
+        let found = self.mutate(SubscriptionOperation::Expired, |wakes| {
             let before = wakes.len();
-            wakes.retain(|wake| wake.id != id || wake.anchor.subject() != subject);
+            wakes.retain(|wake| {
+                wake.id != id
+                    || wake.anchor.subject() != subject
+                    || match wake.kind {
+                        WakeKind::Subscription { .. } => true,
+                        WakeKind::Once | WakeKind::Watch { .. } => false,
+                    }
+            });
             Ok(wakes.len() != before)
         })?;
         if found {
@@ -475,7 +517,13 @@ impl WakeStore {
         state
             .wakes
             .iter()
-            .filter(|wake| wake.anchor.subject() == subject)
+            .filter(|wake| {
+                wake.anchor.subject() == subject
+                    && match wake.kind {
+                        WakeKind::Subscription { .. } => false,
+                        WakeKind::Once | WakeKind::Watch { .. } => true,
+                    }
+            })
             .map(|wake| wake.summary(now))
             .collect()
     }
@@ -488,17 +536,14 @@ impl WakeStore {
     /// A due watch is leased by moving its next check forward in the same write, so a slow tick
     /// can never be leased twice.
     pub(crate) fn take_due(&self, now: SystemTime) -> Result<Due, WakeStoreError> {
-        self.mutate(|wakes| {
+        self.mutate(SubscriptionOperation::Expired, |wakes| {
             let mut due = Due::default();
             wakes.retain_mut(|wake| {
                 if wake.next_at > now {
                     return true;
                 }
                 match &wake.kind {
-                    WakeKind::Subscription { .. } => {
-                        wake.record_subscription("expired");
-                        false
-                    }
+                    WakeKind::Subscription { .. } => false,
                     WakeKind::Once => {
                         due.fired.push(wake.fired("fired", None));
                         false
@@ -520,12 +565,19 @@ impl WakeStore {
 
     fn mutate<T>(
         &self,
+        operation: SubscriptionOperation,
         change: impl FnOnce(&mut Vec<Wake>) -> Result<T, WakeStoreError>,
     ) -> Result<T, WakeStoreError> {
         let mut state = self.state.lock();
         let mut wakes = state.wakes.clone();
         let result = change(&mut wakes)?;
         write(&self.path, &wakes)?;
+        let retained: std::collections::BTreeSet<_> = wakes.iter().map(|wake| wake.id).collect();
+        for wake in &state.wakes {
+            if !retained.contains(&wake.id) {
+                wake.record_subscription(operation);
+            }
+        }
         state.wakes = wakes;
         Ok(result)
     }
@@ -614,7 +666,7 @@ impl Line {
         if self.subscription.is_some() && self.watch.is_some() {
             return None;
         }
-        Some(Wake {
+        let wake = Wake {
             id: WakeId(self.id),
             anchor: Anchor {
                 transport: self.transport.parse().ok()?,
@@ -643,16 +695,43 @@ impl Line {
                     until: at(watch.until_ms),
                 },
             },
-        })
+        };
+        match &wake.kind {
+            WakeKind::Subscription { .. } => {
+                let space = wake.anchor.as_space()?;
+                if space.subject() != wake.anchor.subject()
+                    || !wake
+                        .anchor
+                        .conversation
+                        .is_canonical_for(wake.anchor.kind, wake.anchor.subject())
+                {
+                    return None;
+                }
+            }
+            WakeKind::Once | WakeKind::Watch { .. } => {}
+        }
+        Some(wake)
     }
+}
+
+fn record_subscription(
+    id: WakeId,
+    anchor: &Anchor,
+    target: &PullRequestLinkTarget,
+    operation: SubscriptionOperation,
+) {
+    tracing::info!(
+        audit.event = "gateway.admission", admission.trigger = "pr-subscription",
+        subscription.operation = operation.as_str(), wake.id = %id,
+        github.repository = target.repository.as_str(), github.number = %target.number,
+        agent = %anchor.agent(), conversation.id = %anchor.conversation().key(),
+        "gateway.admission"
+    );
 }
 
 fn expire_subscriptions(wakes: &mut Vec<Wake>, now: SystemTime) {
     wakes.retain(|wake| match wake.kind {
-        WakeKind::Subscription { .. } if wake.next_at <= now => {
-            wake.record_subscription("expired");
-            false
-        }
+        WakeKind::Subscription { .. } if wake.next_at <= now => false,
         WakeKind::Subscription { .. } | WakeKind::Once | WakeKind::Watch { .. } => true,
     });
 }

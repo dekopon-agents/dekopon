@@ -147,7 +147,7 @@ impl Anchor {
         )
         .parse()
         .ok()?;
-        Some(anchor)
+        (anchor.subject.kind() == dekopon_core::PrincipalKind::Space).then_some(anchor)
     }
 
     pub(crate) fn same_channel(&self, other: &Self) -> bool {
