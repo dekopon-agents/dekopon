@@ -4765,6 +4765,7 @@ fn runner_tracking(
     max_concurrent: usize,
     max_conversations: usize,
 ) -> Arc<SessionRunner> {
+    let thread_owner = crate::threads::Owner::new(16);
     Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -4783,9 +4784,13 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
         wakes: None,
-        jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
+        jobs: Arc::new(crate::jobs::Jobs::new(
+            crate::config::DEFAULT_MAX_JOBS,
+            Arc::clone(&thread_owner),
+        )),
         metering: unmetered(),
         shell_threads: dekopon_test_support::shell_threads(),
+        thread_owner,
     })
 }
 
@@ -18334,6 +18339,7 @@ fn journaled_runner(
     models: Arc<dyn ModelFactory>,
     journal: &Path,
 ) -> Arc<SessionRunner> {
+    let thread_owner = crate::threads::Owner::new(16);
     Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -18356,9 +18362,13 @@ fn journaled_runner(
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
         wakes: None,
-        jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
+        jobs: Arc::new(crate::jobs::Jobs::new(
+            crate::config::DEFAULT_MAX_JOBS,
+            Arc::clone(&thread_owner),
+        )),
         metering: unmetered(),
         shell_threads: dekopon_test_support::shell_threads(),
+        thread_owner,
     })
 }
 
@@ -23946,3 +23956,6 @@ async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() 
         crate::follow::FollowTicket::Active { .. }
     ));
 }
+
+#[path = "tests/thread_budget.rs"]
+mod thread_budget;

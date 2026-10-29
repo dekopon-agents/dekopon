@@ -33,6 +33,7 @@ mod proxy;
 mod pull_request_links;
 mod routes;
 mod session;
+mod threads;
 mod transport;
 mod wake;
 
@@ -309,6 +310,7 @@ where
             config.memory.summaries.concurrency,
         )
     });
+    let thread_owner = threads::Owner::new(shell_threads);
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -327,17 +329,15 @@ where
         asset_fetchers,
         thread_ownership,
         wakes,
-        jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
+        jobs: Arc::new(jobs::Jobs::new(
+            config.sessions.max_jobs,
+            Arc::clone(&thread_owner),
+        )),
         metering: Arc::clone(&metering),
         shell_threads: ShellThreads::new(shell_threads, tokio::runtime::Handle::current()),
+        thread_owner: Arc::clone(&thread_owner),
     });
     let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
-    if let Some((sender, dispatcher)) = engine {
-        dispatcher.start(generation.clone(), models, &mut owned_tasks);
-        if let Some(boot) = boot {
-            enqueue_boot(&sender, boot).await;
-        }
-    }
 
     tracing::info!(
         event = "gateway_started",
@@ -354,9 +354,10 @@ where
     let shutdown_grace = config.shutdown_grace;
     let collector = collection::Collector::new(&config.transports, config.sessions.max_concurrent);
     let proxy_listener = config.proxy.clone();
+    let runner_threads = runner.shell_threads.clone();
     let gateway = gateway::Gateway::serving(
         runner,
-        generation,
+        generation.clone(),
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
     )
@@ -375,11 +376,24 @@ where
             .await
             .map_err(GatewaydError::Proxy)?;
     }
+    if let Some((sender, dispatcher)) = engine {
+        dispatcher.start(
+            generation.clone(),
+            models,
+            Arc::clone(&thread_owner),
+            runner_threads,
+            &mut owned_tasks,
+        );
+        if let Some(boot) = boot {
+            enqueue_boot(&sender, boot).await;
+        }
+    }
     let outcome = gateway
         .serve(receiver, stopped, shutdown_grace, collector)
         .await;
     readers.abort_all();
     owned_tasks.shutdown().await;
+    thread_owner.shutdown().await;
     assets.shutdown().await;
     while let Some(result) = readers.join_next().await {
         match result {
@@ -883,7 +897,7 @@ fn spawn_tick(
     store: &Arc<wake::WakeStore>,
     ticks: &mut JoinSet<Option<wake::Fired>>,
     tick: wake::Tick,
-) {
+) -> Result<(), threads::Failure> {
     let store = Arc::clone(store);
     // No transport is named "wake", so a tick's admission key never collides with a session's.
     let Some(admission) = runner
@@ -896,8 +910,22 @@ fn spawn_tick(
             reason = "busy",
             "gateway.wake.tick.skipped"
         );
-        return;
+        return Ok(());
     };
+    let ticket = runner
+        .thread_owner
+        .reserve(&runner.shell_threads)
+        .map_err(|limit| {
+            tracing::info!(
+                event = "gateway_wake_tick_skipped",
+                wake.id = %tick.id(),
+                reason = "shell-threads",
+                limit.maximum = runner.thread_owner.maximum,
+                error = ?limit,
+                "gateway.wake.tick.skipped"
+            );
+            threads::Failure::Limit(limit)
+        })?;
     let shell = routes.route_for_anchor(tick.anchor()).map(|route| {
         dekopon_shell::Interpreter::new(
             dekopon_process::Limits {
@@ -918,7 +946,7 @@ fn spawn_tick(
     let jobs = Arc::clone(&runner.jobs);
     let broker = runner.broker.clone();
     let runtime = tokio::runtime::Handle::current();
-    ticks.spawn_blocking(move || {
+    let result = ticket.spawn(threads::Work::Tick, move || {
         let _admission = admission;
         wake::run_tick(
             tick,
@@ -928,7 +956,24 @@ fn spawn_tick(
             shell,
             job_limits.map(|limits| (jobs, limits)),
         )
+    }).map_err(|error| {
+        tracing::error!(event = "gateway_wake_task_failed", error.kind = ?error.kind(), "gateway.wake.task.failed");
+        threads::Failure::Spawn { kind: error.kind() }
+    })?;
+    ticks.spawn(async move {
+        match result.await {
+            Ok(Ok(fired)) => fired,
+            Ok(Err(failure)) => {
+                tracing::error!(event = "gateway_wake_task_failed", failure = failure.category(), error = %failure, "gateway.wake.task.failed");
+                None
+            }
+            Err(_closed) => {
+                tracing::error!(event = "gateway_wake_task_failed", failure = "cancelled", "gateway.wake.task.failed");
+                None
+            }
+        }
     });
+    Ok(())
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {

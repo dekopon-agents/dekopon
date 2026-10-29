@@ -153,6 +153,8 @@ fn resources(
             current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),
             models: Arc::new(ModelCache::new(Arc::new(Factory(Arc::clone(&script))))),
             counts: Arc::default(),
+            thread_owner: crate::threads::Owner::new(16),
+            shell_threads: dekopon_test_support::shell_threads(),
         },
         script,
     )
@@ -381,6 +383,8 @@ async fn an_overflowed_part_marks_its_later_parts() {
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
+        thread_owner: crate::threads::Owner::new(16),
+        shell_threads: dekopon_test_support::shell_threads(),
     };
     sender.enqueue(task()).await;
     sender.enqueue(task()).await;
@@ -733,6 +737,8 @@ fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: u64) -> Res
             crate::session::ConfiguredModels::default(),
         ))),
         counts: Arc::default(),
+        thread_owner: crate::threads::Owner::new(16),
+        shell_threads: dekopon_test_support::shell_threads(),
     }
 }
 
@@ -1486,6 +1492,8 @@ async fn an_overflowed_part_logs_one_drop_per_later_part() {
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
+        thread_owner: crate::threads::Owner::new(16),
+        shell_threads: dekopon_test_support::shell_threads(),
     };
     sender.enqueue(task()).await;
     sender.enqueue(task()).await;
@@ -1513,4 +1521,53 @@ async fn an_overflowed_part_logs_one_drop_per_later_part() {
             .collect();
         assert_eq!(parts, ["1", "2", "3"], "{event}");
     }
+}
+
+#[tokio::test]
+async fn a_summary_at_the_shell_thread_cap_is_refused_before_calling_the_model() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let before = slots(&journal);
+    let (mut resources, script) =
+        resources(Arc::clone(&journal), [Action::Text("must not run")], true);
+    resources.shell_threads =
+        dekopon_process::ShellThreads::new(1, tokio::runtime::Handle::current());
+    resources.thread_owner = crate::threads::Owner::new(1);
+    let held = resources.shell_threads.reserve::<1>().unwrap();
+    let resources = Arc::new(resources);
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let next = run(
+        Arc::clone(&resources),
+        Queued {
+            task: task(),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    assert!(matches!(next, Next::Stop));
+    assert_eq!(script.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(slots(&journal), before);
+    let records = capture.records();
+    let refused = records
+        .iter()
+        .filter(|record| record.field("event") == Some("gateway_memory_summary_refused"))
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("reason"), Some("shell-threads"));
+    assert_eq!(refused[0].field("limit.maximum"), Some("1"));
+    assert_eq!(refused[0].field("memory.summary.part"), Some("1"));
+    drop(held);
+    assert!(resources.shell_threads.reserve::<1>().is_ok());
+    assert!(
+        resources
+            .thread_owner
+            .reserve(&resources.shell_threads)
+            .is_ok()
+    );
+    resources.thread_owner.shutdown().await;
 }

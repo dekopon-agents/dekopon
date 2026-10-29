@@ -411,7 +411,7 @@ impl Gateway {
                                 self.start_wake(&mut sessions, fired);
                             }
                             for tick in due.ticks {
-                                spawn_tick(&self.runner, &self.active.load().routes, &store, &mut ticks, tick);
+                                drop(spawn_tick(&self.runner, &self.active.load().routes, &store, &mut ticks, tick));
                             }
                         }
                         Ok(Err(error)) => {
@@ -560,10 +560,18 @@ impl Gateway {
                 event = "gateway_sessions_abandoned",
                 "gateway.sessions.abandoned"
             );
-            // A blocking probe cannot be aborted; the runtime's shutdown timeout bounds it.
-            ticks.detach_all();
             sessions.abort_all();
-            while sessions.join_next().await.is_some() {}
+            while let Some(result) = sessions.join_next().await {
+                observe_session(result);
+            }
+            while let Some(result) = ticks.join_next().await {
+                if let Ok(Some(fired)) = result {
+                    self.start_wake(&mut sessions, fired);
+                }
+            }
+            while let Some(result) = sessions.join_next().await {
+                observe_session(result);
+            }
         }
         outcome
     }

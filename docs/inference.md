@@ -37,7 +37,7 @@ Slack event
        empty/refused -> fixed unauthorized reply; no model call
   -> conversation store optionally supplies compacted history + an opaque cache key
   -> prompt loop builds ModelMessage values and ModelTool definitions
-  -> a per-session BlockingModel enters the supplied tokio runtime from spawn_blocking
+  -> a per-session BlockingModel enters the supplied tokio runtime from an admitted ShellThreads turn
   -> the shared ModelClient selects Codex, OpenRouter, or OpenAI-compatible encoding
   -> pooled async reqwest sends compact typed JSON with Content-Length
   -> SSE events stream visible text back to the caller and become AssistantTurn
@@ -390,7 +390,7 @@ synthetic key under `--loopback`; Codex uses
 `--auth-file` when supplied, otherwise its existing credential file (`DEKOPON_CHATGPT_AUTH_FILE`
 or the default). Codex with `--loopback` requires an explicit `--auth-file` pointing to a fresh
 synthetic credential, so it never implicitly loads or rotates the operator's credential.
-It runs `run_prompt_session` on `spawn_blocking`
+It runs `run_prompt_session` on a named thread admitted by the process's `ShellThreads` budget
 with a `BlockingModel` and a local `ScriptRuntime` that returns a fixed synthetic result. It never
 executes the proposed script or opens a broker leg. No gateway configuration or global tracing
 subscriber is required. Without `--loopback`, running it makes a real, potentially billed request:

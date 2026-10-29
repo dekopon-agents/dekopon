@@ -6,7 +6,7 @@ use std::{
 
 use tokio::{
     runtime::Handle,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
 };
 
 use crate::LimitExceeded;
@@ -87,7 +87,51 @@ pub struct ThreadPermit {
     runtime: Handle,
 }
 
+struct Completed(Option<oneshot::Sender<()>>);
+
+impl Drop for Completed {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            done.send(()).unwrap_or(());
+        }
+    }
+}
+
 impl ThreadPermit {
+    pub fn spawn_owned<T: Send + 'static>(
+        self,
+        name: ThreadName,
+        run: impl FnOnce() -> T + Send + 'static,
+    ) -> io::Result<impl Future<Output = Result<thread::Result<T>, tokio::task::JoinError>> + Send>
+    {
+        let Self { permit, runtime } = self;
+        let (done, completed) = oneshot::channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: the returned join operation, retained by the gateway; bound: the ShellThreads permit moved into the thread"
+        )]
+        let thread = thread::Builder::new()
+            .name(name.0.to_owned())
+            .stack_size(ShellThreads::STACK_BYTES)
+            .spawn(move || {
+                let _completed = Completed(Some(done));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _runtime = runtime.enter();
+                    run()
+                }));
+                (permit, result)
+            })?;
+        Ok(async move {
+            drop(completed.await);
+            // Closure completion precedes TLS destruction, so even the final join stays off workers.
+            tokio::task::spawn_blocking(move || match thread.join() {
+                Ok((_permit, result)) => result,
+                Err(payload) => Err(payload),
+            })
+            .await
+        })
+    }
+
     /// The permit lives as long as the thread, so it is released on return, unwind or a refused spawn.
     pub fn spawn<'scope, T: Send + 'scope>(
         self,

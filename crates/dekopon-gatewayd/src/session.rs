@@ -1160,6 +1160,7 @@ pub(crate) struct SessionRunner {
     pub jobs: Arc<crate::jobs::Jobs>,
     pub metering: Arc<dekopon_model_token_governor::Metering>,
     pub shell_threads: ShellThreads,
+    pub thread_owner: Arc<crate::threads::Owner>,
 }
 
 enum RecallSeed {
@@ -2816,7 +2817,7 @@ async fn session_turn(
     let threads = runner.shell_threads.clone();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
-    let result = tokio::task::spawn_blocking(move || {
+    let run = move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = blocking_span.enter();
             let model = match models.client_bound(&model_config, model_runtime, model_cancel) {
@@ -3036,8 +3037,11 @@ async fn session_turn(
                 choice,
             }
         })
-    })
-    .await;
+    };
+    let result = runner
+        .thread_owner
+        .run(&runner.shell_threads, crate::threads::Work::Turn, run)
+        .await;
 
     participant_worker.finish().await;
     deferred.follows = std::mem::take(&mut *pending_follows.lock());
@@ -3048,7 +3052,7 @@ async fn session_turn(
         commit,
         pins,
         choice,
-    } = match result.map_err(TaskFailure::from) {
+    } = match result {
         Ok(turn) => turn,
         Err(failure) => {
             match steers.seal() {
@@ -4161,7 +4165,7 @@ pub(crate) enum TaskFailure {
 }
 
 impl TaskFailure {
-    const fn category(&self) -> &'static str {
+    pub(crate) const fn category(&self) -> &'static str {
         match self {
             Self::Panicked { .. } => "panicked",
             Self::Cancelled => "cancelled",
@@ -4172,14 +4176,20 @@ impl TaskFailure {
 impl From<tokio::task::JoinError> for TaskFailure {
     fn from(error: tokio::task::JoinError) -> Self {
         match error.try_into_panic() {
-            Ok(payload) => Self::Panicked {
-                cause: payload
-                    .downcast_ref::<&str>()
-                    .map(|cause| (*cause).to_owned())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_default(),
-            },
+            Ok(payload) => Self::from(payload),
             Err(_cancelled) => Self::Cancelled,
+        }
+    }
+}
+
+impl From<Box<dyn std::any::Any + Send>> for TaskFailure {
+    fn from(payload: Box<dyn std::any::Any + Send>) -> Self {
+        Self::Panicked {
+            cause: payload
+                .downcast_ref::<&str>()
+                .map(|cause| (*cause).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default(),
         }
     }
 }
