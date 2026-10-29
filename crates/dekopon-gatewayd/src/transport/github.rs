@@ -52,7 +52,7 @@ pub(crate) enum Acked {
 
 pub(crate) struct AdmissionTicket {
     delivery: String,
-    accepted: Arc<Mutex<SeenIds>>,
+    accepted: Option<Arc<Mutex<SeenIds>>>,
     reply: Option<oneshot::Sender<Acked>>,
 }
 
@@ -65,12 +65,39 @@ impl std::fmt::Debug for AdmissionTicket {
 }
 
 impl AdmissionTicket {
+    pub(crate) fn split(self, count: usize) -> (Vec<Self>, impl Future<Output = ()> + Send) {
+        let mut tickets = Vec::with_capacity(count);
+        let mut receivers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (reply, receiver) = oneshot::channel();
+            tickets.push(Self {
+                delivery: self.delivery.clone(),
+                accepted: None,
+                reply: Some(reply),
+            });
+            receivers.push(receiver);
+        }
+        let answer = async move {
+            let mut answer = Acked::Queued;
+            for result in futures_util::future::join_all(receivers).await {
+                match result {
+                    Ok(Acked::Admitted | Acked::Queued | Acked::Ignored) => {}
+                    Ok(Acked::Busy) | Err(_) => answer = Acked::Busy,
+                }
+            }
+            self.answer(answer);
+        };
+        (tickets, answer)
+    }
+
     pub(crate) fn answer(mut self, answer: Acked) {
         let commit = match answer {
             Acked::Admitted | Acked::Queued | Acked::Ignored => true,
             Acked::Busy => false,
         };
-        self.accepted.lock().answer(&self.delivery, commit);
+        if let Some(accepted) = &self.accepted {
+            accepted.lock().answer(&self.delivery, commit);
+        }
         if let Some(reply) = self.reply.take() {
             reply.send(answer).unwrap_or_else(|_receiver_closed| {
                 tracing::debug!(
@@ -86,7 +113,9 @@ impl AdmissionTicket {
 impl Drop for AdmissionTicket {
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
-            self.accepted.lock().answer(&self.delivery, false);
+            if let Some(accepted) = &self.accepted {
+                accepted.lock().answer(&self.delivery, false);
+            }
             reply.send(Acked::Busy).unwrap_or_else(|_receiver_closed| {
                 tracing::debug!(
                     event = "gateway_github_webhook_refused",
@@ -332,7 +361,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         let (reply, receiver) = oneshot::channel();
         let ticket = AdmissionTicket {
             delivery: delivery.clone(),
-            accepted: Arc::clone(&state.accepted),
+            accepted: Some(Arc::clone(&state.accepted)),
             reply: Some(reply),
         };
         (permit, ticket, receiver)
