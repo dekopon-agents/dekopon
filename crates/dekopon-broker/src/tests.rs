@@ -1167,37 +1167,37 @@ fn a_provider_exit_keeps_its_classification_and_carries_its_status_and_stderr() 
     }
 }
 
+fn hex(data: &[u8]) -> String {
+    data.iter().map(|byte| format!("\\{byte:02x}")).collect()
+}
+
+fn stdio_probe_manifest() -> String {
+    serde_json::to_string(&serde_json::json!({
+        "apiVersion": "dekopon.dev/provider/v1alpha1",
+        "id": "stdio-probe",
+        "description": "Inline standard-stream probe",
+        "commandWords": ["stdioprobe"],
+        "capabilities": [{
+            "id": "stdio-probe.run",
+            "description": "Runs the inline body",
+            "effect": dekopon_capability::EffectKind::ReadOnly,
+            "risk": dekopon_core::RiskLevel::Low,
+            "inputSchema": {"type": "object"}
+        }]
+    }))
+    .unwrap()
+}
+
+fn manifest_descriptor(offset: u32, length: usize) -> String {
+    hex(&[
+        offset.to_le_bytes(),
+        u32::try_from(length).unwrap().to_le_bytes(),
+    ]
+    .concat())
+}
+
 fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
-    fn hex(data: &[u8]) -> String {
-        data.iter().map(|byte| format!("\\{byte:02x}")).collect()
-    }
-
-    fn manifest() -> String {
-        serde_json::to_string(&serde_json::json!({
-            "apiVersion": "dekopon.dev/provider/v1alpha1",
-            "id": "stdio-probe",
-            "description": "Inline standard-stream probe",
-            "commandWords": ["stdioprobe"],
-            "capabilities": [{
-                "id": "stdio-probe.run",
-                "description": "Runs the inline body",
-                "effect": dekopon_capability::EffectKind::ReadOnly,
-                "risk": dekopon_core::RiskLevel::Low,
-                "inputSchema": {"type": "object"}
-            }]
-        }))
-        .unwrap()
-    }
-
-    fn descriptor(offset: u32, length: usize) -> String {
-        hex(&[
-            offset.to_le_bytes(),
-            u32::try_from(length).unwrap().to_le_bytes(),
-        ]
-        .concat())
-    }
-
-    let manifest = manifest();
+    let manifest = stdio_probe_manifest();
     let wat = format!(
         r#"(component
         (import "dekopon:stdio/streams@0.1.0" (instance $streams
@@ -1234,7 +1234,47 @@ fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
             (canon lift (core func $provider "invoke") (memory $mem) (realloc (core func $memory "realloc"))))
         (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
             (canon lift (core func $provider "command") (memory $mem) (realloc (core func $memory "realloc")))))"#,
-        descriptor = descriptor(64, manifest.len()),
+        descriptor = manifest_descriptor(64, manifest.len()),
+        manifest = hex(manifest.as_bytes()),
+    );
+    let mut provider = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut provider, wat.as_bytes()).unwrap();
+    provider
+}
+
+fn provider_succeeding_after_writing_stderr() -> tempfile::NamedTempFile {
+    let manifest = stdio_probe_manifest();
+    let wat = format!(
+        r#"(component
+        (import "dekopon:stdio/streams@0.1.0" (instance $streams
+            (export "write-stderr" (func (param "text" string)))))
+        (core module $memory
+            (memory (export "memory") 1)
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+        (core instance $memory (instantiate $memory))
+        (alias core export $memory "memory" (core memory $mem))
+        (core func $stderr (canon lower (func $streams "write-stderr") (memory $mem)))
+        (core module $provider
+            (import "memory" "memory" (memory 1))
+            (import "streams" "stderr" (func $stderr (param i32 i32)))
+            (data (i32.const 0) "{descriptor}")
+            (data (i32.const 64) "{manifest}")
+            (data (i32.const 2048) "warn\0a")
+            (data (i32.const 16) "\00\00")
+            (func (export "describe") (result i32) i32.const 0)
+            (func (export "command") (param i32 i32 i32) (result i32) i32.const 0)
+            (func (export "invoke") (param i32 i32 i32 i32) (result i32)
+                i32.const 2048 i32.const 5 call $stderr
+                i32.const 16))
+        (core instance $provider (instantiate $provider
+            (with "memory" (instance $memory))
+            (with "streams" (instance (export "stderr" (func $stderr))))))
+        (func (export "describe") (result string) (canon lift (core func $provider "describe") (memory $mem)))
+        (func (export "invoke") (param "capability" string) (param "input-json" string) (result (result (error u8)))
+            (canon lift (core func $provider "invoke") (memory $mem) (realloc (core func $memory "realloc"))))
+        (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
+            (canon lift (core func $provider "command") (memory $mem) (realloc (core func $memory "realloc")))))"#,
+        descriptor = manifest_descriptor(64, manifest.len()),
         manifest = hex(manifest.as_bytes()),
     );
     let mut provider = tempfile::NamedTempFile::new().unwrap();
@@ -3850,19 +3890,7 @@ async fn an_authorized_failure_before_the_provider_and_a_success_name_the_loaded
         capability,
         ..invocation_with_input(serde_json::json!({"text": "hi"}))
     };
-    let (host, mut reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-    let captured = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut reader, &mut bytes).expect("stdout");
-        bytes
-    });
-    let assets = dekopon_broker_host::asset::AssetInputs {
-        streams: Some(dekopon_broker_host::Streams {
-            stdin: None,
-            stdout: host.into(),
-        }),
-        ..Default::default()
-    };
+    let (assets, captured) = stdout_assets();
     let result = broker
         .invoke(&context, None, None, request, assets)
         .await
@@ -3870,8 +3898,243 @@ async fn an_authorized_failure_before_the_provider_and_a_success_name_the_loaded
         .result;
     captured.join().expect("stdout reader");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded, "{result:?}");
+    assert!(
+        result.detail.is_none(),
+        "a silent provider carries no detail"
+    );
     assert_eq!(
         artifacts(&broker)[1..],
         [(InvocationOutcome::Succeeded, Some(artifact))]
+    );
+}
+
+#[tokio::test]
+async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail_and_one_that_did_not_carries_none()
+ {
+    use dekopon_broker_host::BrokerProviderRegistry;
+    use dekopon_capability::{EffectKind, InvocationOutcome};
+    use dekopon_core::RiskLevel;
+
+    let provider = provider_succeeding_after_writing_stderr();
+    let registry = BrokerProviderRegistry::load([provider.path()], BrokerHostLimits::default())
+        .await
+        .expect("stderr-writing provider loads");
+    let principal: PrincipalId = "caller".parse().unwrap();
+    let capability: CapabilityId = "stdio-probe.run".parse().unwrap();
+    let provider_id: ProviderId = "stdio-probe".parse().unwrap();
+    let world = PolicyWorld::new(
+        [principal.clone()],
+        [(capability.clone(), provider_id.clone())],
+    )
+    .unwrap();
+    let broker = Broker::new(
+        registry,
+        "broker".parse().unwrap(),
+        PolicyEngine::new(
+            r#"@id("stderr") permit(principal, action, resource);"#,
+            &world,
+        )
+        .unwrap(),
+        ConstraintCatalog::new([(
+            capability.clone(),
+            ConstraintSet {
+                default_secret_use: None,
+                route: CapabilityRoute::Generic,
+                provider: provider_id,
+                effect: EffectKind::ReadOnly,
+                risk: RiskLevel::Low,
+                credential: None,
+                constraints: ExecutionConstraints::default(),
+            },
+        )])
+        .unwrap(),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).unwrap()),
+        BrokerLimits::default(),
+    )
+    .unwrap();
+    let context = AuthenticatedContext::attested(
+        principal,
+        Actor::Agent {
+            agent: "provider-test".parse().unwrap(),
+        },
+        "gateway".parse().unwrap(),
+        "slack.team.user".parse().unwrap(),
+    )
+    .unwrap();
+    let result = broker
+        .invoke(
+            &context,
+            None,
+            None,
+            invocation_with_capability("invoke-stderr", capability),
+            Default::default(),
+        )
+        .await
+        .unwrap()
+        .result;
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded, "{result:?}");
+    let detail = result.detail.expect("stderr is kept as detail");
+    assert_eq!(detail.code, "provider-stderr");
+    assert_eq!(detail.message, "warn\n");
+}
+
+fn invocation_with_capability(
+    id: &str,
+    capability: CapabilityId,
+) -> dekopon_broker_protocol::InvocationRequest {
+    dekopon_broker_protocol::InvocationRequest {
+        id: id.parse().expect("invocation"),
+        capability,
+        ..invocation_with_input(serde_json::json!({}))
+    }
+}
+
+fn stdout_assets() -> (
+    dekopon_broker_host::asset::AssetInputs,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).expect("stdout");
+        bytes
+    });
+    (
+        dekopon_broker_host::asset::AssetInputs {
+            streams: Some(dekopon_broker_host::Streams {
+                stdin: None,
+                stdout: host.into(),
+            }),
+            ..Default::default()
+        },
+        captured,
+    )
+}
+
+#[tokio::test]
+async fn an_http_request_decision_digests_its_own_verdict_and_denial_reason() {
+    use super::{AuditEvent, DecisionMaterial};
+    use dekopon_test_support::LoopbackServer;
+
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let authority = server.authority().to_owned();
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut builder = SurfaceBroker::new(root.path(), &[("http-probe.fetch", "http-probe")]);
+    builder.policy.push_str(
+        r#"@id("only-ok-path") forbid(principal, action == Dekopon::Action::"http-probe.fetch", resource)
+            when { context has request } unless { context.request.url.path == "/ok" };"#,
+    );
+    builder
+        .constraints
+        .iter_mut()
+        .find(|(capability, _)| capability.as_str() == "http-probe.fetch")
+        .expect("http route")
+        .1
+        .constraints
+        .http
+        .as_mut()
+        .expect("http constraints")
+        .allowed_hosts = vec![authority.clone(), "127.0.0.1:1".to_owned()];
+    let broker = builder.build().await;
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            dekopon_broker_protocol::ChatTransportKind::Slack,
+            dekopon_broker_protocol::ConversationKind::Channel,
+            dekopon_broker_protocol::Trigger::Message,
+        ),
+    );
+    for (id, uri) in [
+        ("invoke-http-ok", format!("http://{authority}/ok")),
+        ("invoke-http-denied", "http://127.0.0.1:1/denied".to_owned()),
+    ] {
+        let (assets, captured) = stdout_assets();
+        broker
+            .invoke(
+                &context,
+                None,
+                None,
+                dekopon_broker_protocol::InvocationRequest {
+                    input: serde_json::json!({"uri": uri, "method": "GET"}),
+                    ..invocation_with_capability(
+                        id,
+                        "http-probe.fetch".parse().expect("capability"),
+                    )
+                },
+                assets,
+            )
+            .await
+            .expect("the invocation is accounted");
+        captured.join().expect("stdout reader");
+    }
+
+    let decisions = broker
+        .audit
+        .records()
+        .into_iter()
+        .filter_map(|event| match event {
+            AuditEvent::Decision {
+                invocation,
+                trace,
+                principal: Some(principal),
+                actor: Some(actor),
+                via,
+                attested_subject,
+                capability,
+                provider,
+                authorized_by: Some(authorized_by),
+                policy_ids,
+                decision_point,
+                policy_digest: Some(policy_digest),
+                allowed,
+                reason,
+                decision_digest,
+                ..
+            } if decision_point == "http.request" => {
+                let material = DecisionMaterial {
+                    invocation: &invocation,
+                    trace,
+                    principal: &principal,
+                    actor: &actor,
+                    via: via.as_ref(),
+                    attested_subject: attested_subject.as_ref(),
+                    capability: &capability,
+                    secret_use: None,
+                    provider: provider.as_ref(),
+                    authorized_by: &authorized_by,
+                    policy_ids: &policy_ids,
+                    policy_digest: &policy_digest,
+                    constraints: None,
+                    allowed,
+                    reason: reason.as_deref(),
+                    space: None,
+                };
+                let expected =
+                    super::decision_evidence_digest("policy-decision", &material).expect("digest");
+                Some((
+                    invocation.to_string(),
+                    allowed,
+                    reason,
+                    decision_digest == expected,
+                ))
+            }
+            AuditEvent::Decision { .. } | AuditEvent::Execution { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decisions,
+        [
+            ("invoke-http-ok".to_owned(), true, None, true),
+            (
+                "invoke-http-denied".to_owned(),
+                false,
+                Some("policy-denied".to_owned()),
+                true
+            ),
+        ]
     );
 }
