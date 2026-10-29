@@ -1,0 +1,97 @@
+crates/dekopon-policy/src/lib.rs:198:9: replace PolicyWorld::with_secrets -> Self with Default::default()
+crates/dekopon-policy/src/lib.rs:211:9: replace PolicyWorld::with_group_members -> Self with Default::default()
+crates/dekopon-policy/src/lib.rs:220:9: replace PolicyWorld::with_read_only -> Self with Default::default()
+crates/dekopon-policy/src/lib.rs:123:42: replace * with /
+crates/dekopon-policy/src/lib.rs:225:9: replace PolicyWorld::groups -> BTreeSet<&GroupId> with BTreeSet::new()
+crates/dekopon-policy/src/lib.rs:229:9: replace PolicyWorld::action_groups_of -> Vec<String> with vec![]
+crates/dekopon-policy/src/lib.rs:229:9: replace PolicyWorld::action_groups_of -> Vec<String> with vec!["xyzzy".into()]
+crates/dekopon-policy/src/lib.rs:229:9: replace PolicyWorld::action_groups_of -> Vec<String> with vec![String::new()]
+crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::new()
+crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::from_iter([(String::new(), BTreeSet::new())])
+crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::from_iter([("xyzzy".into(), BTreeSet::new())])
+crates/dekopon-policy/src/lib.rs:254:9: replace PolicyWorld::with_phantoms -> Self with Default::default()
+crates/dekopon-policy/src/lib.rs:280:9: replace PolicyWorld::with_subjects -> Self with Default::default()
+crates/dekopon-policy/src/lib.rs:288:51: replace == with != in PolicyWorld::principal_kind
+crates/dekopon-policy/src/lib.rs:294:9: replace PolicyWorld::identity_digest -> String with String::new()
+crates/dekopon-policy/src/lib.rs:320:9: replace PolicyWorld::schema_json -> serde_json::Value with Default::default()
+crates/dekopon-policy/src/lib.rs:420:12: delete ! in PolicyWorld::schema_json
+crates/dekopon-policy/src/lib.rs:294:9: replace PolicyWorld::identity_digest -> String with "xyzzy".into()
+crates/dekopon-policy/src/lib.rs:468:9: replace PolicyTarget::action -> &str with "xyzzy"
+crates/dekopon-policy/src/lib.rs:468:9: replace PolicyTarget::action -> &str with ""
+crates/dekopon-policy/src/lib.rs:518:9: replace PolicyDecision::refused -> Self with Default::default()
+crates/dekopon-policy/src/lib.rs:594:9: replace <impl fmt::Debug for PolicyEngine>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-policy/src/lib.rs:628:30: replace > with < in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:641:40: replace > with == in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:628:30: replace > with == in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:641:40: replace > with >= in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:641:40: replace > with < in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:644:39: replace > with < in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:652:12: delete ! in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:670:12: delete ! in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:699:9: replace PolicyEngine::authorize -> PolicyDecision with Default::default()
+crates/dekopon-policy/src/lib.rs:708:9: replace PolicyEngine::authorize_http -> PolicyDecision with Default::default()
+crates/dekopon-policy/src/lib.rs:734:30: delete ! in PolicyEngine::authorize_with_facts
+crates/dekopon-policy/src/lib.rs:716:9: replace PolicyEngine::authorize_with_facts -> PolicyDecision with Default::default()
+crates/dekopon-policy/src/lib.rs:743:72: delete ! in PolicyEngine::authorize_with_facts
+crates/dekopon-policy/src/lib.rs:743:69: replace && with || in PolicyEngine::authorize_with_facts
+crates/dekopon-policy/src/lib.rs:753:9: replace PolicyEngine::referenced_capabilities -> impl Iterator<Item =&CapabilityId> with ::std::iter::empty()
+crates/dekopon-policy/src/lib.rs:758:9: replace PolicyEngine::policy_count -> usize with 0
+crates/dekopon-policy/src/lib.rs:758:9: replace PolicyEngine::policy_count -> usize with 1
+crates/dekopon-policy/src/lib.rs:763:9: replace PolicyEngine::digest -> &str with ""
+crates/dekopon-policy/src/lib.rs:883:5: replace apply_annotated_ids -> Result<PolicySet, PolicyBuildError> with Ok(Default::default())
+crates/dekopon-policy/src/lib.rs:763:9: replace PolicyEngine::digest -> &str with "xyzzy"
+crates/dekopon-policy/src/lib.rs:890:21: replace || with && in apply_annotated_ids
+crates/dekopon-policy/src/lib.rs:889:41: replace > with < in apply_annotated_ids
+crates/dekopon-policy/src/lib.rs:890:24: delete ! in apply_annotated_ids
+crates/dekopon-policy/src/lib.rs:891:54: replace || with && in apply_annotated_ids
+crates/dekopon-policy/src/lib.rs:906:12: delete ! in apply_annotated_ids
+crates/dekopon-policy/src/lib.rs:923:5: replace inspect_request_shapes -> Result<(PolicySet, Vec<String>), PolicyBuildError> with Ok((Default::default(), vec![String::new()]))
+crates/dekopon-policy/src/lib.rs:923:5: replace inspect_request_shapes -> Result<(PolicySet, Vec<String>), PolicyBuildError> with Ok((Default::default(), vec!["xyzzy".into()]))
+crates/dekopon-policy/src/lib.rs:929:12: delete ! in inspect_request_shapes
+crates/dekopon-policy/src/lib.rs:923:5: replace inspect_request_shapes -> Result<(PolicySet, Vec<String>), PolicyBuildError> with Ok((Default::default(), vec![]))
+crates/dekopon-policy/src/lib.rs:940:70: replace != with == in inspect_request_shapes
+crates/dekopon-policy/src/lib.rs:940:46: replace || with && in inspect_request_shapes
+crates/dekopon-policy/src/lib.rs:940:28: replace != with == in inspect_request_shapes
+crates/dekopon-policy/src/lib.rs:949:5: replace references_request -> bool with true
+crates/dekopon-policy/src/lib.rs:954:25: replace && with || in references_request
+crates/dekopon-policy/src/lib.rs:949:5: replace references_request -> bool with false
+crates/dekopon-policy/src/lib.rs:953:38: replace == with != in references_request
+crates/dekopon-policy/src/lib.rs:955:29: replace || with && in references_request
+crates/dekopon-policy/src/lib.rs:954:46: replace == with != in references_request
+crates/dekopon-policy/src/lib.rs:959:33: replace == with != in references_request
+crates/dekopon-policy/src/lib.rs:962:20: replace || with && in references_request
+crates/dekopon-policy/src/lib.rs:989:5: replace classify_policies -> Result<(BTreeSet<CapabilityId>, Vec<UnresolvedName>), PolicyBuildError> with Ok((BTreeSet::new(), vec![]))
+crates/dekopon-policy/src/lib.rs:1006:24: delete ! in classify_policies
+crates/dekopon-policy/src/lib.rs:1018:24: delete ! in classify_policies
+crates/dekopon-policy/src/lib.rs:1022:45: replace || with && in classify_policies
+crates/dekopon-policy/src/lib.rs:1022:57: replace == with != in classify_policies
+crates/dekopon-policy/src/lib.rs:1043:24: delete ! in classify_policies
+crates/dekopon-policy/src/lib.rs:1058:24: delete ! in classify_policies
+crates/dekopon-policy/src/lib.rs:1073:37: replace == with != in classify_policies
+crates/dekopon-policy/src/lib.rs:1095:49: replace || with && in classify_policies
+crates/dekopon-policy/src/lib.rs:1095:61: replace == with != in classify_policies
+crates/dekopon-policy/src/lib.rs:1123:5: replace action_group_provider -> Option<ProviderId> with None
+crates/dekopon-policy/src/lib.rs:1131:5: replace build_entities -> Result<Entities, PolicyBuildError> with Ok(Default::default())
+crates/dekopon-policy/src/lib.rs:1210:5: replace policy_digest -> Result<String, PolicyBuildError> with Ok(String::new())
+crates/dekopon-policy/src/lib.rs:1210:5: replace policy_digest -> Result<String, PolicyBuildError> with Ok("xyzzy".into())
+crates/dekopon-policy/src/lib.rs:1293:5: replace finish_digest -> String with String::new()
+crates/dekopon-policy/src/lib.rs:1297:50: replace >> with << in finish_digest
+crates/dekopon-policy/src/lib.rs:1293:5: replace finish_digest -> String with "xyzzy".into()
+crates/dekopon-policy/src/lib.rs:1298:50: replace & with | in finish_digest
+crates/dekopon-policy/src/lib.rs:1298:50: replace & with ^ in finish_digest
+crates/dekopon-policy/src/github.rs:2:5: replace schema -> serde_json::Value with Default::default()
+crates/dekopon-policy/src/request.rs:7:34: replace * with /
+crates/dekopon-policy/src/request.rs:89:44: replace match guard body.is_empty() with true in HttpRequestFacts::context
+crates/dekopon-policy/src/request.rs:61:12: delete ! in HttpRequestFacts::context
+crates/dekopon-policy/src/request.rs:80:27: replace &= with |= in HttpRequestFacts::context
+crates/dekopon-policy/src/request.rs:120:8: delete ! in json_record
+crates/dekopon-policy/src/request.rs:89:44: replace match guard body.is_empty() with false in HttpRequestFacts::context
+crates/dekopon-policy/src/request.rs:126:19: replace > with < in json_record
+crates/dekopon-policy/src/request.rs:126:19: replace > with == in json_record
+crates/dekopon-policy/src/request.rs:189:44: replace match guard fraction.len() <= 4 with false in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64
+crates/dekopon-policy/src/request.rs:189:59: replace <= with > in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64
+crates/dekopon-policy/src/request.rs:211:61: replace || with && in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_map
+crates/dekopon-policy/src/request.rs:211:28: replace == with != in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_map
+crates/dekopon-policy/src/request.rs:211:49: replace == with != in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_map
+crates/dekopon-policy/src/request.rs:215:42: delete ! in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_map
+crates/dekopon-policy/src/request.rs:211:42: replace || with && in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_map
