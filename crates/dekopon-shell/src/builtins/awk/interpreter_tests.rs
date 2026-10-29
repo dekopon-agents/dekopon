@@ -539,6 +539,27 @@ fn printf_and_sprintf_keep_flags_precision_and_character_widths() {
 }
 
 #[test]
+fn signed_nonfinite_conversions_disable_zero_padding() {
+    stdout(
+        r#"awk 'BEGIN{printf "%06d|%06i|%06d|%06i",log(0),log(0),-log(0),-log(0)}'"#,
+        "  -inf|  -inf|   inf|   inf",
+    );
+}
+
+#[test]
+fn signed_large_finite_conversions_use_zero_precision_floating_format() {
+    for conversion in ['d', 'i'] {
+        let program = format!(
+            r#"BEGIN{{printf "%{conversion}|%022{conversion}|%+022{conversion}|%022.25{conversion}|%.25{conversion}|%.25{conversion}|%.25{conversion}",2^63,2^63,2^63,2^63,-2^63,2^63-1024,-(2^63-1024)}}"#
+        );
+        stdout(
+            &format!("awk {}", quote(&program)),
+            "9223372036854775808|0009223372036854775808|+009223372036854775808|0009223372036854775808|-9223372036854775808|0000009223372036854774784|-0000009223372036854774784",
+        );
+    }
+}
+
+#[test]
 fn maximum_format_precision_fits_the_bounded_numeric_renderer() {
     stdout(
         "awk 'BEGIN{print length(sprintf(\"%.4096f\",1e308)),length(sprintf(\"%.4096e\",1e308)),length(sprintf(\"%#.4096g\",1e308)),length(sprintf(\"%#.4096g\",1e-323))}'",
