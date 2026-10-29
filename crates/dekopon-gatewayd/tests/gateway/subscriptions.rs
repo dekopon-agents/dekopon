@@ -460,3 +460,50 @@ async fn a_subscription_wake_reports_non_review_capability_work_in_its_anchored_
     assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
     fixture.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_review_that_also_ran_another_effect_cannot_decline() {
+    let audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let root = chat
+        .server("acme")
+        .user("ualice")
+        .post("cteam", "Review anchor")
+        .await
+        .unwrap();
+    let api = review_api();
+    let settings = Settings::new(
+        vec![subscription(root.id(), "acme/widget", 1)],
+        Some(api.url()),
+    );
+    let address = settings.address;
+    let fixture = boot_subscriptions(
+        &chat,
+        vec![
+            refresh_review(),
+            bash_tool_call("other-work", "probe upper --text inspected"),
+            meta("quiet", "decline_chat_reply", json!({})),
+            final_answer("I refreshed the review and also ran another capability."),
+        ],
+        settings,
+    )
+    .await;
+    deliver(address, "widget", "synchronize", "review-and-other-work").await;
+    assert_eq!(
+        root.thread().next_from("udekopon", WAIT).await.text,
+        "I refreshed the review and also ran another capability."
+    );
+    let other = audit.capture.events_where(
+        "dekopon_broker",
+        &[
+            ("audit.event", "broker.execution"),
+            ("capability.id", "cli-probe.upper"),
+        ],
+    );
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].field("outcome"), Some("Succeeded"));
+    assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
+    assert_review_requests(&api);
+    fixture.shutdown().await;
+    api.join();
+}

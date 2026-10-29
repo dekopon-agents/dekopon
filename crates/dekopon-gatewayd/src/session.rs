@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -21,8 +21,8 @@ use dekopon_agent::{
     },
     prompt::{
         CancellationProbe, ConversationTurn, Handoff, History, MemoryFact, MemoryNotice,
-        OmissionReason, PromptError, ReplaySource, ReplyDisposition, Seal, SessionInputs, Steer,
-        SteerSource, run_prompt_session,
+        OmissionReason, PromptError, ReplaySource, ReplyDisposition, ReviewProgress, Seal,
+        SessionInputs, Steer, SteerSource, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -2740,25 +2740,25 @@ async fn session_turn(
     }
     drop(sink);
     let space_access = leg.space_grants().is_some();
-    let review_refreshed = message
+    let review_progress = message
         .message_id
         .wake_origin()
         .is_some_and(|origin| match origin {
             crate::wake::WakeOrigin::Subscription(_) => true,
             crate::wake::WakeOrigin::Scheduled | crate::wake::WakeOrigin::Digest => false,
         })
-        .then(|| Arc::new(AtomicBool::new(false)));
+        .then(|| Arc::new(ReviewProgress::default()));
     let subscriptions = if let (
-        Some(refreshed),
+        Some(progress),
         MessageId::Wake {
             origin: crate::wake::WakeOrigin::Subscription(target),
             ..
         },
-    ) = (&review_refreshed, &message.message_id)
+    ) = (&review_progress, &message.message_id)
     {
         Some(crate::wake::ReviewSubscriptions::Refresh {
             target: target.clone(),
-            refreshed: Arc::clone(refreshed),
+            progress: Arc::clone(progress),
         })
     } else if route.wakes && space_access && !is_space_wake {
         message
@@ -3090,8 +3090,8 @@ async fn session_turn(
             if progress_notes {
                 inputs = inputs.with_progress_notes();
             }
-            if let Some(refreshed) = review_refreshed.as_deref() {
-                inputs = inputs.with_quiet_review(refreshed);
+            if let Some(progress) = review_progress.as_deref() {
+                inputs = inputs.with_quiet_review(progress);
             } else if is_digest {
                 inputs = inputs.with_quiet_digest();
             } else if reply_optional {

@@ -441,17 +441,13 @@ async fn a_quiet_review_that_refreshed_no_review_cannot_decline_after_capability
 
 #[test]
 fn only_a_successful_review_of_the_subscribed_target_confirms_a_refresh() {
+    use dekopon_agent::prompt::ReviewProgress;
     use dekopon_shell::CapabilityCallResult;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let refreshed = Arc::new(AtomicBool::new(false));
-    let observer = crate::wake::ReviewSubscriptions::Refresh {
-        target: PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
-            .unwrap()
-            .unwrap()
-            .targets
-            .remove(0),
-        refreshed: Arc::clone(&refreshed),
-    };
+    let review_target = PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
+        .unwrap()
+        .unwrap()
+        .targets
+        .remove(0);
     let target = json!({"owner":"acme","repo":"widget","number":17});
     for (capability, input, outcome) in [
         (
@@ -503,22 +499,44 @@ fn only_a_successful_review_of_the_subscribed_target_confirms_a_refresh() {
             CapabilityCallResult::Succeeded,
         ),
     ] {
+        let progress = Arc::new(ReviewProgress::default());
+        let observer = crate::wake::ReviewSubscriptions::Refresh {
+            target: review_target.clone(),
+            progress: Arc::clone(&progress),
+        };
         assert_eq!(
             observer.reviewed(capability, &input, outcome.clone()),
             outcome
         );
-        assert!(!refreshed.load(Ordering::Acquire));
+        assert!(!progress.permits_decline(1));
+        observer.reviewed(
+            "gh.pull-request.comment",
+            &target,
+            CapabilityCallResult::Succeeded,
+        );
+        assert!(!progress.permits_decline(1));
+        assert!(!progress.permits_decline(2));
     }
     for outcome in [
         CapabilityCallResult::Succeeded,
         CapabilityCallResult::SucceededWithStderr("notice".into()),
     ] {
-        refreshed.store(false, Ordering::Release);
+        let progress = Arc::new(ReviewProgress::default());
+        let observer = crate::wake::ReviewSubscriptions::Refresh {
+            target: review_target.clone(),
+            progress: Arc::clone(&progress),
+        };
         assert_eq!(
             observer.reviewed("gh.pull-request.comment", &target, outcome.clone()),
             outcome
         );
-        assert!(refreshed.load(Ordering::Acquire));
+        assert!(progress.permits_decline(1));
+        observer.reviewed(
+            "gh.pull-request.comment",
+            &target,
+            CapabilityCallResult::Succeeded,
+        );
+        assert!(progress.permits_decline(2));
     }
 }
 
