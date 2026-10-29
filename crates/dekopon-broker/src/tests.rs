@@ -1881,3 +1881,322 @@ fn terminal_redirect_refusal_keeps_its_safe_label_detail_and_exit_three() {
         ))
     );
 }
+
+fn valid_memory_config() -> ChatMemoryConfig {
+    ChatMemoryConfig {
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        enabled_agents: vec!["reviewer".parse().expect("agent")],
+        max_lookback_turns: 200,
+        max_recent_turns: 20,
+        max_search_results: 20,
+        max_query_bytes: 256,
+        max_result_bytes: 65_536,
+        max_turn_bytes: 32_768,
+        compaction_target_bytes: 8_388_608,
+        compaction_threshold_bytes: 12_582_912,
+    }
+}
+
+#[test]
+fn chat_memory_config_refuses_each_invalid_limit() {
+    use super::BrokerBuildError;
+    use dekopon_storage_host::StorageLimits;
+
+    let storage = StorageLimits::default();
+    let valid = valid_memory_config();
+    valid.validate(&storage).expect("the baseline is valid");
+    let mut wide_query = valid.clone();
+    wide_query.max_query_bytes = 100_000;
+    wide_query
+        .validate(&storage)
+        .expect("a query below the ceiling is valid");
+
+    type Break = fn(&mut ChatMemoryConfig, &mut StorageLimits);
+    let breaks: &[(&str, Break)] = &[
+        ("no enabled agent", |c, _| c.enabled_agents.clear()),
+        ("duplicate agents", |c, _| {
+            c.enabled_agents = vec!["reviewer".parse().unwrap(); 2];
+        }),
+        ("zero lookback", |c, _| c.max_lookback_turns = 0),
+        ("zero recent", |c, _| c.max_recent_turns = 0),
+        ("zero search results", |c, _| c.max_search_results = 0),
+        ("zero query", |c, _| c.max_query_bytes = 0),
+        ("zero result", |c, _| c.max_result_bytes = 0),
+        ("zero turn", |c, _| c.max_turn_bytes = 0),
+        ("zero target", |c, _| c.compaction_target_bytes = 0),
+        ("zero threshold", |c, _| c.compaction_threshold_bytes = 0),
+        ("recent beyond lookback", |c, _| c.max_recent_turns = 201),
+        ("search beyond lookback", |c, _| c.max_search_results = 201),
+        ("target above threshold", |c, _| {
+            c.compaction_target_bytes = c.compaction_threshold_bytes + 1;
+        }),
+        ("threshold above the file ceiling", |c, s| {
+            c.compaction_threshold_bytes = s.max_file_bytes + 1;
+        }),
+        ("turn below one line", |c, _| c.max_turn_bytes = 240),
+        ("result below an empty history", |c, _| {
+            c.max_result_bytes = 29
+        }),
+        ("lookback that cannot fit the target", |c, _| {
+            c.max_lookback_turns = 1_000;
+            c.max_recent_turns = 1;
+            c.max_search_results = 1;
+        }),
+        ("read chunk above the call limit", |_, s| {
+            s.max_read_bytes_per_call = 256 * 1024 - 1;
+        }),
+        ("turn above the write call limit", |c, s| {
+            s.max_write_bytes_per_call = c.max_turn_bytes - 1;
+        }),
+        ("target above the write call limit", |c, s| {
+            s.max_write_bytes_per_call = c.compaction_target_bytes - 1;
+        }),
+        ("threshold with append above the file ceiling", |c, s| {
+            s.max_file_bytes = c.compaction_threshold_bytes + c.max_turn_bytes - 1;
+        }),
+        ("read budget above the invocation limit", |_, s| {
+            s.max_read_bytes_per_invocation = 0;
+        }),
+        ("write budget above the invocation limit", |_, s| {
+            s.max_write_bytes_per_invocation = 0;
+        }),
+        ("host calls above the invocation limit", |_, s| {
+            s.max_host_calls_per_invocation = 0;
+        }),
+        ("no file slot", |_, s| s.max_files_per_namespace = 0),
+        ("namespace too small for the headroom", |c, s| {
+            s.max_namespace_bytes = c.compaction_threshold_bytes + c.max_turn_bytes;
+        }),
+        ("query above 256 KiB", |c, _| {
+            c.max_query_bytes = 256 * 1024 + 1
+        }),
+        ("result above 1 MiB", |c, _| {
+            c.max_result_bytes = 1024 * 1024 + 1
+        }),
+    ];
+    for (name, apply) in breaks {
+        let (mut config, mut limits) = (valid.clone(), storage.clone());
+        apply(&mut config, &mut limits);
+        assert!(
+            matches!(
+                config.validate(&limits),
+                Err(BrokerBuildError::InvalidChatMemory)
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn chat_memory_is_enabled_only_for_its_listed_agents() {
+    let config = valid_memory_config();
+    assert!(config.enabled_for(&"reviewer".parse().expect("agent")));
+    assert!(!config.enabled_for(&"stranger".parse().expect("agent")));
+}
+
+#[test]
+fn round_up_rounds_a_value_to_the_next_multiple() {
+    assert_eq!(super::round_up(300_000, 262_144).unwrap(), 524_288);
+    assert_eq!(super::round_up(262_144, 262_144).unwrap(), 262_144);
+}
+
+#[test]
+fn capability_routes_have_distinct_stable_names() {
+    let names: std::collections::BTreeSet<_> = [
+        CapabilityRoute::Generic,
+        CapabilityRoute::ChatMemoryRecord,
+        CapabilityRoute::ChatMemoryRecent,
+        CapabilityRoute::ChatMemorySearch,
+    ]
+    .map(CapabilityRoute::as_str)
+    .into();
+    assert_eq!(names.len(), 4);
+    assert!(!names.contains(""));
+    assert!(!names.contains("xyzzy"));
+}
+
+#[test]
+fn credential_refresh_errors_have_distinct_categories() {
+    use super::CredentialRefreshError;
+
+    assert_eq!(
+        CredentialRefreshError::ReauthorizationRequired.category(),
+        "reauthorization-required"
+    );
+    assert_eq!(
+        CredentialRefreshError::Unavailable {
+            category: "timeout"
+        }
+        .category(),
+        "timeout"
+    );
+}
+
+#[test]
+fn a_default_secret_use_field_deserializes_to_some() {
+    let set = |extra: serde_json::Value| {
+        let mut value = serde_json::to_value(storage_set(
+            "storage-probe",
+            StorageInterface::DurableFiles,
+            StorageAccess::ReadOnly,
+            StorageScope::Agent,
+            dekopon_capability::StorageRetention::Keep,
+            None,
+        ))
+        .expect("constraint set serializes");
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<ConstraintSet>(value).expect("constraint set")
+    };
+    assert_eq!(set(serde_json::json!({})).default_secret_use, None);
+    let secret = set(serde_json::json!({
+        "defaultSecretUse": {"drn": "drn:com.xrl:secret:prod:api/token", "sink": "httpBearer"}
+    }));
+    assert_eq!(
+        secret
+            .default_secret_use
+            .expect("a present field decodes")
+            .drn
+            .as_str(),
+        "drn:com.xrl:secret:prod:api/token"
+    );
+}
+
+fn two_probe_sets() -> ConstraintCatalog {
+    use dekopon_capability::StorageRetention;
+
+    let set = |namespace: Option<&str>| {
+        storage_set(
+            "storage-probe",
+            StorageInterface::DurableFiles,
+            StorageAccess::ReadOnly,
+            StorageScope::Agent,
+            StorageRetention::Keep,
+            namespace,
+        )
+    };
+    ConstraintCatalog::new([
+        ("probe.one".parse().unwrap(), set(None)),
+        ("probe.two".parse().unwrap(), set(None)),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn a_constraint_catalog_reports_its_length() {
+    let catalog = two_probe_sets();
+    assert_eq!(catalog.len(), 2);
+    assert!(!catalog.is_empty());
+    assert_eq!(ConstraintCatalog::empty().len(), 0);
+    assert!(ConstraintCatalog::empty().is_empty());
+}
+
+#[tokio::test]
+async fn a_catalog_over_the_constraint_set_ceiling_is_refused() {
+    use super::{BrokerBuildError, CredentialStore};
+
+    let registry = dekopon_broker_host::BrokerProviderRegistry::load(
+        [dekopon_test_support::provider_fixture(
+            "cli-probe-provider.wasm",
+        )],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("a real component loads");
+    let error = two_probe_sets()
+        .validate(&registry, &CredentialStore::empty(), 1)
+        .expect_err("two sets exceed a ceiling of one");
+    assert!(matches!(
+        error,
+        BrokerBuildError::TooManyConstraintSets {
+            count: 2,
+            maximum: 1
+        }
+    ));
+}
+
+#[test]
+fn an_idle_ttl_beyond_u64_millis_is_refused() {
+    use super::BrokerBuildError;
+    use dekopon_capability::StorageRetention;
+
+    let catalog = ConstraintCatalog::new([(
+        "probe.vfs".parse().unwrap(),
+        storage_set(
+            "storage-probe",
+            StorageInterface::DurableFiles,
+            StorageAccess::ReadOnly,
+            StorageScope::Agent,
+            StorageRetention::IdleTtl(std::time::Duration::MAX),
+            None,
+        ),
+    )])
+    .unwrap();
+    assert!(matches!(
+        catalog.retention_policies(),
+        Err(BrokerBuildError::InvalidStorageRetention)
+    ));
+}
+
+#[test]
+fn a_chat_route_needs_each_storage_attribute_to_match() {
+    use super::{BrokerBuildError, RouteConflict};
+    use dekopon_capability::StorageRetention;
+
+    let route_set = |interface, scope, access| ConstraintSet {
+        route: CapabilityRoute::ChatMemoryRecord,
+        ..storage_set(
+            "memory",
+            interface,
+            access,
+            scope,
+            StorageRetention::Keep,
+            None,
+        )
+    };
+    let catalog = |set| ConstraintCatalog::new([("memory.record".parse().unwrap(), set)]).unwrap();
+    catalog(route_set(
+        StorageInterface::Jsonl,
+        StorageScope::PrivateConversation,
+        StorageAccess::ReadWrite,
+    ))
+    .validate_routes()
+    .expect("a fully matching chat route");
+    for (what, set) in [
+        (
+            "interface",
+            route_set(
+                StorageInterface::DurableFiles,
+                StorageScope::PrivateConversation,
+                StorageAccess::ReadWrite,
+            ),
+        ),
+        (
+            "scope",
+            route_set(
+                StorageInterface::Jsonl,
+                StorageScope::Agent,
+                StorageAccess::ReadWrite,
+            ),
+        ),
+        (
+            "access",
+            route_set(
+                StorageInterface::Jsonl,
+                StorageScope::PrivateConversation,
+                StorageAccess::ReadOnly,
+            ),
+        ),
+    ] {
+        assert!(
+            matches!(
+                catalog(set).validate_routes(),
+                Err(BrokerBuildError::ConflictingRoutes { conflicts })
+                    if matches!(conflicts.as_slice(), [RouteConflict::MissingChatStorage { .. }])
+            ),
+            "{what}"
+        );
+    }
+}
