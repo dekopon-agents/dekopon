@@ -1,0 +1,6 @@
+crates/dekopon-broker/src/lib.rs:1187:54: replace > with >= in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:2041:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2040:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2039:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2231:33: delete field errors_present from struct PolicyDecision expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2232:33: delete field refusal from struct PolicyDecision expression in Broker<A>::evaluate
