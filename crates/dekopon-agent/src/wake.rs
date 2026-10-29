@@ -59,7 +59,7 @@ pub enum WakeRefusal {
     DigestExists,
     #[error("this agent already has {maximum} PR subscriptions; cancel one first")]
     SubscriptionsFull { maximum: usize },
-    #[error("space wakes require an authorized mapped channel")]
+    #[error("space wakes require an authorized participant in a mapped channel")]
     MappedChannelRequired,
     #[error("the note is longer than {maximum} bytes")]
     NoteTooLong { maximum: usize },

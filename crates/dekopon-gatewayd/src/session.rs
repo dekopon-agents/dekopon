@@ -2739,7 +2739,7 @@ async fn session_turn(
         ));
     }
     drop(sink);
-    let space_access = leg.space_grants().is_some();
+    let space_access = leg.space_grants().is_some() && !is_space_wake;
     let review_progress = message
         .message_id
         .wake_origin()

@@ -939,12 +939,11 @@ impl Line {
             {
                 return None;
             }
-            if let WakeKind::Watch { probe, every, .. } = &wake.kind {
-                if every.is_zero()
-                    || (probe.purpose == WatchPurpose::Digest && *every < Probe::DIGEST_INTERVAL)
-                {
-                    return None;
-                }
+            if let WakeKind::Watch { probe, every, .. } = &wake.kind
+                && (every.is_zero()
+                    || (probe.purpose == WatchPurpose::Digest && *every < Probe::DIGEST_INTERVAL))
+            {
+                return None;
             }
         }
         Some(wake)

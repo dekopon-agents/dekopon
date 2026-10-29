@@ -223,33 +223,49 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ordinary_channel_schedules_and_watches_also_fire_as_the_space_but_keep_single_shot_lifecycle()
- {
+async fn channel_schedule_and_watch_wakes_run_as_space_while_dm_wakes_remain_personal() {
     let audit = Audit::exclusive().await;
     let script = "probe upper --text waiting | jq -r .text";
-    for action in ["schedule", "watch"] {
+    for (action, container) in [
+        ("schedule", "cteam"),
+        ("watch", "cteam"),
+        ("schedule", "dalice"),
+        ("watch", "dalice"),
+    ] {
         let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
-        let fixture = boot_digests(
-            &chat,
-            temporary(),
-            vec![
-                meta("create", "wake", request(action, script)),
-                final_answer("Set."),
-            ],
-            vec![],
-            None,
-        )
-        .await;
+        let before = audit
+            .capture
+            .events_where(
+                "dekopon_broker",
+                &[
+                    ("capability.id", "cli-probe.upper"),
+                    ("turn.started_by", "wake"),
+                    ("principal", "alice"),
+                ],
+            )
+            .len();
+        let mut responses = vec![meta("create", "wake", request(action, script))];
+        if container == "dalice" {
+            responses.push(meta("personal-list", "wake", json!({"action":"list"})));
+        }
+        responses.push(final_answer("Set."));
+        let fixture = boot_digests(&chat, temporary(), responses, vec![], None).await;
         let root = chat
             .server("acme")
             .user("ualice")
-            .post("cteam", "<@udekopon> remind this channel")
+            .post(container, "<@udekopon> remind this conversation")
             .await
             .unwrap();
         assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
         let mut rows = stored(&fixture);
-        assert_eq!(rows[0]["run_as"], "space");
-        assert_eq!(rows[0]["subject"], "fauxlack.acme.cteam");
+        if container == "cteam" {
+            assert_eq!(rows[0]["run_as"], "space");
+            assert_eq!(rows[0]["subject"], "fauxlack.acme.cteam");
+        } else {
+            assert!(rows[0].get("run_as").is_none());
+            assert_eq!(rows[0]["subject"], "fauxlack.acme.ualice");
+            assert!(fixture.tool_result("personal-list").contains("wake 1:"));
+        }
         let directory = fixture.shutdown().await;
         due(&mut rows[0]);
         let fixture = boot_digests(
@@ -267,7 +283,24 @@ async fn ordinary_channel_schedules_and_watches_also_fire_as_the_space_but_keep_
             root.thread().next_from("udekopon", WAIT).await.text,
             "Fresh."
         );
-        assert_space_read(&audit, "cli-probe.upper", "wake", root.id());
+        if container == "cteam" {
+            assert_space_read(&audit, "cli-probe.upper", "wake", root.id());
+        } else {
+            let decisions = audit.capture.events_where(
+                "dekopon_broker",
+                &[
+                    ("capability.id", "cli-probe.upper"),
+                    ("turn.started_by", "wake"),
+                    ("principal", "alice"),
+                ],
+            );
+            assert_eq!(decisions.len(), before + 1);
+            assert_eq!(
+                decisions.last().unwrap().field("principal.kind"),
+                Some("person")
+            );
+            assert_eq!(decisions.last().unwrap().field("space.id"), None);
+        }
         assert!(
             stored(&fixture).is_empty(),
             "ordinary watches retire on fire"
@@ -531,5 +564,63 @@ async fn a_digest_can_decline_after_real_read_work_without_any_chat_post() {
     assert_space_read(&audit, "cli-probe.upper", "wake", root.id());
     assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unattended_digest_cannot_cancel_itself_and_renew_its_fixed_horizon() {
+    let audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let call = request("digest", "probe upper --text waiting | jq -r .text");
+    let fixture = boot_digests(
+        &chat,
+        temporary(),
+        vec![meta("create", "wake", call.clone()), final_answer("Set.")],
+        vec![],
+        None,
+    )
+    .await;
+    let root = chat
+        .server("acme")
+        .user("ualice")
+        .post("cteam", "<@udekopon> daily digest")
+        .await
+        .unwrap();
+    assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
+    let mut rows = stored(&fixture);
+    let expiry = rows[0]["watch"]["untilMs"].clone();
+    let directory = fixture.shutdown().await;
+    due(&mut rows[0]);
+    let fixture = boot_digests(
+        &chat,
+        directory,
+        vec![
+            meta("cancel-self", "wake", json!({"action":"cancel", "id":1})),
+            meta("renew-self", "wake", call),
+            final_answer("The horizon remains fixed."),
+        ],
+        rows,
+        None,
+    )
+    .await;
+    assert_eq!(
+        root.thread().next_from("udekopon", WAIT).await.text,
+        "The horizon remains fixed."
+    );
+    let rows = stored(&fixture);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["watch"]["untilMs"], expiry);
+    for reason in ["not-found", "mapped-channel-required"] {
+        assert_eq!(
+            audit
+                .capture
+                .events_where(
+                    "dekopon_agent",
+                    &[("audit.event", "agent.wake.refused"), ("reason", reason)]
+                )
+                .len(),
+            1
+        );
+    }
     fixture.shutdown().await;
 }

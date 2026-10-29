@@ -595,6 +595,10 @@ impl WakeRegistrar for SessionWakes {
         self.store.cancel_subscription(&self.space_anchor()?, id)
     }
     fn schedule(&self, request: WakeRequest) -> Result<WakeSummary, WakeRefusal> {
+        if !self.space_access && self.anchor.subject().kind() == dekopon_core::PrincipalKind::Space
+        {
+            return Err(WakeRefusal::MappedChannelRequired);
+        }
         let now = SystemTime::now();
         let anchor = if self.space_access {
             self.space_anchor()?
