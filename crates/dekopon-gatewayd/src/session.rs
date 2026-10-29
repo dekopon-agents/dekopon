@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -1821,7 +1821,8 @@ async fn execute(
             );
             let can_reply = match &message.message_id {
                 MessageId::Github(_) | MessageId::Follow(_) => false,
-                MessageId::Native(_) | MessageId::Wake { .. } | MessageId::Job { .. } => true,
+                MessageId::Wake { .. } => !crate::wake::space_wake(&message),
+                MessageId::Native(_) | MessageId::Job { .. } => true,
             };
             if can_reply
                 && notice.is_none()
@@ -2227,7 +2228,7 @@ async fn session_turn(
                     UNAUTHORIZED_REPLY.to_owned()
                 }
             };
-            if !is_follow && !quiet && answer(driver, message, &reply).await {
+            if !is_follow && !is_subscription && !quiet && answer(driver, message, &reply).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2241,7 +2242,7 @@ async fn session_turn(
                 reason = "attestation-refused",
                 "gateway.session.rejected"
             );
-            if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
+            if !is_follow && !is_subscription && answer(driver, message, UNAUTHORIZED_REPLY).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2253,7 +2254,7 @@ async fn session_turn(
                 error = %error,
                 "gateway.session.failed"
             );
-            if !is_follow && answer(driver, message, FAILURE_REPLY).await {
+            if !is_follow && !is_subscription && answer(driver, message, FAILURE_REPLY).await {
                 reply_delivered(MessageOutcome::Failed);
             }
             return MessageOutcome::Failed.into();
@@ -2328,7 +2329,7 @@ async fn session_turn(
         let reply = leg
             .principal()
             .map_or_else(|| UNAUTHORIZED_REPLY.to_owned(), permission_reply);
-        if !is_follow && answer(driver, message, &reply).await {
+        if !is_follow && !is_subscription && answer(driver, message, &reply).await {
             reply_delivered(MessageOutcome::Unauthorized);
         }
         return MessageOutcome::Unauthorized.into();
@@ -2735,15 +2736,28 @@ async fn session_turn(
     }
     drop(sink);
     let space_access = leg.space_grants().is_some() && !is_subscription;
-    let subscriptions = if route.wakes && space_access {
+    let review_refreshed = is_subscription.then(|| Arc::new(AtomicBool::new(false)));
+    let subscriptions = if let (
+        Some(refreshed),
+        MessageId::Wake {
+            subscription: Some(target),
+            ..
+        },
+    ) = (&review_refreshed, &message.message_id)
+    {
+        Some(crate::wake::ReviewSubscriptions::Refresh {
+            target: target.clone(),
+            refreshed: Arc::clone(refreshed),
+        })
+    } else if route.wakes && space_access {
         message
             .pull_request_links
             .as_ref()
             .zip(runner.wakes.as_ref())
             .zip(Anchor::from_inbound(message, &route.agent).and_then(|anchor| anchor.as_space()))
             .map(
-                |((links, store), anchor)| crate::wake::ReviewSubscriptions {
-                    anchor,
+                |((links, store), anchor)| crate::wake::ReviewSubscriptions::Subscribe {
+                    anchor: Box::new(anchor),
                     store: Arc::clone(store),
                     links: links.clone(),
                 },
@@ -3065,8 +3079,8 @@ async fn session_turn(
             if progress_notes {
                 inputs = inputs.with_progress_notes();
             }
-            if is_subscription {
-                inputs = inputs.with_quiet_review();
+            if let Some(refreshed) = review_refreshed.as_deref() {
+                inputs = inputs.with_quiet_review(refreshed);
             } else if reply_optional {
                 inputs = inputs.with_optional_reply();
             }
@@ -3268,7 +3282,7 @@ async fn session_turn(
                 "gateway.session.failed"
             );
             (
-                if is_follow {
+                if is_follow || is_subscription {
                     Terminal::Answered(OutboundReply::text(UNREPORTED_WORK_REPLY.to_owned()))
                 } else {
                     Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned())
@@ -3466,6 +3480,7 @@ async fn reject_sealed_thread(
                 "gateway.session.rejected"
             );
             if !matches!(message.message_id, MessageId::Follow(_))
+                && !crate::wake::space_wake(message)
                 && !message
                     .thread_continuation
                     .as_ref()

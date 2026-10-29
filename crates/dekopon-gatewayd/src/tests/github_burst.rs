@@ -55,9 +55,18 @@ struct Fixture {
     broker: BrokerFixture,
     transport: GithubTransport,
     gateway: Gateway,
+    gate: crate::session::SessionGate,
 }
 
 async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
+    fixture_with_subscriptions(models, maximum, &[]).await
+}
+
+async fn fixture_with_subscriptions(
+    models: Arc<dyn ModelFactory>,
+    maximum: usize,
+    anchors: &[InboundMessage],
+) -> Fixture {
     let directory = temporary();
     fs::write(
         directory.path().join("dekopon.yaml"),
@@ -79,6 +88,11 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
         "check_run",
         "push"
     ]);
+    if !anchors.is_empty() {
+        doc["sessions"]["wakes"] = json!({"path":directory.path().join("wakes/wakes.jsonl")});
+        doc["transports"].as_array_mut().unwrap().push(json!({"name":"scientist-slack","kind":"slackSocketMode","appTokenEnv":"APP","botTokenEnv":"BOT"}));
+        doc["routes"].as_array_mut().unwrap().push(json!({"transport":"scientist-slack","agent":"reviewer","conversation":{"kind":["thread"]},"memory":{"mode":"oneShot"},"wakes":true}));
+    }
     let config = resolved(directory.path(), &doc).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let broker = BrokerFixture::scripted(directory.path(), |_, _| {
@@ -102,6 +116,32 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
         models,
         maximum,
     );
+    let mut runner = Arc::into_inner(runner).expect("sole runner owner");
+    if !anchors.is_empty() {
+        let store = wakes::wake_store(directory.path());
+        let target = crate::pull_request_links::PullRequestLinkContext::parse(
+            "https://github.com/owner/repo/pull/7",
+        )
+        .unwrap()
+        .unwrap()
+        .targets
+        .remove(0);
+        for message in anchors {
+            store
+                .subscribe(
+                    crate::wake::Anchor::from_inbound(message, &"reviewer".parse().unwrap())
+                        .unwrap()
+                        .as_space()
+                        .unwrap(),
+                    target.clone(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+        runner.wakes = Some(store);
+    }
+    let runner = Arc::new(runner);
+    let gate = runner.gate.clone();
     let generation = CurrentGeneration::boot(routes, Arc::default());
     let transport = GithubTransport::new(
         "github".into(),
@@ -110,17 +150,20 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
         generation.clone(),
         None,
     );
-    let gateway = Gateway::serving(
-        runner,
-        generation,
-        Arc::default(),
-        Arc::new(BTreeMap::from([("github".into(), transport.driver())])),
-    );
+    let mut drivers = BTreeMap::from([("github".into(), transport.driver())]);
+    if !anchors.is_empty() {
+        drivers.insert(
+            "scientist-slack".into(),
+            Arc::new(RecordingDriver::default()),
+        );
+    }
+    let gateway = Gateway::serving(runner, generation, Arc::default(), Arc::new(drivers));
     Fixture {
         _directory: directory,
         broker,
         transport,
         gateway,
+        gate,
     }
 }
 
@@ -751,4 +794,152 @@ async fn wake_reason_returns_the_batch_the_claim_carries() {
         .join("\n");
     assert!(note.find("delivery first.").unwrap() < note.find("delivery second.").unwrap());
     assert!(note.ends_with("Read current state through a broker-granted capability before acting. Call wake_reason for every fact."));
+}
+
+#[tokio::test]
+async fn a_full_anchored_mailbox_returns_503_and_leaves_the_subscription_guid_retryable() {
+    use crate::{
+        collection::Dispositions,
+        session::{Admit, MAILBOX_CAPACITY},
+    };
+    let first = owned_slack_message("first anchor", false);
+    let mut second = owned_slack_message("second anchor", false);
+    second.conversation.thread = Some("1700000001.000001".into());
+    second.reply = ReplyTarget::Slack {
+        channel: second.conversation.id.clone(),
+        thread_ts: second.conversation.thread.clone(),
+    };
+    let anchors = [first, second];
+    let models = ModelScript::new([decline_reply(), decline_reply()]);
+    let mut fixture = fixture_with_subscriptions(Arc::new(Arc::clone(&models)), 4, &anchors).await;
+    let mut bound = route(model_config());
+    bound.transport = "scientist-slack".into();
+    bound.wakes = true;
+    let mut held = Vec::new();
+    for anchor in &anchors {
+        let mut message = owned_slack_message("held", false);
+        message.conversation = anchor.conversation.clone();
+        message.reply = anchor.reply.clone();
+        let Admit::Admitted(admission, ..) =
+            fixture
+                .gate
+                .admit(&bound, message, Dispositions(Vec::new()))
+        else {
+            panic!("anchor admitted")
+        };
+        held.push(admission);
+    }
+    for _ in 0..MAILBOX_CAPACITY {
+        assert!(matches!(
+            fixture.gate.admit(
+                &bound,
+                owned_slack_message("queued", false),
+                Dispositions(Vec::new())
+            ),
+            Admit::Steered(_)
+        ));
+    }
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut push = body("pull_request", 7, 1);
+    push["action"] = json!("synchronize");
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "anchored-full",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    drop(held);
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "anchored-full",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 2);
+    assert_eq!(
+        fixture
+            .transport
+            .request_for_test(signed(
+                &serde_json::to_vec(&push).unwrap(),
+                b"secret",
+                "anchored-full",
+                "pull_request"
+            ))
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert!(fixture.transport.try_delivery_for_test().is_err());
+}
+
+#[tokio::test]
+async fn a_subscription_without_an_anchor_driver_is_ignored_and_commits_its_guid() {
+    let models = ModelScript::new([]);
+    let mut fixture = fixture_with_subscriptions(
+        Arc::new(Arc::clone(&models)),
+        4,
+        &[owned_slack_message("anchor", false)],
+    )
+    .await;
+    fixture.gateway = Gateway::serving(
+        Arc::clone(fixture.gateway.runner_for_test()),
+        CurrentGeneration::boot(
+            Arc::clone(&fixture.gateway.generation_for_test().routes),
+            Arc::default(),
+        ),
+        Arc::default(),
+        Arc::new(BTreeMap::from([(
+            "github".into(),
+            fixture.transport.driver(),
+        )])),
+    );
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut push = body("pull_request", 7, 1);
+    push["action"] = json!("synchronize");
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "no-anchor-driver",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    assert_eq!(
+        fixture
+            .transport
+            .request_for_test(signed(
+                &serde_json::to_vec(&push).unwrap(),
+                b"secret",
+                "no-anchor-driver",
+                "pull_request"
+            ))
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert!(fixture.transport.try_delivery_for_test().is_err());
 }

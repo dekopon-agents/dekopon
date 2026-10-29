@@ -1598,8 +1598,10 @@ The next distinct subscription above the limit is refused; pushes do not extend 
 A later routed `pull_request.synchronize` delivery fires only when its repository subject is
 mapped by the broker and falls inside the GitHub route's `ids`. The wake resumes the anchored
 thread as the space alone, reads the current head, and refreshes its head-pinned COMMENT review.
-The model replies to Slack only when blocking findings changed; otherwise it may select
-`decline_chat_reply` after the review, producing no chat post or progress message.
+After a successful review refresh, the model replies to Slack only when blocking findings
+changed; otherwise it may select `decline_chat_reply`, producing no chat post or progress message.
+Capability work without a confirmed refresh of the subscribed PR requires a visible Slack report,
+or the fixed audit-before-retry warning when no reporting turn remains.
 Unmatched deliveries retain their ordinary repository-session handling.
 
 PR close, including merge, expiry and cancellation remove the subscription. From any mapped

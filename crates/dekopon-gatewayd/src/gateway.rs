@@ -953,18 +953,26 @@ impl Gateway {
                     run_routed_delivery(runner, active, drivers, message, Some(ticket)).await;
                     return;
                 }
-                ticket.answer(transport::github::Acked::Queued);
-                for fired in delivery.fired {
-                    let agent = fired.agent().clone();
-                    let wake = fired.into_inbound();
-                    dekopon_telemetry::link_span(&wake.receive_span, &receipt);
-                    let generation = active.load_full();
-                    if !generation.routes.route(&wake).is_some_and(|route| route.wakes && route.agent == agent) {
-                        session::record_admission(&wake, "ignored", 0, Some("subscription-route-lost"));
-                        continue;
+                let (tickets, answer) = ticket.split(delivery.fired.len());
+                let wakes = delivery.fired.into_iter().zip(tickets).map(|(fired, ticket)| {
+                    let runner = Arc::clone(&runner);
+                    let active = Arc::clone(&active);
+                    let drivers = Arc::clone(&drivers);
+                    let receipt = &receipt;
+                    async move {
+                        let agent = fired.agent().clone();
+                        let wake = fired.into_inbound();
+                        dekopon_telemetry::link_span(&wake.receive_span, receipt);
+                        let generation = active.load_full();
+                        if !generation.routes.route(&wake).is_some_and(|route| route.wakes && route.agent == agent) {
+                            session::record_admission(&wake, "ignored", 0, Some("subscription-route-lost"));
+                            ticket.answer(transport::github::Acked::Ignored);
+                            return;
+                        }
+                        run_routed_delivery(runner, active, drivers, wake, Some(ticket)).await;
                     }
-                    run_routed_delivery(Arc::clone(&runner), Arc::clone(&active), Arc::clone(&drivers), wake, None).await;
-                }
+                });
+                tokio::join!(answer, futures_util::future::join_all(wakes));
             }.instrument(span));
             return;
         }
@@ -1082,10 +1090,16 @@ async fn run_routed_delivery(
     let generation = active.load_full();
     let Some(route) = generation.routes.route(&message).cloned() else {
         session::record_admission(&message, "ignored", 0, Some("route-lost"));
+        if let Some(ticket) = ticket {
+            ticket.answer(transport::github::Acked::Ignored);
+        }
         return;
     };
     let Some(driver) = drivers.get(&message.transport).cloned() else {
         session::record_admission(&message, "ignored", 0, Some("no-driver"));
+        if let Some(ticket) = ticket {
+            ticket.answer(transport::github::Acked::Ignored);
+        }
         return;
     };
     let agent = route.agent.clone();

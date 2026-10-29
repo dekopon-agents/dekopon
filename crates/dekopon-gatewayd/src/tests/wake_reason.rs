@@ -80,6 +80,7 @@ async fn wake_reason_never_names_a_subject_or_conversation() {
     follow.message_id = MessageId::Wake {
         id: WakeId(42),
         notice: "scheduled".into(),
+        subscription: None,
     };
     run_session(runner, route, follow, driver).await;
     assert_eq!(
@@ -104,6 +105,7 @@ async fn wake_reason_is_offered_on_every_gateway_session() {
             MessageId::Wake {
                 id: WakeId(42),
                 notice: "scheduled".into(),
+                subscription: None,
             },
             MessageId::Job {
                 id: JobId::new(9),

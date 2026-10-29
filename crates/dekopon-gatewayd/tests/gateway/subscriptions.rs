@@ -429,3 +429,43 @@ async fn another_mapped_participant_can_list_and_cancel_channel_subscriptions_bu
     assert!(stored(&fixture).is_empty());
     fixture.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_wake_reports_non_review_capability_work_in_its_anchored_thread() {
+    let audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let root = chat
+        .server("acme")
+        .user("ualice")
+        .post("cteam", "Review anchor")
+        .await
+        .unwrap();
+    let settings = Settings::new(vec![subscription(root.id(), "acme/widget", 1)], None);
+    let address = settings.address;
+    let fixture = boot_subscriptions(
+        &chat,
+        vec![
+            bash_tool_call("work", "probe upper --text inspected"),
+            meta("quiet", "decline_chat_reply", json!({})),
+            final_answer("I inspected the PR but could not refresh its review."),
+        ],
+        settings,
+    )
+    .await;
+    deliver(address, "widget", "synchronize", "unreported-work").await;
+    assert_eq!(
+        root.thread().next_from("udekopon", WAIT).await.text,
+        "I inspected the PR but could not refresh its review."
+    );
+    let executions = audit.capture.events_where(
+        "dekopon_broker",
+        &[
+            ("audit.event", "broker.execution"),
+            ("capability.id", "cli-probe.upper"),
+        ],
+    );
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].field("outcome"), Some("Succeeded"));
+    assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
+    fixture.shutdown().await;
+}
