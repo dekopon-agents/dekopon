@@ -7,6 +7,26 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.71.0] - 2026-10-29
+
+### Added
+
+- Cedar policies read context.github, the typed facts of every GitHub webhook family; author-set facts can only deny.
+
+### Changed
+
+- Gateway turns, jobs, wake checks and memory summaries share the shell thread budget; the gateway blocking-thread default is 8.
+
+### Fixed
+
+- awk printf %d and %i print nan and inf as nan and inf, without zero padding
+
+## [dekopon-chart-0.58.0] - 2026-10-29
+
+### Changed
+
+- Chart 0.58.0 targets core v0.71.0 and renders the `v0.71.0` image tag.
+
 ## [0.70.0] - 2026-10-28
 
 ### Added

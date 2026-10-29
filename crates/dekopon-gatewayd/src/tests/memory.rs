@@ -199,6 +199,8 @@ fn summarizing(
         Arc::new(ModelCache::new(Arc::new(
             crate::session::ConfiguredModels::default(),
         ))),
+        Arc::clone(&runner.thread_owner),
+        runner.shell_threads.clone(),
         &mut owned,
     );
     runner.summaries = Some(sender);
