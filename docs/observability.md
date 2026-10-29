@@ -1460,3 +1460,9 @@ Each `accounting.model.turn` outcome also carries numeric `asset.inventory.count
 listed attachments used this turn (fetches, provider inputs, or history image preparation).
 The store snapshots on asset eviction, refetch and failure records serve as its gauges; no rollup
 exporter is awaited. These records contain no attachment source, URL or platform identifier.
+
+Thread admission refusals use `gateway_wake_tick_skipped` with `reason = shell-threads` for a
+wake tick and `gateway_memory_summary_refused` for a summary; both include `limit.maximum`.
+A summary refused before execution leaves its queued journal slot eligible for restart recovery.
+`gateway_thread_failed` records an unconsumed native join failure with its `failure` category;
+`gateway_job_thread_failed` records an OS spawn failure with `error.kind` after job admission.

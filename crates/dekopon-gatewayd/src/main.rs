@@ -131,9 +131,7 @@ fn runtime_builder(cli: &Cli) -> Result<tokio::runtime::Builder, clap::Error> {
             }
         },
     };
-    let blocking = cli
-        .blocking_threads
-        .map_or(512, std::num::NonZeroUsize::get);
+    let blocking = cli.blocking_threads.map_or(8, std::num::NonZeroUsize::get);
     if workers > MAX_RUNTIME_THREADS || blocking > MAX_RUNTIME_THREADS {
         return Err(Cli::command().error(
             ErrorKind::ValueValidation,

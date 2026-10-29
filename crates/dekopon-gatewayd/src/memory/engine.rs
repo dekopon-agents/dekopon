@@ -49,6 +49,8 @@ pub(crate) struct Resources {
     pub current: CurrentGeneration,
     pub models: Arc<ModelCache>,
     pub counts: Arc<Counts>,
+    pub thread_owner: Arc<crate::threads::Owner>,
+    pub shell_threads: dekopon_process::ShellThreads,
 }
 
 #[derive(Default)]
@@ -61,6 +63,7 @@ pub(crate) struct Counts {
 #[derive(Clone)]
 pub(crate) struct Sender {
     queue: mpsc::Sender<Queued>,
+    cancel: watch::Sender<bool>,
     journal: Arc<Journal>,
     pub counts: Arc<Counts>,
 }
@@ -100,6 +103,7 @@ pub(crate) fn channel(
     let (tx, receiver) = mpsc::channel(queue.get());
     let sender = Sender {
         queue: tx,
+        cancel: watch::channel(false).0,
         journal,
         counts,
     };
@@ -116,12 +120,16 @@ impl Dispatcher {
         self,
         current: CurrentGeneration,
         models: Arc<ModelCache>,
+        thread_owner: Arc<crate::threads::Owner>,
+        shell_threads: dekopon_process::ShellThreads,
         owned_tasks: &mut JoinSet<()>,
     ) {
         let resources = Resources {
             journal: Arc::clone(&self.sender.journal),
             current,
             models,
+            thread_owner,
+            shell_threads,
             counts: Arc::clone(&self.sender.counts),
         };
         owned_tasks.spawn(dispatch(
@@ -146,11 +154,21 @@ pub(crate) fn spawn(
         queue,
         concurrency,
     );
-    dispatcher.start(resources.current, resources.models, owned_tasks);
+    dispatcher.start(
+        resources.current,
+        resources.models,
+        resources.thread_owner,
+        resources.shell_threads,
+        owned_tasks,
+    );
     sender
 }
 
 impl Sender {
+    pub(crate) fn stop(&self) {
+        self.cancel.send_replace(true);
+    }
+
     pub(crate) async fn enqueue(&self, task: SlotTask) {
         match self.queue.try_send(Queued {
             task,
@@ -197,11 +215,16 @@ async fn dispatch(
     sender: Sender,
     concurrency: NonZeroUsize,
 ) {
-    let cancel = CancelOnDrop(watch::channel(false).0);
+    let cancel = CancelOnDrop(sender.cancel.clone());
+    let mut stopped = cancel.0.subscribe();
     let mut running = JoinSet::new();
     let mut tasks: HashMap<Id, RunningTask> = HashMap::new();
     loop {
+        if *stopped.borrow() {
+            break;
+        }
         tokio::select! {
+            _ = stopped.changed() => break,
             result = running.join_next_with_id(), if !running.is_empty() => {
                 match result {
                     Some(Ok((id, next))) => {
@@ -263,17 +286,38 @@ async fn run(
     let task = queued.task;
     let blocking_span = span.clone();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
-    match tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&subscriber, || {
-            blocking_span.in_scope(|| summarize(&resources, &task, runtime, cancel, &binding))
+    let thread_owner = Arc::clone(&resources.thread_owner);
+    let threads = resources.shell_threads.clone();
+    let record = task.record;
+    let part = task.part;
+    match thread_owner
+        .run(&threads, crate::threads::Work::Memory, move || {
+            tracing::dispatcher::with_default(&subscriber, || {
+                blocking_span.in_scope(|| summarize(&resources, &task, runtime, cancel, &binding))
+            })
         })
-    })
-    .instrument(span)
-    .await
+        .instrument(span.clone())
+        .await
     {
         Ok(next) => next,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(_cancelled) => Next::Stop,
+        Err(crate::threads::Failure::Task(crate::session::TaskFailure::Panicked { cause })) => {
+            std::panic::resume_unwind(Box::new(cause))
+        }
+        Err(crate::threads::Failure::Task(crate::session::TaskFailure::Cancelled)) => Next::Stop,
+        Err(failure) => {
+            span.in_scope(|| {
+                tracing::warn!(
+                    event = "gateway_memory_summary_refused",
+                    memory.record.id = record.0.get(),
+                    memory.summary.part = part.get(),
+                    reason = failure.category(),
+                    limit.maximum = thread_owner.maximum,
+                    error = %failure,
+                    "gateway.memory.summary.refused"
+                )
+            });
+            Next::Stop
+        }
     }
 }
 

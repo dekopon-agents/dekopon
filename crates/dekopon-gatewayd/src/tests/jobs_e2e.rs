@@ -109,7 +109,7 @@ pub(super) fn runner_with_jobs(
 ) -> Arc<SessionRunner> {
     let mut runner = Arc::into_inner(runner(broker, models, max_concurrent))
         .expect("a fresh runner has one owner");
-    runner.jobs = Arc::new(Jobs::new(max_jobs));
+    runner.jobs = Arc::new(Jobs::new(max_jobs, Arc::clone(&runner.thread_owner)));
     Arc::new(runner)
 }
 
@@ -155,7 +155,7 @@ pub(super) fn job_triggers(
 async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
     let directory = temporary();
     let (broker, parked, server) = parked_nested_broker(directory.path()).await;
-    let jobs = Arc::new(Jobs::new(2));
+    let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let inbound = message("deadline");
     let owner = JobOwner::of(&inbound);
     let anchor =
@@ -165,8 +165,9 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
         ..dekopon_process::Limits::default()
     };
     let context = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor, broker, limits);
+    let threads = dekopon_process::ShellThreads::new(16, tokio::runtime::Handle::current());
     tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(limits, dekopon_test_support::shell_threads())
+        dekopon_shell::Interpreter::new(limits, threads)
             .run("probe upper &", &ProbeInvoker(context))
     })
     .await
@@ -192,6 +193,7 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
         .await
         .expect("broker released")
         .expect("broker completed");
+    jobs.thread_owner.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -887,7 +889,7 @@ async fn a_route_without_job_opt_in_drops_the_notice_once() {
 #[test]
 fn a_full_notice_channel_drops_once_without_blocking_job_completion() {
     let (capture, _guard) = capture_spans();
-    let jobs = Arc::new(Jobs::new(1));
+    let jobs = Arc::new(Jobs::new(1, crate::threads::Owner::new(16)));
     drop(admitted(&jobs, "a", "first").unwrap());
     drop(admitted(&jobs, "a", "second").unwrap());
     let text = capture.events_text();
@@ -1204,7 +1206,7 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
     let directory = temporary();
     let (broker, mut observed) =
         stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
-    let jobs = Arc::new(Jobs::new(2));
+    let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let inbound = message("watch");
     let route = route(model_config());
     let anchor = crate::wake::Anchor::for_job(&inbound, &route.agent).expect("an anchor");
@@ -1252,8 +1254,14 @@ fn admitted(
     inbound.subject = subject_named(subject_text);
     let anchor =
         crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("an anchor");
-    jobs.admit(JobOwner::of(&inbound), anchor, None, Arc::from(text))
-        .map(|(run, _signal)| run)
+    jobs.admit(
+        JobOwner::of(&inbound),
+        anchor,
+        None,
+        Arc::from(text),
+        &dekopon_test_support::shell_threads(),
+    )
+    .map(|admitted| admitted.run)
 }
 
 pub(super) fn owned_by(subject_text: &str) -> JobOwner {
@@ -1270,7 +1278,14 @@ async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner()
     let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
     let (run, signal) = runner
         .jobs
-        .admit(JobOwner::of(&inbound), anchor, None, Arc::from("sleep 5"))
+        .admit(
+            JobOwner::of(&inbound),
+            anchor,
+            None,
+            Arc::from("sleep 5"),
+            &runner.shell_threads,
+        )
+        .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
     let other = admitted(&runner.jobs, "b", "sleep 5").expect("a second slot");
     let driver = Arc::new(RecordingDriver::default());
@@ -1299,7 +1314,7 @@ async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner()
 
 #[test]
 fn dropping_an_unfinished_run_fails_its_row_and_returns_the_permit() {
-    let jobs = Arc::new(Jobs::new(1));
+    let jobs = Arc::new(Jobs::new(1, crate::threads::Owner::new(16)));
     let run = admitted(&jobs, "a", "sleep 9").expect("a free slot");
     assert_eq!(jobs.free_permits(), 0);
     drop(run);
@@ -1310,7 +1325,7 @@ fn dropping_an_unfinished_run_fails_its_row_and_returns_the_permit() {
 
 #[test]
 fn a_full_table_evicts_its_oldest_finished_row_and_never_a_running_one() {
-    let jobs = Arc::new(Jobs::new(2));
+    let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let first = admitted(&jobs, "a", "a").expect("slot");
     let second = admitted(&jobs, "b", "b").expect("slot");
     assert!(admitted(&jobs, "a", "c").is_err());
@@ -1329,7 +1344,7 @@ fn a_full_table_evicts_its_oldest_finished_row_and_never_a_running_one() {
 
 #[test]
 fn a_finished_job_stays_listed_until_a_new_start_needs_its_slot() {
-    let jobs = Arc::new(Jobs::new(2));
+    let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let owner = owned_by("a");
     let a = admitted(&jobs, "a", "A").unwrap();
     drop(a);
@@ -1349,7 +1364,7 @@ fn a_finished_job_stays_listed_until_a_new_start_needs_its_slot() {
 
 #[test]
 fn a_panicking_wait_callback_releases_its_waiter_slot() {
-    let jobs = Arc::new(Jobs::new(1));
+    let jobs = Arc::new(Jobs::new(1, crate::threads::Owner::new(16)));
     let run = admitted(&jobs, "a", "first").expect("slot");
     let owner = owned_by("a");
     let id = jobs.list(&owner)[0].id;
@@ -1367,7 +1382,7 @@ fn a_panicking_wait_callback_releases_its_waiter_slot() {
 
 #[test]
 fn a_finished_job_keeps_its_row_while_a_wait_is_reading_it() {
-    let jobs = Arc::new(Jobs::new(2));
+    let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let waited = admitted(&jobs, "a", "waited").expect("slot");
     drop(admitted(&jobs, "a", "spare").expect("slot"));
     let owner = owned_by("a");
@@ -1455,7 +1470,14 @@ async fn a_stop_word_from_an_unrouted_conversation_still_cancels_its_persons_job
     let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
     let (run, signal) = runner
         .jobs
-        .admit(JobOwner::of(&inbound), anchor, None, Arc::from("sleep 5"))
+        .admit(
+            JobOwner::of(&inbound),
+            anchor,
+            None,
+            Arc::from("sleep 5"),
+            &runner.shell_threads,
+        )
+        .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
     let mut sessions = tokio::task::JoinSet::new();
     crate::dispatch(
@@ -1689,7 +1711,7 @@ async fn tick_once(
         .pop()
         .expect("the watch is due");
     let mut ticks = tokio::task::JoinSet::new();
-    crate::spawn_tick(runner, routes, store, &mut ticks, tick);
+    crate::spawn_tick(runner, routes, store, &mut ticks, tick).expect("tick admitted");
     assert!(matches!(ticks.join_next().await, Some(Ok(None))));
 }
 
@@ -1998,7 +2020,14 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
     let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
     let (run, signal) = runner
         .jobs
-        .admit(JobOwner::of(&inbound), anchor, None, Arc::from("sleep 5"))
+        .admit(
+            JobOwner::of(&inbound),
+            anchor,
+            None,
+            Arc::from("sleep 5"),
+            &runner.shell_threads,
+        )
+        .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
     let held = std::iter::from_fn(|| runner.gate.refusal()).collect::<Vec<_>>();
     assert!(!held.is_empty());
@@ -2040,7 +2069,7 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
 
 #[test]
 fn a_multi_job_wait_holds_every_target_against_notices_and_eviction() {
-    let jobs = Arc::new(Jobs::new(2));
+    let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let mut notices = jobs.take_notices();
     let first = admitted(&jobs, "a", "first").expect("slot");
     let second = admitted(&jobs, "a", "second").expect("slot");
@@ -2061,10 +2090,15 @@ fn a_multi_job_wait_holds_every_target_against_notices_and_eviction() {
         });
         on_park.recv().expect("the wait parks");
         drop(second);
+        let threads = dekopon_test_support::shell_threads();
+        let held_threads = (0..16)
+            .map(|_| jobs.thread_owner.reserve(&threads).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
             admitted(&jobs, "b", "evictor").err(),
             Some(dekopon_shell::JobRefusal::Full { maximum: 2 })
         );
+        drop(held_threads);
         drop(first);
         assert_eq!(
             waiter.join().expect("the waiter"),
@@ -2086,7 +2120,7 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
         stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
     let capture = dekopon_test_support::CaptureLayer::workspace();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
-    let jobs = Arc::new(Jobs::new(4));
+    let jobs = Arc::new(Jobs::new(4, crate::threads::Owner::new(16)));
     let inbound = message("deadline");
     let anchor = || crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
     let limits = |seconds| dekopon_process::Limits {
@@ -2137,7 +2171,7 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
 
 #[test]
 fn a_start_after_the_seal_is_off_even_with_every_permit_held() {
-    let jobs = Arc::new(Jobs::new(1));
+    let jobs = Arc::new(Jobs::new(1, crate::threads::Owner::new(16)));
     let held = admitted(&jobs, "a", "sleep 9").expect("slot");
     jobs.seal();
     assert_eq!(

@@ -212,3 +212,122 @@ fn a_child_tree_keeps_both_its_starter_and_broker_cancellation_sources() {
         assert_eq!(tree.charge_step(), Err(LimitExceeded::Cancelled));
     }
 }
+
+struct ThreadTeardown {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ThreadTeardown {
+    fn drop(&mut self) {
+        self.entered.take().unwrap().send(()).unwrap_or(());
+        self.timed_out.store(
+            self.release
+                .recv_timeout(StdDuration::from_secs(5))
+                .is_err(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+thread_local! {
+    static THREAD_TEARDOWN: std::cell::RefCell<Option<ThreadTeardown>> = const { std::cell::RefCell::new(None) };
+}
+
+#[tokio::test]
+async fn owned_thread_tls_teardown_keeps_the_async_worker_free_until_joined() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let threads = threads();
+    let [permit] = threads.reserve().unwrap();
+    let (entered, teardown) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let expired = Arc::clone(&timed_out);
+    let join = permit
+        .spawn_owned(PROBE, move || {
+            THREAD_TEARDOWN.with(|slot| {
+                *slot.borrow_mut() = Some(ThreadTeardown {
+                    entered: Some(entered),
+                    release: released,
+                    timed_out: expired,
+                })
+            });
+            let slept = tokio::runtime::Handle::current().block_on(async {
+                tokio::time::sleep(StdDuration::from_millis(1)).await;
+                true
+            });
+            (std::thread::current().name().map(str::to_owned), slept)
+        })
+        .unwrap();
+    let mut owned = tokio::task::JoinSet::new();
+    owned.spawn(join);
+    teardown.await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        owned.try_join_next().is_none(),
+        "TLS still owns the native thread"
+    );
+    assert_eq!(
+        threads.reserve::<4>().map(|_| ()),
+        Err(LimitExceeded::ShellThreads { maximum: 4 }),
+        "TLS teardown still holds its permit"
+    );
+    let progressed = !timed_out.load(Ordering::Acquire);
+    release.send(()).unwrap_or(());
+    let (name, slept) = owned.join_next().await.unwrap().unwrap().unwrap().unwrap();
+    assert!(
+        progressed,
+        "a synchronous join stalled the only async worker in TLS teardown"
+    );
+    assert!(!timed_out.load(Ordering::Acquire));
+    assert_eq!(name.as_deref(), Some("sh-thread-probe"));
+    assert!(slept);
+}
+
+#[test]
+fn a_long_owned_thread_leaves_the_only_blocking_slot_free_for_short_io() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let threads = ShellThreads::new(1, runtime.handle().clone());
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let expired = Arc::clone(&timed_out);
+    runtime.block_on(async {
+        let [permit] = threads.reserve().unwrap();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let join = permit
+            .spawn_owned(PROBE, move || {
+                started.send(()).unwrap_or(());
+                expired.store(
+                    released.recv_timeout(StdDuration::from_secs(5)).is_err(),
+                    Ordering::Release,
+                );
+            })
+            .unwrap();
+        let mut owned = tokio::task::JoinSet::new();
+        owned.spawn(join);
+        running.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(tokio::task::spawn_blocking(|| 42).await.unwrap(), 42);
+        release.send(()).unwrap_or(());
+        owned.join_next().await.unwrap().unwrap().unwrap().unwrap();
+    });
+    assert!(
+        !timed_out.load(Ordering::Acquire),
+        "the join occupied the blocking pool before the body completed"
+    );
+    assert!(threads.reserve::<1>().is_ok());
+}

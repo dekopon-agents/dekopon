@@ -26,8 +26,7 @@ The configuration file must be a regular non-symlink file owned by the daemon's 
 ## Runtime threads
 
 Thread sizing is parsed before configuration; flags override their environment fallbacks and
-no configuration key controls a pool. Counts must be positive. Omitted runtime options retain
-Tokio's defaults.
+no configuration key controls a pool. Counts must be positive. Omitted worker and keep-alive options retain Tokio's defaults; the blocking cap defaults to 8.
 
 Effective Tokio worker and blocking counts must each be at most 4096, including values from
 flags, `DEKOPON_WORKER_THREADS`, `DEKOPON_BLOCKING_THREADS`, `TOKIO_WORKER_THREADS`, or available
@@ -36,16 +35,21 @@ CPUs; larger counts are command-line validation errors (exit 2) before any pool 
 | Flag | Environment fallback | Default |
 |---|---|---|
 | `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
-| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 512 |
+| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 8 |
 | `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
 | `--shell-threads` | `DEKOPON_SHELL_THREADS` | 32 |
 
-With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (512 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=16, S=32` give 6 idle and at most 54 threads.
+With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (8 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=8, S=32` give 6 idle and at most 46 threads.
 Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
 `gw-rt-N` namespace and retire after the keep-alive. The stdout worker and OTel providers drain
 before runtime shutdown. The Pi settings are deployment values, not binary defaults.
-Until turns move to `ShellThreads`, the Pi must use `B=16` with a startup arithmetic check;
-`threads/homelab` must not set `B=8` before that move. Afterward, `B=8` gives a ceiling of 46 threads.
+Turns (`sh-turn`), jobs (`sh-job`), wake ticks (`sh-tick`) and memory summaries (`sh-memory`)
+share that shell budget with pipeline stages and helpers. Admission refuses immediately with
+`LimitExceeded::ShellThreads` when capacity is exhausted. A turn holds one permit and each
+non-final pipeline stage adds one; the default retained-value budget permits at most sixteen
+producer stacks, or seventeen permits with the turn. Calls, feeders, jq pumps and upcalls
+also spend this same process budget. The blocking pool handles short I/O and final native joins
+after thread bodies finish; permits remain held through thread-local teardown and the join.
 
 ## Check a configuration
 
@@ -1346,7 +1350,14 @@ grace, queued receipts become `abandoned`; queued wakes are lost and are not rep
 
 At shutdown, transport readers are aborted and in-flight sessions get `shutdownGraceMs` to finish — a model call is already paid for, and abandoning it means a person watching a chat window never hears back. If the grace expires, dropping each async owner marks its synchronous prompt loop cancelled before aborting the wrapper, so no later model turn or capability call starts. A model request or provider effect already in progress remains non-rollbackable and may finish after the async owner is gone.
 
-**Abandonment is bounded, so exit is too.** The async model transport observes the session watch even during a silent read, while other blocking work (including credential/file IO) can still drain after cancellation; dropping an async runtime waits for its blocking threads. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s — inside a pod termination grace that `dekopon-brokerd`'s own drain has to fit into as well, because the kubelet only starts stopping the broker sidecar once this container is gone. The chart defaults that grace to 270 s and asserts at template time that it covers both drains plus `drainBudget.bufferSeconds`, refusing to render anything shorter ([Kubernetes guide](kubernetes.md#draining-takes-both-graces-in-sequence)); 240 s of gateway abandonment does not leave the broker its 120 s inside it, and the kubelet SIGKILLs the broker mid-drain.
+The gateway retains every native thread's join operation even when its async caller is aborted.
+Admitted ticks still deliver their completed fires during shutdown. After resident tasks stop and
+the summary dispatcher requests model cancellation, the gateway joins all admitted native work
+while the runtime and assets remain available. Native thread-local destructors finish on the
+bounded blocking pool, without occupying an async worker. This cleanup follows the serving
+grace; the runtime's final five-second timeout applies to residual short blocking work. The
+chart's termination grace covers both daemon drains plus `drainBudget.bufferSeconds`
+([Kubernetes guide](kubernetes.md#draining-takes-both-graces-in-sequence)).
 
 **Exhausting one transport is a gateway failure.** Healthy transports keep serving during a peer's
 bounded recovery episode. A permanent refusal, exhausted episode, or reader-task panic stops the

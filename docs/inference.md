@@ -37,7 +37,7 @@ Slack event
        empty/refused -> fixed unauthorized reply; no model call
   -> conversation store optionally supplies compacted history + an opaque cache key
   -> prompt loop builds ModelMessage values and ModelTool definitions
-  -> a per-session BlockingModel enters the supplied tokio runtime from spawn_blocking
+  -> a per-session BlockingModel enters the supplied tokio runtime from an admitted ShellThreads turn
   -> the shared ModelClient selects Codex, OpenRouter, or OpenAI-compatible encoding
   -> pooled async reqwest sends compact typed JSON with Content-Length
   -> SSE events stream visible text back to the caller and become AssistantTurn

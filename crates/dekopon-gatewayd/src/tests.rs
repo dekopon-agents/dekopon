@@ -4749,12 +4749,20 @@ fn metered_runner(
     Arc::new(runner)
 }
 
+fn serving_threads() -> dekopon_process::ShellThreads {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => dekopon_process::ShellThreads::new(16, runtime),
+        Err(_outside_runtime) => dekopon_test_support::shell_threads(),
+    }
+}
+
 fn runner_tracking(
     broker: ResolvedBroker,
     models: Arc<dyn ModelFactory>,
     max_concurrent: usize,
     max_conversations: usize,
 ) -> Arc<SessionRunner> {
+    let thread_owner = crate::threads::Owner::new(16);
     Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -4773,9 +4781,13 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
         wakes: None,
-        jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
+        jobs: Arc::new(crate::jobs::Jobs::new(
+            crate::config::DEFAULT_MAX_JOBS,
+            Arc::clone(&thread_owner),
+        )),
         metering: unmetered(),
-        shell_threads: dekopon_test_support::shell_threads(),
+        shell_threads: serving_threads(),
+        thread_owner,
     })
 }
 
@@ -18324,6 +18336,7 @@ fn journaled_runner(
     models: Arc<dyn ModelFactory>,
     journal: &Path,
 ) -> Arc<SessionRunner> {
+    let thread_owner = crate::threads::Owner::new(16);
     Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
@@ -18346,9 +18359,13 @@ fn journaled_runner(
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
         wakes: None,
-        jobs: Arc::new(crate::jobs::Jobs::new(crate::config::DEFAULT_MAX_JOBS)),
+        jobs: Arc::new(crate::jobs::Jobs::new(
+            crate::config::DEFAULT_MAX_JOBS,
+            Arc::clone(&thread_owner),
+        )),
         metering: unmetered(),
-        shell_threads: dekopon_test_support::shell_threads(),
+        shell_threads: serving_threads(),
+        thread_owner,
     })
 }
 
@@ -20818,7 +20835,14 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
     let anchor = crate::wake::Anchor::for_job(&message("job"), &first.agent).unwrap();
     let (running_job, _signal) = runner
         .jobs
-        .admit(owner.clone(), anchor, None, Arc::from("still running"))
+        .admit(
+            owner.clone(),
+            anchor,
+            None,
+            Arc::from("still running"),
+            &runner.shell_threads,
+        )
+        .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
     let asset_seed = runner.conversations.begin(
         &private,
@@ -23936,4 +23960,30 @@ async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() 
         table.ticket(&fixture.key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
     ));
+}
+
+#[path = "tests/thread_budget.rs"]
+mod thread_budget;
+
+pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
+    if !matches!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    ) {
+        return join.await;
+    }
+    let clock = tokio::time::Instant::now();
+    std::thread::yield_now();
+    if tokio::time::Instant::now() != clock {
+        return join.await;
+    }
+    tokio::pin!(join);
+    // A paused Tokio clock must not auto-advance while native threads are still registering timers.
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut join => return result,
+            () = tokio::task::yield_now() => {},
+        }
+    }
 }
