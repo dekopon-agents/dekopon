@@ -1821,7 +1821,8 @@ async fn execute(
             );
             let can_reply = match &message.message_id {
                 MessageId::Github(_) | MessageId::Follow(_) => false,
-                MessageId::Native(_) | MessageId::Wake { .. } | MessageId::Job { .. } => true,
+                MessageId::Wake { .. } => !crate::wake::space_wake(&message),
+                MessageId::Native(_) | MessageId::Job { .. } => true,
             };
             if can_reply
                 && notice.is_none()
@@ -2227,7 +2228,7 @@ async fn session_turn(
                     UNAUTHORIZED_REPLY.to_owned()
                 }
             };
-            if !is_follow && !quiet && answer(driver, message, &reply).await {
+            if !is_follow && !is_subscription && !quiet && answer(driver, message, &reply).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2241,7 +2242,7 @@ async fn session_turn(
                 reason = "attestation-refused",
                 "gateway.session.rejected"
             );
-            if !is_follow && answer(driver, message, UNAUTHORIZED_REPLY).await {
+            if !is_follow && !is_subscription && answer(driver, message, UNAUTHORIZED_REPLY).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2253,7 +2254,7 @@ async fn session_turn(
                 error = %error,
                 "gateway.session.failed"
             );
-            if !is_follow && answer(driver, message, FAILURE_REPLY).await {
+            if !is_follow && !is_subscription && answer(driver, message, FAILURE_REPLY).await {
                 reply_delivered(MessageOutcome::Failed);
             }
             return MessageOutcome::Failed.into();
@@ -2328,7 +2329,7 @@ async fn session_turn(
         let reply = leg
             .principal()
             .map_or_else(|| UNAUTHORIZED_REPLY.to_owned(), permission_reply);
-        if !is_follow && answer(driver, message, &reply).await {
+        if !is_follow && !is_subscription && answer(driver, message, &reply).await {
             reply_delivered(MessageOutcome::Unauthorized);
         }
         return MessageOutcome::Unauthorized.into();
@@ -3466,6 +3467,7 @@ async fn reject_sealed_thread(
                 "gateway.session.rejected"
             );
             if !matches!(message.message_id, MessageId::Follow(_))
+                && !crate::wake::space_wake(message)
                 && !message
                     .thread_continuation
                     .as_ref()

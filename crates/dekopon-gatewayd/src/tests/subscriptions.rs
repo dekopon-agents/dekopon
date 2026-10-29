@@ -193,6 +193,16 @@ async fn a_subscription_wake_decline_makes_no_slack_http_calls() {
         SlackExperience::Classic,
         LivenessConfig::default(),
     );
+    let message = subscription_wake();
+    let mut bound = route(model_config());
+    bound.transport = message.transport.clone();
+    bound.wakes = true;
+    run_session(running, bound, message, transport.driver()).await;
+    assert_eq!(models.requests(), 1);
+    assert!(http.calls().is_empty());
+}
+
+fn subscription_wake() -> InboundMessage {
     let mut message = owned_slack_message("Refresh this PR and decline if unchanged.", false);
     message.subject = subscription_anchor().subject().clone();
     message.message_id = MessageId::Wake {
@@ -200,10 +210,167 @@ async fn a_subscription_wake_decline_makes_no_slack_http_calls() {
         notice: "review".into(),
     };
     message.thread_continuation = None;
+    message
+}
+
+#[tokio::test]
+async fn a_revoked_space_subscription_wake_makes_no_slack_http_calls() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let refusal = dekopon_broker_protocol::SessionRefusal::AgentDenied {
+        principal: "channel-space".parse().unwrap(),
+    };
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::session_refused(&refusal)],
+    )
+    .await;
+    let models = ModelScript::new([]);
+    let running = runner(broker, Arc::clone(&models), 4);
+    let http = spawn_http_mock(slack_handler(Vec::new()));
+    let transport = slack_with(
+        &http.base,
+        SlackExperience::Classic,
+        LivenessConfig::default(),
+    );
     let mut bound = route(model_config());
-    bound.transport = message.transport.clone();
+    bound.transport = "scientist-slack".into();
     bound.wakes = true;
-    run_session(running, bound, message, transport.driver()).await;
-    assert_eq!(models.requests(), 1);
+    run_session(running, bound, subscription_wake(), transport.driver()).await;
+    assert_eq!(models.requests(), 0);
     assert!(http.calls().is_empty());
+    let request = observed.try_recv().expect("fresh space authorization");
+    let BrokerRequest::Capabilities {
+        attestation: Some(claim),
+    } = request.request
+    else {
+        panic!("space leg")
+    };
+    assert_eq!(claim.subject, *subscription_anchor().subject());
+    let scope = claim.scope.unwrap();
+    assert_eq!(scope.trigger, dekopon_broker_protocol::Trigger::Wake);
+    assert!(scope.participant.is_none());
+    let rejections = capture.events_where(
+        "dekopon_gatewayd",
+        &[
+            ("event", "gateway_session_rejected"),
+            ("reason", "agent-denied"),
+        ],
+    );
+    assert_eq!(rejections.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscription_authorization_and_connection_failures_remain_audited_without_slack_http_calls()
+ {
+    use dekopon_broker_protocol::{ERROR_UNAUTHENTICATED, SessionRefusal};
+    for (response, event, reason) in [
+        (
+            Some(ResponseEnvelope::session_refused(
+                &SessionRefusal::UnmappedSubject,
+            )),
+            "gateway_session_rejected",
+            Some("unmapped-subject"),
+        ),
+        (
+            Some(ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "refused")),
+            "gateway_session_rejected",
+            Some("attestation-refused"),
+        ),
+        (
+            Some(ResponseEnvelope::chat_capabilities(
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+                Some("channel-space".parse().unwrap()),
+            )),
+            "gateway_session_rejected",
+            Some("unauthorized"),
+        ),
+        (None, "gateway_session_failed", None),
+    ] {
+        let (capture, _guard) = capture_spans();
+        let directory = temporary();
+        let broker = if let Some(response) = response {
+            stub_broker(directory.path(), vec![response]).await.0
+        } else {
+            ResolvedBroker {
+                socket_path: directory.path().join("absent.sock"),
+                server_uid: crate::current_uid(),
+                frame: FrameLimits::default(),
+            }
+        };
+        let models = ModelScript::new([]);
+        let running = runner(broker, Arc::clone(&models), 4);
+        let http = spawn_http_mock(slack_handler(Vec::new()));
+        let transport = slack_with(
+            &http.base,
+            SlackExperience::Classic,
+            LivenessConfig::default(),
+        );
+        let mut bound = route(model_config());
+        bound.transport = "scientist-slack".into();
+        bound.wakes = true;
+        run_session(running, bound, subscription_wake(), transport.driver()).await;
+        assert_eq!(models.requests(), 0);
+        assert!(http.calls().is_empty());
+        let records = capture.events_where("dekopon_gatewayd", &[("event", event)]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].field("reason"), reason);
+    }
+}
+
+#[tokio::test]
+async fn busy_and_sealed_subscription_wakes_remain_audited_without_slack_http_calls() {
+    for sealed in [false, true] {
+        let (capture, _guard) = capture_spans();
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+        let models = ModelScript::new([]);
+        let running = runner(broker, Arc::clone(&models), 1);
+        let http = spawn_http_mock(slack_handler(Vec::new()));
+        let transport = slack_with(
+            &http.base,
+            SlackExperience::Classic,
+            LivenessConfig::default(),
+        );
+        let mut bound = route(model_config());
+        bound.transport = "scientist-slack".into();
+        bound.wakes = true;
+        let message = subscription_wake();
+        let held = if sealed {
+            let key = crate::conversation::ConversationKey::of(
+                &bound.agent,
+                &bound.transport,
+                &message.conversation,
+                Some(&message.subject),
+            );
+            assert!(crate::session::seal_conversation(&running, &bound, &message, &key).await);
+            None
+        } else {
+            Some(
+                running
+                    .gate
+                    .admit_probe(("dev".into(), "another-conversation".into()))
+                    .unwrap(),
+            )
+        };
+        run_session(running, bound, message, transport.driver()).await;
+        drop(held);
+        assert_eq!(models.requests(), 0);
+        assert!(http.calls().is_empty());
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[
+                        ("event", "gateway_session_rejected"),
+                        ("reason", if sealed { "sealed" } else { "busy" })
+                    ]
+                )
+                .len(),
+            1
+        );
+    }
 }
