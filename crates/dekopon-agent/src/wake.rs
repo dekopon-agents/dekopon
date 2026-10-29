@@ -49,6 +49,10 @@ pub struct WatchSummary {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum WakeRefusal {
+    #[error("this agent already has {maximum} PR subscriptions; cancel one first")]
+    SubscriptionsFull { maximum: usize },
+    #[error("PR subscriptions require an authorized participant in a mapped channel")]
+    MappedChannelRequired,
     #[error("the note is longer than {maximum} bytes")]
     NoteTooLong { maximum: usize },
     #[error("that is further out than this chat allows ({} seconds at most)", maximum.as_secs())]
@@ -62,7 +66,7 @@ pub enum WakeRefusal {
     Full { maximum: usize },
     #[error("the probe script exited {exit} on its first run, so it was not stored:\n{output}")]
     Broken { exit: u8, output: String },
-    #[error("no pending wake of this person has that id")]
+    #[error("no pending wake has that id in this scope")]
     NotFound,
     #[error("the gateway could not reach the broker to run the probe")]
     Unavailable,
@@ -74,6 +78,8 @@ impl WakeRefusal {
     #[must_use]
     pub const fn telemetry_kind(&self) -> &'static str {
         match self {
+            Self::SubscriptionsFull { .. } => "subscriptions-full",
+            Self::MappedChannelRequired => "mapped-channel-required",
             Self::NoteTooLong { .. } => "note-too-long",
             Self::Horizon { .. } => "horizon",
             Self::Interval { .. } => "interval",
@@ -87,6 +93,9 @@ impl WakeRefusal {
 }
 
 pub trait WakeRegistrar: Send + Sync {
+    fn list_subscriptions(&self) -> Result<Vec<WakeSummary>, WakeRefusal>;
+
+    fn cancel_subscription(&self, id: WakeId) -> Result<(), WakeRefusal>;
     fn schedule(&self, request: WakeRequest) -> Result<WakeSummary, WakeRefusal>;
 
     fn list(&self) -> Vec<WakeSummary>;
@@ -102,6 +111,10 @@ pub trait WakeRegistrar: Send + Sync {
     rename_all_fields = "camelCase"
 )]
 enum WakeCall {
+    ListSubscriptions {},
+    CancelSubscription {
+        id: u32,
+    },
     Schedule {
         note: String,
         after_seconds: u64,
@@ -126,12 +139,14 @@ pub(crate) fn wake_tool() -> ModelTool {
                       `everySeconds` for up to `forSeconds`, with no model: exit 0 wakes you \
                       with its output, exit 1 keeps waiting, any other exit wakes you with the \
                       failure. `$PREV` holds the previous run's output; the first run is now and \
-                      only sets it. `list` shows pending wakes; `cancel` takes an `id`."
+                      only sets it. `list` shows pending wakes; `cancel` takes an `id`. \
+                      In a mapped channel, `listSubscriptions` lists this channel's PR subscriptions; \
+                      `cancelSubscription` cancels one by `id`."
             .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["schedule", "watch", "list", "cancel"] },
+                "action": { "type": "string", "enum": ["schedule", "watch", "list", "cancel", "listSubscriptions", "cancelSubscription"] },
                 "note": { "type": "string", "description": "What to do when you wake." },
                 "afterSeconds": { "type": "integer", "minimum": 1 },
                 "script": { "type": "string" },
@@ -163,6 +178,27 @@ pub(crate) fn wake_into(
         }
     };
     let result = match request {
+        WakeCall::ListSubscriptions {} => registrar.list_subscriptions().map(|summaries| {
+            if summaries.is_empty() {
+                "No PR subscriptions.".to_owned()
+            } else {
+                summaries
+                    .iter()
+                    .map(|summary| {
+                        format!(
+                            "subscription {}: expires in {} seconds\n{}",
+                            summary.id,
+                            summary.due_in.as_secs(),
+                            summary.note
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }
+        }),
+        WakeCall::CancelSubscription { id } => registrar
+            .cancel_subscription(WakeId(id))
+            .map(|()| format!("Cancelled subscription {id}.")),
         WakeCall::Schedule {
             note,
             after_seconds,

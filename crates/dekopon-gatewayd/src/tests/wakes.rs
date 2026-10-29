@@ -34,6 +34,8 @@ pub(super) fn wake_store(directory: &Path) -> Arc<WakeStore> {
             path: directory.join("wakes").join("wakes.jsonl"),
             bounds: WakeBounds {
                 max_per_subject: 4,
+                max_subscriptions_per_agent: 64,
+                subscription_expiry: Duration::from_secs(14 * 24 * 60 * 60),
                 min_interval: Duration::from_secs(1),
                 max_horizon: Duration::from_secs(3600),
             },

@@ -246,6 +246,8 @@ sessions:
   wakes:                                      # optional; absent, no route may schedule a wake
     path: /var/lib/dekopon-gatewayd/wakes.jsonl       # relative paths resolve against this file
     maxPerSubject: 20                         # optional, default 20 pending wakes per person
+    maxSubscriptionsPerAgent: 64              # optional, default 64 pending PR subscriptions per agent
+    subscriptionExpiryMs: 1209600000          # optional, default 14 days from subscription creation
     minIntervalMs: 300000                     # optional, default 5 minutes between watch checks; must exceed scriptTimeoutMs
     maxHorizonMs: 2592000000                  # optional, default 30 days
 
@@ -741,6 +743,8 @@ link starts one turn under that message. Host case is ignored; `/files`, `/commi
 and one trailing slash are accepted, and query/fragment do not change the target. Slack
 `<URL|label>` links work. Distinct targets are deduplicated case-insensitively in arrival order
 and reviewed in one turn; structured owner, repository and positive number reach the prompt.
+Repository names must fit the canonical GitHub subject grammar; a dotted repository name is
+refused during link parsing before a review or subscription can be created.
 Bot posts, edits, other GitHub URLs and thread replies gain no trigger. A mention retains
 ordinary mention behavior. Both classic and Agent Slack experiences support the opt-in.
 An ambient link from an unmapped or agent-denied poster gets no reply or reaction; the refusal
@@ -753,6 +757,8 @@ The gateway provides review instructions, including a head-pinned COMMENT review
 summary with the returned review link, and the granted `follow stay` command. GitHub tools and
 authority remain broker/provider-owned; no repository allowlist is added here. The successful
 follow command opens the existing ticket, and delivered follow replies refresh it normally.
+With `wakes: true` and `sessions.wakes`, the first successful COMMENT review of a structured
+target in a mapped channel also subscribes that thread to new commits; see [PR subscriptions](#pr-subscriptions).
 
 ### Slack thread follow
 
@@ -1561,8 +1567,9 @@ model chooses only when and the note it will read. It never names a person or a 
 Every probe run opens its own broker leg attested with `trigger: probe`. The broker neither lists
 nor authorizes a capability that is not read-only on that leg (`probe-write`), whatever policy
 says. The woken session attests `trigger: wake` and is authorized afresh, like any message, so
-a wake can do nothing the person could not do by typing; owner Cedar policy can narrow it further
-through `context.trigger`.
+a personal wake can do only what its scheduling person may do. A PR subscription wake runs as
+the mapped space alone and can do only what that space may do, without a participant leg.
+Owner Cedar policy can narrow either through `context.trigger`.
 
 Pending wakes live in one JSONL file (`0600`, rewritten through a rename, no fsync). A due wake's
 row is removed before its session starts, so a restart at that moment loses it; nothing is ever
@@ -1579,6 +1586,32 @@ and saturation refusals apply. Only when its route no longer answers there as
 the same agent with `wakes: true` does the gateway post the note and any probe output without a session. The local development
 transport cannot schedule wakes: its reply target is a connection number a restart reuses. Provider chat memory does not record wake turns;
 the resident window and the journal do. Platform recall for a wake reads the history up to now.
+
+### PR subscriptions
+
+A successful PR-link COMMENT review on a mapped Slack channel route with `wakes: true` leaves
+one subscription per repository, PR and anchored thread. Repeating the review in the same
+thread reuses it. The store defaults to 64 subscriptions per agent and a 14-day lifetime from
+creation, configured by `sessions.wakes.maxSubscriptionsPerAgent` and `subscriptionExpiryMs`.
+The next distinct subscription above the limit is refused; pushes do not extend expiry.
+
+A later routed `pull_request.synchronize` delivery fires only when its repository subject is
+mapped by the broker and falls inside the GitHub route's `ids`. The wake resumes the anchored
+thread as the space alone, reads the current head, and refreshes its head-pinned COMMENT review.
+When every capability invocation in the turn successfully refreshes the subscribed PR's review,
+the model replies to Slack only when blocking findings changed; otherwise it may select
+`decline_chat_reply`, producing no chat post or progress message. Any other invocation, including
+a failed review or a review of another PR, requires a visible Slack report even after a successful
+refresh, or the fixed audit-before-retry warning when no reporting turn remains.
+Unmatched deliveries retain their ordinary repository-session handling.
+
+PR close, including merge, expiry and cancellation remove the subscription. From any mapped
+participant's freshly authorized turn in the channel, `wake` action `listSubscriptions` lists
+that channel's subscriptions and `cancelSubscription` cancels one by `id`; both require
+asker ∩ space authorization and are refused in DMs. Personal `list` and `cancel` remain separate.
+Subscriptions share the strict JSONL wake store. Older gateways cannot read the new line kind;
+rollback requires removing the wakes file, resetting every pending wake and subscription.
+A lost subscription route is ignored silently rather than posted as an orphan reminder.
 
 ## Durable memory after transport acceptance
 

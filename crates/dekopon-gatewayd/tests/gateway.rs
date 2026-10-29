@@ -772,6 +772,8 @@ impl ModelHold {
 #[derive(Default)]
 struct Timing {
     #[cfg(feature = "fauxlack")]
+    subscriptions: Option<subscriptions::Settings>,
+    #[cfg(feature = "fauxlack")]
     fauxlack: Option<dekopon_gatewayd::fauxlack::Fauxlack>,
     #[cfg(feature = "fauxlack")]
     fauxlack_servers: Vec<String>,
@@ -824,6 +826,10 @@ async fn boot_with(
             &timing.fauxlack_servers,
         );
     }
+    #[cfg(feature = "fauxlack")]
+    if let Some(settings) = &timing.subscriptions {
+        settings.configure_broker(&mut broker_document, &mut policies);
+    }
     write_owner_only(
         &directory.path().join("policies.cedar"),
         policies.as_bytes(),
@@ -874,6 +880,10 @@ async fn boot_with(
     #[cfg(feature = "fauxlack")]
     if timing.fauxlack.is_some() {
         fauxlack::configure_gateway(&mut config, &timing.fauxlack_servers);
+    }
+    #[cfg(feature = "fauxlack")]
+    if let Some(settings) = &timing.subscriptions {
+        settings.configure_gateway(directory.path(), &mut config);
     }
     if let Some(keep_alive) = &timing.keep_alive {
         config["transports"][0]["indicators"]["keepAlive"] = keep_alive.clone();
@@ -2055,3 +2065,7 @@ async fn a_healthy_chat_serves_during_peer_recovery_then_fatal_failure_exits_non
 #[cfg(feature = "fauxlack")]
 #[path = "gateway/fauxlack.rs"]
 mod fauxlack;
+
+#[cfg(feature = "fauxlack")]
+#[path = "gateway/subscriptions.rs"]
+mod subscriptions;

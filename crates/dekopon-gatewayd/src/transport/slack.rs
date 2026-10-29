@@ -518,6 +518,7 @@ impl SlackTransport {
                     .find(&self.name, &follow_conversation, &subject)
                     .filter(|(_, route)| route.ambient.pull_request_links)?;
                 crate::pull_request_links::PullRequestLinkContext::parse(top_text)
+                    .unwrap_or_else(refused_pr_repository)
             })
             .flatten();
         let ambient = pull_request_links.is_some();
@@ -4011,4 +4012,11 @@ mod markdown_tests {
             "```\n7.\n```\n~~~~\n8)\n~~~\n~~~~\n9\\."
         );
     }
+}
+
+fn refused_pr_repository(
+    error: dekopon_core::SubjectError,
+) -> Option<crate::pull_request_links::PullRequestLinkContext> {
+    tracing::info!(event = "gateway_message_ignored", reason = "invalid-repository", error = %error, "gateway.message.ignored");
+    None
 }
