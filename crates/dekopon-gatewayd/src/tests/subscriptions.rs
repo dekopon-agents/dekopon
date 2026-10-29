@@ -170,3 +170,40 @@ fn only_a_confirmed_review_of_a_link_target_creates_a_space_subscription() {
         1
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_wake_decline_makes_no_slack_http_calls() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::chat_capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            Some("channel-space".parse().unwrap()),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([decline_reply()]);
+    let running = runner(broker, Arc::clone(&models), 4);
+    let http = spawn_http_mock(slack_handler(Vec::new()));
+    let transport = slack_with(
+        &http.base,
+        SlackExperience::Classic,
+        LivenessConfig::default(),
+    );
+    let mut message = owned_slack_message("Refresh this PR and decline if unchanged.", false);
+    message.subject = subscription_anchor().subject().clone();
+    message.message_id = MessageId::Wake {
+        id: dekopon_agent::wake::WakeId(1),
+        notice: "review".into(),
+    };
+    message.thread_continuation = None;
+    let mut bound = route(model_config());
+    bound.transport = message.transport.clone();
+    bound.wakes = true;
+    run_session(running, bound, message, transport.driver()).await;
+    assert_eq!(models.requests(), 1);
+    assert!(http.calls().is_empty());
+}
