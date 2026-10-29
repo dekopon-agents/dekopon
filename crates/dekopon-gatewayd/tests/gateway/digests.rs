@@ -651,3 +651,129 @@ async fn an_unattended_digest_cannot_cancel_itself_and_renew_its_fixed_horizon()
     }
     fixture.shutdown().await;
 }
+
+#[derive(Clone, Copy)]
+enum QueuedDigestReload {
+    WakesDisabled,
+    AgentChanged,
+}
+
+async fn wait_gateway_fields(audit: &Audit, fields: &[(&str, &str)]) {
+    tokio::time::timeout(WAIT, async {
+        while audit
+            .capture
+            .events_where("dekopon_gatewayd", fields)
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the gateway recorded the structured event");
+}
+
+async fn assert_a_queued_digest_is_dropped_after_reload(change: QueuedDigestReload) {
+    let audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let fixture = boot_digests(
+        &chat,
+        temporary(),
+        vec![
+            meta(
+                "create",
+                "wake",
+                request("digest", "probe upper --text waiting | jq -r .text"),
+            ),
+            final_answer("Set."),
+        ],
+        vec![],
+        None,
+    )
+    .await;
+    let alice = chat.server("acme").user("ualice");
+    let root = alice
+        .post("cteam", "<@udekopon> daily digest")
+        .await
+        .unwrap();
+    assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
+    let mut rows = stored(&fixture);
+    let directory = fixture.shutdown().await;
+    due(&mut rows[0]);
+    rows[0]["nextAtMs"] = json!(rows[0]["nextAtMs"].as_u64().unwrap() + 5_000);
+    let hold = ModelHold::new();
+    let fixture = boot_with(
+        directory,
+        vec![
+            final_answer("Participant finished."),
+            final_answer("Unexpected digest."),
+        ],
+        None,
+        "plain",
+        false,
+        &Timing {
+            fauxlack: Some(chat.clone()),
+            fauxlack_servers: vec!["acme".into()],
+            wakes: Some(rows),
+            model_hold: Some(hold.clone()),
+            ..Timing::default()
+        },
+    )
+    .await;
+    alice
+        .reply(&root, "<@udekopon> hold this participant turn")
+        .await
+        .unwrap();
+    hold.wait_until_entered().await;
+    wait_gateway_fields(
+        &audit,
+        &[
+            ("audit.event", "gateway.admission"),
+            ("admission.trigger", "digest"),
+            ("outcome", "queued"),
+        ],
+    )
+    .await;
+    let path = fixture.directory.path().join("dekopon-gatewayd.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    match change {
+        QueuedDigestReload::WakesDisabled => config["routes"][0]["wakes"] = json!(false),
+        QueuedDigestReload::AgentChanged => {
+            let agent = "replacement-agent";
+            write_owner_only(
+                &fixture.directory.path().join("dekopon.yaml"),
+                catalog_text().replace(AGENT, agent).as_bytes(),
+            );
+            let policies = fixture.directory.path().join("policies.cedar");
+            write_owner_only(
+                &policies,
+                fs::read_to_string(&policies)
+                    .unwrap()
+                    .replace(AGENT, agent)
+                    .as_bytes(),
+            );
+            for route in config["routes"].as_array_mut().unwrap() {
+                route["agent"] = json!(agent);
+            }
+        }
+    }
+    write_owner_only(&path, &serde_json::to_vec(&config).unwrap());
+    wait_gateway_fields(&audit, &[("event", "gateway_reload_applied")]).await;
+    let model_requests = Arc::clone(&fixture.model_requests);
+    hold.release();
+    fixture.shutdown().await;
+    assert_eq!(model_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        root.thread().transcript().authors(),
+        ["ualice", "udekopon", "ualice", "udekopon"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_digest_is_dropped_when_a_reload_disables_wakes() {
+    assert_a_queued_digest_is_dropped_after_reload(QueuedDigestReload::WakesDisabled).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_digest_is_dropped_when_a_reload_changes_its_agent() {
+    assert_a_queued_digest_is_dropped_after_reload(QueuedDigestReload::AgentChanged).await;
+}

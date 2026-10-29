@@ -925,6 +925,12 @@ impl SessionAdmission {
                     next.receipts.finish(MessageOutcome::RouteLost);
                     continue;
                 };
+                if crate::wake::space_wake(&next.message)
+                    && (!route.wakes || route.agent != next.route.agent)
+                {
+                    next.receipts.finish(MessageOutcome::RouteLost);
+                    continue;
+                }
                 if folds_in(&next.message) {
                     let mut grouped = Vec::new();
                     while let Some(mut same) = running.follow_ups.pop_front_if(|queued| {
