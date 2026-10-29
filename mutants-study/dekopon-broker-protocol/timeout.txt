@@ -1,0 +1,4 @@
+crates/dekopon-broker-protocol/src/lib.rs:947:44: replace match guard assets.len() > MAX_ASSET_ROWS with true in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:947:57: replace > with < in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:1454:9: replace FrameLimits::validate -> Result<Self, ProtocolError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:1925:37: replace > with < in BrokerClient::invoke

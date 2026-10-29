@@ -1,0 +1,8 @@
+crates/dekopon-policy/src/lib.rs:628:30: replace > with >= in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:644:39: replace > with >= in PolicyEngine::build
+crates/dekopon-policy/src/lib.rs:889:41: replace > with >= in apply_annotated_ids
+crates/dekopon-policy/src/lib.rs:1259:8: delete ! in policy_digest
+crates/dekopon-policy/src/request.rs:7:34: replace * with +
+crates/dekopon-policy/src/request.rs:126:19: replace > with >= in json_record
+crates/dekopon-policy/src/request.rs:162:17: replace <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::expecting -> fmt::Result with Ok(Default::default())
+crates/dekopon-policy/src/request.rs:189:44: replace match guard fraction.len() <= 4 with true in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64

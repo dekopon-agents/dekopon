@@ -1,0 +1,127 @@
+crates/dekopon-broker/src/lib.rs:123:9: replace ChatMemoryConfig::validate -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:140:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:139:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:138:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:137:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:136:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:135:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:142:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:135:36: replace != with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:137:38: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:137:38: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:137:38: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:138:40: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:138:40: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:138:40: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:141:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:139:45: replace >= with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:140:48: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:141:36: replace < with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:141:36: replace < with > in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:141:36: replace < with <= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:142:38: replace < with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:142:38: replace < with > in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:164:29: replace * with + in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:164:29: replace * with / in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:175:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:174:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:173:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:172:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:171:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:170:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:169:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:168:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:166:21: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:166:21: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:166:21: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:40: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:40: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:40: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:168:36: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:169:45: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:169:45: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:169:45: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:170:38: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:170:38: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:170:38: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:171:28: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:171:28: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:172:29: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:172:29: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:173:27: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:173:27: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:173:27: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:174:48: replace < with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:174:48: replace < with > in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:174:48: replace < with <= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:175:35: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:175:35: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:175:35: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:37: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:37: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:43: replace * with + in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:43: replace * with / in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:38: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:38: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:45: replace * with + in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:45: replace * with / in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:229:9: replace ChatMemoryConfig::validate_host_limits -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:233:13: replace || with && in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:232:13: replace || with && in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:231:49: replace > with == in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:231:49: replace > with < in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:232:59: replace > with == in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:232:59: replace > with < in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:233:46: replace > with == in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:233:46: replace > with < in ChatMemoryConfig::validate_host_limits
+crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with true
+crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with false
+crates/dekopon-broker/src/lib.rs:247:5: replace round_up -> Result<u64, BrokerBuildError> with Ok(0)
+crates/dekopon-broker/src/lib.rs:247:5: replace round_up -> Result<u64, BrokerBuildError> with Ok(1)
+crates/dekopon-broker/src/lib.rs:249:39: replace * with + in round_up
+crates/dekopon-broker/src/lib.rs:249:39: replace * with / in round_up
+crates/dekopon-broker/src/lib.rs:249:28: replace / with * in round_up
+crates/dekopon-broker/src/lib.rs:249:28: replace / with % in round_up
+crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)
+crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 0
+crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1
+crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with true
+crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with false
+crates/dekopon-broker/src/lib.rs:667:9: replace ConstraintCatalog::validate -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:667:28: replace > with == in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:667:28: replace > with < in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:689:56: replace == with != in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:699:9: replace ConstraintCatalog::retention_policies -> Result<RetentionPolicies, BrokerBuildError> with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:705:42: replace || with && in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:705:37: replace == with != in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:705:61: replace > with < in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:712:29: replace != with == in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:724:9: replace ConstraintCatalog::validate_storage_namespaces -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:730:30: replace != with == in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:753:33: replace > with == in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:753:33: replace > with >= in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:753:33: replace > with < in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:771:9: replace ConstraintCatalog::validate_routes -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:779:32: replace > with == in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:776:46: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:779:32: replace > with < in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:779:32: replace > with >= in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:792:28: replace > with == in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:792:28: replace > with < in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:792:28: replace > with >= in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:804:21: replace && with || in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:802:35: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:803:38: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:804:39: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:2247:17: delete field allowed from struct PolicyDecision expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2255:17: delete field context from struct PolicyRequest expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2267:25: delete field principal from struct PolicyRequest expression in Broker<A>::evaluate

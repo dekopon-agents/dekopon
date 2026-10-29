@@ -1,0 +1,12 @@
+crates/dekopon-broker-protocol/src/lib.rs:76:9: replace SessionRefusal::from_error -> Result<Self, dekopon_core::IdentifierError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:1831:9: replace BrokerClient::run -> Result<RunResponse, ClientError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:1924:9: replace BrokerClient::invoke -> Result<AssetInvocationOutcome, ClientError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:2085:9: replace BrokerClient::generation -> Result<GenerationOutcome, ClientError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:2163:9: replace BrokerClient::connect -> Result<UnixStream, ClientError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:2192:9: replace BrokerClient::connect_once -> Result<UnixStream, ClientError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:2224:5: replace refusal_before_credentials -> ClientError with Default::default()
+crates/dekopon-broker-protocol/src/lib.rs:2232:9: replace && with || in refusal_before_credentials
+crates/dekopon-broker-protocol/src/lib.rs:2225:9: replace && with || in refusal_before_credentials
+crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::new()
+crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::from_iter([Ok(())])
+crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::new(Ok(()))

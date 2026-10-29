@@ -1,0 +1,12 @@
+- lib.rs:123:42 crates/dekopon-policy/src/lib.rs:123:42: replace * with +
+- lib.rs:185:9 crates/dekopon-policy/src/lib.rs:185:9: replace PolicyWorld::principals -> impl Iterator<Item =&PrincipalId> with ::std::iter::empty()
+- lib.rs:189:9 crates/dekopon-policy/src/lib.rs:189:9: replace PolicyWorld::providers -> impl Iterator<Item =&ProviderId> with ::std::iter::empty()
+- lib.rs:193:9 crates/dekopon-policy/src/lib.rs:193:9: replace PolicyWorld::capabilities -> impl Iterator<Item =(&CapabilityId, &ProviderId)> with ::std::iter::empty()
+- lib.rs:203:9 crates/dekopon-policy/src/lib.rs:203:9: replace PolicyWorld::secrets -> impl Iterator<Item =&SecretDrn> with ::std::iter::empty()
+- lib.rs:539:9 crates/dekopon-policy/src/lib.rs:539:9: replace UnresolvedKind::label -> &'static str with ""
+- lib.rs:539:9 crates/dekopon-policy/src/lib.rs:539:9: replace UnresolvedKind::label -> &'static str with "xyzzy"
+- lib.rs:644:39 crates/dekopon-policy/src/lib.rs:644:39: replace > with == in PolicyEngine::build
+- lib.rs:889:21 crates/dekopon-policy/src/lib.rs:889:21: replace || with && in apply_annotated_ids
+- lib.rs:889:41 crates/dekopon-policy/src/lib.rs:889:41: replace > with == in apply_annotated_ids
+- request.rs:39:9 crates/dekopon-policy/src/request.rs:39:9: replace OpaqueBody::label -> &'static str with ""
+- request.rs:39:9 crates/dekopon-policy/src/request.rs:39:9: replace OpaqueBody::label -> &'static str with "xyzzy"
