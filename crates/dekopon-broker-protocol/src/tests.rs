@@ -3060,3 +3060,455 @@ fn a_frame_with_an_unknown_key_is_refused() {
     assert!(absent.github.is_none());
     assert_eq!(serde_json::to_vec(&absent).unwrap(), original);
 }
+
+#[test]
+fn a_traceparent_field_of_the_wrong_width_is_refused() {
+    for wrong_width in [
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7ab-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-001",
+    ] {
+        assert_eq!(
+            wrong_width.parse::<TraceParent>(),
+            Err(TraceParentError::Malformed),
+            "{wrong_width}"
+        );
+    }
+}
+
+#[test]
+fn trace_flags_survive_a_traceparent_round_trip() {
+    let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+        .parse::<TraceParent>()
+        .expect("valid traceparent");
+    assert_eq!(unsampled.flags(), 0);
+    assert_eq!(sample_trace_parent().flags(), 1);
+}
+
+#[test]
+fn an_unmapped_subject_error_decodes_to_unmapped_subject() {
+    assert_eq!(
+        super::SessionRefusal::from_error("unmapped-subject", "anything").unwrap(),
+        super::SessionRefusal::UnmappedSubject
+    );
+}
+
+#[test]
+fn a_string_over_its_bound_is_refused_by_deserialize() {
+    let delivered = DeliveredTurnRequest::new(
+        "invoke-test".parse().expect("valid invocation fixture"),
+        sample_trace_parent(),
+        DeliveryIdentity::Github {
+            delivery: "delivery-1".to_owned(),
+        },
+        String::new(),
+        DeliveredAnswer::accepted_by_transport("a".repeat(64 * 1024 + 1)),
+    );
+    let bytes = serde_json::to_vec(&delivered).expect("request serializes");
+    assert!(serde_json::from_slice::<DeliveredTurnRequest>(&bytes).is_err());
+}
+
+#[test]
+fn a_delivery_identity_never_prints_its_contents() {
+    let delivery = DeliveryIdentity::Github {
+        delivery: "delivery-secret-1".to_owned(),
+    };
+    assert_eq!(format!("{delivery:?}"), "DeliveryIdentity([REDACTED])");
+}
+
+#[test]
+fn a_signed_service_decimal_field_keeps_its_canonical_text() {
+    let telegram = |chat: &str| {
+        serde_json::from_value::<DeliveryIdentity>(
+            json!({"kind": "telegram", "chat": chat, "message": "7"}),
+        )
+    };
+    let Ok(DeliveryIdentity::Telegram { chat, .. }) = telegram("-1001234") else {
+        panic!("a canonical negative chat id decodes");
+    };
+    assert_eq!(chat, "-1001234");
+    for refused in ["0", "+1", "01", "abc", ""] {
+        assert!(telegram(refused).is_err(), "{refused:?}");
+    }
+}
+
+#[test]
+fn a_delivered_answer_exposes_its_text() {
+    assert_eq!(
+        DeliveredAnswer::accepted_by_transport("the answer".to_owned()).as_str(),
+        "the answer"
+    );
+}
+
+#[test]
+fn a_delivered_turn_request_exposes_the_fitted_user_text() {
+    let delivered = DeliveredTurnRequest::new(
+        "invoke-test".parse().expect("valid invocation fixture"),
+        sample_trace_parent(),
+        DeliveryIdentity::Github {
+            delivery: "delivery-1".to_owned(),
+        },
+        "what the user said".to_owned(),
+        DeliveredAnswer::accepted_by_transport("the answer".to_owned()),
+    );
+    assert_eq!(delivered.user(), "what the user said");
+}
+
+#[test]
+fn an_asset_index_reports_its_value() {
+    assert_eq!(super::AssetIndex::try_from(2).expect("in range").get(), 2);
+}
+
+#[test]
+fn a_frame_limit_outside_the_hard_bounds_is_refused() {
+    for max_frame_bytes in [0, super::HARD_MAX_FRAME_BYTES + 1] {
+        let limits = FrameLimits {
+            max_frame_bytes,
+            ..FrameLimits::default()
+        };
+        assert!(
+            matches!(
+                limits.validate(),
+                Err(ProtocolError::InvalidFrameLimit { .. })
+            ),
+            "{max_frame_bytes}"
+        );
+    }
+}
+
+#[test]
+fn a_generation_digest_is_exactly_sixty_four_lowercase_hex_digits() {
+    let request = |digest: String| BrokerRequest::CommitGeneration { digest };
+    assert!(request("a1".repeat(32)).validate().is_ok());
+    for malformed in [
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        format!("{}g", "a".repeat(63)),
+        String::new(),
+    ] {
+        assert!(
+            matches!(
+                request(malformed.clone()).validate(),
+                Err(ProtocolError::InvalidGenerationDigest)
+            ),
+            "{malformed}"
+        );
+    }
+    for operation in [
+        BrokerRequest::PrepareGeneration {
+            digest: "A".repeat(64),
+        },
+        BrokerRequest::AbortGeneration {
+            digest: "A".repeat(64),
+        },
+    ] {
+        assert!(matches!(
+            operation.validate(),
+            Err(ProtocolError::InvalidGenerationDigest)
+        ));
+    }
+}
+
+#[test]
+fn canonical_conversation_text_refuses_what_is_not_canonical() {
+    use super::conversation::{canonical_meta_decimal, canonical_signed_decimal};
+
+    for (text, signed) in [
+        ("5", true),
+        ("-5", true),
+        ("0", false),
+        ("+1", false),
+        ("05", false),
+        ("five", false),
+        ("", false),
+    ] {
+        assert_eq!(canonical_signed_decimal(text), signed, "{text:?}");
+    }
+    let too_long = "1".repeat(65);
+    for (text, meta) in [
+        ("16034700182", true),
+        ("", false),
+        ("0123", false),
+        ("12a4", false),
+        (too_long.as_str(), false),
+    ] {
+        assert_eq!(canonical_meta_decimal(text), meta, "{text:?}");
+    }
+}
+
+#[test]
+fn a_telegram_thread_conversation_requires_a_thread_part() {
+    let subject: dekopon_core::ExternalSubject = "telegram.5551234".parse().expect("subject");
+    let without = conversation(ConversationKind::Thread, None, "-1001234", None);
+    let with = conversation(ConversationKind::Thread, None, "-1001234", Some("7"));
+    assert!(!without.is_canonical_for(ChatTransportKind::Telegram, &subject));
+    assert!(with.is_canonical_for(ChatTransportKind::Telegram, &subject));
+}
+
+#[test]
+fn a_local_transport_has_no_thread_form() {
+    let selector = ConversationMatch {
+        kind: ConversationKindMatch::Any,
+        container: None,
+        ids: Some(vec!["room:thread".to_owned()]),
+    };
+    assert!(selector.validate(ChatTransportKind::Local).is_empty());
+}
+
+#[tokio::test]
+async fn a_shutdown_stream_delivers_eof_to_the_peer() {
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::UnixStream,
+    };
+
+    let (ours, mut peer) = UnixStream::pair().expect("socket pair");
+    let mut stream = super::DescriptorStream::new(ours);
+    stream.shutdown().await.expect("shutdown");
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut rest))
+        .await
+        .expect("the peer sees the half-close")
+        .expect("peer read");
+    assert!(rest.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_resolved_socket_converts_into_its_path() {
+    let path = std::path::PathBuf::from("/run/dekopon/broker.sock");
+    let resolved = super::ResolvedBrokerSocket {
+        path: path.clone(),
+        tier: super::BrokerSocketTier::Explicit,
+    };
+    assert_eq!(resolved.into_path(), path);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unexpected_response_may_have_executed() {
+    assert!(super::ClientError::UnexpectedResponse.may_have_executed());
+    assert!(!super::ClientError::UnsafeSocket.may_have_executed());
+}
+
+#[cfg(unix)]
+async fn capacity_probe(code: &str) -> super::ClientError {
+    use tokio::net::UnixStream;
+
+    let (ours, mut peer) = UnixStream::pair().expect("socket pair");
+    write_frame(
+        &mut peer,
+        &ResponseEnvelope::error(code, "refused"),
+        RETRY_LIMITS,
+    )
+    .await
+    .expect("refusal frame");
+    let mut stream = super::DescriptorStream::new(ours);
+    super::refusal_before_credentials(
+        &mut stream,
+        std::io::Error::from(std::io::ErrorKind::NotConnected),
+        RETRY_LIMITS,
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_capacity_refusal_before_credentials_is_reported_as_remote() {
+    assert!(matches!(
+        capacity_probe(super::ERROR_CAPACITY_EXHAUSTED).await,
+        super::ClientError::Remote { code, .. } if code == super::ERROR_CAPACITY_EXHAUSTED
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_non_capacity_error_frame_before_credentials_is_a_peer_credentials_error() {
+    assert!(matches!(
+        capacity_probe(super::ERROR_UNAUTHENTICATED).await,
+        super::ClientError::PeerCredentials { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_connect_failure_other_than_absent_broker_is_not_retried() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::{BrokerClient, ClientError};
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind fixture"));
+    private_socket(&socket);
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777))
+        .expect("loosen the fixture directory");
+    let client = BrokerClient::new(&socket, owner(directory.path()), RETRY_LIMITS)
+        .expect("valid client limits")
+        .with_connect_window(Duration::from_secs(60));
+    let started = tokio::time::Instant::now();
+    let error = client
+        .capabilities()
+        .await
+        .expect_err("an unsafe socket is refused");
+    assert!(matches!(error, ClientError::UnsafeSocket), "{error:?}");
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
+#[cfg(unix)]
+async fn serve_one_generation_reply(
+    digest: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::net::UnixListener;
+
+    let directory = private_socket_directory();
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind broker fixture");
+    private_socket(&socket);
+    let reply = ResponseEnvelope {
+        api_version: ProtocolVersion::V1Alpha3,
+        response: super::BrokerResponse::Generation {
+            digest: digest.to_owned(),
+            outcome: super::GenerationOutcome::Applied,
+        },
+    };
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept client fixture");
+        read_frame::<_, RequestEnvelope>(&mut stream, RETRY_LIMITS)
+            .await
+            .expect("server decodes the request");
+        write_frame(&mut stream, &reply, RETRY_LIMITS)
+            .await
+            .expect("answer");
+    });
+    (directory, socket, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_generation_reply_for_the_expected_digest_returns_its_outcome() {
+    use super::{BrokerClient, GenerationOutcome};
+
+    let digest = "a".repeat(64);
+    let (directory, socket, server) = serve_one_generation_reply(&digest).await;
+    let client = BrokerClient::new(&socket, owner(directory.path()), RETRY_LIMITS).expect("client");
+    assert_eq!(
+        client
+            .commit_generation(digest)
+            .await
+            .expect("matching reply"),
+        GenerationOutcome::Applied
+    );
+    server.await.expect("server fixture");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_generation_reply_for_another_digest_is_an_unexpected_response() {
+    use super::{BrokerClient, ClientError};
+
+    let (directory, socket, server) = serve_one_generation_reply(&"b".repeat(64)).await;
+    let client = BrokerClient::new(&socket, owner(directory.path()), RETRY_LIMITS).expect("client");
+    let error = client
+        .commit_generation("a".repeat(64))
+        .await
+        .expect_err("another digest's reply is refused");
+    assert!(
+        matches!(error, ClientError::UnexpectedResponse),
+        "{error:?}"
+    );
+    server.await.expect("server fixture");
+}
+
+#[cfg(unix)]
+fn too_many_descriptors() -> super::InvokeAssets {
+    super::InvokeAssets {
+        descriptors: (0..=super::MAX_ASSET_DESCRIPTORS)
+            .map(|_| {
+                std::fs::File::open("/dev/null")
+                    .expect("open fixture")
+                    .into()
+            })
+            .collect(),
+        ..super::InvokeAssets::default()
+    }
+}
+
+#[cfg(unix)]
+fn unreachable_client() -> (tempfile::TempDir, super::BrokerClient) {
+    let directory = private_socket_directory();
+    let client = super::BrokerClient::new(
+        &directory.path().join("absent.sock"),
+        owner(directory.path()),
+        RETRY_LIMITS,
+    )
+    .expect("client");
+    (directory, client)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_with_more_asset_descriptors_than_the_limit_is_refused_before_send() {
+    use super::{ClientError, ExchangePhase, RunRequest};
+
+    let (_directory, client) = unreachable_client();
+    let error = client
+        .run(
+            None,
+            RunRequest {
+                invocation: "run-test".parse().expect("valid invocation fixture"),
+                trace_parent: sample_trace_parent(),
+                word: "probe".to_owned(),
+                argv: Vec::new(),
+            },
+            too_many_descriptors(),
+            async |_upcall| unreachable!(),
+        )
+        .await
+        .err()
+        .expect("six descriptors are refused");
+    assert!(
+        matches!(
+            error,
+            ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source: ProtocolError::TooManyDescriptors
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_invoke_with_more_asset_descriptors_than_the_limit_is_refused_before_send() {
+    use super::{ClientError, ExchangePhase};
+
+    let (_directory, client) = unreachable_client();
+    let error = client
+        .invoke(
+            None,
+            invocation(),
+            too_many_descriptors(),
+            async |_upcall| unreachable!(),
+        )
+        .await
+        .err()
+        .expect("six descriptors are refused");
+    assert!(
+        matches!(
+            error,
+            ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source: ProtocolError::TooManyDescriptors
+            }
+        ),
+        "{error:?}"
+    );
+}
