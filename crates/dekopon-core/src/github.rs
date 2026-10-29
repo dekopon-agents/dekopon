@@ -801,7 +801,8 @@ impl GithubBatch {
     }
     pub fn note(&self) -> String {
         let mut lines = self.0.iter().map(GithubEvent::note).collect::<Vec<_>>();
-        lines.push("Read current checks and head through a broker-granted capability before acting. No associated PR means report only.".to_owned());
+        lines.push("No associated PR means report only.".to_owned());
+        lines.push("Read current state through a broker-granted capability before acting. Call wake_reason for every fact.".to_owned());
         lines.join("\n")
     }
 }

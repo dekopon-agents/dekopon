@@ -666,3 +666,89 @@ async fn a_dispatcher_ignored_delivery_keeps_its_receipt_trace() {
     assert_eq!(records[0]["github.deliveries"], json!(["removed-route"]));
     assert_eq!(records[0]["parent.span.id"], receipt);
 }
+
+#[tokio::test(start_paused = true)]
+async fn wake_reason_returns_the_batch_the_claim_carries() {
+    use dekopon_core::github::GithubEvent;
+    let models = InterruptibleModel::new([
+        answer("lead"),
+        super::wake_reason::call(),
+        answer("reported"),
+    ]);
+    let mut fixture = fixture(Arc::new(Arc::clone(&models)), 1).await;
+    let mut sessions = tokio::task::JoinSet::new();
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "lead",
+            "issue_comment",
+            &body("issue_comment", 7, 1)
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    models.wait_until_entered().await;
+    for (id, event) in [
+        ("first", "issue_comment"),
+        ("second", "pull_request_review"),
+    ] {
+        assert_eq!(
+            post(&mut fixture, &mut sessions, id, event, &body(event, 7, 1)).await,
+            axum::http::StatusCode::OK
+        );
+    }
+    models.release();
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    let (_, encoded) = models
+        .prompt(2)
+        .into_iter()
+        .rev()
+        .find(|(role, _)| role == "tool")
+        .expect("the result reaches the model");
+    let value: Value = serde_json::from_str(&encoded).expect("wake_reason returns JSON");
+    assert_eq!(value["trigger"], "webhook");
+    assert_eq!(value["source"], "github");
+    let events: Vec<GithubEvent> = serde_json::from_value(value["events"].clone()).unwrap();
+    let claims: Vec<_> = fixture
+        .broker
+        .recorded()
+        .into_iter()
+        .filter_map(|request| match request.request {
+            BrokerRequest::Capabilities {
+                attestation: Some(claim),
+            } => claim.scope.and_then(|scope| scope.github),
+            BrokerRequest::Capabilities { attestation: None }
+            | BrokerRequest::Run { .. }
+            | BrokerRequest::Invoke { .. }
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::UpcallResult { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => None,
+        })
+        .collect();
+    assert_eq!(claims.len(), 2, "inspection opens no extra broker leg");
+    let frame_events: Vec<GithubEvent> =
+        serde_json::from_value(serde_json::to_value(&claims[1]).unwrap()).unwrap();
+    assert_eq!(events, frame_events);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.delivery.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    let note = models
+        .prompt(1)
+        .into_iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(note.find("delivery first.").unwrap() < note.find("delivery second.").unwrap());
+    assert!(note.ends_with("Read current state through a broker-granted capability before acting. Call wake_reason for every fact."));
+}

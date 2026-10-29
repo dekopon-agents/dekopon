@@ -64,6 +64,18 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   is independent of `with_agent_config`: it names the calling agent on every `accounting.model.turn`
   record, whether or not the route also offers `inspect_agent_config`; an embedder that never calls
   it gets no `agent` field on the record rather than a guessed one.
+- `meta::WakeReasonView` — the typed JSON returned by the no-argument `wake_reason`
+  tool. `SessionInputs::wake_reason(&WakeReasonView)` supplies it; without a view
+  the tool is absent. Every gateway session supplies a view, independently of
+  `inspectAgentConfig`; the console and TUI supply none. Its `trigger` is `chat`,
+  `webhook`, `wake` or `job`. Chat includes `transportKind`, the broker's principal
+  name or null, `admission` (`new` for fresh admission, `followUp` for a dequeued
+  turn), and `steers`, the consumed person-entry count. Notices and unread steers
+  do not increment it. Webhooks carry `source: github` and the same typed event
+  array as the claim, in arrival order. Wakes carry a `w-` ID and `scheduledBy`
+  principal name or null; jobs carry a `j-` ID. Chat and wake have no subject or
+  conversation fields. Each call returns JSON with the current steer count;
+  inspection spends no capability call and grants no authority.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls

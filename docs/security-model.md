@@ -70,9 +70,17 @@ Cedar sees one delivery at a time as optional `context.github`. Repository-set f
 
 The six classifications cover actor login versus stable numeric ID; PR draft and issue/PR state; run/check status, conclusion and path; deployment details; discussion category/answered; and review state. Author-only detail that is not a policy fact is dropped. Trust an actor by `actor.id`, never by its chosen login. Policies must not permit on a label an issue template can apply: an outsider selecting a template can receive its labels and assignees.
 
-Facts keep GitHub's case. Cedar `==` is case-sensitive, so a forbid on `"none"` never matches `NONE`. Actions and other words admit `[A-Za-z0-9_.:-]{1,64}`. Out-of-bound discussion categories and repository-dispatch actions are absent, including CJK category slugs and dispatch names with spaces. Optional malformed facts disappear, invalid set elements are dropped, and unknown payload fields are ignored; only missing or malformed required facts refuse the delivery.
+Facts keep GitHub's case, except repository names, which are lowercase. Cedar `==` is case-sensitive, so a forbid on `"none"` never matches `NONE`. Actions and other words admit `[A-Za-z0-9_.:-]{1,64}`. Out-of-bound discussion categories and repository-dispatch actions are absent, including CJK category slugs and dispatch names with spaces. Optional malformed facts disappear, invalid set elements are dropped, and unknown payload fields are ignored; only missing or malformed required facts refuse the delivery.
 
 Titles, bodies, comment/review text, commit messages and lists, dispatch inputs, URLs, secret values and location text, and run/job/check names never reach Cedar, the GitHub note or `wake_reason`. Facts do not change policy digests. The agent must still read current checks, reviews and head through broker-granted capabilities before acting.
+
+Every gateway session offers `wake_reason`, a no-argument view of the turn's
+trigger. Its GitHub events are the same bounded typed facts carried on the
+claim, in arrival order, and remain unverified claims of current repository
+state. Chat and wake views expose no identity beyond the broker-mapped principal
+name (or null): no canonical subject, conversation, channel, container or thread
+ID. Wake and job IDs identify the scheduled work only. The tool grants nothing
+and calls no broker; embedders that supply no view do not offer it.
 
 ## Current local process boundary
 

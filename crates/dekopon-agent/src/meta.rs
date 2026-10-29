@@ -1,8 +1,79 @@
-//! Deliberately has no field for a principal, subject, policy source or ID, execution constraint,
-//! legacy credential map, model endpoint, chat token, or broker path, so an embedder cannot
-//! accidentally populate one.
+use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_core::{PrincipalId, github::GithubEvent};
+use dekopon_process::JobId;
+use serde::{Serialize, Serializer};
 
-use serde::Serialize;
+use crate::wake::WakeId;
+
+#[derive(Serialize)]
+#[serde(
+    tag = "trigger",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum WakeReasonView {
+    Chat {
+        transport_kind: ChatTransportKind,
+        principal: Option<PrincipalId>,
+        admission: Admission,
+        steers: u32,
+    },
+    Webhook {
+        source: WebhookSource,
+        events: Vec<GithubEvent>,
+    },
+    Wake {
+        #[serde(serialize_with = "serialize_wake_id")]
+        wake: WakeId,
+        scheduled_by: Option<PrincipalId>,
+    },
+    Job {
+        #[serde(serialize_with = "serialize_job_id")]
+        job: JobId,
+    },
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Admission {
+    New,
+    FollowUp,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookSource {
+    Github,
+}
+
+fn serialize_wake_id<S: Serializer>(id: &WakeId, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!("w-{id}"))
+}
+
+fn serialize_job_id<S: Serializer>(id: &JobId, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!("j-{id}"))
+}
+
+impl WakeReasonView {
+    pub(crate) fn tool_result(&self, steers: u32) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Chat {
+                transport_kind,
+                principal,
+                admission,
+                ..
+            } => serde_json::to_string(&Self::Chat {
+                transport_kind: *transport_kind,
+                principal: principal.clone(),
+                admission: *admission,
+                steers,
+            }),
+            Self::Webhook { .. } | Self::Wake { .. } | Self::Job { .. } => {
+                serde_json::to_string(self)
+            }
+        }
+    }
+}
 
 /// Bounds the tool result since agent instructions can be arbitrarily large; an oversized view
 /// returns a fixed diagnostic with none of the actual content, not a partial or unbounded copy.
@@ -55,6 +126,9 @@ pub struct SkillView {
     pub resources: Vec<String>,
 }
 
+/// Deliberately has no field for a principal, subject, policy source or ID, execution constraint,
+/// legacy credential map, model endpoint, chat token, or broker path, so an embedder cannot
+/// accidentally populate one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfigView {
@@ -191,6 +265,39 @@ mod tests {
                 risk: "Low".to_owned(),
             }],
         )
+    }
+
+    #[test]
+    fn wake_reason_ids_and_null_names_have_the_model_json_shape() {
+        use super::{Admission, WakeReasonView};
+        use crate::wake::WakeId;
+        use dekopon_broker_protocol::ChatTransportKind;
+        use dekopon_process::JobId;
+        for (view, expected) in [
+            (
+                WakeReasonView::Chat {
+                    transport_kind: ChatTransportKind::Local,
+                    principal: None,
+                    admission: Admission::New,
+                    steers: 0,
+                },
+                serde_json::json!({"trigger":"chat","transportKind":"local","principal":null,"admission":"new","steers":3}),
+            ),
+            (
+                WakeReasonView::Wake {
+                    wake: WakeId(42),
+                    scheduled_by: None,
+                },
+                serde_json::json!({"trigger":"wake","wake":"w-42","scheduledBy":null}),
+            ),
+            (
+                WakeReasonView::Job { job: JobId::new(9) },
+                serde_json::json!({"trigger":"job","job":"j-9"}),
+            ),
+        ] {
+            let value: Value = serde_json::from_str(&view.tool_result(3).unwrap()).unwrap();
+            assert_eq!(value, expected);
+        }
     }
 
     #[test]

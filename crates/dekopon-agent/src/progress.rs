@@ -185,7 +185,9 @@ impl FailureClass {
             PromptError::Cancelled
             | PromptError::Model(InferenceError::Cancelled | InferenceError::OverBudget(_)) => None,
             PromptError::MaxSteps { .. } => Some(Self::StepBudget),
-            PromptError::ZeroSteps => Some(Self::Internal),
+            PromptError::ZeroSteps | PromptError::WakeReasonSerialization(_) => {
+                Some(Self::Internal)
+            }
             PromptError::Model(_)
             | PromptError::UnknownTool(_)
             | PromptError::TooManyToolCalls { .. }
@@ -193,6 +195,7 @@ impl FailureClass {
             | PromptError::InvalidArguments { .. }
             | PromptError::ArgumentsNotObject { .. }
             | PromptError::AgentConfigArgumentsNotEmpty { .. }
+            | PromptError::WakeReasonArgumentsNotEmpty { .. }
             | PromptError::DeclineReplyArgumentsNotEmpty { .. }
             | PromptError::MissingCommand { .. }
             | PromptError::MissingAssetId { .. }

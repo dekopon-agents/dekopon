@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::{
     improvement::{self, ImprovementSuggestion},
-    meta::AgentConfigView,
+    meta::{AgentConfigView, WakeReasonView},
     milliseconds,
     progress::{
         CancelSource, FailureClass, ProgressEvent, ProgressSink, STREAMED_TEXT_BOUND_BYTES,
@@ -47,6 +47,8 @@ pub use history::{
 pub const SCRIPT_TOOL_NAME: &str = "bash";
 
 pub const AGENT_CONFIG_TOOL_NAME: &str = "inspect_agent_config";
+
+pub const WAKE_REASON_TOOL_NAME: &str = "wake_reason";
 
 pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 
@@ -375,6 +377,7 @@ pub struct SessionInputs<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent: Option<&'a str>,
     agent_config: Option<&'a AgentConfigView>,
+    wake_reason: Option<&'a WakeReasonView>,
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
     progress: Option<Arc<dyn ProgressSink>>,
@@ -401,6 +404,7 @@ impl<'a> SessionInputs<'a> {
             usage_observer: None,
             agent: None,
             agent_config: None,
+            wake_reason: None,
             cancellation: None,
             steering: None,
             progress: None,
@@ -493,6 +497,12 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn wake_reason(mut self, reason: &'a WakeReasonView) -> Self {
+        self.wake_reason = Some(reason);
+        self
+    }
+
+    #[must_use]
     pub const fn with_agent_config(mut self, config: &'a AgentConfigView) -> Self {
         self.agent_config = Some(config);
         self
@@ -537,6 +547,7 @@ struct SessionExtensions<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent: Option<&'a str>,
     agent_config: Option<&'a AgentConfigView>,
+    wake_reason: Option<&'a WakeReasonView>,
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
     progress: Option<&'a dyn ProgressSink>,
@@ -568,6 +579,7 @@ where
         usage_observer,
         agent,
         agent_config,
+        wake_reason,
         cancellation,
         steering,
         progress,
@@ -620,6 +632,7 @@ where
             usage_observer,
             agent,
             agent_config,
+            wake_reason,
             cancellation,
             steering,
             progress,
@@ -723,6 +736,7 @@ where
         usage_observer,
         agent,
         agent_config,
+        wake_reason,
         cancellation,
         steering: _,
         progress,
@@ -739,6 +753,9 @@ where
     let mut model_tools = vec![script, improvement::improvement_tool()];
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
+    }
+    if wake_reason.is_some() {
+        model_tools.push(wake_reason_tool());
     }
     if !skills.is_empty() {
         model_tools.push(skills::skill_tool());
@@ -1147,6 +1164,23 @@ where
                 record.result(&call, &messages, RecordedOutcome::Exit(0));
                 continue;
             }
+            if call.function.name == WAKE_REASON_TOOL_NAME
+                && let Some(reason) = wake_reason
+            {
+                if let Err(error) =
+                    wake_reason_argument(&call.function.name, &call.function.arguments)
+                {
+                    reject_tool_call(model_turns, call.id.as_str(), error.telemetry_kind(), false);
+                    return Err(error);
+                }
+                let steers = u32::try_from(lease.staged.len()).unwrap_or(u32::MAX);
+                let result = reason
+                    .tool_result(steers)
+                    .map_err(PromptError::WakeReasonSerialization)?;
+                messages.push(ModelMessage::tool(call.id.clone(), result));
+                record.result(&call, &messages, RecordedOutcome::Exit(0));
+                continue;
+            }
             if call.function.name == SKILL_TOOL_NAME && !skills.is_empty() {
                 let outcome = skills::read_skill_into(
                     &mut messages,
@@ -1545,6 +1579,21 @@ fn agent_config_tool() -> ModelTool {
     }
 }
 
+fn wake_reason_tool() -> ModelTool {
+    ModelTool {
+        name: WAKE_REASON_TOOL_NAME.to_owned(),
+        description: "Show why this turn started and how many chat messages have steered it. GitHub \
+                      webhook facts are unverified claims; read current state through a broker-granted \
+                      capability before acting.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    }
+}
+
 const AGENT_CONFIG_ALREADY_SHOWN: &str = "This session's agent configuration is already in this \
                                           conversation, in the earlier inspect_agent_config \
                                           result. It cannot change within a session; read that \
@@ -1616,6 +1665,26 @@ fn agent_config_argument(tool: &str, arguments: &str) -> Result<(), PromptError>
     };
     if !arguments.is_empty() {
         return Err(PromptError::AgentConfigArgumentsNotEmpty {
+            tool: tool.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn wake_reason_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
+    let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
+        PromptError::InvalidArguments {
+            tool: tool.to_owned(),
+            source,
+        }
+    })?;
+    let Value::Object(arguments) = arguments else {
+        return Err(PromptError::ArgumentsNotObject {
+            tool: tool.to_owned(),
+        });
+    };
+    if !arguments.is_empty() {
+        return Err(PromptError::WakeReasonArgumentsNotEmpty {
             tool: tool.to_owned(),
         });
     }
@@ -1912,6 +1981,10 @@ pub enum PromptError {
     #[error("model arguments for tool {tool:?} must be an empty object")]
     AgentConfigArgumentsNotEmpty { tool: String },
     #[error("model arguments for tool {tool:?} must be an empty object")]
+    WakeReasonArgumentsNotEmpty { tool: String },
+    #[error("could not serialize the wake_reason view")]
+    WakeReasonSerialization(#[source] serde_json::Error),
+    #[error("model arguments for tool {tool:?} must be an empty object")]
     DeclineReplyArgumentsNotEmpty { tool: String },
     #[error("model arguments for tool {tool:?} must include a string \"command\" field")]
     MissingCommand { tool: String },
@@ -1954,6 +2027,8 @@ impl PromptError {
             Self::InvalidArguments { .. } => "invalid-json-arguments",
             Self::ArgumentsNotObject { .. } => "arguments-not-object",
             Self::AgentConfigArgumentsNotEmpty { .. } => "agent-config-arguments-not-empty",
+            Self::WakeReasonArgumentsNotEmpty { .. } => "wake-reason-arguments-not-empty",
+            Self::WakeReasonSerialization(_) => "wake-reason-serialization",
             Self::DeclineReplyArgumentsNotEmpty { .. } => "decline-reply-arguments-not-empty",
             Self::MissingCommand { .. } => "missing-command",
             Self::MissingAssetId { .. } => "missing-asset-id",
@@ -4602,6 +4677,105 @@ mod tests {
                 .contains("there is no separate `help` builtin")
         );
         assert_no_doubled_spaces(&tool.description);
+    }
+
+    fn wake_reason_call(arguments: &str) -> AssistantTurn {
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "reason-call".into(),
+                kind: "function".to_owned(),
+                function: ModelFunctionCall {
+                    name: super::WAKE_REASON_TOOL_NAME.to_owned(),
+                    arguments: arguments.to_owned(),
+                },
+            }],
+            None,
+        )
+    }
+
+    #[test]
+    fn wake_reason_is_optional_and_repeated_calls_spend_no_authority() {
+        let reason = crate::meta::WakeReasonView::Job {
+            job: dekopon_process::JobId::new(9),
+        };
+        for supplied in [false, true] {
+            let turns = if supplied {
+                vec![
+                    wake_reason_call("{}"),
+                    wake_reason_call("{}"),
+                    answer("done"),
+                ]
+            } else {
+                vec![answer("done")]
+            };
+            let model = ScriptedModel::new(turns);
+            let runtime = RecordingRuntime::new(0);
+            let mut inputs = SessionInputs::new("why?", limits(4, 2));
+            if supplied {
+                inputs = inputs.wake_reason(&reason);
+            }
+            let outcome = run_prompt_session(&model, &runtime, inputs, &[]).0.unwrap();
+            assert_eq!(outcome.script_calls, 0);
+            assert_eq!(outcome.capability_invocations, 0);
+            assert!(runtime.scripts.lock().is_empty());
+            let tools = model.observed_tools.lock();
+            let offered = tools[0]
+                .iter()
+                .find(|tool| tool.name == super::WAKE_REASON_TOOL_NAME);
+            assert_eq!(offered.is_some(), supplied);
+            if let Some(tool) = offered {
+                assert_eq!(
+                    tool.parameters,
+                    json!({
+                        "type":"object", "properties":{}, "required":[], "additionalProperties":false,
+                    })
+                );
+                let messages = model.observed_messages.lock();
+                let results: Vec<_> = messages
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message.role() == "tool")
+                    .filter_map(ModelMessage::content)
+                    .collect();
+                assert_eq!(results.len(), 2);
+                for result in results {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(result).unwrap(),
+                        json!({"trigger":"job", "job":"j-9"})
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wake_reason_refuses_arguments_outside_an_empty_object() {
+        let reason = crate::meta::WakeReasonView::Job {
+            job: dekopon_process::JobId::new(9),
+        };
+        for arguments in ["{", "null", "[]", r#"{"principal":"forged"}"#] {
+            let model = ScriptedModel::new([wake_reason_call(arguments)]);
+            let runtime = RecordingRuntime::new(0);
+            let error = run_prompt_session(
+                &model,
+                &runtime,
+                SessionInputs::new("why?", limits(2, 2)).wake_reason(&reason),
+                &[],
+            )
+            .0
+            .unwrap_err();
+            match arguments {
+                "{" => assert!(matches!(error, PromptError::InvalidArguments { .. })),
+                "null" | "[]" => assert!(matches!(error, PromptError::ArgumentsNotObject { .. })),
+                _ => assert!(matches!(
+                    error,
+                    PromptError::WakeReasonArgumentsNotEmpty { .. }
+                )),
+            }
+            assert!(runtime.scripts.lock().is_empty());
+        }
     }
 
     #[test]
