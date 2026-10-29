@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -41,10 +44,16 @@ pub(crate) fn space_wake(message: &InboundMessage) -> bool {
         }
 }
 
-pub(crate) struct ReviewSubscriptions {
-    pub(crate) anchor: Anchor,
-    pub(crate) store: Arc<WakeStore>,
-    pub(crate) links: crate::pull_request_links::PullRequestLinkContext,
+pub(crate) enum ReviewSubscriptions {
+    Subscribe {
+        anchor: Box<Anchor>,
+        store: Arc<WakeStore>,
+        links: crate::pull_request_links::PullRequestLinkContext,
+    },
+    Refresh {
+        target: crate::pull_request_links::PullRequestLinkTarget,
+        refreshed: Arc<AtomicBool>,
+    },
 }
 
 impl ReviewSubscriptions {
@@ -68,7 +77,11 @@ impl ReviewSubscriptions {
         {
             return result;
         }
-        for target in &self.links.targets {
+        let targets = match self {
+            Self::Subscribe { links, .. } => links.targets.as_slice(),
+            Self::Refresh { target, .. } => std::slice::from_ref(target),
+        };
+        for target in targets {
             let (owner, repo) = target.coordinates();
             if input
                 .get("owner")
@@ -80,10 +93,19 @@ impl ReviewSubscriptions {
                     .is_some_and(|actual| actual.eq_ignore_ascii_case(repo))
                 && input.get("number").and_then(serde_json::Value::as_u64)
                     == Some(u64::from(target.number))
-                && let Err(error) =
-                    self.store
-                        .subscribe(self.anchor.clone(), target.clone(), SystemTime::now())
             {
+                let (anchor, store) = match self {
+                    Self::Refresh { refreshed, .. } => {
+                        refreshed.store(true, Ordering::Release);
+                        continue;
+                    }
+                    Self::Subscribe { anchor, store, .. } => (anchor, store),
+                };
+                let Err(error) =
+                    store.subscribe(anchor.as_ref().clone(), target.clone(), SystemTime::now())
+                else {
+                    continue;
+                };
                 tracing::info!(
                     audit.event = "gateway.admission",
                     admission.trigger = "pr-subscription",
@@ -231,8 +253,22 @@ impl Anchor {
         )
     }
 
-    pub(crate) fn inbound(&self, id: WakeId, text: String, notice: String) -> InboundMessage {
-        self.inbound_message(MessageId::Wake { id, notice }, text, self.scheduled_in)
+    pub(crate) fn inbound(
+        &self,
+        id: WakeId,
+        text: String,
+        notice: String,
+        subscription: Option<crate::pull_request_links::PullRequestLinkTarget>,
+    ) -> InboundMessage {
+        self.inbound_message(
+            MessageId::Wake {
+                id,
+                notice,
+                subscription,
+            },
+            text,
+            self.scheduled_in,
+        )
     }
 
     fn inbound_message(

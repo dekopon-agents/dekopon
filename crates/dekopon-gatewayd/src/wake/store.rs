@@ -165,14 +165,15 @@ impl Fired {
     }
 
     pub(crate) fn into_inbound(self) -> InboundMessage {
-        let text = match self.subscription {
+        let text = match &self.subscription {
             Some(target) => format!(
-                "[gateway: PR subscription wake] Re-review https://github.com/{}/pull/{} at its current head using granted tools. Read the prior review and current diff; submit a fresh head-pinned COMMENT review. Decide whether the blocking findings changed. Reply in this Slack thread only if they changed; otherwise call decline_chat_reply after the review. This turn runs as the space alone; no person's grants are available.",
+                "[gateway: PR subscription wake] Re-review https://github.com/{}/pull/{} at its current head using granted tools. Read the prior review and current diff; submit a fresh head-pinned COMMENT review. Decide whether the blocking findings changed. After successfully refreshing this PR's review, reply in this Slack thread only if they changed; otherwise call decline_chat_reply. Capability work without a successful refresh requires a Slack report. This turn runs as the space alone; no person's grants are available.",
                 target.repository, target.number
             ),
             None => self.text,
         };
-        self.anchor.inbound(self.id, text, self.notice)
+        self.anchor
+            .inbound(self.id, text, self.notice, self.subscription)
     }
 }
 

@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -2736,15 +2736,28 @@ async fn session_turn(
     }
     drop(sink);
     let space_access = leg.space_grants().is_some() && !is_subscription;
-    let subscriptions = if route.wakes && space_access {
+    let review_refreshed = is_subscription.then(|| Arc::new(AtomicBool::new(false)));
+    let subscriptions = if let (
+        Some(refreshed),
+        MessageId::Wake {
+            subscription: Some(target),
+            ..
+        },
+    ) = (&review_refreshed, &message.message_id)
+    {
+        Some(crate::wake::ReviewSubscriptions::Refresh {
+            target: target.clone(),
+            refreshed: Arc::clone(refreshed),
+        })
+    } else if route.wakes && space_access {
         message
             .pull_request_links
             .as_ref()
             .zip(runner.wakes.as_ref())
             .zip(Anchor::from_inbound(message, &route.agent).and_then(|anchor| anchor.as_space()))
             .map(
-                |((links, store), anchor)| crate::wake::ReviewSubscriptions {
-                    anchor,
+                |((links, store), anchor)| crate::wake::ReviewSubscriptions::Subscribe {
+                    anchor: Box::new(anchor),
                     store: Arc::clone(store),
                     links: links.clone(),
                 },
@@ -3066,8 +3079,8 @@ async fn session_turn(
             if progress_notes {
                 inputs = inputs.with_progress_notes();
             }
-            if is_subscription {
-                inputs = inputs.with_quiet_review();
+            if let Some(refreshed) = review_refreshed.as_deref() {
+                inputs = inputs.with_quiet_review(refreshed);
             } else if reply_optional {
                 inputs = inputs.with_optional_reply();
             }
@@ -3269,7 +3282,7 @@ async fn session_turn(
                 "gateway.session.failed"
             );
             (
-                if is_follow {
+                if is_follow || is_subscription {
                     Terminal::Answered(OutboundReply::text(UNREPORTED_WORK_REPLY.to_owned()))
                 } else {
                     Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned())

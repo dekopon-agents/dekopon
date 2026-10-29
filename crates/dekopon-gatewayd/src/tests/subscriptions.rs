@@ -121,8 +121,8 @@ fn only_a_confirmed_review_of_a_link_target_creates_a_space_subscription() {
     use dekopon_shell::CapabilityCallResult;
     let directory = temporary();
     let store = wakes::wake_store(directory.path());
-    let observer = crate::wake::ReviewSubscriptions {
-        anchor: subscription_anchor(),
+    let observer = crate::wake::ReviewSubscriptions::Subscribe {
+        anchor: Box::new(subscription_anchor()),
         store: Arc::clone(&store),
         links: PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
             .unwrap()
@@ -208,6 +208,13 @@ fn subscription_wake() -> InboundMessage {
     message.message_id = MessageId::Wake {
         id: dekopon_agent::wake::WakeId(1),
         notice: "review".into(),
+        subscription: Some(
+            PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
+                .unwrap()
+                .unwrap()
+                .targets
+                .remove(0),
+        ),
     };
     message.thread_continuation = None;
     message
@@ -372,5 +379,145 @@ async fn busy_and_sealed_subscription_wakes_remain_audited_without_slack_http_ca
                 .len(),
             1
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_review_that_refreshed_no_review_cannot_decline_after_capability_work() {
+    for max_steps in [2, 3] {
+        let directory = temporary();
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            vec![
+                probe_listing(),
+                upper_proposal("done"),
+                ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([
+            script_call("probe upper --text done"),
+            decline_reply(),
+            answer("I ran a capability but refreshed no GitHub review."),
+        ]);
+        let running = runner(broker, Arc::clone(&models), 4);
+        let http = spawn_http_mock(slack_handler(Vec::new()));
+        let transport = slack_with(
+            &http.base,
+            SlackExperience::Classic,
+            LivenessConfig::default(),
+        );
+        let mut bound = route(model_config());
+        bound.transport = "scientist-slack".into();
+        bound.wakes = true;
+        bound.limits.max_steps = max_steps;
+        run_session(running, bound, subscription_wake(), transport.driver()).await;
+        assert_eq!(models.requests(), max_steps as usize);
+        let mut invocations = 0;
+        while let Ok(request) = observed.try_recv() {
+            if let BrokerRequest::Run { word, .. } = request.request {
+                assert_eq!(word, "probe");
+                invocations += 1;
+            }
+        }
+        assert_eq!(invocations, 1);
+        let posts = http
+            .calls()
+            .into_iter()
+            .filter(|(path, _)| path == "/api/chat.postMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 1);
+        let body: Value = serde_json::from_str(&posts[0].1).unwrap();
+        assert_eq!(
+            body["text"],
+            if max_steps == 2 {
+                crate::session::UNREPORTED_WORK_REPLY
+            } else {
+                "I ran a capability but refreshed no GitHub review."
+            }
+        );
+    }
+}
+
+#[test]
+fn only_a_successful_review_of_the_subscribed_target_confirms_a_refresh() {
+    use dekopon_shell::CapabilityCallResult;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let refreshed = Arc::new(AtomicBool::new(false));
+    let observer = crate::wake::ReviewSubscriptions::Refresh {
+        target: PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
+            .unwrap()
+            .unwrap()
+            .targets
+            .remove(0),
+        refreshed: Arc::clone(&refreshed),
+    };
+    let target = json!({"owner":"acme","repo":"widget","number":17});
+    for (capability, input, outcome) in [
+        (
+            "other.write",
+            target.clone(),
+            CapabilityCallResult::Succeeded,
+        ),
+        (
+            "gh.pull-request.comment",
+            target.clone(),
+            CapabilityCallResult::Failed {
+                error: "failed".into(),
+                detail: None,
+            },
+        ),
+        (
+            "gh.pull-request.comment",
+            target.clone(),
+            CapabilityCallResult::Denied {
+                reason: "policy".into(),
+            },
+        ),
+        (
+            "gh.pull-request.comment",
+            target.clone(),
+            CapabilityCallResult::Exited {
+                status: std::num::NonZeroU8::new(1).unwrap(),
+                stderr: "failed".into(),
+            },
+        ),
+        (
+            "gh.pull-request.comment",
+            target.clone(),
+            CapabilityCallResult::NotFound,
+        ),
+        (
+            "gh.pull-request.comment",
+            json!({"owner":"acme","repo":"widget","number":18}),
+            CapabilityCallResult::Succeeded,
+        ),
+        (
+            "gh.pull-request.comment",
+            json!({"owner":"acme","repo":"other","number":17}),
+            CapabilityCallResult::Succeeded,
+        ),
+        (
+            "gh.pull-request.comment",
+            json!({"owner":"other","repo":"widget","number":17}),
+            CapabilityCallResult::Succeeded,
+        ),
+    ] {
+        assert_eq!(
+            observer.reviewed(capability, &input, outcome.clone()),
+            outcome
+        );
+        assert!(!refreshed.load(Ordering::Acquire));
+    }
+    for outcome in [
+        CapabilityCallResult::Succeeded,
+        CapabilityCallResult::SucceededWithStderr("notice".into()),
+    ] {
+        refreshed.store(false, Ordering::Release);
+        assert_eq!(
+            observer.reviewed("gh.pull-request.comment", &target, outcome.clone()),
+            outcome
+        );
+        assert!(refreshed.load(Ordering::Acquire));
     }
 }

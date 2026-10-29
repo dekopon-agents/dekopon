@@ -87,6 +87,7 @@ pub(crate) enum MessageId {
     Wake {
         id: WakeId,
         notice: String,
+        subscription: Option<crate::pull_request_links::PullRequestLinkTarget>,
     },
     Job {
         id: dekopon_process::JobId,
