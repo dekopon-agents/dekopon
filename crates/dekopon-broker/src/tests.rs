@@ -2365,7 +2365,12 @@ fn an_attestor_grant_needs_each_field_valid() {
         );
     }
 
-    for namespace in ["slack.t0123abc.u9xyz", "tel.16034700182"] {
+    let long_repository = format!("github.dekopon-agents.{}", "r".repeat(60));
+    for namespace in [
+        "slack.t0123abc.u9xyz",
+        "tel.16034700182",
+        long_repository.as_str(),
+    ] {
         AttestorGrant {
             namespaces: Some(vec![namespace.to_owned()]),
         }
