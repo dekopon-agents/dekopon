@@ -3444,7 +3444,7 @@ fn too_many_descriptors() -> super::InvokeAssets {
 fn unreachable_client() -> (tempfile::TempDir, super::BrokerClient) {
     let directory = private_socket_directory();
     let client = super::BrokerClient::new(
-        &directory.path().join("absent.sock"),
+        directory.path().join("absent.sock"),
         owner(directory.path()),
         RETRY_LIMITS,
     )
@@ -3458,7 +3458,7 @@ async fn a_run_with_more_asset_descriptors_than_the_limit_is_refused_before_send
     use super::{ClientError, ExchangePhase, RunRequest};
 
     let (_directory, client) = unreachable_client();
-    let error = client
+    let Err(error) = client
         .run(
             None,
             RunRequest {
@@ -3471,8 +3471,9 @@ async fn a_run_with_more_asset_descriptors_than_the_limit_is_refused_before_send
             async |_upcall| unreachable!(),
         )
         .await
-        .err()
-        .expect("six descriptors are refused");
+    else {
+        panic!("six descriptors are refused");
+    };
     assert!(
         matches!(
             error,
@@ -3499,8 +3500,7 @@ async fn an_invoke_with_more_asset_descriptors_than_the_limit_is_refused_before_
             async |_upcall| unreachable!(),
         )
         .await
-        .err()
-        .expect("six descriptors are refused");
+        .expect_err("six descriptors are refused");
     assert!(
         matches!(
             error,
