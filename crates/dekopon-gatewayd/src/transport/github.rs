@@ -265,15 +265,8 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
             return webhook::content_free(StatusCode::OK);
         }
     };
-    if !root.get("repository").is_some_and(Value::is_object) {
-        ignored(state, &delivery, "no-repository");
-        return webhook::content_free(StatusCode::OK);
-    }
-    if let Some(name) = root.pointer("/repository/name").and_then(Value::as_str)
-        && !SubjectService::Github
-            .admits_segment(SubjectSegment::Subject, &name.to_ascii_lowercase())
-    {
-        ignored(state, &delivery, "not-listed");
+    if let Some(reason) = repository_ignore_reason(&root) {
+        ignored(state, &delivery, reason);
         return webhook::content_free(StatusCode::OK);
     }
     let Some(entry) = parse(&root, event_kind, &delivery) else {
@@ -356,6 +349,19 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
             refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE)
         }
     }
+}
+
+fn repository_ignore_reason(root: &Value) -> Option<&'static str> {
+    if !root.get("repository").is_some_and(Value::is_object) {
+        return Some("no-repository");
+    }
+    root.pointer("/repository/name")
+        .and_then(Value::as_str)
+        .filter(|name| {
+            !SubjectService::Github
+                .admits_segment(SubjectSegment::Subject, &name.to_ascii_lowercase())
+        })
+        .map(|_| "not-listed")
 }
 
 fn ignored(state: &StateData, delivery: &str, reason: &str) {
@@ -703,19 +709,12 @@ pub(crate) mod tests {
     }
 
     fn review_payload(family: GithubEvent) -> Value {
-        let fixture = match family {
-            GithubEvent::PullRequestReview => {
-                include_str!("../../tests/fixtures/github-reviews/pull_request_review.json")
-            }
-            GithubEvent::PullRequestReviewComment => {
-                include_str!("../../tests/fixtures/github-reviews/pull_request_review_comment.json")
-            }
-            GithubEvent::PullRequestReviewThread => {
-                include_str!("../../tests/fixtures/github-reviews/pull_request_review_thread.json")
-            }
-            _ => panic!("review family"),
-        };
-        serde_json::from_str(fixture).expect("documented webhook payload")
+        let name = serde_json::to_value(family).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/github-reviews")
+            .join(format!("{}.json", name.as_str().unwrap()));
+        serde_json::from_slice(&std::fs::read(path).expect("documented webhook fixture"))
+            .expect("documented webhook payload")
     }
 
     #[test]
