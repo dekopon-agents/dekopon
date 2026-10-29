@@ -2200,3 +2200,1413 @@ fn a_chat_route_needs_each_storage_attribute_to_match() {
         );
     }
 }
+
+fn chat_scope(
+    kind: dekopon_broker_protocol::ChatTransportKind,
+    conversation_kind: dekopon_broker_protocol::ConversationKind,
+    trigger: dekopon_broker_protocol::Trigger,
+) -> dekopon_broker_protocol::ChatScopeClaim {
+    dekopon_broker_protocol::ChatScopeClaim {
+        participant: None,
+        github: None,
+        transport: "scientist-slack".parse().expect("transport"),
+        kind,
+        conversation: dekopon_broker_protocol::Conversation {
+            kind: conversation_kind,
+            container: Some("t0123abc".to_owned()),
+            id: "c0123abc".to_owned(),
+            thread: None,
+        },
+        delivery: None,
+        trigger,
+    }
+}
+
+fn attested_agent_context(
+    subject: &str,
+    scope: dekopon_broker_protocol::ChatScopeClaim,
+) -> AuthenticatedContext {
+    AuthenticatedContext::attested_chat(
+        "maintainer".parse().expect("principal"),
+        Actor::Agent {
+            agent: "reviewer".parse().expect("agent"),
+        },
+        "gateway".parse().expect("via"),
+        subject.parse().expect("subject"),
+        scope,
+    )
+    .expect("attested context")
+}
+
+#[test]
+fn each_effect_and_risk_level_encodes_to_its_own_authority_tag() {
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+
+    let effects = [
+        EffectKind::ReadOnly,
+        EffectKind::LocalWrite,
+        EffectKind::ExternalWrite,
+    ]
+    .map(super::effect_tag);
+    let risks = [
+        RiskLevel::Low,
+        RiskLevel::Medium,
+        RiskLevel::High,
+        RiskLevel::Critical,
+    ]
+    .map(super::risk_tag);
+    assert_eq!(
+        effects
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        effects.len()
+    );
+    assert_eq!(
+        risks
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        risks.len()
+    );
+}
+
+#[test]
+fn a_secret_map_revision_must_be_nonempty_unpadded_control_free_and_bounded() {
+    use super::{BrokerBuildError, SecretCatalog};
+
+    let overlong = "r".repeat(1_000);
+    for revision in [
+        "",
+        overlong.as_str(),
+        " padded",
+        "padded ",
+        "bell\u{7}inside",
+        "tab\tinside",
+    ] {
+        assert!(
+            matches!(
+                SecretCatalog::empty().with_authority_revision(revision.to_owned()),
+                Err(BrokerBuildError::InvalidSecretMapRevision)
+            ),
+            "{revision:?}"
+        );
+    }
+    let longest_accepted = "r".repeat(128);
+    for revision in ["rev-1", longest_accepted.as_str()] {
+        let catalog = SecretCatalog::empty()
+            .with_authority_revision(revision.to_owned())
+            .unwrap_or_else(|error| panic!("{revision:?}: {error}"));
+        assert_eq!(catalog.authority_revision(), Some(revision));
+    }
+}
+
+#[test]
+fn an_attestor_grant_needs_each_field_valid() {
+    use super::{AttestorGrant, BrokerBuildError};
+
+    let too_many = AttestorGrant {
+        namespaces: Some(vec![
+            "slack.t0123abc".to_owned();
+            super::MAX_POLICY_SCOPE_ENTRIES + 5
+        ]),
+    };
+    let one_segment_too_deep = AttestorGrant {
+        namespaces: Some(vec!["slack.t0123abc.u9xyz.u9xyz".to_owned()]),
+    };
+    for grant in [too_many, one_segment_too_deep] {
+        assert!(
+            matches!(
+                grant.validate(),
+                Err(BrokerBuildError::InvalidAttestorScope { .. })
+            ),
+            "{grant:?}"
+        );
+    }
+}
+
+#[test]
+fn an_audit_error_names_its_category() {
+    assert_eq!(AuditError::Full { maximum: 1 }.category(), "full");
+}
+
+#[test]
+fn the_denying_principal_and_github_denier_record_distinct_values() {
+    use super::{DenyingPrincipal, GithubDenier};
+
+    assert_eq!(DenyingPrincipal::Asker.as_str(), "asker");
+    assert_eq!(DenyingPrincipal::Space.as_str(), "space");
+    assert_eq!(DenyingPrincipal::Both.as_str(), "both");
+    assert_eq!(GithubDenier::Facts.as_str(), "facts");
+    assert_eq!(GithubDenier::AuthorSet.as_str(), "author-set");
+}
+
+#[test]
+fn each_storage_host_error_maps_to_its_public_category() {
+    use dekopon_storage_host::StorageHostError;
+
+    for (source, expected) in [
+        (StorageHostError::QuotaExceeded, "storage-quota"),
+        (StorageHostError::Busy, "storage-busy"),
+        (StorageHostError::Timeout, "storage-timeout"),
+        (StorageHostError::corrupt("test"), "storage-corrupt"),
+        (
+            StorageHostError::CorruptLayout {
+                path: "layout".into(),
+            },
+            "storage-corrupt",
+        ),
+        (StorageHostError::Io, "storage-io"),
+    ] {
+        assert_eq!(
+            public_host_error(&BrokerHostError::Storage { source }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn a_turn_started_by_a_non_person_attested_subject_is_not_credited_to_a_person() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let scope = || {
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        )
+    };
+    let person = attested_agent_context("slack.t0123abc.u9xyz", scope());
+    let space = attested_agent_context("slack.t0123abc.c0123abc", scope());
+    assert_eq!(
+        super::turn_started_by(&person),
+        Some(super::TurnStartedBy::Person)
+    );
+    assert_eq!(
+        super::turn_started_by(&space),
+        Some(super::TurnStartedBy::Message)
+    );
+}
+
+#[test]
+fn audit_records_carry_delivery_and_actor_kind_and_id() {
+    use dekopon_broker_protocol::DeliveryIdentity;
+
+    let local = DeliveryIdentity::Local {
+        transport: "local-dev".parse().expect("transport"),
+        conversation: "session".to_owned(),
+        boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+        connection: 3,
+        sequence: 9,
+    };
+    let message = |message: &str| message.to_owned();
+    for (delivery, kind, id) in [
+        (
+            DeliveryIdentity::Fauxlack {
+                channel: "c1".to_owned(),
+                message: message("m-faux"),
+            },
+            "fauxlack",
+            "m-faux",
+        ),
+        (
+            DeliveryIdentity::Slack {
+                channel: "c1".to_owned(),
+                timestamp: "1712345678.000100".to_owned(),
+            },
+            "slack",
+            "1712345678.000100",
+        ),
+        (
+            DeliveryIdentity::Discord {
+                channel: "c1".to_owned(),
+                message: message("m-discord"),
+            },
+            "discord",
+            "m-discord",
+        ),
+        (
+            DeliveryIdentity::Telegram {
+                chat: "-100".to_owned(),
+                topic: None,
+                message: message("77"),
+            },
+            "telegram",
+            "77",
+        ),
+        (
+            DeliveryIdentity::Whatsapp {
+                waba: "1".to_owned(),
+                phone_number: "2".to_owned(),
+                message: message("wamid.ABC"),
+            },
+            "whatsapp",
+            "wamid.ABC",
+        ),
+        (
+            DeliveryIdentity::Github {
+                delivery: "guid-1".to_owned(),
+            },
+            "github",
+            "guid-1",
+        ),
+        (local, "local", "0123456789abcdef0123456789abcdef-3-9"),
+    ] {
+        assert_eq!(super::delivery_kind(&delivery), kind);
+        assert_eq!(super::delivery_id(&delivery), id);
+    }
+
+    let principal: PrincipalId = "maintainer".parse().expect("principal");
+    let agent: AgentId = "reviewer".parse().expect("agent");
+    for (actor, kind, id) in [
+        (
+            Actor::Human {
+                principal: principal.clone(),
+            },
+            "human",
+            "maintainer",
+        ),
+        (
+            Actor::Service {
+                principal: principal.clone(),
+            },
+            "service",
+            "maintainer",
+        ),
+        (Actor::Agent { agent }, "agent", "reviewer"),
+    ] {
+        assert_eq!(super::actor_kind(&actor), kind);
+        assert_eq!(super::actor_id(&actor), id);
+    }
+}
+
+#[test]
+fn a_rendered_evidence_value_is_absent_when_it_is_empty_or_null() {
+    assert_eq!(super::rendered(&vec!["a"]).as_deref(), Some(r#"["a"]"#));
+    assert_eq!(super::rendered(&Vec::<String>::new()), None);
+    assert_eq!(super::rendered(&None::<u8>), None);
+    assert_eq!(super::rendered(&Some(5)).as_deref(), Some("5"));
+}
+
+#[test]
+fn the_outcome_evidence_digest_is_the_digest_of_the_outcome() {
+    let invocation: InvocationId = "invoke-digest".parse().expect("invocation");
+    let digest = super::outcome_evidence_digest(&invocation, "outcome", &"ok").expect("digest");
+    assert!(digest.starts_with("sha256:") && digest.len() == "sha256:".len() + 64);
+    assert_ne!(
+        digest,
+        super::outcome_evidence_digest(&invocation, "outcome", &"other").expect("digest")
+    );
+}
+
+fn permit(principal: &str, action: &str, kind: &str, resource: &str) -> String {
+    format!(
+        r#"@id("{principal}-{action}") permit(principal == Dekopon::Principal::"{principal}",
+            action == Dekopon::Action::"{action}", resource == Dekopon::{kind}::"{resource}");"#
+    )
+}
+
+const SECRET_DRN: &str = "drn:com.xrl:secret:test:http-probe/token";
+
+fn capability_policy(permitted: &[(&str, &str)]) -> String {
+    permitted
+        .iter()
+        .map(|(capability, provider)| permit("maintainer", capability, "Provider", provider))
+        .collect()
+}
+
+fn memory_route_sets() -> Vec<(CapabilityId, ConstraintSet)> {
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+
+    [
+        (
+            "memory.chat.record",
+            CapabilityRoute::ChatMemoryRecord,
+            EffectKind::LocalWrite,
+            RiskLevel::Medium,
+            StorageAccess::ReadWrite,
+        ),
+        (
+            "memory.chat.recent",
+            CapabilityRoute::ChatMemoryRecent,
+            EffectKind::ReadOnly,
+            RiskLevel::High,
+            StorageAccess::ReadOnly,
+        ),
+        (
+            "memory.chat.search",
+            CapabilityRoute::ChatMemorySearch,
+            EffectKind::ReadOnly,
+            RiskLevel::High,
+            StorageAccess::ReadOnly,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, route, effect, risk, access)| {
+        (
+            name.parse().expect("capability"),
+            ConstraintSet {
+                route,
+                provider: "memory".parse().expect("provider"),
+                effect,
+                risk,
+                ..storage_set(
+                    "memory",
+                    StorageInterface::Jsonl,
+                    access,
+                    StorageScope::PrivateConversation,
+                    Default::default(),
+                    None,
+                )
+            },
+        )
+    })
+    .collect()
+}
+
+fn http_probe_set() -> ConstraintSet {
+    ConstraintSet {
+        default_secret_use: None,
+        route: CapabilityRoute::Generic,
+        provider: "http-probe".parse().expect("provider"),
+        effect: dekopon_capability::EffectKind::ReadOnly,
+        risk: dekopon_core::RiskLevel::Low,
+        credential: None,
+        constraints: ExecutionConstraints {
+            http: Some(HttpConstraints {
+                allowed_hosts: vec!["127.0.0.1:1".to_owned()],
+                allowed_methods: vec!["GET".to_owned()],
+                max_requests: 1,
+                max_request_bytes: 4_096,
+                max_response_bytes: 4_096,
+                allow_plaintext_loopback: true,
+                propagate_trace: false,
+                request_templates: Vec::new(),
+                signed_download: None,
+            }),
+            ..ExecutionConstraints::default()
+        },
+    }
+}
+
+fn cli_probe_set(
+    effect: dekopon_capability::EffectKind,
+    risk: dekopon_core::RiskLevel,
+) -> ConstraintSet {
+    ConstraintSet {
+        default_secret_use: None,
+        route: CapabilityRoute::Generic,
+        provider: "cli-probe".parse().expect("provider"),
+        effect,
+        risk,
+        credential: None,
+        constraints: ExecutionConstraints::default(),
+    }
+}
+
+fn http_probe_binding() -> super::SecretUseBinding {
+    super::SecretUseBinding {
+        binding_id: "http-probe-token".to_owned(),
+        secret: SECRET_DRN.parse().expect("secret"),
+        capability: "http-probe.fetch".parse().expect("capability"),
+        sink: dekopon_core::SecretSinkKind::HttpBearer,
+        basic_username: None,
+        allowed_hosts: vec!["127.0.0.1:1".to_owned()],
+        allowed_methods: vec!["GET".to_owned()],
+        allowed_paths: vec![dekopon_capability::HttpPathRule::Exact {
+            path: "/api/v1/thing".to_owned(),
+        }],
+        allow_query: false,
+        max_injections: 1,
+    }
+}
+
+struct SurfaceBroker<'a> {
+    root: &'a std::path::Path,
+    policy: String,
+    constraints: Vec<(CapabilityId, ConstraintSet)>,
+    memory: bool,
+    secret_binding: Option<Option<&'a str>>,
+    identities: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> SurfaceBroker<'a> {
+    fn new(root: &'a std::path::Path, permitted: &[(&str, &str)]) -> Self {
+        Self {
+            root,
+            policy: capability_policy(permitted),
+            constraints: vec![
+                (
+                    "cli-probe.upper".parse().expect("capability"),
+                    cli_probe_set(
+                        dekopon_capability::EffectKind::ReadOnly,
+                        dekopon_core::RiskLevel::Low,
+                    ),
+                ),
+                (
+                    "cli-probe.count".parse().expect("capability"),
+                    cli_probe_set(
+                        dekopon_capability::EffectKind::ReadOnly,
+                        dekopon_core::RiskLevel::Low,
+                    ),
+                ),
+                (
+                    "http-probe.fetch".parse().expect("capability"),
+                    http_probe_set(),
+                ),
+                (
+                    "storage-probe.run".parse().expect("capability"),
+                    ConstraintSet {
+                        risk: dekopon_core::RiskLevel::Medium,
+                        ..storage_set(
+                            "storage-probe",
+                            StorageInterface::DurableFiles,
+                            StorageAccess::ReadWrite,
+                            StorageScope::PrivateConversation,
+                            Default::default(),
+                            None,
+                        )
+                    },
+                ),
+            ],
+            memory: false,
+            secret_binding: None,
+            identities: Vec::new(),
+        }
+    }
+
+    fn with_identities(mut self, identities: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        self.identities = identities.into_iter().collect();
+        self
+    }
+
+    fn with_memory(mut self) -> Self {
+        self.constraints.extend(memory_route_sets());
+        self.memory = true;
+        self
+    }
+
+    fn with_secret(mut self, permitted: bool, revision: Option<&'a str>) -> Self {
+        if permitted {
+            self.policy
+                .push_str(&permit("maintainer", "secret.use", "Secret", SECRET_DRN));
+        }
+        self.secret_binding = Some(revision);
+        self
+    }
+
+    async fn build(self) -> Broker<InMemoryAuditLog> {
+        self.try_build().await.expect("broker")
+    }
+
+    async fn try_build(self) -> Result<Broker<InMemoryAuditLog>, super::BrokerBuildError> {
+        let _memoization = dekopon_broker_host::enable_test_component_memoization();
+        let storage = dekopon_storage_host::StorageHost::open(
+            self.root
+                .canonicalize()
+                .expect("canonical tempdir")
+                .join("storage"),
+            dekopon_storage_host::StorageLimits::default(),
+        )
+        .expect("storage");
+        let registry = dekopon_broker_host::BrokerProviderRegistry::load_with_storage(
+            [
+                dekopon_test_support::provider_fixture("cli-probe-provider.wasm"),
+                dekopon_test_support::provider_fixture("http-probe-provider.wasm"),
+                dekopon_test_support::provider_fixture("storage-probe-provider.wasm"),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixture/memory-smoke-probe-provider.wasm"),
+            ],
+            BrokerHostLimits::default(),
+            Some(storage),
+        )
+        .await
+        .expect("fixtures load");
+        let world = PolicyWorld::new(
+            ["maintainer".parse().expect("principal")],
+            registry
+                .capabilities()
+                .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+        )
+        .expect("world")
+        .with_secrets([SECRET_DRN.parse().expect("secret")]);
+        let mut broker = Broker::new(
+            registry,
+            "broker".parse().expect("principal"),
+            PolicyEngine::new(&self.policy, &world).expect("policy"),
+            ConstraintCatalog::new(self.constraints).expect("constraints"),
+            CredentialStore::empty(),
+            IdentityDirectory::new(self.identities.iter().map(|(subject, principal)| {
+                (
+                    subject.parse().expect("subject"),
+                    principal.parse().expect("principal"),
+                )
+            }))
+            .expect("identities"),
+            Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+            BrokerLimits::default(),
+        )?;
+        if self.memory {
+            broker = broker.with_chat_memory(valid_memory_config())?;
+        }
+        if let Some(revision) = self.secret_binding {
+            let mut secrets = super::SecretCatalog::new(
+                vec![http_probe_binding()],
+                Arc::new(super::EmptySecretResolver),
+            )
+            .expect("binding");
+            if let Some(revision) = revision {
+                secrets = secrets
+                    .with_authority_revision(revision.to_owned())
+                    .expect("revision");
+            }
+            broker = broker.with_secret_catalog(secrets)?;
+        }
+        Ok(broker)
+    }
+}
+
+fn surface(broker: &Broker<InMemoryAuditLog>, memory_route: bool) -> Vec<u8> {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    broker
+        .canonical_authority_surface(&context, StorageInterface::Jsonl, memory_route)
+        .expect("surface")
+}
+
+#[tokio::test]
+async fn the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied()
+ {
+    let dirs = [(); 6].map(|()| tempfile::tempdir().expect("tempdir"));
+    let upper = [("cli-probe.upper", "cli-probe")];
+    let broker = |index: usize, permitted: &[(&str, &str)]| {
+        SurfaceBroker::new(dirs[index].path(), permitted)
+    };
+
+    let only_upper = surface(&broker(0, &upper).build().await, false);
+    assert!(only_upper.len() > 1);
+
+    let upper_and_count = surface(
+        &broker(1, &[upper[0], ("cli-probe.count", "cli-probe")])
+            .build()
+            .await,
+        false,
+    );
+    assert_ne!(
+        upper_and_count, only_upper,
+        "an added capability rotates the generation"
+    );
+
+    let mut wrong_provider = broker(2, &upper);
+    wrong_provider.policy.push_str(&permit(
+        "maintainer",
+        "cli-probe.count",
+        "Provider",
+        "http-probe",
+    ));
+    assert_eq!(
+        surface(&wrong_provider.build().await, false),
+        only_upper,
+        "a permit that does not name the capability's provider does not make it effective"
+    );
+
+    let memory = broker(
+        3,
+        &[
+            upper[0],
+            ("memory.chat.record", "memory"),
+            ("memory.chat.recent", "memory"),
+            ("memory.chat.search", "memory"),
+        ],
+    )
+    .with_memory()
+    .build()
+    .await;
+    assert_eq!(
+        surface(&memory, false),
+        only_upper,
+        "memory routes stay out of a surface that does not serve them"
+    );
+    assert_ne!(surface(&memory, true), only_upper);
+
+    let mut space_scoped = broker(4, &[upper[0], ("cli-probe.count", "cli-probe")]);
+    space_scoped.constraints[1].1 = ConstraintSet {
+        constraints: ExecutionConstraints {
+            storage: Some(StorageConstraints {
+                interface: StorageInterface::Jsonl,
+                access: StorageAccess::ReadOnly,
+                scope: StorageScope::Space,
+                retention: Default::default(),
+                namespace: None,
+            }),
+            ..ExecutionConstraints::default()
+        },
+        ..space_scoped.constraints[1].1.clone()
+    };
+    assert_eq!(
+        surface(&space_scoped.build().await, false),
+        only_upper,
+        "a space-scoped capability is not effective without a space"
+    );
+}
+
+#[tokio::test]
+async fn the_authority_generation_changes_with_the_secret_bindings_and_map_revision() {
+    let dirs = [(); 7].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let broker = |index: usize| SurfaceBroker::new(dirs[index].path(), &fetch);
+
+    let unbound = surface(&broker(0).build().await, false);
+    let first = surface(
+        &broker(1).with_secret(true, Some("r1")).build().await,
+        false,
+    );
+    let second = surface(
+        &broker(2).with_secret(true, Some("r2")).build().await,
+        false,
+    );
+    let unrevised = surface(&broker(3).with_secret(true, None).build().await, false);
+    let denied = surface(
+        &broker(4).with_secret(false, Some("r1")).build().await,
+        false,
+    );
+
+    assert_ne!(
+        first, unbound,
+        "a usable secret binding is part of the authority"
+    );
+    assert_ne!(first, second, "the map revision is part of the authority");
+    assert_ne!(first, unrevised);
+    assert_eq!(
+        denied, unbound,
+        "a binding the policy does not permit changes no authority"
+    );
+
+    let none_effective = SurfaceBroker::new(dirs[5].path(), &[("cli-probe.upper", "cli-probe")])
+        .with_secret(true, Some("r1"))
+        .build()
+        .await;
+    assert_eq!(
+        surface(&none_effective, false),
+        surface(
+            &SurfaceBroker::new(dirs[6].path(), &[("cli-probe.upper", "cli-probe")])
+                .build()
+                .await,
+            false
+        ),
+        "a binding for a capability that is not effective changes no authority"
+    );
+}
+
+#[test]
+fn a_secret_binding_with_an_invalid_grant_is_refused_by_its_own_validation() {
+    use dekopon_capability::SecretUseGrantError;
+
+    http_probe_binding()
+        .validate()
+        .expect("the baseline binding is valid");
+    let empty_scope = super::SecretUseBinding {
+        allowed_hosts: Vec::new(),
+        ..http_probe_binding()
+    };
+    assert_eq!(empty_scope.validate(), Err(SecretUseGrantError::EmptyScope));
+}
+
+#[test]
+fn secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constraint() {
+    use super::{BrokerBuildError, SecretCatalog, SecretUseBinding};
+
+    fn broker_error(binding: SecretUseBinding) -> Option<BrokerBuildError> {
+        let constraints = ConstraintCatalog::new([
+            (
+                "http-probe.fetch".parse().expect("capability"),
+                http_probe_set(),
+            ),
+            (
+                "cli-probe.upper".parse().expect("capability"),
+                cli_probe_set(
+                    dekopon_capability::EffectKind::ReadOnly,
+                    dekopon_core::RiskLevel::Low,
+                ),
+            ),
+        ])
+        .expect("constraints");
+        SecretCatalog::new(vec![binding], Arc::new(super::EmptySecretResolver))
+            .expect("a well-formed binding builds")
+            .validate(&constraints)
+            .err()
+    }
+
+    assert!(broker_error(http_probe_binding()).is_none());
+    assert!(matches!(
+        broker_error(SecretUseBinding {
+            capability: "missing.capability".parse().expect("capability"),
+            ..http_probe_binding()
+        }),
+        Some(BrokerBuildError::SecretBindingUnknownCapability { .. })
+    ));
+    assert!(matches!(
+        broker_error(SecretUseBinding {
+            capability: "cli-probe.upper".parse().expect("capability"),
+            ..http_probe_binding()
+        }),
+        Some(BrokerBuildError::SecretBindingWithoutHttp { .. })
+    ));
+    for (name, binding) in [
+        (
+            "more injections than the capability may send requests",
+            SecretUseBinding {
+                max_injections: 2,
+                ..http_probe_binding()
+            },
+        ),
+        (
+            "a host the capability does not allow",
+            SecretUseBinding {
+                allowed_hosts: vec!["127.0.0.1:2".to_owned()],
+                ..http_probe_binding()
+            },
+        ),
+        (
+            "a method the capability does not allow",
+            SecretUseBinding {
+                allowed_methods: vec!["POST".to_owned()],
+                ..http_probe_binding()
+            },
+        ),
+    ] {
+        assert!(
+            matches!(
+                broker_error(binding),
+                Some(BrokerBuildError::SecretBindingExceedsCapability { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn validate_set_constraints_refuses_each_inconsistent_constraint_set() {
+    use super::{BrokerBuildError, validate_set_constraints};
+    use dekopon_capability::{AssetConstraints, EffectKind, SecretUseGrant};
+
+    let valid = |set: &ConstraintSet| validate_set_constraints(set);
+    let with = |constraints: ExecutionConstraints, effect| ConstraintSet {
+        effect,
+        constraints,
+        ..cli_probe_set(EffectKind::ReadOnly, dekopon_core::RiskLevel::Low)
+    };
+    let storage = |access| StorageConstraints {
+        interface: StorageInterface::Jsonl,
+        access,
+        scope: StorageScope::PrivateConversation,
+        retention: Default::default(),
+        namespace: None,
+    };
+    let asset = |attach, remove, send| {
+        Some(AssetConstraints {
+            attach,
+            remove,
+            send,
+        })
+    };
+    let secret_use = SecretUseGrant {
+        secret: SECRET_DRN.parse().expect("secret"),
+        sink: dekopon_core::SecretSinkKind::HttpBearer,
+        basic_username: None,
+        allowed_hosts: vec!["127.0.0.1:1".to_owned()],
+        allowed_methods: vec!["GET".to_owned()],
+        allowed_paths: vec![dekopon_capability::HttpPathRule::Exact {
+            path: "/".to_owned(),
+        }],
+        allow_query: false,
+        max_injections: 1,
+        binding_id: "binding".to_owned(),
+        map_revision: None,
+    };
+
+    valid(&with(
+        ExecutionConstraints {
+            storage: Some(storage(StorageAccess::ReadWrite)),
+            asset: asset(true, false, false),
+            ..ExecutionConstraints::default()
+        },
+        EffectKind::LocalWrite,
+    ))
+    .expect("a consistent set is valid");
+
+    let storage_and_http = ExecutionConstraints {
+        storage: Some(storage(StorageAccess::ReadOnly)),
+        ..http_probe_set().constraints
+    };
+    let rows: Vec<(&str, ConstraintSet)> = vec![
+        (
+            "a zero timeout",
+            with(
+                ExecutionConstraints {
+                    timeout_ms: 0,
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "a resolved secret use",
+            with(
+                ExecutionConstraints {
+                    secret_use: Some(secret_use),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "http beside storage",
+            with(storage_and_http, EffectKind::ReadOnly),
+        ),
+        (
+            "write access under a read-only effect",
+            with(
+                ExecutionConstraints {
+                    storage: Some(storage(StorageAccess::ReadWrite)),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "an external write over storage",
+            with(
+                ExecutionConstraints {
+                    storage: Some(storage(StorageAccess::ReadWrite)),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ExternalWrite,
+            ),
+        ),
+        (
+            "send without an external write",
+            with(
+                ExecutionConstraints {
+                    asset: asset(false, false, true),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::LocalWrite,
+            ),
+        ),
+        (
+            "attach under a read-only effect",
+            with(
+                ExecutionConstraints {
+                    asset: asset(true, false, false),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "remove under a read-only effect",
+            with(
+                ExecutionConstraints {
+                    asset: asset(false, true, false),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+    ];
+    for (name, set) in rows {
+        assert!(
+            matches!(valid(&set), Err(BrokerBuildError::InvalidPolicyConstraints)),
+            "{name}"
+        );
+    }
+}
+
+fn invocation_with_input(input: serde_json::Value) -> dekopon_broker_protocol::InvocationRequest {
+    dekopon_broker_protocol::InvocationRequest {
+        id: "invoke-memory-input".parse().expect("invocation"),
+        capability: "memory.chat.recent".parse().expect("capability"),
+        trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+            .parse()
+            .expect("traceparent"),
+        input,
+        secret_use: None,
+    }
+}
+
+#[tokio::test]
+async fn memory_inputs_outside_their_limits_or_with_extra_keys_are_refused() {
+    use serde_json::json;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .build()
+        .await;
+    let curate = |route, input| {
+        let mut request = invocation_with_input(input);
+        let outcome = broker.curate_memory_input(route, &mut request);
+        (outcome, request.input)
+    };
+    let config = valid_memory_config();
+
+    let (outcome, input) = curate(CapabilityRoute::ChatMemoryRecent, json!({"last": 3}));
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(
+        input,
+        json!({
+            "operation": "recent", "last": 3,
+            "maxLookbackTurns": config.max_lookback_turns,
+            "maxRecentTurns": config.max_recent_turns,
+            "maxResultBytes": config.max_result_bytes,
+        })
+    );
+    let (outcome, input) = curate(
+        CapabilityRoute::ChatMemorySearch,
+        json!({"query": "needle"}),
+    );
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(
+        input,
+        json!({
+            "operation": "search", "query": "needle",
+            "maxLookbackTurns": config.max_lookback_turns,
+            "maxSearchResults": config.max_search_results,
+            "maxResultBytes": config.max_result_bytes,
+        })
+    );
+
+    let too_long = "q".repeat(usize::try_from(config.max_query_bytes).expect("query bytes") + 100);
+    for (name, route, input) in [
+        (
+            "zero turns",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": 0}),
+        ),
+        (
+            "more turns than the recent limit",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": u64::from(config.max_recent_turns) + 100}),
+        ),
+        (
+            "a negative count",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": -1}),
+        ),
+        (
+            "a missing count",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({}),
+        ),
+        (
+            "an extra key beside the count",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": 1, "extra": true}),
+        ),
+        (
+            "an empty query",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": ""}),
+        ),
+        (
+            "a query beyond the byte limit",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": too_long}),
+        ),
+        (
+            "a non-text query",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": 5}),
+        ),
+        (
+            "an extra key beside the query",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": "needle", "extra": true}),
+        ),
+        (
+            "a generic route",
+            CapabilityRoute::Generic,
+            json!({"query": "needle"}),
+        ),
+        (
+            "the record route",
+            CapabilityRoute::ChatMemoryRecord,
+            json!({"last": 1}),
+        ),
+    ] {
+        assert_eq!(
+            curate(route, input).0,
+            Err("invalid-memory-input"),
+            "{name}"
+        );
+    }
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let without_memory = SurfaceBroker::new(root.path(), &[]).build().await;
+    let mut request = invocation_with_input(json!({"last": 1}));
+    assert_eq!(
+        without_memory.curate_memory_input(CapabilityRoute::ChatMemoryRecent, &mut request),
+        Err("memory-unavailable")
+    );
+}
+
+#[test]
+fn merge_space_decision_ands_each_verdict_and_unions_policy_ids() {
+    use super::{DenyingPrincipal, SpaceDecision, merge_space_decision};
+
+    let decision = |asker: bool, space: bool, ids: &[&str]| SpaceDecision {
+        id: "space".parse().expect("principal"),
+        asker_allowed: Some(asker),
+        allowed: Some(space),
+        policy_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+        denied_by: None,
+    };
+    for (previous, next, asker, space, denied_by) in [
+        ((true, true), (true, true), true, true, None),
+        (
+            (true, true),
+            (false, true),
+            false,
+            true,
+            Some(DenyingPrincipal::Asker),
+        ),
+        (
+            (true, true),
+            (true, false),
+            true,
+            false,
+            Some(DenyingPrincipal::Space),
+        ),
+        (
+            (false, true),
+            (true, true),
+            false,
+            true,
+            Some(DenyingPrincipal::Asker),
+        ),
+        (
+            (true, false),
+            (true, true),
+            true,
+            false,
+            Some(DenyingPrincipal::Space),
+        ),
+        (
+            (false, false),
+            (true, true),
+            false,
+            false,
+            Some(DenyingPrincipal::Both),
+        ),
+    ] {
+        let mut merged = Some(decision(previous.0, previous.1, &["b", "a"]));
+        merge_space_decision(&mut merged, Some(decision(next.0, next.1, &["c", "a"])));
+        let merged = merged.expect("a decision");
+        assert_eq!(
+            (merged.asker_allowed, merged.allowed, merged.denied_by),
+            (Some(asker), Some(space), denied_by),
+            "{previous:?} then {next:?}"
+        );
+        assert_eq!(merged.policy_ids, ["a", "b", "c"]);
+    }
+
+    let mut kept = Some(decision(true, true, &["a"]));
+    merge_space_decision(&mut kept, None);
+    assert_eq!(kept, Some(decision(true, true, &["a"])));
+}
+
+#[test]
+fn an_identity_directory_lists_its_principals_and_the_ceiling_is_the_longest() {
+    let directory = IdentityDirectory::new([
+        (
+            "slack.t0123abc.u1".parse().expect("subject"),
+            "ann".parse().expect("principal"),
+        ),
+        (
+            "slack.t0123abc.u2".parse().expect("subject"),
+            "maintainer".parse().expect("principal"),
+        ),
+    ])
+    .expect("directory");
+    let mut principals = directory
+        .principals()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    principals.sort();
+    assert_eq!(principals, ["ann", "maintainer"]);
+}
+
+#[tokio::test]
+async fn the_capability_ceiling_lists_each_available_capability_with_its_words_and_help() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .with_identities([
+            ("slack.t0123abc.u1", "ann"),
+            ("slack.t0123abc.u2", "maintainer"),
+        ])
+        .build()
+        .await;
+
+    let (capabilities, words, help) = broker.capability_ceiling();
+    let ids = capabilities
+        .iter()
+        .map(|available| available.capability.id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "cli-probe.count",
+            "cli-probe.upper",
+            "http-probe.fetch",
+            "memory.chat.recent",
+            "memory.chat.record",
+            "memory.chat.search",
+            "storage-probe.run",
+        ]
+    );
+    for available in &capabilities {
+        let set = broker
+            .constraints
+            .get(&available.capability.id)
+            .expect("constrained");
+        assert_eq!(available.provider, set.provider);
+        assert_eq!(available.capability.effect, set.effect);
+        assert_eq!(available.capability.risk, set.risk);
+    }
+    assert!(words.iter().any(|word| word == "smokerecent"), "{words:?}");
+    assert_eq!(
+        help.keys().collect::<std::collections::BTreeSet<_>>(),
+        words.iter().collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(help.values().all(|page| !page.is_empty()));
+
+    assert_eq!(
+        broker.principal_ceiling(),
+        Some("maintainer".parse().expect("principal"))
+    );
+    assert_eq!(
+        broker.display_principal(&"slack.t0123abc.u1".parse().expect("subject")),
+        Some("ann".parse().expect("principal"))
+    );
+    let memory = broker.chat_memory_ceiling().expect("memory is configured");
+    assert_eq!(
+        memory.max_lookback_turns,
+        valid_memory_config().max_lookback_turns
+    );
+    assert_eq!(memory.prompt_note, super::MEMORY_PROMPT_NOTE);
+}
+
+#[tokio::test]
+async fn without_memory_or_identities_the_ceilings_are_absent() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[]).build().await;
+    assert_eq!(broker.principal_ceiling(), None);
+    assert_eq!(
+        broker.display_principal(&"slack.t0123abc.u1".parse().expect("subject")),
+        None
+    );
+    assert!(broker.chat_memory_ceiling().is_none());
+}
+
+#[tokio::test]
+async fn a_chat_route_and_a_storage_constrained_capability_each_use_storage() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .build()
+        .await;
+    for (capability, uses_storage) in [
+        ("memory.chat.recent", true),
+        ("storage-probe.run", true),
+        ("cli-probe.upper", false),
+        ("http-probe.fetch", false),
+        ("unconstrained.capability", false),
+    ] {
+        assert_eq!(
+            broker.capability_uses_storage(&capability.parse().expect("capability")),
+            uses_storage,
+            "{capability}"
+        );
+    }
+}
+
+fn memory_policy() -> [(&'static str, &'static str); 3] {
+    [
+        ("memory.chat.record", "memory"),
+        ("memory.chat.recent", "memory"),
+        ("memory.chat.search", "memory"),
+    ]
+}
+
+#[tokio::test]
+async fn memory_surface_requires_each_of_its_conditions() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let scope = || {
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        )
+    };
+    let broker = SurfaceBroker::new(dirs[0].path(), &memory_policy())
+        .with_memory()
+        .build()
+        .await;
+    let reviewer: AgentId = "reviewer".parse().expect("agent");
+    let stranger: AgentId = "stranger".parse().expect("agent");
+    let with_scope = attested_agent_context("slack.t0123abc.u9xyz", scope());
+    let without_scope = AuthenticatedContext::new(
+        "maintainer".parse().expect("principal"),
+        Actor::Agent {
+            agent: reviewer.clone(),
+        },
+    )
+    .expect("context");
+
+    let surface = broker
+        .memory_surface(&with_scope, &reviewer)
+        .expect("an enabled agent in a chat scope with every route permitted");
+    assert_eq!(
+        surface.max_lookback_turns,
+        valid_memory_config().max_lookback_turns
+    );
+    assert!(broker.memory_surface(&with_scope, &stranger).is_none());
+    assert!(broker.memory_surface(&without_scope, &reviewer).is_none());
+
+    let partial = SurfaceBroker::new(
+        dirs[1].path(),
+        &[
+            ("memory.chat.record", "memory"),
+            ("memory.chat.recent", "memory"),
+        ],
+    )
+    .with_memory()
+    .build()
+    .await;
+    assert!(
+        partial.memory_surface(&with_scope, &reviewer).is_none(),
+        "a surface needs all three routes permitted"
+    );
+}
+
+#[tokio::test]
+async fn reachable_providers_hides_storage_providers_outside_a_chat_scope() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .build()
+        .await;
+    let authorized = broker.constraints.iter().collect::<Vec<_>>();
+    let providers = |context: &AuthenticatedContext| {
+        broker
+            .reachable_providers(context, &authorized)
+            .into_iter()
+            .map(|provider| provider.to_string())
+            .collect::<Vec<_>>()
+    };
+    let chat = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    let direct = AuthenticatedContext::new(
+        "maintainer".parse().expect("principal"),
+        Actor::Service {
+            principal: "maintainer".parse().expect("principal"),
+        },
+    )
+    .expect("context");
+
+    assert_eq!(
+        providers(&chat),
+        ["cli-probe", "http-probe", "storage-probe"]
+    );
+    assert_eq!(providers(&direct), ["cli-probe", "http-probe"]);
+}
+
+fn entry_count(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path)
+        .expect("directory")
+        .map(|entry| {
+            let path = entry.expect("entry").path();
+            1 + if path.is_dir() { entry_count(&path) } else { 0 }
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn a_private_conversation_namespace_rotates_with_authority_and_other_scopes_do_not() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    let request = dekopon_broker_protocol::InvocationRequest {
+        capability: "storage-probe.run".parse().expect("capability"),
+        ..invocation_with_input(serde_json::json!({}))
+    };
+    for (scope, rotates) in [
+        (StorageScope::PrivateConversation, true),
+        (StorageScope::Agent, false),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sizes = Vec::new();
+        for permitted in [
+            vec![("storage-probe.run", "storage-probe")],
+            vec![
+                ("storage-probe.run", "storage-probe"),
+                ("cli-probe.upper", "cli-probe"),
+            ],
+        ] {
+            let mut broker = SurfaceBroker::new(root.path(), &permitted);
+            let run = broker
+                .constraints
+                .iter_mut()
+                .find(|(capability, _)| capability.as_str() == "storage-probe.run")
+                .expect("storage route");
+            run.1.constraints.storage.as_mut().expect("storage").scope = scope;
+            let broker = broker.build().await;
+            let set = broker
+                .constraints
+                .get(&request.capability)
+                .expect("constrained")
+                .clone();
+            let grant = broker
+                .prepare_storage_grant(&context, &request, &set)
+                .expect("grant")
+                .expect("a storage capability prepares a grant")
+                .materialize()
+                .expect("materialized");
+            drop(grant);
+            drop(broker);
+            sizes.push(entry_count(
+                &root.path().canonicalize().expect("root").join("storage"),
+            ));
+        }
+        assert_eq!(sizes[0] != sizes[1], rotates, "{scope:?}");
+    }
+}
