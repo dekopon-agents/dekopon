@@ -1243,7 +1243,10 @@ fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
 }
 
 fn provider_succeeding_after_writing_stderr() -> tempfile::NamedTempFile {
-    let manifest = stdio_probe_manifest();
+    inline_provider_declaring(&stdio_probe_manifest())
+}
+
+fn inline_provider_declaring(manifest: &str) -> tempfile::NamedTempFile {
     let wat = format!(
         r#"(component
         (import "dekopon:stdio/streams@0.1.0" (instance $streams
@@ -3756,8 +3759,7 @@ async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
 }
 
 #[tokio::test]
-async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail_and_one_that_did_not_carries_none()
- {
+async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
     use dekopon_broker_host::BrokerProviderRegistry;
     use dekopon_capability::{EffectKind, InvocationOutcome};
     use dekopon_core::RiskLevel;
@@ -3984,4 +3986,76 @@ async fn an_http_request_decision_digests_its_own_verdict_and_denial_reason() {
             ),
         ]
     );
+}
+
+#[tokio::test]
+async fn with_chat_memory_refuses_routes_whose_matching_risk_is_not_the_fixed_risk() {
+    use super::BrokerBuildError;
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+
+    let capability = |id: &str, effect: EffectKind, risk: RiskLevel| {
+        serde_json::json!({
+            "id": id,
+            "description": "Declared memory route",
+            "effect": effect,
+            "risk": risk,
+            "inputSchema": {"type": "object"}
+        })
+    };
+    let manifest = serde_json::to_string(&serde_json::json!({
+        "apiVersion": "dekopon.dev/provider/v1alpha1",
+        "id": "memory",
+        "description": "Memory routes declaring a risk the broker does not accept",
+        "commandWords": ["memrisk"],
+        "capabilities": [
+            capability("memory.chat.record", EffectKind::LocalWrite, RiskLevel::Medium),
+            capability("memory.chat.recent", EffectKind::ReadOnly, RiskLevel::Low),
+            capability("memory.chat.search", EffectKind::ReadOnly, RiskLevel::High),
+        ]
+    }))
+    .unwrap();
+    let provider = inline_provider_declaring(&manifest);
+    let root = tempfile::tempdir().expect("tempdir");
+    let storage = dekopon_storage_host::StorageHost::open(
+        root.path().canonicalize().expect("root").join("storage"),
+        dekopon_storage_host::StorageLimits::default(),
+    )
+    .expect("storage");
+    let registry = dekopon_broker_host::BrokerProviderRegistry::load_with_storage(
+        [provider.path()],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("the component loads");
+    let world = PolicyWorld::new(
+        ["maintainer".parse().expect("principal")],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("world");
+    let mut routes = memory_route_sets();
+    let recent = routes
+        .iter_mut()
+        .find(|(capability, _)| capability.as_str() == "memory.chat.recent")
+        .expect("recent route");
+    recent.1.risk = RiskLevel::Low;
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("principal"),
+        PolicyEngine::new("", &world).expect("policy"),
+        ConstraintCatalog::new(routes).expect("constraints"),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("constraints that match the declared risk start");
+
+    assert!(matches!(
+        broker.with_chat_memory(valid_memory_config()),
+        Err(BrokerBuildError::InvalidChatMemory)
+    ));
 }
