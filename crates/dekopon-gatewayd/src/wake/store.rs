@@ -152,7 +152,16 @@ impl Wake {
             record_subscription(self.id, &self.anchor, target, operation);
         }
         if self.is_digest() {
-            record_digest(self.id, operation, None);
+            let cause = match operation {
+                WakeOperation::Failed => Some("probe"),
+                WakeOperation::Expired => Some("horizon"),
+                WakeOperation::Created
+                | WakeOperation::Fired
+                | WakeOperation::Declined
+                | WakeOperation::Closed
+                | WakeOperation::Cancelled => None,
+            };
+            record_digest(self.id, operation, cause);
         }
     }
 }

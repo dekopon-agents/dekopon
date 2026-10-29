@@ -23994,3 +23994,6 @@ pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
         }
     }
 }
+
+#[path = "tests/digests.rs"]
+mod digests;

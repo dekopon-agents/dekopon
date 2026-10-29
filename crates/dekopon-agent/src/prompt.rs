@@ -378,7 +378,7 @@ enum ReplyMode<'a> {
 }
 
 impl ReplyMode<'_> {
-    fn review_refreshed(self) -> bool {
+    fn can_decline_after_work(self) -> bool {
         match self {
             Self::Required | Self::Optional => false,
             Self::QuietReview(refreshed) => refreshed.load(Ordering::Acquire),
@@ -1144,7 +1144,7 @@ where
                     decline_reply_argument(&call.function.name, &call.function.arguments)?;
                 }
             }
-            if capability_invocations == 0 || reply_mode.review_refreshed() {
+            if capability_invocations == 0 || reply_mode.can_decline_after_work() {
                 check_cancelled(cancellation)?;
                 match lease.seal() {
                     Seal::Stopped => return Err(PromptError::Cancelled),

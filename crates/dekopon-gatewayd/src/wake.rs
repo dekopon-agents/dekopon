@@ -408,6 +408,11 @@ impl Probe {
     const DIGEST_HEADER: &str = "# dekopon: daily-digest\n";
     const DIGEST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+    pub(crate) fn into_digest(mut self) -> Self {
+        self.purpose = WatchPurpose::Digest;
+        self
+    }
+
     fn minimum_interval(&self, configured: Duration) -> Duration {
         match self.purpose {
             WatchPurpose::Ordinary => configured,
@@ -639,10 +644,8 @@ impl WakeRegistrar for SessionWakes {
                         *limits,
                     )));
                 }
-                let mut probe = Probe::baseline(script, &leg, &self.shell)?;
-                if digest {
-                    probe.purpose = WatchPurpose::Digest;
-                }
+                let probe = Probe::baseline(script, &leg, &self.shell)?;
+                let probe = if digest { probe.into_digest() } else { probe };
                 self.store.register(
                     anchor,
                     note,

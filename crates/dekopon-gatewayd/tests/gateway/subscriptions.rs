@@ -56,20 +56,11 @@ permit(principal == Dekopon::Principal::"team", action == Dekopon::Action::"gh.p
     }
 
     pub(super) fn configure_gateway(&self, directory: &Path, config: &mut Value) {
-        config["sessions"]["wakes"] = json!({"path":directory.join("wakes.jsonl")});
-        for route in config["routes"].as_array_mut().unwrap() {
-            route["wakes"] = json!(true);
-        }
+        configure_wakes(directory, &self.rows, config);
         config["transports"].as_array_mut().unwrap().push(
             json!({"name":"github","kind":"githubWebhook","bind":self.address,"secretEnv":"PATH"}),
         );
         config["routes"].as_array_mut().unwrap().push(json!({"transport":"github","agent":AGENT,"githubEvents":["pull_request"],"conversation":{"kind":["thread"],"container":"acme","ids":["acme.widget","acme.unmapped"]},"memory":{"mode":"oneShot"}}));
-        let encoded = self
-            .rows
-            .iter()
-            .map(|row| format!("{row}\n"))
-            .collect::<String>();
-        write_owner_only(&directory.join("wakes.jsonl"), encoded.as_bytes());
     }
 }
 
@@ -117,7 +108,7 @@ async fn boot_subscriptions(chat: &Fauxlack, responses: Vec<Value>, settings: Se
     fixture
 }
 
-fn stored(fixture: &Fixture) -> Vec<Value> {
+pub(super) fn stored(fixture: &Fixture) -> Vec<Value> {
     fs::read_to_string(fixture.directory.path().join("wakes.jsonl"))
         .unwrap()
         .lines()
@@ -125,7 +116,7 @@ fn stored(fixture: &Fixture) -> Vec<Value> {
         .collect()
 }
 
-fn meta(id: &str, name: &str, arguments: Value) -> Value {
+pub(super) fn meta(id: &str, name: &str, arguments: Value) -> Value {
     json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]}}]})
 }
 
@@ -157,7 +148,7 @@ async fn deliver(address: SocketAddr, repo: &str, action: &str, delivery: &str) 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 }
 
-fn response(body: Value) -> Vec<u8> {
+pub(super) fn response(body: Value) -> Vec<u8> {
     let body = body.to_string();
     format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).into_bytes()
 }
@@ -181,7 +172,7 @@ fn refresh_review() -> Value {
     )
 }
 
-async fn wait_event(audit: &Audit, event: &str) {
+pub(super) async fn wait_event(audit: &Audit, event: &str) {
     tokio::time::timeout(WAIT, async {
         while audit
             .capture
