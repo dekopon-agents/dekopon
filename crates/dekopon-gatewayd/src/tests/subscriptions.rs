@@ -208,7 +208,7 @@ fn subscription_wake() -> InboundMessage {
     message.message_id = MessageId::Wake {
         id: dekopon_agent::wake::WakeId(1),
         notice: "review".into(),
-        subscription: Some(
+        origin: crate::wake::WakeOrigin::Subscription(
             PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
                 .unwrap()
                 .unwrap()

@@ -374,6 +374,7 @@ enum ReplyMode<'a> {
     Required,
     Optional,
     QuietReview(&'a AtomicBool),
+    QuietDigest,
 }
 
 impl ReplyMode<'_> {
@@ -381,13 +382,14 @@ impl ReplyMode<'_> {
         match self {
             Self::Required | Self::Optional => false,
             Self::QuietReview(refreshed) => refreshed.load(Ordering::Acquire),
+            Self::QuietDigest => true,
         }
     }
 
     const fn offered(self) -> bool {
         match self {
             Self::Required => false,
-            Self::Optional | Self::QuietReview(_) => true,
+            Self::Optional | Self::QuietReview(_) | Self::QuietDigest => true,
         }
     }
 }
@@ -565,6 +567,12 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn with_quiet_digest(mut self) -> Self {
+        self.reply_mode = ReplyMode::QuietDigest;
+        self
+    }
+
+    #[must_use]
     pub const fn with_optional_reply(mut self) -> Self {
         self.reply_mode = ReplyMode::Optional;
         self
@@ -642,6 +650,9 @@ where
     match reply_mode {
         ReplyMode::Required => {}
         ReplyMode::Optional => messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION)),
+        ReplyMode::QuietDigest => messages.push(ModelMessage::system(
+            "This is a daily space digest. Verify the waiting items through granted reads. Post one concise threaded summary only for changed, nonempty items; otherwise call decline_chat_reply, including after read work. Name GitHub logins as plain text, never Slack mentions."
+        )),
         ReplyMode::QuietReview(_) => messages.push(ModelMessage::system(
             "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. A successful refresh is your visible report: if blocking findings are unchanged, call decline_chat_reply; if they changed, reply to chat. Capability work without that successful refresh requires a chat report."
         )),

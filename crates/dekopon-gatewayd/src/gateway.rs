@@ -1039,10 +1039,8 @@ impl Gateway {
         ));
     }
 
-    /// A wake whose route no longer answers as its agent is delivered as its note, so the person still
-    /// hears what they asked to be reminded of.
     fn start_wake(&self, sessions: &mut JoinSet<()>, fired: wake::Fired) {
-        let subscription = fired.is_subscription();
+        let space = fired.is_space();
         let agent = fired.agent().clone();
         let id = fired.id();
         let message = fired.into_inbound();
@@ -1065,7 +1063,7 @@ impl Gateway {
             wake.id = %id,
             "gateway.wake.orphaned")
         });
-        if !subscription
+        if !space
             && let Some(driver) = self.drivers.get(&message.transport).cloned()
             && let MessageId::Wake { notice, .. } = &message.message_id
         {

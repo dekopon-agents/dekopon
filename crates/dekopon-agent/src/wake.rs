@@ -20,6 +20,12 @@ impl fmt::Display for WakeId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WakeRequest {
+    Digest {
+        note: String,
+        script: String,
+        every: Duration,
+        until: Duration,
+    },
     Once {
         note: String,
         after: Duration,
@@ -49,9 +55,11 @@ pub struct WatchSummary {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum WakeRefusal {
+    #[error("this space already has a daily digest; cancel it first")]
+    DigestExists,
     #[error("this agent already has {maximum} PR subscriptions; cancel one first")]
     SubscriptionsFull { maximum: usize },
-    #[error("PR subscriptions require an authorized participant in a mapped channel")]
+    #[error("space wakes require an authorized mapped channel")]
     MappedChannelRequired,
     #[error("the note is longer than {maximum} bytes")]
     NoteTooLong { maximum: usize },
@@ -62,7 +70,7 @@ pub enum WakeRefusal {
         minimum.as_secs()
     )]
     Interval { minimum: Duration },
-    #[error("this person already has {maximum} pending wakes; cancel one first")]
+    #[error("this subject already has {maximum} pending wakes; cancel one first")]
     Full { maximum: usize },
     #[error("the probe script exited {exit} on its first run, so it was not stored:\n{output}")]
     Broken { exit: u8, output: String },
@@ -78,6 +86,7 @@ impl WakeRefusal {
     #[must_use]
     pub const fn telemetry_kind(&self) -> &'static str {
         match self {
+            Self::DigestExists => "digest-exists",
             Self::SubscriptionsFull { .. } => "subscriptions-full",
             Self::MappedChannelRequired => "mapped-channel-required",
             Self::NoteTooLong { .. } => "note-too-long",
@@ -111,6 +120,12 @@ pub trait WakeRegistrar: Send + Sync {
     rename_all_fields = "camelCase"
 )]
 enum WakeCall {
+    Digest {
+        note: String,
+        script: String,
+        every_seconds: u64,
+        for_seconds: u64,
+    },
     ListSubscriptions {},
     CancelSubscription {
         id: u32,
@@ -139,14 +154,23 @@ pub(crate) fn wake_tool() -> ModelTool {
                       `everySeconds` for up to `forSeconds`, with no model: exit 0 wakes you \
                       with its output, exit 1 keeps waiting, any other exit wakes you with the \
                       failure. `$PREV` holds the previous run's output; the first run is now and \
-                      only sets it. `list` shows pending wakes; `cancel` takes an `id`. \
+                      only sets it. In mapped channels all new wakes run as the space; anyone freshly authorized \
+                      in the channel can list/cancel them. DMs keep personal wakes. \
+                      `digest` uses the watch arguments for a recurring daily digest in a mapped channel, \
+                      at least 86400 seconds apart, for at most the configured horizon (30 days by default); \
+                      state its expiry, then require a new request to renew it. Only one digest per space. \
+                      Its read-only script prints a stable sorted snapshot of open non-draft PRs inactive \
+                      seven days, outstanding review requests without an answering review, and open \
+                      unassigned issues, using granted repositories and plain GitHub logins. Omit clocks \
+                      and changing ages; emit nothing for no items and propagate read failures. \
+                      Empty/unchanged checks post nothing. `list` shows pending wakes; `cancel` takes an `id`. \
                       In a mapped channel, `listSubscriptions` lists this channel's PR subscriptions; \
                       `cancelSubscription` cancels one by `id`."
             .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["schedule", "watch", "list", "cancel", "listSubscriptions", "cancelSubscription"] },
+                "action": { "type": "string", "enum": ["schedule", "watch", "digest", "list", "cancel", "listSubscriptions", "cancelSubscription"] },
                 "note": { "type": "string", "description": "What to do when you wake." },
                 "afterSeconds": { "type": "integer", "minimum": 1 },
                 "script": { "type": "string" },
@@ -178,6 +202,13 @@ pub(crate) fn wake_into(
         }
     };
     let result = match request {
+        WakeCall::Digest { note, script, every_seconds, for_seconds } => registrar
+            .schedule(WakeRequest::Digest {
+                note, script,
+                every: Duration::from_secs(every_seconds),
+                until: Duration::from_secs(for_seconds),
+            })
+            .map(|summary| format!("Daily digest registered. It expires in {} seconds; request it again after expiry or cancellation to renew. Cancel with wake action cancel and id {}.\n{}", summary.watch.as_ref().map_or(0, |watch| watch.ends_in.as_secs()), summary.id, render(&summary))),
         WakeCall::ListSubscriptions {} => registrar.list_subscriptions().map(|summaries| {
             if summaries.is_empty() {
                 "No PR subscriptions.".to_owned()
