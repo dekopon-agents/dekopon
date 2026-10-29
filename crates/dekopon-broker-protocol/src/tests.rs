@@ -3555,7 +3555,7 @@ fn a_trailing_colon_is_not_a_thread_form() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refusing_broker_is_retried_until_the_connect_window_ends() {
     use super::{BrokerClient, ClientError};
 
