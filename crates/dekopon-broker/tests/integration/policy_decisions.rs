@@ -649,7 +649,8 @@ async fn github_facts_must_match_the_attested_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_space_wake_refuses_a_different_channel_a_dm_a_participant_or_a_message_trigger() {
+async fn a_space_wake_or_probe_refuses_a_different_channel_a_dm_a_participant_or_a_message_trigger()
+{
     let (broker, _) = space_broker(SPACE_PROMPT, "").await;
     let mut original = channel_claim(
         ChatTransportKind::Slack,
@@ -665,13 +666,25 @@ async fn a_space_wake_refuses_a_different_channel_a_dm_a_participant_or_a_messag
         |claim| claim.scope.as_mut().unwrap().participant = Some("p1".into()),
         |claim| claim.scope.as_mut().unwrap().trigger = dekopon_broker::Trigger::Message,
     ];
-    for change in changes {
-        let mut claim = original.clone();
-        change(&mut claim);
-        let (_, refusal) = broker.resolve_context(&gateway(), Some(&grant), &claim);
-        assert_eq!(
-            refusal.expect("invalid space wake refused").reason,
-            "attestation-denied"
+    for trigger in [
+        dekopon_broker::Trigger::Wake,
+        dekopon_broker::Trigger::Probe,
+    ] {
+        original.scope.as_mut().unwrap().trigger = trigger;
+        assert!(
+            broker
+                .resolve_context(&gateway(), Some(&grant), &original)
+                .1
+                .is_none()
         );
+        for change in changes {
+            let mut claim = original.clone();
+            change(&mut claim);
+            let (_, refusal) = broker.resolve_context(&gateway(), Some(&grant), &claim);
+            assert_eq!(
+                refusal.expect("invalid space turn refused").reason,
+                "attestation-denied"
+            );
+        }
     }
 }

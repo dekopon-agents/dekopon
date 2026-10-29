@@ -202,13 +202,13 @@ async fn a_subscription_wake_decline_makes_no_slack_http_calls() {
     assert!(http.calls().is_empty());
 }
 
-fn subscription_wake() -> InboundMessage {
+pub(super) fn subscription_wake() -> InboundMessage {
     let mut message = owned_slack_message("Refresh this PR and decline if unchanged.", false);
     message.subject = subscription_anchor().subject().clone();
     message.message_id = MessageId::Wake {
         id: dekopon_agent::wake::WakeId(1),
         notice: "review".into(),
-        subscription: Some(
+        origin: crate::wake::WakeOrigin::Subscription(
             PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
                 .unwrap()
                 .unwrap()

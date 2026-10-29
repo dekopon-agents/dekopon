@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
     progress::ProgressText,
+    wake::WakeOrigin,
 };
 use futures_util::future::BoxFuture;
 use thiserror::Error;
@@ -87,7 +88,7 @@ pub(crate) enum MessageId {
     Wake {
         id: WakeId,
         notice: String,
-        subscription: Option<crate::pull_request_links::PullRequestLinkTarget>,
+        origin: WakeOrigin,
     },
     Job {
         id: dekopon_process::JobId,
@@ -96,10 +97,24 @@ pub(crate) enum MessageId {
 }
 
 impl MessageId {
+    pub(crate) const fn wake_origin(&self) -> Option<&WakeOrigin> {
+        match self {
+            Self::Wake { origin, .. } => Some(origin),
+            Self::Native(_) | Self::Github(_) | Self::Follow(_) | Self::Job { .. } => None,
+        }
+    }
+
     pub(crate) const fn trigger(&self) -> Trigger {
         match self {
             Self::Native(_) | Self::Follow(_) | Self::Github(_) => Trigger::Message,
-            Self::Wake { .. } => Trigger::Wake,
+            Self::Wake {
+                origin: WakeOrigin::Digest,
+                ..
+            } => Trigger::Probe,
+            Self::Wake {
+                origin: WakeOrigin::Scheduled | WakeOrigin::Subscription(_),
+                ..
+            } => Trigger::Wake,
             Self::Job { .. } => Trigger::Job,
         }
     }

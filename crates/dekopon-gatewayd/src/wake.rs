@@ -42,6 +42,63 @@ pub(crate) fn space_wake(message: &InboundMessage) -> bool {
         }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WakeOrigin {
+    Scheduled,
+    Subscription(crate::pull_request_links::PullRequestLinkTarget),
+    Digest,
+}
+
+impl WakeOrigin {
+    pub(crate) const fn is_digest(&self) -> bool {
+        match self {
+            Self::Digest => true,
+            Self::Scheduled | Self::Subscription(_) => false,
+        }
+    }
+
+    pub(crate) const fn admission_trigger(&self) -> Option<&'static str> {
+        match self {
+            Self::Scheduled => None,
+            Self::Subscription(_) => Some("pr-subscription"),
+            Self::Digest => Some("digest"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WakeOperation {
+    Created,
+    Fired,
+    Declined,
+    Expired,
+    Failed,
+    Closed,
+    Cancelled,
+}
+
+impl WakeOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Fired => "fired",
+            Self::Declined => "declined",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+            Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+pub(crate) fn record_digest(id: WakeId, operation: WakeOperation, cause: Option<&str>) {
+    tracing::info!(
+        audit.event = "gateway.admission", admission.trigger = "digest",
+        digest.operation = operation.as_str(), wake.id = %id, wake.run_as = "space",
+        reason = cause, "gateway.admission"
+    );
+}
+
 pub(crate) enum ReviewSubscriptions {
     Subscribe {
         anchor: Box<Anchor>,
@@ -159,8 +216,8 @@ impl Anchor {
         let service = match self.kind {
             ChatTransportKind::Slack => "slack",
             ChatTransportKind::Fauxlack => "fauxlack",
-            ChatTransportKind::Discord
-            | ChatTransportKind::Telegram
+            ChatTransportKind::Discord => "discord",
+            ChatTransportKind::Telegram
             | ChatTransportKind::Whatsapp
             | ChatTransportKind::Github
             | ChatTransportKind::Local => return None,
@@ -262,14 +319,10 @@ impl Anchor {
         id: WakeId,
         text: String,
         notice: String,
-        subscription: Option<crate::pull_request_links::PullRequestLinkTarget>,
+        origin: WakeOrigin,
     ) -> InboundMessage {
         self.inbound_message(
-            MessageId::Wake {
-                id,
-                notice,
-                subscription,
-            },
+            MessageId::Wake { id, notice, origin },
             text,
             self.scheduled_in,
         )
@@ -346,14 +399,59 @@ impl Anchor {
 pub(crate) struct Probe {
     script: String,
     prev: String,
+    purpose: WatchPurpose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchPurpose {
+    Ordinary,
+    Digest,
 }
 
 impl Probe {
+    const DIGEST_HEADER: &str = "# dekopon: daily-digest\n";
+    const DIGEST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+    pub(crate) fn into_digest(mut self) -> Self {
+        self.purpose = WatchPurpose::Digest;
+        self
+    }
+
+    fn minimum_interval(&self, configured: Duration) -> Duration {
+        match self.purpose {
+            WatchPurpose::Ordinary => configured,
+            WatchPurpose::Digest => configured.max(Self::DIGEST_INTERVAL),
+        }
+    }
+
+    fn encoded_script(&self) -> String {
+        match self.purpose {
+            WatchPurpose::Ordinary => self.script.clone(),
+            WatchPurpose::Digest => format!("{}{}", Self::DIGEST_HEADER, self.script),
+        }
+    }
+
+    fn decode(script: String, prev: String, space: bool) -> Self {
+        if space && let Some(script) = script.strip_prefix(Self::DIGEST_HEADER) {
+            return Self {
+                script: script.to_owned(),
+                prev,
+                purpose: WatchPurpose::Digest,
+            };
+        }
+        Self {
+            script,
+            prev,
+            purpose: WatchPurpose::Ordinary,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn scripted_for_test(script: &str) -> Self {
         Self {
             script: script.to_owned(),
             prev: String::new(),
+            purpose: WatchPurpose::Ordinary,
         }
     }
 
@@ -362,10 +460,16 @@ impl Probe {
         leg: &dyn CapabilityInvoker,
         shell: &Interpreter,
     ) -> Result<Self, WakeRefusal> {
+        let script = if script.starts_with(Self::DIGEST_HEADER) {
+            format!("\n{script}")
+        } else {
+            script
+        };
         match Verdict::from(shell.run(&script, leg)) {
             Verdict::Fire { output } | Verdict::Wait { output } => Ok(Self {
                 script,
                 prev: output,
+                purpose: WatchPurpose::Ordinary,
             }),
             Verdict::Failed { exit, output } => Err(WakeRefusal::Broken {
                 exit: exit.get(),
@@ -491,28 +595,49 @@ impl WakeRegistrar for SessionWakes {
         self.store.cancel_subscription(&self.space_anchor()?, id)
     }
     fn schedule(&self, request: WakeRequest) -> Result<WakeSummary, WakeRefusal> {
+        if !self.space_access && self.anchor.subject().kind() == dekopon_core::PrincipalKind::Space
+        {
+            return Err(WakeRefusal::MappedChannelRequired);
+        }
         let now = SystemTime::now();
+        let anchor = if self.space_access {
+            self.space_anchor()?
+        } else {
+            self.anchor.clone()
+        };
+        let digest = match &request {
+            WakeRequest::Digest { .. } => true,
+            WakeRequest::Once { .. } | WakeRequest::Watch { .. } => false,
+        };
         let summary = match request {
             WakeRequest::Once { note, after } => {
                 self.check(&note, after)?;
-                self.store.register(
-                    self.anchor.clone(),
-                    note,
-                    now,
-                    store::Schedule::Once { after },
-                )?
+                self.store
+                    .register(anchor, note, now, store::Schedule::Once { after })?
             }
             WakeRequest::Watch {
                 note,
                 script,
                 every,
                 until,
+            }
+            | WakeRequest::Digest {
+                note,
+                script,
+                every,
+                until,
             } => {
+                if digest {
+                    self.space_anchor()?;
+                }
                 self.check(&note, until)?;
-                if every < self.bounds.min_interval || every > until {
-                    return Err(WakeRefusal::Interval {
-                        minimum: self.bounds.min_interval,
-                    });
+                let minimum = if digest {
+                    self.bounds.min_interval.max(Probe::DIGEST_INTERVAL)
+                } else {
+                    self.bounds.min_interval
+                };
+                if every < minimum || every > until {
+                    return Err(WakeRefusal::Interval { minimum });
                 }
                 let mut leg = self
                     .anchor
@@ -528,8 +653,9 @@ impl WakeRegistrar for SessionWakes {
                     )));
                 }
                 let probe = Probe::baseline(script, &leg, &self.shell)?;
+                let probe = if digest { probe.into_digest() } else { probe };
                 self.store.register(
-                    self.anchor.clone(),
+                    anchor,
                     note,
                     now,
                     store::Schedule::Watch {
@@ -554,11 +680,25 @@ impl WakeRegistrar for SessionWakes {
     }
 
     fn list(&self) -> Vec<WakeSummary> {
-        self.store.list(&self.anchor.subject, SystemTime::now())
+        self.store.list_for(
+            &self.anchor,
+            self.space_access
+                .then(|| self.anchor.as_space())
+                .flatten()
+                .as_ref(),
+            SystemTime::now(),
+        )
     }
 
     fn cancel(&self, id: WakeId) -> Result<(), WakeRefusal> {
-        self.store.cancel(&self.anchor.subject, id)?;
+        self.store.cancel_for(
+            &self.anchor,
+            self.space_access
+                .then(|| self.anchor.as_space())
+                .flatten()
+                .as_ref(),
+            id,
+        )?;
         tracing::info!(event = "gateway_wake_cancelled", wake.id = %id, "gateway.wake.cancelled");
         Ok(())
     }
@@ -619,6 +759,20 @@ pub(crate) fn run_tick(
             None
         }
     }
+}
+
+pub(crate) fn digest_reply(text: &str) -> String {
+    const MAXIMUM: usize = 1_900;
+    const MARKER: &str = "\n[truncated]";
+    let escaped = text.replace('<', "&lt;").replace('>', "&gt;");
+    if escaped.len() <= MAXIMUM {
+        return escaped;
+    }
+    let mut end = MAXIMUM - MARKER.len();
+    while !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &escaped[..end])
 }
 
 pub(crate) fn fired_text(id: WakeId, note: &str, reason: &str, output: Option<&str>) -> String {

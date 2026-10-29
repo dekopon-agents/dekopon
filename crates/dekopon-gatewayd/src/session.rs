@@ -573,7 +573,7 @@ pub(crate) fn record_admission(
             { audit.event = "gateway.admission", outcome, busy.cause = cause,
               transport = %message.transport, conversation.id = %message.conversation.key(),
               queue.depth = depth,
-              admission.trigger = if crate::wake::space_wake(message) { Some("pr-subscription") } else { message.pull_request_links.as_ref().map(|_| "pull-request-link") } },
+              admission.trigger = message.message_id.wake_origin().and_then(crate::wake::WakeOrigin::admission_trigger).or_else(|| if crate::wake::space_wake(message) { Some("space-wake") } else { message.pull_request_links.as_ref().map(|_| "pull-request-link") }) },
             "gateway.admission"
         )
     };
@@ -925,6 +925,12 @@ impl SessionAdmission {
                     next.receipts.finish(MessageOutcome::RouteLost);
                     continue;
                 };
+                if crate::wake::space_wake(&next.message)
+                    && (!route.wakes || route.agent != next.route.agent)
+                {
+                    next.receipts.finish(MessageOutcome::RouteLost);
+                    continue;
+                }
                 if folds_in(&next.message) {
                     let mut grouped = Vec::new();
                     while let Some(mut same) = running.follow_ups.pop_front_if(|queued| {
@@ -2125,7 +2131,11 @@ async fn session_turn(
     // message text, transport presentation, and model output never influence that choice.
     let mut key = conversation_key(route, message);
     let is_follow = matches!(message.message_id, MessageId::Follow(_));
-    let is_subscription = crate::wake::space_wake(message);
+    let is_space_wake = crate::wake::space_wake(message);
+    let is_digest = message
+        .message_id
+        .wake_origin()
+        .is_some_and(crate::wake::WakeOrigin::is_digest);
     if is_follow {
         let ticket = runner.follow.as_ref().map(|table| {
             let follow_key = crate::follow::follow_key(
@@ -2228,7 +2238,7 @@ async fn session_turn(
                     UNAUTHORIZED_REPLY.to_owned()
                 }
             };
-            if !is_follow && !is_subscription && !quiet && answer(driver, message, &reply).await {
+            if !is_follow && !is_space_wake && !quiet && answer(driver, message, &reply).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2242,7 +2252,7 @@ async fn session_turn(
                 reason = "attestation-refused",
                 "gateway.session.rejected"
             );
-            if !is_follow && !is_subscription && answer(driver, message, UNAUTHORIZED_REPLY).await {
+            if !is_follow && !is_space_wake && answer(driver, message, UNAUTHORIZED_REPLY).await {
                 reply_delivered(MessageOutcome::Unauthorized);
             }
             return MessageOutcome::Unauthorized.into();
@@ -2254,7 +2264,7 @@ async fn session_turn(
                 error = %error,
                 "gateway.session.failed"
             );
-            if !is_follow && !is_subscription && answer(driver, message, FAILURE_REPLY).await {
+            if !is_follow && !is_space_wake && answer(driver, message, FAILURE_REPLY).await {
                 reply_delivered(MessageOutcome::Failed);
             }
             return MessageOutcome::Failed.into();
@@ -2329,7 +2339,7 @@ async fn session_turn(
         let reply = leg
             .principal()
             .map_or_else(|| UNAUTHORIZED_REPLY.to_owned(), permission_reply);
-        if !is_follow && !is_subscription && answer(driver, message, &reply).await {
+        if !is_follow && !is_space_wake && answer(driver, message, &reply).await {
             reply_delivered(MessageOutcome::Unauthorized);
         }
         return MessageOutcome::Unauthorized.into();
@@ -2337,7 +2347,7 @@ async fn session_turn(
     let mapped_participants = participants::Mapping::for_turn(route, message)
         == participants::Mapping::Pending
         && leg.space_grants().is_some()
-        && !is_subscription;
+        && !is_space_wake;
     runner.gate.resolve_mapping(
         &(message.transport.clone(), message.conversation.key()),
         &cancellation,
@@ -2379,7 +2389,7 @@ async fn session_turn(
         },
         MessageId::Wake { id, .. } => WakeReasonView::Wake {
             wake: *id,
-            scheduled_by: if is_subscription {
+            scheduled_by: if is_space_wake {
                 None
             } else {
                 principal.clone()
@@ -2670,7 +2680,7 @@ async fn session_turn(
             Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
     let (mut settings, keep_alive) = (liveness.settings, liveness.keep_alive.clone());
-    if is_follow || is_subscription {
+    if is_follow || is_space_wake {
         settings.mode = crate::config::LivenessMode::Off;
     }
     // Keep this declared before progress and sink: Rust drops them first, so cancellation can't
@@ -2687,7 +2697,7 @@ async fn session_turn(
         keep_alive,
         cancellation: cancellation.clone(),
         max_duration: route.max_duration,
-        silent_until_success: is_follow || is_subscription,
+        silent_until_success: is_follow || is_space_wake,
     });
     sink.emit(ProgressEvent::Started {
         agent: route.agent.to_string(),
@@ -2735,12 +2745,19 @@ async fn session_turn(
         ));
     }
     drop(sink);
-    let space_access = leg.space_grants().is_some() && !is_subscription;
-    let review_progress = is_subscription.then(|| Arc::new(ReviewProgress::default()));
+    let space_access = leg.space_grants().is_some() && !is_space_wake;
+    let review_progress = message
+        .message_id
+        .wake_origin()
+        .is_some_and(|origin| match origin {
+            crate::wake::WakeOrigin::Subscription(_) => true,
+            crate::wake::WakeOrigin::Scheduled | crate::wake::WakeOrigin::Digest => false,
+        })
+        .then(|| Arc::new(ReviewProgress::default()));
     let subscriptions = if let (
         Some(progress),
         MessageId::Wake {
-            subscription: Some(target),
+            origin: crate::wake::WakeOrigin::Subscription(target),
             ..
         },
     ) = (&review_progress, &message.message_id)
@@ -2749,7 +2766,7 @@ async fn session_turn(
             target: target.clone(),
             progress: Arc::clone(progress),
         })
-    } else if route.wakes && space_access {
+    } else if route.wakes && space_access && !is_space_wake {
         message
             .pull_request_links
             .as_ref()
@@ -3081,6 +3098,8 @@ async fn session_turn(
             }
             if let Some(progress) = review_progress.as_deref() {
                 inputs = inputs.with_quiet_review(progress);
+            } else if is_digest {
+                inputs = inputs.with_quiet_digest();
             } else if reply_optional {
                 inputs = inputs.with_optional_reply();
             }
@@ -3238,6 +3257,9 @@ async fn session_turn(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
+        if is_digest && let MessageId::Wake { id, .. } = &message.message_id {
+            crate::wake::record_digest(*id, crate::wake::WakeOperation::Declined, Some("model"));
+        }
         progress.terminal(Terminal::Silent).await;
         return Ended {
             outcome: MessageOutcome::Declined,
@@ -3252,7 +3274,12 @@ async fn session_turn(
             } else {
                 outcome.answer.as_str()
             });
-            let reply = if images.is_empty() {
+            let text = if is_digest {
+                crate::wake::digest_reply(&text)
+            } else {
+                text
+            };
+            let reply = if is_digest || images.is_empty() {
                 OutboundReply::text(text.clone())
             } else {
                 OutboundReply::with_images(text.clone(), images)
@@ -3282,7 +3309,7 @@ async fn session_turn(
                 "gateway.session.failed"
             );
             (
-                if is_follow || is_subscription {
+                if is_follow || is_space_wake {
                     Terminal::Answered(OutboundReply::text(UNREPORTED_WORK_REPLY.to_owned()))
                 } else {
                     Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned())

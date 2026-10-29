@@ -395,6 +395,7 @@ enum ReplyMode<'a> {
     Required,
     Optional,
     QuietReview(&'a ReviewProgress),
+    QuietDigest,
 }
 
 impl ReplyMode<'_> {
@@ -402,13 +403,14 @@ impl ReplyMode<'_> {
         match self {
             Self::Required | Self::Optional => capability_invocations == 0,
             Self::QuietReview(progress) => progress.permits_decline(capability_invocations),
+            Self::QuietDigest => true,
         }
     }
 
     const fn offered(self) -> bool {
         match self {
             Self::Required => false,
-            Self::Optional | Self::QuietReview(_) => true,
+            Self::Optional | Self::QuietReview(_) | Self::QuietDigest => true,
         }
     }
 }
@@ -586,6 +588,12 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn with_quiet_digest(mut self) -> Self {
+        self.reply_mode = ReplyMode::QuietDigest;
+        self
+    }
+
+    #[must_use]
     pub const fn with_optional_reply(mut self) -> Self {
         self.reply_mode = ReplyMode::Optional;
         self
@@ -663,6 +671,9 @@ where
     match reply_mode {
         ReplyMode::Required => {}
         ReplyMode::Optional => messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION)),
+        ReplyMode::QuietDigest => messages.push(ModelMessage::system(
+            "This is a daily space digest. Verify the waiting items through granted reads. Post one concise threaded summary only for changed, nonempty items; otherwise call decline_chat_reply, including after read work. Name GitHub logins as plain text, never Slack mentions."
+        )),
         ReplyMode::QuietReview(_) => messages.push(ModelMessage::system(
             "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."
         )),

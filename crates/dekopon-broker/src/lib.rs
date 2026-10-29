@@ -2855,8 +2855,10 @@ where
         };
         if self.identities.principal_kind(principal) == PrincipalKind::Space
             && !claim.scope.as_ref().is_some_and(|scope| {
-                scope.trigger == Trigger::Wake
-                    && scope.participant.is_none()
+                (match scope.trigger {
+                    Trigger::Wake | Trigger::Probe => true,
+                    Trigger::Message | Trigger::Job => false,
+                }) && scope.participant.is_none()
                     && scope.github.is_none()
                     && scope.delivery.is_none()
                     && space_subject(scope).as_ref() == Some(&claim.subject)

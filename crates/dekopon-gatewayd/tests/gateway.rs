@@ -774,6 +774,10 @@ struct Timing {
     #[cfg(feature = "fauxlack")]
     subscriptions: Option<subscriptions::Settings>,
     #[cfg(feature = "fauxlack")]
+    wakes: Option<Vec<Value>>,
+    #[cfg(feature = "fauxlack")]
+    digest_api: Option<String>,
+    #[cfg(feature = "fauxlack")]
     fauxlack: Option<dekopon_gatewayd::fauxlack::Fauxlack>,
     #[cfg(feature = "fauxlack")]
     fauxlack_servers: Vec<String>,
@@ -830,6 +834,14 @@ async fn boot_with(
     if let Some(settings) = &timing.subscriptions {
         settings.configure_broker(&mut broker_document, &mut policies);
     }
+    #[cfg(feature = "fauxlack")]
+    if timing.wakes.is_some() {
+        digests::configure_broker(
+            &mut broker_document,
+            &mut policies,
+            timing.digest_api.as_deref(),
+        );
+    }
     write_owner_only(
         &directory.path().join("policies.cedar"),
         policies.as_bytes(),
@@ -884,6 +896,10 @@ async fn boot_with(
     #[cfg(feature = "fauxlack")]
     if let Some(settings) = &timing.subscriptions {
         settings.configure_gateway(directory.path(), &mut config);
+    }
+    #[cfg(feature = "fauxlack")]
+    if let Some(rows) = &timing.wakes {
+        configure_wakes(directory.path(), rows, &mut config);
     }
     if let Some(keep_alive) = &timing.keep_alive {
         config["transports"][0]["indicators"]["keepAlive"] = keep_alive.clone();
@@ -2069,3 +2085,20 @@ mod fauxlack;
 #[cfg(feature = "fauxlack")]
 #[path = "gateway/subscriptions.rs"]
 mod subscriptions;
+
+#[cfg(feature = "fauxlack")]
+fn configure_wakes(directory: &Path, rows: &[Value], config: &mut Value) {
+    config["sessions"]["wakes"] = json!({"path":directory.join("wakes.jsonl")});
+    for route in config["routes"].as_array_mut().unwrap() {
+        route["wakes"] = json!(true);
+    }
+    let encoded = rows
+        .iter()
+        .map(|row| format!("{row}\n"))
+        .collect::<String>();
+    write_owner_only(&directory.join("wakes.jsonl"), encoded.as_bytes());
+}
+
+#[cfg(feature = "fauxlack")]
+#[path = "gateway/digests.rs"]
+mod digests;
