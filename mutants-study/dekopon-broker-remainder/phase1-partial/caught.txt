@@ -1,0 +1,94 @@
+crates/dekopon-broker/src/lib.rs:139:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:138:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:137:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:136:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:135:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:140:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:168:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:40: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:141:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:172:29: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:37: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:176:43: replace * with + in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:38: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with true
+crates/dekopon-broker/src/lib.rs:249:39: replace * with + in round_up
+crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)
+crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 0
+crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1
+crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with true
+crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with false
+crates/dekopon-broker/src/lib.rs:667:28: replace > with == in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:804:21: replace && with || in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:853:9: replace CredentialRefreshError::permanent -> bool with false
+crates/dekopon-broker/src/lib.rs:857:9: replace CredentialRefreshError::reason -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:857:9: replace CredentialRefreshError::reason -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:887:9: replace StoredCredential::covers -> bool with true
+crates/dekopon-broker/src/lib.rs:887:9: replace StoredCredential::covers -> bool with false
+crates/dekopon-broker/src/lib.rs:920:9: replace CredentialStore::get -> Option<&StoredCredential> with None
+crates/dekopon-broker/src/lib.rs:974:9: replace SecretUseBinding::matches -> bool with false
+crates/dekopon-broker/src/lib.rs:974:9: replace SecretUseBinding::matches -> bool with true
+crates/dekopon-broker/src/lib.rs:977:13: replace && with || in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:976:13: replace && with || in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:975:13: replace && with || in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:974:26: replace == with != in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:975:29: replace == with != in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:976:26: replace == with != in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:977:47: replace == with != in SecretUseBinding::matches
+crates/dekopon-broker/src/lib.rs:1146:39: replace > with == in SecretCatalog::validate
+crates/dekopon-broker/src/lib.rs:1146:39: replace > with >= in SecretCatalog::validate
+crates/dekopon-broker/src/lib.rs:1150:33: delete ! in SecretCatalog::validate
+crates/dekopon-broker/src/lib.rs:1154:35: delete ! in SecretCatalog::validate
+crates/dekopon-broker/src/lib.rs:1169:9: replace SecretCatalog::binding -> Option<&SecretUseBinding> with None
+crates/dekopon-broker/src/lib.rs:1184:9: replace AttestorGrant::validate -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:1187:34: replace || with && in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1187:54: replace > with < in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1200:25: replace && with || in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1199:46: replace <= with > in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1201:53: replace == with != in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1209:16: delete ! in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1220:9: replace AttestorGrant::permits -> bool with true
+crates/dekopon-broker/src/lib.rs:1220:9: replace AttestorGrant::permits -> bool with false
+crates/dekopon-broker/src/lib.rs:1258:9: replace IdentityDirectory::resolve -> Option<&PrincipalId> with None
+crates/dekopon-broker/src/lib.rs:1265:51: replace == with != in IdentityDirectory::principal_kind
+crates/dekopon-broker/src/lib.rs:1289:5: replace space_subject -> Option<ExternalSubject> with None
+crates/dekopon-broker/src/lib.rs:1311:5: replace policy_context -> PolicyContext with Default::default()
+crates/dekopon-broker/src/lib.rs:1348:9: replace TurnStartedBy::as_str -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:1348:9: replace TurnStartedBy::as_str -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:1359:5: replace turn_started_by -> Option<TurnStartedBy> with None
+crates/dekopon-broker/src/lib.rs:1361:16: replace match guard context .attested_subject() .is_some_and(|subject| subject.kind() == PrincipalKind::Person) with false in turn_started_by
+crates/dekopon-broker/src/lib.rs:1363:55: replace == with != in turn_started_by
+crates/dekopon-broker/src/lib.rs:1376:5: replace probe_permits -> bool with true
+crates/dekopon-broker/src/lib.rs:1376:5: replace probe_permits -> bool with false
+crates/dekopon-broker/src/lib.rs:1379:9: replace || with && in probe_permits
+crates/dekopon-broker/src/lib.rs:1378:43: replace != with == in probe_permits
+crates/dekopon-broker/src/lib.rs:1379:19: replace == with != in probe_permits
+crates/dekopon-broker/src/lib.rs:1388:22: replace != with == in validate_trusted_metadata
+crates/dekopon-broker/src/lib.rs:1388:5: replace validate_trusted_metadata -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:1396:31: replace == with != in validate_trusted_metadata
+crates/dekopon-broker/src/lib.rs:1397:27: replace == with != in validate_trusted_metadata
+crates/dekopon-broker/src/lib.rs:1399:12: delete ! in validate_trusted_metadata
+crates/dekopon-broker/src/lib.rs:1418:5: replace validate_set_credential -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:1437:16: delete ! in validate_set_credential
+crates/dekopon-broker/src/lib.rs:1450:5: replace validate_set_constraints -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:1453:9: replace || with && in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1451:31: replace == with != in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1453:40: replace && with || in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1463:12: delete ! in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1463:40: replace == with != in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1469:13: replace || with && in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1468:25: replace && with || in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1468:39: replace != with == in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1469:48: replace && with || in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1469:62: replace == with != in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1544:9: replace <impl fmt::Display for RouteConflict>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:1807:9: replace InMemoryAuditLog::records -> Vec<AuditEvent> with vec![]
+crates/dekopon-broker/src/lib.rs:1813:9: replace <impl AuditLog for InMemoryAuditLog>::append -> Result<(), AuditError> with Ok(())

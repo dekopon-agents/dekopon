@@ -1,0 +1,18 @@
+crates/dekopon-broker/src/lib.rs:873:9: replace <impl From<BoundCredential> for StoredCredential>::from -> Self with Default::default()
+crates/dekopon-broker/src/lib.rs:879:9: replace <impl From<Arc<dyn RefreshingCredential>> for StoredCredential>::from -> Self with Default::default()
+crates/dekopon-broker/src/lib.rs:920:9: replace CredentialStore::get -> Option<&StoredCredential> with Some(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:944:9: replace SecretUseBinding::grant -> SecretUseGrant with Default::default()
+crates/dekopon-broker/src/lib.rs:959:9: replace SecretUseBinding::proposal -> SecretUseProposal with Default::default()
+crates/dekopon-broker/src/lib.rs:991:9: replace SecretMaterial::into_secret_bytes -> SecretBytes with Default::default()
+crates/dekopon-broker/src/lib.rs:1018:9: replace <impl SecretResolver for EmptySecretResolver>::resolve -> Result<SecretMaterial, SecretResolutionError> with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:1102:9: replace SecretCatalog::drns -> impl Iterator<Item =&SecretDrn> with ::std::iter::once(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:1118:9: replace SecretCatalog::grant -> SecretUseGrant with Default::default()
+crates/dekopon-broker/src/lib.rs:1128:9: replace SecretCatalog::authority_bindings -> Vec<&SecretUseBinding> with vec![Box::leak(Box::new(Default::default()))]
+crates/dekopon-broker/src/lib.rs:1169:9: replace SecretCatalog::binding -> Option<&SecretUseBinding> with Some(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:1258:9: replace IdentityDirectory::resolve -> Option<&PrincipalId> with Some(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:1263:9: replace IdentityDirectory::principal_kind -> PrincipalKind with Default::default()
+crates/dekopon-broker/src/lib.rs:1270:9: replace IdentityDirectory::principals -> impl Iterator<Item =&PrincipalId> with ::std::iter::once(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:1289:5: replace space_subject -> Option<ExternalSubject> with Some(Default::default())
+crates/dekopon-broker/src/lib.rs:1359:5: replace turn_started_by -> Option<TurnStartedBy> with Some(Default::default())
+crates/dekopon-broker/src/lib.rs:1468:9: replace && with || in validate_set_constraints
+crates/dekopon-broker/src/lib.rs:1807:9: replace InMemoryAuditLog::records -> Vec<AuditEvent> with vec![Default::default()]
