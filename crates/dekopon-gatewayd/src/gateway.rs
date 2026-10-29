@@ -573,6 +573,10 @@ impl Gateway {
                 observe_session(result);
             }
         }
+        if let Some(summaries) = &self.runner.summaries {
+            summaries.stop();
+        }
+        self.runner.thread_owner.shutdown().await;
         outcome
     }
 

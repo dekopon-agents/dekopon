@@ -50,7 +50,7 @@ impl Failure {
 }
 
 pub(crate) struct Owner {
-    tasks: Mutex<JoinSet<()>>,
+    tasks: Mutex<JoinSet<OwnedSemaphorePermit>>,
     slots: Arc<Semaphore>,
     pub(crate) maximum: u32,
 }
@@ -112,7 +112,7 @@ impl Owner {
     }
 }
 
-fn observe(result: Result<(), tokio::task::JoinError>) {
+fn observe(result: Result<OwnedSemaphorePermit, tokio::task::JoinError>) {
     let result = result.map_err(TaskFailure::from);
     if let Err(failure) = result {
         tracing::error!(
@@ -141,15 +141,15 @@ impl Ticket {
             permit,
             slot,
         } = self;
-        let span = tracing::Span::current();
         let subscriber = tracing::dispatcher::get_default(Clone::clone);
         let join = permit.spawn_owned(ThreadName::new(work.name()), move || {
-            tracing::dispatcher::with_default(&subscriber, || span.in_scope(run))
+            tracing::dispatcher::with_default(&subscriber, run)
         })?;
         let (reply, result) = oneshot::channel();
         owner.tasks.lock().spawn(
             async move {
-                let _slot = slot;
+                #[cfg(test)]
+                let join = crate::tests::native_join(join);
                 let result = join
                     .await
                     .map_err(TaskFailure::from)
@@ -164,9 +164,34 @@ impl Ticket {
                         "gateway.thread.failed"
                     ),
                 }
+                slot
             }
             .instrument(tracing::Span::current()),
         );
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_join_receipts_remain_bounded_until_the_owner_reaps_them() {
+        let owner = Owner::new(1);
+        let threads = ShellThreads::new(1, tokio::runtime::Handle::current());
+        let result = owner
+            .reserve(&threads)
+            .unwrap()
+            .spawn(Work::Turn, || 42)
+            .unwrap();
+        assert_eq!(result.await.unwrap().unwrap(), 42);
+        assert_eq!(owner.slots.available_permits(), 0);
+        assert_eq!(owner.tasks.lock().len(), 1);
+        tokio::task::yield_now().await;
+        drop(owner.reserve(&threads).unwrap());
+        owner.shutdown().await;
+        assert!(owner.tasks.lock().is_empty());
+        assert!(threads.reserve::<1>().is_ok());
     }
 }

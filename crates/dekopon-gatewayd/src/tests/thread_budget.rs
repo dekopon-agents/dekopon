@@ -31,7 +31,7 @@ async fn a_turn_at_the_shell_thread_cap_is_refused_without_holding_a_permit() {
         Arc::clone(&runner),
         route(model_config()),
         message("refused"),
-        driver.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
     assert_eq!(models.requests(), 0);
@@ -78,7 +78,7 @@ async fn a_job_at_the_shell_thread_cap_is_refused_without_a_row_or_permit() {
 async fn a_tick_at_the_shell_thread_cap_is_refused_without_holding_admission() {
     use tracing_subscriber::prelude::*;
     let directory = temporary();
-    let (broker, observed) = stub_broker(directory.path(), Vec::new()).await;
+    let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
     let runner = with_thread_cap(runner(broker, ModelScript::new([]), 1), 1);
     let store = wakes::wake_store(directory.path());
     let now = std::time::SystemTime::now();

@@ -165,8 +165,9 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
         ..dekopon_process::Limits::default()
     };
     let context = JobContext::for_turn(Arc::clone(&jobs), &inbound, anchor, broker, limits);
+    let threads = dekopon_process::ShellThreads::new(16, tokio::runtime::Handle::current());
     tokio::task::spawn_blocking(move || {
-        dekopon_shell::Interpreter::new(limits, dekopon_test_support::shell_threads())
+        dekopon_shell::Interpreter::new(limits, threads)
             .run("probe upper &", &ProbeInvoker(context))
     })
     .await
@@ -192,6 +193,7 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
         .await
         .expect("broker released")
         .expect("broker completed");
+    jobs.thread_owner.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1709,7 +1711,7 @@ async fn tick_once(
         .pop()
         .expect("the watch is due");
     let mut ticks = tokio::task::JoinSet::new();
-    crate::spawn_tick(runner, routes, store, &mut ticks, tick);
+    crate::spawn_tick(runner, routes, store, &mut ticks, tick).expect("tick admitted");
     assert!(matches!(ticks.join_next().await, Some(Ok(None))));
 }
 

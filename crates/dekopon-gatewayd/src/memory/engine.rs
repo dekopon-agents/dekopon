@@ -63,6 +63,7 @@ pub(crate) struct Counts {
 #[derive(Clone)]
 pub(crate) struct Sender {
     queue: mpsc::Sender<Queued>,
+    cancel: watch::Sender<bool>,
     journal: Arc<Journal>,
     pub counts: Arc<Counts>,
 }
@@ -102,6 +103,7 @@ pub(crate) fn channel(
     let (tx, receiver) = mpsc::channel(queue.get());
     let sender = Sender {
         queue: tx,
+        cancel: watch::channel(false).0,
         journal,
         counts,
     };
@@ -163,6 +165,10 @@ pub(crate) fn spawn(
 }
 
 impl Sender {
+    pub(crate) fn stop(&self) {
+        self.cancel.send_replace(true);
+    }
+
     pub(crate) async fn enqueue(&self, task: SlotTask) {
         match self.queue.try_send(Queued {
             task,
@@ -209,11 +215,16 @@ async fn dispatch(
     sender: Sender,
     concurrency: NonZeroUsize,
 ) {
-    let cancel = CancelOnDrop(watch::channel(false).0);
+    let cancel = CancelOnDrop(sender.cancel.clone());
+    let mut stopped = cancel.0.subscribe();
     let mut running = JoinSet::new();
     let mut tasks: HashMap<Id, RunningTask> = HashMap::new();
     loop {
+        if *stopped.borrow() {
+            break;
+        }
         tokio::select! {
+            _ = stopped.changed() => break,
             result = running.join_next_with_id(), if !running.is_empty() => {
                 match result {
                     Some(Ok((id, next))) => {

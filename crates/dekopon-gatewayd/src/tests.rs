@@ -20837,7 +20837,14 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
     let anchor = crate::wake::Anchor::for_job(&message("job"), &first.agent).unwrap();
     let (running_job, _signal) = runner
         .jobs
-        .admit(owner.clone(), anchor, None, Arc::from("still running"))
+        .admit(
+            owner.clone(),
+            anchor,
+            None,
+            Arc::from("still running"),
+            &runner.shell_threads,
+        )
+        .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
     let asset_seed = runner.conversations.begin(
         &private,
@@ -23959,3 +23966,21 @@ async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() 
 
 #[path = "tests/thread_budget.rs"]
 mod thread_budget;
+
+pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
+    if !matches!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    ) {
+        return join.await;
+    }
+    tokio::pin!(join);
+    // A paused Tokio clock must not auto-advance while native threads are still registering timers.
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut join => return result,
+            () = tokio::task::yield_now() => {},
+        }
+    }
+}

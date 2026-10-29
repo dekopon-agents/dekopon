@@ -402,7 +402,14 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
     let anchor = crate::wake::Anchor::for_job(&x, &route.agent).unwrap();
     let (held, signal) = runner
         .jobs
-        .admit(owner.clone(), anchor, None, Arc::from("sleep 30"))
+        .admit(
+            owner.clone(),
+            anchor,
+            None,
+            Arc::from("sleep 30"),
+            &runner.shell_threads,
+        )
+        .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
     let output = tool_output_of(&runner, &models, route, y.clone()).await;
     assert_eq!(output.lines().next(), Some("rows=0"));

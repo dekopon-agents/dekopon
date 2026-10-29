@@ -380,11 +380,10 @@ async fn an_overflowed_part_marks_its_later_parts() {
     journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
     let (tx, _rx) = mpsc::channel(1);
     let sender = Sender {
+        cancel: watch::channel(false).0,
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
-        thread_owner: crate::threads::Owner::new(16),
-        shell_threads: dekopon_test_support::shell_threads(),
     };
     sender.enqueue(task()).await;
     sender.enqueue(task()).await;
@@ -1489,11 +1488,10 @@ async fn an_overflowed_part_logs_one_drop_per_later_part() {
     journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
     let (tx, _rx) = mpsc::channel(1);
     let sender = Sender {
+        cancel: watch::channel(false).0,
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
-        thread_owner: crate::threads::Owner::new(16),
-        shell_threads: dekopon_test_support::shell_threads(),
     };
     sender.enqueue(task()).await;
     sender.enqueue(task()).await;
@@ -1570,4 +1568,27 @@ async fn a_summary_at_the_shell_thread_cap_is_refused_before_calling_the_model()
             .is_ok()
     );
     resources.thread_owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn stopping_before_dispatch_starts_joins_without_running_queued_work() {
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (resources, script) = resources(journal, [Action::Text("must not run")], true);
+    let mut owned = JoinSet::new();
+    let sender = spawn(
+        resources,
+        4.try_into().unwrap(),
+        1.try_into().unwrap(),
+        &mut owned,
+    );
+    sender.enqueue(task()).await;
+    sender.stop();
+    tokio::time::timeout(Duration::from_secs(2), owned.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(owned.is_empty());
+    assert_eq!(script.calls.load(Ordering::Relaxed), 0);
 }
