@@ -755,8 +755,8 @@ impl GithubEvent {
             && let Some(id) = run.id
         {
             let association = match self.thread() {
-                GithubThread::Number(n) => format!("Some({n})"),
-                GithubThread::Repository => "None".to_owned(),
+                GithubThread::Number(n) => format!("#{n}"),
+                GithubThread::Repository => "none".to_owned(),
             };
             line.push_str(&format!(" run {id}; associated PR {association};"));
         }
@@ -818,6 +818,35 @@ mod tests {
     use serde_json::json;
     fn event(name: &str) -> GithubEvent {
         serde_json::from_value(json!({"delivery":"delivery-1","event":name,"repository":{"id":10,"fullName":"owner/repo"},"actor":{"id":1},"number":7,"kind":"none","authorSet":{"actorLogin":"name[bot]"}})).unwrap()
+    }
+    #[test]
+    fn run_note_names_the_associated_pull_request_or_none() {
+        for (numbers, thread, association) in
+            [(vec![7], "#7", "#7"), (vec![], "repository", "none")]
+        {
+            let mut e = event("workflow_run");
+            e.target = Target::Run {
+                run: RunFacts {
+                    id: Some(GithubId::new(3).unwrap()),
+                    pull_requests: Some(
+                        BoundedVec::new(
+                            numbers
+                                .into_iter()
+                                .map(|n| GithubNumber::new(n).unwrap())
+                                .collect(),
+                        )
+                        .unwrap(),
+                    ),
+                    ..RunFacts::default()
+                },
+            };
+            assert_eq!(
+                e.note(),
+                format!(
+                    "[gateway: unverified GitHub workflow_run claim] repository owner/repo; action none; {thread}; delivery delivery-1. run 3; associated PR {association};"
+                )
+            );
+        }
     }
     #[test]
     fn every_family_keys_by_its_number_or_the_repository() {
