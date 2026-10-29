@@ -1,0 +1,87 @@
+crates/dekopon-broker-protocol/src/lib.rs:60:53: replace * with +
+crates/dekopon-broker-protocol/src/lib.rs:77:13: delete match arm ERROR_UNMAPPED_SUBJECT in SessionRefusal::from_error
+crates/dekopon-broker-protocol/src/lib.rs:60:46: replace * with +
+crates/dekopon-broker-protocol/src/lib.rs:157:9: replace TraceParent::flags -> u8 with 1
+crates/dekopon-broker-protocol/src/lib.rs:208:39: replace || with && in decode_hex
+crates/dekopon-broker-protocol/src/lib.rs:369:13: replace deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::expecting -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:383:28: replace > with == in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_str
+crates/dekopon-broker-protocol/src/lib.rs:383:28: replace > with >= in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_str
+crates/dekopon-broker-protocol/src/lib.rs:393:28: replace > with >= in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_string
+crates/dekopon-broker-protocol/src/lib.rs:525:9: replace <impl fmt::Debug for DeliveryIdentity>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:641:5: replace deserialize_signed_service_decimal -> Result<String, D::Error> with Ok("xyzzy".into())
+crates/dekopon-broker-protocol/src/lib.rs:641:5: replace deserialize_signed_service_decimal -> Result<String, D::Error> with Ok(String::new())
+crates/dekopon-broker-protocol/src/lib.rs:659:13: replace deserialize_optional_positive_service_decimal::<impl serde::de::Visitor<'de> for OptionalServiceDecimal>::expecting -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:673:13: replace deserialize_optional_positive_service_decimal::<impl serde::de::Visitor<'de> for OptionalServiceDecimal>::visit_unit -> Result<Self::Value, E> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:666:13: replace deserialize_optional_positive_service_decimal::<impl serde::de::Visitor<'de> for OptionalServiceDecimal>::visit_none -> Result<Self::Value, E> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:687:49: replace * with +
+crates/dekopon-broker-protocol/src/lib.rs:701:9: replace DeliveredAnswer::as_str -> &str with ""
+crates/dekopon-broker-protocol/src/lib.rs:701:9: replace DeliveredAnswer::as_str -> &str with "xyzzy"
+crates/dekopon-broker-protocol/src/lib.rs:749:9: replace DeliveredTurnRequest::user -> &str with ""
+crates/dekopon-broker-protocol/src/lib.rs:749:9: replace DeliveredTurnRequest::user -> &str with "xyzzy"
+crates/dekopon-broker-protocol/src/lib.rs:953:20: replace match guard !valid_generation_digest(digest) with true in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:920:33: replace > with == in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:920:33: replace > with >= in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:947:57: replace > with >= in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:970:5: replace valid_generation_digest -> bool with false
+crates/dekopon-broker-protocol/src/lib.rs:971:9: replace && with || in valid_generation_digest
+crates/dekopon-broker-protocol/src/lib.rs:970:18: replace == with != in valid_generation_digest
+crates/dekopon-broker-protocol/src/lib.rs:973:47: replace || with && in valid_generation_digest
+crates/dekopon-broker-protocol/src/lib.rs:1003:9: replace AssetIndex::get -> u8 with 0
+crates/dekopon-broker-protocol/src/lib.rs:1003:9: replace AssetIndex::get -> u8 with 1
+crates/dekopon-broker-protocol/src/lib.rs:1010:31: replace < with <= in <impl TryFrom<u8> for AssetIndex>::try_from
+crates/dekopon-broker-protocol/src/lib.rs:1454:38: replace || with && in FrameLimits::validate
+crates/dekopon-broker-protocol/src/lib.rs:1454:62: replace > with == in FrameLimits::validate
+crates/dekopon-broker-protocol/src/lib.rs:1454:62: replace > with >= in FrameLimits::validate
+crates/dekopon-broker-protocol/src/lib.rs:1467:36: replace * with +
+crates/dekopon-broker-protocol/src/lib.rs:1832:37: replace > with == in BrokerClient::run
+crates/dekopon-broker-protocol/src/lib.rs:1832:37: replace > with < in BrokerClient::run
+crates/dekopon-broker-protocol/src/lib.rs:1832:37: replace > with >= in BrokerClient::run
+crates/dekopon-broker-protocol/src/lib.rs:1925:37: replace > with == in BrokerClient::invoke
+crates/dekopon-broker-protocol/src/lib.rs:1925:37: replace > with >= in BrokerClient::invoke
+crates/dekopon-broker-protocol/src/lib.rs:2104:63: replace match guard digest == expected with true in BrokerClient::generation
+crates/dekopon-broker-protocol/src/lib.rs:2104:63: replace match guard digest == expected with false in BrokerClient::generation
+crates/dekopon-broker-protocol/src/lib.rs:2104:70: replace == with != in BrokerClient::generation
+crates/dekopon-broker-protocol/src/lib.rs:2172:31: replace match guard error.is_absent_broker() with true in BrokerClient::connect
+crates/dekopon-broker-protocol/src/lib.rs:2224:22: replace == with != in refusal_before_credentials
+crates/dekopon-broker-protocol/src/lib.rs:2232:17: replace == with != in refusal_before_credentials
+crates/dekopon-broker-protocol/src/lib.rs:2377:9: replace <impl fmt::Display for ExchangePhase>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:2392:9: replace ClientError::is_absent_broker -> bool with true
+crates/dekopon-broker-protocol/src/lib.rs:2411:13: delete match arm Self::UnexpectedResponse in ClientError::may_have_executed
+crates/dekopon-broker-protocol/src/lib.rs:2471:9: replace ResolvedBrokerSocket::into_path -> PathBuf with Default::default()
+crates/dekopon-broker-protocol/src/lib.rs:2516:5: replace ipc_socket_mode -> u32 with 0
+crates/dekopon-broker-protocol/src/lib.rs:2516:5: replace ipc_socket_mode -> u32 with 1
+crates/dekopon-broker-protocol/src/lib.rs:2516:44: replace == with != in ipc_socket_mode
+crates/dekopon-broker-protocol/src/lib.rs:2516:36: replace & with | in ipc_socket_mode
+crates/dekopon-broker-protocol/src/lib.rs:2516:36: replace & with ^ in ipc_socket_mode
+crates/dekopon-broker-protocol/src/lib.rs:2536:9: replace BrokerSocketDiscovery::from_process -> Self with Default::default()
+crates/dekopon-broker-protocol/src/lib.rs:2539:33: delete ! in BrokerSocketDiscovery::from_process
+crates/dekopon-broker-protocol/src/lib.rs:2542:33: delete ! in BrokerSocketDiscovery::from_process
+crates/dekopon-broker-protocol/src/lib.rs:2545:33: delete ! in BrokerSocketDiscovery::from_process
+crates/dekopon-broker-protocol/src/conversation.rs:160:66: replace && with || in Conversation::is_canonical_for
+crates/dekopon-broker-protocol/src/conversation.rs:283:17: replace <impl Deserialize<'de> for ConversationKindMatch>::deserialize::<impl serde::de::Visitor<'de> for KindMatch>::expecting -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/conversation.rs:417:32: replace && with || in thread_form
+crates/dekopon-broker-protocol/src/conversation.rs:517:36: replace < with <= in canonical_negative_decimal
+crates/dekopon-broker-protocol/src/conversation.rs:521:5: replace canonical_signed_decimal -> bool with true
+crates/dekopon-broker-protocol/src/conversation.rs:523:41: replace && with || in canonical_signed_decimal
+crates/dekopon-broker-protocol/src/conversation.rs:527:5: replace canonical_meta_decimal -> bool with true
+crates/dekopon-broker-protocol/src/conversation.rs:530:9: replace && with || in canonical_meta_decimal
+crates/dekopon-broker-protocol/src/conversation.rs:528:9: replace && with || in canonical_meta_decimal
+crates/dekopon-broker-protocol/src/conversation.rs:529:9: replace && with || in canonical_meta_decimal
+crates/dekopon-broker-protocol/src/conversation.rs:553:13: replace deserialize_optional_part::<impl serde::de::Visitor<'de> for OptionalPart>::expecting -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/conversation.rs:560:13: replace deserialize_optional_part::<impl serde::de::Visitor<'de> for OptionalPart>::visit_none -> Result<Self::Value, E> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/conversation.rs:567:13: replace deserialize_optional_part::<impl serde::de::Visitor<'de> for OptionalPart>::visit_unit -> Result<Self::Value, E> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/descriptor.rs:48:9: replace DescriptorStream::peer_disconnected with ()
+crates/dekopon-broker-protocol/src/descriptor.rs:55:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with true in DescriptorStream::peer_disconnected
+crates/dekopon-broker-protocol/src/descriptor.rs:55:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with false in DescriptorStream::peer_disconnected
+crates/dekopon-broker-protocol/src/descriptor.rs:55:44: replace == with != in DescriptorStream::peer_disconnected
+crates/dekopon-broker-protocol/src/descriptor.rs:78:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with true in DescriptorStream::read_frame_when_ready
+crates/dekopon-broker-protocol/src/descriptor.rs:78:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with false in DescriptorStream::read_frame_when_ready
+crates/dekopon-broker-protocol/src/descriptor.rs:78:44: replace == with != in DescriptorStream::read_frame_when_ready
+crates/dekopon-broker-protocol/src/descriptor.rs:194:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with false in <impl AsyncRead for DescriptorStream>::poll_read
+crates/dekopon-broker-protocol/src/descriptor.rs:194:44: replace == with != in <impl AsyncRead for DescriptorStream>::poll_read
+crates/dekopon-broker-protocol/src/descriptor.rs:194:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with true in <impl AsyncRead for DescriptorStream>::poll_read
+crates/dekopon-broker-protocol/src/descriptor.rs:237:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with true in <impl AsyncWrite for DescriptorStream>::poll_write
+crates/dekopon-broker-protocol/src/descriptor.rs:237:31: replace match guard error.kind() == io::ErrorKind::WouldBlock with false in <impl AsyncWrite for DescriptorStream>::poll_write
+crates/dekopon-broker-protocol/src/descriptor.rs:237:44: replace == with != in <impl AsyncWrite for DescriptorStream>::poll_write
+crates/dekopon-broker-protocol/src/descriptor.rs:244:9: replace <impl AsyncWrite for DescriptorStream>::poll_flush -> Poll<io::Result<()>> with Poll::from(Ok(()))
+crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::from(Ok(()))

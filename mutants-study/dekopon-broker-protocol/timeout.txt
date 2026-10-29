@@ -1,0 +1,27 @@
+crates/dekopon-broker-protocol/src/lib.rs:947:44: replace match guard assets.len() > MAX_ASSET_ROWS with true in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:947:57: replace > with < in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:1454:9: replace FrameLimits::validate -> Result<Self, ProtocolError> with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:1513:5: replace read_payload -> Result<Vec<u8>, ReadFrameError> with Ok(vec![])
+crates/dekopon-broker-protocol/src/lib.rs:1513:5: replace read_payload -> Result<Vec<u8>, ReadFrameError> with Ok(vec![0])
+crates/dekopon-broker-protocol/src/lib.rs:1513:5: replace read_payload -> Result<Vec<u8>, ReadFrameError> with Ok(vec![1])
+crates/dekopon-broker-protocol/src/lib.rs:1515:18: replace < with == in read_payload
+crates/dekopon-broker-protocol/src/lib.rs:1515:18: replace < with > in read_payload
+crates/dekopon-broker-protocol/src/lib.rs:1556:5: replace write_frame -> Result<(), ProtocolError> with Ok(())
+crates/dekopon-broker-protocol/src/lib.rs:1819:9: replace BrokerClient::capabilities -> Result<Vec<AvailableCapability>, ClientError> with Ok(vec![])
+crates/dekopon-broker-protocol/src/lib.rs:1925:37: replace > with < in BrokerClient::invoke
+crates/dekopon-broker-protocol/src/lib.rs:2314:8: delete ! in validate_socket_path
+crates/dekopon-broker-protocol/src/lib.rs:2315:12: delete ! in validate_socket_path
+crates/dekopon-broker-protocol/src/lib.rs:2485:5: replace secure_socket_parent -> bool with false
+crates/dekopon-broker-protocol/src/lib.rs:2487:25: replace == with != in secure_socket_parent
+crates/dekopon-broker-protocol/src/lib.rs:2488:25: replace == with != in secure_socket_parent
+crates/dekopon-broker-protocol/src/lib.rs:2488:17: replace & with | in secure_socket_parent
+crates/dekopon-broker-protocol/src/lib.rs:2488:17: replace & with ^ in secure_socket_parent
+crates/dekopon-broker-protocol/src/lib.rs:2501:5: replace secure_socket -> bool with false
+crates/dekopon-broker-protocol/src/lib.rs:2501:44: replace & with | in secure_socket
+crates/dekopon-broker-protocol/src/lib.rs:2501:44: replace & with ^ in secure_socket
+crates/dekopon-broker-protocol/src/lib.rs:2503:25: replace == with != in secure_socket
+crates/dekopon-broker-protocol/src/lib.rs:2504:27: replace == with != in secure_socket
+crates/dekopon-broker-protocol/src/lib.rs:2506:13: replace || with && in secure_socket
+crates/dekopon-broker-protocol/src/lib.rs:2505:18: replace == with != in secure_socket
+crates/dekopon-broker-protocol/src/descriptor.rs:109:9: replace DescriptorStream::write_frame -> Result<(), ProtocolError> with Ok(())
+crates/dekopon-broker-protocol/src/descriptor.rs:207:9: replace <impl AsyncWrite for DescriptorStream>::poll_write -> Poll<io::Result<usize>> with Poll::from(Ok(1))
