@@ -1,0 +1,23 @@
+[
+  {
+    "crate": "dekopon-policy",
+    "command": "CARGO_NET_OFFLINE=true cargo test --locked -p dekopon-policy",
+    "exit_code": 101,
+    "wall_seconds": 0.07739758491516113,
+    "status": "blocked-before-compilation"
+  },
+  {
+    "crate": "dekopon-broker",
+    "command": "CARGO_NET_OFFLINE=true cargo test --locked -p dekopon-broker",
+    "exit_code": 101,
+    "wall_seconds": 0.07155990600585938,
+    "status": "blocked-before-compilation"
+  },
+  {
+    "crate": "dekopon-broker-protocol",
+    "command": "CARGO_NET_OFFLINE=true cargo test --locked -p dekopon-broker-protocol",
+    "exit_code": 101,
+    "wall_seconds": 0.06509804725646973,
+    "status": "blocked-before-compilation"
+  }
+]
