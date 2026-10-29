@@ -6,7 +6,7 @@ use tracing_subscriber::prelude::*;
 
 fn github_message(owner: &str, repo: &str, guid: &str, number: u64) -> InboundMessage {
     let mut inbound = message(
-        "[gateway: unverified GitHub workflow_run claim] associated PR None; report only; read current checks before acting.",
+        "[gateway: unverified GitHub workflow_run claim] associated PR none; report only; read current checks before acting.",
     );
     inbound.transport = "github".into();
     inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Github;
