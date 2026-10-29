@@ -518,6 +518,10 @@ impl SlackTransport {
                     .find(&self.name, &follow_conversation, &subject)
                     .filter(|(_, route)| route.ambient.pull_request_links)?;
                 crate::pull_request_links::PullRequestLinkContext::parse(top_text)
+                    .unwrap_or_else(|error| {
+                        tracing::info!(event = "gateway_message_ignored", reason = "invalid-repository", error = %error, "gateway.message.ignored");
+                        None
+                    })
             })
             .flatten();
         let ambient = pull_request_links.is_some();

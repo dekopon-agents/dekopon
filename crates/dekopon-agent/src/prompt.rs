@@ -366,6 +366,22 @@ where
     )
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReplyMode {
+    Required,
+    Optional,
+    QuietReview,
+}
+
+impl ReplyMode {
+    const fn offered(self) -> bool {
+        match self {
+            Self::Required => false,
+            Self::Optional | Self::QuietReview => true,
+        }
+    }
+}
+
 pub struct SessionInputs<'a> {
     prompt: &'a str,
     recorded: Option<&'a str>,
@@ -381,7 +397,7 @@ pub struct SessionInputs<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
     progress: Option<Arc<dyn ProgressSink>>,
-    optional_reply: bool,
+    reply_mode: ReplyMode,
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
@@ -408,7 +424,7 @@ impl<'a> SessionInputs<'a> {
             cancellation: None,
             steering: None,
             progress: None,
-            optional_reply: false,
+            reply_mode: ReplyMode::Required,
             skills: &[],
             progress_notes: false,
             wakes: None,
@@ -533,8 +549,14 @@ impl<'a> SessionInputs<'a> {
     }
 
     #[must_use]
+    pub const fn with_quiet_review(mut self) -> Self {
+        self.reply_mode = ReplyMode::QuietReview;
+        self
+    }
+
+    #[must_use]
     pub const fn with_optional_reply(mut self) -> Self {
-        self.optional_reply = true;
+        self.reply_mode = ReplyMode::Optional;
         self
     }
 }
@@ -551,7 +573,7 @@ struct SessionExtensions<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
     steering: Option<&'a dyn SteerSource>,
     progress: Option<&'a dyn ProgressSink>,
-    optional_reply: bool,
+    reply_mode: ReplyMode,
     skills: &'a [Skill],
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
@@ -583,7 +605,7 @@ where
         cancellation,
         steering,
         progress,
-        optional_reply,
+        reply_mode,
         skills,
         progress_notes,
         wakes,
@@ -607,8 +629,12 @@ where
     if let Some(listing) = skills::prompt_block(skills) {
         messages.push(ModelMessage::system(listing));
     }
-    if optional_reply {
-        messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION));
+    match reply_mode {
+        ReplyMode::Required => {}
+        ReplyMode::Optional => messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION)),
+        ReplyMode::QuietReview => messages.push(ModelMessage::system(
+            "This is a PR subscription re-review. Refresh the GitHub review using your granted tools. Reply to chat only when blocking findings changed. Otherwise call decline_chat_reply, including after capability work; this mode permits that silence."
+        )),
     }
     if let Some(notice) = memory_notice {
         messages.push(ModelMessage::system(notice.text()));
@@ -636,7 +662,7 @@ where
             cancellation,
             steering,
             progress,
-            optional_reply,
+            reply_mode,
             skills,
             progress_notes,
             wakes,
@@ -740,7 +766,7 @@ where
         cancellation,
         steering: _,
         progress,
-        optional_reply,
+        reply_mode,
         skills,
         progress_notes,
         wakes,
@@ -760,7 +786,7 @@ where
     if !skills.is_empty() {
         model_tools.push(skills::skill_tool());
     }
-    if optional_reply {
+    if reply_mode.offered() {
         model_tools.push(decline_reply_tool());
     }
     if wakes.is_some() {
@@ -1082,7 +1108,7 @@ where
             });
         }
 
-        let decline_requested = optional_reply
+        let decline_requested = reply_mode.offered()
             && turn
                 .tool_calls
                 .iter()
@@ -1097,7 +1123,7 @@ where
                     decline_reply_argument(&call.function.name, &call.function.arguments)?;
                 }
             }
-            if capability_invocations == 0 {
+            if capability_invocations == 0 || reply_mode == ReplyMode::QuietReview {
                 check_cancelled(cancellation)?;
                 match lease.seal() {
                     Seal::Stopped => return Err(PromptError::Cancelled),

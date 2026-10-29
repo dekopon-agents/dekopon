@@ -9,6 +9,7 @@ use std::{
 
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
+use dekopon_core::github::{GithubEvent, GithubEventName, GithubThread};
 use dekopon_core::{AgentId, ExternalSubject};
 use dekopon_shell::{CapabilityInvoker, Interpreter};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use thiserror::Error;
 use super::{Anchor, Probe, Verdict, fired_text};
 use crate::{
     config::{ResolvedWakes, WakeBounds},
+    pull_request_links::PullRequestLinkTarget,
     transport::{InboundMessage, ReplyTarget},
 };
 
@@ -68,6 +70,9 @@ struct Wake {
 #[derive(Clone, Debug)]
 enum WakeKind {
     Once,
+    Subscription {
+        target: PullRequestLinkTarget,
+    },
     Watch {
         probe: Probe,
         every: Duration,
@@ -83,7 +88,7 @@ impl Wake {
             note: self.note.clone(),
             due_in: until(self.next_at),
             watch: match &self.kind {
-                WakeKind::Once => None,
+                WakeKind::Once | WakeKind::Subscription { .. } => None,
                 WakeKind::Watch {
                     probe,
                     every,
@@ -106,19 +111,38 @@ impl Wake {
                 Some(output) => format!("{}\n\n{output}", self.note),
                 None => self.note.clone(),
             },
+            subscription: match &self.kind {
+                WakeKind::Subscription { target } => Some(target.clone()),
+                WakeKind::Once | WakeKind::Watch { .. } => None,
+            },
+        }
+    }
+
+    fn record_subscription(&self, operation: &str) {
+        if let WakeKind::Subscription { target } = &self.kind {
+            tracing::info!(
+                audit.event = "gateway.admission", admission.trigger = "pr-subscription",
+                subscription.operation = operation, wake.id = %self.id,
+                github.repository = target.repository.as_str(), github.number = %target.number,
+                agent = %self.anchor.agent(), conversation.id = %self.anchor.conversation().key(),
+                "gateway.admission"
+            );
         }
     }
 }
 
-/// Proof that the wake's row has already been removed from disk.
 pub(crate) struct Fired {
     anchor: Anchor,
     id: WakeId,
     text: String,
     notice: String,
+    subscription: Option<PullRequestLinkTarget>,
 }
 
 impl Fired {
+    pub(crate) fn is_subscription(&self) -> bool {
+        self.subscription.is_some()
+    }
     pub(crate) const fn id(&self) -> WakeId {
         self.id
     }
@@ -128,7 +152,14 @@ impl Fired {
     }
 
     pub(crate) fn into_inbound(self) -> InboundMessage {
-        self.anchor.inbound(self.id, self.text, self.notice)
+        let text = match self.subscription {
+            Some(target) => format!(
+                "[gateway: PR subscription wake] Re-review https://github.com/{}/pull/{} at its current head using granted tools. Read the prior review and current diff; submit a fresh head-pinned COMMENT review. Decide whether the blocking findings changed. Reply in this Slack thread only if they changed; otherwise call decline_chat_reply after the review. This turn runs as the space alone; no person's grants are available.",
+                target.repository, target.number
+            ),
+            None => self.text,
+        };
+        self.anchor.inbound(self.id, text, self.notice)
     }
 }
 
@@ -195,6 +226,12 @@ pub(crate) struct Due {
     pub ticks: Vec<Tick>,
 }
 
+#[derive(Default)]
+pub(crate) struct SubscriptionDelivery {
+    pub(crate) matched: bool,
+    pub(crate) fired: Vec<Fired>,
+}
+
 struct State {
     wakes: Vec<Wake>,
     next_id: u32,
@@ -207,6 +244,143 @@ pub(crate) struct WakeStore {
 }
 
 impl WakeStore {
+    pub(crate) fn subscribe(
+        &self,
+        anchor: Anchor,
+        target: PullRequestLinkTarget,
+        now: SystemTime,
+    ) -> Result<WakeSummary, WakeRefusal> {
+        let mut state = self.state.lock();
+        let mut wakes = state.wakes.clone();
+        expire_subscriptions(&mut wakes, now);
+        if let Some(wake) = wakes.iter().find(|wake| {
+            wake.anchor.same_thread(&anchor)
+                && match &wake.kind {
+                    WakeKind::Subscription { target: existing } => existing == &target,
+                    WakeKind::Once | WakeKind::Watch { .. } => false,
+                }
+        }) {
+            return Ok(wake.summary(now));
+        }
+        let maximum = self.bounds.max_subscriptions_per_agent;
+        let pending = wakes
+            .iter()
+            .filter(|wake| {
+                wake.anchor.agent() == anchor.agent()
+                    && match wake.kind {
+                        WakeKind::Subscription { .. } => true,
+                        WakeKind::Once | WakeKind::Watch { .. } => false,
+                    }
+            })
+            .count();
+        if pending >= maximum {
+            return Err(WakeRefusal::SubscriptionsFull { maximum });
+        }
+        let wake = Wake {
+            id: WakeId(state.next_id),
+            anchor,
+            note: format!("PR subscription {}#{}", target.repository, target.number),
+            next_at: now + self.bounds.subscription_expiry,
+            kind: WakeKind::Subscription { target },
+        };
+        let summary = wake.summary(now);
+        wakes.push(wake);
+        write(&self.path, &wakes)?;
+        if let Some(wake) = wakes.last() {
+            wake.record_subscription("created");
+        }
+        state.wakes = wakes;
+        state.next_id = state.next_id.wrapping_add(1);
+        Ok(summary)
+    }
+
+    pub(crate) fn list_subscriptions(
+        &self,
+        anchor: &Anchor,
+        now: SystemTime,
+    ) -> Result<Vec<WakeSummary>, WakeRefusal> {
+        Ok(self.mutate(|wakes| {
+            expire_subscriptions(wakes, now);
+            Ok(wakes
+                .iter()
+                .filter(|wake| {
+                    wake.anchor.same_channel(anchor)
+                        && match wake.kind {
+                            WakeKind::Subscription { .. } => true,
+                            WakeKind::Once | WakeKind::Watch { .. } => false,
+                        }
+                })
+                .map(|wake| wake.summary(now))
+                .collect())
+        })?)
+    }
+
+    pub(crate) fn cancel_subscription(
+        &self,
+        anchor: &Anchor,
+        id: WakeId,
+    ) -> Result<(), WakeRefusal> {
+        let found = self.mutate(|wakes| {
+            let before = wakes.len();
+            wakes.retain(|wake| {
+                let remove = wake.id == id
+                    && wake.anchor.same_channel(anchor)
+                    && match wake.kind {
+                        WakeKind::Subscription { .. } => true,
+                        WakeKind::Once | WakeKind::Watch { .. } => false,
+                    };
+                if remove {
+                    wake.record_subscription("cancelled");
+                }
+                !remove
+            });
+            Ok(before != wakes.len())
+        })?;
+        if found {
+            Ok(())
+        } else {
+            Err(WakeRefusal::NotFound)
+        }
+    }
+
+    pub(crate) fn matches_subscription(&self, agent: &AgentId, event: &GithubEvent) -> bool {
+        self.state
+            .lock()
+            .wakes
+            .iter()
+            .any(|wake| subscription_matches(wake, agent, event))
+    }
+
+    pub(crate) fn deliver_subscriptions(
+        &self,
+        agent: &AgentId,
+        event: &GithubEvent,
+        now: SystemTime,
+    ) -> Result<SubscriptionDelivery, WakeStoreError> {
+        self.mutate(|wakes| {
+            expire_subscriptions(wakes, now);
+            let mut delivery = SubscriptionDelivery::default();
+            wakes.retain(|wake| {
+                if !subscription_matches(wake, agent, event) {
+                    return true;
+                }
+                delivery.matched = true;
+                match event.action.as_ref().map(|action| action.as_str()) {
+                    Some("closed") => {
+                        wake.record_subscription("expired");
+                        false
+                    }
+                    Some("synchronize") => {
+                        wake.record_subscription("fired");
+                        delivery.fired.push(wake.fired("fired", None));
+                        true
+                    }
+                    _ => true,
+                }
+            });
+            Ok(delivery)
+        })
+    }
     pub(crate) fn open(config: &ResolvedWakes) -> Result<Self, WakeStoreError> {
         if let Some(parent) = config.path.parent() {
             DirBuilder::new()
@@ -321,6 +495,10 @@ impl WakeStore {
                     return true;
                 }
                 match &wake.kind {
+                    WakeKind::Subscription { .. } => {
+                        wake.record_subscription("expired");
+                        false
+                    }
                     WakeKind::Once => {
                         due.fired.push(wake.fired("fired", None));
                         false
@@ -369,6 +547,8 @@ struct Line {
     next_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch: Option<WatchLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription: Option<PullRequestLinkTarget>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -405,7 +585,7 @@ impl From<&Wake> for Line {
             note: wake.note.clone(),
             next_at_ms: millis(wake.next_at),
             watch: match &wake.kind {
-                WakeKind::Once => None,
+                WakeKind::Once | WakeKind::Subscription { .. } => None,
                 WakeKind::Watch {
                     probe,
                     every,
@@ -417,6 +597,10 @@ impl From<&Wake> for Line {
                     until_ms: millis(*until),
                 }),
             },
+            subscription: match &wake.kind {
+                WakeKind::Subscription { target } => Some(target.clone()),
+                WakeKind::Once | WakeKind::Watch { .. } => None,
+            },
         }
     }
 }
@@ -427,6 +611,9 @@ impl Line {
         reason = "reshaped by the unit that next rewrites this"
     )]
     fn wake(self) -> Option<Wake> {
+        if self.subscription.is_some() && self.watch.is_some() {
+            return None;
+        }
         Some(Wake {
             id: WakeId(self.id),
             anchor: Anchor {
@@ -443,9 +630,11 @@ impl Line {
             },
             note: self.note,
             next_at: at(self.next_at_ms),
-            kind: match self.watch {
-                None => WakeKind::Once,
-                Some(watch) => WakeKind::Watch {
+            kind: match (self.watch, self.subscription) {
+                (None, None) => WakeKind::Once,
+                (None, Some(target)) => WakeKind::Subscription { target },
+                (Some(_), Some(_)) => return None,
+                (Some(watch), None) => WakeKind::Watch {
                     probe: Probe {
                         script: watch.script,
                         prev: watch.prev,
@@ -455,6 +644,29 @@ impl Line {
                 },
             },
         })
+    }
+}
+
+fn expire_subscriptions(wakes: &mut Vec<Wake>, now: SystemTime) {
+    wakes.retain(|wake| match wake.kind {
+        WakeKind::Subscription { .. } if wake.next_at <= now => {
+            wake.record_subscription("expired");
+            false
+        }
+        WakeKind::Subscription { .. } | WakeKind::Once | WakeKind::Watch { .. } => true,
+    });
+}
+
+fn subscription_matches(wake: &Wake, agent: &AgentId, event: &GithubEvent) -> bool {
+    if event.event != GithubEventName::PullRequest || wake.anchor.agent() != agent {
+        return false;
+    }
+    match (&wake.kind, event.thread()) {
+        (WakeKind::Subscription { target }, GithubThread::Number(number)) => {
+            target.repository == event.repository.full_name && target.number == number
+        }
+        (WakeKind::Subscription { .. }, GithubThread::Repository)
+        | (WakeKind::Once | WakeKind::Watch { .. }, _) => false,
     }
 }
 

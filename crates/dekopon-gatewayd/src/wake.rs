@@ -30,6 +30,88 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 8 * 1024;
 // Meta refuses free-form business-initiated text outside the 24-hour customer-service window.
 const WHATSAPP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
+pub(crate) fn space_wake(message: &InboundMessage) -> bool {
+    message.subject.kind() == dekopon_core::PrincipalKind::Space
+        && match message.message_id {
+            MessageId::Wake { .. } => true,
+            MessageId::Native(_)
+            | MessageId::Github(_)
+            | MessageId::Follow(_)
+            | MessageId::Job { .. } => false,
+        }
+}
+
+pub(crate) struct ReviewSubscriptions {
+    pub(crate) anchor: Anchor,
+    pub(crate) store: Arc<WakeStore>,
+    pub(crate) links: crate::pull_request_links::PullRequestLinkContext,
+}
+
+impl ReviewSubscriptions {
+    pub(crate) fn reviewed(
+        &self,
+        capability: &str,
+        input: &serde_json::Value,
+        result: dekopon_shell::CapabilityCallResult,
+    ) -> dekopon_shell::CapabilityCallResult {
+        use dekopon_shell::CapabilityCallResult;
+        if capability != "gh.pull-request.comment"
+            || !match result {
+                CapabilityCallResult::Succeeded | CapabilityCallResult::SucceededWithStderr(_) => {
+                    true
+                }
+                CapabilityCallResult::Failed { .. }
+                | CapabilityCallResult::Denied { .. }
+                | CapabilityCallResult::Exited { .. }
+                | CapabilityCallResult::NotFound => false,
+            }
+        {
+            return result;
+        }
+        for target in &self.links.targets {
+            let (owner, repo) = target.coordinates();
+            if input
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(owner))
+                && input
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(repo))
+                && input.get("number").and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(target.number))
+                && let Err(error) =
+                    self.store
+                        .subscribe(self.anchor.clone(), target.clone(), SystemTime::now())
+            {
+                tracing::info!(
+                    audit.event = "gateway.admission",
+                    admission.trigger = "pr-subscription",
+                    subscription.operation = "ignored",
+                    reason = error.telemetry_kind(),
+                    "gateway.admission"
+                );
+                let note = format!(
+                    "The GitHub review succeeded, but its PR subscription was not saved: {error}"
+                );
+                return match result {
+                    CapabilityCallResult::Succeeded => {
+                        CapabilityCallResult::SucceededWithStderr(note)
+                    }
+                    CapabilityCallResult::SucceededWithStderr(stderr) => {
+                        CapabilityCallResult::SucceededWithStderr(format!("{stderr}\n{note}"))
+                    }
+                    CapabilityCallResult::Failed { .. }
+                    | CapabilityCallResult::Denied { .. }
+                    | CapabilityCallResult::Exited { .. }
+                    | CapabilityCallResult::NotFound => result,
+                };
+            }
+        }
+        result
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Anchor {
     transport: TransportId,
@@ -42,6 +124,43 @@ pub(crate) struct Anchor {
 }
 
 impl Anchor {
+    pub(crate) fn as_space(&self) -> Option<Self> {
+        use dekopon_broker_protocol::ConversationKind;
+        match self.conversation.kind {
+            ConversationKind::Channel | ConversationKind::Thread => {}
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => return None,
+        }
+        let service = match self.kind {
+            ChatTransportKind::Slack => "slack",
+            ChatTransportKind::Fauxlack => "fauxlack",
+            ChatTransportKind::Discord
+            | ChatTransportKind::Telegram
+            | ChatTransportKind::Whatsapp
+            | ChatTransportKind::Github
+            | ChatTransportKind::Local => return None,
+        };
+        let mut anchor = self.clone();
+        anchor.subject = format!(
+            "{service}.{}.{}",
+            self.conversation.container.as_deref()?,
+            self.conversation.id
+        )
+        .parse()
+        .ok()?;
+        Some(anchor)
+    }
+
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        self.agent == other.agent
+            && self.transport == other.transport
+            && self.subject == other.subject
+            && self.conversation.container == other.conversation.container
+            && self.conversation.id == other.conversation.id
+    }
+
+    pub(crate) fn same_thread(&self, other: &Self) -> bool {
+        self.same_channel(other) && self.conversation.thread == other.conversation.thread
+    }
     /// A local reply target is a connection number that a restart hands to another client.
     pub(crate) fn from_inbound(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
         if matches!(message.reply, ReplyTarget::Local { .. }) {
@@ -260,6 +379,7 @@ pub(crate) struct SessionWakes {
     runtime: tokio::runtime::Handle,
     shell: Interpreter,
     started: SystemTime,
+    space_access: bool,
     job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
 }
 
@@ -281,7 +401,20 @@ impl SessionWakes {
             runtime,
             shell,
             started: SystemTime::now(),
+            space_access: false,
         }
+    }
+
+    pub(crate) fn with_space_access(mut self, allowed: bool) -> Self {
+        self.space_access = allowed;
+        self
+    }
+
+    fn space_anchor(&self) -> Result<Anchor, WakeRefusal> {
+        self.space_access
+            .then(|| self.anchor.as_space())
+            .flatten()
+            .ok_or(WakeRefusal::MappedChannelRequired)
     }
 
     #[expect(
@@ -309,6 +442,14 @@ impl SessionWakes {
 }
 
 impl WakeRegistrar for SessionWakes {
+    fn list_subscriptions(&self) -> Result<Vec<WakeSummary>, WakeRefusal> {
+        self.store
+            .list_subscriptions(&self.space_anchor()?, SystemTime::now())
+    }
+
+    fn cancel_subscription(&self, id: WakeId) -> Result<(), WakeRefusal> {
+        self.store.cancel_subscription(&self.space_anchor()?, id)
+    }
     fn schedule(&self, request: WakeRequest) -> Result<WakeSummary, WakeRefusal> {
         let now = SystemTime::now();
         let summary = match request {

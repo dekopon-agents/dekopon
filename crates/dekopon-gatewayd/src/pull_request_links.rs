@@ -1,11 +1,15 @@
 use std::collections::HashSet;
 
-use dekopon_core::github::{GithubNumber, GithubThread};
+use dekopon_core::{
+    ExternalSubject, SubjectError,
+    github::{GithubNumber, GithubThread, RepoFullName},
+};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PullRequestLinkTarget {
-    pub(crate) owner: String,
-    pub(crate) repo: String,
+    pub(crate) repository: RepoFullName,
     pub(crate) number: GithubNumber,
 }
 
@@ -15,7 +19,7 @@ pub(crate) struct PullRequestLinkContext {
 }
 
 impl PullRequestLinkContext {
-    pub(crate) fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Option<Self>, SubjectError> {
         let delimiter = |c: char| c.is_whitespace() || "<>|\"[]()`".contains(c);
         let text = if text.len() > crate::transport::MAX_INBOUND_TEXT_BYTES {
             let prefix = &text[..crate::transport::floor_boundary(
@@ -35,28 +39,24 @@ impl PullRequestLinkContext {
         let mut targets = Vec::new();
         loop {
             let (bare, slack) = remaining.split_once('<').unwrap_or((remaining, ""));
-            targets.extend(
-                bare.split(delimiter)
-                    .filter_map(PullRequestLinkTarget::parse),
-            );
+            for candidate in bare.split(delimiter) {
+                if let Some(target) = PullRequestLinkTarget::parse(candidate)? {
+                    targets.push(target);
+                }
+            }
             let Some((link, tail)) = slack.split_once('>') else {
                 break;
             };
             let url = link.split_once('|').map_or(link, |(url, _)| url);
-            if let Some(target) = PullRequestLinkTarget::parse(url) {
+            if let Some(target) = PullRequestLinkTarget::parse(url)? {
                 targets.push(target);
             }
             remaining = tail;
         }
         let mut seen = HashSet::new();
-        targets.retain(|target| {
-            seen.insert((
-                target.owner.clone(),
-                target.repo.clone(),
-                target.number.to_string(),
-            ))
-        });
-        (!targets.is_empty()).then_some(Self { targets })
+        targets
+            .retain(|target| seen.insert((target.repository.clone(), target.number.to_string())));
+        Ok((!targets.is_empty()).then_some(Self { targets }))
     }
 
     pub(crate) fn prompt(&self) -> String {
@@ -64,9 +64,10 @@ impl PullRequestLinkContext {
             .targets
             .iter()
             .map(|target| {
+                let (owner, repo) = target.coordinates();
                 format!(
                     r#"{{"owner":"{}","repo":"{}","number":{}}}"#,
-                    target.owner, target.repo, target.number
+                    owner, repo, target.number
                 )
             })
             .collect::<Vec<_>>()
@@ -80,12 +81,12 @@ impl PullRequestLinkContext {
         let owners: Vec<_> = self
             .targets
             .iter()
-            .map(|target| target.owner.as_str())
+            .map(|target| target.coordinates().0)
             .collect();
         let names: Vec<_> = self
             .targets
             .iter()
-            .map(|target| target.repo.as_str())
+            .map(|target| target.coordinates().1)
             .collect();
         dekopon_telemetry::with_event_string_array("github.repository.owners", &owners, || {
             dekopon_telemetry::with_event_string_array("github.repository.names", &names, emit)
@@ -94,19 +95,29 @@ impl PullRequestLinkContext {
 }
 
 impl PullRequestLinkTarget {
-    fn parse(candidate: &str) -> Option<Self> {
+    pub(crate) fn coordinates(&self) -> (&str, &str) {
+        self.repository.as_str().split_once('/').unwrap_or_default()
+    }
+
+    fn parse(candidate: &str) -> Result<Option<Self>, SubjectError> {
         let candidate = candidate.trim_end_matches([',', '.', ';', ':', '!', '?']);
-        if !candidate.get(..8)?.eq_ignore_ascii_case("https://") || candidate.contains('\\') {
-            return None;
+        if !candidate
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+            || candidate.contains('\\')
+        {
+            return Ok(None);
         }
-        let url = reqwest::Url::parse(candidate).ok()?;
+        let Ok(url) = reqwest::Url::parse(candidate) else {
+            return Ok(None);
+        };
         if url.scheme() != "https"
             || url.host_str() != Some("github.com")
             || !url.username().is_empty()
             || url.password().is_some()
             || url.port().is_some()
         {
-            return None;
+            return Ok(None);
         }
         let segments: Vec<_> = url
             .path()
@@ -120,7 +131,7 @@ impl PullRequestLinkTarget {
             | [owner, repo, "pull", number, "files" | "commits" | "checks"] => {
                 (*owner, *repo, *number)
             }
-            _ => return None,
+            _ => return Ok(None),
         };
         if owner.is_empty()
             || repo.is_empty()
@@ -133,16 +144,25 @@ impl PullRequestLinkTarget {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         {
-            return None;
+            return Ok(None);
         }
-        let number = match number.parse::<GithubThread>().ok()? {
-            GithubThread::Number(number) => number,
-            GithubThread::Repository => return None,
+        let subject = ExternalSubject::github(owner, repo)?;
+        let repository = RepoFullName::new(&format!(
+            "{}/{}",
+            subject.tenant().unwrap_or_default(),
+            subject.subject()
+        ))
+        .map_err(|_| SubjectError::InvalidSegment {
+            segment: "subject",
+            value: repo.to_owned(),
+        })?;
+        let Ok(number) = number.parse::<GithubThread>() else {
+            return Ok(None);
         };
-        Some(Self {
-            owner: owner.to_ascii_lowercase(),
-            repo: repo.to_ascii_lowercase(),
-            number,
-        })
+        let number = match number {
+            GithubThread::Number(number) => number,
+            GithubThread::Repository => return Ok(None),
+        };
+        Ok(Some(Self { repository, number }))
     }
 }

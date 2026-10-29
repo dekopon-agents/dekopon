@@ -131,12 +131,13 @@ async fn refused_ambient_link_then_mention(
 fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data() {
     let links = PullRequestLinkContext::parse(&format!(
         "<{PR}|review> HTTPS://GITHUB.COM/ACME/WIDGET/pull/17/files?x=1#diff \
-         https://github.com/other/repo.name/pull/18/checks/"
+         https://github.com/other/repo-name/pull/18/checks/"
     ))
+    .unwrap()
     .unwrap();
     assert_eq!(links.targets.len(), 2);
-    assert_eq!(links.targets[0].owner, "acme");
-    assert_eq!(links.targets[0].repo, "widget");
+    assert_eq!(links.targets[0].coordinates().0, "acme");
+    assert_eq!(links.targets[0].coordinates().1, "widget");
     assert_eq!(
         links.targets[0].number,
         dekopon_core::github::GithubNumber::new(17).unwrap()
@@ -147,7 +148,7 @@ fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data(
         serde_json::from_str::<Value>(targets).unwrap(),
         json!([
             {"owner": "acme", "repo": "widget", "number": 17},
-            {"owner": "other", "repo": "repo.name", "number": 18}
+            {"owner": "other", "repo": "repo-name", "number": 18}
         ])
     );
     for url in [
@@ -165,7 +166,10 @@ fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data(
         "https://github.com/acme/widget/pull/17x",
         "https://github.com/acme%2felse/widget/pull/17",
     ] {
-        assert!(PullRequestLinkContext::parse(url).is_none(), "{url}");
+        assert!(
+            PullRequestLinkContext::parse(url).unwrap().is_none(),
+            "{url}"
+        );
     }
 }
 
@@ -175,6 +179,7 @@ fn a_non_pr_slack_hyperlink_does_not_start_a_review_from_its_display_label() {
         PullRequestLinkContext::parse(
             "<https://github.com/acme/widget/issues/17|https://github.com/other/repo/pull/18>"
         )
+        .unwrap()
         .is_none()
     );
 }
@@ -185,16 +190,17 @@ fn a_pr_slack_hyperlink_reviews_only_its_url_and_bare_links_outside_it() {
         "{PR} <{PR}|https://github.com/other/repo/pull/18> \
          https://github.com/third/project/pull/19"
     ))
+    .unwrap()
     .unwrap();
     assert_eq!(links.targets.len(), 2);
-    assert_eq!(links.targets[0].owner, "acme");
-    assert_eq!(links.targets[0].repo, "widget");
+    assert_eq!(links.targets[0].coordinates().0, "acme");
+    assert_eq!(links.targets[0].coordinates().1, "widget");
     assert_eq!(
         links.targets[0].number,
         dekopon_core::github::GithubNumber::new(17).unwrap()
     );
-    assert_eq!(links.targets[1].owner, "third");
-    assert_eq!(links.targets[1].repo, "project");
+    assert_eq!(links.targets[1].coordinates().0, "third");
+    assert_eq!(links.targets[1].coordinates().1, "project");
     assert_eq!(
         links.targets[1].number,
         dekopon_core::github::GithubNumber::new(19).unwrap()
@@ -208,13 +214,13 @@ fn a_truncated_pr_link_is_never_reinterpreted_as_a_shorter_number() {
         "{}{url}",
         " ".repeat(MAX_INBOUND_TEXT_BYTES - url.len() + 1)
     );
-    assert!(PullRequestLinkContext::parse(&text).is_none());
+    assert!(PullRequestLinkContext::parse(&text).unwrap().is_none());
 }
 
 #[test]
 fn truncation_keeps_complete_slack_hyperlinks_and_drops_incomplete_ones() {
     let complete = format!("<{PR}|review>{}", "x".repeat(MAX_INBOUND_TEXT_BYTES));
-    let links = PullRequestLinkContext::parse(&complete).unwrap();
+    let links = PullRequestLinkContext::parse(&complete).unwrap().unwrap();
     assert_eq!(links.targets.len(), 1);
     assert_eq!(
         links.targets[0].number,
@@ -224,7 +230,11 @@ fn truncation_keeps_complete_slack_hyperlinks_and_drops_incomplete_ones() {
         "<https://github.com/acme/widget/issues/17|{PR} {}>",
         "x".repeat(MAX_INBOUND_TEXT_BYTES)
     );
-    assert!(PullRequestLinkContext::parse(&incomplete).is_none());
+    assert!(
+        PullRequestLinkContext::parse(&incomplete)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -446,7 +456,7 @@ fn other_speakers_stay_queued_before_and_after_pr_link_mapping_resolves() {
         let gate = SessionGate::new(1);
         let route = persistent_route(model_config(), shared_window());
         let mut first = owned_slack_message(PR, false);
-        first.pull_request_links = PullRequestLinkContext::parse(PR);
+        first.pull_request_links = PullRequestLinkContext::parse(PR).unwrap();
         let key = (first.transport.clone(), first.conversation.key());
         let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(vec![]))
         else {
