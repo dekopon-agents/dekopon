@@ -403,7 +403,7 @@ async fn another_mapped_participant_can_list_and_cancel_channel_subscriptions_bu
     for id in ["dm-list", "dm-cancel"] {
         assert_eq!(
             fixture.tool_result(id),
-            "Not done: PR subscriptions require an authorized participant in a mapped channel."
+            "Not done: space wakes require an authorized participant in a mapped channel."
         );
     }
     assert_eq!(stored(&fixture).len(), 1);

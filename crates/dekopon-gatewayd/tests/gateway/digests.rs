@@ -499,11 +499,11 @@ async fn a_digest_in_a_dm_and_a_second_digest_in_one_space_are_refused_before_pe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unchanged_and_empty_digest_probes_start_no_model_turn_and_post_nothing() {
+async fn unchanged_empty_and_unrouted_digest_probes_start_no_model_turn_and_post_nothing() {
     let audit = Audit::exclusive().await;
-    for empty in [false, true] {
+    for case in ["unchanged", "empty", "unrouted"] {
         let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
-        let script = if empty {
+        let script = if case == "empty" {
             "probe upper --text read | jq -r '\"\"'"
         } else {
             "probe upper --text waiting | jq -r .text"
@@ -529,16 +529,24 @@ async fn unchanged_and_empty_digest_probes_start_no_model_turn_and_post_nothing(
         let mut rows = stored(&fixture);
         let directory = fixture.shutdown().await;
         rows[0]["nextAtMs"] = json!(0);
+        if case == "unrouted" {
+            rows[0]["agent"] = json!("absent-agent");
+        }
+        let operation = if case == "unrouted" {
+            "failed"
+        } else {
+            "declined"
+        };
         let previous = audit
             .capture
-            .events_where("dekopon_gatewayd", &[("digest.operation", "declined")])
+            .events_where("dekopon_gatewayd", &[("digest.operation", operation)])
             .len();
         let fixture = boot_digests(&chat, directory, vec![], rows, None).await;
-        wait_digest(&audit, "declined", previous).await;
+        wait_digest(&audit, operation, previous).await;
         assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
-        assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
-        assert_eq!(stored(&fixture).len(), 1);
+        assert_eq!(stored(&fixture).len(), usize::from(case != "unrouted"));
         fixture.shutdown().await;
+        assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
     }
 }
 
