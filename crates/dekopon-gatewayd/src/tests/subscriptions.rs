@@ -42,7 +42,7 @@ fn a_dotted_repository_is_refused_at_pr_link_parse_and_persists_nothing() {
 }
 
 #[test]
-fn the_sixty_fifth_subscription_is_refused_with_a_typed_error() {
+fn the_sixty_fifth_subscription_is_refused_per_agent_across_channels() {
     let directory = temporary();
     let store = wakes::wake_store(directory.path());
     let anchor = subscription_anchor();
@@ -54,7 +54,17 @@ fn the_sixty_fifth_subscription_is_refused_with_a_typed_error() {
                 .unwrap()
                 .targets
                 .remove(0);
-        store.subscribe(anchor.clone(), target, now).unwrap();
+        let mut message = owned_slack_message("review", false);
+        message.conversation.id = if number % 2 == 0 { "cfirst" } else { "csecond" }.into();
+        message.reply = ReplyTarget::Slack {
+            channel: message.conversation.id.clone(),
+            thread_ts: message.conversation.thread.clone(),
+        };
+        let channel = Anchor::from_inbound(&message, anchor.agent())
+            .unwrap()
+            .as_space()
+            .unwrap();
+        store.subscribe(channel, target, now).unwrap();
     }
     let target = PullRequestLinkContext::parse("https://github.com/acme/widget/pull/65")
         .unwrap()
@@ -65,7 +75,13 @@ fn the_sixty_fifth_subscription_is_refused_with_a_typed_error() {
         store.subscribe(anchor.clone(), target, now),
         Err(dekopon_agent::wake::WakeRefusal::SubscriptionsFull { maximum: 64 })
     );
-    assert_eq!(store.list_subscriptions(&anchor, now).unwrap().len(), 64);
+    assert_eq!(
+        fs::read_to_string(directory.path().join("wakes/wakes.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        64
+    );
 }
 
 #[test]
