@@ -2030,12 +2030,15 @@ fn credential_refresh_errors_have_distinct_categories() {
 #[test]
 fn a_default_secret_use_field_deserializes_to_some() {
     let set = |extra: serde_json::Value| {
-        let mut value = serde_json::json!({
-            "provider": "storage-probe",
-            "effect": "read-only",
-            "risk": "Low",
-            "constraints": {},
-        });
+        let mut value = serde_json::to_value(storage_set(
+            "storage-probe",
+            StorageInterface::DurableFiles,
+            StorageAccess::ReadOnly,
+            StorageScope::Agent,
+            dekopon_capability::StorageRetention::Keep,
+            None,
+        ))
+        .expect("constraint set serializes");
         value
             .as_object_mut()
             .unwrap()
