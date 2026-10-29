@@ -9797,13 +9797,4731 @@
           ]
         }
       ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:445:9: replace <impl fmt::Display for CapabilityRoute>::fmt -> fmt::Result with Ok(Default::default())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "<impl fmt::Display for CapabilityRoute>::fmt",
+            "return_type": "-> fmt::Result",
+            "span": {
+              "start": {
+                "line": 444,
+                "column": 5
+              },
+              "end": {
+                "line": 446,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 445,
+              "column": 9
+            },
+            "end": {
+              "line": 445,
+              "column": 43
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_445_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_445_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 37.061222085,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.733344854,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with \"\"",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "CapabilityRoute::as_str",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 432,
+                "column": 5
+              },
+              "end": {
+                "line": 440,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 434,
+              "column": 9
+            },
+            "end": {
+              "line": 439,
+              "column": 10
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_434_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_434_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.051075192,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 54.03580043,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with \"xyzzy\"",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "CapabilityRoute::as_str",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 432,
+                "column": 5
+              },
+              "end": {
+                "line": 440,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 434,
+              "column": 9
+            },
+            "end": {
+              "line": 439,
+              "column": 10
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_434_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_434_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 36.945949932,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 48.785074581,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(Some(Default::default()))",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "deserialize_default_secret_use",
+            "return_type": "-> Result<Option<DefaultSecretUse>, D::Error>",
+            "span": {
+              "start": {
+                "line": 487,
+                "column": 1
+              },
+              "end": {
+                "line": 494,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 493,
+              "column": 5
+            },
+            "end": {
+              "line": 493,
+              "column": 58
+            }
+          },
+          "replacement": "Ok(Some(Default::default()))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_493_col_5_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_493_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.838684241,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:518:9: replace StartupWarning::reason -> &'static str with \"\"",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "StartupWarning::reason",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 516,
+                "column": 5
+              },
+              "end": {
+                "line": 522,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 518,
+              "column": 9
+            },
+            "end": {
+              "line": 521,
+              "column": 10
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_518_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_518_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.568693159,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.760032015,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "deserialize_default_secret_use",
+            "return_type": "-> Result<Option<DefaultSecretUse>, D::Error>",
+            "span": {
+              "start": {
+                "line": 487,
+                "column": 1
+              },
+              "end": {
+                "line": 494,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 493,
+              "column": 5
+            },
+            "end": {
+              "line": 493,
+              "column": 58
+            }
+          },
+          "replacement": "Ok(None)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_493_col_5.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_493_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 22.73135721,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.769272433,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:526:9: replace StartupWarning::capability -> &CapabilityId with Box::leak(Box::new(Default::default()))",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "StartupWarning::capability",
+            "return_type": "-> &CapabilityId",
+            "span": {
+              "start": {
+                "line": 524,
+                "column": 5
+              },
+              "end": {
+                "line": 530,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 526,
+              "column": 9
+            },
+            "end": {
+              "line": 529,
+              "column": 10
+            }
+          },
+          "replacement": "Box::leak(Box::new(Default::default()))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_526_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_526_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.948436933,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:518:9: replace StartupWarning::reason -> &'static str with \"xyzzy\"",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "StartupWarning::reason",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 516,
+                "column": 5
+              },
+              "end": {
+                "line": 522,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 518,
+              "column": 9
+            },
+            "end": {
+              "line": 521,
+              "column": 10
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_518_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_518_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 40.012489874,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 19.259637167,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:584:9: replace ConstraintCatalog::with_agent_credentials -> Self with Default::default()",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::with_agent_credentials",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 576,
+                "column": 5
+              },
+              "end": {
+                "line": 586,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 584,
+              "column": 9
+            },
+            "end": {
+              "line": 585,
+              "column": 13
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_584_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_584_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 35.032373852,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 13.760722304,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:535:9: replace <impl fmt::Display for StartupWarning>::fmt -> fmt::Result with Ok(Default::default())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "<impl fmt::Display for StartupWarning>::fmt",
+            "return_type": "-> fmt::Result",
+            "span": {
+              "start": {
+                "line": 534,
+                "column": 5
+              },
+              "end": {
+                "line": 546,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 535,
+              "column": 9
+            },
+            "end": {
+              "line": 545,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_535_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_535_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 36.388368212,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 51.95228382,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:558:9: replace ConstraintCatalog::empty -> Self with Default::default()",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::empty",
+            "return_type": "-> Self",
+            "span": {
+              "start": {
+                "line": 556,
+                "column": 5
+              },
+              "end": {
+                "line": 559,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 558,
+              "column": 9
+            },
+            "end": {
+              "line": 558,
+              "column": 24
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_558_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_558_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 35.522537594,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 51.931491295,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:590:9: replace ConstraintCatalog::credential_for -> Option<&'a str> with None",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::credential_for",
+            "return_type": "-> Option<&'a str>",
+            "span": {
+              "start": {
+                "line": 588,
+                "column": 5
+              },
+              "end": {
+                "line": 599,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 590,
+              "column": 9
+            },
+            "end": {
+              "line": 598,
+              "column": 51
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_590_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_590_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 37.000218436,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 8.500656502,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:590:9: replace ConstraintCatalog::credential_for -> Option<&'a str> with Some(\"xyzzy\")",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::credential_for",
+            "return_type": "-> Option<&'a str>",
+            "span": {
+              "start": {
+                "line": 588,
+                "column": 5
+              },
+              "end": {
+                "line": 599,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 590,
+              "column": 9
+            },
+            "end": {
+              "line": 598,
+              "column": 51
+            }
+          },
+          "replacement": "Some(\"xyzzy\")",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_590_col_9_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_590_col_9_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 38.168908008,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 14.973429609,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:590:9: replace ConstraintCatalog::credential_for -> Option<&'a str> with Some(\"\")",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::credential_for",
+            "return_type": "-> Option<&'a str>",
+            "span": {
+              "start": {
+                "line": 588,
+                "column": 5
+              },
+              "end": {
+                "line": 599,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 590,
+              "column": 9
+            },
+            "end": {
+              "line": 598,
+              "column": 51
+            }
+          },
+          "replacement": "Some(\"\")",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_590_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_590_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 40.078472986,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 14.111838662,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:602:9: replace ConstraintCatalog::selectable_credentials -> Vec<&'a str> with vec![]",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::selectable_credentials",
+            "return_type": "-> Vec<&'a str>",
+            "span": {
+              "start": {
+                "line": 601,
+                "column": 5
+              },
+              "end": {
+                "line": 612,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 602,
+              "column": 9
+            },
+            "end": {
+              "line": 611,
+              "column": 14
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_602_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_602_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 48.202329718,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 21.60861452,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:602:9: replace ConstraintCatalog::selectable_credentials -> Vec<&'a str> with vec![\"\"]",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::selectable_credentials",
+            "return_type": "-> Vec<&'a str>",
+            "span": {
+              "start": {
+                "line": 601,
+                "column": 5
+              },
+              "end": {
+                "line": 612,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 602,
+              "column": 9
+            },
+            "end": {
+              "line": 611,
+              "column": 14
+            }
+          },
+          "replacement": "vec![\"\"]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_602_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_602_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 35.370543888,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 13.322873564,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:615:9: replace ConstraintCatalog::retain_routed -> Vec<CapabilityId> with vec![Default::default()]",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retain_routed",
+            "return_type": "-> Vec<CapabilityId>",
+            "span": {
+              "start": {
+                "line": 614,
+                "column": 5
+              },
+              "end": {
+                "line": 629,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 615,
+              "column": 9
+            },
+            "end": {
+              "line": 628,
+              "column": 16
+            }
+          },
+          "replacement": "vec![Default::default()]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_615_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_615_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.428595809,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:602:9: replace ConstraintCatalog::selectable_credentials -> Vec<&'a str> with vec![\"xyzzy\"]",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::selectable_credentials",
+            "return_type": "-> Vec<&'a str>",
+            "span": {
+              "start": {
+                "line": 601,
+                "column": 5
+              },
+              "end": {
+                "line": 612,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 602,
+              "column": 9
+            },
+            "end": {
+              "line": 611,
+              "column": 14
+            }
+          },
+          "replacement": "vec![\"xyzzy\"]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_602_col_9_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_602_col_9_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 54.339039927,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.8350704,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:615:9: replace ConstraintCatalog::retain_routed -> Vec<CapabilityId> with vec![]",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retain_routed",
+            "return_type": "-> Vec<CapabilityId>",
+            "span": {
+              "start": {
+                "line": 614,
+                "column": 5
+              },
+              "end": {
+                "line": 629,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 615,
+              "column": 9
+            },
+            "end": {
+              "line": 628,
+              "column": 16
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_615_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_615_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 38.055600737,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 25.10985551,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:633:9: replace ConstraintCatalog::get -> Option<&ConstraintSet> with Some(Box::leak(Box::new(Default::default())))",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::get",
+            "return_type": "-> Option<&ConstraintSet>",
+            "span": {
+              "start": {
+                "line": 631,
+                "column": 5
+              },
+              "end": {
+                "line": 634,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 633,
+              "column": 9
+            },
+            "end": {
+              "line": 633,
+              "column": 34
+            }
+          },
+          "replacement": "Some(Box::leak(Box::new(Default::default())))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_633_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_633_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 7.203546239,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:622:34: delete ! in ConstraintCatalog::retain_routed",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retain_routed",
+            "return_type": "-> Vec<CapabilityId>",
+            "span": {
+              "start": {
+                "line": 614,
+                "column": 5
+              },
+              "end": {
+                "line": 629,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 622,
+              "column": 34
+            },
+            "end": {
+              "line": 622,
+              "column": 35
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_622_col_34.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_622_col_34.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 28.846132097,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.784131759,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:637:9: replace ConstraintCatalog::iter -> impl Iterator<Item =(&CapabilityId, &ConstraintSet)> with ::std::iter::once((Box::leak(Box::new(Default::default())), Box::leak(Box::new(Default::default()))))",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::iter",
+            "return_type": "-> impl Iterator<Item =(&CapabilityId, &ConstraintSet)>",
+            "span": {
+              "start": {
+                "line": 636,
+                "column": 5
+              },
+              "end": {
+                "line": 638,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 637,
+              "column": 9
+            },
+            "end": {
+              "line": 637,
+              "column": 25
+            }
+          },
+          "replacement": "::std::iter::once((Box::leak(Box::new(Default::default())), Box::leak(Box::new(Default::default()))))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_637_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_637_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.702407386,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:633:9: replace ConstraintCatalog::get -> Option<&ConstraintSet> with None",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::get",
+            "return_type": "-> Option<&ConstraintSet>",
+            "span": {
+              "start": {
+                "line": 631,
+                "column": 5
+              },
+              "end": {
+                "line": 634,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 633,
+              "column": 9
+            },
+            "end": {
+              "line": 633,
+              "column": 34
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_633_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_633_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 41.747517707,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.725715177,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:641:9: replace ConstraintCatalog::routed -> Option<(&CapabilityId, &ConstraintSet)> with Some((Box::leak(Box::new(Default::default())), Box::leak(Box::new(Default::default()))))",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::routed",
+            "return_type": "-> Option<(&CapabilityId, &ConstraintSet)>",
+            "span": {
+              "start": {
+                "line": 640,
+                "column": 5
+              },
+              "end": {
+                "line": 642,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 641,
+              "column": 9
+            },
+            "end": {
+              "line": 641,
+              "column": 61
+            }
+          },
+          "replacement": "Some((Box::leak(Box::new(Default::default())), Box::leak(Box::new(Default::default()))))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_641_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_641_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.5515656060000005,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:637:9: replace ConstraintCatalog::iter -> impl Iterator<Item =(&CapabilityId, &ConstraintSet)> with ::std::iter::empty()",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::iter",
+            "return_type": "-> impl Iterator<Item =(&CapabilityId, &ConstraintSet)>",
+            "span": {
+              "start": {
+                "line": 636,
+                "column": 5
+              },
+              "end": {
+                "line": 638,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 637,
+              "column": 9
+            },
+            "end": {
+              "line": 637,
+              "column": 25
+            }
+          },
+          "replacement": "::std::iter::empty()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_637_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_637_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.93477539,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 22.719661157,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:641:9: replace ConstraintCatalog::routed -> Option<(&CapabilityId, &ConstraintSet)> with None",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::routed",
+            "return_type": "-> Option<(&CapabilityId, &ConstraintSet)>",
+            "span": {
+              "start": {
+                "line": 640,
+                "column": 5
+              },
+              "end": {
+                "line": 642,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 641,
+              "column": 9
+            },
+            "end": {
+              "line": 641,
+              "column": 61
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_641_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_641_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 34.597977203,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 24.760516936,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:645:9: replace ConstraintCatalog::chat_memory_provider -> Option<&ProviderId> with Some(Box::leak(Box::new(Default::default())))",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::chat_memory_provider",
+            "return_type": "-> Option<&ProviderId>",
+            "span": {
+              "start": {
+                "line": 644,
+                "column": 5
+              },
+              "end": {
+                "line": 649,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 645,
+              "column": 9
+            },
+            "end": {
+              "line": 648,
+              "column": 38
+            }
+          },
+          "replacement": "Some(Box::leak(Box::new(Default::default())))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_645_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_645_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 9.03576798,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:641:52: replace == with != in ConstraintCatalog::routed",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::routed",
+            "return_type": "-> Option<(&CapabilityId, &ConstraintSet)>",
+            "span": {
+              "start": {
+                "line": 640,
+                "column": 5
+              },
+              "end": {
+                "line": 642,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 641,
+              "column": 52
+            },
+            "end": {
+              "line": 641,
+              "column": 54
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_641_col_52.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_641_col_52.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 31.031014221,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 24.737844527,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:645:9: replace ConstraintCatalog::chat_memory_provider -> Option<&ProviderId> with None",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::chat_memory_provider",
+            "return_type": "-> Option<&ProviderId>",
+            "span": {
+              "start": {
+                "line": 644,
+                "column": 5
+              },
+              "end": {
+                "line": 649,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 645,
+              "column": 9
+            },
+            "end": {
+              "line": 648,
+              "column": 38
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_645_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_645_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 34.432704263,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 22.924243525,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 0",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::len",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 651,
+                "column": 5
+              },
+              "end": {
+                "line": 654,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 653,
+              "column": 9
+            },
+            "end": {
+              "line": 653,
+              "column": 24
+            }
+          },
+          "replacement": "0",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_653_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_653_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 30.562767137,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 51.872212379,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::len",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 651,
+                "column": 5
+              },
+              "end": {
+                "line": 654,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 653,
+              "column": 9
+            },
+            "end": {
+              "line": 653,
+              "column": 24
+            }
+          },
+          "replacement": "1",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_653_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_653_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.016627484,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 51.580164601,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with true",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::is_empty",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 656,
+                "column": 5
+              },
+              "end": {
+                "line": 659,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 658,
+              "column": 9
+            },
+            "end": {
+              "line": 658,
+              "column": 29
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_658_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_658_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 31.283533534,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 43.849305937,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:667:9: replace ConstraintCatalog::validate -> Result<(), BrokerBuildError> with Ok(())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 667,
+              "column": 9
+            },
+            "end": {
+              "line": 695,
+              "column": 15
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 49.359807584,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.18535588,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with false",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::is_empty",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 656,
+                "column": 5
+              },
+              "end": {
+                "line": 659,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 658,
+              "column": 9
+            },
+            "end": {
+              "line": 658,
+              "column": 29
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_658_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_658_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 24.600201852,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.561045546,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:667:28: replace > with == in ConstraintCatalog::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 667,
+              "column": 28
+            },
+            "end": {
+              "line": 667,
+              "column": 29
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_28.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 44.255901221,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 49.943578035,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:667:28: replace > with < in ConstraintCatalog::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 667,
+              "column": 28
+            },
+            "end": {
+              "line": 667,
+              "column": 29
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_28_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_28_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 45.677742248,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.126802315,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:689:56: replace == with != in ConstraintCatalog::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 689,
+              "column": 56
+            },
+            "end": {
+              "line": 689,
+              "column": 58
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_689_col_56.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_689_col_56.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 28.519463729,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 14.494496222,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:17: replace && with || in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 17
+            },
+            "end": {
+              "line": 705,
+              "column": 19
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_17.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_17.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.379367575,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:667:28: replace > with >= in ConstraintCatalog::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 667,
+              "column": 28
+            },
+            "end": {
+              "line": 667,
+              "column": 29
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_28_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_28_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 41.719106084,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 55.213721679,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:699:9: replace ConstraintCatalog::retention_policies -> Result<RetentionPolicies, BrokerBuildError> with Ok(Default::default())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 699,
+              "column": 9
+            },
+            "end": {
+              "line": 720,
+              "column": 21
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_699_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_699_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 33.951798141,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 15.074610835,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:42: replace || with && in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 42
+            },
+            "end": {
+              "line": 705,
+              "column": 44
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_42.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_42.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 27.575693743,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 13.496737778,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:37: replace == with != in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 37
+            },
+            "end": {
+              "line": 705,
+              "column": 39
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_37.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_37.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 31.136919527,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.93367096,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with < in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 61
+            },
+            "end": {
+              "line": 705,
+              "column": 62
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 24.777098413,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 14.136821512,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:712:17: replace && with || in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 712,
+              "column": 17
+            },
+            "end": {
+              "line": 712,
+              "column": 19
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_712_col_17.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_712_col_17.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.668484071,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:712:29: replace != with == in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 712,
+              "column": 29
+            },
+            "end": {
+              "line": 712,
+              "column": 31
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_712_col_29.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_712_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 23.032260188,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 13.201168405,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 61
+            },
+            "end": {
+              "line": 705,
+              "column": 62
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 45.759056435,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.796064428,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with >= in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 61
+            },
+            "end": {
+              "line": 705,
+              "column": 62
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 24.739820481,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 51.675781272,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:730:30: replace != with == in ConstraintCatalog::validate_storage_namespaces",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_storage_namespaces",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 723,
+                "column": 5
+              },
+              "end": {
+                "line": 768,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 730,
+              "column": 30
+            },
+            "end": {
+              "line": 730,
+              "column": 32
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_730_col_30.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_730_col_30.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 26.131999202,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.427236915,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:753:33: replace > with == in ConstraintCatalog::validate_storage_namespaces",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_storage_namespaces",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 723,
+                "column": 5
+              },
+              "end": {
+                "line": 768,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 753,
+              "column": 33
+            },
+            "end": {
+              "line": 753,
+              "column": 34
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_753_col_33.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_753_col_33.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 28.642006278,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.394128234,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:724:9: replace ConstraintCatalog::validate_storage_namespaces -> Result<(), BrokerBuildError> with Ok(())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_storage_namespaces",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 723,
+                "column": 5
+              },
+              "end": {
+                "line": 768,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 724,
+              "column": 9
+            },
+            "end": {
+              "line": 767,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_724_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_724_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 53.035865482,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.221329847,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:753:33: replace > with < in ConstraintCatalog::validate_storage_namespaces",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_storage_namespaces",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 723,
+                "column": 5
+              },
+              "end": {
+                "line": 768,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 753,
+              "column": 33
+            },
+            "end": {
+              "line": 753,
+              "column": 34
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_753_col_33_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_753_col_33_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 23.5587964,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 12.301639434,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:753:33: replace > with >= in ConstraintCatalog::validate_storage_namespaces",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_storage_namespaces",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 723,
+                "column": 5
+              },
+              "end": {
+                "line": 768,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 753,
+              "column": 33
+            },
+            "end": {
+              "line": 753,
+              "column": 34
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_753_col_33_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_753_col_33_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 19.014781825,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.203212745,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:776:46: replace == with != in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 776,
+              "column": 46
+            },
+            "end": {
+              "line": 776,
+              "column": 48
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_776_col_46.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_776_col_46.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 38.32002306,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.633830361,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:771:9: replace ConstraintCatalog::validate_routes -> Result<(), BrokerBuildError> with Ok(())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 771,
+              "column": 9
+            },
+            "end": {
+              "line": 818,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_771_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_771_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 48.036212983,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.233909665,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:779:32: replace > with == in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 779,
+              "column": 32
+            },
+            "end": {
+              "line": 779,
+              "column": 33
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_779_col_32.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_779_col_32.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 31.702887443,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 22.317791334,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:779:32: replace > with < in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 779,
+              "column": 32
+            },
+            "end": {
+              "line": 779,
+              "column": 33
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_779_col_32_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_779_col_32_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 25.624398751,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 9.269886941,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:792:28: replace > with == in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 792,
+              "column": 28
+            },
+            "end": {
+              "line": 792,
+              "column": 29
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_792_col_28.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_792_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 32.500170299,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 25.253539752000002,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:792:28: replace > with < in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 792,
+              "column": 28
+            },
+            "end": {
+              "line": 792,
+              "column": 29
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_792_col_28_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_792_col_28_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 27.236307128,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 8.052050491,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:779:32: replace > with >= in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 779,
+              "column": 32
+            },
+            "end": {
+              "line": 779,
+              "column": 33
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_779_col_32_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_779_col_32_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 47.462014803,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 26.719533741,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:792:28: replace > with >= in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 792,
+              "column": 28
+            },
+            "end": {
+              "line": 792,
+              "column": 29
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_792_col_28_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_792_col_28_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 17.870868476,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 26.725685989,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:804:21: replace && with || in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 804,
+              "column": 21
+            },
+            "end": {
+              "line": 804,
+              "column": 23
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_804_col_21.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_804_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 30.569630025,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.615915551,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:802:35: replace == with != in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 802,
+              "column": 35
+            },
+            "end": {
+              "line": 802,
+              "column": 37
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_802_col_35.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_802_col_35.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 28.285659392,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 18.76183033,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 803,
+              "column": 21
+            },
+            "end": {
+              "line": 803,
+              "column": 23
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_803_col_21.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_803_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 34.293940282,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 52.283717669,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:803:38: replace == with != in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 803,
+              "column": 38
+            },
+            "end": {
+              "line": 803,
+              "column": 40
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_803_col_38.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_803_col_38.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 19.924824451,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 26.270046471,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:804:39: replace == with != in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 804,
+              "column": 39
+            },
+            "end": {
+              "line": 804,
+              "column": 41
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_804_col_39.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_804_col_39.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 26.616116165,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.276200018,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with \"\"",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "CredentialRefreshError::category",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 844,
+                "column": 5
+              },
+              "end": {
+                "line": 850,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 846,
+              "column": 9
+            },
+            "end": {
+              "line": 849,
+              "column": 10
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_846_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_846_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 37.549387178,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 48.156059877,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:853:9: replace CredentialRefreshError::permanent -> bool with true",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "CredentialRefreshError::permanent",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 852,
+                "column": 5
+              },
+              "end": {
+                "line": 854,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 853,
+              "column": 9
+            },
+            "end": {
+              "line": 853,
+              "column": 54
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_853_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_853_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 37.33380185,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 27.064562188,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with \"xyzzy\"",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "CredentialRefreshError::category",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 844,
+                "column": 5
+              },
+              "end": {
+                "line": 850,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 846,
+              "column": 9
+            },
+            "end": {
+              "line": 849,
+              "column": 10
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_846_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_846_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 35.108777702,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 49.961255164,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
     }
   ],
-  "total_mutants": 141,
-  "missed": 30,
-  "caught": 100,
+  "total_mutants": 209,
+  "missed": 47,
+  "caught": 142,
   "timeout": 0,
-  "unviable": 11,
+  "unviable": 20,
   "success": 0,
   "start_time": "2026-10-29T08:51:31.793727148Z",
   "end_time": null,

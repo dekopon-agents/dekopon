@@ -1,7 +1,0 @@
-error: failed to load source for dependency `tracing-core`
-
-Caused by:
-  unable to update https://github.com/dekopon-agents/tracing?rev=2b696a18454a04df9c9a60569b6fb73a22415296#2b696a18
-
-Caused by:
-  can't checkout from 'https://github.com/dekopon-agents/tracing': you are in the offline mode (--offline)

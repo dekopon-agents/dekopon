@@ -9,3 +9,12 @@ crates/dekopon-broker/src/lib.rs:362:9: replace AuthenticatedContext::via -> Opt
 crates/dekopon-broker/src/lib.rs:367:9: replace AuthenticatedContext::attested_subject -> Option<&ExternalSubject> with Some(Box::leak(Box::new(Default::default())))
 crates/dekopon-broker/src/lib.rs:372:9: replace AuthenticatedContext::chat_scope -> Option<&ChatScopeClaim> with Some(Box::leak(Box::new(Default::default())))
 crates/dekopon-broker/src/lib.rs:425:9: replace CapabilityRoute::chat_memory_access -> Option<StorageAccess> with Some(Default::default())
+crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(Some(Default::default()))
+crates/dekopon-broker/src/lib.rs:526:9: replace StartupWarning::capability -> &CapabilityId with Box::leak(Box::new(Default::default()))
+crates/dekopon-broker/src/lib.rs:615:9: replace ConstraintCatalog::retain_routed -> Vec<CapabilityId> with vec![Default::default()]
+crates/dekopon-broker/src/lib.rs:633:9: replace ConstraintCatalog::get -> Option<&ConstraintSet> with Some(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:637:9: replace ConstraintCatalog::iter -> impl Iterator<Item =(&CapabilityId, &ConstraintSet)> with ::std::iter::once((Box::leak(Box::new(Default::default())), Box::leak(Box::new(Default::default()))))
+crates/dekopon-broker/src/lib.rs:641:9: replace ConstraintCatalog::routed -> Option<(&CapabilityId, &ConstraintSet)> with Some((Box::leak(Box::new(Default::default())), Box::leak(Box::new(Default::default()))))
+crates/dekopon-broker/src/lib.rs:645:9: replace ConstraintCatalog::chat_memory_provider -> Option<&ProviderId> with Some(Box::leak(Box::new(Default::default())))
+crates/dekopon-broker/src/lib.rs:705:17: replace && with || in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:712:17: replace && with || in ConstraintCatalog::retention_policies

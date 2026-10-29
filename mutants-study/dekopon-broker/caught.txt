@@ -98,3 +98,45 @@ crates/dekopon-broker/src/lib.rs:416:9: delete ! in CapabilityRoute::is_chat_mem
 crates/dekopon-broker/src/lib.rs:421:9: replace CapabilityRoute::is_chat_memory_retrieval -> bool with true
 crates/dekopon-broker/src/lib.rs:421:9: replace CapabilityRoute::is_chat_memory_retrieval -> bool with false
 crates/dekopon-broker/src/lib.rs:425:9: replace CapabilityRoute::chat_memory_access -> Option<StorageAccess> with None
+crates/dekopon-broker/src/lib.rs:445:9: replace <impl fmt::Display for CapabilityRoute>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:518:9: replace StartupWarning::reason -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:518:9: replace StartupWarning::reason -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:584:9: replace ConstraintCatalog::with_agent_credentials -> Self with Default::default()
+crates/dekopon-broker/src/lib.rs:590:9: replace ConstraintCatalog::credential_for -> Option<&'a str> with None
+crates/dekopon-broker/src/lib.rs:590:9: replace ConstraintCatalog::credential_for -> Option<&'a str> with Some("xyzzy")
+crates/dekopon-broker/src/lib.rs:590:9: replace ConstraintCatalog::credential_for -> Option<&'a str> with Some("")
+crates/dekopon-broker/src/lib.rs:602:9: replace ConstraintCatalog::selectable_credentials -> Vec<&'a str> with vec![]
+crates/dekopon-broker/src/lib.rs:602:9: replace ConstraintCatalog::selectable_credentials -> Vec<&'a str> with vec![""]
+crates/dekopon-broker/src/lib.rs:602:9: replace ConstraintCatalog::selectable_credentials -> Vec<&'a str> with vec!["xyzzy"]
+crates/dekopon-broker/src/lib.rs:615:9: replace ConstraintCatalog::retain_routed -> Vec<CapabilityId> with vec![]
+crates/dekopon-broker/src/lib.rs:622:34: delete ! in ConstraintCatalog::retain_routed
+crates/dekopon-broker/src/lib.rs:633:9: replace ConstraintCatalog::get -> Option<&ConstraintSet> with None
+crates/dekopon-broker/src/lib.rs:637:9: replace ConstraintCatalog::iter -> impl Iterator<Item =(&CapabilityId, &ConstraintSet)> with ::std::iter::empty()
+crates/dekopon-broker/src/lib.rs:641:9: replace ConstraintCatalog::routed -> Option<(&CapabilityId, &ConstraintSet)> with None
+crates/dekopon-broker/src/lib.rs:641:52: replace == with != in ConstraintCatalog::routed
+crates/dekopon-broker/src/lib.rs:645:9: replace ConstraintCatalog::chat_memory_provider -> Option<&ProviderId> with None
+crates/dekopon-broker/src/lib.rs:667:9: replace ConstraintCatalog::validate -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:667:28: replace > with < in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:689:56: replace == with != in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:699:9: replace ConstraintCatalog::retention_policies -> Result<RetentionPolicies, BrokerBuildError> with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:705:42: replace || with && in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:705:37: replace == with != in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:705:61: replace > with < in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:712:29: replace != with == in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:730:30: replace != with == in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:753:33: replace > with == in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:724:9: replace ConstraintCatalog::validate_storage_namespaces -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:753:33: replace > with < in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:753:33: replace > with >= in ConstraintCatalog::validate_storage_namespaces
+crates/dekopon-broker/src/lib.rs:776:46: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:771:9: replace ConstraintCatalog::validate_routes -> Result<(), BrokerBuildError> with Ok(())
+crates/dekopon-broker/src/lib.rs:779:32: replace > with == in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:779:32: replace > with < in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:792:28: replace > with == in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:792:28: replace > with < in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:779:32: replace > with >= in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:792:28: replace > with >= in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:802:35: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:803:38: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:804:39: replace == with != in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:853:9: replace CredentialRefreshError::permanent -> bool with true

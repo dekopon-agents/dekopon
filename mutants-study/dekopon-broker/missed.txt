@@ -28,3 +28,20 @@ crates/dekopon-broker/src/lib.rs:232:59: replace > with >= in ChatMemoryConfig::
 crates/dekopon-broker/src/lib.rs:233:46: replace > with >= in ChatMemoryConfig::validate_host_limits
 crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with true
 crates/dekopon-broker/src/lib.rs:249:39: replace * with + in round_up
+crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)
+crates/dekopon-broker/src/lib.rs:535:9: replace <impl fmt::Display for StartupWarning>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker/src/lib.rs:558:9: replace ConstraintCatalog::empty -> Self with Default::default()
+crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 0
+crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1
+crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with true
+crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with false
+crates/dekopon-broker/src/lib.rs:667:28: replace > with == in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:667:28: replace > with >= in ConstraintCatalog::validate
+crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:705:61: replace > with >= in ConstraintCatalog::retention_policies
+crates/dekopon-broker/src/lib.rs:804:21: replace && with || in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes
+crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with ""
+crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with "xyzzy"

@@ -1,0 +1,15 @@
+crates/dekopon-broker/src/lib.rs:139:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:138:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:137:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:136:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:140:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:135:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:140:48: replace > with == in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:141:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:140:48: replace > with >= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:142:38: replace < with <= in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:168:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:13: replace || with && in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:167:40: replace > with < in ChatMemoryConfig::validate
+crates/dekopon-broker/src/lib.rs:168:36: replace > with == in ChatMemoryConfig::validate
