@@ -2630,6 +2630,7 @@ struct SurfaceBroker<'a> {
     memory: bool,
     secret_binding: Option<Option<&'a str>>,
     identities: Vec<(&'a str, &'a str)>,
+    storage: bool,
 }
 
 impl<'a> SurfaceBroker<'a> {
@@ -2674,6 +2675,7 @@ impl<'a> SurfaceBroker<'a> {
             memory: false,
             secret_binding: None,
             identities: Vec::new(),
+            storage: true,
         }
     }
 
@@ -2703,14 +2705,16 @@ impl<'a> SurfaceBroker<'a> {
 
     async fn try_build(self) -> Result<Broker<InMemoryAuditLog>, super::BrokerBuildError> {
         let _memoization = dekopon_broker_host::enable_test_component_memoization();
-        let storage = dekopon_storage_host::StorageHost::open(
-            self.root
-                .canonicalize()
-                .expect("canonical tempdir")
-                .join("storage"),
-            dekopon_storage_host::StorageLimits::default(),
-        )
-        .expect("storage");
+        let storage = self.storage.then(|| {
+            dekopon_storage_host::StorageHost::open(
+                self.root
+                    .canonicalize()
+                    .expect("canonical tempdir")
+                    .join("storage"),
+                dekopon_storage_host::StorageLimits::default(),
+            )
+            .expect("storage")
+        });
         let registry = dekopon_broker_host::BrokerProviderRegistry::load_with_storage(
             [
                 dekopon_test_support::provider_fixture("cli-probe-provider.wasm"),
@@ -2720,7 +2724,7 @@ impl<'a> SurfaceBroker<'a> {
                     .join("tests/fixture/memory-smoke-probe-provider.wasm"),
             ],
             BrokerHostLimits::default(),
-            Some(storage),
+            storage,
         )
         .await
         .expect("fixtures load");
@@ -2920,6 +2924,19 @@ fn a_secret_binding_with_an_invalid_grant_is_refused_by_its_own_validation() {
         ..http_probe_binding()
     };
     assert_eq!(empty_scope.validate(), Err(SecretUseGrantError::EmptyScope));
+}
+
+#[test]
+fn a_secret_catalog_lists_the_secrets_its_bindings_name() {
+    let catalog = super::SecretCatalog::new(
+        vec![http_probe_binding()],
+        Arc::new(super::EmptySecretResolver),
+    )
+    .expect("catalog");
+    assert_eq!(
+        catalog.drns().map(|drn| drn.as_str()).collect::<Vec<_>>(),
+        [SECRET_DRN]
+    );
 }
 
 #[test]
@@ -3609,4 +3626,252 @@ async fn a_private_conversation_namespace_rotates_with_authority_and_other_scope
         }
         assert_eq!(sizes[0] != sizes[1], rotates, "{scope:?}");
     }
+}
+
+fn secret_proposal() -> super::SecretUseProposal {
+    super::SecretUseProposal::HttpBearer {
+        secret: SECRET_DRN.parse().expect("secret"),
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
+    use super::AttestorGrant;
+    use dekopon_broker_protocol::{Attestation, SessionRefusal};
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let dirs = [(); 3].map(|()| tempfile::tempdir().expect("tempdir"));
+    let scope = || {
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        )
+    };
+    let context = attested_agent_context("slack.t0123abc.u9xyz", scope());
+
+    let denying = SurfaceBroker::new(dirs[0].path(), &[]).build().await;
+    let refusal = denying
+        .authorize_invocation(&context, &"cli-probe.upper".parse().expect("capability"))
+        .err()
+        .expect("nothing permits the capability");
+    let evaluation = refusal
+        .evaluation
+        .expect("a policy denial carries its evaluation");
+    assert!(!evaluation.errors_present);
+
+    let erroring_secret_policy = permit("maintainer", "secret.use", "Secret", SECRET_DRN)
+        .replace(");", ") when { 9223372036854775807 + 1 > 0 };");
+    let mut secret_broker =
+        SurfaceBroker::new(dirs[1].path(), &[("http-probe.fetch", "http-probe")])
+            .with_secret(false, None);
+    secret_broker.policy.push_str(&erroring_secret_policy);
+    let secret_broker = secret_broker.build().await;
+    let capability = "http-probe.fetch".parse().expect("capability");
+    let mut decision = secret_broker
+        .authorize_invocation(&context, &capability)
+        .ok()
+        .expect("the capability is permitted");
+    assert!(!decision.errors_present);
+    let refusal = secret_broker
+        .bind_secret_use(
+            &context,
+            &capability,
+            &mut decision,
+            Some(&secret_proposal()),
+        )
+        .expect_err("the secret policy errors, so the use is denied");
+    assert_eq!(refusal.reason, "secret-denied");
+    let evaluation = refusal
+        .evaluation
+        .expect("a secret denial carries its evaluation");
+    assert!(evaluation.errors_present);
+    assert!(
+        decision.errors_present,
+        "a secret policy error is remembered on the capability decision"
+    );
+
+    let identities = [("slack.t0123abc.u9xyz", "maintainer")];
+    let agents = SurfaceBroker::new(dirs[2].path(), &[])
+        .with_identities(identities)
+        .build()
+        .await;
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().expect("principal"),
+        Actor::Service {
+            principal: "gateway".parse().expect("principal"),
+        },
+    )
+    .expect("gateway");
+    let grant = AttestorGrant { namespaces: None };
+    let mut thread_scope = scope();
+    thread_scope.conversation.kind = ConversationKind::Thread;
+    thread_scope.conversation.thread = Some("1712345678.000100".to_owned());
+    let claim = Attestation::for_chat(
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "reviewer".parse().expect("agent"),
+        thread_scope,
+    );
+    let (_, refusal) = agents.resolve_context(&gateway, Some(&grant), &claim);
+    let refusal = refusal.expect("no policy lets the maintainer prompt the agent");
+    assert_eq!(refusal.reason, "agent-denied");
+    assert_eq!(
+        refusal.session,
+        SessionRefusal::AgentDenied {
+            principal: "maintainer".parse().expect("principal")
+        }
+    );
+    assert!(refusal.evaluation.is_some());
+}
+
+fn only_cli_probe(mut broker: SurfaceBroker<'_>) -> SurfaceBroker<'_> {
+    broker
+        .constraints
+        .retain(|(capability, _)| capability.as_str().starts_with("cli-probe."));
+    broker
+}
+
+#[tokio::test]
+async fn a_denial_digests_the_same_with_or_without_a_storage_host_unless_the_capability_stores() {
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let context = AuthenticatedContext::new(
+        "maintainer".parse().expect("principal"),
+        Actor::Service {
+            principal: "maintainer".parse().expect("principal"),
+        },
+    )
+    .expect("context");
+    let request = dekopon_broker_protocol::InvocationRequest {
+        capability: "cli-probe.upper".parse().expect("capability"),
+        ..invocation_with_input(serde_json::json!({"text": "hi"}))
+    };
+    let mut digests = Vec::new();
+    for with_storage in [true, false] {
+        let mut broker = only_cli_probe(SurfaceBroker::new(
+            dirs[usize::from(with_storage)].path(),
+            &[],
+        ));
+        broker.storage = with_storage;
+        let broker = broker.build().await;
+        let result = broker
+            .deny(
+                &context,
+                &request,
+                super::unevaluated_refusal("policy-denied"),
+            )
+            .await
+            .expect("a denial is recorded");
+        assert_eq!(
+            result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        digests.push(result.evidence[0].digest.clone());
+    }
+    assert_eq!(digests[0], digests[1]);
+}
+
+#[tokio::test]
+async fn an_authorized_failure_before_the_provider_and_a_success_name_the_loaded_artifact() {
+    use dekopon_capability::{Evidence, InvocationOutcome};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = only_cli_probe(SurfaceBroker::new(
+        root.path(),
+        &[("cli-probe.upper", "cli-probe")],
+    ))
+    .build()
+    .await;
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            dekopon_broker_protocol::ChatTransportKind::Slack,
+            dekopon_broker_protocol::ConversationKind::Channel,
+            dekopon_broker_protocol::Trigger::Message,
+        ),
+    );
+    let provider: ProviderId = "cli-probe".parse().expect("provider");
+    let artifact = broker
+        .registry
+        .loaded_provider_metadata()
+        .find(|metadata| metadata.manifest.id == provider)
+        .map(|metadata| metadata.artifact_sha256)
+        .expect("the cli-probe artifact is loaded");
+    let artifacts = |broker: &Broker<InMemoryAuditLog>| {
+        broker
+            .audit
+            .records()
+            .into_iter()
+            .filter_map(|event| match event {
+                AuditEvent::Execution {
+                    provider_artifact_sha256,
+                    outcome,
+                    ..
+                } => Some((outcome, provider_artifact_sha256)),
+                AuditEvent::Decision { .. } => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let capability: CapabilityId = "cli-probe.upper".parse().expect("capability");
+    let set = broker
+        .constraints
+        .get(&capability)
+        .expect("constrained")
+        .clone();
+    let invocation: InvocationId = "invoke-failed-early".parse().expect("invocation");
+    broker
+        .fail_authorized_before_provider(
+            &context,
+            &invocation,
+            "0000000000000000000000000000f1c7".parse().expect("trace"),
+            &capability,
+            "decision-early",
+            broker.decision_reference("decision-early"),
+            &set,
+            None,
+            &[],
+            Evidence {
+                kind: "policy-decision".to_owned(),
+                digest: "sha256:early".to_owned(),
+                media_type: "application/json".to_owned(),
+                uri: None,
+            },
+            "storage-io",
+        )
+        .await
+        .expect("the failure is recorded");
+    assert_eq!(
+        artifacts(&broker),
+        [(InvocationOutcome::Failed, Some(artifact.clone()))]
+    );
+
+    let request = dekopon_broker_protocol::InvocationRequest {
+        id: "invoke-succeeds".parse().expect("invocation"),
+        capability,
+        ..invocation_with_input(serde_json::json!({"text": "hi"}))
+    };
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).expect("stdout");
+        bytes
+    });
+    let assets = dekopon_broker_host::asset::AssetInputs {
+        streams: Some(dekopon_broker_host::Streams {
+            stdin: None,
+            stdout: host.into(),
+        }),
+        ..Default::default()
+    };
+    let result = broker
+        .invoke(&context, None, None, request, assets)
+        .await
+        .expect("the invocation runs")
+        .result;
+    captured.join().expect("stdout reader");
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded, "{result:?}");
+    assert_eq!(
+        artifacts(&broker)[1..],
+        [(InvocationOutcome::Succeeded, Some(artifact))]
+    );
 }
