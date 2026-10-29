@@ -21,22 +21,22 @@ crates/dekopon-broker-protocol/src/lib.rs:383:28: replace > with < in deserializ
 crates/dekopon-broker-protocol/src/lib.rs:393:13: replace deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_string -> Result<Self::Value, E> with Ok(Default::default())
 crates/dekopon-broker-protocol/src/lib.rs:393:28: replace > with == in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_string
 crates/dekopon-broker-protocol/src/lib.rs:393:28: replace > with < in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_string
-crates/dekopon-broker-protocol/src/lib.rs:444:13: delete field invocation from struct Self expression in Attestation::bound_to
 crates/dekopon-broker-protocol/src/lib.rs:525:9: replace <impl fmt::Debug for DeliveryIdentity>::fmt -> fmt::Result with Ok(Default::default())
+crates/dekopon-broker-protocol/src/lib.rs:444:13: delete field invocation from struct Self expression in Attestation::bound_to
 crates/dekopon-broker-protocol/src/lib.rs:532:9: replace DeliveryIdentity::is_canonical_for -> bool with true
 crates/dekopon-broker-protocol/src/lib.rs:542:17: replace != with == in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:532:9: replace DeliveryIdentity::is_canonical_for -> bool with false
-crates/dekopon-broker-protocol/src/lib.rs:547:25: replace == with != in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:547:45: replace && with || in DeliveryIdentity::is_canonical_for
-crates/dekopon-broker-protocol/src/lib.rs:558:21: replace && with || in DeliveryIdentity::is_canonical_for
+crates/dekopon-broker-protocol/src/lib.rs:547:25: replace == with != in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:551:25: replace == with != in DeliveryIdentity::is_canonical_for
+crates/dekopon-broker-protocol/src/lib.rs:558:21: replace && with || in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:551:45: replace && with || in DeliveryIdentity::is_canonical_for
+crates/dekopon-broker-protocol/src/lib.rs:557:21: replace && with || in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:571:21: replace && with || in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:556:25: replace == with != in DeliveryIdentity::is_canonical_for
-crates/dekopon-broker-protocol/src/lib.rs:557:21: replace && with || in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:568:21: replace && with || in DeliveryIdentity::is_canonical_for
-crates/dekopon-broker-protocol/src/lib.rs:567:21: replace && with || in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:566:21: replace && with || in DeliveryIdentity::is_canonical_for
+crates/dekopon-broker-protocol/src/lib.rs:567:21: replace && with || in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:565:22: replace == with != in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:567:41: replace == with != in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:581:21: replace && with || in DeliveryIdentity::is_canonical_for
@@ -56,25 +56,24 @@ crates/dekopon-broker-protocol/src/lib.rs:596:36: replace > with < in DeliveryId
 crates/dekopon-broker-protocol/src/lib.rs:596:36: replace > with == in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:596:36: replace > with >= in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:597:34: replace > with == in DeliveryIdentity::is_canonical_for
-crates/dekopon-broker-protocol/src/lib.rs:597:34: replace > with >= in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:597:34: replace > with < in DeliveryIdentity::is_canonical_for
-crates/dekopon-broker-protocol/src/lib.rs:641:5: replace deserialize_signed_service_decimal -> Result<String, D::Error> with Ok(String::new())
+crates/dekopon-broker-protocol/src/lib.rs:597:34: replace > with >= in DeliveryIdentity::is_canonical_for
 crates/dekopon-broker-protocol/src/lib.rs:701:9: replace DeliveredAnswer::as_str -> &str with ""
+crates/dekopon-broker-protocol/src/lib.rs:641:5: replace deserialize_signed_service_decimal -> Result<String, D::Error> with Ok(String::new())
 crates/dekopon-broker-protocol/src/lib.rs:641:5: replace deserialize_signed_service_decimal -> Result<String, D::Error> with Ok("xyzzy".into())
+crates/dekopon-broker-protocol/src/lib.rs:701:9: replace DeliveredAnswer::as_str -> &str with "xyzzy"
 crates/dekopon-broker-protocol/src/lib.rs:749:9: replace DeliveredTurnRequest::user -> &str with ""
 crates/dekopon-broker-protocol/src/lib.rs:749:9: replace DeliveredTurnRequest::user -> &str with "xyzzy"
-crates/dekopon-broker-protocol/src/lib.rs:701:9: replace DeliveredAnswer::as_str -> &str with "xyzzy"
-crates/dekopon-broker-protocol/src/lib.rs:918:9: replace BrokerRequest::validate -> Result<(), ProtocolError> with Ok(())
 crates/dekopon-broker-protocol/src/lib.rs:947:44: replace match guard assets.len() > MAX_ASSET_ROWS with false in BrokerRequest::validate
-crates/dekopon-broker-protocol/src/lib.rs:953:20: replace match guard !valid_generation_digest(digest) with false in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:918:9: replace BrokerRequest::validate -> Result<(), ProtocolError> with Ok(())
 crates/dekopon-broker-protocol/src/lib.rs:953:20: replace match guard !valid_generation_digest(digest) with true in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:953:20: replace match guard !valid_generation_digest(digest) with false in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:920:33: replace > with == in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:920:33: replace > with < in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:929:38: replace >= with < in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:941:24: delete ! in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:938:24: delete ! in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:947:57: replace > with == in BrokerRequest::validate
-crates/dekopon-broker-protocol/src/lib.rs:947:57: replace > with >= in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:953:20: delete ! in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:970:5: replace valid_generation_digest -> bool with true
 crates/dekopon-broker-protocol/src/lib.rs:970:5: replace valid_generation_digest -> bool with false
@@ -111,16 +110,16 @@ crates/dekopon-broker-protocol/src/lib.rs:2409:52: replace == with != in ClientE
 crates/dekopon-broker-protocol/src/lib.rs:2410:47: replace == with != in ClientError::may_have_executed
 crates/dekopon-broker-protocol/src/lib.rs:2471:9: replace ResolvedBrokerSocket::into_path -> PathBuf with Default::default()
 crates/dekopon-broker-protocol/src/conversation.rs:101:9: replace Conversation::is_canonical_for -> bool with true
-crates/dekopon-broker-protocol/src/conversation.rs:101:9: replace Conversation::is_canonical_for -> bool with false
 crates/dekopon-broker-protocol/src/conversation.rs:101:31: replace || with && in Conversation::is_canonical_for
-crates/dekopon-broker-protocol/src/conversation.rs:101:34: delete ! in Conversation::is_canonical_for
+crates/dekopon-broker-protocol/src/conversation.rs:101:9: replace Conversation::is_canonical_for -> bool with false
 crates/dekopon-broker-protocol/src/conversation.rs:101:12: delete ! in Conversation::is_canonical_for
+crates/dekopon-broker-protocol/src/conversation.rs:101:34: delete ! in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:111:21: replace && with || in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:110:21: replace && with || in Conversation::is_canonical_for
-crates/dekopon-broker-protocol/src/conversation.rs:108:35: replace == with != in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:109:21: replace && with || in Conversation::is_canonical_for
-crates/dekopon-broker-protocol/src/conversation.rs:124:21: replace && with || in Conversation::is_canonical_for
+crates/dekopon-broker-protocol/src/conversation.rs:108:35: replace == with != in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:109:34: replace == with != in Conversation::is_canonical_for
+crates/dekopon-broker-protocol/src/conversation.rs:124:21: replace && with || in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:123:21: replace && with || in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:122:21: replace && with || in Conversation::is_canonical_for
 crates/dekopon-broker-protocol/src/conversation.rs:121:35: replace == with != in Conversation::is_canonical_for
@@ -173,6 +172,6 @@ crates/dekopon-broker-protocol/src/conversation.rs:530:9: replace && with || in 
 crates/dekopon-broker-protocol/src/conversation.rs:529:9: replace && with || in canonical_meta_decimal
 crates/dekopon-broker-protocol/src/conversation.rs:528:9: replace && with || in canonical_meta_decimal
 crates/dekopon-broker-protocol/src/conversation.rs:527:5: delete ! in canonical_meta_decimal
-crates/dekopon-broker-protocol/src/conversation.rs:529:12: delete ! in canonical_meta_decimal
 crates/dekopon-broker-protocol/src/conversation.rs:528:24: replace <= with > in canonical_meta_decimal
+crates/dekopon-broker-protocol/src/conversation.rs:529:12: delete ! in canonical_meta_decimal
 crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::from(Ok(()))

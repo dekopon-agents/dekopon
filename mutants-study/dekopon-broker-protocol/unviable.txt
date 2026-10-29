@@ -8,5 +8,5 @@ crates/dekopon-broker-protocol/src/lib.rs:2224:5: replace refusal_before_credent
 crates/dekopon-broker-protocol/src/lib.rs:2232:9: replace && with || in refusal_before_credentials
 crates/dekopon-broker-protocol/src/lib.rs:2225:9: replace && with || in refusal_before_credentials
 crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::new()
-crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::from_iter([Ok(())])
 crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::new(Ok(()))
+crates/dekopon-broker-protocol/src/descriptor.rs:248:9: replace <impl AsyncWrite for DescriptorStream>::poll_shutdown -> Poll<io::Result<()>> with Poll::from_iter([Ok(())])

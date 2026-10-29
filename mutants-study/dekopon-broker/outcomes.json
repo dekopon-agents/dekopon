@@ -8,7 +8,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 188.666698013,
+          "duration": 194.848926372,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -22,7 +22,7 @@
         },
         {
           "phase": "Test",
-          "duration": 13.254092149,
+          "duration": 13.086415174,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -78,7 +78,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 39.157424496,
+          "duration": 37.749796908,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -92,7 +92,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.471163315,
+          "duration": 9.487618596,
           "process_status": {
             "Failure": 101
           },
@@ -150,7 +150,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 84.143901943,
+          "duration": 78.08239774,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -164,7 +164,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.542837602,
+          "duration": 9.782355172,
           "process_status": {
             "Failure": 101
           },
@@ -222,7 +222,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 38.018030087,
+          "duration": 33.208724819,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -236,7 +236,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.196140597,
+          "duration": 9.139829861,
           "process_status": {
             "Failure": 101
           },
@@ -294,7 +294,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 31.437734602,
+          "duration": 31.148654098,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -308,7 +308,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.392716373,
+          "duration": 9.177380933,
           "process_status": {
             "Failure": 101
           },
@@ -366,7 +366,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 38.577711431,
+          "duration": 37.512727981,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -380,7 +380,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.959706132,
+          "duration": 9.634377415,
           "process_status": {
             "Failure": 101
           },
@@ -438,7 +438,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 33.855259428,
+          "duration": 34.011350052,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -452,7 +452,7 @@
         },
         {
           "phase": "Test",
-          "duration": 8.957604262,
+          "duration": 10.618494171,
           "process_status": {
             "Failure": 101
           },
@@ -510,7 +510,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 35.050475734,
+          "duration": 31.584458977,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -524,7 +524,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.350293165,
+          "duration": 10.187270677,
           "process_status": {
             "Failure": 101
           },
@@ -582,7 +582,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 378.506327808,
+          "duration": 364.045171993,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -596,7 +596,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.352801878,
+          "duration": 10.370150983,
           "process_status": {
             "Failure": 101
           },
@@ -654,7 +654,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 37.47724556,
+          "duration": 35.360763185,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -668,7 +668,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.858691283,
+          "duration": 10.47774404,
           "process_status": {
             "Failure": 101
           },
@@ -726,7 +726,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 49.439161394,
+          "duration": 43.927982661,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -740,7 +740,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.911507375,
+          "duration": 10.160312981,
           "process_status": {
             "Failure": 101
           },
@@ -798,7 +798,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 31.873809316,
+          "duration": 32.220278851,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -812,7 +812,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.14947335,
+          "duration": 9.68517133,
           "process_status": {
             "Failure": 101
           },
@@ -870,7 +870,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 28.447799768,
+          "duration": 30.429638724,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -884,7 +884,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.88519906,
+          "duration": 9.809539511,
           "process_status": {
             "Failure": 101
           },
@@ -942,7 +942,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 29.438505284,
+          "duration": 30.319537464,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -956,7 +956,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.056995293,
+          "duration": 9.485858022,
           "process_status": {
             "Failure": 101
           },
@@ -1014,7 +1014,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.389302341,
+          "duration": 28.740380833,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1028,7 +1028,7 @@
         },
         {
           "phase": "Test",
-          "duration": 13.037849849,
+          "duration": 11.477844877,
           "process_status": {
             "Failure": 101
           },
@@ -1086,7 +1086,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 31.358048263,
+          "duration": 39.442195096,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1100,7 +1100,7 @@
         },
         {
           "phase": "Test",
-          "duration": 12.780613253,
+          "duration": 11.325493127,
           "process_status": {
             "Failure": 101
           },
@@ -1158,7 +1158,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 535.898486211,
+          "duration": 508.927694989,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1172,79 +1172,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.050613388,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:139:45: replace >= with < in ChatMemoryConfig::validate",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 182,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 139,
-              "column": 45
-            },
-            "end": {
-              "line": 139,
-              "column": 47
-            }
-          },
-          "replacement": "<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_139_col_45.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_139_col_45.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 18.542022434,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 10.90503757,
+          "duration": 11.482533937,
           "process_status": {
             "Failure": 101
           },
@@ -1302,7 +1230,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.304899415,
+          "duration": 12.311937296,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1316,7 +1244,151 @@
         },
         {
           "phase": "Test",
-          "duration": 10.968505413,
+          "duration": 8.924052388,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:139:45: replace >= with < in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 139,
+              "column": 45
+            },
+            "end": {
+              "line": 139,
+              "column": 47
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_139_col_45.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_139_col_45.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 21.769347031,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.305342217,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:141:36: replace < with == in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 141,
+              "column": 36
+            },
+            "end": {
+              "line": 141,
+              "column": 37
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_141_col_36.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_141_col_36.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 15.311142864,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 8.703742397,
           "process_status": {
             "Failure": 101
           },
@@ -1374,7 +1446,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.356377764,
+          "duration": 20.539702469,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1388,80 +1460,8 @@
         },
         {
           "phase": "Test",
-          "duration": 37.032088717,
+          "duration": 36.972866252,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:141:36: replace < with == in ChatMemoryConfig::validate",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 182,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 141,
-              "column": 36
-            },
-            "end": {
-              "line": 141,
-              "column": 37
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_141_col_36.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_141_col_36.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 16.006712071,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 8.922301649,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -1516,7 +1516,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.444693594,
+          "duration": 18.297711229,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1530,80 +1530,8 @@
         },
         {
           "phase": "Test",
-          "duration": 35.804857934,
+          "duration": 33.871057474,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:141:36: replace < with > in ChatMemoryConfig::validate",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 182,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 141,
-              "column": 36
-            },
-            "end": {
-              "line": 141,
-              "column": 37
-            }
-          },
-          "replacement": ">",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_141_col_36_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_141_col_36_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 16.489806209,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 10.312210651000001,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -1658,7 +1586,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 17.859203007,
+          "duration": 10.896853338,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1672,7 +1600,79 @@
         },
         {
           "phase": "Test",
-          "duration": 11.114145553,
+          "duration": 9.399511029,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:141:36: replace < with > in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 141,
+              "column": 36
+            },
+            "end": {
+              "line": 141,
+              "column": 37
+            }
+          },
+          "replacement": ">",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_141_col_36_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_141_col_36_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 17.690071633,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.511379125,
           "process_status": {
             "Failure": 101
           },
@@ -1730,7 +1730,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.7762467,
+          "duration": 11.61029582,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1744,7 +1744,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.752969165,
+          "duration": 10.576098922,
           "process_status": {
             "Failure": 101
           },
@@ -1802,7 +1802,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.545489324,
+          "duration": 19.360234628,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1816,7 +1816,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.567807663,
+          "duration": 9.709987831,
           "process_status": {
             "Failure": 101
           },
@@ -1874,7 +1874,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.293292209,
+          "duration": 15.575627655,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1888,7 +1888,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.703508749000001,
+          "duration": 9.804767885,
           "process_status": {
             "Failure": 101
           },
@@ -1946,7 +1946,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.062686274,
+          "duration": 14.170632367,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1960,7 +1960,79 @@
         },
         {
           "phase": "Test",
-          "duration": 8.527409202,
+          "duration": 10.150171155,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 177,
+              "column": 13
+            },
+            "end": {
+              "line": 177,
+              "column": 15
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_177_col_13.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_177_col_13.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 12.290760395,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.74512395,
           "process_status": {
             "Failure": 101
           },
@@ -2018,7 +2090,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.425683551,
+          "duration": 24.472145372,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2032,80 +2104,8 @@
         },
         {
           "phase": "Test",
-          "duration": 36.205322323,
+          "duration": 37.35424141,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 182,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 177,
-              "column": 13
-            },
-            "end": {
-              "line": 177,
-              "column": 15
-            }
-          },
-          "replacement": "&&",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_177_col_13.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_177_col_13.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 12.188275746,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 10.017254513,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -2160,7 +2160,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.818591749,
+          "duration": 10.896138177,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2174,7 +2174,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.618544641,
+          "duration": 8.583470311,
           "process_status": {
             "Failure": 101
           },
@@ -2232,7 +2232,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.266097124,
+          "duration": 12.821622529999999,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2246,7 +2246,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.410856532,
+          "duration": 8.917215469,
           "process_status": {
             "Failure": 101
           },
@@ -2304,7 +2304,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 17.880501928,
+          "duration": 19.313307542,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2318,7 +2318,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.381702222,
+          "duration": 10.71506813,
           "process_status": {
             "Failure": 101
           },
@@ -2376,7 +2376,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.477104022,
+          "duration": 15.583514041,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2390,7 +2390,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.768098552,
+          "duration": 10.817941724,
           "process_status": {
             "Failure": 101
           },
@@ -2448,7 +2448,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.672286505,
+          "duration": 11.720050555,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2462,79 +2462,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.536671686,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:171:13: replace || with && in ChatMemoryConfig::validate",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 182,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 171,
-              "column": 13
-            },
-            "end": {
-              "line": 171,
-              "column": 15
-            }
-          },
-          "replacement": "&&",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_171_col_13.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_171_col_13.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 12.966724312,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 10.384012096,
+          "duration": 9.803227137,
           "process_status": {
             "Failure": 101
           },
@@ -2592,7 +2520,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.869815057,
+          "duration": 11.943636837,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2606,7 +2534,79 @@
         },
         {
           "phase": "Test",
-          "duration": 11.646709115,
+          "duration": 11.488224181,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:171:13: replace || with && in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 171,
+              "column": 13
+            },
+            "end": {
+              "line": 171,
+              "column": 15
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_171_col_13.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_171_col_13.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 14.994349589,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.122352859,
           "process_status": {
             "Failure": 101
           },
@@ -2664,7 +2664,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.476330668,
+          "duration": 13.100359947,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2678,7 +2678,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.118229985,
+          "duration": 10.254962388,
           "process_status": {
             "Failure": 101
           },
@@ -2736,7 +2736,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.600087957,
+          "duration": 11.584588698,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2750,7 +2750,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.069386461,
+          "duration": 11.349231231,
           "process_status": {
             "Failure": 101
           },
@@ -2808,7 +2808,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.138350435,
+          "duration": 15.346030825,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2822,7 +2822,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.578689975,
+          "duration": 11.066120509,
           "process_status": {
             "Failure": 101
           },
@@ -2880,7 +2880,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.422229172,
+          "duration": 17.784564234,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2894,7 +2894,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.343026739999999,
+          "duration": 10.104340167,
           "process_status": {
             "Failure": 101
           },
@@ -2952,7 +2952,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.590725439,
+          "duration": 12.409970198,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2966,7 +2966,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.157272956,
+          "duration": 10.065552199,
           "process_status": {
             "Failure": 101
           },
@@ -3024,7 +3024,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.430633532,
+          "duration": 17.600821874,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3038,7 +3038,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.305321659,
+          "duration": 10.870456903000001,
           "process_status": {
             "Failure": 101
           },
@@ -3096,7 +3096,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.022859253,
+          "duration": 14.688568725,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3110,7 +3110,7 @@
         },
         {
           "phase": "Test",
-          "duration": 12.063233603,
+          "duration": 9.389804274,
           "process_status": {
             "Failure": 101
           },
@@ -3168,7 +3168,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.915181647,
+          "duration": 13.130713439,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3182,7 +3182,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.306450286,
+          "duration": 10.679785593,
           "process_status": {
             "Failure": 101
           },
@@ -3240,7 +3240,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.62863343,
+          "duration": 11.677813531,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3254,7 +3254,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.965504043,
+          "duration": 11.509712028,
           "process_status": {
             "Failure": 101
           },
@@ -3312,7 +3312,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.86085559,
+          "duration": 15.143755635,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3326,7 +3326,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.150037803,
+          "duration": 9.870420695,
           "process_status": {
             "Failure": 101
           },
@@ -3384,7 +3384,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.857926749,
+          "duration": 13.65238223,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3398,7 +3398,7 @@
         },
         {
           "phase": "Test",
-          "duration": 34.660940455,
+          "duration": 35.652350787,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3454,7 +3454,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.348360882,
+          "duration": 14.918433774,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3468,7 +3468,7 @@
         },
         {
           "phase": "Test",
-          "duration": 8.047785055,
+          "duration": 7.931420044,
           "process_status": {
             "Failure": 101
           },
@@ -3526,7 +3526,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.436931908,
+          "duration": 12.527947152,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3540,7 +3540,7 @@
         },
         {
           "phase": "Test",
-          "duration": 32.974830368,
+          "duration": 31.734587941,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3596,7 +3596,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.947673426,
+          "duration": 12.897744804,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3610,7 +3610,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.195857831,
+          "duration": 9.831600182,
           "process_status": {
             "Failure": 101
           },
@@ -3668,7 +3668,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 17.850170412,
+          "duration": 16.969695743,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3682,7 +3682,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.361794284,
+          "duration": 9.707321862,
           "process_status": {
             "Failure": 101
           },
@@ -3740,7 +3740,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.077346608,
+          "duration": 14.699019282,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3754,7 +3754,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.479060282,
+          "duration": 11.020204855,
           "process_status": {
             "Failure": 101
           },
@@ -3812,7 +3812,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.589222724999999,
+          "duration": 11.69648524,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3826,7 +3826,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.103417938,
+          "duration": 11.587857055,
           "process_status": {
             "Failure": 101
           },
@@ -3884,7 +3884,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.09021354,
+          "duration": 11.317407158,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3898,7 +3898,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.391447653,
+          "duration": 11.944205006,
           "process_status": {
             "Failure": 101
           },
@@ -3956,7 +3956,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.98796107,
+          "duration": 12.419415717,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3970,7 +3970,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.701482997,
+          "duration": 12.212399179,
           "process_status": {
             "Failure": 101
           },
@@ -4028,7 +4028,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.808950027,
+          "duration": 12.376163211,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4042,7 +4042,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.184445053,
+          "duration": 11.482658562,
           "process_status": {
             "Failure": 101
           },
@@ -4100,7 +4100,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.00635694,
+          "duration": 12.952598817,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4114,7 +4114,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.253280699,
+          "duration": 11.064640688,
           "process_status": {
             "Failure": 101
           },
@@ -4172,7 +4172,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.793303398,
+          "duration": 13.568737713,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4186,7 +4186,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.845051602,
+          "duration": 9.148252934,
           "process_status": {
             "Failure": 101
           },
@@ -4244,7 +4244,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.991280638,
+          "duration": 11.776961957,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4258,7 +4258,7 @@
         },
         {
           "phase": "Test",
-          "duration": 36.45722833,
+          "duration": 34.865615416,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4314,7 +4314,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.315394882,
+          "duration": 16.002732299,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4328,7 +4328,79 @@
         },
         {
           "phase": "Test",
-          "duration": 10.152350981,
+          "duration": 11.737944806,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:173:27: replace > with < in ChatMemoryConfig::validate",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 119,
+                "column": 5
+              },
+              "end": {
+                "line": 182,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 173,
+              "column": 27
+            },
+            "end": {
+              "line": 173,
+              "column": 28
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_173_col_27_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_173_col_27_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 18.345644178,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 9.429645241,
           "process_status": {
             "Failure": 101
           },
@@ -4386,7 +4458,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 10.518892978,
+          "duration": 10.651371839,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4400,80 +4472,8 @@
         },
         {
           "phase": "Test",
-          "duration": 36.199513493,
+          "duration": 34.68594402,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:173:27: replace > with < in ChatMemoryConfig::validate",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 119,
-                "column": 5
-              },
-              "end": {
-                "line": 182,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 173,
-              "column": 27
-            },
-            "end": {
-              "line": 173,
-              "column": 28
-            }
-          },
-          "replacement": "<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_173_col_27_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_173_col_27_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 14.998348592,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 9.901925865,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -4528,7 +4528,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.703075232,
+          "duration": 11.743253701,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4542,7 +4542,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.02013281,
+          "duration": 9.472133415,
           "process_status": {
             "Failure": 101
           },
@@ -4600,7 +4600,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.729480039,
+          "duration": 15.537924194,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4614,7 +4614,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.711818673,
+          "duration": 9.667312346,
           "process_status": {
             "Failure": 101
           },
@@ -4672,7 +4672,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.678234096,
+          "duration": 19.838903562,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4686,7 +4686,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.026048119,
+          "duration": 10.739557595,
           "process_status": {
             "Failure": 101
           },
@@ -4744,7 +4744,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.611839778,
+          "duration": 15.351815531,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4758,7 +4758,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.575892335,
+          "duration": 11.209177484,
           "process_status": {
             "Failure": 101
           },
@@ -4816,7 +4816,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 10.720609414,
+          "duration": 11.682429198,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4830,7 +4830,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.478316024,
+          "duration": 10.213888341,
           "process_status": {
             "Failure": 101
           },
@@ -4888,7 +4888,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.123705681,
+          "duration": 11.80326218,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4902,7 +4902,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.939802473,
+          "duration": 10.603375082,
           "process_status": {
             "Failure": 101
           },
@@ -4960,7 +4960,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.48788433,
+          "duration": 14.537858498,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4974,7 +4974,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.279777687,
+          "duration": 11.180266827,
           "process_status": {
             "Failure": 101
           },
@@ -5032,7 +5032,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.032915988,
+          "duration": 12.023006712,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5046,7 +5046,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.662259942,
+          "duration": 10.540574234,
           "process_status": {
             "Failure": 101
           },
@@ -5104,7 +5104,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.647304819,
+          "duration": 11.09955329,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5118,7 +5118,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.177384947,
+          "duration": 9.457440101,
           "process_status": {
             "Failure": 101
           },
@@ -5176,7 +5176,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 17.891275532,
+          "duration": 17.478226081,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5190,7 +5190,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.536060772,
+          "duration": 10.400424139,
           "process_status": {
             "Failure": 101
           },
@@ -5248,7 +5248,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.047842878,
+          "duration": 16.852815356,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5262,7 +5262,7 @@
         },
         {
           "phase": "Test",
-          "duration": 8.835815748,
+          "duration": 9.260442525,
           "process_status": {
             "Failure": 101
           },
@@ -5320,7 +5320,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.218006663,
+          "duration": 11.742481544,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5334,7 +5334,7 @@
         },
         {
           "phase": "Test",
-          "duration": 33.513271138,
+          "duration": 35.455718099,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5390,7 +5390,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.721675068,
+          "duration": 14.553293316,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5404,7 +5404,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.761969694,
+          "duration": 11.350999246,
           "process_status": {
             "Failure": 101
           },
@@ -5462,7 +5462,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.586520088,
+          "duration": 16.574770462,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5476,7 +5476,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.336153216,
+          "duration": 10.527145963,
           "process_status": {
             "Failure": 101
           },
@@ -5534,7 +5534,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 17.532868869,
+          "duration": 15.140965692,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5548,7 +5548,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.113143814,
+          "duration": 10.045434215,
           "process_status": {
             "Failure": 101
           },
@@ -5606,7 +5606,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.444871103,
+          "duration": 16.879527572,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5620,7 +5620,7 @@
         },
         {
           "phase": "Test",
-          "duration": 7.736727069,
+          "duration": 8.860742305,
           "process_status": {
             "Failure": 101
           },
@@ -5678,7 +5678,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.248921354,
+          "duration": 12.29936518,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5692,7 +5692,7 @@
         },
         {
           "phase": "Test",
-          "duration": 34.38505239,
+          "duration": 32.804326894,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5748,7 +5748,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 20.306984949,
+          "duration": 19.663218022,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5762,7 +5762,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.596222582,
+          "duration": 10.054018245,
           "process_status": {
             "Failure": 101
           },
@@ -5820,7 +5820,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 24.232788175,
+          "duration": 21.788154987,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5834,7 +5834,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.816133547,
+          "duration": 8.95377972,
           "process_status": {
             "Failure": 101
           },
@@ -5892,7 +5892,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 23.728538134,
+          "duration": 26.037970402,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5906,7 +5906,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.509756367,
+          "duration": 10.200566473,
           "process_status": {
             "Failure": 101
           },
@@ -5964,7 +5964,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 21.765378885,
+          "duration": 20.796050873,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5978,7 +5978,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.39401412,
+          "duration": 10.633292154,
           "process_status": {
             "Failure": 101
           },
@@ -6036,7 +6036,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.550848933,
+          "duration": 23.694053689,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6050,7 +6050,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.049048259,
+          "duration": 12.391489858,
           "process_status": {
             "Failure": 101
           },
@@ -6108,7 +6108,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 10.71181419,
+          "duration": 13.533922838,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6122,7 +6122,7 @@
         },
         {
           "phase": "Test",
-          "duration": 12.374774916,
+          "duration": 11.226007169,
           "process_status": {
             "Failure": 101
           },
@@ -6180,7 +6180,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.553239499,
+          "duration": 11.458007843,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6194,7 +6194,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.183611618,
+          "duration": 10.340700903,
           "process_status": {
             "Failure": 101
           },
@@ -6252,7 +6252,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 27.089580647,
+          "duration": 23.318565645,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6266,7 +6266,7 @@
         },
         {
           "phase": "Test",
-          "duration": 37.067894325,
+          "duration": 34.185771955,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6322,7 +6322,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.482698981,
+          "duration": 15.086290234,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6336,7 +6336,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.925873109,
+          "duration": 10.69749821,
           "process_status": {
             "Failure": 101
           },
@@ -6394,7 +6394,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.789582377,
+          "duration": 11.329050095,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6408,7 +6408,7 @@
         },
         {
           "phase": "Test",
-          "duration": 36.393928653,
+          "duration": 33.446294631,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6464,7 +6464,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.816561916,
+          "duration": 20.820021733,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6478,7 +6478,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.22413441,
+          "duration": 11.404060414,
           "process_status": {
             "Failure": 101
           },
@@ -6536,7 +6536,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 21.166463611,
+          "duration": 18.670654819,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6550,79 +6550,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.990931796,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with false",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ChatMemoryConfig::enabled_for",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 240,
-                "column": 5
-              },
-              "end": {
-                "line": 243,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 242,
-              "column": 9
-            },
-            "end": {
-              "line": 242,
-              "column": 44
-            }
-          },
-          "replacement": "false",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_242_col_9_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_242_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 24.336365159,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 8.333117971,
+          "duration": 9.821309826,
           "process_status": {
             "Failure": 101
           },
@@ -6680,7 +6608,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.624961617,
+          "duration": 11.40264724,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6694,8 +6622,80 @@
         },
         {
           "phase": "Test",
-          "duration": 32.715961401,
+          "duration": 32.263640309,
           "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with false",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ChatMemoryConfig::enabled_for",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 243,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 242,
+              "column": 9
+            },
+            "end": {
+              "line": 242,
+              "column": 44
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_242_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_242_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 22.532673704,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 8.903533164,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -6750,7 +6750,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.979806816,
+          "duration": 19.819719337,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6764,79 +6764,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.515975385,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:247:5: replace round_up -> Result<u64, BrokerBuildError> with Ok(1)",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "round_up",
-            "return_type": "-> Result<u64, BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 246,
-                "column": 1
-              },
-              "end": {
-                "line": 251,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 247,
-              "column": 5
-            },
-            "end": {
-              "line": 250,
-              "column": 52
-            }
-          },
-          "replacement": "Ok(1)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_247_col_5_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_247_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 27.897103923,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 9.682553820999999,
+          "duration": 9.846567685,
           "process_status": {
             "Failure": 101
           },
@@ -6894,7 +6822,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 27.22927706,
+          "duration": 24.942156676,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6908,7 +6836,79 @@
         },
         {
           "phase": "Test",
-          "duration": 10.907672849,
+          "duration": 10.831628914,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:247:5: replace round_up -> Result<u64, BrokerBuildError> with Ok(1)",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "round_up",
+            "return_type": "-> Result<u64, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 246,
+                "column": 1
+              },
+              "end": {
+                "line": 251,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 247,
+              "column": 5
+            },
+            "end": {
+              "line": 250,
+              "column": 52
+            }
+          },
+          "replacement": "Ok(1)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_247_col_5_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_247_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 26.716814712,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.49983739,
           "process_status": {
             "Failure": 101
           },
@@ -6966,7 +6966,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.260359989,
+          "duration": 18.694518194,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6980,79 +6980,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.867898201,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:249:28: replace / with * in round_up",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "round_up",
-            "return_type": "-> Result<u64, BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 246,
-                "column": 1
-              },
-              "end": {
-                "line": 251,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 249,
-              "column": 28
-            },
-            "end": {
-              "line": 249,
-              "column": 29
-            }
-          },
-          "replacement": "*",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_249_col_28_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_249_col_28_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 20.12858915,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 9.597113725,
+          "duration": 10.582410824,
           "process_status": {
             "Failure": 101
           },
@@ -7110,7 +7038,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 28.35812527,
+          "duration": 16.044316091,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7124,7 +7052,79 @@
         },
         {
           "phase": "Test",
-          "duration": 10.061346378,
+          "duration": 10.082299131,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:249:28: replace / with * in round_up",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "round_up",
+            "return_type": "-> Result<u64, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 246,
+                "column": 1
+              },
+              "end": {
+                "line": 251,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 249,
+              "column": 28
+            },
+            "end": {
+              "line": 249,
+              "column": 29
+            }
+          },
+          "replacement": "*",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_249_col_28_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_249_col_28_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 24.960375471,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.002975538,
           "process_status": {
             "Failure": 101
           },
@@ -7182,7 +7182,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.894526966,
+          "duration": 25.937765922,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7196,7 +7196,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.848400001,
+          "duration": 10.725652357,
           "process_status": {
             "Failure": 101
           },
@@ -7254,7 +7254,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.967894425,
+          "duration": 3.291591432,
           "process_status": {
             "Failure": 101
           },
@@ -7266,78 +7266,6 @@
             "--package=dekopon-broker@0.71.0",
             "-p",
             "dekopon-broker-host"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "deserialize_default_secret_use",
-            "return_type": "-> Result<Option<DefaultSecretUse>, D::Error>",
-            "span": {
-              "start": {
-                "line": 487,
-                "column": 1
-              },
-              "end": {
-                "line": 494,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 493,
-              "column": 5
-            },
-            "end": {
-              "line": 493,
-              "column": 58
-            }
-          },
-          "replacement": "Ok(None)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_493_col_5.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_493_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 23.035277905,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 11.538439461,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
           ]
         }
       ]
@@ -7382,7 +7310,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 31.069135888,
+          "duration": 28.489662943,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7396,7 +7324,79 @@
         },
         {
           "phase": "Test",
-          "duration": 11.335333034,
+          "duration": 8.543372059,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "deserialize_default_secret_use",
+            "return_type": "-> Result<Option<DefaultSecretUse>, D::Error>",
+            "span": {
+              "start": {
+                "line": 487,
+                "column": 1
+              },
+              "end": {
+                "line": 494,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 493,
+              "column": 5
+            },
+            "end": {
+              "line": 493,
+              "column": 58
+            }
+          },
+          "replacement": "Ok(None)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_493_col_5.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_493_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 20.692980221,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 9.294867007,
           "process_status": {
             "Failure": 101
           },
@@ -7454,7 +7454,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.92286578,
+          "duration": 17.89994064,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7468,79 +7468,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.160662004,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ConstraintCatalog::len",
-            "return_type": "-> usize",
-            "span": {
-              "start": {
-                "line": 651,
-                "column": 5
-              },
-              "end": {
-                "line": 654,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 653,
-              "column": 9
-            },
-            "end": {
-              "line": 653,
-              "column": 24
-            }
-          },
-          "replacement": "1",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_653_col_9_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_653_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 16.828793659,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 9.853289575,
+          "duration": 9.914387678,
           "process_status": {
             "Failure": 101
           },
@@ -7598,7 +7526,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 28.420292382,
+          "duration": 23.278797338,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7612,7 +7540,79 @@
         },
         {
           "phase": "Test",
-          "duration": 9.958064488,
+          "duration": 11.146072484,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::len",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 651,
+                "column": 5
+              },
+              "end": {
+                "line": 654,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 653,
+              "column": 9
+            },
+            "end": {
+              "line": 653,
+              "column": 24
+            }
+          },
+          "replacement": "1",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_653_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_653_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 31.710081734,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.084585488,
           "process_status": {
             "Failure": 101
           },
@@ -7670,7 +7670,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.343296637999998,
+          "duration": 13.980881573,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7684,79 +7684,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.215643661,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:667:9: replace ConstraintCatalog::validate -> Result<(), BrokerBuildError> with Ok(())",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ConstraintCatalog::validate",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 661,
-                "column": 5
-              },
-              "end": {
-                "line": 696,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 667,
-              "column": 9
-            },
-            "end": {
-              "line": 695,
-              "column": 15
-            }
-          },
-          "replacement": "Ok(())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_9.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 31.845154316,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 9.665894963,
+          "duration": 9.598619045,
           "process_status": {
             "Failure": 101
           },
@@ -7814,7 +7742,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.811569372,
+          "duration": 21.398611238,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7828,7 +7756,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.106469657,
+          "duration": 8.446028839,
           "process_status": {
             "Failure": 101
           },
@@ -7886,7 +7814,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 21.459813106,
+          "duration": 22.566777655,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7900,7 +7828,79 @@
         },
         {
           "phase": "Test",
-          "duration": 6.287094138,
+          "duration": 7.426292311,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:667:9: replace ConstraintCatalog::validate -> Result<(), BrokerBuildError> with Ok(())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 661,
+                "column": 5
+              },
+              "end": {
+                "line": 696,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 667,
+              "column": 9
+            },
+            "end": {
+              "line": 695,
+              "column": 15
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_667_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_667_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 28.980955091,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 8.9453205,
           "process_status": {
             "Failure": 101
           },
@@ -7958,7 +7958,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 26.429993888,
+          "duration": 16.64361561,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7972,7 +7972,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.317058364,
+          "duration": 12.109098642,
           "process_status": {
             "Failure": 101
           },
@@ -8030,7 +8030,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.364794773,
+          "duration": 1.717611814,
           "process_status": {
             "Failure": 101
           },
@@ -8042,78 +8042,6 @@
             "--package=dekopon-broker@0.71.0",
             "-p",
             "dekopon-broker-host"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:699:9: replace ConstraintCatalog::retention_policies -> Result<RetentionPolicies, BrokerBuildError> with Ok(Default::default())",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ConstraintCatalog::retention_policies",
-            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 698,
-                "column": 5
-              },
-              "end": {
-                "line": 721,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 699,
-              "column": 9
-            },
-            "end": {
-              "line": 720,
-              "column": 21
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_699_col_9.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_699_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 34.625979002,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 10.998195613,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
           ]
         }
       ]
@@ -8158,7 +8086,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 28.436258751,
+          "duration": 9.201739929,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8172,8 +8100,80 @@
         },
         {
           "phase": "Test",
-          "duration": 35.398020764,
+          "duration": 36.176676549,
           "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:699:9: replace ConstraintCatalog::retention_policies -> Result<RetentionPolicies, BrokerBuildError> with Ok(Default::default())",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 699,
+              "column": 9
+            },
+            "end": {
+              "line": 720,
+              "column": 21
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_699_col_9.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_699_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 35.256805242,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 9.802062359,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -8228,7 +8228,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.721875564,
+          "duration": 12.481416831,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8242,79 +8242,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.127014095,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ConstraintCatalog::retention_policies",
-            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 698,
-                "column": 5
-              },
-              "end": {
-                "line": 721,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 705,
-              "column": 61
-            },
-            "end": {
-              "line": 705,
-              "column": 62
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 15.631891028,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 10.761016946,
+          "duration": 9.465585406,
           "process_status": {
             "Failure": 101
           },
@@ -8372,7 +8300,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 28.505535215,
+          "duration": 13.524427984,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8386,7 +8314,79 @@
         },
         {
           "phase": "Test",
-          "duration": 10.055928396,
+          "duration": 9.829218664999999,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with < in ConstraintCatalog::retention_policies",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::retention_policies",
+            "return_type": "-> Result<RetentionPolicies, BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 698,
+                "column": 5
+              },
+              "end": {
+                "line": 721,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 705,
+              "column": 61
+            },
+            "end": {
+              "line": 705,
+              "column": 62
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61_001.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 18.287724989,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.007887992,
           "process_status": {
             "Failure": 101
           },
@@ -8444,7 +8444,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.416769157,
+          "duration": 1.263269738,
           "process_status": {
             "Failure": 101
           },
@@ -8463,7 +8463,7 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with < in ConstraintCatalog::retention_policies",
+          "name": "crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies",
           "package": "dekopon-broker",
           "file": "crates/dekopon-broker/src/lib.rs",
           "function": {
@@ -8490,17 +8490,17 @@
               "column": 62
             }
           },
-          "replacement": "<",
+          "replacement": "==",
           "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61_001.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61_001.diff",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_705_col_61.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_705_col_61.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 15.408644648,
+          "duration": 28.611258647,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8514,7 +8514,7 @@
         },
         {
           "phase": "Test",
-          "duration": 8.825291558,
+          "duration": 9.264338334,
           "process_status": {
             "Failure": 101
           },
@@ -8572,7 +8572,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.104574219,
+          "duration": 15.194199041,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8586,7 +8586,7 @@
         },
         {
           "phase": "Test",
-          "duration": 13.378474647,
+          "duration": 11.424256571,
           "process_status": {
             "Failure": 101
           },
@@ -8644,7 +8644,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 9.184850635,
+          "duration": 17.447431625,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8658,7 +8658,7 @@
         },
         {
           "phase": "Test",
-          "duration": 35.265597714,
+          "duration": 34.026955541,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8714,7 +8714,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 40.820124248,
+          "duration": 32.810752884,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8728,7 +8728,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.036359088,
+          "duration": 9.781845851,
           "process_status": {
             "Failure": 101
           },
@@ -8786,7 +8786,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.193796473999999,
+          "duration": 16.282691354,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8800,7 +8800,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.57123029,
+          "duration": 9.905075742,
           "process_status": {
             "Failure": 101
           },
@@ -8858,7 +8858,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.534788428,
+          "duration": 14.061203153,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8872,79 +8872,7 @@
         },
         {
           "phase": "Test",
-          "duration": 8.35766112,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:753:33: replace > with >= in ConstraintCatalog::validate_storage_namespaces",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ConstraintCatalog::validate_storage_namespaces",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 723,
-                "column": 5
-              },
-              "end": {
-                "line": 768,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 753,
-              "column": 33
-            },
-            "end": {
-              "line": 753,
-              "column": 34
-            }
-          },
-          "replacement": ">=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_753_col_33_002.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_753_col_33_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 23.220176666,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 12.210155858,
+          "duration": 10.706663246,
           "process_status": {
             "Failure": 101
           },
@@ -9002,7 +8930,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 26.702102747,
+          "duration": 26.803158482,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9016,7 +8944,79 @@
         },
         {
           "phase": "Test",
-          "duration": 12.032202798,
+          "duration": 10.239981098,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:753:33: replace > with >= in ConstraintCatalog::validate_storage_namespaces",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_storage_namespaces",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 723,
+                "column": 5
+              },
+              "end": {
+                "line": 768,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 753,
+              "column": 33
+            },
+            "end": {
+              "line": 753,
+              "column": 34
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_753_col_33_002.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_753_col_33_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 27.644033732,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.170858808,
           "process_status": {
             "Failure": 101
           },
@@ -9074,7 +9074,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 36.109443567,
+          "duration": 35.874403733,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9088,7 +9088,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.230526091,
+          "duration": 11.295618153,
           "process_status": {
             "Failure": 101
           },
@@ -9146,7 +9146,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.33950208,
+          "duration": 12.785923662,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9160,7 +9160,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.070977777,
+          "duration": 9.884419851,
           "process_status": {
             "Failure": 101
           },
@@ -9218,7 +9218,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.73444594,
+          "duration": 14.308264986,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9232,7 +9232,7 @@
         },
         {
           "phase": "Test",
-          "duration": 16.846902253,
+          "duration": 18.726195548,
           "process_status": {
             "Failure": 101
           },
@@ -9290,7 +9290,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 25.728646008,
+          "duration": 21.096521636,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9304,7 +9304,7 @@
         },
         {
           "phase": "Test",
-          "duration": 7.294832699,
+          "duration": 7.399359125,
           "process_status": {
             "Failure": 101
           },
@@ -9362,7 +9362,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 21.652476232,
+          "duration": 21.779299684,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9376,7 +9376,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.660648785,
+          "duration": 10.364683037,
           "process_status": {
             "Failure": 101
           },
@@ -9434,7 +9434,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 23.787549486,
+          "duration": 24.212786219,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9448,7 +9448,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.990451152,
+          "duration": 10.28403767,
           "process_status": {
             "Failure": 101
           },
@@ -9506,7 +9506,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 12.301172573,
+          "duration": 11.797244214,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9520,7 +9520,7 @@
         },
         {
           "phase": "Test",
-          "duration": 8.381149538,
+          "duration": 7.590881112,
           "process_status": {
             "Failure": 101
           },
@@ -9578,7 +9578,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.394242213,
+          "duration": 10.390314967,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9592,79 +9592,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.558297084,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host",
-            "--lib",
-            "--test",
-            "integration"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes",
-          "package": "dekopon-broker",
-          "file": "crates/dekopon-broker/src/lib.rs",
-          "function": {
-            "function_name": "ConstraintCatalog::validate_routes",
-            "return_type": "-> Result<(), BrokerBuildError>",
-            "span": {
-              "start": {
-                "line": 770,
-                "column": 5
-              },
-              "end": {
-                "line": 819,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 803,
-              "column": 21
-            },
-            "end": {
-              "line": 803,
-              "column": 23
-            }
-          },
-          "replacement": "||",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_803_col_21.log",
-      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_803_col_21.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 13.322121678,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-broker@0.71.0",
-            "-p",
-            "dekopon-broker-host"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 11.196708185,
+          "duration": 10.266817885,
           "process_status": {
             "Failure": 101
           },
@@ -9722,7 +9650,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 20.170419199,
+          "duration": 19.747400832,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9736,7 +9664,79 @@
         },
         {
           "phase": "Test",
-          "duration": 11.667278298,
+          "duration": 11.298666936,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host",
+            "--lib",
+            "--test",
+            "integration"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes",
+          "package": "dekopon-broker",
+          "file": "crates/dekopon-broker/src/lib.rs",
+          "function": {
+            "function_name": "ConstraintCatalog::validate_routes",
+            "return_type": "-> Result<(), BrokerBuildError>",
+            "span": {
+              "start": {
+                "line": 770,
+                "column": 5
+              },
+              "end": {
+                "line": 819,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 803,
+              "column": 21
+            },
+            "end": {
+              "line": 803,
+              "column": 23
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-broker__src__lib.rs_line_803_col_21.log",
+      "diff_path": "diff/crates__dekopon-broker__src__lib.rs_line_803_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 16.880810982,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-broker@0.71.0",
+            "-p",
+            "dekopon-broker-host"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 10.72297487,
           "process_status": {
             "Failure": 101
           },
@@ -9794,7 +9794,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 16.100936384,
+          "duration": 14.718159214,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9808,7 +9808,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.560018999,
+          "duration": 10.221278887,
           "process_status": {
             "Failure": 101
           },
@@ -9866,7 +9866,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 11.763273539,
+          "duration": 10.741903523,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9880,7 +9880,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.101588073,
+          "duration": 10.116847429,
           "process_status": {
             "Failure": 101
           },
@@ -9938,7 +9938,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 14.585235225,
+          "duration": 17.93786595,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9952,7 +9952,7 @@
         },
         {
           "phase": "Test",
-          "duration": 10.108185709,
+          "duration": 9.968463356,
           "process_status": {
             "Failure": 101
           },
@@ -10010,7 +10010,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 19.72594893,
+          "duration": 20.538187808,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10024,7 +10024,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.849971048,
+          "duration": 10.11957883,
           "process_status": {
             "Failure": 101
           },
@@ -10082,7 +10082,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 29.396516433,
+          "duration": 30.584598259,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10096,7 +10096,7 @@
         },
         {
           "phase": "Test",
-          "duration": 11.035589464,
+          "duration": 10.838683005,
           "process_status": {
             "Failure": 101
           },
@@ -10154,7 +10154,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 29.82696418,
+          "duration": 28.331752669,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10168,7 +10168,7 @@
         },
         {
           "phase": "Test",
-          "duration": 34.845807954,
+          "duration": 34.929426261,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10224,7 +10224,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 29.145298263,
+          "duration": 24.900543713,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10238,7 +10238,7 @@
         },
         {
           "phase": "Test",
-          "duration": 35.380430434,
+          "duration": 34.703359998,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10294,7 +10294,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.1970661,
+          "duration": 21.45154076,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10308,7 +10308,7 @@
         },
         {
           "phase": "Test",
-          "duration": 33.329046163,
+          "duration": 30.894442217,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10364,7 +10364,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 22.962247478,
+          "duration": 21.769623507,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10378,7 +10378,7 @@
         },
         {
           "phase": "Test",
-          "duration": 9.797050472,
+          "duration": 9.68385177,
           "process_status": {
             "Failure": 101
           },
@@ -10436,7 +10436,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.678587758,
+          "duration": 20.447198035,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10450,7 +10450,7 @@
         },
         {
           "phase": "Test",
-          "duration": 34.179432649,
+          "duration": 32.916386404,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10506,7 +10506,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 20.905372563,
+          "duration": 18.926539461,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10520,7 +10520,7 @@
         },
         {
           "phase": "Test",
-          "duration": 17.774168904,
+          "duration": 15.766023886,
           "process_status": {
             "Failure": 101
           },
@@ -10578,7 +10578,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 13.735349317,
+          "duration": 12.857964414,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10592,7 +10592,7 @@
         },
         {
           "phase": "Test",
-          "duration": 14.971862963,
+          "duration": 13.916633509,
           "process_status": {
             "Failure": 101
           },
@@ -10650,7 +10650,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 18.436990269,
+          "duration": 13.471282535,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10664,7 +10664,7 @@
         },
         {
           "phase": "Test",
-          "duration": 14.890538011,
+          "duration": 13.719619576,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -10687,7 +10687,7 @@
   "timeout": 0,
   "unviable": 3,
   "success": 0,
-  "start_time": "2026-10-29T11:55:49.479369208Z",
-  "end_time": "2026-10-29T12:31:49.435149657Z",
+  "start_time": "2026-10-29T14:41:33.605495873Z",
+  "end_time": "2026-10-29T15:16:33.365616605Z",
   "cargo_mutants_version": "27.1.0"
 }

@@ -2,6 +2,7 @@ crates/dekopon-broker-protocol/src/lib.rs:369:13: replace deserialize_bounded_st
 crates/dekopon-broker-protocol/src/lib.rs:383:28: replace > with >= in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_str
 crates/dekopon-broker-protocol/src/lib.rs:393:28: replace > with >= in deserialize_bounded_string::<impl serde::de::Visitor<'de> for Visitor<MAXIMUM>>::visit_string
 crates/dekopon-broker-protocol/src/lib.rs:920:33: replace > with >= in BrokerRequest::validate
+crates/dekopon-broker-protocol/src/lib.rs:947:57: replace > with >= in BrokerRequest::validate
 crates/dekopon-broker-protocol/src/lib.rs:1454:62: replace > with >= in FrameLimits::validate
 crates/dekopon-broker-protocol/src/lib.rs:1832:37: replace > with >= in BrokerClient::run
 crates/dekopon-broker-protocol/src/lib.rs:1925:37: replace > with >= in BrokerClient::invoke

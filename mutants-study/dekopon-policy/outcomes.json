@@ -8,7 +8,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 42.103283713,
+          "duration": 47.689855892,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -20,7 +20,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.632026701,
+          "duration": 4.421933001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -58,7 +58,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.9174567700000003,
+          "duration": 2.223683059,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -70,7 +70,7 @@
         },
         {
           "phase": "Test",
-          "duration": 6.373230145,
+          "duration": 6.787735529,
           "process_status": {
             "Failure": 101
           },
@@ -123,7 +123,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.114371925,
+          "duration": 0.95817291,
           "process_status": {
             "Failure": 101
           },
@@ -177,7 +177,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 5.531175476,
+          "duration": 4.828784476,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -189,7 +189,7 @@
         },
         {
           "phase": "Test",
-          "duration": 6.691064441,
+          "duration": 7.115956724,
           "process_status": {
             "Failure": 101
           },
@@ -242,7 +242,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.864406066,
+          "duration": 0.810937142,
           "process_status": {
             "Failure": 101
           },
@@ -296,7 +296,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.781034572,
+          "duration": 4.379527174,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -308,7 +308,7 @@
         },
         {
           "phase": "Test",
-          "duration": 7.175341538,
+          "duration": 6.330645029,
           "process_status": {
             "Failure": 101
           },
@@ -361,7 +361,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.208362919,
+          "duration": 0.855062354,
           "process_status": {
             "Failure": 101
           },
@@ -415,7 +415,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 5.488690303,
+          "duration": 6.432681412,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -427,7 +427,7 @@
         },
         {
           "phase": "Test",
-          "duration": 1.106970859,
+          "duration": 0.902812877,
           "process_status": {
             "Failure": 101
           },
@@ -480,7 +480,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 3.499423708,
+          "duration": 4.111394618,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -492,7 +492,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.260417517,
+          "duration": 4.123373866,
           "process_status": {
             "Failure": 101
           },
@@ -545,7 +545,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.5549789,
+          "duration": 0.558278192,
           "process_status": {
             "Failure": 101
           },
@@ -599,7 +599,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.780957115,
+          "duration": 2.310919513,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -611,7 +611,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.326233589,
+          "duration": 5.3907685,
           "process_status": {
             "Failure": 101
           },
@@ -664,7 +664,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 3.174523712,
+          "duration": 3.590286133,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -676,7 +676,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.969269023,
+          "duration": 5.2212320309999996,
           "process_status": {
             "Failure": 101
           },
@@ -729,7 +729,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 66.498039275,
+          "duration": 65.99000858,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -741,7 +741,7 @@
         },
         {
           "phase": "Test",
-          "duration": 6.081968856,
+          "duration": 5.342972965,
           "process_status": {
             "Failure": 101
           },
@@ -794,7 +794,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.804285424,
+          "duration": 1.056600635,
           "process_status": {
             "Failure": 101
           },
@@ -848,7 +848,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.318096525,
+          "duration": 3.242924366,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -860,7 +860,7 @@
         },
         {
           "phase": "Test",
-          "duration": 6.147494886,
+          "duration": 6.161646335,
           "process_status": {
             "Failure": 101
           },
@@ -900,7 +900,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 79.143989182,
+          "duration": 78.941838524,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -912,7 +912,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.45622578,
+          "duration": 0.455004767,
           "process_status": {
             "Failure": 101
           },
@@ -965,7 +965,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 3.121506198,
+          "duration": 3.177047484,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -977,72 +977,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.270810905,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:229:9: replace PolicyWorld::action_groups_of -> Vec<String> with vec![String::new()]",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "PolicyWorld::action_groups_of",
-            "return_type": "-> Vec<String>",
-            "span": {
-              "start": {
-                "line": 228,
-                "column": 5
-              },
-              "end": {
-                "line": 234,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 229,
-              "column": 9
-            },
-            "end": {
-              "line": 233,
-              "column": 15
-            }
-          },
-          "replacement": "vec![String::new()]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_229_col_9_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_229_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 2.837684274,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.126673139,
+          "duration": 4.510572901,
           "process_status": {
             "Failure": 101
           },
@@ -1095,7 +1030,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.601247116,
+          "duration": 2.169869833,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1107,7 +1042,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.559334223,
+          "duration": 0.502676312,
           "process_status": {
             "Failure": 101
           },
@@ -1123,44 +1058,44 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::from_iter([(String::new(), BTreeSet::new())])",
+          "name": "crates/dekopon-policy/src/lib.rs:229:9: replace PolicyWorld::action_groups_of -> Vec<String> with vec![String::new()]",
           "package": "dekopon-policy",
           "file": "crates/dekopon-policy/src/lib.rs",
           "function": {
-            "function_name": "PolicyWorld::action_groups",
-            "return_type": "-> BTreeMap<String, BTreeSet<&CapabilityId>>",
+            "function_name": "PolicyWorld::action_groups_of",
+            "return_type": "-> Vec<String>",
             "span": {
               "start": {
-                "line": 236,
+                "line": 228,
                 "column": 5
               },
               "end": {
-                "line": 247,
+                "line": 234,
                 "column": 6
               }
             }
           },
           "span": {
             "start": {
-              "line": 237,
+              "line": 229,
               "column": 9
             },
             "end": {
-              "line": 246,
+              "line": 233,
               "column": 15
             }
           },
-          "replacement": "BTreeMap::from_iter([(String::new(), BTreeSet::new())])",
+          "replacement": "vec![String::new()]",
           "genre": "FnValue"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_237_col_9_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_237_col_9_001.diff",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_229_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_229_col_9_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.94192015,
+          "duration": 2.53754926,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1172,7 +1107,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.660977211,
+          "duration": 4.436968195,
           "process_status": {
             "Failure": 101
           },
@@ -1225,7 +1160,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.81177135,
+          "duration": 0.911302157,
           "process_status": {
             "Failure": 101
           },
@@ -1242,7 +1177,7 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::from_iter([(\"xyzzy\".into(), BTreeSet::from_iter([Box::leak(Box::new(Default::default()))]))])",
+          "name": "crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::from_iter([(String::new(), BTreeSet::new())])",
           "package": "dekopon-policy",
           "file": "crates/dekopon-policy/src/lib.rs",
           "function": {
@@ -1269,24 +1204,35 @@
               "column": 15
             }
           },
-          "replacement": "BTreeMap::from_iter([(\"xyzzy\".into(), BTreeSet::from_iter([Box::leak(Box::new(Default::default()))]))])",
+          "replacement": "BTreeMap::from_iter([(String::new(), BTreeSet::new())])",
           "genre": "FnValue"
         }
       },
-      "summary": "Unviable",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_237_col_9_004.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_237_col_9_004.diff",
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_237_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_237_col_9_001.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.706034927,
+          "duration": 1.8662793130000002,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.568257776,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
-            "--no-run",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -1333,7 +1279,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.621921896,
+          "duration": 1.868522584,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1345,13 +1291,67 @@
         },
         {
           "phase": "Test",
-          "duration": 4.861871162,
+          "duration": 4.533632695,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:237:9: replace PolicyWorld::action_groups -> BTreeMap<String, BTreeSet<&CapabilityId>> with BTreeMap::from_iter([(\"xyzzy\".into(), BTreeSet::from_iter([Box::leak(Box::new(Default::default()))]))])",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "PolicyWorld::action_groups",
+            "return_type": "-> BTreeMap<String, BTreeSet<&CapabilityId>>",
+            "span": {
+              "start": {
+                "line": 236,
+                "column": 5
+              },
+              "end": {
+                "line": 247,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 237,
+              "column": 9
+            },
+            "end": {
+              "line": 246,
+              "column": 15
+            }
+          },
+          "replacement": "BTreeMap::from_iter([(\"xyzzy\".into(), BTreeSet::from_iter([Box::leak(Box::new(Default::default()))]))])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_237_col_9_004.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_237_col_9_004.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.757083051,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -1398,7 +1398,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.264165152,
+          "duration": 2.062913571,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1410,7 +1410,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.556467652,
+          "duration": 0.76175544,
           "process_status": {
             "Failure": 101
           },
@@ -1463,7 +1463,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.80631492,
+          "duration": 0.959133989,
           "process_status": {
             "Failure": 101
           },
@@ -1517,7 +1517,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.165783071,
+          "duration": 2.165012837,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1529,7 +1529,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.603976167,
+          "duration": 0.655581344,
           "process_status": {
             "Failure": 101
           },
@@ -1582,7 +1582,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.168115306,
+          "duration": 2.379825963,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1594,7 +1594,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.615602397,
+          "duration": 4.751322173,
           "process_status": {
             "Failure": 101
           },
@@ -1647,7 +1647,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.428769691,
+          "duration": 2.702988736,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1659,7 +1659,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.894351665,
+          "duration": 4.245194655,
           "process_status": {
             "Failure": 101
           },
@@ -1712,7 +1712,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.359890454,
+          "duration": 2.171722879,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1724,7 +1724,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.078608986,
+          "duration": 4.695807038,
           "process_status": {
             "Failure": 101
           },
@@ -1777,7 +1777,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.225694671,
+          "duration": 2.509196883,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1789,7 +1789,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.40634326,
+          "duration": 0.614918543,
           "process_status": {
             "Failure": 101
           },
@@ -1842,7 +1842,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.673303148,
+          "duration": 1.858316791,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -1854,137 +1854,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.857796817,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:468:9: replace PolicyTarget::action -> &str with \"\"",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "PolicyTarget::action",
-            "return_type": "-> &str",
-            "span": {
-              "start": {
-                "line": 466,
-                "column": 5
-              },
-              "end": {
-                "line": 473,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 468,
-              "column": 9
-            },
-            "end": {
-              "line": 472,
-              "column": 10
-            }
-          },
-          "replacement": "\"\"",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_468_col_9.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_468_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 2.374456537,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.652411138,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:468:9: replace PolicyTarget::action -> &str with \"xyzzy\"",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "PolicyTarget::action",
-            "return_type": "-> &str",
-            "span": {
-              "start": {
-                "line": 466,
-                "column": 5
-              },
-              "end": {
-                "line": 473,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 468,
-              "column": 9
-            },
-            "end": {
-              "line": 472,
-              "column": 10
-            }
-          },
-          "replacement": "\"xyzzy\"",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_468_col_9_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_468_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.824866678,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.65760655,
+          "duration": 0.86186132,
           "process_status": {
             "Failure": 101
           },
@@ -2037,7 +1907,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.06699335,
+          "duration": 1.814900797,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2049,7 +1919,137 @@
         },
         {
           "phase": "Test",
-          "duration": 4.943035494,
+          "duration": 4.849716064,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:468:9: replace PolicyTarget::action -> &str with \"xyzzy\"",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "PolicyTarget::action",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 466,
+                "column": 5
+              },
+              "end": {
+                "line": 473,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 468,
+              "column": 9
+            },
+            "end": {
+              "line": 472,
+              "column": 10
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_468_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_468_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.769679538,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.75788558,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:468:9: replace PolicyTarget::action -> &str with \"\"",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "PolicyTarget::action",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 466,
+                "column": 5
+              },
+              "end": {
+                "line": 473,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 468,
+              "column": 9
+            },
+            "end": {
+              "line": 472,
+              "column": 10
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_468_col_9.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_468_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.273919202,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.866242618,
           "process_status": {
             "Failure": 101
           },
@@ -2102,7 +2102,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.869729465,
+          "duration": 1.975777211,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2114,7 +2114,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.070435825,
+          "duration": 4.126499357,
           "process_status": {
             "Failure": 101
           },
@@ -2167,7 +2167,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.509631084,
+          "duration": 1.523000139,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2179,72 +2179,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.167021528,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:539:9: replace UnresolvedKind::label -> &'static str with \"xyzzy\"",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "UnresolvedKind::label",
-            "return_type": "-> &'static str",
-            "span": {
-              "start": {
-                "line": 537,
-                "column": 5
-              },
-              "end": {
-                "line": 544,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 539,
-              "column": 9
-            },
-            "end": {
-              "line": 543,
-              "column": 10
-            }
-          },
-          "replacement": "\"xyzzy\"",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_539_col_9_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_539_col_9_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.761630728,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.036602062,
+          "duration": 3.870926371,
           "process_status": {
             "Failure": 101
           },
@@ -2297,7 +2232,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.605897014,
+          "duration": 0.603576729,
           "process_status": {
             "Failure": 101
           },
@@ -2305,6 +2240,71 @@
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:539:9: replace UnresolvedKind::label -> &'static str with \"xyzzy\"",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "UnresolvedKind::label",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 537,
+                "column": 5
+              },
+              "end": {
+                "line": 544,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 539,
+              "column": 9
+            },
+            "end": {
+              "line": 543,
+              "column": 10
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_539_col_9_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_539_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.409707722,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 4.069089505,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -2351,7 +2351,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.814617141,
+          "duration": 0.807690898,
           "process_status": {
             "Failure": 101
           },
@@ -2405,7 +2405,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.768722516,
+          "duration": 0.755435916,
           "process_status": {
             "Failure": 101
           },
@@ -2459,7 +2459,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.868815261,
+          "duration": 0.863113558,
           "process_status": {
             "Failure": 101
           },
@@ -2513,7 +2513,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.910662695,
+          "duration": 0.864536692,
           "process_status": {
             "Failure": 101
           },
@@ -2567,7 +2567,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.411578353,
+          "duration": 1.509380414,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2579,7 +2579,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.560087897,
+          "duration": 0.457723498,
           "process_status": {
             "Failure": 101
           },
@@ -2632,7 +2632,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.311491797,
+          "duration": 1.4649029040000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2644,72 +2644,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.201936967,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:628:30: replace > with == in PolicyEngine::build",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "PolicyEngine::build",
-            "return_type": "-> Result<(Self, Vec<UnresolvedName>), PolicyBuildError>",
-            "span": {
-              "start": {
-                "line": 623,
-                "column": 5
-              },
-              "end": {
-                "line": 695,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 628,
-              "column": 30
-            },
-            "end": {
-              "line": 628,
-              "column": 31
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_628_col_30.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_628_col_30.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.413546699,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.845139676,
+          "duration": 3.9944744610000003,
           "process_status": {
             "Failure": 101
           },
@@ -2762,7 +2697,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.310787977,
+          "duration": 1.267620146,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2774,7 +2709,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.407057308,
+          "duration": 0.354158749,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:628:30: replace > with == in PolicyEngine::build",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "PolicyEngine::build",
+            "return_type": "-> Result<(Self, Vec<UnresolvedName>), PolicyBuildError>",
+            "span": {
+              "start": {
+                "line": 623,
+                "column": 5
+              },
+              "end": {
+                "line": 695,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 628,
+              "column": 30
+            },
+            "end": {
+              "line": 628,
+              "column": 31
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_628_col_30.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_628_col_30.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.560605973,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 3.944966167,
           "process_status": {
             "Failure": 101
           },
@@ -2827,7 +2827,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.465979125,
+          "duration": 1.268707277,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2839,7 +2839,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.604570179,
+          "duration": 0.458495997,
           "process_status": {
             "Failure": 101
           },
@@ -2892,7 +2892,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.113096139,
+          "duration": 1.207870619,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2904,7 +2904,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.90459485,
+          "duration": 4.668532451,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2955,7 +2955,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.309360374,
+          "duration": 1.606905346,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -2967,7 +2967,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.405357781,
+          "duration": 0.452115659,
           "process_status": {
             "Failure": 101
           },
@@ -3020,7 +3020,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.518400483,
+          "duration": 1.258033642,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3032,72 +3032,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.243924044,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:644:39: replace > with == in PolicyEngine::build",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "PolicyEngine::build",
-            "return_type": "-> Result<(Self, Vec<UnresolvedName>), PolicyBuildError>",
-            "span": {
-              "start": {
-                "line": 623,
-                "column": 5
-              },
-              "end": {
-                "line": 695,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 644,
-              "column": 39
-            },
-            "end": {
-              "line": 644,
-              "column": 40
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_644_col_39.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_644_col_39.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.156193609,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.074597912,
+          "duration": 4.501992458,
           "process_status": {
             "Failure": 101
           },
@@ -3150,7 +3085,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.357315749,
+          "duration": 1.4199802510000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3162,7 +3097,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.354964625,
+          "duration": 0.402189875,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:644:39: replace > with == in PolicyEngine::build",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "PolicyEngine::build",
+            "return_type": "-> Result<(Self, Vec<UnresolvedName>), PolicyBuildError>",
+            "span": {
+              "start": {
+                "line": 623,
+                "column": 5
+              },
+              "end": {
+                "line": 695,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 644,
+              "column": 39
+            },
+            "end": {
+              "line": 644,
+              "column": 40
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_644_col_39.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_644_col_39.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.105999205,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 4.488143058,
           "process_status": {
             "Failure": 101
           },
@@ -3215,7 +3215,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.407016026,
+          "duration": 1.210436604,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3227,7 +3227,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.657194888,
+          "duration": 0.602467572,
           "process_status": {
             "Failure": 101
           },
@@ -3280,7 +3280,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.258826365,
+          "duration": 1.471548199,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3292,7 +3292,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.760234328,
+          "duration": 0.912861206,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:708:9: replace PolicyEngine::authorize_http -> PolicyDecision with Default::default()",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "PolicyEngine::authorize_http",
+            "return_type": "-> PolicyDecision",
+            "span": {
+              "start": {
+                "line": 702,
+                "column": 5
+              },
+              "end": {
+                "line": 709,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 708,
+              "column": 9
+            },
+            "end": {
+              "line": 708,
+              "column": 56
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_708_col_9.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_708_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.4119670659999999,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.853028893,
           "process_status": {
             "Failure": 101
           },
@@ -3345,7 +3410,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.257356862,
+          "duration": 1.369235022,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3357,73 +3422,8 @@
         },
         {
           "phase": "Test",
-          "duration": 4.850791175,
+          "duration": 5.861049176,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:708:9: replace PolicyEngine::authorize_http -> PolicyDecision with Default::default()",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "PolicyEngine::authorize_http",
-            "return_type": "-> PolicyDecision",
-            "span": {
-              "start": {
-                "line": 702,
-                "column": 5
-              },
-              "end": {
-                "line": 709,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 708,
-              "column": 9
-            },
-            "end": {
-              "line": 708,
-              "column": 56
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_708_col_9.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_708_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.6633711089999998,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.75985427,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -3473,7 +3473,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.716056821,
+          "duration": 1.850431017,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3485,7 +3485,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.810243459,
+          "duration": 0.811938253,
           "process_status": {
             "Failure": 101
           },
@@ -3538,7 +3538,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.3650719709999999,
+          "duration": 1.51657654,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3550,7 +3550,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.811942332,
+          "duration": 0.802968932,
           "process_status": {
             "Failure": 101
           },
@@ -3603,7 +3603,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.210634811,
+          "duration": 2.182975904,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3615,7 +3615,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.76053545,
+          "duration": 0.804777918,
           "process_status": {
             "Failure": 101
           },
@@ -3668,7 +3668,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.955977633,
+          "duration": 0.60727895,
           "process_status": {
             "Failure": 101
           },
@@ -3722,7 +3722,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.864734039,
+          "duration": 1.66272302,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3734,7 +3734,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.584835076,
+          "duration": 5.102658186,
           "process_status": {
             "Failure": 101
           },
@@ -3787,7 +3787,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.164261748,
+          "duration": 2.176831054,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3799,7 +3799,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.084737806,
+          "duration": 4.239110493,
           "process_status": {
             "Failure": 101
           },
@@ -3852,7 +3852,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.262915099,
+          "duration": 1.366615014,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3864,7 +3864,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.447415119,
+          "duration": 4.027301773,
           "process_status": {
             "Failure": 101
           },
@@ -3917,7 +3917,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.208290213,
+          "duration": 1.263128595,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -3929,7 +3929,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.934748725,
+          "duration": 4.236748316,
           "process_status": {
             "Failure": 101
           },
@@ -3982,7 +3982,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.554851132,
+          "duration": 0.561978014,
           "process_status": {
             "Failure": 101
           },
@@ -4036,7 +4036,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.507179713,
+          "duration": 0.555545312,
           "process_status": {
             "Failure": 101
           },
@@ -4090,7 +4090,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.665502499,
+          "duration": 1.46484712,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4102,72 +4102,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.923833117,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:883:5: replace apply_annotated_ids -> Result<PolicySet, PolicyBuildError> with Ok(Default::default())",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "apply_annotated_ids",
-            "return_type": "-> Result<PolicySet, PolicyBuildError>",
-            "span": {
-              "start": {
-                "line": 880,
-                "column": 1
-              },
-              "end": {
-                "line": 918,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 883,
-              "column": 5
-            },
-            "end": {
-              "line": 917,
-              "column": 16
-            }
-          },
-          "replacement": "Ok(Default::default())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_883_col_5.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_883_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.567616219,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.76263283,
+          "duration": 4.207957298,
           "process_status": {
             "Failure": 101
           },
@@ -4220,7 +4155,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.104291456,
+          "duration": 1.367686478,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4232,7 +4167,72 @@
         },
         {
           "phase": "Test",
-          "duration": 4.157330191,
+          "duration": 3.940613408,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:883:5: replace apply_annotated_ids -> Result<PolicySet, PolicyBuildError> with Ok(Default::default())",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "apply_annotated_ids",
+            "return_type": "-> Result<PolicySet, PolicyBuildError>",
+            "span": {
+              "start": {
+                "line": 880,
+                "column": 1
+              },
+              "end": {
+                "line": 918,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 883,
+              "column": 5
+            },
+            "end": {
+              "line": 917,
+              "column": 16
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_883_col_5.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_883_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.457218731,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.659286347,
           "process_status": {
             "Failure": 101
           },
@@ -4285,7 +4285,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.32150311,
+          "duration": 1.2665630860000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4297,72 +4297,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.360560716,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:889:41: replace > with < in apply_annotated_ids",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "apply_annotated_ids",
-            "return_type": "-> Result<PolicySet, PolicyBuildError>",
-            "span": {
-              "start": {
-                "line": 880,
-                "column": 1
-              },
-              "end": {
-                "line": 918,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 889,
-              "column": 41
-            },
-            "end": {
-              "line": 889,
-              "column": 42
-            }
-          },
-          "replacement": "<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_889_col_41_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_889_col_41_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.055253459,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.406561553,
+          "duration": 4.4462118010000005,
           "process_status": {
             "Failure": 101
           },
@@ -4415,7 +4350,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.6262594529999999,
+          "duration": 1.740456939,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4427,7 +4362,72 @@
         },
         {
           "phase": "Test",
-          "duration": 3.986603183,
+          "duration": 4.23677991,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:889:41: replace > with < in apply_annotated_ids",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "apply_annotated_ids",
+            "return_type": "-> Result<PolicySet, PolicyBuildError>",
+            "span": {
+              "start": {
+                "line": 880,
+                "column": 1
+              },
+              "end": {
+                "line": 918,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 889,
+              "column": 41
+            },
+            "end": {
+              "line": 889,
+              "column": 42
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_889_col_41_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_889_col_41_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.159340906,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.354041261,
           "process_status": {
             "Failure": 101
           },
@@ -4480,7 +4480,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.510884442,
+          "duration": 1.826987667,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4492,7 +4492,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.09343472,
+          "duration": 4.128539777,
           "process_status": {
             "Failure": 101
           },
@@ -4545,7 +4545,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.5657768939999999,
+          "duration": 1.566074593,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4557,7 +4557,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.407352968,
+          "duration": 0.455550241,
           "process_status": {
             "Failure": 101
           },
@@ -4610,7 +4610,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.460458961,
+          "duration": 1.524023268,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4622,7 +4622,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.504704633,
+          "duration": 0.410293072,
           "process_status": {
             "Failure": 101
           },
@@ -4675,7 +4675,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.307995468,
+          "duration": 1.165518352,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4687,7 +4687,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.404047681,
+          "duration": 0.354917903,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:923:5: replace inspect_request_shapes -> Result<(PolicySet, Vec<String>), PolicyBuildError> with Ok((Default::default(), vec![String::new()]))",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "inspect_request_shapes",
+            "return_type": "-> Result<(PolicySet, Vec<String>), PolicyBuildError>",
+            "span": {
+              "start": {
+                "line": 920,
+                "column": 1
+              },
+              "end": {
+                "line": 946,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 923,
+              "column": 5
+            },
+            "end": {
+              "line": 945,
+              "column": 28
+            }
+          },
+          "replacement": "Ok((Default::default(), vec![String::new()]))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_923_col_5_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_923_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.679600765,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.35539106,
           "process_status": {
             "Failure": 101
           },
@@ -4740,7 +4805,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.21133679,
+          "duration": 1.215201283,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4752,73 +4817,8 @@
         },
         {
           "phase": "Test",
-          "duration": 4.847626174,
+          "duration": 4.887241983,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:923:5: replace inspect_request_shapes -> Result<(PolicySet, Vec<String>), PolicyBuildError> with Ok((Default::default(), vec![String::new()]))",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "inspect_request_shapes",
-            "return_type": "-> Result<(PolicySet, Vec<String>), PolicyBuildError>",
-            "span": {
-              "start": {
-                "line": 920,
-                "column": 1
-              },
-              "end": {
-                "line": 946,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 923,
-              "column": 5
-            },
-            "end": {
-              "line": 945,
-              "column": 28
-            }
-          },
-          "replacement": "Ok((Default::default(), vec![String::new()]))",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_923_col_5_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_923_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.613856524,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.407942503,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -4868,7 +4868,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.822979502,
+          "duration": 1.211839778,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4880,7 +4880,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.352137458,
+          "duration": 0.453733392,
           "process_status": {
             "Failure": 101
           },
@@ -4933,7 +4933,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.6624086519999999,
+          "duration": 1.457872525,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -4945,7 +4945,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.240442873,
+          "duration": 4.134595543,
           "process_status": {
             "Failure": 101
           },
@@ -4998,7 +4998,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.821382882,
+          "duration": 1.2604065420000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5010,72 +5010,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.559628144,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:940:28: replace != with == in inspect_request_shapes",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "inspect_request_shapes",
-            "return_type": "-> Result<(PolicySet, Vec<String>), PolicyBuildError>",
-            "span": {
-              "start": {
-                "line": 920,
-                "column": 1
-              },
-              "end": {
-                "line": 946,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 940,
-              "column": 28
-            },
-            "end": {
-              "line": 940,
-              "column": 30
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_940_col_28.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_940_col_28.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 2.030484779,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.272540894,
+          "duration": 0.653261987,
           "process_status": {
             "Failure": 101
           },
@@ -5128,7 +5063,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.168382465,
+          "duration": 2.016608853,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5140,7 +5075,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.42469307,
+          "duration": 4.485338966,
           "process_status": {
             "Failure": 101
           },
@@ -5193,7 +5128,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.6623748109999998,
+          "duration": 1.7665403849999999,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5205,7 +5140,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.714020962,
+          "duration": 4.193611578,
           "process_status": {
             "Failure": 101
           },
@@ -5221,44 +5156,44 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:949:5: replace references_request -> bool with true",
+          "name": "crates/dekopon-policy/src/lib.rs:940:28: replace != with == in inspect_request_shapes",
           "package": "dekopon-policy",
           "file": "crates/dekopon-policy/src/lib.rs",
           "function": {
-            "function_name": "references_request",
-            "return_type": "-> bool",
+            "function_name": "inspect_request_shapes",
+            "return_type": "-> Result<(PolicySet, Vec<String>), PolicyBuildError>",
             "span": {
               "start": {
-                "line": 948,
+                "line": 920,
                 "column": 1
               },
               "end": {
-                "line": 970,
+                "line": 946,
                 "column": 2
               }
             }
           },
           "span": {
             "start": {
-              "line": 949,
-              "column": 5
+              "line": 940,
+              "column": 28
             },
             "end": {
-              "line": 969,
-              "column": 6
+              "line": 940,
+              "column": 30
             }
           },
-          "replacement": "true",
-          "genre": "FnValue"
+          "replacement": "==",
+          "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_949_col_5.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_949_col_5.diff",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_940_col_28.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_940_col_28.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.915728275,
+          "duration": 2.0775776,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5270,7 +5205,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.709784471,
+          "duration": 3.9280561179999998,
           "process_status": {
             "Failure": 101
           },
@@ -5323,7 +5258,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.575549364,
+          "duration": 1.765857258,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5335,7 +5270,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.96099658,
+          "duration": 0.509843771,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:949:5: replace references_request -> bool with true",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "references_request",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 948,
+                "column": 1
+              },
+              "end": {
+                "line": 970,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 949,
+              "column": 5
+            },
+            "end": {
+              "line": 969,
+              "column": 6
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_949_col_5.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_949_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.021547171,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.608994564,
           "process_status": {
             "Failure": 101
           },
@@ -5388,7 +5388,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.8118738410000002,
+          "duration": 2.015099493,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5400,137 +5400,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.347546029,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:955:29: replace || with && in references_request",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "references_request",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 948,
-                "column": 1
-              },
-              "end": {
-                "line": 970,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 955,
-              "column": 29
-            },
-            "end": {
-              "line": 955,
-              "column": 31
-            }
-          },
-          "replacement": "&&",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_955_col_29.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_955_col_29.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.307273437,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.99818722,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:954:46: replace == with != in references_request",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "references_request",
-            "return_type": "-> bool",
-            "span": {
-              "start": {
-                "line": 948,
-                "column": 1
-              },
-              "end": {
-                "line": 970,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 954,
-              "column": 46
-            },
-            "end": {
-              "line": 954,
-              "column": 48
-            }
-          },
-          "replacement": "!=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_954_col_46.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_954_col_46.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.423790914,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.552506156,
+          "duration": 4.235756687,
           "process_status": {
             "Failure": 101
           },
@@ -5583,7 +5453,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.9794041199999999,
+          "duration": 1.271392004,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5595,7 +5465,137 @@
         },
         {
           "phase": "Test",
-          "duration": 4.038554397,
+          "duration": 4.243026168,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:954:46: replace == with != in references_request",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "references_request",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 948,
+                "column": 1
+              },
+              "end": {
+                "line": 970,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 954,
+              "column": 46
+            },
+            "end": {
+              "line": 954,
+              "column": 48
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_954_col_46.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_954_col_46.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.410204801,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.609908362,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:955:29: replace || with && in references_request",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "references_request",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 948,
+                "column": 1
+              },
+              "end": {
+                "line": 970,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 955,
+              "column": 29
+            },
+            "end": {
+              "line": 955,
+              "column": 31
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_955_col_29.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_955_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.823935818,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 4.088156367,
           "process_status": {
             "Failure": 101
           },
@@ -5648,61 +5648,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.708332328,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:979:5: replace entity_uid -> EntityUid with Default::default()",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "entity_uid",
-            "return_type": "-> EntityUid",
-            "span": {
-              "start": {
-                "line": 978,
-                "column": 1
-              },
-              "end": {
-                "line": 980,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 979,
-              "column": 5
-            },
-            "end": {
-              "line": 979,
-              "column": 75
-            }
-          },
-          "replacement": "Default::default()",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "Unviable",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_979_col_5.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_979_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.911620346,
+          "duration": 0.714060258,
           "process_status": {
             "Failure": 101
           },
@@ -5756,7 +5702,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.367145346,
+          "duration": 1.263138704,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5768,13 +5714,67 @@
         },
         {
           "phase": "Test",
-          "duration": 0.816339015,
+          "duration": 0.663196231,
           "process_status": {
             "Failure": 101
           },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:979:5: replace entity_uid -> EntityUid with Default::default()",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "entity_uid",
+            "return_type": "-> EntityUid",
+            "span": {
+              "start": {
+                "line": 978,
+                "column": 1
+              },
+              "end": {
+                "line": 980,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 979,
+              "column": 5
+            },
+            "end": {
+              "line": 979,
+              "column": 75
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_979_col_5.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_979_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.619783574,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -5821,7 +5821,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.655940893,
+          "duration": 1.110902442,
           "process_status": {
             "Failure": 101
           },
@@ -5875,7 +5875,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.71148872,
+          "duration": 1.007376416,
           "process_status": {
             "Failure": 101
           },
@@ -5929,7 +5929,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.511921161,
+          "duration": 0.672569557,
           "process_status": {
             "Failure": 101
           },
@@ -5983,7 +5983,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.318280827,
+          "duration": 1.4704502480000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -5995,7 +5995,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.350820812,
+          "duration": 5.657024654,
           "process_status": {
             "Failure": 101
           },
@@ -6048,7 +6048,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.723427059,
+          "duration": 2.822008164,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6060,7 +6060,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.83485193,
+          "duration": 5.106950684,
           "process_status": {
             "Failure": 101
           },
@@ -6113,7 +6113,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.263337691,
+          "duration": 1.610870877,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6125,7 +6125,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.732431846,
+          "duration": 4.3937083359999995,
           "process_status": {
             "Failure": 101
           },
@@ -6178,7 +6178,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.109389422,
+          "duration": 1.331748254,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6190,7 +6190,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.891150444,
+          "duration": 4.546589564,
           "process_status": {
             "Failure": 101
           },
@@ -6243,7 +6243,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.572063339,
+          "duration": 1.913870567,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6255,7 +6255,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.336357915,
+          "duration": 4.177559198,
           "process_status": {
             "Failure": 101
           },
@@ -6308,7 +6308,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.261319362,
+          "duration": 1.459255244,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6320,7 +6320,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.035113919,
+          "duration": 4.482252189,
           "process_status": {
             "Failure": 101
           },
@@ -6373,7 +6373,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.205201551,
+          "duration": 1.2071394930000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6385,7 +6385,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.772773275,
+          "duration": 4.944001111,
           "process_status": {
             "Failure": 101
           },
@@ -6438,7 +6438,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.16136019,
+          "duration": 1.362166172,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6450,7 +6450,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.331284898,
+          "duration": 4.7420356439999996,
           "process_status": {
             "Failure": 101
           },
@@ -6503,7 +6503,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.317278918,
+          "duration": 1.508608167,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6515,7 +6515,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.334173916,
+          "duration": 4.37840506,
           "process_status": {
             "Failure": 101
           },
@@ -6568,7 +6568,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.519249411,
+          "duration": 1.158461027,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6580,7 +6580,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.333450547,
+          "duration": 3.983306086,
           "process_status": {
             "Failure": 101
           },
@@ -6633,7 +6633,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.657726473,
+          "duration": 0.557599926,
           "process_status": {
             "Failure": 101
           },
@@ -6687,7 +6687,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.214693302,
+          "duration": 1.2575735780000001,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6699,7 +6699,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.498667688,
+          "duration": 4.247484162,
           "process_status": {
             "Failure": 101
           },
@@ -6752,7 +6752,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.358816835,
+          "duration": 1.31402554,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6764,7 +6764,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.996291634,
+          "duration": 4.041952559,
           "process_status": {
             "Failure": 101
           },
@@ -6817,7 +6817,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.718996852,
+          "duration": 1.763504244,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6829,7 +6829,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.540517319,
+          "duration": 4.803065063,
           "process_status": {
             "Failure": 101
           },
@@ -6882,7 +6882,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.217286163,
+          "duration": 2.431026947,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6894,7 +6894,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.786726436,
+          "duration": 4.195493892,
           "process_status": {
             "Failure": 101
           },
@@ -6947,7 +6947,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.222972821,
+          "duration": 2.170067936,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -6959,7 +6959,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.684232613,
+          "duration": 4.403998967,
           "process_status": {
             "Failure": 101
           },
@@ -7012,7 +7012,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.772958315,
+          "duration": 2.041269317,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7024,7 +7024,7 @@
         },
         {
           "phase": "Test",
-          "duration": 5.158502083,
+          "duration": 6.235935432,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7075,7 +7075,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.332575326,
+          "duration": 2.8767526549999998,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7087,72 +7087,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.788125457,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:1297:50: replace >> with << in finish_digest",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/lib.rs",
-          "function": {
-            "function_name": "finish_digest",
-            "return_type": "-> String",
-            "span": {
-              "start": {
-                "line": 1292,
-                "column": 1
-              },
-              "end": {
-                "line": 1301,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 1297,
-              "column": 50
-            },
-            "end": {
-              "line": 1297,
-              "column": 52
-            }
-          },
-          "replacement": "<<",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_1297_col_50.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_1297_col_50.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.109193302,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.614451417,
+          "duration": 4.130910084,
           "process_status": {
             "Failure": 101
           },
@@ -7205,7 +7140,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.274349518,
+          "duration": 2.661387157,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7217,7 +7152,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.935088705,
+          "duration": 3.983795361,
           "process_status": {
             "Failure": 101
           },
@@ -7233,7 +7168,7 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/dekopon-policy/src/lib.rs:1298:50: replace & with ^ in finish_digest",
+          "name": "crates/dekopon-policy/src/lib.rs:1297:50: replace >> with << in finish_digest",
           "package": "dekopon-policy",
           "file": "crates/dekopon-policy/src/lib.rs",
           "function": {
@@ -7252,25 +7187,25 @@
           },
           "span": {
             "start": {
-              "line": 1298,
+              "line": 1297,
               "column": 50
             },
             "end": {
-              "line": 1298,
-              "column": 51
+              "line": 1297,
+              "column": 52
             }
           },
-          "replacement": "^",
+          "replacement": "<<",
           "genre": "BinaryOperator"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_1298_col_50_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_1298_col_50_001.diff",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_1297_col_50.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_1297_col_50.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.461287278,
+          "duration": 1.161104095,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7282,7 +7217,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.613990447,
+          "duration": 0.814585665,
           "process_status": {
             "Failure": 101
           },
@@ -7335,7 +7270,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.813331041,
+          "duration": 1.975429279,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7347,7 +7282,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.609552149,
+          "duration": 0.775850056,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/lib.rs:1298:50: replace & with ^ in finish_digest",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/lib.rs",
+          "function": {
+            "function_name": "finish_digest",
+            "return_type": "-> String",
+            "span": {
+              "start": {
+                "line": 1292,
+                "column": 1
+              },
+              "end": {
+                "line": 1301,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 1298,
+              "column": 50
+            },
+            "end": {
+              "line": 1298,
+              "column": 51
+            }
+          },
+          "replacement": "^",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__lib.rs_line_1298_col_50_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__lib.rs_line_1298_col_50_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.01494378,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.823015093,
           "process_status": {
             "Failure": 101
           },
@@ -7387,7 +7387,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.567958454,
+          "duration": 1.414705162,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7399,7 +7399,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.652770664,
+          "duration": 0.975040641,
           "process_status": {
             "Failure": 101
           },
@@ -7439,7 +7439,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.8606324829999998,
+          "duration": 1.314108915,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7451,73 +7451,8 @@
         },
         {
           "phase": "Test",
-          "duration": 5.105056458,
+          "duration": 5.3119132350000005,
           "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/request.rs:39:9: replace OpaqueBody::label -> &'static str with \"\"",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/request.rs",
-          "function": {
-            "function_name": "OpaqueBody::label",
-            "return_type": "-> &'static str",
-            "span": {
-              "start": {
-                "line": 37,
-                "column": 5
-              },
-              "end": {
-                "line": 46,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 39,
-              "column": 9
-            },
-            "end": {
-              "line": 45,
-              "column": 10
-            }
-          },
-          "replacement": "\"\"",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__request.rs_line_39_col_9.log",
-      "diff_path": "diff/crates__dekopon-policy__src__request.rs_line_39_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.620230823,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 3.9381373809999998,
-          "process_status": {
-            "Failure": 101
-          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -7567,7 +7502,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.505858346,
+          "duration": 0.555416901,
           "process_status": {
             "Failure": 101
           },
@@ -7621,7 +7556,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.710451689,
+          "duration": 0.502201491,
           "process_status": {
             "Failure": 101
           },
@@ -7629,6 +7564,71 @@
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/request.rs:39:9: replace OpaqueBody::label -> &'static str with \"\"",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/request.rs",
+          "function": {
+            "function_name": "OpaqueBody::label",
+            "return_type": "-> &'static str",
+            "span": {
+              "start": {
+                "line": 37,
+                "column": 5
+              },
+              "end": {
+                "line": 46,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 39,
+              "column": 9
+            },
+            "end": {
+              "line": 45,
+              "column": 10
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__request.rs_line_39_col_9.log",
+      "diff_path": "diff/crates__dekopon-policy__src__request.rs_line_39_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.307172236,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 4.850854018,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -7675,7 +7675,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.15719234,
+          "duration": 1.062151821,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7687,7 +7687,7 @@
         },
         {
           "phase": "Test",
-          "duration": 3.98091065,
+          "duration": 4.280880563,
           "process_status": {
             "Failure": 101
           },
@@ -7740,7 +7740,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.460562428,
+          "duration": 1.660388135,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7752,7 +7752,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.65974359,
+          "duration": 0.863867906,
           "process_status": {
             "Failure": 101
           },
@@ -7805,7 +7805,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.259029946,
+          "duration": 1.056393596,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -7817,7 +7817,72 @@
         },
         {
           "phase": "Test",
-          "duration": 3.928613449,
+          "duration": 5.158582731,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/request.rs:80:27: replace &= with |= in HttpRequestFacts::context",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/request.rs",
+          "function": {
+            "function_name": "HttpRequestFacts::context",
+            "return_type": "-> Result<(Context, Option<OpaqueBody>), super::RequestError>",
+            "span": {
+              "start": {
+                "line": 50,
+                "column": 5
+              },
+              "end": {
+                "line": 116,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 80,
+              "column": 27
+            },
+            "end": {
+              "line": 80,
+              "column": 29
+            }
+          },
+          "replacement": "|=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__request.rs_line_80_col_27.log",
+      "diff_path": "diff/crates__dekopon-policy__src__request.rs_line_80_col_27.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.17169628,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 5.295008388,
           "process_status": {
             "Failure": 101
           },
@@ -7870,7 +7935,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.608398639,
+          "duration": 0.75644906,
           "process_status": {
             "Failure": 101
           },
@@ -7878,71 +7943,6 @@
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/request.rs:80:27: replace &= with |= in HttpRequestFacts::context",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/request.rs",
-          "function": {
-            "function_name": "HttpRequestFacts::context",
-            "return_type": "-> Result<(Context, Option<OpaqueBody>), super::RequestError>",
-            "span": {
-              "start": {
-                "line": 50,
-                "column": 5
-              },
-              "end": {
-                "line": 116,
-                "column": 6
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 80,
-              "column": 27
-            },
-            "end": {
-              "line": 80,
-              "column": 29
-            }
-          },
-          "replacement": "|=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__request.rs_line_80_col_27.log",
-      "diff_path": "diff/crates__dekopon-policy__src__request.rs_line_80_col_27.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.214087416,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.033590716,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -7989,7 +7989,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.064685659,
+          "duration": 1.365760406,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8001,7 +8001,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.710812182,
+          "duration": 1.022031896,
           "process_status": {
             "Failure": 101
           },
@@ -8054,7 +8054,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.214274918,
+          "duration": 1.563844306,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8066,7 +8066,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.093627529,
+          "duration": 4.585678691,
           "process_status": {
             "Failure": 101
           },
@@ -8119,7 +8119,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.105587909,
+          "duration": 1.057036845,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8131,7 +8131,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.558671988,
+          "duration": 0.655069773,
           "process_status": {
             "Failure": 101
           },
@@ -8184,7 +8184,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.556315374,
+          "duration": 0.552519643,
           "process_status": {
             "Failure": 101
           },
@@ -8238,7 +8238,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.520924143,
+          "duration": 0.759810646,
           "process_status": {
             "Failure": 101
           },
@@ -8292,7 +8292,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.1174794,
+          "duration": 1.369781993,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8304,7 +8304,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.152948612,
+          "duration": 4.750139505,
           "process_status": {
             "Failure": 101
           },
@@ -8357,7 +8357,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.505345101,
+          "duration": 0.457073655,
           "process_status": {
             "Failure": 101
           },
@@ -8411,7 +8411,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.610991394,
+          "duration": 0.560864462,
           "process_status": {
             "Failure": 101
           },
@@ -8465,7 +8465,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.458266173,
+          "duration": 0.602623605,
           "process_status": {
             "Failure": 101
           },
@@ -8519,7 +8519,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.45400413,
+          "duration": 0.454512353,
           "process_status": {
             "Failure": 101
           },
@@ -8573,7 +8573,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.451960765,
+          "duration": 0.455510301,
           "process_status": {
             "Failure": 101
           },
@@ -8627,7 +8627,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.503844419,
+          "duration": 0.451961705,
           "process_status": {
             "Failure": 101
           },
@@ -8681,7 +8681,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.172739653,
+          "duration": 1.164939471,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8693,7 +8693,7 @@
         },
         {
           "phase": "Test",
-          "duration": 5.241365102,
+          "duration": 5.253728835,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8744,7 +8744,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.310340915,
+          "duration": 1.415433859,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8756,7 +8756,7 @@
         },
         {
           "phase": "Test",
-          "duration": 5.272129827,
+          "duration": 5.090820487,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8807,7 +8807,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.062311127,
+          "duration": 1.007930098,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -8819,8 +8819,73 @@
         },
         {
           "phase": "Test",
-          "duration": 5.350437553,
+          "duration": 4.861592183,
           "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/dekopon-policy/src/request.rs:189:44: replace match guard fraction.len() <= 4 with false in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64",
+          "package": "dekopon-policy",
+          "file": "crates/dekopon-policy/src/request.rs",
+          "function": {
+            "function_name": "<impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64",
+            "return_type": "-> Result<Unique, E>",
+            "span": {
+              "start": {
+                "line": 181,
+                "column": 13
+              },
+              "end": {
+                "line": 194,
+                "column": 14
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 189,
+              "column": 44
+            },
+            "end": {
+              "line": 189,
+              "column": 63
+            }
+          },
+          "replacement": "false",
+          "genre": "MatchArmGuard"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__dekopon-policy__src__request.rs_line_189_col_44_001.log",
+      "diff_path": "diff/crates__dekopon-policy__src__request.rs_line_189_col_44_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.17415563,
+          "process_status": "Success",
+          "argv": [
+            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=dekopon-policy@0.71.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 4.183411722,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
@@ -8870,7 +8935,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.404301386,
+          "duration": 0.452418851,
           "process_status": {
             "Failure": 101
           },
@@ -8878,71 +8943,6 @@
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
             "test",
             "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/dekopon-policy/src/request.rs:189:44: replace match guard fraction.len() <= 4 with false in <impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64",
-          "package": "dekopon-policy",
-          "file": "crates/dekopon-policy/src/request.rs",
-          "function": {
-            "function_name": "<impl Deserialize<'de> for Unique>::deserialize::<impl Visitor<'de> for Walk>::visit_f64",
-            "return_type": "-> Result<Unique, E>",
-            "span": {
-              "start": {
-                "line": 181,
-                "column": 13
-              },
-              "end": {
-                "line": 194,
-                "column": 14
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 189,
-              "column": 44
-            },
-            "end": {
-              "line": 189,
-              "column": 63
-            }
-          },
-          "replacement": "false",
-          "genre": "MatchArmGuard"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__dekopon-policy__src__request.rs_line_189_col_44_001.log",
-      "diff_path": "diff/crates__dekopon-policy__src__request.rs_line_189_col_44_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 1.215447396,
-          "process_status": "Success",
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--package=dekopon-policy@0.71.0"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 4.443321526,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
-            "test",
             "--verbose",
             "--package=dekopon-policy@0.71.0"
           ]
@@ -8989,7 +8989,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.505340498,
+          "duration": 0.504945599,
           "process_status": {
             "Failure": 101
           },
@@ -9043,7 +9043,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.606474144,
+          "duration": 0.655718542,
           "process_status": {
             "Failure": 101
           },
@@ -9097,7 +9097,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.336155,
+          "duration": 0.907408604,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9109,7 +9109,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.239323521,
+          "duration": 4.314996339,
           "process_status": {
             "Failure": 101
           },
@@ -9162,7 +9162,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.16561248,
+          "duration": 1.264363113,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9174,7 +9174,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.818392618,
+          "duration": 0.968088295,
           "process_status": {
             "Failure": 101
           },
@@ -9227,7 +9227,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.265821704,
+          "duration": 1.623253506,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9239,7 +9239,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.659356339,
+          "duration": 0.555793625,
           "process_status": {
             "Failure": 101
           },
@@ -9292,7 +9292,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.258976099,
+          "duration": 0.964906288,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9304,7 +9304,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.658444896,
+          "duration": 0.655035773,
           "process_status": {
             "Failure": 101
           },
@@ -9357,7 +9357,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.27025789,
+          "duration": 1.015119324,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9369,7 +9369,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.611785865,
+          "duration": 0.554823572,
           "process_status": {
             "Failure": 101
           },
@@ -9422,7 +9422,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 1.1649891860000001,
+          "duration": 1.21017133,
           "process_status": "Success",
           "argv": [
             "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
@@ -9434,7 +9434,7 @@
         },
         {
           "phase": "Test",
-          "duration": 4.2190836019999995,
+          "duration": 4.338961748,
           "process_status": {
             "Failure": 101
           },
@@ -9454,7 +9454,7 @@
   "timeout": 0,
   "unviable": 36,
   "success": 0,
-  "start_time": "2026-10-29T11:51:01.777248593Z",
-  "end_time": "2026-10-29T11:55:49.233180609Z",
+  "start_time": "2026-10-29T13:49:08.682319491Z",
+  "end_time": "2026-10-29T13:54:08.612670096Z",
   "cargo_mutants_version": "27.1.0"
 }

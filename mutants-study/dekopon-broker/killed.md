@@ -1,30 +1,30 @@
-- lib.rs:135:13 crates/dekopon-broker/src/lib.rs:135:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:136:13 crates/dekopon-broker/src/lib.rs:136:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:137:13 crates/dekopon-broker/src/lib.rs:137:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:138:13 crates/dekopon-broker/src/lib.rs:138:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:139:13 crates/dekopon-broker/src/lib.rs:139:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:140:13 crates/dekopon-broker/src/lib.rs:140:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:141:13 crates/dekopon-broker/src/lib.rs:141:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:167:13 crates/dekopon-broker/src/lib.rs:167:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:167:40 crates/dekopon-broker/src/lib.rs:167:40: replace > with < in ChatMemoryConfig::validate
-- lib.rs:168:13 crates/dekopon-broker/src/lib.rs:168:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:172:29 crates/dekopon-broker/src/lib.rs:172:29: replace > with == in ChatMemoryConfig::validate
-- lib.rs:176:37 crates/dekopon-broker/src/lib.rs:176:37: replace > with == in ChatMemoryConfig::validate
-- lib.rs:176:43 crates/dekopon-broker/src/lib.rs:176:43: replace * with + in ChatMemoryConfig::validate
-- lib.rs:177:13 crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate
-- lib.rs:177:38 crates/dekopon-broker/src/lib.rs:177:38: replace > with == in ChatMemoryConfig::validate
-- lib.rs:242:9 crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with true
-- lib.rs:249:39 crates/dekopon-broker/src/lib.rs:249:39: replace * with + in round_up
-- lib.rs:434:9 crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with ""
-- lib.rs:434:9 crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with "xyzzy"
-- lib.rs:493:5 crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None)
-- lib.rs:653:9 crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 0
-- lib.rs:653:9 crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1
-- lib.rs:658:9 crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with false
-- lib.rs:658:9 crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with true
-- lib.rs:667:28 crates/dekopon-broker/src/lib.rs:667:28: replace > with == in ConstraintCatalog::validate
-- lib.rs:705:61 crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies
-- lib.rs:803:21 crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes
-- lib.rs:804:21 crates/dekopon-broker/src/lib.rs:804:21: replace && with || in ConstraintCatalog::validate_routes
-- lib.rs:846:9 crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with ""
-- lib.rs:846:9 crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with "xyzzy"
+- lib.rs:135:13 crates/dekopon-broker/src/lib.rs:135:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:136:13 crates/dekopon-broker/src/lib.rs:136:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:137:13 crates/dekopon-broker/src/lib.rs:137:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:138:13 crates/dekopon-broker/src/lib.rs:138:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:139:13 crates/dekopon-broker/src/lib.rs:139:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:140:13 crates/dekopon-broker/src/lib.rs:140:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:141:13 crates/dekopon-broker/src/lib.rs:141:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:167:13 crates/dekopon-broker/src/lib.rs:167:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:167:40 crates/dekopon-broker/src/lib.rs:167:40: replace > with < in ChatMemoryConfig::validate — caught
+- lib.rs:168:13 crates/dekopon-broker/src/lib.rs:168:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:172:29 crates/dekopon-broker/src/lib.rs:172:29: replace > with == in ChatMemoryConfig::validate — caught
+- lib.rs:176:37 crates/dekopon-broker/src/lib.rs:176:37: replace > with == in ChatMemoryConfig::validate — caught
+- lib.rs:176:43 crates/dekopon-broker/src/lib.rs:176:43: replace * with + in ChatMemoryConfig::validate — caught
+- lib.rs:177:13 crates/dekopon-broker/src/lib.rs:177:13: replace || with && in ChatMemoryConfig::validate — caught
+- lib.rs:177:38 crates/dekopon-broker/src/lib.rs:177:38: replace > with == in ChatMemoryConfig::validate — caught
+- lib.rs:242:9 crates/dekopon-broker/src/lib.rs:242:9: replace ChatMemoryConfig::enabled_for -> bool with true — caught
+- lib.rs:249:39 crates/dekopon-broker/src/lib.rs:249:39: replace * with + in round_up — caught
+- lib.rs:434:9 crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with "" — caught
+- lib.rs:434:9 crates/dekopon-broker/src/lib.rs:434:9: replace CapabilityRoute::as_str -> &'static str with "xyzzy" — caught
+- lib.rs:493:5 crates/dekopon-broker/src/lib.rs:493:5: replace deserialize_default_secret_use -> Result<Option<DefaultSecretUse>, D::Error> with Ok(None) — caught
+- lib.rs:653:9 crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 0 — caught
+- lib.rs:653:9 crates/dekopon-broker/src/lib.rs:653:9: replace ConstraintCatalog::len -> usize with 1 — caught
+- lib.rs:658:9 crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with false — caught
+- lib.rs:658:9 crates/dekopon-broker/src/lib.rs:658:9: replace ConstraintCatalog::is_empty -> bool with true — caught
+- lib.rs:667:28 crates/dekopon-broker/src/lib.rs:667:28: replace > with == in ConstraintCatalog::validate — caught
+- lib.rs:705:61 crates/dekopon-broker/src/lib.rs:705:61: replace > with == in ConstraintCatalog::retention_policies — caught
+- lib.rs:803:21 crates/dekopon-broker/src/lib.rs:803:21: replace && with || in ConstraintCatalog::validate_routes — caught
+- lib.rs:804:21 crates/dekopon-broker/src/lib.rs:804:21: replace && with || in ConstraintCatalog::validate_routes — caught
+- lib.rs:846:9 crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with "" — caught
+- lib.rs:846:9 crates/dekopon-broker/src/lib.rs:846:9: replace CredentialRefreshError::category -> &'static str with "xyzzy" — caught
