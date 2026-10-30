@@ -2,7 +2,7 @@
 
 For a native Mac installation with a budgeted OpenRouter key, start with
 [Run on a Mac](../../docs/run-on-mac.md), then choose the [Slack Agent review channel](../slack-github/README.md)
-for owner/colleague GitHub profiles and a broker-held PAT, or the [harmless Agent DM starter](../mac-slack/README.md).
+for owner/colleague GitHub read grants and a broker-held PAT, or the [harmless Agent DM starter](../mac-slack/README.md).
 This page owns the Slack app and token setup.
 
 This directory contains the Slack app profiles also used by the
@@ -187,7 +187,9 @@ export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-...
 ## Allow a sender
 
 Find the workspace team ID (`T…`) and the sender’s member ID (`U…`, available from **Copy member
-ID** in their profile). Lowercase both and add the canonical subject to `broker.yaml`:
+ID** in their profile). Opened in a web browser, a channel's URL is
+`https://app.slack.com/client/T…/C…`: the workspace ID, then the channel ID a channel route needs.
+Lowercase the team and member IDs and add the canonical subject to `broker.yaml`:
 
 ```yaml
 principals:
