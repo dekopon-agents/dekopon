@@ -1,5 +1,7 @@
 use crate::prompt::PromptError;
+use dekopon_core::AssetNumber;
 use dekopon_model::model::{ModelMessage, ModelTool, ModelToolCall};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{fmt, io, num::NonZeroU8, str::FromStr};
@@ -73,39 +75,72 @@ pub enum MemoryRefusal {
     Range { len: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Target {
+    Record(u64),
+    Asset(AssetNumber),
+}
+
+impl Target {
+    fn parse(
+        record: Option<u64>,
+        asset: Option<AssetNumber>,
+    ) -> Result<Option<Self>, serde_json::Error> {
+        match (record, asset) {
+            (Some(record), None) => Ok(Some(Self::Record(record))),
+            (None, Some(asset)) => Ok(Some(Self::Asset(asset))),
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err(serde_json::Error::custom(
+                "select exactly one of recordId and asset",
+            )),
+        }
+    }
+}
+
 pub trait MemoryTools: Send + Sync {
     fn read(
         &self,
-        record_id: u64,
+        target: Target,
         representation_id: &str,
         range: Option<(u64, u64)>,
     ) -> Result<String, MemoryRefusal>;
-    fn set_pin(&self, record_id: u64, representation_id: &str) -> Result<String, MemoryRefusal>;
-    fn clear_pin(&self, record_id: Option<u64>) -> Result<String, MemoryRefusal>;
+    fn set_pin(&self, target: Target, representation_id: &str) -> Result<String, MemoryRefusal>;
+    fn clear_pin(&self, target: Option<Target>) -> Result<String, MemoryRefusal>;
 }
 pub fn tools() -> [ModelTool; 3] {
     [
         ModelTool {
             name: "read_memory_record".into(),
-            description: "Read a retained record by ID. representationId is `native` (the original turn), `summary-<n>` (generated summary part n) or `metadata` (the record's envelope). Range is a UTF-8 byte interval [start,end). A summary that was not generated is not available.".into(),
-            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"representationId":{"type":"string"},"range":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}},"required":["recordId","representationId"],"additionalProperties":false}),
+            description: "Read a retained recordId or asset number (exactly one). An asset offers generated summary-<n> and metadata; read its original with fetch_chat_asset. representationId is `native` (the original turn), `summary-<n>` (generated summary part n) or `metadata` (the record's envelope). Range is a UTF-8 byte interval [start,end). A summary that was not generated is not available.".into(),
+            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"asset":{"type":"integer","minimum":1},"representationId":{"type":"string"},"range":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}},"required":["representationId"],"oneOf":[{"required":["recordId"]},{"required":["asset"]}],"additionalProperties":false}),
         },
         ModelTool {
             name: "set_memory_pin".into(),
-            description: "Pin a record to `native`, `summary-<n>` or `metadata` for future included history; a pin does not force inclusion.".into(),
-            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"representationId":{"type":"string"}},"required":["recordId","representationId"],"additionalProperties":false}),
+            description: "Pin exactly one recordId or asset number to `native`, `summary-<n>` or `metadata` for future included history; a pin does not force inclusion. An asset native pin requires a live image or binary document that this model can accept; text documents offer summaries and metadata.".into(),
+            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"asset":{"type":"integer","minimum":1},"representationId":{"type":"string"}},"required":["representationId"],"oneOf":[{"required":["recordId"]},{"required":["asset"]}],"additionalProperties":false}),
         },
         ModelTool {
             name: "clear_memory_pin".into(),
-            description: "Clear one record's pin, or omit recordId to clear all pins in this conversation.".into(),
-            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"}},"additionalProperties":false}),
+            description: "Clear exactly one recordId or asset number, or omit both to clear every record and asset pin in this conversation.".into(),
+            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"asset":{"type":"integer","minimum":1}},"not":{"required":["recordId","asset"]},"additionalProperties":false}),
         },
     ]
 }
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RecordArguments {
-    record_id: u64,
+    #[serde(default, deserialize_with = "present")]
+    record_id: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    asset: Option<AssetNumber>,
     representation_id: String,
     #[serde(default)]
     range: Option<(u64, u64)>,
@@ -113,8 +148,10 @@ struct RecordArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ClearArguments {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     record_id: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    asset: Option<AssetNumber>,
 }
 pub enum Dispatched {
     NotMemory,
@@ -136,10 +173,20 @@ pub fn dispatch(
                         tool: name.to_owned(),
                         source,
                     })?;
+                let target = Target::parse(args.record_id, args.asset)
+                    .and_then(|target| {
+                        target.ok_or_else(|| {
+                            serde_json::Error::custom("select exactly one of recordId and asset")
+                        })
+                    })
+                    .map_err(|source| PromptError::InvalidArguments {
+                        tool: name.to_owned(),
+                        source,
+                    })?;
                 if name == "read_memory_record" {
-                    memory.read(args.record_id, &args.representation_id, args.range)
+                    memory.read(target, &args.representation_id, args.range)
                 } else {
-                    memory.set_pin(args.record_id, &args.representation_id)
+                    memory.set_pin(target, &args.representation_id)
                 }
             }
             "clear_memory_pin" => {
@@ -150,7 +197,13 @@ pub fn dispatch(
                             source,
                         }
                     })?;
-                memory.clear_pin(args.record_id)
+                let target = Target::parse(args.record_id, args.asset).map_err(|source| {
+                    PromptError::InvalidArguments {
+                        tool: name.to_owned(),
+                        source,
+                    }
+                })?;
+                memory.clear_pin(target)
             }
             _ => return Ok(Dispatched::NotMemory),
         };

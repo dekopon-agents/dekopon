@@ -1018,6 +1018,16 @@ impl SessionAssets {
     }
 }
 
+impl SessionAssets {
+    pub(crate) fn memory_assets(&self) -> MemoryAssets<'_> {
+        MemoryAssets {
+            store: &self.store,
+            access: &self.access,
+            images_supported: self.images_supported,
+        }
+    }
+}
+
 impl AssetSource for SessionAssets {
     fn prepare_request(
         &self,
@@ -1641,6 +1651,33 @@ impl AssetFailure {
 // actual cleanup.
 const MAX_RELEASE_TOMBSTONES: usize = 1024;
 type RetentionKey = (AssetStateKey, u64);
+
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryAssets<'a> {
+    pub store: &'a AssetStore,
+    pub access: &'a AssetAccess,
+    pub images_supported: bool,
+}
+
+impl MemoryAssets<'_> {
+    pub(crate) fn native_eligible(
+        &self,
+        number: dekopon_core::AssetNumber,
+        kind: dekopon_core::asset::AssetKind,
+    ) -> bool {
+        use dekopon_core::asset::AssetKind;
+        let native = match kind {
+            AssetKind::Image => self.images_supported,
+            AssetKind::BinaryDocument => true,
+            AssetKind::TextDocument | AssetKind::Other => false,
+        };
+        native
+            && self
+                .store
+                .get_access(self.access, number.get(), Instant::now())
+                .is_some_and(|asset| asset.is_fetchable(self.images_supported))
+    }
+}
 
 pub(crate) enum SummaryInput {
     Image { mime: String, blob: DiskBlob },
@@ -2439,7 +2476,7 @@ pub(crate) mod retention_tests {
         }
     }
 
-    pub(super) struct NoScripts;
+    pub(crate) struct NoScripts;
 
     impl dekopon_agent::prompt::ScriptRuntime for NoScripts {
         fn run_script(&self, _: &str, _participant: Option<&str>) -> dekopon_shell::ScriptOutcome {

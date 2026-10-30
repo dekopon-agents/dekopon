@@ -1,12 +1,13 @@
 use std::{io, num::NonZeroU64, time::SystemTime};
 
-use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools, Rung};
+use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools, Rung, Target};
 use parking_lot::Mutex;
 
 use super::{
     Journal, JournalError, millis,
     records::{Head, admits, record_text},
 };
+use crate::asset::MemoryAssets;
 use crate::memory::record::{GrantDigest, PinLine, RecordId, Slot, Subject};
 
 const MAX_READ_BYTES: u64 = 16 * 1024;
@@ -25,6 +26,7 @@ pub(crate) struct JournalMemoryTools<'a> {
     stem: String,
     admission: Admission,
     queued: Mutex<Vec<PinLine>>,
+    assets: Option<MemoryAssets<'a>>,
 }
 
 impl<'a> JournalMemoryTools<'a> {
@@ -34,51 +36,78 @@ impl<'a> JournalMemoryTools<'a> {
             stem,
             admission,
             queued: Mutex::new(Vec::new()),
+            assets: None,
         }
+    }
+
+    pub(crate) fn with_assets(mut self, assets: MemoryAssets<'a>) -> Self {
+        self.assets = Some(assets);
+        self
     }
 
     pub(crate) fn into_pins(self) -> Vec<PinLine> {
         self.queued.into_inner()
     }
 
-    fn lookup(
-        &self,
-        record_id: u64,
-    ) -> Result<(Head, std::sync::Arc<std::fs::File>), MemoryRefusal> {
-        let id = NonZeroU64::new(record_id)
-            .map(RecordId)
-            .ok_or(MemoryRefusal::RecordUnknown)?;
-        let snapshot = match self.journal.record_lookup(&self.stem, id) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None)
-            | Err(JournalError::Io {
-                kind: io::ErrorKind::NotFound,
-            }) => return Err(MemoryRefusal::RecordUnknown),
-            Err(JournalError::Io { kind }) => return Err(MemoryRefusal::Storage { kind }),
-            Err(JournalError::Corrupt) => {
-                return Err(MemoryRefusal::Storage {
-                    kind: io::ErrorKind::InvalidData,
-                });
+    fn lookup(&self, target: Target) -> Result<Located, MemoryRefusal> {
+        let snapshot = match target {
+            Target::Record(record) => {
+                let record = NonZeroU64::new(record)
+                    .map(RecordId)
+                    .ok_or(MemoryRefusal::RecordUnknown)?;
+                self.journal.record_lookup(&self.stem, record)
             }
-        };
+            Target::Asset(_) => self.journal.record_snapshot(&self.stem, false),
+        }
+        .map_err(|error| match error {
+            JournalError::Io {
+                kind: io::ErrorKind::NotFound,
+            } => MemoryRefusal::RecordUnknown,
+            JournalError::Io { kind } => MemoryRefusal::Storage { kind },
+            JournalError::Corrupt => MemoryRefusal::Storage {
+                kind: io::ErrorKind::InvalidData,
+            },
+        })?
+        .ok_or(MemoryRefusal::RecordUnknown)?;
         let file = snapshot.file;
         let head = snapshot
             .records
             .into_iter()
-            .find(|head| head.header.id == id)
+            .find(|head| match target {
+                Target::Record(id) => head.header.id.0.get() == id,
+                Target::Asset(number) => {
+                    self.admitted(head)
+                        && head
+                            .header
+                            .arrived
+                            .iter()
+                            .any(|asset| asset.number == number)
+                }
+            })
             .ok_or(MemoryRefusal::RecordUnknown)?;
-        if !admits(
+        if !self.admitted(&head) {
+            return Err(MemoryRefusal::RecordIneligible);
+        }
+        Ok(Located {
+            head,
+            file,
+            subject: match target {
+                Target::Record(_) => Subject::Record,
+                Target::Asset(number) => Subject::Asset(number),
+            },
+        })
+    }
+
+    fn admitted(&self, head: &Head) -> bool {
+        admits(
             &head.header,
             &self.admission.grant,
             self.admission.horizon_ms,
             self.admission.sealed_at_ms,
-        ) {
-            return Err(MemoryRefusal::RecordIneligible);
-        }
-        Ok((head, file))
+        )
     }
 
-    fn rung(head: &Head, representation_id: &str) -> Result<Rung, MemoryRefusal> {
+    fn record_rung(head: &Head, representation_id: &str) -> Result<Rung, MemoryRefusal> {
         let available = available(head);
         let rung: Rung =
             representation_id
@@ -98,12 +127,12 @@ impl<'a> JournalMemoryTools<'a> {
         }
     }
 
-    fn pinned(&self, record: RecordId) -> Option<Option<Rung>> {
+    fn pinned(&self, record: RecordId, subject: Subject) -> Option<Option<Rung>> {
         self.queued
             .lock()
             .iter()
             .rev()
-            .find(|line| line.record == record)
+            .find(|line| line.record == record && line.subject == subject)
             .map(|line| line.pin)
     }
 }
@@ -169,32 +198,152 @@ fn storage(error: JournalError) -> MemoryRefusal {
     }
 }
 
+struct Located {
+    head: Head,
+    file: std::sync::Arc<std::fs::File>,
+    subject: Subject,
+}
+
+impl Located {
+    fn asset(&self) -> Option<&crate::memory::record::ArrivedAsset> {
+        match self.subject {
+            Subject::Record => None,
+            Subject::Asset(number) => self
+                .head
+                .header
+                .arrived
+                .iter()
+                .find(|asset| asset.number == number),
+        }
+    }
+}
+
+impl JournalMemoryTools<'_> {
+    fn rung(&self, located: &Located, id: &str, pin: bool) -> Result<Rung, MemoryRefusal> {
+        let Some(asset) = located.asset() else {
+            return Self::record_rung(&located.head, id);
+        };
+        let state = asset.join(&located.head.asset_lines);
+        let native = pin
+            && self
+                .assets
+                .is_some_and(|assets| assets.native_eligible(asset.number, asset.kind));
+        let available = asset_available(&state.summaries, native);
+        let rung: Rung = id
+            .parse()
+            .map_err(|_unknown| MemoryRefusal::UnknownRepresentation {
+                available: available.clone(),
+            })?;
+        match rung {
+            Rung::Metadata => Ok(rung),
+            Rung::Native if native => Ok(rung),
+            Rung::Native => Err(MemoryRefusal::RepresentationUnavailable { available }),
+            Rung::Summary(part) => match state.summaries.get(usize::from(part.get() - 1)) {
+                Some(Slot::Generated(_)) => Ok(rung),
+                Some(Slot::Queued | Slot::Running | Slot::Error(_)) => {
+                    Err(MemoryRefusal::RepresentationUnavailable { available })
+                }
+                None => Err(MemoryRefusal::UnknownRepresentation { available }),
+            },
+        }
+    }
+}
+
+pub(crate) fn asset_available(slots: &[Slot], native: bool) -> Vec<Rung> {
+    let mut rungs = Vec::new();
+    if native {
+        rungs.push(Rung::Native);
+    }
+    rungs.extend(slots.iter().enumerate().filter_map(|(index, slot)| {
+        match slot {
+            Slot::Generated(_) => u8::try_from(index + 1)
+                .ok()
+                .and_then(std::num::NonZeroU8::new)
+                .map(Rung::Summary),
+            Slot::Queued | Slot::Running | Slot::Error(_) => None,
+        }
+    }));
+    rungs.push(Rung::Metadata);
+    rungs
+}
+
+fn asset_metadata(head: &Head, asset: &crate::memory::record::ArrivedAsset) -> String {
+    use dekopon_core::asset::AssetKind;
+    let kind = match asset.kind {
+        AssetKind::Image => "image",
+        AssetKind::TextDocument => "text-document",
+        AssetKind::BinaryDocument => "binary-document",
+        AssetKind::Other => "other",
+    };
+    let bytes = asset
+        .bytes
+        .map_or_else(|| "size unknown".to_owned(), |bytes| format!("{bytes} B"));
+    format!(
+        "[chat-asset:{} · {kind} · {bytes} · arrived with memory #{}]",
+        asset.number.get(),
+        head.header.id.0
+    )
+}
+
 impl MemoryTools for JournalMemoryTools<'_> {
     fn read(
         &self,
-        record_id: u64,
+        target: Target,
         representation_id: &str,
         range: Option<(u64, u64)>,
     ) -> Result<String, MemoryRefusal> {
-        let (head, file) = self.lookup(record_id)?;
-        let text = match Self::rung(&head, representation_id)? {
-            Rung::Native => {
-                let total = record_text(&file, &head, None).map_err(storage)?.total;
-                let (start, end) = window(total, range)?;
-                let selected = record_text(&file, &head, Some((start, end)))
-                    .map_err(storage)?
-                    .selected;
-                return utf8(selected, total);
-            }
-            Rung::Summary(part) => match head.header.summaries.get(usize::from(part.get() - 1)) {
-                Some(Slot::Generated(text)) => text.clone(),
-                Some(Slot::Queued | Slot::Running | Slot::Error(_)) | None => {
+        let located = self.lookup(target)?;
+        let rung = self.rung(&located, representation_id, false)?;
+        let text = match located.asset() {
+            Some(asset) => match rung {
+                Rung::Summary(part) => match &asset.join(&located.head.asset_lines).summaries
+                    [usize::from(part.get() - 1)]
+                {
+                    Slot::Generated(text) => text.clone(),
+                    Slot::Queued | Slot::Running | Slot::Error(_) => {
+                        return Err(MemoryRefusal::RepresentationUnavailable {
+                            available: asset_available(
+                                &asset.join(&located.head.asset_lines).summaries,
+                                false,
+                            ),
+                        });
+                    }
+                },
+                Rung::Metadata => asset_metadata(&located.head, asset),
+                Rung::Native => {
                     return Err(MemoryRefusal::RepresentationUnavailable {
-                        available: available(&head),
+                        available: asset_available(
+                            &asset.join(&located.head.asset_lines).summaries,
+                            false,
+                        ),
                     });
                 }
             },
-            Rung::Metadata => envelope(&head, Rung::Metadata),
+            None => match rung {
+                Rung::Native => {
+                    let total = record_text(&located.file, &located.head, None)
+                        .map_err(storage)?
+                        .total;
+                    let (start, end) = window(total, range)?;
+                    return utf8(
+                        record_text(&located.file, &located.head, Some((start, end)))
+                            .map_err(storage)?
+                            .selected,
+                        total,
+                    );
+                }
+                Rung::Summary(part) => {
+                    match &located.head.header.summaries[usize::from(part.get() - 1)] {
+                        Slot::Generated(text) => text.clone(),
+                        Slot::Queued | Slot::Running | Slot::Error(_) => {
+                            return Err(MemoryRefusal::RepresentationUnavailable {
+                                available: available(&located.head),
+                            });
+                        }
+                    }
+                }
+                Rung::Metadata => envelope(&located.head, Rung::Metadata),
+            },
         };
         let total = text.len() as u64;
         let (start, end) = window(total, range)?;
@@ -203,65 +352,74 @@ impl MemoryTools for JournalMemoryTools<'_> {
             .ok_or(MemoryRefusal::Range { len: total })
     }
 
-    fn set_pin(&self, record_id: u64, representation_id: &str) -> Result<String, MemoryRefusal> {
-        let (head, _file) = self.lookup(record_id)?;
-        let rung = Self::rung(&head, representation_id)?;
+    fn set_pin(&self, target: Target, representation_id: &str) -> Result<String, MemoryRefusal> {
+        let located = self.lookup(target)?;
+        let rung = self.rung(&located, representation_id, true)?;
         self.queued.lock().push(PinLine {
             at_ms: millis(SystemTime::now()),
-            record: head.header.id,
+            record: located.head.header.id,
+            subject: located.subject,
             pin: Some(rung),
-            subject: Subject::Record,
         });
-        Ok(format!("pinned record {record_id} to {rung}"))
+        Ok(match target {
+            Target::Record(id) => format!("pinned record {id} to {rung}"),
+            Target::Asset(number) => format!("pinned asset {} to {rung}", number.get()),
+        })
     }
 
-    fn clear_pin(&self, record_id: Option<u64>) -> Result<String, MemoryRefusal> {
+    fn clear_pin(&self, target: Option<Target>) -> Result<String, MemoryRefusal> {
         let now = millis(SystemTime::now());
-        let records: Vec<RecordId> = match record_id {
-            Some(id) => vec![self.lookup(id)?.0.header.id],
-            None => {
-                let snapshot = match self.journal.record_snapshot(&self.stem, false) {
-                    Ok(Some(snapshot)) => snapshot,
-                    Ok(None) => return Ok("no eligible pin found".into()),
-                    Err(JournalError::Io { kind }) => return Err(MemoryRefusal::Storage { kind }),
-                    Err(JournalError::Corrupt) => {
-                        return Err(MemoryRefusal::Storage {
-                            kind: io::ErrorKind::InvalidData,
+        let mut pins = Vec::new();
+        if let Some(target) = target {
+            let located = self.lookup(target)?;
+            pins.push(PinLine {
+                at_ms: now,
+                record: located.head.header.id,
+                subject: located.subject,
+                pin: None,
+            });
+        } else {
+            let Some(snapshot) = self
+                .journal
+                .record_snapshot(&self.stem, false)
+                .map_err(storage)?
+            else {
+                return Ok("no eligible pin found".into());
+            };
+            for head in snapshot.records.iter().filter(|head| self.admitted(head)) {
+                if self
+                    .pinned(head.header.id, Subject::Record)
+                    .unwrap_or(head.header.pin)
+                    .is_some()
+                {
+                    pins.push(PinLine {
+                        at_ms: now,
+                        record: head.header.id,
+                        subject: Subject::Record,
+                        pin: None,
+                    });
+                }
+                for asset in &head.header.arrived {
+                    let subject = Subject::Asset(asset.number);
+                    if self
+                        .pinned(head.header.id, subject)
+                        .unwrap_or(asset.join(&head.asset_lines).pin)
+                        .is_some()
+                    {
+                        pins.push(PinLine {
+                            at_ms: now,
+                            record: head.header.id,
+                            subject,
+                            pin: None,
                         });
                     }
-                };
-                snapshot
-                    .records
-                    .iter()
-                    .filter(|head| {
-                        admits(
-                            &head.header,
-                            &self.admission.grant,
-                            self.admission.horizon_ms,
-                            self.admission.sealed_at_ms,
-                        )
-                    })
-                    .filter(|head| {
-                        self.pinned(head.header.id)
-                            .unwrap_or(head.header.pin)
-                            .is_some()
-                    })
-                    .map(|head| head.header.id)
-                    .collect()
+                }
             }
-        };
-        if records.is_empty() {
+        }
+        if pins.is_empty() {
             return Ok("no eligible pin found".into());
         }
-        let mut queued = self.queued.lock();
-        for record in records {
-            queued.push(PinLine {
-                at_ms: now,
-                record,
-                pin: None,
-                subject: Subject::Record,
-            });
-        }
+        self.queued.lock().extend(pins);
         Ok("pin cleared".into())
     }
 }

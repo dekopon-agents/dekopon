@@ -2916,6 +2916,10 @@ async fn session_turn(
     let threads = runner.shell_threads.clone();
     let model_cancel = cancellation.model_watch();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
+    let runner_asset_counts = runner
+        .summaries
+        .as_ref()
+        .map(|sender| Arc::clone(&sender.counts));
     let run = move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = blocking_span.enter();
@@ -2934,6 +2938,7 @@ async fn session_turn(
                 table: participant_table,
             };
             let mut choice = None;
+            let mut native_asset_bytes = 0;
             let (prior, commit, replay_source) = match (&seeded, &recalled_journal) {
                 (Window::Journal { prior }, Some(snapshot))
                     if let (Some(knobs), Some(window)) = (knobs.as_ref(), memory_window) =>
@@ -2963,9 +2968,11 @@ async fn session_turn(
                             max_turns: window.limits.max_turns,
                             max_bytes: window.limits.max_bytes,
                             model: &model_key,
+                            assets: Some(assets.memory_assets()),
                         },
                     ) {
                         Ok(projected) => {
+                            native_asset_bytes = projected.assets.native_bytes as usize;
                             let ids: Vec<String> = projected
                                 .prior
                                 .iter()
@@ -2986,6 +2993,25 @@ async fn session_turn(
                                         memory.rung.native = projected.rungs.native,
                                         memory.rung.summary = projected.rungs.summary,
                                         memory.rung.metadata = projected.rungs.metadata,
+                                        memory.asset.rung.native = projected.assets.rungs.native,
+                                        memory.asset.rung.summary = projected.assets.rungs.summary,
+                                        memory.asset.rung.metadata =
+                                            projected.assets.rungs.metadata,
+                                        memory.asset.native.bytes = projected.assets.native_bytes,
+                                        memory.asset.omitted = projected.assets.omitted,
+                                        memory.asset.native_unresident =
+                                            projected.assets.native_unresident,
+                                        memory.asset.native_unshowable =
+                                            projected.assets.native_unshowable,
+                                        memory.asset.lines = projected.assets.lines,
+                                        memory.asset.enqueued =
+                                            runner_asset_counts.as_ref().map_or(0, |counts| counts
+                                                .asset_enqueued
+                                                .load(Ordering::Relaxed)),
+                                        memory.asset.deferred =
+                                            runner_asset_counts.as_ref().map_or(0, |counts| counts
+                                                .asset_deferred
+                                                .load(Ordering::Relaxed)),
                                         memory.omitted = projected.omitted.len() as u64,
                                         memory.opaque.dropped = projected.opaque_dropped,
                                         memory.repacked = projected.repacked,
@@ -3065,6 +3091,7 @@ async fn session_turn(
                 );
             }
             let mut inputs = SessionInputs::new(&text, limits)
+                .with_native_asset_bytes(native_asset_bytes)
                 .with_memory_notice(memory_notice.as_ref())
                 .with_recorded_prompt(&recorded)
                 .with_system(Some(&instructions))
@@ -3098,6 +3125,7 @@ async fn session_turn(
                         sealed_at_ms: memory_seal.map(journal::millis),
                     },
                 )
+                .with_assets(assets.memory_assets())
             });
             if let Some(tools) = memory_tools.as_ref() {
                 inputs = inputs.with_memory_tools(tools);

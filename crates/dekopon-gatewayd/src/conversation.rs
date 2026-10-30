@@ -17,7 +17,7 @@ use crate::{
     asset::{AssetAccess, AssetFence},
     cache_key::{self, CacheKeySecret},
     config::MemoryWindow,
-    memory::project::Prior,
+    memory::project::PriorRecord,
     routes::BoundRoute,
 };
 
@@ -141,7 +141,7 @@ impl ConversationKey {
 /// projection report, and every other route keeps its own window of user and answer text.
 #[derive(Clone, Debug)]
 pub(crate) enum Window {
-    Journal { prior: Vec<Prior> },
+    Journal { prior: Vec<PriorRecord> },
     Owned(History),
 }
 
@@ -168,7 +168,7 @@ pub(crate) enum Seed {
 
 pub(crate) enum Commit {
     Journal {
-        prior: Vec<Prior>,
+        prior: Vec<PriorRecord>,
     },
     Owned {
         recalled: Option<ConversationTurn>,

@@ -1,4 +1,4 @@
-mod assets;
+pub(crate) mod assets;
 
 use super::super::journal::records::tests::{fixture, journal};
 use super::*;
@@ -769,7 +769,7 @@ async fn held_listener() -> (
     (endpoint, requested, disconnected, servers)
 }
 
-fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: u64) -> Resources {
+pub(crate) fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: u64) -> Resources {
     let mut routes = RoutingTable::default();
     routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":endpoint,"model":"fixture","modalities":["image"],"timeoutMs":timeout_ms})).unwrap()));
     Resources {
@@ -1126,7 +1126,7 @@ fn record(id: u64, user: &str, parts: usize) -> super::super::record::TurnRecord
 
 fn projection(
     journal: &Journal,
-    prior: &[super::super::project::Prior],
+    prior: &[super::super::project::PriorRecord],
     max_turns: usize,
     max_bytes: usize,
 ) -> super::super::project::Projected {
@@ -1139,6 +1139,7 @@ fn projection(
         max_turns,
         max_bytes,
         model: &fixture().model,
+        assets: None,
     })
     .unwrap()
 }
@@ -1371,7 +1372,7 @@ fn a_record_without_generated_summaries_is_never_asked() {
 
 fn window_projection(
     journal: &Journal,
-    prior: &[super::super::project::Prior],
+    prior: &[super::super::project::PriorRecord],
     (hot_turns, max_turns, max_bytes): (usize, usize, usize),
 ) -> (super::super::project::Projected, Vec<RecordId>) {
     let mut snapshot = journal.record_snapshot(STEM, false).unwrap().unwrap();
@@ -1385,6 +1386,7 @@ fn window_projection(
         max_turns,
         max_bytes,
         model: &fixture().model,
+        assets: None,
     })
     .unwrap();
     let ids = snapshot.records.iter().map(|head| head.header.id).collect();

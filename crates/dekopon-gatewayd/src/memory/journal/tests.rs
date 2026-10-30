@@ -226,6 +226,7 @@ fn an_unlocked_reader_keeps_its_snapshot_across_maintain() {
         max_turns: 8,
         max_bytes: 64 * 1024,
         model: &model,
+        assets: None,
     })
     .unwrap();
     let before: Vec<_> = projected.messages.iter().map(message_text).collect();
@@ -237,7 +238,11 @@ fn an_unlocked_reader_keeps_its_snapshot_across_maintain() {
         let worker = scope.spawn(move || {
             let recalled = reader.recall(STEM, &grant(), window(), now).is_ok();
             let sealed = reader.sealed(STEM, RETENTION).is_ok();
-            let read = tools_for(reader, grant()).read(kept.0.get(), "native", None);
+            let read = tools_for(reader, grant()).read(
+                dekopon_agent::memory_tools::Target::Record(kept.0.get()),
+                "native",
+                None,
+            );
             tx.send((recalled, sealed, read)).unwrap();
         });
         let result = rx.recv_timeout(Duration::from_secs(3));
@@ -430,8 +435,21 @@ fn no_reader_decodes_a_body() {
         assert_eq!(head.header.pin, Some(Rung::Metadata));
     }
     let tools = tools_for(&journal, grant());
-    assert!(tools.read(ids[3].0.get(), "metadata", None).is_ok());
-    tools.set_pin(ids[3].0.get(), "native").unwrap();
+    assert!(
+        tools
+            .read(
+                dekopon_agent::memory_tools::Target::Record(ids[3].0.get()),
+                "metadata",
+                None
+            )
+            .is_ok()
+    );
+    tools
+        .set_pin(
+            dekopon_agent::memory_tools::Target::Record(ids[3].0.get()),
+            "native",
+        )
+        .unwrap();
     persist_pins(&journal, tools);
     assert_eq!(bodies(&journal), capped);
     let decoded = records::DECODED_BYTES.get();
@@ -460,9 +478,18 @@ fn pin_ids_map_to_rungs() {
     }
     let id = record.0.get();
     let tools = tools_for(&journal, grant());
-    assert_eq!(tools.read(id, "summary-2", None).unwrap(), "part two text");
+    assert_eq!(
+        tools
+            .read(
+                dekopon_agent::memory_tools::Target::Record(id),
+                "summary-2",
+                None
+            )
+            .unwrap(),
+        "part two text"
+    );
     assert!(matches!(
-        tools.read(id, "summary two", None),
+        tools.read(dekopon_agent::memory_tools::Target::Record(id), "summary two", None),
         Err(MemoryRefusal::UnknownRepresentation { available })
             if available == [
                 Rung::Native,
@@ -471,8 +498,15 @@ fn pin_ids_map_to_rungs() {
                 Rung::Metadata,
             ]
     ));
-    tools.set_pin(id, "summary-2").unwrap();
-    tools.set_pin(other.0.get(), "native").unwrap();
+    tools
+        .set_pin(dekopon_agent::memory_tools::Target::Record(id), "summary-2")
+        .unwrap();
+    tools
+        .set_pin(
+            dekopon_agent::memory_tools::Target::Record(other.0.get()),
+            "native",
+        )
+        .unwrap();
     persist_pins(&journal, tools);
     assert_eq!(
         recalled_pins(&journal),
@@ -482,7 +516,9 @@ fn pin_ids_map_to_rungs() {
         ]
     );
     let tools = tools_for(&journal, grant());
-    tools.set_pin(id, "metadata").unwrap();
+    tools
+        .set_pin(dekopon_agent::memory_tools::Target::Record(id), "metadata")
+        .unwrap();
     persist_pins(&journal, tools);
     assert_eq!(
         recalled_pins(&journal),
@@ -519,8 +555,16 @@ fn a_summary_that_is_not_generated_is_refused() {
     ] {
         assert!(journal.write_slot(STEM, slot(record, 1, state)).unwrap());
         for refusal in [
-            tools.read(id, "summary-1", None).unwrap_err(),
-            tools.set_pin(id, "summary-1").unwrap_err(),
+            tools
+                .read(
+                    dekopon_agent::memory_tools::Target::Record(id),
+                    "summary-1",
+                    None,
+                )
+                .unwrap_err(),
+            tools
+                .set_pin(dekopon_agent::memory_tools::Target::Record(id), "summary-1")
+                .unwrap_err(),
         ] {
             let shown = refusal.to_string();
             assert!(!shown.contains("canary"), "{shown}");
@@ -534,20 +578,32 @@ fn a_summary_that_is_not_generated_is_refused() {
     assert!(tools.into_pins().is_empty());
     let tools = tools_for(&journal, grant());
     assert!(matches!(
-        tools.read(id, "native", Some((4, 2))),
+        tools.read(
+            dekopon_agent::memory_tools::Target::Record(id),
+            "native",
+            Some((4, 2))
+        ),
         Err(MemoryRefusal::Range { .. })
     ));
     assert!(matches!(
-        tools.read(999, "native", None),
+        tools.read(
+            dekopon_agent::memory_tools::Target::Record(999),
+            "native",
+            None
+        ),
         Err(MemoryRefusal::RecordUnknown)
     ));
     let changed = tools_for(&journal, GrantDigest::of(&["probe.write".to_owned()]));
     assert!(matches!(
-        changed.read(id, "native", None),
+        changed.read(
+            dekopon_agent::memory_tools::Target::Record(id),
+            "native",
+            None
+        ),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(matches!(
-        changed.set_pin(id, "native"),
+        changed.set_pin(dekopon_agent::memory_tools::Target::Record(id), "native"),
         Err(MemoryRefusal::RecordIneligible)
     ));
     journal
@@ -555,7 +611,11 @@ fn a_summary_that_is_not_generated_is_refused() {
         .unwrap();
     assert!(!journal.path(STEM).exists());
     assert!(matches!(
-        tools.read(id, "native", None),
+        tools.read(
+            dekopon_agent::memory_tools::Target::Record(id),
+            "native",
+            None
+        ),
         Err(MemoryRefusal::RecordUnknown)
     ));
 }
@@ -575,12 +635,22 @@ fn reading_metadata_returns_the_envelope() {
     );
     let tools = tools_for(&journal, grant());
     assert_eq!(
-        tools.read(record.0.get(), "metadata", None).unwrap(),
+        tools
+            .read(
+                dekopon_agent::memory_tools::Target::Record(record.0.get()),
+                "metadata",
+                None
+            )
+            .unwrap(),
         expected
     );
     assert_eq!(
         tools
-            .read(record.0.get(), "metadata", Some((0, 7)))
+            .read(
+                dekopon_agent::memory_tools::Target::Record(record.0.get()),
+                "metadata",
+                Some((0, 7))
+            )
             .unwrap(),
         "[memory"
     );
@@ -1022,6 +1092,7 @@ fn a_warm_window_repacks_down_to_max_turns_on_count_alone() {
             max_turns: 4,
             max_bytes: limits.limits.max_bytes,
             model: &model,
+            assets: None,
         })
         .unwrap();
         if projected.repacked {
@@ -1053,6 +1124,7 @@ fn project_native(journal: &Journal) -> Vec<ModelMessage> {
         max_turns: 8,
         max_bytes: 4 * 1024 * 1024,
         model: &ModelKey::new(Backend::OpenAiCompatible, "model"),
+        assets: None,
     })
     .unwrap()
     .messages

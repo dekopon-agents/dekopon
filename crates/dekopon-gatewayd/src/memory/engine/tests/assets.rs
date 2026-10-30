@@ -13,14 +13,14 @@ use crate::{
 use dekopon_agent::attachment::ChatAssetSource;
 use dekopon_core::asset::AssetKind;
 
-struct World {
-    dir: Arc<tempfile::TempDir>,
-    disk: Arc<tempfile::TempDir>,
-    journal: Arc<Journal>,
-    store: Arc<AssetStore>,
-    access: AssetAccess,
-    fence: Arc<AssetFence>,
-    stem: String,
+pub(crate) struct World {
+    pub(crate) dir: Arc<tempfile::TempDir>,
+    pub(crate) disk: Arc<tempfile::TempDir>,
+    pub(crate) journal: Arc<Journal>,
+    pub(crate) store: Arc<AssetStore>,
+    pub(crate) access: AssetAccess,
+    pub(crate) fence: Arc<AssetFence>,
+    pub(crate) stem: String,
 }
 struct Live {
     access: AssetAccess,
@@ -28,11 +28,15 @@ struct Live {
     stem: String,
 }
 impl World {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
+        Self::with_budget(8 * 1024 * 1024)
+    }
+
+    pub(crate) fn with_budget(budget: usize) -> Self {
         let (dir, journal) = journal();
         let disk = tempfile::tempdir().unwrap();
         let store = Arc::new(
-            Arc::into_inner(retention_tests::store(8 * 1024 * 1024))
+            Arc::into_inner(retention_tests::store(budget))
                 .unwrap()
                 .with_storage(disk.path())
                 .unwrap(),
@@ -84,7 +88,7 @@ impl World {
             stem,
         }
     }
-    fn arrive(&self, mimes: &[&str], resident: Option<&[u8]>, parts: usize) -> Header {
+    pub(crate) fn arrive(&self, mimes: &[&str], resident: Option<&[u8]>, parts: usize) -> Header {
         let pending = mimes
             .iter()
             .map(|mime| PendingAsset {
@@ -135,6 +139,26 @@ impl World {
             .unwrap()
             .unwrap()
     }
+    pub(crate) fn shared() -> Self {
+        let mut world = Self::new();
+        let key = ConversationKey::for_space(
+            dekopon_core::SpaceKey {
+                agent: "reviewer".parse().unwrap(),
+                transport: "slack".to_owned().into(),
+                workspace: Some("team".to_owned().into()),
+                channel: "channel".to_owned().into(),
+            },
+            Some("thread".into()),
+        );
+        world.stem = key.journal_stem();
+        world.access = AssetAccess::persistent(key, 1, Arc::clone(&world.fence));
+        world
+    }
+
+    pub(crate) async fn generate(&self, header: &Header, index: usize, text: &'static str) {
+        let _script = self.run(header, index, [Action::Text(text)]).await;
+    }
+
     fn task(&self, header: &Header, index: usize) -> SlotTask {
         SlotTask {
             stem: self.stem.clone(),
@@ -144,13 +168,13 @@ impl World {
             access: Some(self.access.clone()),
         }
     }
-    fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> Snapshot {
         self.journal
             .record_snapshot(&self.stem, true)
             .unwrap()
             .unwrap()
     }
-    fn slots(&self, header: &Header, index: usize) -> Vec<Slot> {
+    pub(crate) fn slots(&self, header: &Header, index: usize) -> Vec<Slot> {
         let snapshot = self.snapshot();
         let head = snapshot
             .records
@@ -193,7 +217,7 @@ impl World {
         .await;
         script
     }
-    fn write(&self, header: &Header, index: usize, part: u8, slot: Slot) {
+    pub(crate) fn write(&self, header: &Header, index: usize, part: u8, slot: Slot) {
         self.journal
             .write_slot(
                 &self.stem,
