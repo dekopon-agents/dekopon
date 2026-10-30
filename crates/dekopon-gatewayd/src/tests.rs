@@ -1092,7 +1092,7 @@ async fn an_image_summary_route_without_an_image_model_refuses_at_load() {
         crate::routes::RouteProblem::MemoryPolicy { problem: PolicyProblem::ImageSummariesNeedImageModel { model }, .. } if model == "local-qwen")));
     input["models"].as_array_mut().unwrap().push(json!({
         "name":"summary","kind":"openaiCompatible","endpoint":"http://127.0.0.1:9",
-        "model":"summary","modalities":["image"]}));
+        "model":"summary","timeoutMs":1000,"modalities":["image"]}));
     input["routes"][0]["memory"]["summaries"]["model"] = json!("summary");
     let config = load(directory.path(), &input)
         .await

@@ -664,7 +664,13 @@ impl Journal {
             .mode(0o600)
             .open(&path)?;
         let mut buffered = io::BufWriter::with_capacity(64 * 1024, &mut file);
-        records::encode_record(&mut buffered, &record, arrived.clone())?;
+        let assets_arrived = arrived.len();
+        let slots_queued = record.summaries.len()
+            + arrived
+                .iter()
+                .map(|asset| asset.summaries.len())
+                .sum::<usize>();
+        records::encode_record(&mut buffered, &record, arrived)?;
         buffered.flush()?;
         drop(buffered);
         // Ownership transfers before fallible scans can encounter another corrupt journal file.
@@ -697,12 +703,8 @@ impl Journal {
             memory.generation = record.turn.0,
             memory.record.bytes = size.0,
             memory.record.items = record.original.len(),
-            memory.slots.queued = record.summaries.len()
-                + arrived
-                    .iter()
-                    .map(|asset| asset.summaries.len())
-                    .sum::<usize>(),
-            memory.assets.arrived = arrived.len(),
+            memory.slots.queued = slots_queued,
+            memory.assets.arrived = assets_arrived,
             "gateway.memory.published"
         );
         Ok(Some(record.id))
