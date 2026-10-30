@@ -7,7 +7,7 @@ local model, Docker, Kubernetes, Linux VM, or Firecracker.
 
 **Status: released building blocks; manual setup.** The release and tap supply executables,
 not a configured Mac service. There is no native installer or account-provisioning command. The
-[harmless Slack Agent starter](../examples/mac-slack/README.md) passes the released 0.72.0 configuration checks;
+[harmless Slack Agent starter](../examples/mac-slack/README.md) passes the released 0.74.0 configuration checks;
 its actual Mac/Slack/OpenRouter acceptance remains an operator step. The broker requires an installed compatible provider, and the
 gateway refuses a sender with no granted capability: a provider-free chat bot is not currently
 supported. For useful GitHub work, use the [Slack Agent review-channel guide](../examples/slack-github/README.md):
@@ -31,7 +31,7 @@ measurement, not resident memory.
 
 ## Install
 
-The released Mac target is **Apple Silicon / ARM64** (`aarch64-apple-darwin`). The 0.72.0
+The released Mac target is **Apple Silicon / ARM64** (`aarch64-apple-darwin`). The 0.74.0
 binaries declare macOS 11 as their minimum but have been checked only on macOS 15; use Sequoia 15
 or later. Intel Macs have no current archive or bottle; a source build is outside the release
 build matrix. Both daemons must come from the same release. Use that tag's configuration and
@@ -46,30 +46,30 @@ provider downloads here and in the examples without a GitHub account. Only the H
 ### Prebuilt archives
 
 This is the service path used below. Stage a verified archive in a versioned,
-operator-controlled directory so upgrades and rollback are deliberate. Release [0.72.0](https://github.com/dekopon-agents/dekopon/releases/tag/v0.72.0)
+operator-controlled directory so upgrades and rollback are deliberate. Release [0.74.0](https://github.com/dekopon-agents/dekopon/releases/tag/v0.74.0)
 provides macOS ARM64 and Linux ARM64/x86-64 archives; the optimized-Wasmtime variants are Linux-only.
 The standard archive also contains the optional console and reference documents, but no providers.
 
 ```console
-gh release download v0.72.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.72.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.72.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.74.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.74.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.74.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.72.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.72.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.74.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.74.0-aarch64-apple-darwin.tar.gz
 ```
 
 For the first installation, create the exact paths the service templates use:
 
 ```console
-sudo install -d -o root -g wheel -m 0755 /usr/local/lib/dekopon/0.72.0
+sudo install -d -o root -g wheel -m 0755 /usr/local/lib/dekopon/0.74.0
 sudo install -o root -g wheel -m 0755 \
-  dekopon-0.72.0-aarch64-apple-darwin/dekopon-brokerd \
-  dekopon-0.72.0-aarch64-apple-darwin/dekopon-gatewayd \
-  /usr/local/lib/dekopon/0.72.0/
+  dekopon-0.74.0-aarch64-apple-darwin/dekopon-brokerd \
+  dekopon-0.74.0-aarch64-apple-darwin/dekopon-gatewayd \
+  /usr/local/lib/dekopon/0.74.0/
 test ! -e /usr/local/lib/dekopon/current && \
   test ! -L /usr/local/lib/dekopon/current && \
-  sudo ln -s /usr/local/lib/dekopon/0.72.0 /usr/local/lib/dekopon/current
+  sudo ln -s /usr/local/lib/dekopon/0.74.0 /usr/local/lib/dekopon/current
 /usr/local/lib/dekopon/current/dekopon-brokerd --version
 /usr/local/lib/dekopon/current/dekopon-gatewayd --version
 ```
@@ -113,7 +113,9 @@ archive path keeps them root-owned.
 A manual [macOS workflow](../.github/workflows/macos-compat.yml) installs this release from the tap
 on a GitHub ARM64 runner and runs both daemons as temporary same-user launchd jobs against synthetic
 Slack, GitHub and model fixtures; the [development guide](development.md#macos-homebrew-compatibility)
-lists what it asserts. It uses its own fixture configuration, not an example's files, and does not prove
+lists what it asserts. Its `daemons: checkout` input builds candidate binaries from the dispatched
+commit instead, which is not release evidence. It uses its own fixture configuration, not an
+example's files, and does not prove
 separate-UID LaunchDaemons, sleep/logout/reboot recovery, Gatekeeper, Slack plan entitlements, real
 PAT permissions or OpenRouter billing, so complete the checks below even after a green run. A
 maintainer dispatches it from the default branch:
@@ -131,18 +133,18 @@ pinned in [`rust-toolchain.toml`](../rust-toolchain.toml), and check out the rel
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
-git checkout v0.72.0
+git checkout v0.74.0
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopon-gatewayd
 ```
 
-Alternatively, `cargo install --locked --version 0.72.0 <daemon-name>` uses crates.io, if both
+Alternatively, `cargo install --locked --version 0.74.0 <daemon-name>` uses crates.io, if both
 crates have finished publishing. Neither method installs providers or a service. The
 [development guide](development.md) owns build and provider-fixture checks.
 
 ## Prepare Slack and the model
 
-Use the [Slack Agent manifest from the release](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml).
+Use the [Slack Agent manifest from the release](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml).
 It enables Slack's Agent view and native Working/Stop session UI. The workspace plan and admin
 policy must allow those features. It still uses **Socket Mode**, with the same two credentials;
 Agent API support does not introduce a public listener or webhook URL.
@@ -224,7 +226,8 @@ broker configuration, which contains references. You create and fill it with the
 runs the binary directly and needs no `EnvironmentVariables` entry or secret-loading wrapper.
 
 Setting `GITHUB_TOKEN` in a plist or sourcing a broker `.env` does not populate this credential:
-the released broker has no dotenv loader and this bearer-token field does not expand `${...}`.
+the broker reads no credential from its environment and this bearer-token field does not expand
+`${...}`.
 Do not add the PAT to the gateway's `credentials.env`; that would give the wrong process the
 secret. Keep the file out of Git and ordinary logs/backups. To rotate the PAT, edit the file again
 as `_dekopon_broker`: with both daemons running, the broker loads a valid replacement within
@@ -539,11 +542,11 @@ has no journal; adding one creates chat text and attachment state that needs its
 and backup policy. Restoring old configuration never undoes an external effect.
 
 For an upgrade, read [upgrading](upgrading.md) and save the current configuration and provider
-lock. Extract the candidate archive as in [Prebuilt archives](#prebuilt-archives) (0.73.0 stands
+lock. Extract the candidate archive as in [Prebuilt archives](#prebuilt-archives) (0.75.0 stands
 for its version here), then stage and check the candidate pair beside the running one:
 
 ```console
-new=0.73.0
+new=0.75.0
 sudo install -d -o root -g wheel -m 0755 "/usr/local/lib/dekopon/$new"
 sudo install -o root -g wheel -m 0755 "dekopon-$new-aarch64-apple-darwin/dekopon-brokerd" \
   "dekopon-$new-aarch64-apple-darwin/dekopon-gatewayd" "/usr/local/lib/dekopon/$new/"
@@ -567,7 +570,7 @@ both jobs, run
 `brew unpin dekopon && brew upgrade dekopon && brew pin dekopon`, check, and start them; the
 upgrade deletes the previous keg, so keep the previous release archive as the rollback pair.
 For rollback, stop both jobs, restore the configuration and provider state saved for the old
-release, run `sudo ln -sfh /usr/local/lib/dekopon/0.72.0 /usr/local/lib/dekopon/current`, and start
+release, run `sudo ln -sfh /usr/local/lib/dekopon/0.74.0 /usr/local/lib/dekopon/current`, and start
 them again. Use the retained binary **pair and matching configuration/provider state**, not an
 old binary against a newly migrated store. There is no universal reverse data migration. Do not
 run both releases concurrently, and inspect uncertain external effects before retrying.

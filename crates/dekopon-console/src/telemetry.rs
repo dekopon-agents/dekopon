@@ -70,7 +70,8 @@ fn settings(text: &str) -> Result<ExporterSettings, TelemetryError> {
         dekopon_telemetry::TelemetryError::Configuration(_)
         | dekopon_telemetry::TelemetryError::NoRuntime
         | dekopon_telemetry::TelemetryError::HttpClient(_)
-        | dekopon_telemetry::TelemetryError::CaCertificate { .. }
+        | dekopon_telemetry::TelemetryError::CaCertificateUnreadable { .. }
+        | dekopon_telemetry::TelemetryError::CaCertificateNotPem
         | dekopon_telemetry::TelemetryError::Exporter { .. } => TelemetryError::Settings,
     })
 }

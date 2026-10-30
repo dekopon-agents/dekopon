@@ -23,6 +23,43 @@ dekopon-gatewayd --config /path/to/gatewayd.yaml
 
 The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
 
+## Environment file
+
+Added in 0.74.0. Both serving daemons accept `--env-file PATH`, a private file of variables
+loaded before serving; [`dekopon-brokerd`](../crates/dekopon-brokerd/README.md#environment-file)
+reads it the same way.
+
+```console
+dekopon-gatewayd --config /path/to/gatewayd.yaml --env-file /path/to/gateway.env
+```
+
+- **Precedence:** a command-line option, then an inherited variable (an empty one included),
+  then the file, then the default. YAML configuration sources are unaffected.
+- **Grammar:** UTF-8, LF or CRLF. Blank lines and lines whose first non-blank character is `#` are
+  ignored. Each other line is `KEY=VALUE` with an optional leading `export `; the key is
+  `[A-Za-z_][A-Za-z0-9_]*` and `=` follows it directly. A value is unquoted (no whitespace or
+  quote characters) or wrapped in `'…'` or `"…"`, which hold spaces. Values are literal: `$`, `\`
+  and `#` are ordinary characters, nothing is expanded, and text after a value is an error, so
+  there are no inline comments. `K=`, `K=''` and `K=""` set an empty value. A shell-sourced file
+  that relied on expansion, escapes or command substitution must be converted to literal values.
+- **Refused lines:** a duplicate key, a NUL, a byte-order mark, a stray carriage return, an
+  unmatched quote, and the keys `DEKOPON_SHELL_JQ_WORKER`, `LD_*`, `DYLD_*`, `HOME`, `TMPDIR`,
+  `PATH`, `APPDATA`, `XDG_*`, `DEKOPON_CHATGPT_AUTH_FILE`, `DEKOPON_BROKER_SOCKET` and
+  `DEKOPON_CONFIG`. A refusal names the path and line, never a key or value.
+- **File policy:** at most 64 KiB, a regular file (not a symlink, FIFO or directory) owned by the
+  daemon's effective user, mode `0600` inside a `0700` directory, one hard link. Every ancestor
+  directory must be owned by root or that user and not group- or world-writable unless sticky.
+  A relative path resolves once against the working directory; launchd and systemd units should
+  use absolute paths. On macOS an admin-owned Homebrew prefix such as `/usr/local/etc` or
+  `/opt/homebrew` fails the ancestor rule for a separate daemon user; a root-owned chain such as
+  `/Library/Application Support/Dekopon/gateway/` passes.
+- **Helper modes:** `auth` and `check` (including `--probe`) refuse the option with exit 2 before
+  opening anything; `--help` and `--version` open nothing.
+- **Startup:** the daemon re-executes itself in place with the merged environment before any
+  thread exists, so its PID, supervisor and signal handling are those of a direct start. A
+  refused file exits 1 and an invalid value exits 2, before anything is bound. A value error from
+  a variable names the option and variable, not the value.
+
 ## Runtime threads
 
 Thread sizing is parsed before configuration; flags override their environment fallbacks and
@@ -307,8 +344,10 @@ generation; sessions already running retain their original client trust.
 These roots supplement public roots without granting network access. A listed CA lets
 whoever holds its private key impersonate model endpoints to this gateway. No ambient
 `SSL_CERT_FILE`, `SSL_CERT_DIR`, system trust store or proxy is consulted; redirects
-and existing timeouts are unchanged. This setting covers inference, not subscription
-OAuth refresh, OTLP export or the OCI provider manager.
+and existing timeouts are unchanged. This setting covers inference and gateway
+subscription OAuth refresh. Each generation keeps its own HTTP client trust, including
+refreshes already in flight. OTLP export and the OCI provider manager have separate
+CA configuration.
 
 Mount the public PEM file read-only into the gateway at the configured absolute path
 using an operator-supplied volume mount in the rendered Deployment; the chart has no

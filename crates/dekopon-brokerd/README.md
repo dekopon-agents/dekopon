@@ -30,6 +30,14 @@ Success exits 0 without output; absent, refused, unmapped, wrong-server, malform
 endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects `--config`, loads no
 components or credentials, invokes nothing, and initializes no telemetry.
 
+## Environment file
+
+Added in 0.74.0. Serving accepts `--env-file PATH` with the grammar, file policy and precedence of
+the [gateway's environment file](../../docs/gatewayd.md#environment-file); `probe`, `provider` and
+`check` refuse it with exit 2 before opening anything. The broker reads tuning and `OTEL_*`
+variables from it. It reads no credential from its environment: a `GITHUB_TOKEN` line is an unread
+variable, and provider credentials stay in the private `credentialsPath` YAML.
+
 ## Runtime threads
 
 Thread sizing is parsed before configuration; flags override their environment fallbacks and

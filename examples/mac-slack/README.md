@@ -6,11 +6,11 @@ It grants no GitHub, host-shell, file, or provider-write access. To start with u
 use the [owner-and-colleague review-channel guide](../slack-github/README.md). This smaller example
 first establishes that the installation can answer and run a tool without a GitHub PAT.
 
-The example targets **Dekopon 0.72.0** and **JSONPlaceholder provider 0.7.0**. These files pass
-`check` with the released Linux 0.72.0 daemons and that component; that proves nothing about macOS
+The example targets **Dekopon 0.74.0** and **JSONPlaceholder provider 0.7.0**. These files pass
+`check` with the released Linux 0.74.0 daemons and that component; that proves nothing about macOS
 services, Slack or OpenRouter. Complete the Mac runbook's
 [acceptance checks](../../docs/run-on-mac.md#acceptance-before-switching) before switching another
-bot off. Use the [0.72.0 source](https://github.com/dekopon-agents/dekopon/tree/v0.72.0) for the
+bot off. Use the [0.74.0 source](https://github.com/dekopon-agents/dekopon/tree/v0.74.0) for the
 matching contracts; `main` can be ahead of the release.
 
 ## Accounts, files, and one provider
@@ -38,7 +38,7 @@ sudo install -o _dekopon_broker -g "$(id -gn _dekopon_broker)" -m 0600 \
 
 The [provider release](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/tag/v0.7.0)
 is separate from the application release. Use these component bytes with the constraints below;
-older provider README examples use fields that 0.72.0 rejects. There is no need for Docker, an OCI
+older provider README examples use fields that 0.74.0 rejects. There is no need for Docker, an OCI
 registry client, a Rust build, or a provider API key for this starter.
 
 ## Broker configuration and policy
@@ -82,7 +82,7 @@ capabilities:
             allowPlaintextLoopback: false
 ```
 
-Keep the gateway peer principal literally `dekopon-gatewayd`: 0.72.0 uses that name and its
+Keep the gateway peer principal literally `dekopon-gatewayd`: 0.74.0 uses that name and its
 attestor grant for the gateway's startup/reload handshake. Another name can pass offline checks
 and still fail boot with `peer is not the reconciliation owner`. The separate `broker-operator`
 entry lets a health probe authenticate as the broker's own UID; it grants no provider call.
@@ -188,7 +188,7 @@ Choose one exact OpenRouter model ID that supports tool calls. The configuration
 does not pin an upstream provider. Add a supported `routing.only` list only if you need that
 restriction; [OpenRouter settings](../../docs/gatewayd.md#openrouter-model-settings) describe the fields.
 
-Create the Slack app from the [0.72.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml), then obtain the
+Create the Slack app from the [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml), then obtain the
 `xapp-…` app token with `connections:write` and the installed bot's `xoxb-…` token using the
 [Slack setup](../slack/README.md). The manifest enables more features than this DM-only route uses. Its scopes do not grant a sender
 broker permission, and no channel route is enabled here. No public listener is needed.

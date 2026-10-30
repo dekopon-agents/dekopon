@@ -628,8 +628,8 @@ async fn dispatch_in_context(
                 }
             };
             app.broker_trace = Some(leg.session_trace().to_string());
-            let model: Arc<dyn ChatModel + Send + Sync> = match build_model(options, stop) {
-                Ok(model) => Arc::from(model),
+            let model = match build_model(options, stop) {
+                Ok(model) => Arc::new(model),
                 Err(error) => {
                     let report = app.report(ErrorReport::from_error("build model client", &error));
                     refuse_turn(app, report);
@@ -641,27 +641,32 @@ async fn dispatch_in_context(
             stop.reset();
             let (handle_cancel, signal) = CancelSignal::pair();
             stop.bind_broker(handle_cancel);
+            let turn = crate::session::run_turn(
+                leg.with_cancel_signal(signal),
+                Arc::clone(&model) as Arc<dyn ChatModel + Send + Sync>,
+                prompt,
+                instructions(app),
+                app.agents
+                    .iter()
+                    .find(|agent| agent.metadata.name == session.agent.as_str())
+                    .expect("session catalog agent")
+                    .clone(),
+                options.clone(),
+                std::mem::replace(history, History::new(options.history_limits)),
+                stop.clone(),
+                progress,
+                sender,
+            );
             #[expect(
                 clippy::disallowed_methods,
-                reason = "owner: RunningTurn retained by the event loop and joined on completion or shutdown; bound: one active turn admitted by app.busy and running"
+                reason = "owner: RunningTurn joined on completion or shutdown; bound: one active turn admitted by app.busy and running, including its credential drain"
             )]
             let handle = tokio::spawn(
-                crate::session::run_turn(
-                    leg.with_cancel_signal(signal),
-                    model,
-                    prompt,
-                    instructions(app),
-                    app.agents
-                        .iter()
-                        .find(|agent| agent.metadata.name == session.agent.as_str())
-                        .expect("session catalog agent")
-                        .clone(),
-                    options.clone(),
-                    std::mem::replace(history, History::new(options.history_limits)),
-                    stop.clone(),
-                    progress,
-                    sender,
-                )
+                async move {
+                    let result = turn.await;
+                    model.drain_credentials().await;
+                    result
+                }
                 .in_current_span(),
             );
             *running = Some(RunningTurn {

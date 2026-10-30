@@ -21012,9 +21012,7 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
         },
     )
     .unwrap();
-    let first = configured
-        .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
-        .unwrap();
+    let first = configured.chatgpt_credential(Some(&first_path)).unwrap();
     let old = Arc::downgrade(&first);
     document["models"][0]["model"] = json!("second");
     write_config(root.path(), &document);
@@ -21025,9 +21023,7 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
     ));
     assert!(Arc::ptr_eq(
         &first,
-        &configured
-            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
-            .unwrap()
+        &configured.chatgpt_credential(Some(&first_path)).unwrap()
     ));
     document["routes"][0]["steering"] = json!("boundary");
     write_config(root.path(), &document);
@@ -21038,9 +21034,7 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
     ));
     assert!(Arc::ptr_eq(
         &first,
-        &configured
-            .chatgpt_credential(Some(&first_path), Duration::from_secs(2))
-            .unwrap()
+        &configured.chatgpt_credential(Some(&first_path)).unwrap()
     ));
     document["models"][0]["authFile"] = json!(next_path);
     write_config(root.path(), &document);
@@ -21049,9 +21043,7 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
         broker.request().await.request,
         BrokerRequest::PrepareGeneration { .. }
     ));
-    let next = configured
-        .chatgpt_credential(Some(&next_path), Duration::from_secs(2))
-        .unwrap();
+    let next = configured.chatgpt_credential(Some(&next_path)).unwrap();
     assert!(!Arc::ptr_eq(&first, &next));
     drop(first);
     configured.retire();

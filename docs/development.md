@@ -209,7 +209,7 @@ Declare shared versions and path dependencies in the root `Cargo.toml`; commit `
 
 GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization; an execution contract the owner approved gives it for what it lists.
 
-Expensive validation runs on pull requests (`pull_request`) and merge queue groups (`merge_group`), with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them and a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`; the required `quality (stable)` context aggregates all four lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs one `cargo package --locked --no-verify` invocation with `-p` for every public crate in `.github/release-crates.txt` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
+Expensive validation runs on pull requests (`pull_request`) and merge queue groups (`merge_group`), with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them, a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`, and a native `macos-15` lane runs only `cargo test -p dekopon-broker-protocol`, the one crate that receives `SCM_RIGHTS` descriptors; the required `quality (stable)` context aggregates all five lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs one `cargo package --locked --no-verify` invocation with `-p` for every public crate in `.github/release-crates.txt` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
 
 The optional `memory-lab` workflow runs the pinned memory harness's deterministic fake-profile
 scenarios against the exact pull-request head SHA on `pull_request`, filtered to
@@ -268,8 +268,8 @@ cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dek
 cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
 ```
 
-The overlay pins [C12 at `6e850d9e`](https://github.com/dekopon-agents/wasmtime/commit/6e850d9e9df96b0eacd6867e8ffb8a813200e42f),
-based on Wasmtime 49.0.4. Wasmtime's workspace path dependencies keep its compiler
+The overlay pins [C12 at `1d165f99`](https://github.com/dekopon-agents/wasmtime/commit/1d165f99768bd679497cf3dd1de6c89f6861a1c3),
+based on Wasmtime 49.0.5. Wasmtime's workspace path dependencies keep its compiler
 and internal crates on that revision. The memory changes compact finalized machine-code buffers
 and release source locations after preserving the address map; they do not include the separate
 experimental unwind/linking changes. The RPi deploys this build on ARM64; it is a dogfood
@@ -399,6 +399,8 @@ cargo test --workspace --all-features --locked --lib --bins --tests
 cargo test --workspace --all-features --locked --doc
 # broker-host components (Linux ARM64): on an aarch64 Linux host only, the component host's own tests.
 cargo test -p dekopon-broker-host --test host --all-features --locked
+# broker-protocol descriptors (macOS): on a macOS host only, the descriptor-passing crate's tests.
+cargo test -p dekopon-broker-protocol --all-features --locked
 # dependency policy: advisories, licenses, bans, and sources over the full feature graph.
 cargo deny --all-features check
 ```
@@ -436,11 +438,15 @@ therefore means adding it, backticked, to that document in the same change. Grep
 ### macOS Homebrew compatibility
 
 The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
-`macos-15` runner and installs Dekopon and `cassette` from the real Homebrew tap. It records the
-Homebrew and macOS versions, tap revision and installed binaries, requires the pinned tap commit,
-versions and ARM64 Mach-O architecture, and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py)
-with `--launchd`. It does not build the checkout or substitute downloaded executables for the
-Homebrew installation.
+`macos-15` runner and installs `cassette` from the real Homebrew tap. With its default `daemons:
+tap` input it also installs Dekopon from the tap, records the Homebrew and macOS versions, tap
+revision and installed binaries, and requires the pinned tap commit, versions and ARM64 Mach-O
+architecture; `daemons: checkout` instead builds both daemons from the dispatched commit in
+release mode, which is candidate evidence, not a released installation. It runs
+[`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd` and the `mode` input:
+`env-file` (the default, as the Mac runbook installs) or `legacy-wrapper` (the only mode a release
+before 0.74.0 supports).
+It never substitutes downloaded executables for the Homebrew installation.
 
 The helper writes its own broker, gateway, catalog, Cedar and credential files for the loopback
 fixtures; it does not load the configuration blocks in the example READMEs. It loads
@@ -458,10 +464,15 @@ The fixture's WebSocket dependency is pinned by version, wheel URL and SHA-256 i
 
 The test requires these observable results:
 
-- The gateway shell wrapper loads fake model/app/bot values from a private `credentials.env`;
-  the broker separately loads its private `credentialsPath` YAML. The fake PAT contains
-  `${GITHUB_TOKEN}`, the broker's environment sets `GITHUB_TOKEN`, and the provider fixture
-  requires the unexpanded value. No daemon dotenv feature is assumed.
+- In `--legacy-wrapper` mode the gateway shell wrapper loads fake model/app/bot values from a
+  private `credentials.env`. In `--env-file` mode both daemons start directly with
+  [`--env-file`](gatewayd.md#environment-file) (launchd `ProgramArguments` name the binary), are
+  restarted (`launchctl kickstart -k` under launchd) and serve again, and forced runs with
+  malformed lines and an invalid tuning value must exit without echoing a synthetic value. In
+  both modes the broker loads its literal private `credentialsPath` YAML; the daemons' own
+  environment-file loader is literal and the YAML takes no environment substitution. The fake
+  PAT contains `${GITHUB_TOKEN}`, the broker's environment sets `GITHUB_TOKEN`, and the provider
+  fixture requires the unexpanded value.
 - Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
   then produce threaded Slack replies; an owner follow-up without a mention in the owner's thread
   is answered the same way. Unmapped and denied senders, and a mapped room without a grant,
@@ -471,16 +482,19 @@ The test requires these observable results:
 - A local transport turn completes a provider read; an out-of-scope HTTP request is refused; local
   unmapped and denied senders are refused as exactly `unmapped-subject` and `agent-denied`.
 - Working status identifies the initiating member and clears to active; native Stop cancels a held model
-  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged
-  on a single connection.
+  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged,
+  on one connection per gateway process.
 - The four fake credentials, and any text with their shared `synthetic-` prefix, are absent from
-  checks, logs, model inputs, tool results and replies; each endpoint receives only its expected
+  checks, logs, model inputs, tool results and replies, and the four are absent from every fixture
+  file other than the private credential files; each endpoint receives only its expected
   credential. Exact call counts and broker execution records identify the loaded provider artifacts.
 
 With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
 uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
-creates accounts or falls back silently to foreground execution. Each job clears inherited
-environment variables before starting its binary or wrapper. Cleanup removes private temporary
+creates accounts or falls back silently to foreground execution. A legacy-wrapper job clears
+inherited environment variables with `env -i` before starting its binary or wrapper; an
+env-file job names the binary directly and sets only `PATH`, `TMPDIR` and `RUST_LOG` through
+`EnvironmentVariables`. Cleanup removes private temporary
 files only after complete success; a failure retains them and reports their path for diagnosis.
 
 To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
@@ -504,9 +518,12 @@ python3 -m venv "$fixture_dir/venv"
   --cassette-bin "$(brew --prefix cassette)/bin/cassette"
 ```
 
-The workflow refuses any tap commit other than its `DEKOPON_TAP_COMMIT`, and the helper refuses a
-mismatched daemon version or component checksum. A tap update therefore needs an explicit
-compatibility review and pin update, not an automatic skip. Validate changes
+The helper starts both daemons with `--env-file` by default; pass `--legacy-wrapper` for a release
+before 0.74.0, and `--expected-version` for a binary that reports another version, such as a source
+build passed as `--bin-dir target/release`. The workflow refuses any tap commit other
+than its `DEKOPON_TAP_COMMIT`, and the helper refuses a mismatched daemon version or component
+checksum. A tap update therefore needs an explicit compatibility review and pin update, not an
+automatic skip. Validate changes
 with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
 `actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
 

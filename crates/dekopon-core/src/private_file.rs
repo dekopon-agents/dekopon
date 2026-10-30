@@ -28,6 +28,22 @@ pub enum TemporarySweep {
 impl PrivateFileLock {
     // The lock lives on a sibling because replacing the record by rename changes its inode.
     pub fn acquire(path: &Path) -> Result<Self, PrivateFileError> {
+        let (file, path) = Self::open(path)?;
+        file.lock()
+            .map_err(|source| PrivateFileError { path, source })?;
+        Ok(Self { file })
+    }
+
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>, PrivateFileError> {
+        let (file, path) = Self::open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(source)) => Err(PrivateFileError { path, source }),
+        }
+    }
+
+    fn open(path: &Path) -> Result<(File, PathBuf), PrivateFileError> {
         let lock = lock_path(path).ok_or_else(|| PrivateFileError {
             path: path.to_path_buf(),
             source: io::Error::from(io::ErrorKind::InvalidInput),
@@ -35,11 +51,11 @@ impl PrivateFileLock {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         set_private_file_mode(&mut options);
-        let file = options
-            .open(&lock)
-            .and_then(|file| file.lock().map(|()| file))
-            .map_err(|source| PrivateFileError { path: lock, source })?;
-        Ok(Self { file })
+        let file = options.open(&lock).map_err(|source| PrivateFileError {
+            path: lock.clone(),
+            source,
+        })?;
+        Ok((file, lock))
     }
 }
 

@@ -1,8 +1,11 @@
 use parking_lot::Mutex;
 use std::{
-    io::{BufRead as _, BufReader, Read as _, Write as _},
+    io::{BufRead as _, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -151,41 +154,73 @@ impl MockResponse {
 
 pub(crate) struct MockServer {
     address: String,
+    scheme: &'static str,
+    connections: Arc<AtomicUsize>,
     pub(crate) requests: Arc<Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl MockServer {
     pub(crate) fn start(responses: Vec<MockResponse>) -> Self {
+        Self::start_with(
+            "http",
+            responses
+                .into_iter()
+                .map(|response| (response, None))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn start_tls(responses: Vec<(MockResponse, Arc<rustls::ServerConfig>)>) -> Self {
+        Self::start_with(
+            "https",
+            responses
+                .into_iter()
+                .map(|(response, config)| (response, Some(config)))
+                .collect(),
+        )
+    }
+
+    fn start_with(
+        scheme: &'static str,
+        responses: Vec<(MockResponse, Option<Arc<rustls::ServerConfig>>)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
         let address = listener
             .local_addr()
             .expect("mock endpoint address")
             .to_string();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let thread_connections = Arc::clone(&connections);
         let thread_requests = Arc::clone(&requests);
         let handle = thread::spawn(move || {
             let mut held = Vec::new();
-            for mut response in responses {
-                let Ok((mut stream, _)) = listener.accept() else {
+            for (response, tls) in responses {
+                let Ok((stream, _)) = listener.accept() else {
                     break;
                 };
-                let Some(request) = read_request(&mut stream) else {
-                    continue;
-                };
-                thread_requests.lock().push(request);
-                if response.hang_up {
-                    continue;
-                }
-                if let Some(gate) = response.header_gate.take() {
-                    held.push(thread::spawn(move || {
-                        let _receiver_closed = gate.ready.send(());
-                        let _released_or_dropped =
-                            gate.release.recv_timeout(Duration::from_secs(5));
-                        write_response(&mut stream, response);
-                    }));
-                } else {
-                    write_response(&mut stream, response);
+                thread_connections.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .set_nodelay(true)
+                    .expect("disable Nagle for split regression");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                match tls {
+                    Some(config) => handle_request(
+                        rustls::StreamOwned::new(
+                            rustls::ServerConnection::new(config).unwrap(),
+                            stream,
+                        ),
+                        response,
+                        &thread_requests,
+                        &mut held,
+                    ),
+                    None => handle_request(stream, response, &thread_requests, &mut held),
                 }
             }
             for worker in held {
@@ -194,13 +229,48 @@ impl MockServer {
         });
         Self {
             address,
+            scheme,
+            connections,
             requests,
             handle: Some(handle),
         }
     }
 
+    pub(crate) fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        match self.scheme {
+            "https" => format!(
+                "https://localhost:{}",
+                self.address.rsplit_once(':').unwrap().1
+            ),
+            _ => format!("http://{}", self.address),
+        }
+    }
+
+    pub(crate) fn request_uris(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .map(|request| {
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let host = request
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                    .unwrap()
+                    .1
+                    .trim();
+                format!("{}://{host}{target}", self.scheme)
+            })
+            .collect()
     }
 
     pub(crate) fn requests(&self) -> Vec<String> {
@@ -208,7 +278,31 @@ impl MockServer {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: MockResponse) {
+fn handle_request<S: Read + Write + Send + 'static>(
+    mut stream: S,
+    mut response: MockResponse,
+    requests: &Mutex<Vec<String>>,
+    held: &mut Vec<thread::JoinHandle<()>>,
+) {
+    let Some(request) = read_request(&mut stream) else {
+        return;
+    };
+    requests.lock().push(request);
+    if response.hang_up {
+        return;
+    }
+    if let Some(gate) = response.header_gate.take() {
+        held.push(thread::spawn(move || {
+            let _receiver_closed = gate.ready.send(());
+            let _released_or_dropped = gate.release.recv_timeout(Duration::from_secs(5));
+            write_response(&mut stream, response);
+        }));
+    } else {
+        write_response(&mut stream, response);
+    }
+}
+
+fn write_response(stream: &mut impl Write, response: MockResponse) {
     let headers = response
         .headers
         .iter()
@@ -239,9 +333,6 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
             let _closed = stream.write_all(prefix);
         }
         Delivery::Split(size) => {
-            stream
-                .set_nodelay(true)
-                .expect("disable Nagle for split regression");
             for chunk in response.body.as_bytes().chunks(size) {
                 if stream.write_all(chunk).is_err() {
                     break;
@@ -282,8 +373,8 @@ impl Drop for MockServer {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<String> {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
+fn read_request(stream: &mut impl Read) -> Option<String> {
+    let mut reader = BufReader::new(stream);
     let mut request = String::new();
     let mut content_length = 0_usize;
     loop {

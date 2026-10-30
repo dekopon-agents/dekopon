@@ -110,8 +110,11 @@ where
     for warning in &report.warnings {
         warning.log();
     }
-    let Some(candidate) = candidate else {
-        return Err(BrokerdError::from_problems(report.problems));
+    let candidate = match candidate {
+        Some(Loaded::Candidate(candidate)) => *candidate,
+        Some(Loaded::Unchanged) | None => {
+            return Err(BrokerdError::from_problems(report.problems));
+        }
     };
     let uid = current_uid();
     let limits = candidate.limits;
@@ -163,6 +166,8 @@ where
         deadline.clone(),
     )
     .await;
+
+    coordination.drain_credentials().await;
 
     // Checking result before cleanup here is deliberate: propagating cleanup's error first would
     // mask the real failure and skip logging broker_stopped.
@@ -291,6 +296,11 @@ struct Candidate {
     snapshot: config::ConfigSnapshot,
 }
 
+enum Loaded {
+    Candidate(Box<Candidate>),
+    Unchanged,
+}
+
 struct Coordination {
     config_path: PathBuf,
     loading: tokio::sync::Semaphore,
@@ -301,6 +311,7 @@ struct GenerationState {
     active: Arc<Candidate>,
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
     reported: Option<RawCandidate>,
+    retired_credentials: Vec<std::sync::Weak<dekopon_model::chatgpt::CredentialFile>>,
 }
 
 impl GenerationState {
@@ -326,7 +337,25 @@ impl Coordination {
                 active: Arc::new(active),
                 prepared: None,
                 reported: None,
+                retired_credentials: Vec::new(),
             }),
+        }
+    }
+
+    async fn drain_credentials(&self) {
+        let credentials = {
+            let state = self.state.lock();
+            let mut credentials = state.active.ready.chatgpt.clone();
+            credentials.extend(
+                state
+                    .retired_credentials
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade),
+            );
+            credentials
+        };
+        for credential in credentials {
+            credential.drain().await;
         }
     }
 
@@ -360,8 +389,8 @@ impl Coordination {
             }
             Arc::clone(&state.active)
         };
-        let (next, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
-        let Some(next) = next else {
+        let (loaded, report) = load_candidate(&self.config_path, Mode::Reload(&active)).await;
+        let Some(loaded) = loaded else {
             let entries = report
                 .problems
                 .iter()
@@ -409,16 +438,17 @@ impl Coordination {
                 return (state.active.digest.clone(), GenerationOutcome::Refused);
             }
             state.reported = None;
-            if next.digest == state.active.digest
-                && next.fingerprint.is_some()
-                && next.fingerprint == state.active.fingerprint
-            {
-                state.prepared = None;
-                return (next.digest.clone(), GenerationOutcome::Active);
+            match loaded {
+                Loaded::Unchanged => {
+                    state.prepared = None;
+                    return (active.digest.clone(), GenerationOutcome::Active);
+                }
+                Loaded::Candidate(next) => {
+                    let next = Arc::<Candidate>::from(next);
+                    state.prepared = Some((uid, active, Arc::clone(&next)));
+                    next
+                }
             }
-            let next = Arc::new(next);
-            state.prepared = Some((uid, active, Arc::clone(&next)));
-            next
         };
         next.ready.scheduled.inspect_records().await;
         (next.digest.clone(), GenerationOutcome::Prepared)
@@ -438,6 +468,17 @@ impl Coordination {
             return GenerationOutcome::Refused;
         }
         let categories = state.active.snapshot.changed_categories(&next.snapshot);
+        state
+            .retired_credentials
+            .retain(|credential| credential.strong_count() > 0);
+        let retired: Vec<_> = state
+            .active
+            .ready
+            .chatgpt
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        state.retired_credentials.extend(retired);
         state.active = next;
         state.active.ready.policy_loaded();
         tracing::info!(
@@ -473,7 +514,7 @@ impl Coordination {
     clippy::too_many_lines,
     reason = "independent validation stages aggregate failures before preparing a candidate"
 )]
-async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate>, CheckReport) {
+async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, CheckReport) {
     let mut report = CheckReport::default();
     let uid = current_uid();
     let load_mode = match mode {
@@ -622,6 +663,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                         None => Credentials::Loaded(CredentialStore::empty()),
                     },
                     secrets,
+                    chatgpt: Vec::new(),
                     fingerprint: None,
                     storage,
                     assets: None,
@@ -636,6 +678,25 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
         }
         return (None, report);
     };
+    let digest = config.snapshot.digest();
+    match residents {
+        Residents::Borrow(active)
+            if report.problems.is_empty()
+                && runtime.fingerprint.is_some()
+                && runtime.fingerprint == active.fingerprint
+                && digest.as_ref().is_ok_and(|digest| *digest == active.digest) =>
+        {
+            // A provider's ownership and mode are not in the digest, so same bytes still recheck them.
+            return match validate_unmanaged_providers(&config, Some(&active.ready.registry), uid) {
+                Ok(()) => (Some(Loaded::Unchanged), report),
+                Err(error) => {
+                    report.problems.push(error);
+                    (None, report)
+                }
+            };
+        }
+        Residents::Open | Residents::Borrow(_) | Residents::Scratch => {}
+    }
     let limits = ServerLimits {
         frame: frame_limits,
         max_connections: config.server_limits.max_connections,
@@ -677,7 +738,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
     }
     match prepared {
         Ok(ready) if report.problems.is_empty() => {
-            let digest = match snapshot.digest() {
+            let digest = match digest {
                 Ok(digest) => digest,
                 Err(source) => {
                     report.problems.push(BrokerdError::Snapshot { source });
@@ -685,7 +746,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                 }
             };
             (
-                Some(Candidate {
+                Some(Loaded::Candidate(Box::new(Candidate {
                     digest,
                     fingerprint,
                     ready,
@@ -696,7 +757,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Candidate
                     assets,
                     locked_providers,
                     snapshot,
-                }),
+                }))),
                 report,
             )
         }
@@ -765,6 +826,7 @@ async fn boot_runtime(
     let (private, storage, assets) = (private?, storage?, assets?);
     Some(Runtime {
         credentials: Credentials::Loaded(private.credentials),
+        chatgpt: private.chatgpt,
         secrets: Secrets::Loaded(private.secrets, private.scheduled),
         fingerprint: Some(private.fingerprint),
         storage,
@@ -795,6 +857,7 @@ async fn reload_runtime(
     let private = private?;
     Some(Runtime {
         credentials: Credentials::Loaded(private.credentials),
+        chatgpt: private.chatgpt,
         secrets: Secrets::Loaded(private.secrets, private.scheduled),
         fingerprint: Some(private.fingerprint),
         storage,
@@ -805,6 +868,7 @@ async fn reload_runtime(
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static AFTER_PRIVATE_READ: std::sync::Arc<dyn Fn() + Send + Sync>;
+    pub(crate) static BEFORE_BROKER_PREPARE: std::sync::Arc<dyn Fn() + Send + Sync>;
 }
 
 async fn private_inputs(
@@ -884,8 +948,13 @@ async fn private_inputs(
         },
         |(catalog, _, scheduled)| (catalog, scheduled),
     );
+    let (credentials, chatgpt) = credentials.map_or_else(
+        || (CredentialStore::empty(), Vec::new()),
+        |loaded| (loaded.store, loaded.chatgpt),
+    );
     Some(PrivateInputs {
-        credentials: credentials.map_or_else(CredentialStore::empty, |loaded| loaded.store),
+        credentials,
+        chatgpt,
         secrets: catalog,
         scheduled,
         fingerprint,
@@ -894,6 +963,7 @@ async fn private_inputs(
 
 struct PrivateInputs {
     credentials: CredentialStore,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     secrets: dekopon_broker::SecretCatalog,
     scheduled: secrets::ScheduledCatalog,
     fingerprint: PrivateFingerprint,
@@ -1061,6 +1131,7 @@ enum Secrets {
 
 struct Runtime {
     credentials: Credentials,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     secrets: Secrets,
     fingerprint: Option<PrivateFingerprint>,
     storage: Option<dekopon_storage_host::StorageHost>,
@@ -1071,6 +1142,7 @@ struct Ready {
     identity_digest: String,
     broker: Arc<Broker<TraceOnlyAuditLog>>,
     scheduled: secrets::ScheduledCatalog,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     identities: BTreeMap<u32, MappedPeer>,
     registry: BrokerProviderRegistry,
 }
@@ -1083,6 +1155,22 @@ impl Ready {
             "broker.policy.loaded"
         );
     }
+}
+
+fn validate_unmanaged_providers(
+    config: &ResolvedConfig,
+    resident_registry: Option<&BrokerProviderRegistry>,
+    uid: u32,
+) -> Result<(), BrokerdError> {
+    // Locked artifacts were checked at boot; a pruned old blob is not a new authority source.
+    let locked = match resident_registry {
+        Some(_) => config.locked_providers.as_ref().map_or(0, Vec::len),
+        None => 0,
+    };
+    for provider in config.providers.iter().skip(locked) {
+        socket::validate_owned_file(provider, uid)?;
+    }
+    Ok(())
 }
 
 /// Every problem found before the broker is built is returned together; the policy and the
@@ -1098,20 +1186,11 @@ async fn prepare(
     report: &mut CheckReport,
     resident_registry: Option<BrokerProviderRegistry>,
 ) -> Result<Ready, Vec<BrokerdError>> {
+    #[cfg(test)]
+    let _hook_ran = BEFORE_BROKER_PREPARE.try_with(|hook| hook()).is_ok();
     let warnings = &mut report.warnings;
-    let uid = current_uid();
-    // Locked artifacts were checked at boot; a pruned old blob is not a new authority source.
-    for provider in config
-        .providers
-        .iter()
-        .skip(if resident_registry.is_some() {
-            config.locked_providers.as_ref().map_or(0, Vec::len)
-        } else {
-            0
-        })
-    {
-        socket::validate_owned_file(provider, uid).map_err(|error| vec![error.into()])?;
-    }
+    validate_unmanaged_providers(&config, resident_registry.as_ref(), current_uid())
+        .map_err(|error| vec![error])?;
     let mut registry = if let Some(registry) = resident_registry {
         Ok(registry)
     } else {
@@ -1317,6 +1396,7 @@ async fn prepare(
         identity_digest: identity_digest.expect("a ready policy has an identity world"),
         broker: Arc::new(broker),
         scheduled: scheduled.unwrap_or_default(),
+        chatgpt: runtime.chatgpt,
         identities,
         registry: shared_registry,
     })

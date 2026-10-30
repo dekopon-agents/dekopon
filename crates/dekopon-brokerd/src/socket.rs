@@ -6,7 +6,7 @@ use std::{
 };
 
 use dekopon_broker_protocol::{ipc_socket_mode, secure_socket, secure_socket_parent};
-use dekopon_core::{AncestorPolicy, FileHygieneError, check_trusted_ancestors};
+use dekopon_core::{AncestorOwners, AncestorPolicy, FileHygieneError, check_trusted_ancestors};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -109,6 +109,7 @@ fn validate_ancestors(path: &Path) -> Result<(), SocketError> {
     let policy = AncestorPolicy {
         canonicalize: false,
         include_self: true,
+        owners: AncestorOwners::Any,
     };
     check_trusted_ancestors(path, policy).map_err(|error| match error {
         FileHygieneError::Io { path, source } => SocketError::Metadata { path, source },

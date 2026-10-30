@@ -137,7 +137,7 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 - No socket. It is runtime state on a writable volume. Audit needs no volume: it is a best-effort
   log record on the container's stdout, and an OTLP log record when `telemetry` is configured
   ([the broker audit record](observability.md#the-broker-audit-record)).
-- No system CA store dependency. `reqwest` and `ureq` use rustls with compiled-in webpki roots, so
+- No system CA store dependency. `reqwest` uses rustls with compiled-in webpki roots, so
   outbound TLS does not consult `/etc/ssl`. The broker's provider registry client also trusts the PEM
   file `DEKOPON_REGISTRY_CA_BUNDLE` names; the image does not set it.
 

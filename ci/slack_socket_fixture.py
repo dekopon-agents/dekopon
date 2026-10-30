@@ -27,6 +27,7 @@ class SlackSocketFixture:
         self.closing = threading.Event()
         self.connection = None
         self.connections = []
+        self.allowed_connections = 1
         self.handlers = []
         self._calls, self._replies, self._statuses, self._failures = [], [], [], []
         self._acks, self._sent = set(), set()
@@ -177,8 +178,8 @@ class SlackSocketFixture:
     def _socket(self, connection):
         with self.condition:
             self.handlers.append(threading.current_thread())
-            if self.connections:
-                self._fail("Unexpected repeated Slack socket")
+            if self.connection is not None or len(self.connections) >= self.allowed_connections:
+                self._fail("Unexpected concurrent or repeated Slack socket")
                 return
             self.connections.append(connection)
         try:
@@ -235,6 +236,10 @@ class SlackSocketFixture:
                     raise RuntimeError(f"Timed out waiting for Slack fixture {description}"
                                        + (f"; downstream failures: {downstream}" if downstream else ""))
                 self.condition.wait(remaining)
+
+    def expect_reconnect(self):
+        with self.condition:
+            self.allowed_connections += 1
 
     def wait_connected(self, timeout=15):
         return self._wait(lambda: self.connection, "connection", timeout)

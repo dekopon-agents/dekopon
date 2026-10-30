@@ -8,6 +8,58 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## --env-file and Wasmtime 49.0.5 (0.74.0)
+
+No configuration change is required. Both serving daemons accept an optional
+`--env-file PATH`: a private literal `KEY=VALUE` file loaded before serving, below
+options and inherited variables. Unsafe files, malformed lines, reserved keys and
+helper modes are refused without echoing values. See the gateway's
+[environment-file contract](gatewayd.md#environment-file). The Helm chart passes
+no `--env-file` option. A 0.73.0 daemon rejects the option; remove it from launch
+arguments before downgrading.
+
+OTLP CA certificate errors now name `OTEL_EXPORTER_OTLP_CERTIFICATE`, rather than
+the path it names.
+
+An unchanged broker reload poll no longer rebuilds the broker and policy. No
+operator action is required.
+
+Both Wasmtime builds move to 49.0.5 for RUSTSEC-2026-0422, RUSTSEC-2026-0423 and
+RUSTSEC-2026-0424; the memory-optimized overlay is pinned at `1d165f99`.
+
+Downgrading to 0.73.0 is revert-safe once `--env-file` is removed from launch
+arguments: there is no configuration, persisted-format or wire change. A downgrade
+reopens RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
+
+## PR subscriptions, space digests and rustix 1.1.6 (0.73.0)
+
+No configuration change is required. `sessions.wakes` gains two optional keys:
+`maxSubscriptionsPerAgent` (default 64) and `subscriptionExpiryMs` (default 14 days).
+Both must be greater than zero. A 0.72.0 gateway rejects these keys; remove them
+before downgrading.
+
+On a route with wakes, space grants and pull request links, a PR-link review turn's
+first successful GitHub COMMENT review subscribes its channel thread. A later
+`pull_request` `synchronize` delivery from a mapped repository fires a quiet
+re-review wake that runs as the space alone, without the reviewer's personal
+grants. Close, merge or expiry ends the subscription. The `wake` tool lists and
+cancels subscriptions from the channel.
+
+The `wake` tool's `digest` action registers one daily threaded digest per space.
+It runs as the space with a read-only probe trigger; unchanged or empty checks
+stay quiet. Newly created mapped-space schedule and watch wakes also run as the
+space alone. The `wake` tool's definition changes on every route with wakes, so
+that route's prompt cache goes cold once after the upgrade.
+
+rustix 1.1.6 is required. Production descriptor receives are unchanged; the new
+truncated-receive tests exercise Linux and macOS behavior.
+
+Downgrading to 0.72.0 is not revert-safe once a subscription or space-digest wake
+exists. Ordinary wake lines without `subscription` or `run_as` keep their 0.72.0
+shape. Lines carrying either field, including newly created mapped-space schedule
+and watch wakes, are refused by a 0.72.0 gateway. If any such line exists, remove
+the wakes file before downgrading, losing every pending wake.
+
 ## The wake_reason tool and GitHub review deliveries (0.72.0)
 
 No configuration change is required.

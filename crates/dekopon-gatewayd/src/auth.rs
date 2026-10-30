@@ -41,18 +41,16 @@ pub enum AuthError {
     Manifest(#[source] serde_yaml::Error),
 }
 
-pub(crate) fn execute(account: &AuthCommand) -> Result<CommandResult, AuthError> {
+pub(crate) async fn execute(account: &AuthCommand) -> Result<CommandResult, AuthError> {
     match account {
-        AuthCommand::ChatGpt { command } => execute_chatgpt(command),
+        AuthCommand::ChatGpt { command } => execute_chatgpt(command).await,
     }
 }
 
-fn execute_chatgpt(command: &ChatGptAuthCommand) -> Result<CommandResult, AuthError> {
+async fn execute_chatgpt(command: &ChatGptAuthCommand) -> Result<CommandResult, AuthError> {
     let status = match command {
         ChatGptAuthCommand::Login { auth_file } => {
-            let stderr = io::stderr();
-            let mut output = stderr.lock();
-            chatgpt::login_with_output(auth_file.as_deref(), &mut output)?;
+            chatgpt::login(auth_file.as_deref()).await?;
             chatgpt::status(auth_file.as_deref())?
         }
         ChatGptAuthCommand::Status { auth_file } => chatgpt::status(auth_file.as_deref())?,

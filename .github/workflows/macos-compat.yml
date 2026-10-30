@@ -2,19 +2,30 @@ name: macOS compatibility
 
 on:
   workflow_dispatch:
+    inputs:
+      daemons:
+        description: Released tap formula, or a release build of the dispatched checkout
+        type: choice
+        options: [tap, checkout]
+        default: tap
+      mode:
+        description: Start both daemons with --env-file, or the gateway through the legacy shell wrapper
+        type: choice
+        options: [env-file, legacy-wrapper]
+        default: env-file
 
 permissions:
   contents: read
 
 jobs:
   homebrew-smoke:
-    name: Homebrew ARM64 Slack, replay and user launchd
+    name: Homebrew ARM64 Slack, replay and user launchd (${{ inputs.daemons }}, ${{ inputs.mode }})
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       HOMEBREW_NO_ANALYTICS: "1"
-      DEKOPON_EXPECTED_VERSION: "0.72.0"
-      DEKOPON_TAP_COMMIT: f31c21d374938f2944dbeefcb17b89fddb546ca1
+      DEKOPON_EXPECTED_VERSION: "0.74.0"
+      DEKOPON_TAP_COMMIT: ad54c51917e50aeb59193940d12315775f6c05c6
     steps:
       - name: Check out the smoke helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -22,6 +33,7 @@ jobs:
           persist-credentials: false
 
       - name: Install the released native formula from the tap
+        if: inputs.daemons == 'tap'
         shell: bash
         run: |
           set -euo pipefail
@@ -29,6 +41,7 @@ jobs:
           test "$(uname -m)" = arm64
           brew update
           brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
+          printf 'DEKOPON_BIN_DIR=%s\n' "$(brew --prefix dekopon)/bin" >> "$GITHUB_ENV"
           prefix=$(brew --prefix dekopon)
           cassette_prefix=$(brew --prefix cassette)
           tap_commit=$(git -C "$(brew --repository dekopon-agents/tap)" rev-parse HEAD)
@@ -52,6 +65,33 @@ jobs:
             "$cassette_prefix/bin/cassette" --version
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Build both daemons from the checkout and install cassette from the tap
+        if: inputs.daemons == 'checkout'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          brew update
+          brew install dekopon-agents/tap/cassette
+          cargo build --release --locked -p dekopon-gatewayd -p dekopon-brokerd
+          version=$(target/release/dekopon-gatewayd --version | cut -d' ' -f2)
+          {
+            printf 'DEKOPON_BIN_DIR=%s\n' "$PWD/target/release"
+            printf 'DEKOPON_EXPECTED_VERSION=%s\n' "$version"
+          } >> "$GITHUB_ENV"
+          {
+            printf '### Source build\n\n'
+            printf 'Runner: %s, architecture: %s\n\n' "$RUNNER_OS" "$(uname -m)"
+            printf 'Commit: %s\n\n' "$(git rev-parse HEAD)"
+            for binary in dekopon-brokerd dekopon-gatewayd; do
+              file "target/release/$binary" | grep -Eq 'Mach-O 64-bit executable arm64'
+              "target/release/$binary" --version
+            done
+            test "$("$(brew --prefix cassette)/bin/cassette" --version)" = 'cassette 0.1.0'
+            "$(brew --prefix cassette)/bin/cassette" --version
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Fetch the pinned public provider components
         shell: bash
         run: |
@@ -73,11 +113,15 @@ jobs:
 
       - name: Exercise credential loading, Slack Agent, replay and user launchd
         shell: bash
+        env:
+          SMOKE_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/dekopon-compat-venv/bin/python" ci/macos-compat-smoke.py \
             --launchd \
-            --bin-dir "$(brew --prefix dekopon)/bin" \
+            "--$SMOKE_MODE" \
+            --expected-version "$DEKOPON_EXPECTED_VERSION" \
+            --bin-dir "$DEKOPON_BIN_DIR" \
             --provider "$RUNNER_TEMP/jsonplaceholder-provider.wasm" \
             --gh-provider "$RUNNER_TEMP/gh-provider.wasm" \
             --cassette-bin "$(brew --prefix cassette)/bin/cassette" \

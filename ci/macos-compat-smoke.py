@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from slack_socket_fixture import SlackSocketFixture
 
 
-VERSION = "0.72.0"
+VERSION = "0.74.0"
 PROVIDER_SHA256 = "64914f342a367129f69f857c78871e37c967dfb8eff8215c047899007e326462"
 GH_PROVIDER_SHA256 = "b2abb6a8a2dec689cb345b2b394b41a291d66196b2672a8fd86a014fe5cdee32"
 SUBJECT = "slack.t0123abc.u0123abc"
@@ -39,6 +39,9 @@ DIRECT_CHANNEL = "D0123ABC"
 REPLY = "Read-only provider call passed."
 PR_REPLY = "PR metadata read passed."
 HTTP_DENIED_REPLY = "The broker refused the out-of-scope HTTP request."
+LEGACY_WRAPPER = "legacy-wrapper"
+ENV_FILE = "env-file"
+SECRET_FILES = ("broker-credentials.yaml", "credentials.env", "gateway.env")
 
 
 def private_json(path, value):
@@ -65,6 +68,14 @@ def failure_text(error):
     return redacted(f"{error.__cause__}; {error}" if error.__cause__ else str(error))
 
 
+def assert_no_credentials_in_directory(root):
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink() and path.name not in SECRET_FILES:
+            data = path.read_bytes()
+            if any(secret.encode() in data for secret in SECRETS):
+                raise RuntimeError(f"Synthetic credential appeared in fixture file {path.relative_to(root)}")
+
+
 def command(args, env, check=True, timeout=15):
     result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=timeout)
     assert_no_credentials(result.stdout + result.stderr, f"{Path(args[0]).name} command output")
@@ -73,7 +84,7 @@ def command(args, env, check=True, timeout=15):
     return result
 
 
-def configure(root, port, gateway, slack_endpoint):
+def configure(root, port, gateway, slack_endpoint, mode):
     credentials = root / "broker-credentials.yaml"
     credentials.write_text(f"""apiVersion: dekopon.dev/broker-credentials/v1alpha1
 credentials:
@@ -84,22 +95,38 @@ credentials:
     secret: '{BROKER_PAT}'
 """, encoding="utf-8")
     credentials.chmod(0o600)
-    environment = root / "credentials.env"
-    environment.write_text(
-        f"export SMOKE_MODEL_KEY='{MODEL_KEY}'\n"
-        f"export DEKOPON_GATEWAYD_SLACK_APP_TOKEN='{SLACK_APP_TOKEN}'\n"
-        f"export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN='{SLACK_BOT_TOKEN}'\n", encoding="utf-8")
-    environment.chmod(0o600)
-    wrapper = root / "gateway-wrapper"
-    wrapper.write_text(f"""#!/bin/sh
+    private_files = [credentials]
+    if mode == LEGACY_WRAPPER:
+        environment = root / "credentials.env"
+        environment.write_text(
+            f"export SMOKE_MODEL_KEY='{MODEL_KEY}'\n"
+            f"export DEKOPON_GATEWAYD_SLACK_APP_TOKEN='{SLACK_APP_TOKEN}'\n"
+            f"export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN='{SLACK_BOT_TOKEN}'\n", encoding="utf-8")
+        environment.chmod(0o600)
+        wrapper = root / "gateway-wrapper"
+        wrapper.write_text(f"""#!/bin/sh
 set -eu
 umask 077
 . {shlex.quote(str(environment))}
 exec {shlex.quote(str(gateway))} --worker-threads 2 --blocking-threads 8 \\
   --config {shlex.quote(str(root / 'gateway.yaml'))}
 """, encoding="utf-8")
-    wrapper.chmod(0o700)
-    for path in (credentials, environment):
+        wrapper.chmod(0o700)
+        private_files.append(environment)
+    else:
+        gateway_env = root / "gateway.env"
+        gateway_env.write_text(
+            "# Literal values; nothing is expanded.\n"
+            f"SMOKE_MODEL_KEY={MODEL_KEY}\n"
+            f"export DEKOPON_GATEWAYD_SLACK_APP_TOKEN='{SLACK_APP_TOKEN}'\n"
+            f"DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=\"{SLACK_BOT_TOKEN}\"\n"
+            "DEKOPON_BLOCKING_THREADS=8\n", encoding="utf-8")
+        gateway_env.chmod(0o600)
+        broker_env = root / "broker.env"
+        broker_env.write_text("DEKOPON_BLOCKING_THREADS=8\nDEKOPON_CPU_THREADS=2\n", encoding="utf-8")
+        broker_env.chmod(0o600)
+        private_files += [gateway_env, broker_env]
+    for path in private_files:
         status = path.stat()
         if status.st_mode & 0o777 != 0o600 or status.st_nlink != 1 or status.st_uid != os.getuid():
             raise RuntimeError(f"Private credential file has unsafe ownership, mode or links: {path.name}")
@@ -376,8 +403,9 @@ def launchd_domain(env):
 
 
 class Daemon:
-    def __init__(self, name, args, root, env, domain):
+    def __init__(self, name, args, root, env, domain, direct=False):
         self.name, self.args, self.root, self.env, self.domain = name, args, root, env, domain
+        self.direct = direct
         self.process = None
         self.log = None
         self.target = None
@@ -388,23 +416,48 @@ class Daemon:
 
     def start(self):
         if self.domain is None:
-            self.log = self.path.open("wb")
+            self.log = self.path.open("ab")
             self.process = subprocess.Popen(self.args, cwd=self.root, env=self.env,
                                             stdout=self.log, stderr=subprocess.STDOUT)
             return
         label = f"dev.dekopon.compat.{self.root.name}.{self.name}"
         plist = self.root / f"{self.name}.plist"
-        plist.write_bytes(plistlib.dumps({
+        job = {
             "Label": label,
             "ProgramArguments": ["/usr/bin/env", "-i", *[f"{key}={value}" for key, value in self.env.items()], *self.args],
             "WorkingDirectory": str(self.root), "RunAtLoad": True, "ExitTimeOut": 15, "Umask": 63,
             "StandardOutPath": str(self.path), "StandardErrorPath": str(self.path),
-        }))
+        }
+        if self.direct:
+            job["ProgramArguments"] = list(self.args)
+            job["EnvironmentVariables"] = dict(self.env)
+        plist.write_bytes(plistlib.dumps(job))
         plist.chmod(0o600)
         command(["/usr/bin/plutil", "-lint", str(plist)], self.env)
         self.target = f"{self.domain}/{label}"
         print(f"Owned launchd job: {self.target}", flush=True)
         command(["/bin/launchctl", "bootstrap", self.domain, str(plist)], self.env)
+
+    def restart(self, socket_path):
+        if self.process is not None:
+            self.process.terminate()
+            if self.process.wait(timeout=15) != 0:
+                raise RuntimeError(f"{self.name} did not exit cleanly before restart: {self.process.returncode}")
+            self.log.close()
+            self.start()
+            wait_for_socket(socket_path, self)
+            return
+        old, _ = self.status()
+        command(["/bin/launchctl", "kickstart", "-k", self.target], self.env)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            pid, _ = self.status()
+            if pid is not None and pid != old:
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError(f"launchctl kickstart -k did not start a new process: {self.target}")
+        wait_for_socket(socket_path, self)
 
     def status(self):
         if self.process is not None:
@@ -602,7 +655,42 @@ def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished
     return thread
 
 
-def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd):
+def forced_failures(root, binaries, env):
+    for name, binary in binaries.items():
+        for contents, status in ((f"SMOKE_MODEL_KEY={MODEL_KEY} {SLACK_BOT_TOKEN}\n", 1),
+                                 (f"DEKOPON_BLOCKING_KEEP_ALIVE='{SLACK_APP_TOKEN}'\n", 2),
+                                 (f"OK=1\nBROKER_PAT='{BROKER_PAT}\n", 1)):
+            path = root / f"forced-{name}.env"
+            path.write_text(contents, encoding="utf-8")
+            path.chmod(0o600)
+            try:
+                result = command([str(binary), "--config", str(root / f"{name}.yaml"), "--env-file", str(path)],
+                                 env, check=False, timeout=30)
+            finally:
+                path.unlink()
+            if result.returncode != status:
+                raise RuntimeError(f"Forced {name} --env-file failure exited {result.returncode}, not {status}")
+            if (root / f"{name}.sock").exists():
+                raise RuntimeError(f"Forced {name} --env-file failure bound its socket")
+    print("Forced --env-file failures: malformed lines and an invalid tuning value refused without echoing values.", flush=True)
+
+
+def serves_again(root, requests):
+    before = list(requests)
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            reply = turn(root, UNMAPPED_SUBJECT, "Read post 7.", "after-restart")
+            break
+        except (ConnectionRefusedError, FileNotFoundError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+    if requests != before or not reply.get("reply") or reply["reply"] == REPLY:
+        raise RuntimeError("The restarted gateway did not serve the refusal turn without downstream calls")
+
+
+def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mode, expected_version):
     for source, filename, expected in ((provider, "provider.wasm", PROVIDER_SHA256),
                                        (gh_provider, "gh-provider.wasm", GH_PROVIDER_SHA256)):
         component = source.read_bytes()
@@ -615,7 +703,7 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd):
     binaries = {name: bin_dir / f"dekopon-{name}d" for name in ("broker", "gateway")}
     for binary in binaries.values():
         version = command([str(binary), "--version"], env, timeout=10).stdout.strip()
-        if version != f"{binary.name} {VERSION}":
+        if version != f"{binary.name} {expected_version}":
             raise RuntimeError(f"Unexpected installed version: {version}")
         print(f"Binary: {binary} ({version})", flush=True)
     if command([str(cassette_binary), "--version"], env).stdout.strip() != "cassette 0.1.0":
@@ -641,19 +729,24 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd):
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         http_started = True
-        configure(root, server.server_port, binaries["gateway"], slack.endpoint)
+        configure(root, server.server_port, binaries["gateway"], slack.endpoint, mode)
         for name, binary in binaries.items():
             command([str(binary), "check", str(root / f"{name}.yaml")],
                     {**env, "RUST_LOG": "warn"}, timeout=60)
+        if mode == ENV_FILE:
+            forced_failures(root, binaries, env)
         for name, binary in binaries.items():
-            if name == "broker":
+            if mode == ENV_FILE:
+                args = [str(binary), "--worker-threads", "2", "--config", str(root / f"{name}.yaml"),
+                        "--env-file", str(root / f"{name}.env")]
+            elif name == "broker":
                 args = [str(binary), "--worker-threads", "2", "--blocking-threads", "8",
                         "--cpu-threads", "2", "--config", str(root / "broker.yaml")]
-                daemon_env = {**env, "GITHUB_TOKEN": BROKER_GITHUB_TOKEN}
             else:
                 args = [str(root / "gateway-wrapper")]
-                daemon_env = {**env, "RUST_LOG": "info,dekopon_gatewayd::gateway=debug"}
-            daemon = Daemon(name, args, root, daemon_env, domain)
+            daemon_env = ({**env, "GITHUB_TOKEN": BROKER_GITHUB_TOKEN} if name == "broker"
+                          else {**env, "RUST_LOG": "info,dekopon_gatewayd::gateway=debug"})
+            daemon = Daemon(name, args, root, daemon_env, domain, direct=mode == ENV_FILE)
             daemons.append(daemon)
             daemon.start()
             wait_for_socket(root / f"{name}.sock", daemon)
@@ -675,6 +768,16 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd):
             raise RuntimeError("The positive and HTTP-denied turns did not select the intended tool arguments")
         stop_thread = slack_turns(root, slack, requests, stop_started, stop_release, stop_finished)
         slack.assert_clean()
+        if mode == ENV_FILE:
+            broker, gateway = daemons[1], daemons[2]
+            broker.restart(root / "broker.sock")
+            command([str(binaries["broker"]), "probe", "--socket", str(root / "broker.sock")], env, timeout=10)
+            slack.expect_reconnect()
+            gateway.restart(root / "gateway.sock")
+            slack.wait_connected()
+            serves_again(root, requests)
+            print("Restarted both --env-file daemons" + (" with launchctl kickstart -k" if domain else "")
+                  + "; the broker probe and a gateway turn succeeded again.", flush=True)
     except BaseException as error:
         failure = error
         raise
@@ -709,6 +812,7 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd):
         raise RuntimeError(f"Daemons did not shut down cleanly: {[d.returncode for d in daemons]}")
     for name in ("broker", "gateway", "cassette"):
         assert_no_credentials((root / f"{name}.log").read_text(), f"{name} daemon log")
+    assert_no_credentials_in_directory(root)
     executions = [json.loads(line) for line in (root / "broker.log").read_text().splitlines()]
     successes = [event for event in executions if event.get("audit.event") == "broker.execution"
                  and event.get("outcome") == "Succeeded"
@@ -744,10 +848,11 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd):
                   if event.get("event") == "gateway_session_rejected" and event.get("transport") == "local"}
     if rejections != {(UNMAPPED_SUBJECT, "unmapped-subject"), (DENIED_SUBJECT, "agent-denied")}:
         raise RuntimeError("Local refusals did not record exactly the unmapped and policy-denied gateway reasons")
-    print("PASS: private broker credential file kept ${GITHUB_TOKEN} literal; shell-sourced gateway environment, configuration checks and broker probe.")
+    print("PASS: private broker credential file kept ${GITHUB_TOKEN} literal; " + ("--env-file daemon environments with forced-failure scans and restart"
+          if mode == ENV_FILE else "shell-sourced gateway environment") + ", configuration checks and broker probe.")
     print("PASS: actual cassette replay served four credential-bound provider GETs; eleven model calls include one cancelled request.")
     print("PASS: out-of-scope HTTP request refused without reaching the provider fixture; credentials and their synthetic- prefix absent from checks, logs, model inputs, tool results and replies.")
-    print("PASS: real Slack Agent adapter acknowledged all envelopes on one connection; owner and colleague received threaded PR reads; the owner's unmentioned thread follow-up was answered; unmapped/denied senders and missing room grant made no downstream calls; the owner's direct message matched no channel-only route.")
+    print("PASS: real Slack Agent adapter acknowledged all envelopes on one connection per gateway process; owner and colleague received threaded PR reads; the owner's unmentioned thread follow-up was answered; unmapped/denied senders and missing room grant made no downstream calls; the owner's direct message matched no channel-only route.")
     print("PASS: processing status identified the initiator and active status omitted it; native Stop cancelled a held model request without provider work or a normal answer.")
     print("PASS: clean daemon shutdown" + (" and owned launchd jobs unloaded." if domain else "."))
     print("Scope: fixture concurrency 4, same-UID " + ("user launchd jobs" if domain else "foreground processes")
@@ -761,13 +866,21 @@ def main():
     parser.add_argument("--gh-provider", type=Path, required=True)
     parser.add_argument("--cassette-bin", type=Path, required=True)
     parser.add_argument("--launchd", action="store_true", help="Require an existing Darwin user launchd domain; never fall back to processes.")
+    parser.add_argument("--expected-version", default=VERSION, help="Daemon version both binaries must report.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--legacy-wrapper", dest="mode", action="store_const", const=LEGACY_WRAPPER,
+                       help="Start the gateway through a shell wrapper that sources credentials.env; releases before 0.74.0.")
+    modes.add_argument("--env-file", dest="mode", action="store_const", const=ENV_FILE,
+                       help="Start both daemons directly with --env-file, restart them and force refused files (default).")
+    parser.set_defaults(mode=ENV_FILE)
     args = parser.parse_args()
     # macOS TMPDIR paths can exceed sockaddr_un; resolve /tmp's symlink before protected-file checks.
     root = Path(tempfile.mkdtemp(prefix="deko-mac-", dir=Path("/tmp").resolve()))
     remove = False
     try:
         smoke(root, args.bin_dir.resolve(strict=True), args.provider.resolve(strict=True),
-              args.gh_provider.resolve(strict=True), args.cassette_bin.resolve(strict=True), args.launchd)
+              args.gh_provider.resolve(strict=True), args.cassette_bin.resolve(strict=True), args.launchd,
+              args.mode, args.expected_version)
         remove = True
     except Exception as error:
         raise SystemExit(failure_text(error)) from None

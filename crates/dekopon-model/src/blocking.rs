@@ -16,6 +16,10 @@ pub struct BlockingModel {
 }
 
 impl BlockingModel {
+    pub async fn drain_credentials(&self) {
+        self.client.drain_credentials().await;
+    }
+
     /// Supplies the session runtime and signal. Call `complete` only on a blocking task.
     #[must_use]
     pub fn new(

@@ -2,6 +2,8 @@
 //! readability alone is the threat; a failed rotation because of a read-only parent directory would
 //! leave the retired token on disk for reuse.
 
+use tracing::Instrument as _;
+
 use std::{
     collections::BTreeMap,
     num::NonZeroU64,
@@ -18,7 +20,7 @@ use dekopon_broker::{
 use dekopon_broker_host::BoundCredential;
 use dekopon_core::{FileHygieneError, FileTier, Redacted, error_chain, read_trusted_file};
 use dekopon_http_host::ConfigurationError;
-use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshOutcome};
+use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshClient, RefreshOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -122,6 +124,7 @@ pub(crate) async fn load(
 
 pub(crate) struct LoadedCredentials {
     pub(crate) store: CredentialStore,
+    pub(crate) chatgpt: Vec<Arc<CredentialFile>>,
     pub(crate) references: serde_yaml::Value,
     pub(crate) private_digest: [u8; 32],
 }
@@ -193,19 +196,21 @@ pub(crate) async fn load_with_bytes(
         path: path.to_path_buf(),
         diagnostic: "invalid document".to_owned(),
     })?;
-    let (resolved, private_digest) = tokio::task::spawn_blocking(move || {
-        resolve(parsed, expected_uid, &mut private_digest).map(|store| (store, private_digest))
+    tokio::task::spawn_blocking(move || {
+        let mut chatgpt = Vec::new();
+        let store = resolve(parsed, expected_uid, &mut private_digest, &mut chatgpt)?;
+        Ok(LoadedCredentials {
+            store,
+            chatgpt,
+            references,
+            private_digest: private_digest.finalize().into(),
+        })
     })
     .await
     .map_err(|join| CredentialsError::Read {
         path: path.to_path_buf(),
         source: std::io::Error::other(join),
-    })??;
-    Ok(LoadedCredentials {
-        store: resolved,
-        references,
-        private_digest: private_digest.finalize().into(),
-    })
+    })?
 }
 
 #[cfg(test)]
@@ -223,6 +228,7 @@ fn resolve(
     file: CredentialsFile,
     expected_uid: u32,
     private_digest: &mut Sha256,
+    chatgpt: &mut Vec<Arc<CredentialFile>>,
 ) -> Result<CredentialStore, CredentialsError> {
     if file.credentials.len() > HARD_MAX_CREDENTIALS {
         return Err(CredentialsError::TooMany {
@@ -251,7 +257,7 @@ fn resolve(
             problems.push(format!("credential {name:?} is declared more than once"));
             continue;
         }
-        match resolve_entry(entry, expected_uid, private_digest) {
+        match resolve_entry(entry, expected_uid, private_digest, chatgpt) {
             Ok(credential) => entries.push((name, credential)),
             Err(entry_problems) => problems.extend(entry_problems),
         }
@@ -266,6 +272,7 @@ fn resolve_entry(
     entry: CredentialEntry,
     expected_uid: u32,
     private_digest: &mut Sha256,
+    chatgpt: &mut Vec<Arc<CredentialFile>>,
 ) -> Result<StoredCredential, Vec<String>> {
     let name = entry.name;
     let kind = entry.kind;
@@ -339,13 +346,24 @@ fn resolve_entry(
                 problems.push(describe_structural(&name, &source));
             }
             match open_auth_file(&name, &auth_file, expected_uid) {
-                Ok(credential) if problems.is_empty() => Ok(StoredCredential::Refreshing(
-                    Arc::new(ChatGptSubscriptionCredential {
-                        name,
-                        credential: Arc::new(credential),
-                        destinations: entry.destinations,
-                    }),
-                )),
+                Ok(credential) if problems.is_empty() => {
+                    let credential = Arc::new(credential);
+                    chatgpt.push(Arc::clone(&credential));
+                    Ok(StoredCredential::Refreshing(Arc::new(
+                        ChatGptSubscriptionCredential {
+                            name,
+                            credential,
+                            refresh: RefreshClient::new(REFRESH_TIMEOUT, &[]).map_err(
+                                |source| {
+                                    vec![format!(
+                                        "could not build ChatGPT refresh client: {source}"
+                                    )]
+                                },
+                            )?,
+                            destinations: entry.destinations,
+                        },
+                    )))
+                }
                 Ok(_) => Err(problems),
                 Err(problem) => {
                     problems.push(problem);
@@ -526,7 +544,7 @@ fn open_auth_file(
             auth_file.display()
         ));
     }
-    let credential = CredentialFile::open(auth_file, REFRESH_TIMEOUT).map_err(|source| {
+    let credential = CredentialFile::open(auth_file).map_err(|source| {
         format!(
             "credential {name:?} authFile {} is not a Dekopon ChatGPT credential: {}",
             auth_file.display(),
@@ -563,6 +581,7 @@ fn parent_is_owner_writable(parent: &Path) -> bool {
 struct ChatGptSubscriptionCredential {
     name: String,
     credential: Arc<CredentialFile>,
+    refresh: RefreshClient,
     destinations: Vec<String>,
 }
 
@@ -589,31 +608,12 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
             outcome = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         );
-        let credential = Arc::clone(&self.credential);
-        let blocking_span = span.clone();
-        // This refresh runs on the blocking pool because dekopon-model's client blocks on a file
-        // lock and would stall the runtime worker inline.
-        let joined =
-            tokio::task::spawn_blocking(move || blocking_span.in_scope(|| credential.current()))
-                .await;
-        let resolved = match joined {
-            Ok(resolved) => resolved,
-            Err(source) => {
-                span.record("outcome", "failed");
-                span.record("otel.status_code", "error");
-                tracing::warn!(
-                    event = "broker_chatgpt_credential_refresh_failed",
-                    credential = %self.name,
-                    category = "refresh-task",
-                    error = %source,
-                    "broker.chatgpt.credential.refresh.failed"
-                );
-                return Err(CredentialRefreshError::Unavailable {
-                    category: "refresh-task",
-                });
-            }
-        };
-        let resolved = match resolved {
+        let resolved = match self
+            .credential
+            .current(&self.refresh)
+            .instrument(span.clone())
+            .await
+        {
             Ok(resolved) => resolved,
             Err(source) => {
                 span.record("outcome", "failed");
@@ -664,6 +664,7 @@ impl ChatGptSubscriptionCredential {
                     (false, "token-endpoint-rejected")
                 }
             }
+            ChatGptError::RefreshTask(_) => (false, "refresh-task"),
             ChatGptError::Request(_) => (false, "transport"),
             ChatGptError::Protocol(_) => (false, "token-endpoint-protocol"),
             _ => (true, "credential-unusable"),

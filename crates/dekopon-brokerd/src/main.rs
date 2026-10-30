@@ -51,6 +51,9 @@ struct Cli {
     /// Strict owner-controlled broker YAML/JSON configuration.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Private KEY=VALUE file loaded before serving; options and inherited variables win.
+    #[arg(long, value_name = "PATH")]
+    env_file: Option<PathBuf>,
     /// Maintenance or health-check mode. Omit to serve the broker.
     #[command(subcommand)]
     command: Option<Command>,
@@ -259,15 +262,33 @@ fn cpu_pool_builder(cli: &Cli) -> Result<rayon::ThreadPoolBuilder, clap::Error> 
 
 #[cfg(unix)]
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
+    };
     if let Err(error) = validate_cli(&cli) {
-        if let Err(print_error) = error.print() {
-            eprintln!("dekopon-brokerd: could not print command-line error: {print_error}");
-        }
-        return ExitCode::from(2);
+        return dekopon_core::render_cli_error(error, Cli::command());
     }
-    let mut builder = runtime_builder(&cli).unwrap_or_else(|error| error.exit());
-    let cpu_builder = cpu_pool_builder(&cli).unwrap_or_else(|error| error.exit());
+    if let Some(env_file) = &cli.env_file {
+        match &cli.command {
+            None => {}
+            Some(Command::Probe { .. } | Command::Provider(_) | Command::Check(_)) => {
+                eprintln!("dekopon-brokerd: --env-file is accepted only when serving");
+                return ExitCode::from(2);
+            }
+        }
+        let error = dekopon_core::env_file::reexec(env_file, rustix::process::geteuid().as_raw());
+        eprintln!("dekopon-brokerd: {}", error_chain(&error));
+        return ExitCode::FAILURE;
+    }
+    let mut builder = match runtime_builder(&cli) {
+        Ok(builder) => builder,
+        Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
+    };
+    let cpu_builder = match cpu_pool_builder(&cli) {
+        Ok(builder) => builder,
+        Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
+    };
     if let Err(error) = cpu_builder.build_global() {
         eprintln!("dekopon-brokerd: could not start the CPU pool: {error}");
         return ExitCode::FAILURE;

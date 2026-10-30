@@ -7,6 +7,51 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-10-30
+
+### Added
+
+- `--env-file PATH` on dekopon-gatewayd and dekopon-brokerd loads a private literal KEY=VALUE file before serving, below options and inherited variables, and refuses unsafe files, malformed lines, reserved keys and helper modes without echoing values.
+
+### Fixed
+
+- An unchanged broker reload poll no longer rebuilds the broker and policy every two seconds before answering that nothing changed.
+
+### Security
+
+- Wasmtime moves to 49.0.5 in both builds for RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
+
+## [dekopon-chart-0.61.0] - 2026-10-30
+
+### Changed
+
+- Chart 0.61.0 targets core v0.74.0 and renders the `v0.74.0` image tag.
+
+## [0.73.0] - 2026-10-30
+
+### Added
+
+- PR reviews can subscribe their channel thread to quiet re-review when new commits arrive.
+- Mapped channels can request a daily threaded digest that runs as the space and list or cancel channel wakes.
+- Provide a release-checked read-only Slack starter using the JSONPlaceholder provider.
+- Release-pinned Slack Agent review-channel setup with owner and colleague profiles and broker-held GitHub PAT instructions.
+- Manual ARM64 macOS Homebrew compatibility workflow exercising released daemons and a pinned provider with local fixtures.
+- Native Homebrew integration coverage for private credential loading, Slack Agent PR reads and Stop, cassette replay, authorization refusals and current-user launchd cleanup.
+
+### Changed
+
+- Document the native Mac Slack and OpenRouter operating path, including launchd and budget limits.
+- Use the public provider download URL in the local Mac compatibility instructions so the fixture needs no GitHub login.
+- Record the successful native ARM64 Homebrew compatibility run while retaining launchd and live-service acceptance limits.
+- Record the successful hosted Mac credential, Slack Agent, cassette replay and current-user launchd integration result.
+- Require rustix 1.1.6, which fixes truncated SCM_RIGHTS ancillary buffers (a panic on macOS), and test a truncated descriptor receive on Linux and macOS.
+
+## [dekopon-chart-0.60.0] - 2026-10-30
+
+### Changed
+
+- Chart 0.60.0 targets core v0.73.0 and renders the `v0.73.0` image tag.
+
 ## [0.72.0] - 2026-10-29
 
 ### Added

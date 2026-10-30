@@ -1,6 +1,6 @@
 # A Slack Agent for owner-and-colleague PR reviews
 
-This starter runs **Dekopon 0.72.0** with **GitHub provider 0.11.1** on the
+This starter runs **Dekopon 0.74.0** with **GitHub provider 0.11.1** on the
 [native Mac installation](../../docs/run-on-mac.md). One owner and one colleague can ask the
 agent to read GitHub pull requests, diffs, checks, and files in one Slack channel. Both start
 read-only: the agent explains findings and drafts review text in Slack. Neither can publish a
@@ -217,7 +217,7 @@ There are no write constraints or write permits in this default configuration.
 ## Gateway and Slack Agent setup
 
 Create the Slack app from the
-[released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml),
+[released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml),
 following the [Slack setup steps](../slack/README.md). The workspace plan and admin policy must
 support Slack's Agent experience. Install/reinstall the app after applying its bot scopes,
 generate an `xapp-…` app-level token with `connections:write`, obtain the installed `xoxb-…` bot
@@ -386,7 +386,7 @@ disabled if every submission needs an independent operator approval.
 
 ## Validate and accept
 
-These files pass `check` with the released Linux 0.72.0 daemons and the pinned 0.11.1 component;
+These files pass `check` with the released Linux 0.74.0 daemons and the pinned 0.11.1 component;
 that proves nothing about macOS services, Slack, the PAT or OpenRouter.
 
 Set the broker YAML, credentials, and Cedar files to owner `_dekopon_broker`, mode `0600`; set the

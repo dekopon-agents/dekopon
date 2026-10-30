@@ -5,7 +5,7 @@ use std::{
     fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    thread,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,14 +17,20 @@ use dekopon_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use ureq::Agent;
+use tokio::{
+    sync::{Semaphore, oneshot},
+    task::JoinSet,
+};
+use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
+use crate::http::InferenceHttp;
 use crate::model::{MAX_ERROR_BODY_BYTES, sanitize_diagnostic};
-use std::io::Read as _;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_BASE_URL: &str = "https://auth.openai.com";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const LOGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(10);
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 const AUTH_VERSION: u32 = 1;
@@ -63,9 +69,28 @@ pub struct ResolvedCredential {
     pub refresh: Option<RefreshOutcome>,
 }
 
+#[derive(Clone)]
+pub struct RefreshClient {
+    pub(crate) http: InferenceHttp,
+    timeout: Duration,
+}
+
+impl RefreshClient {
+    pub fn new(
+        timeout: Duration,
+        extra_ca_bundles: &[Redacted<String>],
+    ) -> Result<Self, crate::error::InferenceError> {
+        Ok(Self {
+            http: InferenceHttp::new(timeout, extra_ca_bundles)?,
+            timeout,
+        })
+    }
+}
+
 /// Do not duplicate refresh-and-persist; its primitives live in `dekopon_core::private_file` and a second sequence risks replaying a rotated token.
 pub struct CredentialFile {
-    agent: Agent,
+    admission: Arc<Semaphore>,
+    tasks: Mutex<JoinSet<()>>,
     path: PathBuf,
     credentials: Mutex<ChatGptCredentials>,
     endpoints: ChatGptEndpoints,
@@ -83,23 +108,18 @@ impl fmt::Debug for CredentialFile {
 }
 
 impl CredentialFile {
-    pub fn open(auth_path: &Path, timeout: Duration) -> Result<Self, ChatGptError> {
-        Self::with_endpoints(auth_path, timeout, ChatGptEndpoints::production())
+    pub fn open(auth_path: &Path) -> Result<Self, ChatGptError> {
+        Self::with_endpoints(auth_path, ChatGptEndpoints::production())
     }
 
     pub(crate) fn with_endpoints(
         auth_path: &Path,
-        timeout: Duration,
         endpoints: ChatGptEndpoints,
     ) -> Result<Self, ChatGptError> {
-        if timeout.is_zero() {
-            return Err(ChatGptError::Configuration(
-                "model timeout must be greater than zero".to_owned(),
-            ));
-        }
         let credentials = load_credentials(auth_path)?;
         Ok(Self {
-            agent: crate::agent(timeout),
+            admission: Arc::new(Semaphore::new(1)),
+            tasks: Mutex::new(JoinSet::new()),
             path: auth_path.to_path_buf(),
             credentials: Mutex::new(credentials),
             endpoints,
@@ -124,14 +144,11 @@ impl CredentialFile {
     /// Still returns Ok with the in-memory token as RotatedUnsaved when persisting fails after a
     /// refresh, since the provider already invalidated the old token and erroring would strand the
     /// only working credential.
-    pub fn current(&self) -> Result<ResolvedCredential, ChatGptError> {
-        let mut credentials = self.snapshot();
-        let refresh = self.refresh_if_needed(&mut credentials, None)?;
-        Ok(ResolvedCredential {
-            access: credentials.access.clone(),
-            account_id: credentials.account_id.clone(),
-            refresh,
-        })
+    pub async fn current(
+        self: &Arc<Self>,
+        client: &RefreshClient,
+    ) -> Result<ResolvedCredential, ChatGptError> {
+        self.refresh_if_needed(client, None).await
     }
 
     pub(crate) fn unrefreshed(&self) -> Result<ResolvedCredential, ChatGptError> {
@@ -148,17 +165,23 @@ impl CredentialFile {
         })
     }
 
-    pub fn force_refresh(
-        &self,
+    pub async fn force_refresh(
+        self: &Arc<Self>,
+        client: &RefreshClient,
         rejected: &Redacted<String>,
     ) -> Result<ResolvedCredential, ChatGptError> {
-        let mut credentials = self.snapshot();
-        let refresh = self.refresh_if_needed(&mut credentials, Some(rejected))?;
-        Ok(ResolvedCredential {
-            access: credentials.access,
-            account_id: credentials.account_id,
-            refresh,
-        })
+        self.refresh_if_needed(client, Some(rejected.clone())).await
+    }
+
+    pub async fn drain(&self) {
+        let mut tasks = {
+            let mut tasks = self.tasks.lock();
+            self.admission.close();
+            std::mem::take(&mut *tasks)
+        };
+        while let Some(result) = tasks.join_next().await {
+            observe_refresh_task(result);
+        }
     }
 
     /// The credential lock must not be held across a request; holding it while streaming would
@@ -174,16 +197,89 @@ impl CredentialFile {
         *stored = credentials.clone();
     }
 
-    /// The refresh token rotates and OAuth reuse detection can revoke the whole family if a retired
-    /// token is replayed, so processes serialize on a lock and the loser adopts the winner's write.
-    fn refresh_if_needed(
-        &self,
-        credentials: &mut ChatGptCredentials,
-        rejected: Option<&Redacted<String>>,
-    ) -> Result<Option<RefreshOutcome>, ChatGptError> {
-        if rejected.is_none() && !needs_refresh(credentials)? {
-            return Ok(None);
+    async fn refresh_if_needed(
+        self: &Arc<Self>,
+        client: &RefreshClient,
+        rejected: Option<Redacted<String>>,
+    ) -> Result<ResolvedCredential, ChatGptError> {
+        let credentials = self.snapshot();
+        if rejected.is_none() && !needs_refresh(&credentials)? {
+            return Ok(resolved(credentials, None));
         }
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?;
+        let permit = Arc::new(permit);
+        let lock = tokio::time::timeout(client.timeout, self.acquire_lock(&permit))
+            .await
+            .map_err(|source| {
+                ChatGptError::RefreshTask(io::Error::new(io::ErrorKind::TimedOut, source))
+            })??;
+        let (reply, wait) = oneshot::channel();
+        {
+            let mut tasks = self.tasks.lock();
+            if self.admission.is_closed() {
+                return Err(ChatGptError::RefreshTask(io::Error::other(
+                    "credential refresh owner shut down",
+                )));
+            }
+            while let Some(result) = tasks.try_join_next() {
+                observe_refresh_task(result);
+            }
+            let owner = Arc::clone(self);
+            let client = client.clone();
+            let span = tracing::Span::current();
+            tasks.spawn(
+                async move {
+                    let _permit = permit;
+                    let result = owner.refresh_locked(lock, client, rejected).await;
+                    let _waiter_dropped = reply.send(result);
+                }
+                .instrument(span)
+                .with_current_subscriber(),
+            );
+        }
+        wait.await
+            .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?
+    }
+
+    async fn acquire_lock(
+        &self,
+        permit: &Arc<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<PrivateFileLock, ChatGptError> {
+        loop {
+            if self.admission.is_closed() {
+                return Err(ChatGptError::RefreshTask(io::Error::other(
+                    "credential refresh owner shut down",
+                )));
+            }
+            let path = self.path.clone();
+            let permit = Arc::clone(permit);
+            let attempt = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                PrivateFileLock::try_acquire(&path)
+            })
+            .await
+            .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?
+            .map_err(|error| ChatGptError::LockAuth {
+                path: error.path,
+                source: error.source,
+            })?;
+            if let Some(lock) = attempt {
+                return Ok(lock);
+            }
+            tokio::time::sleep(LOCK_POLL).await;
+        }
+    }
+
+    /// The file lock spans HTTP and persistence because replaying a spent refresh token can revoke its family.
+    async fn refresh_locked(
+        self: &Arc<Self>,
+        lock: PrivateFileLock,
+        client: RefreshClient,
+        rejected: Option<Redacted<String>>,
+    ) -> Result<ResolvedCredential, ChatGptError> {
         let span = tracing::info_span!(
             "chatgpt.refresh",
             forced = rejected.is_some(),
@@ -192,88 +288,114 @@ impl CredentialFile {
             duration_ms = tracing::field::Empty,
             credential.expires_at = tracing::field::Empty,
         );
-        let _entered = span.enter();
         let started = Instant::now();
+        let result = async {
+            let _lock = lock;
+            let owner = Arc::clone(self);
+            let (mut credentials, adopted) = tokio::task::spawn_blocking(move || {
+                owner.adopt(rejected.as_ref())
+            }).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))??;
+            if adopted {
+                return Ok(resolved(credentials, Some(RefreshOutcome::Adopted)));
+            }
+            credentials = refresh_credentials(&client.http, client.timeout, &self.endpoints, &credentials).await?;
+            let owner = Arc::clone(self);
+            let save_span = tracing::Span::current();
+            let save_dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let (credentials, outcome) = tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&save_dispatch, || save_span.in_scope(|| {
+                let outcome = match save_credentials(&owner.path, &credentials) {
+                    Ok(()) => RefreshOutcome::Rotated,
+                    Err(error) => {
+                        tracing::error!(event = "chatgpt_credential_save_failed", path = %owner.path.display(), error = %error, "chatgpt.credential.save.failed");
+                        RefreshOutcome::RotatedUnsaved
+                    }
+                };
+                owner.install(&credentials);
+                (credentials, outcome)
+            }))).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?;
+            Ok(resolved(credentials, Some(outcome)))
+        }.instrument(span.clone()).await;
+        match &result {
+            Ok(resolved) => record_refresh(
+                &span,
+                resolved.refresh.map_or("current", RefreshOutcome::label),
+                started,
+                self.snapshot().expires_at,
+            ),
+            Err(_) => {
+                span.record("outcome", "failed");
+                span.record("otel.status_code", "error");
+                span.record("duration_ms", elapsed_ms(started));
+            }
+        }
+        result
+    }
 
-        let _lock =
-            PrivateFileLock::acquire(&self.path).map_err(|error| ChatGptError::LockAuth {
-                path: error.path,
-                source: error.source,
-            })?;
-        // Credentials are re-read right after taking the refresh lock because another process may
-        // have rotated them while this one waited.
-        *credentials = self.snapshot();
+    fn adopt(
+        &self,
+        rejected: Option<&Redacted<String>>,
+    ) -> Result<(ChatGptCredentials, bool), ChatGptError> {
+        let mut credentials = self.snapshot();
         let installed_replacement = rejected
             .is_some_and(|token| credentials.access.expose() != token.expose())
-            && !needs_refresh(credentials)?;
-        let adopted = !installed_replacement && adopt_stored_credentials(&self.path, credentials);
+            && !needs_refresh(&credentials)?;
+        let adopted =
+            !installed_replacement && adopt_stored_credentials(&self.path, &mut credentials);
         if let Some(rejected) = rejected
             && credentials.access.expose() == rejected.expose()
             && let Ok(stored) = load_credentials(&self.path)
             && stored.access.expose() != rejected.expose()
             && !needs_refresh(&stored)?
         {
-            *credentials = stored;
+            credentials = stored;
         }
         let replaced = rejected.is_none_or(|token| credentials.access.expose() != token.expose());
-        if (adopted || replaced) && !needs_refresh(credentials)? {
-            self.install(credentials);
-            record_refresh(
-                &span,
-                RefreshOutcome::Adopted.label(),
-                started,
-                credentials.expires_at,
-            );
-            return Ok(Some(RefreshOutcome::Adopted));
+        let adopted = (adopted || replaced) && !needs_refresh(&credentials)?;
+        if adopted {
+            self.install(&credentials);
         }
-
-        let refreshed = match refresh_credentials(&self.agent, &self.endpoints, credentials) {
-            Ok(refreshed) => refreshed,
-            Err(error) => {
-                span.record("outcome", "failed");
-                span.record("otel.status_code", "error");
-                span.record("duration_ms", elapsed_ms(started));
-                return Err(error);
-            }
-        };
-        *credentials = refreshed;
-        let outcome = match save_credentials(&self.path, credentials) {
-            Ok(()) => RefreshOutcome::Rotated,
-            Err(error) => {
-                tracing::error!(
-                    event = "chatgpt_credential_save_failed",
-                    path = %self.path.display(),
-                    error = %error,
-                    "chatgpt.credential.save.failed"
-                );
-                RefreshOutcome::RotatedUnsaved
-            }
-        };
-        self.install(credentials);
-        record_refresh(&span, outcome.label(), started, credentials.expires_at);
-        Ok(Some(outcome))
+        Ok((credentials, adopted))
     }
 }
 
-pub fn login(auth_path: Option<&Path>) -> Result<PathBuf, ChatGptError> {
-    login_with_output(auth_path, &mut io::stdout())
+fn resolved(
+    credentials: ChatGptCredentials,
+    refresh: Option<RefreshOutcome>,
+) -> ResolvedCredential {
+    ResolvedCredential {
+        access: credentials.access,
+        account_id: credentials.account_id,
+        refresh,
+    }
 }
 
-pub fn login_with_output(
+fn observe_refresh_task(result: Result<(), tokio::task::JoinError>) {
+    if let Err(source) = result {
+        tracing::error!(error = %source, "ChatGPT refresh task failed");
+    }
+}
+
+pub async fn login(auth_path: Option<&Path>) -> Result<PathBuf, ChatGptError> {
+    login_on_stderr(auth_path, ChatGptEndpoints::production()).await
+}
+
+async fn login_on_stderr(
     auth_path: Option<&Path>,
-    output: &mut dyn Write,
+    endpoints: ChatGptEndpoints,
 ) -> Result<PathBuf, ChatGptError> {
-    login_with_endpoints(auth_path, ChatGptEndpoints::production(), output)
+    let mut output = io::stderr();
+    login_with_endpoints(auth_path, endpoints, &mut output).await
 }
 
-fn login_with_endpoints(
+async fn login_with_endpoints(
     auth_path: Option<&Path>,
     endpoints: ChatGptEndpoints,
     output: &mut dyn Write,
 ) -> Result<PathBuf, ChatGptError> {
     let path = resolve_auth_path(auth_path)?;
-    let agent = crate::agent(Duration::from_secs(30));
-    let device = start_device_login(&agent, &endpoints)?;
+    let http = InferenceHttp::new(LOGIN_REQUEST_TIMEOUT, &[])
+        .map_err(|source| ChatGptError::Configuration(source.to_string()))?;
+    let device = start_device_login(&http, &endpoints).await?;
     writeln!(output, "Open {}", endpoints.verification_url)
         .and_then(|()| writeln!(output, "Enter code: {}", device.user_code))
         .and_then(|()| writeln!(output, "Waiting for ChatGPT authorization…"))
@@ -282,9 +404,12 @@ fn login_with_endpoints(
         .flush()
         .map_err(|source| ChatGptError::Output { source })?;
 
-    let authorization = poll_device_login(&agent, &endpoints, &device)?;
-    let credentials = exchange_authorization(&agent, &endpoints, &authorization)?;
-    save_credentials(&path, &credentials)?;
+    let authorization = poll_device_login(&http, &endpoints, &device).await?;
+    let credentials = exchange_authorization(&http, &endpoints, &authorization).await?;
+    let saved_path = path.clone();
+    tokio::task::spawn_blocking(move || save_credentials(&saved_path, &credentials))
+        .await
+        .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))??;
     Ok(path)
 }
 
@@ -447,25 +572,27 @@ struct ChatGptCredentials {
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn start_device_login(
-    agent: &Agent,
+async fn start_device_login(
+    http: &InferenceHttp,
     endpoints: &ChatGptEndpoints,
 ) -> Result<DeviceLogin, ChatGptError> {
-    let mut response = agent
+    let response = http
         .post(&endpoints.device_code)
-        .send_json(json!({"client_id": CLIENT_ID}))
+        .timeout(LOGIN_REQUEST_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(json!({"client_id": CLIENT_ID}).to_string())
+        .send()
+        .await
         .map_err(|error| ChatGptError::Request(error.to_string()))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        let detail = oauth_failure_detail(response);
+        let detail = oauth_failure_detail(response).await;
         return Err(ChatGptError::Login(format!(
             "device authorization returned HTTP {status}: {detail}"
         )));
     }
-    let response = response
-        .body_mut()
-        .read_json::<DeviceCodeResponse>()
-        .map_err(|error| ChatGptError::Protocol(error.to_string()))?;
+    let response: DeviceCodeResponse =
+        read_json(response, crate::diagnostic::DiagnosticSecrets::default()).await?;
     if response.device_auth_id.trim().is_empty() || response.user_code.trim().is_empty() {
         return Err(ChatGptError::Protocol(
             "device authorization response omitted required fields".to_owned(),
@@ -486,8 +613,8 @@ fn start_device_login(
     })
 }
 
-fn poll_device_login(
-    agent: &Agent,
+async fn poll_device_login(
+    http: &InferenceHttp,
     endpoints: &ChatGptEndpoints,
     device: &DeviceLogin,
 ) -> Result<DeviceAuthorization, ChatGptError> {
@@ -496,11 +623,21 @@ fn poll_device_login(
     let mut transport_failure: Option<String> = None;
     while started.elapsed() < DEVICE_LOGIN_TIMEOUT {
         let remaining = DEVICE_LOGIN_TIMEOUT.saturating_sub(started.elapsed());
-        thread::sleep(interval.min(remaining));
-        let response = match agent.post(&endpoints.device_token).send_json(json!({
-            "device_auth_id": device.device_auth_id,
-            "user_code": device.user_code,
-        })) {
+        tokio::time::sleep(interval.min(remaining)).await;
+        let response = match http
+            .post(&endpoints.device_token)
+            .timeout(LOGIN_REQUEST_TIMEOUT)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "device_auth_id": device.device_auth_id,
+                    "user_code": device.user_code,
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(
@@ -516,17 +653,14 @@ fn poll_device_login(
         transport_failure = None;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
-            let mut response = response;
-            let response = response
-                .body_mut()
-                .read_json::<DeviceAuthorizationResponse>()
-                .map_err(|error| ChatGptError::Protocol(error.to_string()))?;
+            let response: DeviceAuthorizationResponse =
+                read_json(response, crate::diagnostic::DiagnosticSecrets::default()).await?;
             return Ok(DeviceAuthorization {
                 code: Redacted::new(response.authorization_code),
                 verifier: Redacted::new(response.code_verifier),
             });
         }
-        let body = read_error_body(response, crate::diagnostic::DiagnosticSecrets::default());
+        let body = read_error_body(response, crate::diagnostic::DiagnosticSecrets::default()).await;
         let error_code = oauth_error_code(&body);
         if status == 403
             || status == 404
@@ -555,13 +689,14 @@ fn backed_off(interval: Duration) -> Duration {
         .min(Duration::from_secs(30))
 }
 
-fn exchange_authorization(
-    agent: &Agent,
+async fn exchange_authorization(
+    http: &InferenceHttp,
     endpoints: &ChatGptEndpoints,
     authorization: &DeviceAuthorization,
 ) -> Result<ChatGptCredentials, ChatGptError> {
     request_token(
-        agent,
+        http,
+        LOGIN_REQUEST_TIMEOUT,
         &endpoints.token,
         [
             ("grant_type", "authorization_code"),
@@ -573,15 +708,18 @@ fn exchange_authorization(
         crate::diagnostic::DiagnosticSecrets::new(Some(&authorization.code))
             .with_previous(&authorization.verifier),
     )
+    .await
 }
 
-fn refresh_credentials(
-    agent: &Agent,
+async fn refresh_credentials(
+    http: &InferenceHttp,
+    timeout: Duration,
     endpoints: &ChatGptEndpoints,
     credentials: &ChatGptCredentials,
 ) -> Result<ChatGptCredentials, ChatGptError> {
     request_token(
-        agent,
+        http,
+        timeout,
         &endpoints.token,
         [
             ("grant_type", "refresh_token"),
@@ -591,21 +729,26 @@ fn refresh_credentials(
         crate::diagnostic::DiagnosticSecrets::new(Some(&credentials.refresh))
             .with_previous(&credentials.access),
     )
+    .await
 }
 
-fn request_token<'a, const N: usize>(
-    agent: &Agent,
+async fn request_token<'a, const N: usize>(
+    http: &InferenceHttp,
+    timeout: Duration,
     endpoint: &str,
     form: [(&'a str, &'a str); N],
     secrets: crate::diagnostic::DiagnosticSecrets<'_>,
 ) -> Result<ChatGptCredentials, ChatGptError> {
-    let mut response = agent
+    let response = http
         .post(endpoint)
-        .send_form(form)
+        .timeout(timeout)
+        .form(form.as_slice())
+        .send()
+        .await
         .map_err(|error| ChatGptError::Request(secrets.sanitize(&error.to_string())))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        let body = read_error_body(response, secrets);
+        let body = read_error_body(response, secrets).await;
         let code = oauth_error_code(&body).map(|value| secrets.sanitize(&value));
         return Err(ChatGptError::TokenRefused {
             status,
@@ -613,10 +756,7 @@ fn request_token<'a, const N: usize>(
             code,
         });
     }
-    let token = response
-        .body_mut()
-        .read_json::<TokenResponse>()
-        .map_err(|error| ChatGptError::Protocol(secrets.sanitize(&error.to_string())))?;
+    let token: TokenResponse = read_json(response, secrets).await?;
     if token.access_token.expose().is_empty() || token.refresh_token.expose().is_empty() {
         return Err(ChatGptError::Protocol(
             "token response omitted required credentials".to_owned(),
@@ -652,18 +792,46 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .ok_or_else(|| ChatGptError::Protocol("access token omitted ChatGPT account ID".to_owned()))
 }
 
-fn read_error_body(
-    response: ureq::http::Response<ureq::Body>,
+async fn read_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    secrets: crate::diagnostic::DiagnosticSecrets<'_>,
+) -> Result<T, ChatGptError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|source| ChatGptError::Protocol(secrets.sanitize(&source.to_string())))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > crate::http::MAX_BUFFERED_BYTES {
+            return Err(ChatGptError::Protocol(
+                "authentication response is too large".to_owned(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|source| ChatGptError::Protocol(secrets.sanitize(&source.to_string())))
+}
+
+async fn read_error_body(
+    mut response: reqwest::Response,
     secrets: crate::diagnostic::DiagnosticSecrets<'_>,
 ) -> String {
     let mut bytes = Vec::new();
-    let read = response
-        .into_parts()
-        .1
-        .into_reader()
-        .take(MAX_ERROR_BODY_BYTES + 1)
-        .read_to_end(&mut bytes);
-    let text = if read.is_err() || bytes.len() > MAX_ERROR_BODY_BYTES as usize {
+    let truncated = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = (MAX_ERROR_BODY_BYTES as usize + 1).saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if bytes.len() > MAX_ERROR_BODY_BYTES as usize {
+                    break true;
+                }
+            }
+            Ok(None) => break false,
+            Err(_source) => break true,
+        }
+    };
+    let text = if truncated {
         secrets.sanitize_truncated(&bytes)
     } else {
         secrets.sanitize(&String::from_utf8_lossy(&bytes))
@@ -674,8 +842,8 @@ fn read_error_body(
     text
 }
 
-fn oauth_failure_detail(response: ureq::http::Response<ureq::Body>) -> String {
-    let body = read_error_body(response, crate::diagnostic::DiagnosticSecrets::default());
+async fn oauth_failure_detail(response: reqwest::Response) -> String {
+    let body = read_error_body(response, crate::diagnostic::DiagnosticSecrets::default()).await;
     let code = oauth_error_code(&body);
     oauth_detail(&body, code.as_deref())
 }
@@ -973,6 +1141,8 @@ pub enum ChatGptError {
         #[source]
         source: io::Error,
     },
+    #[error("ChatGPT credential refresh task failed")]
+    RefreshTask(#[source] io::Error),
     #[error("ChatGPT authentication request failed: {0}")]
     Request(String),
     #[error("invalid ChatGPT authentication response: {0}")]
@@ -994,11 +1164,12 @@ pub enum ChatGptError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io, path::Path, time::Duration};
+    use std::{fs, io, path::Path, sync::Arc, time::Duration};
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::{Value, json};
     use tempfile::TempDir;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     use crate::codex::{CodexClient, replay_transcript, request_body_json};
     use crate::{
@@ -1010,9 +1181,10 @@ mod tests {
 
     use super::{
         AUTH_VERSION, AuthPathEnvironment, ChatGptCredentials, ChatGptEndpoints, ChatGptError,
-        CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, RefreshOutcome,
-        credential_lock_path, export_credentials, exported_path, extract_account_id,
-        load_credentials, login_with_endpoints, logout, save_credentials, status,
+        CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, PrivateFileLock, RefreshClient,
+        RefreshOutcome, credential_lock_path, export_credentials, exported_path,
+        extract_account_id, load_credentials, login_with_endpoints, logout, save_credentials,
+        status,
     };
     use crate::{
         mock::{MockResponse, MockServer},
@@ -1919,7 +2091,100 @@ mod tests {
     }
 
     #[test]
-    fn device_login_exchanges_and_stores_credentials() {
+    fn login_persists_after_stale_cleanup_with_stderr_logging_without_deadlock() {
+        use std::{
+            process::{Command, Stdio},
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Instant,
+        };
+        const CHILD_ENDPOINT: &str = "DEKOPON_TEST_STDERR_LOGIN_ENDPOINT";
+        const CHILD_PATH: &str = "DEKOPON_TEST_STDERR_LOGIN_PATH";
+        if let Ok(endpoint) = std::env::var(CHILD_ENDPOINT) {
+            struct LoggedStderr(Arc<AtomicUsize>);
+            impl io::Write for LoggedStderr {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    io::Write::write(&mut io::stderr(), bytes)
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    io::Write::flush(&mut io::stderr())
+                }
+            }
+            let writes = Arc::new(AtomicUsize::new(0));
+            let logged = Arc::clone(&writes);
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || LoggedStderr(Arc::clone(&logged)))
+                .finish()
+                .try_init()
+                .unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let path = PathBuf::from(std::env::var_os(CHILD_PATH).unwrap());
+            runtime
+                .block_on(super::login_on_stderr(
+                    Some(&path),
+                    ChatGptEndpoints::local(&endpoint),
+                ))
+                .unwrap();
+            assert!(
+                writes.load(Ordering::SeqCst) > 0,
+                "the save worker must log through stderr"
+            );
+            return;
+        }
+        let server = MockServer::start(vec![
+            MockResponse::json(
+                json!({"device_auth_id": "device-1", "user_code": "CODE-1234", "interval": 0}),
+            ),
+            MockResponse::json(
+                json!({"authorization_code": "authorization-1", "code_verifier": "verifier-1"}),
+            ),
+            MockResponse::json(
+                json!({"access_token": fake_access("acct-login"), "refresh_token": "refresh-1", "expires_in": 3600}),
+            ),
+        ]);
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("auth.json");
+        let stale = path.with_extension("tmp-0");
+        fs::write(&stale, "abandoned synthetic credential").unwrap();
+        let endpoint = format!("{}/login-prefix", server.base_url());
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "chatgpt::tests::login_persists_after_stale_cleanup_with_stderr_logging_without_deadlock", "--nocapture"])
+            .env(CHILD_ENDPOINT, &endpoint).env(CHILD_PATH, &path)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let completed = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            completed,
+            "login deadlocked while its save worker logged to stderr"
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!stale.exists());
+        let saved = load_credentials(&path).unwrap();
+        assert_eq!(saved.account_id, "acct-login");
+        assert_eq!(saved.refresh.expose(), "refresh-1");
+        assert_eq!(
+            server.request_uris(),
+            ["device-code", "device-token", "token"].map(|part| format!("{endpoint}/{part}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn device_login_exchanges_and_stores_credentials() {
         let access = fake_access("acct-login");
         let server = MockServer::start(vec![
             MockResponse::json(json!({
@@ -1946,6 +2211,7 @@ mod tests {
             ChatGptEndpoints::local(&server.base_url()),
             &mut output,
         )
+        .await
         .expect("device login succeeds");
 
         let credentials = load_credentials(&path).expect("stored credentials");
@@ -1953,6 +2219,11 @@ mod tests {
         assert_eq!(credentials.refresh.expose(), "refresh-1");
         let output = String::from_utf8(output).expect("UTF-8 login output");
         assert!(output.contains("CODE-1234"));
+        assert_eq!(
+            server.request_uris(),
+            ["device-code", "device-token", "token"]
+                .map(|path| format!("{}/{path}", server.base_url()))
+        );
         let requests = server.requests.lock();
         assert!(requests[2].contains("grant_type=authorization_code"));
         assert!(requests[2].contains("code_verifier=verifier-1"));
@@ -2368,8 +2639,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_dropped_poll_does_not_abort_the_device_login() {
+    #[tokio::test]
+    async fn one_dropped_poll_does_not_abort_the_device_login() {
         let server = MockServer::start(vec![
             MockResponse::json(json!({
                 "device_auth_id": "device-1",
@@ -2396,6 +2667,7 @@ mod tests {
             ChatGptEndpoints::local(&server.base_url()),
             &mut output,
         )
+        .await
         .expect("a dropped poll must not end the login");
 
         assert_eq!(
@@ -2551,8 +2823,8 @@ mod tests {
         assert!(error.to_string().contains("could not parse"), "{error}");
     }
 
-    #[test]
-    fn a_rotated_credential_is_persisted_and_adopted_without_a_second_refresh() {
+    #[tokio::test]
+    async fn a_rotated_credential_is_persisted_and_adopted_without_a_second_refresh() {
         let server = MockServer::start(vec![MockResponse::json(json!({
             "access_token": fake_access("acct-rotated"),
             "refresh_token": "refresh-rotated",
@@ -2563,13 +2835,19 @@ mod tests {
         save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
             .expect("save credentials");
         let endpoints = ChatGptEndpoints::local(&server.base_url());
-        let first =
-            CredentialFile::with_endpoints(&path, Duration::from_secs(2), endpoints.clone())
-                .expect("first holder opens the credential");
-        let second = CredentialFile::with_endpoints(&path, Duration::from_secs(2), endpoints)
-            .expect("second holder opens the same credential");
+        let first = Arc::new(
+            CredentialFile::with_endpoints(&path, endpoints.clone())
+                .expect("first holder opens the credential"),
+        );
+        let second = Arc::new(
+            CredentialFile::with_endpoints(&path, endpoints)
+                .expect("second holder opens the same credential"),
+        );
 
-        let rotated = first.current().expect("the refresh succeeds");
+        let rotated = first
+            .current(&refresh_client())
+            .await
+            .expect("the refresh succeeds");
 
         assert_eq!(rotated.refresh, Some(RefreshOutcome::Rotated));
         assert_eq!(rotated.account_id, "acct-rotated");
@@ -2588,7 +2866,10 @@ mod tests {
             "no lock was taken around the refresh"
         );
 
-        let adopted = second.current().expect("the second holder adopts");
+        let adopted = second
+            .current(&refresh_client())
+            .await
+            .expect("the second holder adopts");
 
         assert_eq!(adopted.refresh, Some(RefreshOutcome::Adopted));
         assert_eq!(adopted.account_id, "acct-rotated");
@@ -2599,29 +2880,29 @@ mod tests {
         );
 
         let reused = second
-            .current()
+            .current(&refresh_client())
+            .await
             .expect("the adopted token is still current");
         assert_eq!(reused.refresh, None);
         assert_eq!(server.requests().len(), 1);
     }
 
-    #[test]
-    fn a_refresh_that_cannot_lock_fails_without_spending_the_refresh_token() {
+    #[tokio::test]
+    async fn a_refresh_that_cannot_lock_fails_without_spending_the_refresh_token() {
         let server = MockServer::start(Vec::new());
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
             .expect("save credentials");
         fs::create_dir(credential_lock_path(&path).expect("lock path")).expect("block the lock");
-        let credential = CredentialFile::with_endpoints(
-            &path,
-            Duration::from_secs(2),
-            ChatGptEndpoints::local(&server.base_url()),
-        )
-        .expect("the credential opens");
+        let credential = Arc::new(
+            CredentialFile::with_endpoints(&path, ChatGptEndpoints::local(&server.base_url()))
+                .expect("the credential opens"),
+        );
 
         let refused = credential
-            .current()
+            .current(&refresh_client())
+            .await
             .expect_err("an unlocked refresh is refused");
 
         assert!(
@@ -2635,8 +2916,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_rejected_refresh_grant_carries_the_oauth_code_as_a_field() {
+    #[tokio::test]
+    async fn a_rejected_refresh_grant_carries_the_oauth_code_as_a_field() {
         let refresh = "refresh-old-sentinel-7c1e";
         let access = fake_access("acct-old");
         let server = MockServer::start(vec![MockResponse::failure(
@@ -2650,15 +2931,14 @@ mod tests {
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-old", refresh, 0))
             .expect("save credentials");
-        let credential = CredentialFile::with_endpoints(
-            &path,
-            Duration::from_secs(2),
-            ChatGptEndpoints::local(&server.base_url()),
-        )
-        .expect("the credential opens");
+        let credential = Arc::new(
+            CredentialFile::with_endpoints(&path, ChatGptEndpoints::local(&server.base_url()))
+                .expect("the credential opens"),
+        );
 
         let refused = credential
-            .current()
+            .current(&refresh_client())
+            .await
             .expect_err("a rejected grant must not produce a token");
 
         let ChatGptError::TokenRefused {
@@ -2689,44 +2969,255 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_rotated_credential_is_returned_when_the_write_back_fails() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let server = MockServer::start(vec![MockResponse::json(json!({
-            "access_token": fake_access("acct-unsaved"),
-            "refresh_token": "refresh-unsaved",
-            "expires_in": 3600
-        }))]);
+    #[tokio::test]
+    async fn a_rotated_credential_is_returned_when_the_write_back_fails() {
+        let (response, accepted, release) = rotation_response().held_before_headers();
+        let server = MockServer::start(vec![response]);
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
-        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
-            .expect("save credentials");
-        let credential = CredentialFile::with_endpoints(
-            &path,
-            Duration::from_secs(2),
-            ChatGptEndpoints::local(&server.base_url()),
-        )
-        .expect("the credential opens");
-
-        fs::File::create(credential_lock_path(&path).expect("lock path")).expect("lock file");
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
-            .expect("make the credential directory unwritable");
-        let resolved = credential.current();
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
-            .expect("restore the credential directory");
-
-        let resolved = resolved.expect("an unsaved rotation still yields a usable token");
-        assert_eq!(resolved.refresh, Some(RefreshOutcome::RotatedUnsaved));
-        assert_eq!(resolved.account_id, "acct-unsaved");
+        let credential = refresh_fixture(&path, &server);
+        let waiter = tokio::spawn({
+            let credential = Arc::clone(&credential);
+            async move { credential.current(&refresh_client()).await }
+        });
+        accepted.await.unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        release.send(()).unwrap();
+        let rotated = waiter.await.unwrap().unwrap();
+        assert_eq!(rotated.refresh, Some(RefreshOutcome::RotatedUnsaved));
+        assert_eq!(rotated.access.expose(), &fake_access("acct-rotated"));
+        let adopted = credential
+            .force_refresh(&refresh_client(), &Redacted::new(fake_access("acct-old")))
+            .await
+            .unwrap();
+        assert_eq!(adopted.refresh, Some(RefreshOutcome::Adopted));
+        assert_eq!(adopted.access.expose(), rotated.access.expose());
+        credential.drain().await;
         assert_eq!(
-            load_credentials(&path)
-                .expect("stored credentials")
-                .refresh
-                .expose(),
-            "refresh-old",
-            "the write was supposed to have failed"
+            server.request_uris(),
+            [format!("{}/prefix/token", server.base_url())]
+        );
+    }
+
+    fn refresh_client() -> RefreshClient {
+        RefreshClient::new(Duration::from_secs(2), &[]).unwrap()
+    }
+
+    fn rotation_response() -> MockResponse {
+        MockResponse::json(json!({
+            "access_token": fake_access("acct-rotated"),
+            "refresh_token": "refresh-rotated",
+            "expires_in": 3600,
+        }))
+    }
+
+    fn refresh_fixture(path: &Path, server: &MockServer) -> Arc<CredentialFile> {
+        save_credentials(path, &credential_fixture("acct-old", "refresh-old", 0)).unwrap();
+        Arc::new(
+            CredentialFile::with_endpoints(
+                path,
+                ChatGptEndpoints::local(&format!("{}/prefix", server.base_url())),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn dropping_the_waiter_preserves_a_spent_rotation_for_another_holder() {
+        let (response, accepted, release) = rotation_response().held_before_headers();
+        let server = MockServer::start(vec![response]);
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("auth.json");
+        let first = refresh_fixture(&path, &server);
+        let second = Arc::new(
+            CredentialFile::with_endpoints(
+                &path,
+                ChatGptEndpoints::local(&format!("{}/prefix", server.base_url())),
+            )
+            .unwrap(),
+        );
+        let waiter = tokio::spawn({
+            let first = Arc::clone(&first);
+            async move { first.current(&refresh_client()).await }
+        });
+        accepted.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        first.drain().await;
+        assert_eq!(
+            load_credentials(&path).unwrap().refresh.expose(),
+            "refresh-rotated"
+        );
+        let adopted = second.current(&refresh_client()).await.unwrap();
+        assert_eq!(adopted.refresh, Some(RefreshOutcome::Adopted));
+        assert_eq!(adopted.access.expose(), &fake_access("acct-rotated"));
+        second.drain().await;
+        assert_eq!(
+            server.request_uris(),
+            [format!("{}/prefix/token", server.base_url())]
+        );
+    }
+
+    fn generated_refresh_issuer() -> (Redacted<String>, Arc<rustls::ServerConfig>) {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .signed_by(&key, &ca)
+            .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+        .unwrap();
+        (Redacted::new(ca.pem()), Arc::new(config))
+    }
+
+    #[tokio::test]
+    async fn refresh_generations_replace_and_remove_roots_while_in_flight_trust_is_preserved() {
+        let (root_a, server_a) = generated_refresh_issuer();
+        let (root_b, server_b) = generated_refresh_issuer();
+        let (response, accepted, release) = rotation_response().held_before_headers();
+        let server = MockServer::start_tls(vec![
+            (response, server_a),
+            (
+                MockResponse::json(
+                    json!({"access_token": fake_access("acct-replaced"), "refresh_token": "refresh-replaced", "expires_in": 3600}),
+                ),
+                Arc::clone(&server_b),
+            ),
+            (rotation_response(), Arc::clone(&server_b)),
+            (rotation_response(), server_b),
+        ]);
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("auth.json");
+        let credential = refresh_fixture(&path, &server);
+        let original = RefreshClient::new(Duration::from_secs(2), &[root_a]).unwrap();
+        let waiter = tokio::spawn({
+            let credential = Arc::clone(&credential);
+            let original = original.clone();
+            async move { credential.current(&original).await }
+        });
+        accepted.await.unwrap();
+        let replacement = RefreshClient::new(Duration::from_secs(2), &[root_b]).unwrap();
+        let removed = refresh_client();
+        release.send(()).unwrap();
+        let first = waiter.await.unwrap().unwrap();
+        assert_eq!(first.refresh, Some(RefreshOutcome::Rotated));
+        let second = credential
+            .force_refresh(&replacement, &first.access)
+            .await
+            .unwrap();
+        assert_eq!(second.refresh, Some(RefreshOutcome::Rotated));
+        assert_eq!(second.access.expose(), &fake_access("acct-replaced"));
+        assert!(matches!(
+            credential.force_refresh(&removed, &second.access).await,
+            Err(ChatGptError::Request(_))
+        ));
+        assert!(matches!(
+            credential.force_refresh(&original, &second.access).await,
+            Err(ChatGptError::Request(_))
+        ));
+        credential.drain().await;
+        assert_eq!(
+            load_credentials(&path).unwrap().refresh.expose(),
+            "refresh-replaced"
+        );
+        assert_eq!(
+            server.request_uris(),
+            vec![format!("{}/prefix/token", server.base_url()); 2]
+        );
+        assert_eq!(server.connections(), 4);
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_spend_one_refresh_token() {
+        let (response, accepted, release) = rotation_response().held_before_headers();
+        let server = MockServer::start(vec![response]);
+        let temp = TempDir::new().unwrap();
+        let credential = refresh_fixture(&temp.path().join("auth.json"), &server);
+        let first = tokio::spawn({
+            let credential = Arc::clone(&credential);
+            async move { credential.current(&refresh_client()).await }
+        });
+        accepted.await.unwrap();
+        let client = refresh_client();
+        let mut second = Box::pin(credential.current(&client));
+        assert!(futures_util::poll!(&mut second).is_pending());
+        release.send(()).unwrap();
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(first.refresh, Some(RefreshOutcome::Rotated));
+        assert_eq!(second.refresh, Some(RefreshOutcome::Adopted));
+        assert_eq!(first.access.expose(), second.access.expose());
+        credential.drain().await;
+        assert_eq!(
+            server.request_uris(),
+            [format!("{}/prefix/token", server.base_url())]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_lock_acquisition_leaves_no_refresh_task_or_request() {
+        let server = MockServer::start(vec![rotation_response()]);
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("auth.json");
+        let credential = refresh_fixture(&path, &server);
+        let lock = PrivateFileLock::acquire(&path).unwrap();
+        assert!(PrivateFileLock::try_acquire(&path).unwrap().is_none());
+        let client = refresh_client();
+        let mut waiter = Box::pin(credential.current(&client));
+        assert!(futures_util::poll!(&mut waiter).is_pending());
+        drop(waiter);
+        assert!(credential.tasks.lock().is_empty());
+        assert!(server.request_uris().is_empty());
+        drop(lock);
+        let rotated = credential.current(&refresh_client()).await.unwrap();
+        assert_eq!(rotated.refresh, Some(RefreshOutcome::Rotated));
+        credential.drain().await;
+        assert_eq!(
+            server.request_uris(),
+            [format!("{}/prefix/token", server.base_url())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_waiter_does_not_remove_the_response_body_deadline() {
+        let (response, accepted, release) = rotation_response().stalled_after(1);
+        let server = MockServer::start(vec![response]);
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("auth.json");
+        let credential = refresh_fixture(&path, &server);
+        let waiter = tokio::spawn({
+            let credential = Arc::clone(&credential);
+            async move { credential.current(&refresh_client()).await }
+        });
+        accepted.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        credential.drain().await;
+        release.send(()).unwrap();
+        assert!(credential.tasks.lock().is_empty());
+        assert_eq!(
+            load_credentials(&path).unwrap().refresh.expose(),
+            "refresh-old"
+        );
+        assert_eq!(
+            server.request_uris(),
+            [format!("{}/prefix/token", server.base_url())]
         );
     }
 
@@ -2736,12 +3227,9 @@ mod tests {
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-test", "refresh-secret", 0))
             .expect("save credentials");
-        let credential = CredentialFile::with_endpoints(
-            &path,
-            Duration::from_secs(2),
-            ChatGptEndpoints::local("http://127.0.0.1:9"),
-        )
-        .expect("the credential opens");
+        let credential =
+            CredentialFile::with_endpoints(&path, ChatGptEndpoints::local("http://127.0.0.1:9"))
+                .expect("the credential opens");
 
         let status = credential.status().expect("status reads the snapshot");
 
@@ -2755,9 +3243,8 @@ mod tests {
     #[test]
     fn a_missing_credential_file_refuses_to_open() {
         let temp = TempDir::new().expect("temporary directory");
-        let refused =
-            CredentialFile::open(&temp.path().join("absent.json"), Duration::from_secs(2))
-                .expect_err("an absent credential cannot be opened");
+        let refused = CredentialFile::open(&temp.path().join("absent.json"))
+            .expect_err("an absent credential cannot be opened");
 
         assert!(matches!(refused, ChatGptError::NotLoggedIn { .. }));
     }
