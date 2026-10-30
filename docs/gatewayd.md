@@ -7,8 +7,8 @@ It holds chat bot and model credentials: what it needs to hear a question and as
 **Status: Current.** A route is `persistent` unless configured otherwise; durable memory is a separate
 broker/agent opt-in and never turns that default into automatic replay. The chart enforces the
 [current local process boundary](security-model.md#current-local-process-boundary), and CI keeps
-broker, policy, host and console crates out of the gateway's dependency tree
-([dependency gates](development.md#runtime-facts-that-are-easy-to-miss)).
+the crates listed in its [dependency gates](development.md#runtime-facts-that-are-easy-to-miss) out
+of the gateway's dependency tree.
 
 [`../examples/conditional-write/`](../examples/conditional-write/README.md) is the complete worked
 deployment: a Slack DM from an owner-mapped sender, two narrow `http-probe` capabilities, a
@@ -35,7 +35,7 @@ transport kind or route match is a startup failure, not an ignored setting.
   document under the same file rules. The directory is owned by the daemon's UID and not group- or
   world-writable, unless it is a read-only Kubernetes projection. `transports`, `models` and
   `routes` concatenate; any other key set in two fragments, or fragments that disagree on
-  `apiVersion`, refuse startup naming the files. A route sits in the fragment that defines its
+  `apiVersion`, refuse startup; a key conflict names the files that set it. A route sits in the fragment that defines its
   transport, so renaming a file cannot reorder routes. A directory with no `*.yaml` is refused.
 
 ## Environment file
@@ -145,7 +145,7 @@ client and routing settings, capped at 16 output tokens and bounded by 30 second
   model. `--against` requires `--probe`. The baseline binds against its own `catalogPath`;
   `--catalog` applies only to the candidate.
 - Without `--against`, every model is probed. A baseline configuration or catalog that does not
-  load is a warning, and every model is then probed.
+  load or bind is a warning, and every model is then probed.
 - `chatgptSubscription` models are never probed, because reading the login can refresh and rotate
   it under the running gateway. Each changed one warns `not probed: subscription auth`; a changed
   `anthropic` model warns `not probed: proxy-only model` and a changed `openaiCompatible` model
@@ -355,7 +355,8 @@ down. A transport with liveness off or no active progress message still records 
 
 `sessions.memory` holds journal retention, the one gateway summary engine, and per-agent
 `agents.<agentId>` entries. An agent ID must name a routed agent, and its `retention` may only
-narrow the global limits. A persistent route may set the four knobs under `routes[].memory`; a
+narrow the global limits. A persistent route may set `hotTurns`, `summaries`, `capture` and `selection` under
+`routes[].memory`; a
 route's value replaces its agent's. Unknown keys refuse at load.
 
 | Key | Default | Rule |
@@ -535,11 +536,10 @@ refusals stated beside each key above:
 - an unknown Slack experience, indicator key or enum value;
 - with resolved `mode: native`, `indicators.stream` or `indicators.cancelButton` on
   `whatsappCloudApi`, which can neither edit a message nor carry an interactive component;
-  `indicators.stream` on Slack; `indicators.cancelButton` on Slack Agent; or `cancelButton` with
-  neither streaming nor a progress line;
+  `indicators.stream` on Slack; `indicators.cancelButton` on Slack Agent; `cancelButton` with
+  neither streaming nor a progress line; or `indicators.statusText: true` on anything except Slack
+  Agent, or alongside `progress: message`, including conversation and route overrides;
 - `reaction.working: on|auto` on WhatsApp, which cannot clear a working reaction;
-- resolved `indicators.statusText: true` on anything except Slack Agent, or alongside
-  `progress: message`, including conversation and route overrides;
 - an effective `indicators.keepAlive` with `everySeconds: 0` or an offset of `0`, which is a render
   loop rather than a keep-alive;
 - an `indicators.templates` line using a placeholder its field cannot render. `working` and

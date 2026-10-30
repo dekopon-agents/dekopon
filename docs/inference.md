@@ -96,7 +96,7 @@ Per backend:
   `stream` field to set — one that could be written but not honored would be worse than none.
 - `openrouter` always streams at `https://openrouter.ai/api/v1/chat/completions`; there is no
   configurable endpoint or stream switch. It always sends `X-OpenRouter-Cache: false` and never
-  sends `stream_options` or `usage.include`, which OpenRouter deprecated: usage, `cost` and
+  sends `stream_options`, `usage.include` or `reasoning.exclude`; OpenRouter deprecated the first two: usage, `cost` and
   `cost_details` arrive in the final chunk regardless. The prompt cache key travels as `session_id`.
 - `openaiCompatible` streams by default and takes `stream: false` for an endpoint that gets it
   wrong: a proxy that buffers the whole event stream, or a server that drops `usage` when asked to
