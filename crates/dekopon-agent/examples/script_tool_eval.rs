@@ -1009,49 +1009,53 @@ fn run() -> Result<u32, EvalError> {
         reason = "owner: this evaluation run, which drops it on return; bound: the example's one runtime"
     )]
     let runtime = tokio::runtime::Runtime::new().map_err(EvalError::Runtime)?;
-    let mut rows =
-        std::io::BufWriter::new(std::fs::File::create(&arguments.out).map_err(EvalError::Rows)?);
-    let mut failed = 0_u32;
-    for task in &tasks {
-        let system = match task.world {
-            World::Basic => &basic_system,
-            World::Orchard => &orchard_system,
-        };
-        for index in 0..arguments.repeat.get() {
-            let row = run_trial(
-                &runtime,
-                &client,
-                &Trial {
-                    task,
-                    index,
-                    system,
-                    history: &history,
-                    label: &arguments.label,
-                    model: &arguments.model,
-                    client: arguments.client,
-                    timeout: MODEL_TIMEOUT,
-                },
-            )?;
-            serde_json::to_writer(&mut rows, &row)
-                .map_err(|error| EvalError::Rows(error.into()))?;
-            rows.write_all(b"\n").map_err(EvalError::Rows)?;
-            rows.flush().map_err(EvalError::Rows)?;
-            println!(
-                "task={} trial={index} reward={} fatal={} turns={} scripts={} seconds={:.1}",
-                row.task,
-                row.reward,
-                row.fatal.unwrap_or("none"),
-                row.model_turns,
-                row.script_calls,
-                row.seconds,
-            );
-            if row.reward == 0 {
-                failed = failed.saturating_add(1);
+    let result = (|| {
+        let mut rows = std::io::BufWriter::new(
+            std::fs::File::create(&arguments.out).map_err(EvalError::Rows)?,
+        );
+        let mut failed = 0_u32;
+        for task in &tasks {
+            let system = match task.world {
+                World::Basic => &basic_system,
+                World::Orchard => &orchard_system,
+            };
+            for index in 0..arguments.repeat.get() {
+                let row = run_trial(
+                    &runtime,
+                    &client,
+                    &Trial {
+                        task,
+                        index,
+                        system,
+                        history: &history,
+                        label: &arguments.label,
+                        model: &arguments.model,
+                        client: arguments.client,
+                        timeout: MODEL_TIMEOUT,
+                    },
+                )?;
+                serde_json::to_writer(&mut rows, &row)
+                    .map_err(|error| EvalError::Rows(error.into()))?;
+                rows.write_all(b"\n").map_err(EvalError::Rows)?;
+                rows.flush().map_err(EvalError::Rows)?;
+                println!(
+                    "task={} trial={index} reward={} fatal={} turns={} scripts={} seconds={:.1}",
+                    row.task,
+                    row.reward,
+                    row.fatal.unwrap_or("none"),
+                    row.model_turns,
+                    row.script_calls,
+                    row.seconds,
+                );
+                if row.reward == 0 {
+                    failed = failed.saturating_add(1);
+                }
             }
         }
-    }
+        Ok(failed)
+    })();
     runtime.block_on(client.drain_credentials());
-    Ok(failed)
+    result
 }
 
 #[cfg(test)]
