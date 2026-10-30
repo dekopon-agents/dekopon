@@ -460,6 +460,14 @@ broker's bearer credential. The real Slack Agent adapter speaks Socket Mode to t
 [`slack_socket_fixture.py`](../ci/slack_socket_fixture.py), not
 [Fauxlack](gatewayd.md#fauxlack-tests-only) or a real workspace.
 
+**Released evidence.** `daemons: tap`, `mode: env-file` passed on `macos-15` ARM64 (macOS 15.8.2,
+Homebrew 7.0.11) at tap commit `ad54c51917e50aeb59193940d12315775f6c05c6`, with `dekopon`,
+`dekopon-brokerd` and `dekopon-gatewayd` all 0.74.0 from tag `v0.74.0`, dispatched from
+`9782c2fc335027f418f97502834ed6b846ddf410`
+([run 41092694914](https://github.com/dekopon-agents/dekopon/actions/runs/41092694914)); the
+`legacy-wrapper` run 41092717879 passed too. Only the released formula ran, with no checkout build.
+"It does not prove" below applies to it unchanged.
+
 **A green run proves:**
 
 - The broker's private `credentialsPath` YAML takes no environment substitution: a fake PAT's
