@@ -43,12 +43,12 @@ The defaults start only the broker, with no executable capabilities. A chat depl
 chat and model credentials. [ChatGPT credentials](#the-chatgpt-credential-is-seeded-once) and
 [managed provider sets](#the-managed-provider-set-comes-from-the-claim) need extra steps.
 
-From the registry, using **chart version `0.61.0`**, not application version `0.74.0`:
+From the registry, using **chart version `0.62.0`**, not application version `0.75.0`:
 
 ```console
-helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.61.0
+helm show chart oci://ghcr.io/dekopon-agents/charts/dekopon --version 0.62.0
 helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
-  --version 0.61.0 -n dekopon --create-namespace -f my-values.yaml
+  --version 0.62.0 -n dekopon --create-namespace -f my-values.yaml
 ```
 
 The Helm CLI takes the `oci://` prefix; an [Argo CD](#consuming-it-from-argocd) chart source does
@@ -634,7 +634,7 @@ running.
 The image workflow publishes under the Git tag, so an empty `image.tag` renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.74.0
+ghcr.io/dekopon-agents/dekopon:v0.75.0
 ```
 
 There is no `latest`. `image.digest`, empty by default, pins the `linux/amd64` + `linux/arm64`
@@ -687,7 +687,7 @@ spec:
   source:
     repoURL: ghcr.io/dekopon-agents/charts   # bare: no oci:// prefix on this source type
     chart: dekopon
-    targetRevision: 0.61.0                    # the CHART version, not appVersion
+    targetRevision: 0.62.0                    # the CHART version, not appVersion
     helm:
       valueFiles: []
       values: |
