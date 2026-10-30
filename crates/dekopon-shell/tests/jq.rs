@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dekopon_core::env_file::JQ_WORKER_MARKER;
 use dekopon_process::Limits;
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter};
 use serde_json::{Value, json};
@@ -319,7 +320,7 @@ fn the_interpreter_forwards_a_jq_result_while_the_producer_is_still_open() {
 fn worker_emits_the_first_document_before_stdin_ends() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dekopon-shell-jq-worker"))
         .env_clear()
-        .env("DEKOPON_SHELL_JQ_WORKER", "1")
+        .env(JQ_WORKER_MARKER, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -384,7 +385,7 @@ fn old_and_malformed_worker_headers_are_refused() {
     for header in ["[\".\",false]", "not json"] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dekopon-shell-jq-worker"))
             .env_clear()
-            .env("DEKOPON_SHELL_JQ_WORKER", "1")
+            .env(JQ_WORKER_MARKER, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -607,4 +608,80 @@ fn a_max_value_bytes_sized_input_passes() {
         .run(&format!("echo '{}' | jq length", json!(input)), &Invoker);
     assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
     assert_eq!(outcome.output, "30000");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_jq_worker_starts_with_an_empty_environment() {
+    const SYNTHETIC: &str = "DEKOPON_TEST_SYNTHETIC_PARENT_SECRET";
+
+    struct WorkerEnvironment {
+        observed: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl CapabilityInvoker for WorkerEnvironment {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            _: dekopon_shell::CommandProposal,
+            _streams: dekopon_shell::Streams,
+            _tree: &dekopon_process::TreeContext,
+        ) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+        fn note(&self, _: &str, _: Option<Duration>) {
+            let worker = std::path::Path::new(env!("CARGO_BIN_EXE_dekopon-shell-jq-worker"))
+                .canonicalize()
+                .unwrap();
+            let parent = std::process::id().to_string();
+            let found = std::fs::read_dir("/proc").unwrap().find_map(|entry| {
+                let process = entry.ok()?.path();
+                let stat = std::fs::read_to_string(process.join("stat")).ok()?;
+                let ppid = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?;
+                (ppid == parent && std::fs::read_link(process.join("exe")).ok()? == worker)
+                    .then(|| std::fs::read(process.join("environ")).ok())?
+            });
+            *self.observed.lock() = found;
+        }
+    }
+
+    if std::env::var_os(SYNTHETIC).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "a_jq_worker_starts_with_an_empty_environment"])
+            .env(SYNTHETIC, "synthetic-parent-value")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the child run with a synthetic parent value failed");
+        return;
+    }
+    let parent = std::fs::read("/proc/self/environ").unwrap();
+    assert!(
+        parent
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"DEKOPON_TEST_SYNTHETIC_PARENT_SECRET=synthetic-parent-value")
+    );
+    worker();
+    let invoker = WorkerEnvironment {
+        observed: Mutex::new(None),
+    };
+    let outcome = Interpreter::new(
+        Limits {
+            timeout: Duration::from_secs(3),
+            ..Limits::default()
+        },
+        shell_threads(),
+    )
+    .run(
+        "jq -n 'range(1000000000)' | { read first; progress \"$first\"; head -1; }",
+        &invoker,
+    );
+    assert_eq!(outcome.exit_code.get(), 0, "{outcome:?}");
+    let environ = invoker
+        .observed
+        .lock()
+        .take()
+        .expect("a running jq worker was found");
+    assert_eq!(environ, format!("{JQ_WORKER_MARKER}=1\0").into_bytes());
 }

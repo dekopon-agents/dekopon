@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::OnceLock,
     time::Duration,
 };
@@ -210,17 +210,12 @@ impl ExporterSettings {
 }
 
 fn read_ca_certificate(path: &Path) -> Result<Vec<u8>, TelemetryError> {
-    let pem = std::fs::read(path).map_err(|source| TelemetryError::CaCertificate {
-        path: path.to_owned(),
-        source,
-    })?;
+    let pem = std::fs::read(path)
+        .map_err(|error| TelemetryError::CaCertificateUnreadable { kind: error.kind() })?;
     if reqwest::Certificate::from_pem_bundle(&pem)
         .map_or(true, |certificates| certificates.is_empty())
     {
-        return Err(TelemetryError::Configuration(format!(
-            "{CA_CERTIFICATE_ENV} names {}, which holds no PEM certificate",
-            path.display()
-        )));
+        return Err(TelemetryError::CaCertificateNotPem);
     }
     Ok(pem)
 }
@@ -313,12 +308,10 @@ pub enum TelemetryError {
     NoRuntime,
     #[error("could not build OTLP HTTP client")]
     HttpClient(#[source] reqwest::Error),
-    #[error("could not read OTLP CA certificate {}", path.display())]
-    CaCertificate {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("could not read the file {CA_CERTIFICATE_ENV} names ({kind:?})")]
+    CaCertificateUnreadable { kind: std::io::ErrorKind },
+    #[error("the file {CA_CERTIFICATE_ENV} names holds no PEM certificate")]
+    CaCertificateNotPem,
     #[error("could not build OTLP {signal} exporter")]
     Exporter {
         signal: &'static str,
@@ -634,14 +627,16 @@ mod tests {
     fn a_ca_certificate_must_be_a_readable_pem() {
         assert!(matches!(
             read_ca_certificate(std::path::Path::new("/nonexistent/otlp-ca.pem")),
-            Err(TelemetryError::CaCertificate { .. })
+            Err(TelemetryError::CaCertificateUnreadable {
+                kind: std::io::ErrorKind::NotFound
+            })
         ));
         assert!(matches!(
             read_ca_certificate(std::path::Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/Cargo.toml"
             ))),
-            Err(TelemetryError::Configuration(_))
+            Err(TelemetryError::CaCertificateNotPem)
         ));
         assert!(read_ca_certificate(std::path::Path::new(PRIVATE_ROOT)).is_ok());
     }

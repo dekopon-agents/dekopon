@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use dekopon_core::{AncestorPolicy, FileHygieneError, check_trusted_ancestors};
+use dekopon_core::{AncestorOwners, AncestorPolicy, FileHygieneError, check_trusted_ancestors};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
@@ -628,6 +628,7 @@ fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
     let policy = AncestorPolicy {
         canonicalize: false,
         include_self: false,
+        owners: AncestorOwners::Any,
     };
     check_trusted_ancestors(path, policy).map_err(|error| match error {
         FileHygieneError::Io { path, source } => StorageHostError::RootIo { path, source },
