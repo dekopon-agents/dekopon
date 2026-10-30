@@ -3994,6 +3994,10 @@ async fn lock_only_replacement_keeps_reload_candidate_on_the_active_registry() {
         .await
         .unwrap();
     assert_ne!(current, loaded.digest);
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
     let (next, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let next = next.expect("lock-only change belongs to lock_watch, not reload refusal");
@@ -4039,6 +4043,10 @@ async fn reload_uses_active_managed_registry_without_the_lock_file() {
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.expect("managed boot candidate");
     fs::remove_file(broker.lock()).unwrap();
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
     let (next, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert!(next.is_some());
@@ -4059,6 +4067,10 @@ async fn reload_uses_active_managed_registry_without_pruned_old_blob() {
             .join(format!("{}.wasm", broker.component_digest)),
     )
     .unwrap();
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
     let (next, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert!(next.is_some());
