@@ -2,13 +2,17 @@
 
 Start with [`design.md`](design.md). It carries the [constitution](design.md#constitution) every other document must agree with, separates current behavior from committed direction, and records the invariants every change must preserve.
 
+Install on [Kubernetes](kubernetes.md), the preferred deployment, or on [a Mac](run-on-mac.md) if
+you are moving from OpenClaw or Hermes.
+
 ## Reading paths
 
 ### Install and run
 
+- [Run on Kubernetes](kubernetes.md): Helm and Argo CD installation, credentials and storage
 - [Run on a Mac](run-on-mac.md): native installation, Slack Agent/OpenRouter, broker PATs, launchd, budgets and recovery
-- [Slack Agent review channel](../examples/slack-github/README.md): owner/colleague GitHub profiles, read-only PR analysis and optional publishing
-- [Run on Kubernetes](kubernetes.md): Helm and ArgoCD installation, credentials, storage, and upgrades
+- [Slack Agent review channel](../examples/slack-github/README.md): owner and colleague read grants, read-only PR analysis and optional publishing
+- [Upgrade](upgrading.md): the current release's upgrade and rollback
 - [Operations](operations.md): startup refusals, audit, shutdown, and the detailed daemon contracts
 
 ### Understand the project
