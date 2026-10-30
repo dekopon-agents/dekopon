@@ -245,6 +245,28 @@ jobs:
       - name: Test broker-host component boundaries
         run: cargo test -p dekopon-broker-host --test host --all-features --locked
 
+  # Release archives ship aarch64-apple-darwin, whose kernel passes SCM_RIGHTS differently from Linux:
+  # run the one crate that owns recvmsg natively there.
+  macos_descriptors:
+    name: broker-protocol descriptors (macOS)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Restore macOS test dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: macos-descriptors-v1
+          cache-bin: "false"
+          save-if: "false"
+      - name: Test broker-protocol descriptor passing
+        run: cargo test -p dekopon-broker-protocol --all-features --locked
+
   # The RPi runs the Wasmtime-optimized ARM64 image, so pull requests test that flavor on that architecture.
   wasmtime_optimization:
     name: Wasmtime optimization
@@ -304,7 +326,7 @@ jobs:
   # lane this pull request did not select is skipped, so require each one only under its own gate.
   quality:
     name: quality (stable)
-    needs: [changes, quality_checks, test, arm64_components, docs]
+    needs: [changes, quality_checks, test, arm64_components, macos_descriptors, docs]
     if: ${{ always() && !cancelled() && (needs.changes.outputs.run_rust != 'false' || needs.changes.outputs.run_docs != 'false') }}
     runs-on: ubuntu-24.04
     steps:
@@ -316,6 +338,7 @@ jobs:
           CHECKS_RESULT: ${{ needs.quality_checks.result }}
           TESTS_RESULT: ${{ needs.test.result }}
           ARM64_RESULT: ${{ needs.arm64_components.result }}
+          MACOS_RESULT: ${{ needs.macos_descriptors.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
         run: |
           set -euo pipefail
@@ -323,6 +346,7 @@ jobs:
             test "$CHECKS_RESULT" = success
             test "$TESTS_RESULT" = success
             test "$ARM64_RESULT" = success
+            test "$MACOS_RESULT" = success
           fi
           if [ "$RUN_DOCS" != false ]; then
             test "$DOCS_RESULT" = success
