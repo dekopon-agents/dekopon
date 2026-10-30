@@ -436,42 +436,78 @@ therefore means adding it, backticked, to that document in the same change. Grep
 ### macOS Homebrew compatibility
 
 The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
-`macos-15` runner and installs `dekopon-agents/tap/dekopon` from the real Homebrew tap. It records
-the tap revision and installed binaries, requires the pinned daemon version and ARM64 Mach-O
-architecture, and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py). It does not build
-the checkout or substitute downloaded executables for the Homebrew installation.
+`macos-15` runner and installs Dekopon and `cassette` from the real Homebrew tap. It records the
+tap revision and installed binaries, requires the pinned versions and ARM64 Mach-O architecture,
+and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd`. It does not
+build the checkout or substitute downloaded executables for the Homebrew installation.
 
-The helper loads one checksum-pinned JSONPlaceholder component, checks minimal configuration,
-starts the real broker and gateway, and sends a local-transport turn with an explicit synthetic
-subject. A local model fixture proposes one provider read, and a local API fixture returns synthetic data. The
-check requires the tool result and final answer, verifies the observed request counts, and shuts
-down its processes and temporary files. Daemon subprocesses receive a small explicit environment
-with a synthetic model key; they do not inherit the runner's credentials.
+The helper loads checksum-pinned JSONPlaceholder and GitHub components. Actual
+[`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md) supplies authored
+synthetic HTTP responses; it makes no upstream requests. An HTTP fixture independently
+verifies the broker's synthetic bearer credential before forwarding only the request's Accept
+header to replay. Replay ignores Authorization and therefore cannot prove injection by itself.
+
+The real Slack Agent adapter connects to the bounded loopback HTTP/WebSocket fixture in
+[`slack_socket_fixture.py`](../ci/slack_socket_fixture.py). This exercises Socket Mode protocol,
+not the in-process [Fauxlack transport](gatewayd.md#fauxlack-tests-only) or a real Slack workspace.
+The fixture's WebSocket dependency is pinned by version, wheel URL and SHA-256 in
+[`macos-compat-requirements.txt`](../ci/macos-compat-requirements.txt).
+
+The test requires these observable results:
+
+- The gateway shell wrapper loads fake model/app/bot values from a private `credentials.env`;
+  the broker separately loads its literal private `credentialsPath` YAML. No daemon dotenv
+  feature or environment substitution is assumed.
+- Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
+  then produce threaded Slack replies. Unmapped and denied senders, and a mapped room without a
+  grant, produce no model or provider requests.
+- A local transport turn completes a provider read; an out-of-scope HTTP request is refused.
+- Working status identifies the initiating member and clears to active; native Stop cancels a held model
+  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged.
+- The four fake credentials are absent from checks, logs, model inputs, tool results and replies;
+  each endpoint receives only its expected credential. Exact call counts and broker execution
+  records identify the loaded provider artifacts.
+
+With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
+uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
+creates accounts or falls back silently to foreground execution. Each job clears inherited
+environment variables before starting its binary or wrapper. Cleanup removes private temporary
+files only after complete success; a failure retains them and reports their path for diagnosis.
 
 To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
 
 ```console
 brew tap dekopon-agents/tap
 brew trust dekopon-agents/tap
-brew install dekopon-agents/tap/dekopon
+brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
 fixture_dir="$(mktemp -d)"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
   https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/download/v0.7.0/jsonplaceholder-provider.wasm \
   --output "$fixture_dir/jsonplaceholder-provider.wasm"
-python3 ci/macos-compat-smoke.py --bin-dir "$(brew --prefix dekopon)/bin" \
-  --provider "$fixture_dir/jsonplaceholder-provider.wasm"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  https://github.com/dekopon-agents/dekopon-provider-gh/releases/download/v0.11.1/gh-provider.wasm \
+  --output "$fixture_dir/gh-provider.wasm"
+python3 -m venv "$fixture_dir/venv"
+"$fixture_dir/venv/bin/python" -m pip install --require-hashes --no-deps \
+  -r ci/macos-compat-requirements.txt
+"$fixture_dir/venv/bin/python" ci/macos-compat-smoke.py --launchd \
+  --bin-dir "$(brew --prefix dekopon)/bin" \
+  --provider "$fixture_dir/jsonplaceholder-provider.wasm" \
+  --gh-provider "$fixture_dir/gh-provider.wasm" \
+  --cassette-bin "$(brew --prefix cassette)/bin/cassette"
 ```
 
 The helper refuses a mismatched daemon version or component checksum. A tap update therefore
 needs an explicit compatibility review and pin update, not an automatic skip. Validate changes
-with `python3 -m py_compile ci/macos-compat-smoke.py` and
+with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
 `actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
 
-This is a same-UID read-only process smoke, not the production credential boundary. It does not
-exercise Slack Agent APIs, OpenRouter billing, GitHub credentials, launchd, Gatekeeper, sleep,
-logout or reboot. No administrator account setup or live API secrets are required. It is separate
-from required PR checks: [manual dispatch](run-on-mac.md#manual-homebrew-compatibility-check)
-works only after GitHub registers the workflow on the default branch.
+Omitting `--launchd` runs the same fixtures with foreground processes, including on Linux. That
+does not establish launchd coverage. Both modes use one UID and synthetic services: they do not
+prove production UID isolation, system LaunchDaemons, Gatekeeper, sleep/logout/reboot recovery,
+Slack plan entitlements, real GitHub permissions or OpenRouter billing. No administrator account
+setup or live API secrets are required. The lane is separate from required PR checks; use
+[manual dispatch](run-on-mac.md#manual-homebrew-compatibility-check) for hosted Mac evidence.
 
 ### OpenObserve OTLP end-to-end test
 

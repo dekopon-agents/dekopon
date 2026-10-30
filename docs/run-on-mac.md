@@ -99,12 +99,19 @@ still required, and the Homebrew prefix must not be writable by either daemon ac
 ### Manual Homebrew compatibility check
 
 The [macOS compatibility workflow](../.github/workflows/macos-compat.yml) installs the real tap
-on GitHub's ARM64 `macos-15` runner. It checks the installed release and Mach-O architecture,
-then runs a minimal provider-backed turn with the installed broker and gateway, a pinned
-JSONPlaceholder component, and loopback model/API fixtures. It uses no Slack, OpenRouter or
-GitHub PAT credentials and does not build replacement daemon binaries.
+on GitHub's ARM64 `macos-15` runner. It checks the installed versions and Mach-O architecture,
+then runs the real broker and gateway as temporary jobs in an existing user launchd domain.
+The gateway's private shell file supplies fake model and Slack tokens; the broker's separate
+private credentials YAML supplies a fake PAT. Actual `cassette` replay serves synthetic provider
+responses, and a local Socket Mode fixture drives the released Slack Agent adapter.
 
-The [2026-10-30 hosted run](https://github.com/dekopon-agents/dekopon/actions/runs/40996222822)
+The check requires owner/colleague PR reads and threaded replies, sender and room denials,
+native Working/Stop, secret-free logs and responses, and clean job removal. It uses no live
+Slack, OpenRouter or GitHub credentials and does not build replacement daemon binaries. See the
+[development instructions](development.md#macos-homebrew-compatibility) for exact coverage,
+fixture pins and a local command.
+
+The initial [2026-10-30 process-only hosted run](https://github.com/dekopon-agents/dekopon/actions/runs/40996222822)
 passed on macOS 15.8.2 / ARM64: the tap installed Dekopon 0.72.0, both configuration checks and
 the broker probe passed, and the turn completed with two model-fixture requests, one authorized
 provider GET, the expected reply and clean daemon shutdown. This verifies the Homebrew process
@@ -119,10 +126,10 @@ gh run list --repo dekopon-agents/dekopon --workflow macos-compat.yml --event wo
 
 GitHub requires the workflow to be on the default branch before dispatch; selecting a draft
 branch with `--ref` does not register a new workflow. This lane is manual, not a required PR
-check. Its one-user, read-only process smoke does not prove separate-user permissions, launchd,
+check. Its current-user launchd jobs do not prove separate-user permissions, system LaunchDaemons,
 sleep/logout/reboot recovery, Gatekeeper behavior or live integrations. Complete those checks
-below even after a green run. The [development instructions](development.md#macos-homebrew-compatibility)
-also explain how to run the same fixture locally.
+below even after a green run. The fixture is a small Slack protocol server, not the in-process
+Fauxlack test transport or a real workspace installation.
 
 ### From a checkout
 
