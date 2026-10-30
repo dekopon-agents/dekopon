@@ -2,6 +2,8 @@
 
 Dekopon is an extensible runtime for self-hosted AI agents. Providers are WebAssembly components; the model proposes, a separate broker authorizes and executes; and provider credentials can never reach the model. The three goals that decide what belongs here are the [constitution](docs/design.md#constitution).
 
+Install on [Kubernetes](docs/kubernetes.md), the preferred deployment, or on [a Mac](docs/run-on-mac.md) if you are moving from OpenClaw or Hermes.
+
 > **Status:** pre-1.0 and in active production use. The one known production deployment is the maintainer's Raspberry Pi homelab: Kubernetes on a home fiber connection, serving Discord, Slack, and WhatsApp. This is not a general production-readiness guarantee. Both daemons are Unix-only. `dekopon-brokerd` maps configured peer UIDs to trusted context under the [current local process boundary](docs/security-model.md#current-local-process-boundary); `dekopon-gatewayd` holds chat and model credentials and no broker authority.
 
 ## Install
@@ -11,15 +13,15 @@ Dekopon is an extensible runtime for self-hosted AI agents. Providers are WebAss
 - **Mac, for people moving from OpenClaw or Hermes:** [Run Dekopon on a Mac](docs/run-on-mac.md)
   covers native installation, Slack Agent setup, the
   [GitHub review channel](examples/slack-github/README.md), broker-held PATs, spending limits,
-  launchd and recovery.
+  launchd, upgrade and recovery.
 
 [Upgrade](docs/upgrading.md) both daemons together from one release.
 
 The [Homebrew tap](https://github.com/dekopon-agents/homebrew-tap) and
 [release archives](https://github.com/dekopon-agents/dekopon/releases) also support Linux on ARM64
 and x86-64. See the [native installation methods](docs/run-on-mac.md#install) for the daemon pair;
-select the Linux archive for your architecture. The archives contain no provider components. Both daemons are Unix-only and must come from the
-same release. [Container image details](docs/container-image.md) cover image contents, provenance,
+select the Linux archive for your architecture. The archives contain no provider components.
+[Container image details](docs/container-image.md) cover image contents, provenance,
 and local image builds; [development](docs/development.md) covers building and checking a checkout.
 
 ## Design documentation
