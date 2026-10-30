@@ -104,7 +104,13 @@ then runs a minimal provider-backed turn with the installed broker and gateway, 
 JSONPlaceholder component, and loopback model/API fixtures. It uses no Slack, OpenRouter or
 GitHub PAT credentials and does not build replacement daemon binaries.
 
-Once that workflow exists on the repository's default branch, a maintainer can run it manually:
+The [2026-10-30 hosted run](https://github.com/dekopon-agents/dekopon/actions/runs/40996222822)
+passed on macOS 15.8.2 / ARM64: the tap installed Dekopon 0.72.0, both configuration checks and
+the broker probe passed, and the turn completed with two model-fixture requests, one authorized
+provider GET, the expected reply and clean daemon shutdown. This verifies the Homebrew process
+path at that release; it does not replace the service and live-integration acceptance checks below.
+
+A maintainer can run the registered workflow manually from the default branch:
 
 ```console
 gh workflow run macos-compat.yml --repo dekopon-agents/dekopon --ref main
