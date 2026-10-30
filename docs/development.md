@@ -442,7 +442,7 @@ binaries, and requires the pinned versions and ARM64 Mach-O architecture; `daemo
 instead builds both daemons from the dispatched commit in release mode, which is candidate
 evidence, not a released installation. It runs
 [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd` and the `mode` input:
-`legacy-wrapper` (the default, and the only mode a release before 0.73.0 supports) or `env-file`.
+`legacy-wrapper` (the default, and the only mode a release before 0.74.0 supports) or `env-file`.
 It never substitutes downloaded executables for the Homebrew installation.
 
 The helper loads checksum-pinned JSONPlaceholder and GitHub components. Actual

@@ -25,7 +25,7 @@ The configuration file must be a regular non-symlink file owned by the daemon's 
 
 ## Environment file
 
-Added in 0.73.0. Both serving daemons accept `--env-file PATH`, a private file of variables
+Added in 0.74.0. Both serving daemons accept `--env-file PATH`, a private file of variables
 loaded before serving; [`dekopon-brokerd`](../crates/dekopon-brokerd/README.md#environment-file)
 reads it the same way.
 
