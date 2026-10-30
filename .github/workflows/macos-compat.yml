@@ -14,7 +14,7 @@ jobs:
     env:
       HOMEBREW_NO_ANALYTICS: "1"
       DEKOPON_EXPECTED_VERSION: "0.72.0"
-      DEKOPON_TAP_COMMIT: cdc0e83e0294d12bbcdc258e21acd92ee37f2b9d
+      DEKOPON_TAP_COMMIT: f31c21d374938f2944dbeefcb17b89fddb546ca1
     steps:
       - name: Check out the smoke helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
