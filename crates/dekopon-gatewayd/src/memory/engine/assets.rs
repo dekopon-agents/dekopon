@@ -25,7 +25,7 @@ impl Sender {
                 let key = (stem.to_owned(), header.id, asset.number);
                 {
                     let mut in_flight = self.in_flight.lock();
-                    if in_flight.contains(&key) {
+                    if *self.cancel.borrow() || in_flight.contains(&key) {
                         continue;
                     }
                     if in_flight.len() >= self.asset_limit {
@@ -59,6 +59,21 @@ impl Sender {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn wait_assets(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let joined = self.counts.joined.notified();
+                if self.in_flight.lock().is_empty() {
+                    break;
+                }
+                joined.await;
+            }
+        })
+        .await
+        .expect("asset tasks joined");
+    }
+
     pub(super) fn release(&self, task: &SlotTask) {
         match task.subject {
             Subject::Record => {}
@@ -68,6 +83,8 @@ impl Sender {
                     .remove(&(task.stem.clone(), task.record, number));
             }
         }
+        #[cfg(test)]
+        self.counts.joined.notify_one();
     }
 }
 
@@ -86,7 +103,7 @@ pub(super) fn load_input(
     resources: &Resources,
     task: &SlotTask,
     head: &Head,
-) -> Result<Option<SummaryInput>, ()> {
+) -> Result<Option<SummaryInput>, crate::asset::NotReadable> {
     let number = match task.subject {
         Subject::Record => return Ok(None),
         Subject::Asset(number) => number,
@@ -96,7 +113,7 @@ pub(super) fn load_input(
         .arrived
         .iter()
         .find(|asset| asset.number == number)
-        .ok_or(())?;
+        .ok_or(crate::asset::NotReadable::NotResident)?;
     tracing::Span::current().record("asset.kind", kind_label(asset.kind));
     let result = task
         .access
@@ -110,7 +127,7 @@ pub(super) fn load_input(
         }
         Err(refusal) => {
             tracing::Span::current().record("asset.read", refusal.label());
-            Err(())
+            Err(refusal)
         }
     }
 }
@@ -130,9 +147,11 @@ pub(super) fn complete(
     task: &SlotTask,
     input: SummaryInput,
     previous: &[Slot],
-    limit: NonZeroU32,
-    max_input: NonZeroU32,
+    plan: &super::super::record::SummaryPlan,
 ) -> Completed {
+    let Some(limit) = plan.parts.get(usize::from(task.part.get() - 1)).copied() else {
+        return Completed::Cancelled;
+    };
     let number = match task.subject {
         Subject::Record => return Completed::Cancelled,
         Subject::Asset(number) => number,
@@ -180,7 +199,7 @@ pub(super) fn complete(
             )
         }
         SummaryInput::Text(mut text) => {
-            text.truncate(text.floor_char_boundary(max_input.get() as usize));
+            text.truncate(text.floor_char_boundary(plan.max_input_bytes.get() as usize));
             let bytes = text.len();
             let message = ModelMessage::user(text);
             (message.clone(), bytes, 0, message)

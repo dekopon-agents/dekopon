@@ -80,6 +80,10 @@ pub(crate) struct Counts {
     pub evicted: AtomicU64,
     pub asset_enqueued: AtomicU64,
     pub asset_deferred: AtomicU64,
+    #[cfg(test)]
+    pub(crate) joined: tokio::sync::Notify,
+    #[cfg(test)]
+    panic_before_walk: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -89,7 +93,7 @@ pub(crate) struct Sender {
     journal: Arc<Journal>,
     pub counts: Arc<Counts>,
     assets: Arc<AssetStore>,
-    in_flight: Arc<parking_lot::Mutex<HashSet<(String, RecordId, AssetNumber)>>>,
+    in_flight: AssetReservations,
     asset_limit: usize,
 }
 
@@ -112,10 +116,12 @@ enum Stage {
     PanicWrite,
 }
 
-struct CancelOnDrop(watch::Sender<bool>);
+type AssetReservations = Arc<parking_lot::Mutex<HashSet<(String, RecordId, AssetNumber)>>>;
+struct CancelOnDrop(watch::Sender<bool>, AssetReservations);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.send_replace(true);
+        self.1.lock().clear();
     }
 }
 
@@ -256,7 +262,7 @@ async fn dispatch(
     sender: Sender,
     concurrency: NonZeroUsize,
 ) {
-    let cancel = CancelOnDrop(sender.cancel.clone());
+    let cancel = CancelOnDrop(sender.cancel.clone(), Arc::clone(&sender.in_flight));
     let mut stopped = cancel.0.subscribe();
     let mut running = JoinSet::new();
     let mut tasks: HashMap<Id, RunningTask> = HashMap::new();
@@ -394,45 +400,26 @@ fn summarize(
     cancel: watch::Receiver<bool>,
     binding: &Binding,
 ) -> Next {
+    #[cfg(test)]
+    assert!(
+        !resources
+            .counts
+            .panic_before_walk
+            .swap(false, Ordering::Relaxed),
+        "forced stale task panic before walk"
+    );
     let journal = &resources.journal;
-    let loaded = journal.record_lookup(&task.stem, task.record);
-    let (snapshot, position) = match loaded {
-        Ok(Some(snapshot)) => match snapshot
-            .records
-            .iter()
-            .position(|head| head.header.id == task.record)
-        {
-            Some(position) => (snapshot, position),
-            None => return evicted(resources, task),
-        },
-        Ok(None) => return evicted(resources, task),
-        Err(error) => {
-            match task.subject {
-                Subject::Record => {}
-                Subject::Asset(_) => {
-                    tracing::warn!(
-                        event = "gateway_memory_summary_refused",
-                        reason = error.label(),
-                        "asset summary header unavailable"
-                    );
-                    return Next::Stop;
-                }
-            }
-            return fail(
-                resources,
-                task,
-                None,
-                &Slot::Queued,
-                error_slot(io_failure(error), "could not read summary input"),
-                task.part
-                    .get()
-                    .checked_add(1)
-                    .and_then(NonZeroU8::new)
-                    .map_or(Next::Stop, Next::Continue),
-            );
-        }
+    let snapshot = match load(resources, task) {
+        Ok(snapshot) => snapshot,
+        Err(next) => return next,
     };
-    let head = &snapshot.records[position];
+    let Some(head) = snapshot
+        .records
+        .iter()
+        .find(|head| head.header.id == task.record)
+    else {
+        return evicted(resources, task);
+    };
     let expected = Some(head.header.turn);
     *binding.lock() = expected;
     let part = usize::from(task.part.get() - 1);
@@ -459,7 +446,7 @@ fn summarize(
     let next = next_pending(&slots, part + 1);
     let asset_input = match assets::load_input(resources, task, head) {
         Ok(input) => input,
-        Err(()) => return Next::Stop,
+        Err(_refusal) => return Next::Stop,
     };
     match write_slot(journal, task, &Slot::Queued, Slot::Running, expected) {
         Ok(true) => {}
@@ -486,9 +473,12 @@ fn summarize(
         );
         return Next::Stop;
     };
-    if matches!(&asset_input, Some(crate::asset::SummaryInput::Image { .. }))
-        && !model.accepts_images()
-    {
+    let image = match &asset_input {
+        Some(crate::asset::SummaryInput::Image { .. }) => true,
+        Some(crate::asset::SummaryInput::Text(_) | crate::asset::SummaryInput::Binary { .. })
+        | None => false,
+    };
+    if image && !model.accepts_images() {
         let _written = mark_later(
             journal,
             task,
@@ -534,15 +524,7 @@ fn summarize(
         via: Via::Summary,
     };
     let completed = match asset_input {
-        Some(input) => assets::complete(
-            client.as_ref(),
-            call,
-            task,
-            input,
-            &slots[..part],
-            *limit,
-            plan.max_input_bytes,
-        ),
+        Some(input) => assets::complete(client.as_ref(), call, task, input, &slots[..part], plan),
         None => {
             let input = match input(&snapshot, head, plan.max_input_bytes.get() as usize) {
                 Ok(input) => input,
@@ -560,6 +542,51 @@ fn summarize(
             complete_summary(client.as_ref(), call, input, previous, task.part, *limit)
         }
     };
+    finish(resources, task, completed, expected, next)
+}
+
+fn load(resources: &Resources, task: &SlotTask) -> Result<Snapshot, Next> {
+    let journal = &resources.journal;
+    let loaded = journal.record_lookup(&task.stem, task.record);
+    match loaded {
+        Ok(Some(snapshot)) => Ok(snapshot),
+        Ok(None) => Err(evicted(resources, task)),
+        Err(error) => {
+            match task.subject {
+                Subject::Record => {}
+                Subject::Asset(_) => {
+                    tracing::warn!(
+                        event = "gateway_memory_summary_refused",
+                        reason = error.label(),
+                        "asset summary header unavailable"
+                    );
+                    return Err(Next::Stop);
+                }
+            }
+            Err(fail(
+                resources,
+                task,
+                None,
+                &Slot::Queued,
+                error_slot(io_failure(error), "could not read summary input"),
+                task.part
+                    .get()
+                    .checked_add(1)
+                    .and_then(NonZeroU8::new)
+                    .map_or(Next::Stop, Next::Continue),
+            ))
+        }
+    }
+}
+
+fn finish(
+    resources: &Resources,
+    task: &SlotTask,
+    completed: Completed,
+    expected: Option<TurnId>,
+    next: Next,
+) -> Next {
+    let journal = &resources.journal;
     let slot = match completed {
         Completed::Slot(slot) => slot,
         Completed::Cancelled => return Next::Stop,

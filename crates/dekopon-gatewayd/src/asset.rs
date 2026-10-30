@@ -1648,6 +1648,7 @@ pub(crate) enum SummaryInput {
     Binary { mime: String, blob: DiskBlob },
 }
 
+#[derive(Debug)]
 pub(crate) enum NotReadable {
     Revoked,
     NotResident,
@@ -1873,7 +1874,12 @@ impl AssetStore {
             })
     }
     #[cfg(test)]
-    fn admit(&self, access: &AssetAccess, id: u64, bytes: &[u8]) -> Result<DiskBlob, BlobError> {
+    pub(crate) fn admit(
+        &self,
+        access: &AssetAccess,
+        id: u64,
+        bytes: &[u8],
+    ) -> Result<DiskBlob, BlobError> {
         access
             .with_active(|key| {
                 let mut entries = self.entries.lock();
@@ -2116,7 +2122,7 @@ mod note_tests;
 mod resolve_tests;
 
 #[cfg(test)]
-mod retention_tests {
+pub(crate) mod retention_tests {
     use super::*;
 
     fn inventory_rows(session: &SessionAssets) -> Vec<AssetRow> {
@@ -2176,7 +2182,13 @@ mod retention_tests {
     fn residents(store: &AssetStore) -> usize {
         store.retention.lock().resident_files()
     }
-    fn reclaim(store: &AssetStore, access: &AssetAccess, id: u64) {
+    pub(crate) async fn hold_downloads(store: &AssetStore) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&store.downloads.permits)
+            .acquire_many_owned(MAX_CONCURRENT_DOWNLOADS as u32)
+            .await
+            .unwrap()
+    }
+    pub(crate) fn reclaim(store: &AssetStore, access: &AssetAccess, id: u64) {
         let mut entries = store.entries.lock();
         let row = row_mut(&mut entries, &access.key, id).unwrap();
         store
@@ -2185,7 +2197,7 @@ mod retention_tests {
             .evict((access.key.clone(), id), row)
             .unwrap();
     }
-    fn store(budget: usize) -> Arc<AssetStore> {
+    pub(crate) fn store(budget: usize) -> Arc<AssetStore> {
         Arc::new(AssetStore::with_retention(
             8,
             Duration::from_secs(600),
@@ -2648,7 +2660,7 @@ mod retention_tests {
         .unwrap();
     }
 
-    fn durable_window() -> crate::config::MemoryWindow {
+    pub(crate) fn durable_window() -> crate::config::MemoryWindow {
         crate::config::MemoryWindow {
             scope: crate::config::MemoryScope::PrivateConversation,
             idle_timeout: Duration::from_secs(3600),
@@ -3838,7 +3850,12 @@ mod retention_tests {
         assert!(!text.contains("dekopon-assets-") && !text.contains("base64"));
     }
 
-    struct Fetcher(std::sync::atomic::AtomicUsize);
+    #[derive(Default)]
+    pub(crate) struct Fetcher {
+        pub calls: std::sync::atomic::AtomicUsize,
+        pub bytes: std::sync::atomic::AtomicUsize,
+        pub gone: std::sync::atomic::AtomicBool,
+    }
     impl AssetFetcher for Fetcher {
         fn fetch(
             &self,
@@ -3846,8 +3863,14 @@ mod retention_tests {
             _: u64,
         ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, crate::transport::TransportError>>
         {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Ok(b"aaa".to_vec()) })
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                if self.gone.load(Ordering::Relaxed) {
+                    return Err(crate::transport::TransportError::Service { code: "404".into() });
+                }
+                self.bytes.fetch_add(3, Ordering::Relaxed);
+                Ok(b"aaa".to_vec())
+            })
         }
     }
     #[tokio::test(flavor = "multi_thread")]
@@ -3881,7 +3904,7 @@ mod retention_tests {
         assert!(note.contains("input-0.png (image/png, size unknown)"));
         assert!(note.contains("input-1.png (image/png, 0 B)"));
         assert!(note.contains("input-2.png (image/png, 2 KB)"));
-        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher = Arc::new(Fetcher::default());
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
@@ -3896,7 +3919,7 @@ mod retention_tests {
                 .collect::<Vec<_>>(),
             [None, Some(0), Some(2048)]
         );
-        assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 0);
         tokio::task::spawn_blocking(move || {
             let id = registered.arrived[0];
             let blob = input(&session, id).unwrap();
@@ -3909,7 +3932,7 @@ mod retention_tests {
                 Err(BlobError::Reclaimed)
             );
             assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
             let empty_id = registered.arrived[1];
             let empty = store.admit(&access, empty_id, b"").unwrap();
             assert_eq!(empty.len(), 0);
@@ -3921,7 +3944,7 @@ mod retention_tests {
                 Err(BlobError::Reclaimed)
             );
             assert_eq!(inventory_rows(&session)[1].bytes, Some(0));
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
         })
         .await
         .unwrap();
@@ -3946,7 +3969,7 @@ mod retention_tests {
                     Instant::now(),
                 )
                 .arrived[0];
-            let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+            let fetcher = Arc::new(Fetcher::default());
             let session = SessionAssets::new(
                 Arc::clone(&store),
                 access,
@@ -3957,14 +3980,14 @@ mod retention_tests {
             tokio::task::spawn_blocking(move || {
                 let first = session.fetch(id).unwrap_err();
                 assert!(first.contains("store-failed"), "{first}");
-                assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
                 let second = session.fetch(id).unwrap_err();
                 assert!(second.contains("store-failed"), "{second}");
                 assert_eq!(
                     input(&session, id).unwrap_err(),
                     ChatAssetRefusal::StoreFailed
                 );
-                assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
                 assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
                 assert_eq!(store.retention.lock().bytes, 0);
                 assert_eq!(residents(&store), 0);
@@ -3979,7 +4002,7 @@ mod retention_tests {
         let store = store(2);
         let access = access("one");
         let id = register(&store, &access);
-        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher = Arc::new(Fetcher::default());
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
@@ -3996,7 +4019,7 @@ mod retention_tests {
                         .contains("attachment exceeds the byte limit")
                 );
             }
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 0);
             assert!(store.pin(&access, id, Recency::Keep).unwrap().is_none());
         })
         .await
@@ -4073,7 +4096,7 @@ mod retention_tests {
         let store = store(3);
         let access = access("one");
         let a = register(&store, &access);
-        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher = Arc::new(Fetcher::default());
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
@@ -4089,7 +4112,7 @@ mod retention_tests {
             assert_eq!(weak.data.read(), Err(BlobError::Reclaimed));
             assert_eq!(input(&session, a).unwrap().read().unwrap(), b"aaa");
             assert_eq!(weak.data.read().unwrap(), b"aaa");
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 2);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
         })
         .await
         .unwrap();
@@ -4100,8 +4123,7 @@ mod retention_tests {
         let store = store(3);
         let access = access("one");
         let a = register(&store, &access);
-        let fetcher: Arc<dyn AssetFetcher> =
-            Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher: Arc<dyn AssetFetcher> = Arc::new(Fetcher::default());
         let source = AssetSourceRef::Telegram {
             file_id: "file".into(),
         };

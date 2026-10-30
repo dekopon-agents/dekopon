@@ -722,7 +722,7 @@ fn arrived_item_numbers_count_asset_markers_without_span_entries() {
 }
 
 #[test]
-fn boot_never_requeues_asset_slots_or_arrival_summaries() {
+fn boot_requeues_asset_slots_without_enqueuing_them() {
     let (dir, journal) = journal();
     let mut record = fixture();
     record.summaries[0] = Slot::Running;
@@ -743,7 +743,7 @@ fn boot_never_requeues_asset_slots_or_arrival_summaries() {
         .unwrap();
     drop(journal);
     let (journal, boot) = reopen(dir.path());
-    assert_eq!(boot.requeued, 1);
+    assert_eq!(boot.requeued, 2);
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.tasks[0].part.get(), 1);
     let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();
@@ -752,10 +752,14 @@ fn boot_never_requeues_asset_slots_or_arrival_summaries() {
         snapshot.records[0].header.arrived[0].summaries,
         [Slot::Running]
     );
-    let [AssetSideLine::Slot(line)] = snapshot.records[0].asset_lines.as_slice() else {
+    assert_eq!(boot.tasks[0].subject, Subject::Record);
+    let [AssetSideLine::Slot(line), AssetSideLine::Slot(requeued)] =
+        snapshot.records[0].asset_lines.as_slice()
+    else {
         panic!("asset slot stays unapplied");
     };
     assert_eq!(line.slot, Slot::Running);
+    assert_eq!(requeued.slot, Slot::Queued);
 }
 
 #[test]

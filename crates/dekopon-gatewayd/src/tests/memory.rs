@@ -2440,3 +2440,166 @@ fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
     ));
     assert!(sealed.read(resumed.0.get(), "native", None).is_ok());
 }
+
+#[tokio::test(start_paused = true)]
+async fn asset_summaries_go_only_to_the_summaries_model() {
+    use crate::{
+        asset::{AssetAccess, AssetFence},
+        config::memory::{AttachmentSummaries, Toggle},
+        memory::{
+            generation::{Deferred, PostReply, drain},
+            record::GrantDigest,
+        },
+    };
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, mut frames) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let reply = vendor(Vec::new()).await;
+    let summary = vendor((0..4).map(|_| router_answer("description")).collect()).await;
+    let decoy = vendor(Vec::new()).await;
+    let mut runner = Arc::into_inner(journaled_runner(
+        broker,
+        Arc::new(crate::session::ConfiguredModels::default()),
+        journal_dir.path(),
+    ))
+    .unwrap();
+    let journal = Arc::clone(runner.journal.as_ref().unwrap());
+    let counts = Arc::<Counts>::default();
+    let (sender, dispatcher) = crate::memory::engine::channel(
+        Arc::clone(&journal),
+        Arc::clone(&runner.assets),
+        Arc::clone(&counts),
+        8.try_into().unwrap(),
+        1.try_into().unwrap(),
+    );
+    let mut routes = RoutingTable::default();
+    for (name, vendor) in [("reply", &reply), ("summary", &summary), ("decoy", &decoy)] {
+        routes.models.insert(name.into(), Arc::new(serde_json::from_value(json!({"kind":"openaiCompatible","name":name,"endpoint":vendor.endpoint,"model":"fixture","modalities":["image"],"timeoutMs":60000})).unwrap()));
+    }
+    let mut owned = tokio::task::JoinSet::new();
+    dispatcher.start(
+        crate::gateway::CurrentGeneration::boot(Arc::new(routes), Arc::default()),
+        Arc::new(ModelCache::new(Arc::new(
+            crate::session::ConfiguredModels::default(),
+        ))),
+        Arc::clone(&runner.thread_owner),
+        runner.shell_threads.clone(),
+        &mut owned,
+    );
+    runner.summaries = Some(sender);
+    let key = private_conversation_key("dev", "only-summary", SUBJECT);
+    let stem = key.journal_stem();
+    let grant = GrantDigest::of(&[]);
+    let access = AssetAccess::persistent(
+        key.clone(),
+        1,
+        Arc::new(AssetFence::new().with_grant(grant.hex())),
+    );
+    let registered = runner.assets.assets_for_access(
+        &access,
+        vec![pending("sender-name-canary.png", "image/png", 6)],
+        Instant::now(),
+    );
+    drop(
+        runner
+            .assets
+            .admit(&access, registered.arrived[0], b"pixels")
+            .unwrap(),
+    );
+    let mut plan = crate::memory::generation::plan(&summarized_route(2)).unwrap();
+    plan.parts = vec![64.try_into().unwrap(), 128.try_into().unwrap()];
+    let post = |plan, arrivals, recalled| Deferred {
+        record: Some(PostReply {
+            key: key.clone(),
+            granted: Vec::new(),
+            access: access.clone(),
+            publication: None,
+            captured: captured("conversation-canary", Some("delivered-reply-canary")),
+            arrivals,
+            attachments: AttachmentSummaries {
+                images: Toggle::Summarize,
+                documents: Toggle::Summarize,
+            },
+            keep: crate::journal::Keep::Everything,
+            plan,
+            recalled,
+        }),
+        ..Deferred::default()
+    };
+    assert!(journal.record_snapshot(&stem, true).unwrap().is_none());
+    drain(&runner, post(Some(plan), vec![registered.arrived], None)).await;
+    for part in 0..2 {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let joined = counts.joined.notified();
+                let snapshot = journal.record_snapshot(&stem, true).unwrap().unwrap();
+                let head = &snapshot.records[0];
+                if let Slot::Generated(_) =
+                    &head.header.arrived[0].join(&head.asset_lines).summaries[part]
+                {
+                    break;
+                }
+                joined.await;
+            }
+        })
+        .await
+        .unwrap();
+        runner.summaries.as_ref().unwrap().wait_assets().await;
+        if part == 0 {
+            let recalled = journal.record_snapshot(&stem, true).unwrap();
+            drain(&runner, post(None, vec![Vec::new()], recalled)).await;
+        }
+    }
+    let bodies = summary.bodies.lock().clone();
+    assert_eq!(bodies.len(), 4);
+    let files: Vec<_> = bodies
+        .iter()
+        .filter(|body| {
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["content"].as_array().is_some())
+        })
+        .collect();
+    assert_eq!(files.len(), 2);
+    for (index, body) in files.iter().enumerate() {
+        assert_asset_summary_request(body, index);
+    }
+    assert!(reply.bodies.lock().is_empty());
+    assert!(decoy.bodies.lock().is_empty());
+    assert!(frames.try_recv().is_err(), "summaries sent no broker frame");
+    owned.shutdown().await;
+}
+
+fn assert_asset_summary_request(body: &Value, index: usize) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    assert_eq!(body["model"], "fixture");
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    let image = &messages[1]["content"][0];
+    assert_eq!(image["type"], "image_url");
+    let url = image["image_url"]["url"].as_str().unwrap();
+    assert_eq!(
+        STANDARD
+            .decode(url.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap(),
+        b"pixels"
+    );
+    let text = messages[0]["content"].as_str().unwrap();
+    assert_eq!(
+        text.contains("Earlier, shorter descriptions:\ndescription"),
+        index == 1
+    );
+    for canary in [
+        "conversation-canary",
+        "delivered-reply-canary",
+        "sender-name-canary",
+        "files.slack.com",
+    ] {
+        assert!(!body.to_string().contains(canary));
+    }
+}

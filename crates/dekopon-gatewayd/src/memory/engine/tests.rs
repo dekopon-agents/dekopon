@@ -1,3 +1,5 @@
+mod assets;
+
 use super::super::journal::records::tests::{fixture, journal};
 use super::*;
 use crate::{
@@ -30,6 +32,19 @@ struct Script {
     actions: Mutex<VecDeque<Action>>,
     calls: AtomicUsize,
     inputs: Mutex<Vec<String>>,
+    parts: Mutex<Vec<SeenPart>>,
+}
+#[derive(Debug, PartialEq)]
+enum SeenPart {
+    Image {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    File {
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    },
 }
 struct Gate {
     started: tokio::sync::Notify,
@@ -60,6 +75,27 @@ impl ChatModel for Script {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let mut captured = String::new();
         for message in messages {
+            if let Some(parts) = message.parts() {
+                for part in parts {
+                    use dekopon_model::model::ContentPart;
+                    match part {
+                        ContentPart::Image { mime, data } => {
+                            self.parts.lock().push(SeenPart::Image {
+                                mime: mime.clone(),
+                                bytes: data.read().unwrap(),
+                            })
+                        }
+                        ContentPart::File { name, mime, data } => {
+                            self.parts.lock().push(SeenPart::File {
+                                name: name.clone(),
+                                mime: mime.clone(),
+                                bytes: data.read().unwrap(),
+                            })
+                        }
+                        ContentPart::Text(_) => {}
+                    }
+                }
+            }
             if let ModelMessage::Journal {
                 message: ReplayMessage::User(texts),
             } = message
@@ -142,10 +178,11 @@ fn resources(
         actions: Mutex::new(actions.into_iter().collect()),
         calls: AtomicUsize::new(0),
         inputs: Mutex::new(Vec::new()),
+        parts: Mutex::new(Vec::new()),
     });
     let mut routes = RoutingTable::default();
     if configured {
-        routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":"http://127.0.0.1:9","model":"fixture","timeoutMs":1000})).unwrap()));
+        routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":"http://127.0.0.1:9","model":"fixture","modalities":["image"],"timeoutMs":1000})).unwrap()));
     }
     (
         Resources {
@@ -734,7 +771,7 @@ async fn held_listener() -> (
 
 fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: u64) -> Resources {
     let mut routes = RoutingTable::default();
-    routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":endpoint,"model":"fixture","timeoutMs":timeout_ms})).unwrap()));
+    routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":endpoint,"model":"fixture","modalities":["image"],"timeoutMs":timeout_ms})).unwrap()));
     Resources {
         assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
         journal,
