@@ -437,67 +437,64 @@ therefore means adding it, backticked, to that document in the same change. Grep
 
 ### macOS Homebrew compatibility
 
-The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
-`macos-15` runner and installs `cassette` from the real Homebrew tap. With its default `daemons:
-tap` input it also installs Dekopon from the tap, records the Homebrew and macOS versions, tap
-revision and installed binaries, and requires the pinned tap commit, versions and ARM64 Mach-O
-architecture; `daemons: checkout` instead builds both daemons from the dispatched commit in
-release mode, which is candidate evidence, not a released installation. It runs
-[`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd` and the `mode` input:
-`env-file` (the default, as the Mac runbook installs) or `legacy-wrapper` (the only mode a release
-before 0.74.0 supports).
-It never substitutes downloaded executables for the Homebrew installation.
+The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) workflow runs both daemons as
+user launchd jobs on a GitHub ARM64 `macos-15` runner against loopback Slack, GitHub and model
+fixtures. It is not a required PR check; dispatch it as
+[Run on a Mac](run-on-mac.md#manual-homebrew-compatibility-check) shows.
 
-The helper writes its own broker, gateway, catalog, Cedar and credential files for the loopback
-fixtures; it does not load the configuration blocks in the example READMEs. It loads
-checksum-pinned JSONPlaceholder and GitHub components. Actual
-[`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md) supplies authored
-synthetic HTTP responses; it makes no upstream requests. An HTTP fixture independently
-verifies the broker's synthetic bearer credential before forwarding only the request's Accept
-header to replay. Replay ignores Authorization and therefore cannot prove injection by itself.
+| Input | Values |
+|---|---|
+| `daemons` | `tap` (default): the tap's `dekopon` and `cassette`, as installed. `checkout`: both daemons built in release mode from the dispatched commit, with the tap's `cassette`; candidate evidence, not a released installation. |
+| `mode` | `env-file` (default): both daemons start directly with [`--env-file`](gatewayd.md#environment-file), as the Mac runbook installs. `legacy-wrapper`: the gateway starts through a shell wrapper that sources a private `credentials.env`; the only mode before 0.74.0. |
 
-The real Slack Agent adapter connects to the bounded loopback HTTP/WebSocket fixture in
-[`slack_socket_fixture.py`](../ci/slack_socket_fixture.py). This exercises Socket Mode protocol,
-not the in-process [Fauxlack transport](gatewayd.md#fauxlack-tests-only) or a real Slack workspace.
-The fixture's WebSocket dependency is pinned by version, wheel URL and SHA-256 in
-[`macos-compat-requirements.txt`](../ci/macos-compat-requirements.txt).
+**Pins.** Every run requires ARM64 Mach-O daemons and `cassette` 0.1.0. A `tap` run also requires
+the tap at `DEKOPON_TAP_COMMIT` and daemons at `DEKOPON_EXPECTED_VERSION`. The helper refuses any
+other daemon version or provider checksum, so a tap update needs a compatibility review and a pin
+update.
 
-The test requires these observable results:
+**Fixtures.** The helper, [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py), gets authored
+HTTP responses from
+[`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md), which makes
+no upstream request; replay ignores `Authorization`, so an HTTP fixture in front of it checks the
+broker's bearer credential. The real Slack Agent adapter speaks Socket Mode to the loopback
+[`slack_socket_fixture.py`](../ci/slack_socket_fixture.py), not
+[Fauxlack](gatewayd.md#fauxlack-tests-only) or a real workspace.
 
-- In `--legacy-wrapper` mode the gateway shell wrapper loads fake model/app/bot values from a
-  private `credentials.env`. In `--env-file` mode both daemons start directly with
-  [`--env-file`](gatewayd.md#environment-file) (launchd `ProgramArguments` name the binary), are
-  restarted (`launchctl kickstart -k` under launchd) and serve again, and forced runs with
-  malformed lines and an invalid tuning value must exit without echoing a synthetic value. In
-  both modes the broker loads its literal private `credentialsPath` YAML; the daemons' own
-  environment-file loader is literal and the YAML takes no environment substitution. The fake
-  PAT contains `${GITHUB_TOKEN}`, the broker's environment sets `GITHUB_TOKEN`, and the provider
-  fixture requires the unexpanded value.
-- Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
-  then produce threaded Slack replies; an owner follow-up without a mention in the owner's thread
-  is answered the same way. Unmapped and denied senders, and a mapped room without a grant,
-  produce no model or provider requests. The owner's direct message matches no channel-only route:
-  the gateway logs it as an unrouted `gateway_message_ignored` debug record, with no model or
-  provider request and no Slack reply or status.
-- A local transport turn completes a provider read; an out-of-scope HTTP request is refused; local
+**A green run proves:**
+
+- The broker's private `credentialsPath` YAML takes no environment substitution: a fake PAT's
+  `${GITHUB_TOKEN}` stays unexpanded although the broker's environment sets it.
+- In `env-file` mode, the loader takes `$` literally, both daemons restart under
+  `launchctl kickstart -k` and serve again, and an environment file with malformed lines or an
+  invalid tuning value stops a daemon before it binds, without echoing a value.
+- Owner and colleague channel mentions, and the owner's unmentioned follow-up in their thread, pass
+  real broker policy and get threaded read-only GitHub replies.
+- Unmapped and denied senders, and a mapped room without a grant, cause no model or provider
+  request. The owner's direct message matches no channel-only route; it logs an unrouted
+  `gateway_message_ignored` debug record and gets no model or provider request, Slack reply or
+  status.
+- On the local transport, a provider read completes, an out-of-scope HTTP request is refused, and
   unmapped and denied senders are refused as exactly `unmapped-subject` and `agent-denied`.
-- Working status identifies the initiating member and clears to active; native Stop cancels a held model
-  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged,
+- Working status names the initiating member and clears to `active`; native Stop cancels a held
+  model request with no provider call or normal answer. Every Socket Mode envelope is acknowledged,
   on one connection per gateway process.
-- The four fake credentials, and any text with their shared `synthetic-` prefix, are absent from
-  checks, logs, model inputs, tool results and replies, and the four are absent from every fixture
-  file other than the private credential files; each endpoint receives only its expected
-  credential. Exact call counts and broker execution records identify the loaded provider artifacts.
+- The four fake credentials, and any text with their `synthetic-` prefix, never reach checks,
+  logs, model inputs, tool results or replies, and the four appear in no fixture file but the
+  private credential files. Each endpoint receives only its own credential; exact call counts and
+  broker execution records identify the loaded provider artifacts.
+- With `--launchd`, two uniquely named jobs in the existing `gui/<uid>` or `user/<uid>` domain exit
+  cleanly and unload, with no sudo, new accounts or foreground fallback. A `legacy-wrapper` job
+  starts through `env -i`; an `env-file` job sets only `PATH`, `TMPDIR`, `RUST_LOG` and the broker's
+  test `GITHUB_TOKEN`. A failed run keeps its private temporary files and prints their path.
 
-With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
-uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
-creates accounts or falls back silently to foreground execution. A legacy-wrapper job clears
-inherited environment variables with `env -i` before starting its binary or wrapper; an
-env-file job names the binary directly and sets only `PATH`, `TMPDIR` and `RUST_LOG` through
-`EnvironmentVariables`. Cleanup removes private temporary
-files only after complete success; a failure retains them and reports their path for diagnosis.
+**It does not prove** production UID isolation, system LaunchDaemons, Gatekeeper, sleep, logout or
+reboot recovery, Slack plan entitlements, real GitHub permissions, OpenRouter billing or the example
+READMEs' configuration: every run uses one UID, synthetic services and the helper's own
+configuration and credential files. Without `--launchd`, the helper runs the same fixtures
+as foreground processes, including on Linux, and proves nothing about launchd. No run needs an
+administrator account or a live API secret.
 
-To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
+Run it from a checkout on an Apple Silicon Mac with Homebrew:
 
 ```console
 brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
@@ -518,21 +515,11 @@ python3 -m venv "$fixture_dir/venv"
   --cassette-bin "$(brew --prefix cassette)/bin/cassette"
 ```
 
-The helper starts both daemons with `--env-file` by default; pass `--legacy-wrapper` for a release
-before 0.74.0, and `--expected-version` for a binary that reports another version, such as a source
-build passed as `--bin-dir target/release`. The workflow refuses any tap commit other
-than its `DEKOPON_TAP_COMMIT`, and the helper refuses a mismatched daemon version or component
-checksum. A tap update therefore needs an explicit compatibility review and pin update, not an
-automatic skip. Validate changes
-with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
-`actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
-
-Omitting `--launchd` runs the same fixtures with foreground processes, including on Linux. That
-does not establish launchd coverage. Both modes use one UID and synthetic services: they do not
-prove production UID isolation, system LaunchDaemons, Gatekeeper, sleep/logout/reboot recovery,
-Slack plan entitlements, real GitHub permissions or OpenRouter billing. No administrator account
-setup or live API secrets are required. The lane is separate from required PR checks; use
-[manual dispatch](run-on-mac.md#manual-homebrew-compatibility-check) for hosted Mac evidence.
+Add `--legacy-wrapper` for the legacy mode, and `--expected-version` for a binary that reports a
+version other than the helper's pin, such as a source build passed as `--bin-dir target/release`.
+Validate a change to the lane with
+`python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
+`actionlint .github/workflows/macos-compat.yml`, then run the helper against the selected release.
 
 ### OpenObserve OTLP end-to-end test
 

@@ -1,112 +1,142 @@
 # Slack setup
 
-For a native Mac installation with a budgeted OpenRouter key, start with
-[Run on a Mac](../../docs/run-on-mac.md), then choose the [Slack Agent review channel](../slack-github/README.md)
-for owner/colleague GitHub read grants and a broker-held PAT, or the [harmless Agent DM starter](../mac-slack/README.md).
-This page owns the Slack app and token setup.
+Create the Slack app, export its two tokens, and map senders and channels to broker principals.
+`dekopon-gatewayd` connects outbound over Socket Mode; no public endpoint is needed. On a Mac, start
+from [Run on a Mac](../../docs/run-on-mac.md), which links here. The
+[review channel](../slack-github/README.md), [DM starter](../mac-slack/README.md) and
+[conditional writer](../conditional-write/README.md) recipes use this app.
 
-This directory contains the Slack app profiles also used by the
-[conditional writer](../conditional-write/README.md). Both receive direct messages and
-explicit channel mentions over Socket Mode, open supported attachments on demand, and publish
-best-effort in-flight liveness. Both profiles receive channel history for opted-in `follow: true`
-routes. The Agent profile also lets a freshly authorized sender continue in an exact owned thread
-without repeating the mention on routes without follow. Other ambient messages are dropped before
-routing. No public endpoint is needed.
+1. [Choose a manifest](#choose-a-manifest).
+2. [Create the app and credentials](#create-the-app-and-credentials).
+3. [Allow a sender](#allow-a-sender) and invite the bot.
+4. Optionally, configure [attachment replies](#configure-attachment-replies),
+   [in-flight indicators](#configure-in-flight-indicators) and [thread follow](#follow-a-thread).
 
-Choose the profile before creating the app:
+## Choose a manifest
 
-| Profile | Manifest | Workspace support | In-flight UX |
-|---|---|---|---|
-| Classic | [`manifest.yaml`](manifest.yaml) | Free or paid | Temporary `:tangerine:` reaction when configured |
-| Agent | [`manifest-agent.yaml`](manifest-agent.yaml) | Slack Agent feature enabled by plan/admin | Native Working/Stop session UI, degrading to the reaction |
+Choose before creating the app; each manifest pairs with one transport `experience`.
 
-Slack's [Agent guide](https://docs.slack.dev/ai/developing-agents/) says some AI features require a
-paid plan; the [Developer Program](https://api.slack.com/developer-program) offers a fully featured
-sandbox for development. Slack exposes some Agent settings on free workspaces even when the API is
-disabled. Dekopon never infers billing: an Agent installation that receives `feature_disabled` permanently downgrades that
-transport to its configured reaction fallback. If that also lacks `reactions:write`, liveness is a
-no-op and the final reply is unchanged.
+| | Classic | Agent |
+|---|---|---|
+| Manifest | [`manifest.yaml`](manifest.yaml) | [`manifest-agent.yaml`](manifest-agent.yaml) |
+| Transport | `experience: classic` (default) | `experience: agent` |
+| Workspace | Free or paid | Slack Agent features enabled by plan and admin policy |
+| In-flight indicator | Temporary `:tangerine:` reaction when configured | Native Working/Stop session UI, falling back to the reaction |
+| Direct messages | Top-level replies, one conversation per DM | One thread and session per root message |
+| Channel thread without `follow` | Each message must mention the bot | After an authorized mention, the same sender continues without one |
+| Stop | A `cancelButton: true` button, or a `stop` or `cancel` reply | Slack's Stop control (`cancelButton` is refused), or a `stop` or `cancel` reply |
+
+- Slack's [Agent guide](https://docs.slack.dev/ai/developing-agents/) says some AI features need a
+  paid plan even though their settings appear on every plan; the
+  [Developer Program](https://api.slack.com/developer-program) offers a fully featured sandbox.
+  Choose Agent only where the plan and admin policy enable it; Dekopon never infers the plan.
+- A refused authorization or a gateway restart ends an Agent continuation. Another sender must
+  mention the bot and is authorized separately.
 
 ## Create the app and credentials
 
-`dekopon-gatewayd` needs two different Slack credentials:
+`dekopon-gatewayd` reads two Slack tokens from environment variables:
 
 | Credential | Prefix | Purpose | Environment variable |
 |---|---|---|---|
 | App-level token | `xapp-…` | Opens the outbound Socket Mode connection | `DEKOPON_GATEWAYD_SLACK_APP_TOKEN` |
-| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes liveness/text or attachment replies, and reads attachments | `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN` |
+| Bot User OAuth Token | `xoxb-…` | Identifies the bot, posts replies and liveness, and reads and uploads attachments | `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN` |
 
-Neither token belongs in the app manifest or a Dekopon configuration file.
+Keep both tokens out of the manifest, every Dekopon configuration file, issues and commits.
 
 ### Create the app
 
-1. Open [Your Apps](https://api.slack.com/apps) and select **Create New App → From a manifest**.
-2. Choose the workspace, paste either the classic [`manifest.yaml`](manifest.yaml) or paid/admin-
-   enabled [`manifest-agent.yaml`](manifest-agent.yaml), and finish creating the app.
-3. Select the new app from [Your Apps](https://api.slack.com/apps). Its **Basic Information** page
-   has a URL like `https://api.slack.com/apps/{APP_ID}/general`, where `{APP_ID}` is the identifier
-   Slack assigned to the app. Use that URL to return directly to these settings later.
+1. In [Your Apps](https://api.slack.com/apps), select **Create New App → From a manifest**.
+2. Choose the workspace, paste the classic [`manifest.yaml`](manifest.yaml) or the Agent
+   [`manifest-agent.yaml`](manifest-agent.yaml), and create the app.
+3. Select the new app in [Your Apps](https://api.slack.com/apps). Its **Basic Information** page is
+   `https://api.slack.com/apps/{APP_ID}/general`.
 
-Both manifests enable Socket Mode and the App Home messages tab. Both include `files:write` for
-bounded provider-attachment replies; remove it only when no route grants asset.send. The classic profile adds
-`reactions:write` for the explicitly configured fallback; remove that scope and leave liveness off
-if the classic deployment wants final replies only. The Agent profile additionally adds
-`agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
-requires for Agent View. Both profiles include `channels:history`/`message.channels` and
-`groups:history`/`message.groups` for thread follow; Agent also uses them for owned-thread continuation. Opening App Home is not
-itself routed as a prompt. To admit top-level PR links, enable
-[`ambient.pullRequestLinks`](../../docs/gatewayd.md#slack-pull-request-links) on a channel route
-with `follow: true` and a journal; other ambient channel-history events retain their existing gates.
+Both manifests enable Socket Mode and the App Home messages tab, and request:
+
+- `files:write`, for provider attachment replies; remove it only when no route grants `asset.send`.
+- `reactions:write`, for optional working and seen reactions; remove it and leave both reactions
+  off for final replies only.
+- `channels:history` with `message.channels` and `groups:history` with `message.groups`, for
+  [thread follow](#follow-a-thread) and Agent continuation. Other unmentioned channel messages are
+  dropped before routing.
+- `reactions:read`, `reaction_added` and `users:read`, so a human thumbs-down ends following.
+
+The Agent manifest adds the `agent_view` feature, the `assistant:write` scope, and the
+`agent_session_stopped` and `app_home_opened` events. Opening App Home is not a prompt.
 
 ### Generate the app-level token (`xapp-…`)
 
-1. On the **Basic Information** page, scroll down to **App-Level Tokens** and select
-   **Generate Token and Scopes**.
-2. In the **Generate an app-level token** dialog:
-   1. Enter `dekopon` under **Token Name**. This is only a label in Slack; another descriptive name
-      works too.
-   2. Select **Add Scope**, then choose `connections:write`. This is the only app-level scope
-      Dekopon needs. The bot scopes from the manifest do not belong here.
-   3. Confirm that the dialog shows the token name and `connections:write`. The **Generate** button
-      becomes available only after both are present. If Slack shows another empty permission
-      selector, leave it empty; a second scope is not required. Select **Generate**.
-3. Slack shows the generated token and its scope. Select **Copy** and save the complete `xapp-…`
-   value as `DEKOPON_GATEWAYD_SLACK_APP_TOKEN`. After closing the dialog, the **App-Level Tokens** table
-   should contain one row named `dekopon` with the `connections:write` scope. Select the token name
-   in that table to reopen its **Copy** and **Revoke** controls.
+1. On **Basic Information**, under **App-Level Tokens**, select **Generate Token and Scopes**.
+2. Name the token, for example `dekopon`, select **Add Scope**, and choose `connections:write`.
+   It is the only scope this token needs; bot scopes do not belong here.
+3. Select **Generate**. It enables once the name and scope are set; leave any extra empty scope
+   selector empty.
+4. Select **Copy** and save the `xapp-…` value as `DEKOPON_GATEWAYD_SLACK_APP_TOKEN`.
 
-Treat the token as a secret. Do not paste it into `manifest.yaml`, `gatewayd.yaml`, an issue, or a
-commit. Use **Revoke** in the token details if it is exposed.
+The **App-Level Tokens** table then lists the token with `connections:write`. Select its name to
+reopen **Copy**, or to **Revoke** an exposed token.
 
 ### Install the app and get the bot token (`xoxb-…`)
 
-1. Select **Install App** in the Slack app settings sidebar, then select **Install to Workspace**.
-2. Review the requested bot permissions and select **Allow**.
-3. After installation, copy the **Bot User OAuth Token** from **OAuth & Permissions**. Save the
-   complete `xoxb-…` value as `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN`.
+1. In the settings sidebar, select **Install App → Install to Workspace**, review the bot
+   permissions, and select **Allow**.
+2. In **OAuth & Permissions**, copy the **Bot User OAuth Token** and save the `xoxb-…` value as
+   `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN`.
 
-If the app was already installed, open **OAuth & Permissions** directly to find the bot token. If
-bot scopes change later, select **Reinstall to Workspace** so the new scopes take effect.
+After changing bot scopes, select **Reinstall to Workspace** so they take effect.
+
+### Export the credentials
+
+Export both under the variable names `gatewayd.yaml` references. On a Mac, put them in the
+gateway's `credentials.env` instead ([credential files](../../docs/run-on-mac.md#credential-files)):
+
+```console
+export DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-...
+export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-...
+```
+
+## Allow a sender
+
+Collect the Slack IDs, invite the bot, then map each sender:
+
+1. Copy the sender's member ID (`U…`) with **Copy member ID** in their Slack profile.
+2. Open the channel in a web browser. Its URL, `https://app.slack.com/client/T…/C…`, holds the
+   workspace ID (`T…`) and then the channel ID (`C…`).
+3. In each channel a route names, run `/invite @dekopon`.
+
+Lowercase the workspace and member IDs and add the canonical subject to `broker.yaml`:
+
+```yaml
+principals:
+  maintainer:
+    subjects: [slack.t0123abc.u9xyz]
+```
+
+Make sure the gateway identity's attestor namespace covers that workspace:
+
+```yaml
+attestor:
+  namespaces: [slack.t0123abc]
+```
+
+An unmapped sender is refused before any model call. In a channel, a new conversation starts
+only with a mention.
 
 ## Configure attachment replies
 
-Slack's current file path is `files.getUploadURLExternal` → a tokenless upload to Slack's returned,
-origin-checked URL → `files.completeUploadExternal` with the authenticated channel/thread, once per
-attachment. The bot token is attached only to the two fixed Slack Web API calls and never to the
-upload URL. Files are delivered only after explicit broker authorization of `asset.send`; attaching
-alone retains them. This adapter accepts any concrete valid media type. Route instructions should
-state that accepted set; invalid labels are refused. See
-[asset handles](../../docs/gatewayd.md#asset-handles-and-delivery) for the bounds.
+A route delivers a provider file only after the broker authorizes `asset.send`; attaching alone
+keeps the file. The Slack adapter accepts any concrete valid media type and refuses invalid
+labels, so name the accepted set in the route instructions.
+
+Each file goes through `files.getUploadURLExternal`, a tokenless upload to Slack's returned,
+origin-checked URL, then `files.completeUploadExternal` to the authenticated channel or thread.
+The bot token goes only to the two Web API calls, never to the upload URL.
+[Asset handles](../../docs/gatewayd.md#asset-handles-and-delivery) lists the bounds.
 
 ## Configure in-flight indicators
 
-Session indicators are opt-in and start after fresh broker authorization. A same-sender steer joins
-the running leg; a queued sender opens a fresh leg when their turn starts. Accepted steers and
-queued non-wake messages get best-effort `eyes` only when their resolved route opts in with
-`reaction.seen: on`, subject to reaction-scope availability. This admission acknowledgment can precede a later
-authorization refusal; it does not signify permission to run. Unauthorized turns get no session
-progress or inference. Busy refusals, unrouted and ambient messages get no liveness indicator;
-a busy refusal can still get the configured text reply.
+Indicators are opt-in and start only after fresh broker authorization. Set them on the transport.
 
 Classic/free profile:
 
@@ -132,97 +162,30 @@ indicators:
   statusText: true
 ```
 
-The Agent manifest already requests `assistant:write`; no new scope is needed. This transport
-option needs a route with `progressNotes: true` to hand over. See the
-[Slack status-text contract](../../docs/gatewayd.md#slack-socket-mode) for its lease and hidden Stop
-control. Omit `statusText` to retain the native-only default.
-
-`cancelButton` is refused on `experience: agent`: Slack renders its own Stop control there. On both
-profiles a reply of `stop` or `cancel` in the conversation stops the run — see
-[Liveness, progress, and stopping a run](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
-
-`experience` controls conversation semantics and never changes in response to a cosmetic API
-failure. Classic DMs retain top-level replies and one whole-DM conversation. Agent DMs use one
-Slack thread/session per root message, including their conversation history and Stop key. In an
-Agent channel, the initial request must mention the bot. Fresh authorization then claims the
-exact workspace/channel/root-thread/sender tuple in a bounded process-local registry, allowing only
-that sender's unmentioned follow-ups in that thread. Revocation removes the claim and restart clears
-all claims; another sender must mention and authorize independently.
-
-Persistent history is private per authenticated subject unless the route explicitly sets
-`scope: sharedConversation`. Slack sharing is normally root-thread scoped: independently authorized
-participants in that root thread then share retained turns and attachment references, while every
-message receives its own broker decision. Every person-originated turn, in every scope, carries
-a gateway-authored participant label naming the sender's broker principal or saying `unmapped participant`.
-That label reaches the model provider. This example does not opt into shared history.
-
-In Agent mode, Dekopon sets `processing` once—Slack owns the standard Working UI and one-hour
-processing timeout—sends the durable reply, and queues `active` cleanup.
-Slack's Stop button produces an authenticated `agent_session_stopped` event. Dekopon cooperatively
-prevents subsequent model turns and capability calls, suppresses the stale answer/history commit,
-and posts `Stopped.` An already-running model request or provider effect cannot be rolled back and
-may finish before the synchronous loop reaches its next cancellation boundary.
-
-An unmentioned owned-thread follow-up is also told that a reply is optional and receives the
-payload-free `decline_chat_reply` tool. Choosing it before capability work sends no Slack message,
-creates no delivery receipt, and avoids taking the last word. A decline selected alongside work
-runs none of it; after any earlier capability invocation, the model must visibly summarize the
-result. If its turn budget is exhausted, a fixed warning says to inspect audit before retrying.
-Explicit mentions and DMs always require replies.
-
-Liveness failures never delay or fail the terminal reply. `feature_disabled`, `missing_scope`, and
-other permanent Agent installation failures trip a per-transport breaker, and two consecutive
-failures on any one surface stop it for that session. Reaction cleanup removes only a reaction this
-session attempted; a failed cleanup may leave a harmless `:tangerine:` marker.
-
-### Export the credentials
-
-Export the values under the environment-variable names referenced by `gatewayd.yaml`:
-
-```console
-export DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-...
-export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-...
-```
-
-## Allow a sender
-
-Find the workspace team ID (`T…`) and the sender’s member ID (`U…`, available from **Copy member
-ID** in their profile). Opened in a web browser, a channel's URL is
-`https://app.slack.com/client/T…/C…`: the workspace ID, then the channel ID a channel route needs.
-Lowercase the team and member IDs and add the canonical subject to `broker.yaml`:
-
-```yaml
-principals:
-  maintainer:
-    subjects: [slack.t0123abc.u9xyz]
-```
-
-Also make sure the gateway identity’s attestor namespace covers that workspace:
-
-```yaml
-attestor:
-  namespaces: [slack.t0123abc]
-```
-
-An unmapped sender is refused before any model call. In channels, a new conversation responds only
-when mentioned. An Agent channel thread then accepts unmentioned follow-ups only from each exact
-sender it already freshly authorized there; direct messages route normally.
+- `statusText: true` shows notes from a route with `progressNotes: true`; omit it for native status
+  only. The [status-text contract](../../docs/gatewayd.md#slack-socket-mode) covers its lease and
+  hidden Stop control.
+- With `reaction.seen: on` on the resolved route, accepted steers and queued non-wake messages get
+  a best-effort `eyes`. It acknowledges admission, not permission to run.
+- Unauthorized, busy, unrouted and ambient messages get no indicator; a busy refusal can still get
+  its text reply.
+- An Agent transport that receives `feature_disabled` permanently falls back to its configured
+  reaction, or to no indicator without `reactions:write`; replies and `experience` stay unchanged.
+- Indicator failures never delay or fail the reply. A failed cleanup can leave a `:tangerine:`
+  reaction.
+- Stop is cooperative: it blocks further model turns and capability calls, drops the stale answer
+  and its history commit, and posts `Stopped.`. A model request or provider effect already running
+  cannot be rolled back
+  ([stopping a run](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run)).
 
 ## Follow a thread
 
-With `sessions.journal` configured, a Slack route selecting `[channel, thread]` may set
-`follow: true`. An authorized `follow stay` opens one thread ticket for all speakers.
-Unmentioned replies batch for 30 seconds of quiet or two minutes maximum, retaining labelled
-text from every speaker within the text bound. Each batch runs as its newest authenticated
-speaker under fresh broker authorization, including the mapped channel space's restrictions.
-The reply is optional: silence is the default, and follow messages never steer running work.
-Only a delivered reply renews the 24-hour ticket.
+Set `follow: true` on a `[channel, thread]` Slack route and configure `sessions.journal`. After an
+authorized `follow stay`, the bot hears every speaker's unmentioned replies in that thread, answers
+only when useful, and runs each batch under its newest speaker's fresh authorization.
 
-Both manifests include the history scopes and channel-message events required to hear replies,
-plus `reactions:read`, `reaction_added`, and `users:read` for human thumbs-down handling.
-Reinstall the app after changing scopes. `mute`, configured stop words, an authorized `follow leave`,
-a human thumbs-down on an agent message in the thread, or expiry ends following. Bot reactions
-and reactions on other messages are ignored. A mention starts an addressed turn again; its
-authorized `follow stay` restores following. Leaving does not let another person cancel the
-asker's running session. The [gateway contract](../../docs/gatewayd.md#slack-thread-follow)
-describes the admission and installation requirements.
+`mute`, a configured stop word, an authorized `follow leave`, a human thumbs-down on an agent
+message in the thread, or expiry ends following; only a delivered reply renews the 24-hour ticket.
+[Slack thread follow](../../docs/gatewayd.md#slack-thread-follow) covers batching and installation.
+For top-level PR links, also set
+[`ambient.pullRequestLinks`](../../docs/gatewayd.md#slack-pull-request-links).
